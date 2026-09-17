@@ -1,6 +1,7 @@
 /target/
 /dist/
 /artifacts/
+/.worktrees/
 /fjord-old-visual/
 /.env
 /.env.*
