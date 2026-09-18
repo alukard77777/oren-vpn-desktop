@@ -9,6 +9,9 @@ use std::{
 
 use multicore_core::{MAX_PROFILES, ProfileError, ProfileStore, Snapshot};
 
+#[cfg(windows)]
+use std::path::Path;
+
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 fn snapshot(source: &str, name: &str) -> Arc<Snapshot> {
@@ -87,6 +90,28 @@ fn ids_are_unique_lowercase_v4_uuids_and_index_keeps_urls_secret() {
             .mode();
         assert_eq!(mode & 0o077, 0);
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn index_keeps_owner_only_protected_acl_across_atomic_replacements() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let index = profiles.join("index.json");
+    let store = ProfileStore::open(&profiles, None).unwrap();
+
+    let first = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    assert_protected_single_principal_dacl(&index);
+
+    store
+        .create_profile(snapshot("https://two.invalid/sub", "Two"))
+        .unwrap();
+    assert_protected_single_principal_dacl(&index);
+
+    store.activate(&first).unwrap();
+    assert_protected_single_principal_dacl(&index);
 }
 
 #[test]
@@ -361,4 +386,113 @@ fn hostile_cleanup_target_is_not_followed(create_link: impl FnOnce(&PathBuf, &Pa
     assert_eq!(reopened.active_id(), None);
 
     fs::remove_dir(&child).unwrap();
+}
+
+#[cfg(windows)]
+fn assert_protected_single_principal_dacl(path: &Path) {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_SUCCESS, LocalFree},
+        Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetSecurityDescriptorControl, GetTokenInformation, OBJECT_INHERIT_ACE,
+            PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        },
+        Storage::FileSystem::FILE_ALL_ACCESS,
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(
+        status,
+        ERROR_SUCCESS,
+        "failed to inspect {}",
+        path.display()
+    );
+    assert!(!dacl.is_null());
+
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    assert_ne!(
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+        0
+    );
+    assert_ne!(control & SE_DACL_PROTECTED, 0, "{}", path.display());
+
+    let mut size = ACL_SIZE_INFORMATION::default();
+    assert_ne!(
+        unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut size as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        size.AceCount,
+        1,
+        "unexpected ACL entries for {}",
+        path.display()
+    );
+
+    let mut raw_ace = ptr::null_mut();
+    assert_ne!(unsafe { GetAce(dacl, 0, &mut raw_ace) }, 0);
+    let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+    assert_eq!(ace.Header.AceType, 0, "ACE must be ACCESS_ALLOWED");
+    assert_eq!(ace.Mask, FILE_ALL_ACCESS);
+    assert_eq!(
+        ace.Header.AceFlags & (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8,
+        0,
+        "index file ACE must not be inheritable"
+    );
+
+    let mut token = ptr::null_mut();
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let mut bytes_needed = 0_u32;
+    unsafe {
+        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut bytes_needed);
+    }
+    assert_ne!(bytes_needed, 0);
+    let word_size = std::mem::size_of::<usize>();
+    let mut token_info = vec![0_usize; (bytes_needed as usize).div_ceil(word_size)];
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                token_info.as_mut_ptr().cast(),
+                bytes_needed,
+                &mut bytes_needed,
+            )
+        },
+        0
+    );
+    let token_user = unsafe { &*token_info.as_ptr().cast::<TOKEN_USER>() };
+    let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+    assert_ne!(unsafe { EqualSid(ace_sid, token_user.User.Sid) }, 0);
+
+    unsafe { CloseHandle(token) };
+    unsafe { LocalFree(descriptor.cast()) };
 }
