@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use multicore_release::{
-    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, extract_verified_bundle,
+    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, archive_entry_unix_mode, extract_verified_bundle,
     extract_verified_bundle_with_limit, sha256_bytes,
 };
 use tempfile::TempDir;
@@ -161,6 +161,9 @@ fn symlink_entries_are_rejected() {
     writer.write_all(sums.as_bytes()).unwrap();
     writer.finish().unwrap();
     mark_central_entry_as_unix_symlink(&archive, b"link");
+    let mut reopened = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+    let link = reopened.by_name("link").unwrap();
+    assert_eq!(archive_entry_unix_mode(&link).unwrap() & 0o170000, 0o120000);
     let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
     assert!(
         error.to_string().contains("archive links are not allowed"),
@@ -203,6 +206,14 @@ fn expanded_size_limit_is_explicitly_guarded() {
     let error = extract_verified_bundle_with_limit(&archive, &destination, 1).unwrap_err();
     assert!(error.to_string().contains("expanded archive is too large"));
     assert!(!destination.exists(), "failed extraction must clean up");
+
+    let inventory = extract_verified_bundle_with_limit(
+        &archive,
+        &temp.path().join("clamped-out"),
+        MAX_EXPANDED_BYTES + 1,
+    )
+    .unwrap();
+    assert!(inventory.expanded_bytes() > 1);
 }
 
 #[test]

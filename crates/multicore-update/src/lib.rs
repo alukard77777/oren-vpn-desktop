@@ -345,6 +345,7 @@ pub fn extract_verified_bundle_with_limit(
     destination: &Path,
     max_expanded_bytes: u64,
 ) -> Result<BundleInventory, UpdateError> {
+    let max_expanded_bytes = max_expanded_bytes.min(MAX_EXPANDED_BYTES);
     if destination.exists() {
         return Err(UpdateError::InvalidBundle(
             "extraction destination already exists".into(),
@@ -719,4 +720,9 @@ mod publication_tests {
         assert!(backup.join("old.txt").is_file());
         assert!(!staged.exists());
     }
+}
+
+#[doc(hidden)]
+pub fn archive_entry_unix_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Option<u32> {
+    entry.unix_mode()
 }
