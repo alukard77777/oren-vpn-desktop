@@ -124,6 +124,12 @@ pub enum ProfileError {
         #[source]
         source: io::Error,
     },
+    #[error("profile index mutation committed but durability maintenance is required")]
+    IndexMaintenanceDebt {
+        id: ProfileId,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,6 +149,13 @@ struct ProfileIndexEntry {
 pub struct ProfileStore {
     root: PathBuf,
     index: RwLock<ProfileIndex>,
+    #[cfg(test)]
+    index_fault: std::sync::atomic::AtomicU8,
+}
+
+enum IndexCommit {
+    Clean,
+    MaintenanceDebt(io::Error),
 }
 
 impl ProfileStore {
@@ -152,7 +165,14 @@ impl ProfileStore {
     ) -> Result<Self, ProfileError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        let root_metadata = fs::symlink_metadata(&root)?;
+        if !root_metadata.file_type().is_dir() || is_link_or_reparse(&root_metadata) {
+            return Err(ProfileError::InvalidIndex(
+                "profile root is not a real directory".to_owned(),
+            ));
+        }
         secure_directory(&root)?;
+        let root = fs::canonicalize(root)?;
         let index_path = root.join(INDEX_FILE);
         let index = match fs::symlink_metadata(&index_path) {
             Ok(metadata) => {
@@ -178,6 +198,8 @@ impl ProfileStore {
         Ok(Self {
             root,
             index: RwLock::new(index),
+            #[cfg(test)]
+            index_fault: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -243,12 +265,20 @@ impl ProfileStore {
             created_at_unix: unix_timestamp(),
         });
         proposed.active_id = Some(id.clone());
-        if let Err(error) = self.persist_index(&proposed) {
-            let _ = fs::remove_dir_all(&profile_path);
-            return Err(error);
+        match self.persist_index(&proposed) {
+            Ok(IndexCommit::Clean) => {
+                *index = proposed;
+                Ok(id)
+            }
+            Ok(IndexCommit::MaintenanceDebt(source)) => {
+                *index = proposed;
+                Err(ProfileError::IndexMaintenanceDebt { id, source })
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&profile_path);
+                Err(error)
+            }
         }
-        *index = proposed;
-        Ok(id)
     }
 
     pub fn replace_profile(
@@ -258,7 +288,7 @@ impl ProfileStore {
     ) -> Result<u64, ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
-        let store = PersistentSnapshotStore::open(self.profile_path(id))?;
+        let store = PersistentSnapshotStore::open(self.validate_profile_directory(id)?)?;
         let (generation, _) = store.commit_with_generation((*snapshot).clone())?;
         drop(store);
         let (reloaded_generation, _) = self.load_profile(id)?;
@@ -275,8 +305,16 @@ impl ProfileStore {
         if index.active_id.as_ref() != Some(id) {
             let mut proposed = index.clone();
             proposed.active_id = Some(id.clone());
-            self.persist_index(&proposed)?;
-            *index = proposed;
+            match self.persist_index(&proposed)? {
+                IndexCommit::Clean => *index = proposed,
+                IndexCommit::MaintenanceDebt(source) => {
+                    *index = proposed;
+                    return Err(ProfileError::IndexMaintenanceDebt {
+                        id: id.clone(),
+                        source,
+                    });
+                }
+            }
         }
         Ok(snapshot)
     }
@@ -298,13 +336,17 @@ impl ProfileStore {
         {
             self.load_profile(next_active)?;
         }
-        self.persist_index(&proposed)?;
+        let index_commit = self.persist_index(&proposed)?;
         *index = proposed;
         let active = index.active_id.clone();
-        let profile_path = self.profile_path(id);
-        match fs::remove_dir_all(&profile_path) {
-            Ok(()) => Ok(active),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(active),
+        match self.remove_profile_directory(id) {
+            Ok(()) => match index_commit {
+                IndexCommit::Clean => Ok(active),
+                IndexCommit::MaintenanceDebt(source) => Err(ProfileError::IndexMaintenanceDebt {
+                    id: id.clone(),
+                    source,
+                }),
+            },
             Err(source) => Err(ProfileError::CleanupDebt {
                 id: id.clone(),
                 source,
@@ -338,19 +380,46 @@ impl ProfileStore {
     }
 
     fn load_profile(&self, id: &ProfileId) -> Result<(u64, Arc<Snapshot>), ProfileError> {
-        let path = self.profile_path(id);
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|_| ProfileError::Unavailable(id.clone()))?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(ProfileError::Unavailable(id.clone()));
-        }
+        let path = self.validate_profile_directory(id)?;
         let store = PersistentSnapshotStore::open(path)?;
         store
             .current_with_generation()
             .ok_or_else(|| ProfileError::Unavailable(id.clone()))
     }
 
-    fn persist_index(&self, index: &ProfileIndex) -> Result<(), ProfileError> {
+    fn validate_profile_directory(&self, id: &ProfileId) -> Result<PathBuf, ProfileError> {
+        let path = self.profile_path(id);
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| ProfileError::Unavailable(id.clone()))?;
+        if !metadata.file_type().is_dir() || is_link_or_reparse(&metadata) {
+            return Err(ProfileError::Unavailable(id.clone()));
+        }
+        Ok(path)
+    }
+
+    fn remove_profile_directory(&self, id: &ProfileId) -> io::Result<()> {
+        let path = self.profile_path(id);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_dir() || is_link_or_reparse(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile cleanup target is not a real directory",
+            ));
+        }
+        if path.parent() != Some(self.root.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile cleanup target escaped its root",
+            ));
+        }
+        fs::remove_dir_all(path)
+    }
+
+    fn persist_index(&self, index: &ProfileIndex) -> Result<IndexCommit, ProfileError> {
         validate_index(index)?;
         let bytes = serde_json::to_vec(index)
             .map_err(|error| ProfileError::InvalidIndex(error.to_string()))?;
@@ -377,14 +446,44 @@ impl ProfileStore {
             file.flush()?;
             file.sync_all()?;
             drop(file);
+            #[cfg(test)]
+            if self.take_index_fault(1) {
+                return Err(io::Error::other("injected pre-replace index failure"));
+            }
             atomic_replace(&temporary, &target)?;
-            secure_file(&target)?;
-            sync_directory(&self.root)
+            #[cfg(test)]
+            if self.take_index_fault(2) {
+                return Ok(IndexCommit::MaintenanceDebt(io::Error::other(
+                    "injected post-replace index failure",
+                )));
+            }
+            Ok(match sync_directory(&self.root) {
+                Ok(()) => IndexCommit::Clean,
+                Err(error) => IndexCommit::MaintenanceDebt(error),
+            })
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
         result.map_err(ProfileError::Io)
+    }
+
+    #[cfg(test)]
+    fn inject_index_fault(&self, point: u8) {
+        self.index_fault
+            .store(point, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_index_fault(&self, point: u8) -> bool {
+        self.index_fault
+            .compare_exchange(
+                point,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }
 
@@ -403,6 +502,11 @@ fn validate_index(index: &ProfileIndex) -> Result<(), ProfileError> {
             "duplicate profile ID".to_owned(),
         ));
     }
+    if index.profiles.is_empty() != index.active_id.is_none() {
+        return Err(ProfileError::InvalidIndex(
+            "empty and active profile state disagree".to_owned(),
+        ));
+    }
     if index
         .active_id
         .as_ref()
@@ -413,6 +517,23 @@ fn validate_index(index: &ProfileIndex) -> Result<(), ProfileError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn is_valid_profile_id(value: &str) -> bool {
@@ -466,4 +587,130 @@ fn atomic_replace(_source: &Path, _target: &Path) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "atomic index replacement unsupported",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "multicore-profile-index-fault-test-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn snapshot(source: &str, name: &str) -> Arc<Snapshot> {
+        let mihomo = format!(
+            "proxies:\n  - name: {name}\n    type: socks5\n    server: 127.0.0.1\n    port: 31001\nproxy-groups:\n  - name: Proxy\n    type: select\n    proxies: [{name}]\nrules:\n  - MATCH,Proxy\n"
+        );
+        Arc::new(
+            Snapshot::parse(mihomo.as_bytes(), br#"{"outbounds":[]}"#)
+                .unwrap()
+                .with_subscription_source(source, None, 1_700_000_000)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn create_reverts_before_replace_and_reconciles_after_replace() {
+        let pre_root = TempDirectory::new();
+        let pre = ProfileStore::open(&pre_root.0, None).unwrap();
+        pre.inject_index_fault(1);
+        assert!(matches!(
+            pre.create_profile(snapshot("https://pre.invalid/sub", "Pre")),
+            Err(ProfileError::Io(_))
+        ));
+        assert!(pre.list().unwrap().is_empty());
+        assert!(!pre_root.0.join(INDEX_FILE).exists());
+
+        let post_root = TempDirectory::new();
+        let post = ProfileStore::open(&post_root.0, None).unwrap();
+        post.inject_index_fault(2);
+        let id = match post.create_profile(snapshot("https://post.invalid/sub", "Post")) {
+            Err(ProfileError::IndexMaintenanceDebt { id, .. }) => id,
+            result => panic!("expected committed maintenance debt, got {result:?}"),
+        };
+        assert_eq!(post.active_id(), Some(id.clone()));
+        drop(post);
+        let reopened = ProfileStore::open(&post_root.0, None).unwrap();
+        assert_eq!(reopened.active_id(), Some(id));
+        assert_eq!(reopened.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn activate_reverts_before_replace_and_reconciles_after_replace() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(&root.0, None).unwrap();
+        let first = store
+            .create_profile(snapshot("https://one.invalid/sub", "One"))
+            .unwrap();
+        let second = store
+            .create_profile(snapshot("https://two.invalid/sub", "Two"))
+            .unwrap();
+        assert_eq!(store.active_id(), Some(second.clone()));
+
+        store.inject_index_fault(1);
+        assert!(matches!(store.activate(&first), Err(ProfileError::Io(_))));
+        assert_eq!(store.active_id(), Some(second));
+
+        store.inject_index_fault(2);
+        assert!(matches!(
+            store.activate(&first),
+            Err(ProfileError::IndexMaintenanceDebt { .. })
+        ));
+        assert_eq!(store.active_id(), Some(first.clone()));
+        drop(store);
+        assert_eq!(
+            ProfileStore::open(&root.0, None).unwrap().active_id(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn delete_reverts_before_replace_and_never_resurrects_after_replace() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(&root.0, None).unwrap();
+        let first = store
+            .create_profile(snapshot("https://one.invalid/sub", "One"))
+            .unwrap();
+        let second = store
+            .create_profile(snapshot("https://two.invalid/sub", "Two"))
+            .unwrap();
+
+        store.inject_index_fault(1);
+        assert!(matches!(store.delete(&first), Err(ProfileError::Io(_))));
+        assert!(store.list().unwrap().iter().any(|item| item.id == first));
+        assert!(root.0.join(first.as_str()).is_dir());
+
+        store.inject_index_fault(2);
+        assert!(matches!(
+            store.delete(&first),
+            Err(ProfileError::IndexMaintenanceDebt { .. })
+        ));
+        assert!(!store.list().unwrap().iter().any(|item| item.id == first));
+        assert!(!root.0.join(first.as_str()).exists());
+        drop(store);
+
+        let reopened = ProfileStore::open(&root.0, None).unwrap();
+        assert_eq!(reopened.active_id(), Some(second));
+        assert!(!reopened.list().unwrap().iter().any(|item| item.id == first));
+    }
 }

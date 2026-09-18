@@ -73,8 +73,20 @@ fn ids_are_unique_lowercase_v4_uuids_and_index_keeps_urls_secret() {
     assert!(!index.contains("https://"));
     assert!(!index.contains("private-a"));
     assert!(!index.contains("private-b"));
-    assert_eq!(store.list().unwrap().len(), 2);
+    let summaries = store.list().unwrap();
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries.iter().filter(|profile| profile.active).count(), 1);
     assert_eq!(index.matches("active_id").count(), 1);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(root.profiles().join("index.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+    }
 }
 
 #[test]
@@ -265,4 +277,88 @@ fn invalid_deserialized_id_is_rejected_before_any_child_path_is_used() {
         ProfileStore::open(profiles, None),
         Err(ProfileError::InvalidIndex(_))
     ));
+}
+
+#[test]
+fn malformed_empty_and_active_states_are_rejected_in_both_directions() {
+    const ID: &str = "8a7f10a1-6ea8-4f65-8f15-711a184019d8";
+    let cases = [
+        format!(r#"{{"schema_version":1,"profiles":[],"active_id":"{ID}"}}"#),
+        format!(
+            r#"{{"schema_version":1,"profiles":[{{"id":"{ID}","created_at_unix":1}}],"active_id":null}}"#
+        ),
+    ];
+    for (case, contents) in cases.into_iter().enumerate() {
+        let root = TempDirectory::new();
+        let profiles = root.0.join(format!("profiles-{case}"));
+        fs::create_dir(&profiles).unwrap();
+        fs::write(profiles.join("index.json"), contents).unwrap();
+        assert!(matches!(
+            ProfileStore::open(profiles, None),
+            Err(ProfileError::InvalidIndex(_))
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_rejects_symlink_child_without_touching_external_target_or_resurrecting() {
+    use std::os::unix::fs::symlink;
+
+    hostile_cleanup_target_is_not_followed(|target, link| symlink(target, link).unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn delete_rejects_junction_child_without_touching_external_target_or_resurrecting() {
+    use std::process::Command;
+
+    hostile_cleanup_target_is_not_followed(|target, link| {
+        let output = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+}
+
+#[cfg(any(unix, windows))]
+fn hostile_cleanup_target_is_not_followed(create_link: impl FnOnce(&PathBuf, &PathBuf)) {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let external = root.0.join("external");
+    fs::create_dir(&external).unwrap();
+    fs::write(external.join("sentinel.txt"), b"do not remove").unwrap();
+
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    let id = store
+        .create_profile(snapshot("https://hostile.invalid/sub", "Hostile"))
+        .unwrap();
+    let child = profiles.join(id.as_str());
+    let retired = root.0.join("retired-real-profile");
+    fs::rename(&child, &retired).unwrap();
+    create_link(&external, &child);
+
+    assert!(matches!(
+        store.delete(&id),
+        Err(ProfileError::CleanupDebt { .. })
+    ));
+    assert_eq!(
+        fs::read(external.join("sentinel.txt")).unwrap(),
+        b"do not remove"
+    );
+    assert!(child.exists());
+    drop(store);
+
+    let reopened = ProfileStore::open(&profiles, None).unwrap();
+    assert!(reopened.list().unwrap().is_empty());
+    assert_eq!(reopened.active_id(), None);
+
+    fs::remove_dir(&child).unwrap();
 }
