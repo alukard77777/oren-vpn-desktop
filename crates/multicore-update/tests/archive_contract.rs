@@ -3,7 +3,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use multicore_release::{extract_verified_bundle, sha256_bytes};
+use multicore_release::{
+    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, extract_verified_bundle, sha256_bytes,
+};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 
@@ -76,6 +78,113 @@ fn traversal_and_unlisted_files_are_rejected() {
     let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
     assert!(error.to_string().contains("unsafe archive path"));
     assert!(!temp.path().join("escape.txt").exists());
+}
+
+#[test]
+fn absolute_and_normalized_duplicate_paths_are_rejected() {
+    for name in ["/escape.txt", "foo/../escape.txt"] {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("bundle.zip");
+        let mut files = required_files();
+        files.insert(name.into(), b"escape".to_vec());
+        write_bundle(&archive, &files, &files);
+        let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+        assert!(error.to_string().contains("unsafe archive path"));
+    }
+
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("bundle.zip");
+    let mut files = required_files();
+    files.insert("readme.md".into(), b"duplicate".to_vec());
+    let sums = files.clone();
+    files.insert("README.md".into(), b"readme".to_vec());
+    write_bundle(&archive, &files, &sums);
+    let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+    assert!(error.to_string().contains("duplicate archive path"));
+}
+
+#[test]
+#[cfg(unix)]
+fn symlink_entries_are_rejected() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("bundle.zip");
+    let files = required_files();
+    let file = File::create(&archive).unwrap();
+    let mut writer = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in &files {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    let options = SimpleFileOptions::default().unix_permissions(0o120777);
+    writer.start_file("link", options).unwrap();
+    writer.write_all(b"MultiCore.exe").unwrap();
+    let sums = files
+        .iter()
+        .map(|(name, bytes)| format!("{} *{}\n", sha256_bytes(bytes), name))
+        .chain(std::iter::once(format!(
+            "{} *link\n",
+            sha256_bytes(b"MultiCore.exe")
+        )))
+        .collect::<String>();
+    writer
+        .start_file("SHA256SUMS.txt", SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(sums.as_bytes()).unwrap();
+    writer.finish().unwrap();
+    let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+    assert!(
+        error.to_string().contains("archive links are not allowed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unlisted_extra_and_entry_limit_are_rejected() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("bundle.zip");
+    let mut files = required_files();
+    files.insert("extra.txt".into(), b"extra".to_vec());
+    write_bundle(&archive, &files, &required_files());
+    let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("checksum inventory does not match")
+    );
+
+    let archive = temp.path().join("too-many.zip");
+    let mut files = required_files();
+    for index in 0..(MAX_ARCHIVE_ENTRIES - files.len()) {
+        files.insert(format!("extra/{index}.txt"), vec![index as u8]);
+    }
+    write_bundle(&archive, &files, &files);
+    let error = extract_verified_bundle(&archive, &temp.path().join("too-many-out")).unwrap_err();
+    assert!(error.to_string().contains("entry count is invalid"));
+}
+
+#[test]
+fn expanded_size_limit_is_explicitly_guarded() {
+    assert_eq!(MAX_EXPANDED_BYTES, 1024 * 1024 * 1024);
+}
+
+#[test]
+fn malformed_or_missing_pe_and_hash_are_rejected() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("bad-pe.zip");
+    let mut files = required_files();
+    files.insert("MultiCore.exe".into(), vec![0_u8; 256]);
+    write_bundle(&archive, &files, &files);
+    let error = extract_verified_bundle(&archive, &temp.path().join("bad-pe-out")).unwrap_err();
+    assert!(error.to_string().contains("PE"), "{error}");
+
+    let archive = temp.path().join("bad-hash.zip");
+    let files = required_files();
+    let mut sums = files.clone();
+    sums.insert("README.md".into(), b"wrong".to_vec());
+    write_bundle(&archive, &files, &sums);
+    let error = extract_verified_bundle(&archive, &temp.path().join("bad-hash-out")).unwrap_err();
+    assert!(error.to_string().contains("checksum mismatch"));
 }
 
 #[test]

@@ -688,4 +688,22 @@ mod publication_tests {
         assert!(!backup.exists());
         assert!(staged.exists());
     }
+
+    #[test]
+    fn successful_publication_replaces_previous_install_directory() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("MultiCore");
+        let staged = temp.path().join("MultiCore.new");
+        let backup = temp.path().join("MultiCore.previous");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&staged).unwrap();
+        fs::write(target.join("old.txt"), b"old").unwrap();
+        fs::write(staged.join("new.txt"), b"new").unwrap();
+        transactional_swap_with(&target, &staged, &backup, |from, to| fs::rename(from, to))
+            .unwrap();
+        assert_eq!(fs::read(target.join("new.txt")).unwrap(), b"new");
+        assert!(!target.join("old.txt").exists());
+        assert!(backup.join("old.txt").is_file());
+        assert!(!staged.exists());
+    }
 }

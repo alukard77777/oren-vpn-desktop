@@ -363,4 +363,21 @@ mod tests {
         assert!(!ui.action_enabled);
         assert!(ui.detail.contains("сборке"));
     }
+
+    #[test]
+    fn checking_current_downloading_and_error_states_have_stable_actions() {
+        let checking = UpdateState::Checking.presentation(true);
+        assert_eq!(checking.action, UpdateAction::None);
+        assert!(checking.busy);
+        let current = UpdateState::Current.presentation(true);
+        assert_eq!(current.action, UpdateAction::Check);
+        assert!(current.action_enabled);
+        let downloading = UpdateState::Downloading(release()).presentation(true);
+        assert_eq!(downloading.action, UpdateAction::None);
+        assert!(downloading.busy);
+        let error = UpdateState::Error("network unavailable".into()).presentation(true);
+        assert_eq!(error.action, UpdateAction::None);
+        assert!(!error.busy);
+        assert_eq!(error.detail, "network unavailable");
+    }
 }
