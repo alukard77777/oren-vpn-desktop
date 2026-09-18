@@ -206,14 +206,6 @@ fn expanded_size_limit_is_explicitly_guarded() {
     let error = extract_verified_bundle_with_limit(&archive, &destination, 1).unwrap_err();
     assert!(error.to_string().contains("expanded archive is too large"));
     assert!(!destination.exists(), "failed extraction must clean up");
-
-    let inventory = extract_verified_bundle_with_limit(
-        &archive,
-        &temp.path().join("clamped-out"),
-        MAX_EXPANDED_BYTES + 1,
-    )
-    .unwrap();
-    assert!(inventory.expanded_bytes() > 1);
 }
 
 #[test]

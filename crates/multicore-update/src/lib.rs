@@ -345,7 +345,7 @@ pub fn extract_verified_bundle_with_limit(
     destination: &Path,
     max_expanded_bytes: u64,
 ) -> Result<BundleInventory, UpdateError> {
-    let max_expanded_bytes = max_expanded_bytes.min(MAX_EXPANDED_BYTES);
+    let max_expanded_bytes = effective_expanded_limit(max_expanded_bytes);
     if destination.exists() {
         return Err(UpdateError::InvalidBundle(
             "extraction destination already exists".into(),
@@ -357,6 +357,10 @@ pub fn extract_verified_bundle_with_limit(
         let _ = fs::remove_dir_all(destination);
     }
     result
+}
+
+fn effective_expanded_limit(requested: u64) -> u64 {
+    requested.min(MAX_EXPANDED_BYTES)
 }
 
 fn extract_verified_bundle_inner(
@@ -673,10 +677,19 @@ fn transactional_swap_with(
 
 #[cfg(test)]
 mod publication_tests {
-    use super::transactional_swap_with;
+    use super::{MAX_EXPANDED_BYTES, effective_expanded_limit, transactional_swap_with};
     use std::fs;
     use std::io;
     use tempfile::TempDir;
+
+    #[test]
+    fn requested_expanded_limit_never_exceeds_global_ceiling() {
+        assert_eq!(effective_expanded_limit(1), 1);
+        assert_eq!(
+            effective_expanded_limit(MAX_EXPANDED_BYTES + 1),
+            MAX_EXPANDED_BYTES
+        );
+    }
 
     #[test]
     fn failed_publication_restores_previous_install_directory() {
