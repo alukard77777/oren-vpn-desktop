@@ -47,6 +47,15 @@ impl UpdateState {
     }
 
     pub(crate) fn presentation(&self, runtime_idle: bool) -> UpdatePresentation {
+        let configured = configured_repository().ok().flatten().is_some();
+        self.presentation_with_configuration(runtime_idle, configured)
+    }
+
+    pub(crate) fn presentation_with_configuration(
+        &self,
+        runtime_idle: bool,
+        configured: bool,
+    ) -> UpdatePresentation {
         match self {
             Self::Unconfigured => UpdatePresentation {
                 status: format!("MultiCore {}", env!("CARGO_PKG_VERSION")),
@@ -97,26 +106,23 @@ impl UpdateState {
                 available: true,
                 busy: true,
             },
-            Self::Error(message) => {
-                let configured = configured_repository().ok().flatten().is_some();
-                UpdatePresentation {
-                    status: "Не удалось проверить обновления".into(),
-                    detail: message.clone(),
-                    action_label: if configured {
-                        "Повторить".into()
-                    } else {
-                        String::new()
-                    },
-                    action: if configured {
-                        UpdateAction::Check
-                    } else {
-                        UpdateAction::None
-                    },
-                    action_enabled: configured,
-                    available: false,
-                    busy: false,
-                }
-            }
+            Self::Error(message) => UpdatePresentation {
+                status: "Не удалось проверить обновления".into(),
+                detail: message.clone(),
+                action_label: if configured {
+                    "Повторить".into()
+                } else {
+                    String::new()
+                },
+                action: if configured {
+                    UpdateAction::Check
+                } else {
+                    UpdateAction::None
+                },
+                action_enabled: configured,
+                available: false,
+                busy: false,
+            },
         }
     }
 
@@ -375,9 +381,16 @@ mod tests {
         let downloading = UpdateState::Downloading(release()).presentation(true);
         assert_eq!(downloading.action, UpdateAction::None);
         assert!(downloading.busy);
-        let error = UpdateState::Error("network unavailable".into()).presentation(true);
-        assert_eq!(error.action, UpdateAction::None);
-        assert!(!error.busy);
-        assert_eq!(error.detail, "network unavailable");
+        for (configured, action, enabled) in [
+            (false, UpdateAction::None, false),
+            (true, UpdateAction::Check, true),
+        ] {
+            let error = UpdateState::Error("network unavailable".into())
+                .presentation_with_configuration(true, configured);
+            assert_eq!(error.action, action);
+            assert_eq!(error.action_enabled, enabled);
+            assert!(!error.busy);
+            assert_eq!(error.detail, "network unavailable");
+        }
     }
 }

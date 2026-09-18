@@ -333,13 +333,25 @@ pub fn extract_verified_bundle(
     archive_path: &Path,
     destination: &Path,
 ) -> Result<BundleInventory, UpdateError> {
+    extract_verified_bundle_with_limit(archive_path, destination, MAX_EXPANDED_BYTES)
+}
+
+/// Extract and verify a bundle with an explicit expanded-size ceiling.
+///
+/// The limit parameter is useful to callers that need a tighter policy than the
+/// release-wide default (and keeps boundary behavior directly testable).
+pub fn extract_verified_bundle_with_limit(
+    archive_path: &Path,
+    destination: &Path,
+    max_expanded_bytes: u64,
+) -> Result<BundleInventory, UpdateError> {
     if destination.exists() {
         return Err(UpdateError::InvalidBundle(
             "extraction destination already exists".into(),
         ));
     }
     fs::create_dir(destination)?;
-    let result = extract_verified_bundle_inner(archive_path, destination);
+    let result = extract_verified_bundle_inner(archive_path, destination, max_expanded_bytes);
     if result.is_err() {
         let _ = fs::remove_dir_all(destination);
     }
@@ -349,6 +361,7 @@ pub fn extract_verified_bundle(
 fn extract_verified_bundle_inner(
     archive_path: &Path,
     destination: &Path,
+    max_expanded_bytes: u64,
 ) -> Result<BundleInventory, UpdateError> {
     let archive_file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(archive_file)?;
@@ -380,7 +393,7 @@ fn extract_verified_bundle_inner(
             expanded_bytes = expanded_bytes.checked_add(entry.size()).ok_or_else(|| {
                 UpdateError::InvalidBundle("expanded archive size overflow".into())
             })?;
-            if expanded_bytes > MAX_EXPANDED_BYTES {
+            if expanded_bytes > max_expanded_bytes {
                 return Err(UpdateError::InvalidBundle(
                     "expanded archive is too large".into(),
                 ));
@@ -449,7 +462,7 @@ fn extract_verified_bundle_inner(
             written = written
                 .checked_add(read as u64)
                 .ok_or_else(|| UpdateError::InvalidBundle("file size overflow".into()))?;
-            if written > entry.size() || written > MAX_EXPANDED_BYTES {
+            if written > entry.size() || written > max_expanded_bytes {
                 return Err(UpdateError::InvalidBundle(
                     "archive entry exceeded its declared size".into(),
                 ));

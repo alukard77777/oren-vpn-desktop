@@ -4,7 +4,8 @@ use std::io::Write;
 use std::path::Path;
 
 use multicore_release::{
-    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, extract_verified_bundle, sha256_bytes,
+    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, extract_verified_bundle,
+    extract_verified_bundle_with_limit, sha256_bytes,
 };
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
@@ -48,6 +49,35 @@ fn write_bundle(path: &Path, files: &BTreeMap<String, Vec<u8>>, sums: &BTreeMap<
     archive.start_file("SHA256SUMS.txt", options).unwrap();
     archive.write_all(checksum_text.as_bytes()).unwrap();
     archive.finish().unwrap();
+}
+
+fn mark_central_entry_as_unix_symlink(path: &Path, name: &[u8]) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let signature = [0x50, 0x4b, 0x01, 0x02];
+    let mut found = false;
+    for offset in 0..bytes.len().saturating_sub(46) {
+        if bytes[offset..offset + 4] != signature {
+            continue;
+        }
+        let name_len =
+            u16::from_le_bytes(bytes[offset + 28..offset + 30].try_into().unwrap()) as usize;
+        let extra_len =
+            u16::from_le_bytes(bytes[offset + 30..offset + 32].try_into().unwrap()) as usize;
+        let comment_len =
+            u16::from_le_bytes(bytes[offset + 32..offset + 34].try_into().unwrap()) as usize;
+        let name_start = offset + 46;
+        if name_start + name_len > bytes.len() || &bytes[name_start..name_start + name_len] != name
+        {
+            continue;
+        }
+        bytes[offset + 4..offset + 6].copy_from_slice(&[0x14, 0x03]);
+        bytes[offset + 38..offset + 42].copy_from_slice(&(0o120777_u32 << 16).to_le_bytes());
+        assert!(extra_len <= bytes.len() && comment_len <= bytes.len());
+        found = true;
+        break;
+    }
+    assert!(found, "central directory entry not found");
+    std::fs::write(path, bytes).unwrap();
 }
 
 #[test]
@@ -95,16 +125,14 @@ fn absolute_and_normalized_duplicate_paths_are_rejected() {
     let temp = TempDir::new().unwrap();
     let archive = temp.path().join("bundle.zip");
     let mut files = required_files();
-    files.insert("readme.md".into(), b"duplicate".to_vec());
-    let sums = files.clone();
-    files.insert("README.md".into(), b"readme".to_vec());
-    write_bundle(&archive, &files, &sums);
+    files.insert("dir/file".into(), b"one".to_vec());
+    files.insert("dir//file".into(), b"two".to_vec());
+    write_bundle(&archive, &files, &files);
     let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
     assert!(error.to_string().contains("duplicate archive path"));
 }
 
 #[test]
-#[cfg(unix)]
 fn symlink_entries_are_rejected() {
     let temp = TempDir::new().unwrap();
     let archive = temp.path().join("bundle.zip");
@@ -132,6 +160,7 @@ fn symlink_entries_are_rejected() {
         .unwrap();
     writer.write_all(sums.as_bytes()).unwrap();
     writer.finish().unwrap();
+    mark_central_entry_as_unix_symlink(&archive, b"link");
     let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
     assert!(
         error.to_string().contains("archive links are not allowed"),
@@ -166,6 +195,14 @@ fn unlisted_extra_and_entry_limit_are_rejected() {
 #[test]
 fn expanded_size_limit_is_explicitly_guarded() {
     assert_eq!(MAX_EXPANDED_BYTES, 1024 * 1024 * 1024);
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("bundle.zip");
+    let files = required_files();
+    write_bundle(&archive, &files, &files);
+    let destination = temp.path().join("out");
+    let error = extract_verified_bundle_with_limit(&archive, &destination, 1).unwrap_err();
+    assert!(error.to_string().contains("expanded archive is too large"));
+    assert!(!destination.exists(), "failed extraction must clean up");
 }
 
 #[test]
