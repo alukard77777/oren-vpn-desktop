@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -17,9 +17,11 @@ use crate::{
 };
 
 pub const MAX_PROFILES: usize = 16;
+pub const MAX_PROFILE_INDEX_BYTES: u64 = 16 * 1024;
 const INDEX_SCHEMA_VERSION: u32 = 1;
 const INDEX_FILE: &str = "index.json";
 const INDEX_TEMP_FILE: &str = "index.json.tmp";
+const LOCK_FILE: &str = ".index.lock";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -114,6 +116,8 @@ pub enum ProfileError {
     InvalidProfileId,
     #[error("profile limit reached")]
     LimitReached,
+    #[error("profile store is already open")]
+    Locked,
     #[error("profile not found")]
     NotFound(ProfileId),
     #[error("profile is unavailable")]
@@ -148,14 +152,150 @@ struct ProfileIndexEntry {
 #[derive(Debug)]
 pub struct ProfileStore {
     root: PathBuf,
+    root_guard: DirectoryGuard,
+    _lock: fs::File,
     index: RwLock<ProfileIndex>,
     #[cfg(test)]
     index_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    load_fault: std::sync::Mutex<Option<ProfileId>>,
 }
 
 enum IndexCommit {
     Clean,
     MaintenanceDebt(io::Error),
+}
+
+#[derive(Debug)]
+struct DirectoryGuard {
+    path: PathBuf,
+    handle: fs::File,
+    identity: DirectoryIdentity,
+    allow_delete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    first: u64,
+    second: u64,
+}
+
+impl DirectoryGuard {
+    fn open(path: &Path, allow_delete: bool) -> io::Result<Self> {
+        let (handle, identity) = open_directory_identity(path, allow_delete)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            handle,
+            identity,
+            allow_delete,
+        })
+    }
+
+    fn verify_unchanged(&self) -> io::Result<()> {
+        let (_, identity) = open_directory_identity(&self.path, self.allow_delete)?;
+        if identity != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guarded profile directory identity changed",
+            ));
+        }
+        let _ = self.handle.metadata()?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn open_directory_identity(
+    path: &Path,
+    allow_delete: bool,
+) -> io::Result<(fs::File, DirectoryIdentity)> {
+    use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    let share_mode =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if allow_delete { FILE_SHARE_DELETE } else { 0 };
+    let handle = OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile directory is reparse-backed or has the wrong type",
+        ));
+    }
+    Ok((
+        handle,
+        DirectoryIdentity {
+            first: u64::from(info.dwVolumeSerialNumber),
+            second: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        },
+    ))
+}
+
+#[cfg(unix)]
+fn open_directory_identity(
+    path: &Path,
+    _allow_delete: bool,
+) -> io::Result<(fs::File, DirectoryIdentity)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let lexical = fs::symlink_metadata(path)?;
+    if !lexical.file_type().is_dir() || lexical.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile directory is symlink-backed or has the wrong type",
+        ));
+    }
+    let handle = fs::File::open(path)?;
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || metadata.dev() != lexical.dev() || metadata.ino() != lexical.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile directory identity changed while opening",
+        ));
+    }
+    Ok((
+        handle,
+        DirectoryIdentity {
+            first: metadata.dev(),
+            second: metadata.ino(),
+        },
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory_identity(
+    path: &Path,
+    _allow_delete: bool,
+) -> io::Result<(fs::File, DirectoryIdentity)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile directory is symlink-backed or has the wrong type",
+        ));
+    }
+    let handle = fs::File::open(path)?;
+    Ok((
+        handle,
+        DirectoryIdentity {
+            first: metadata.len(),
+            second: 0,
+        },
+    ))
 }
 
 impl ProfileStore {
@@ -171,8 +311,25 @@ impl ProfileStore {
                 "profile root is not a real directory".to_owned(),
             ));
         }
+        let lexical_root_guard = DirectoryGuard::open(&root, false)?;
         secure_directory(&root)?;
+        lexical_root_guard.verify_unchanged()?;
         let root = fs::canonicalize(root)?;
+        let root_guard = DirectoryGuard::open(&root, false)?;
+        if root_guard.identity != lexical_root_guard.identity {
+            return Err(ProfileError::InvalidIndex(
+                "profile root identity changed while opening".to_owned(),
+            ));
+        }
+        let lock_path = root.join(LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        secure_file(&lock_path)?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| ProfileError::Locked)?;
         let index_path = root.join(INDEX_FILE);
         let index = match fs::symlink_metadata(&index_path) {
             Ok(metadata) => {
@@ -182,7 +339,21 @@ impl ProfileStore {
                     ));
                 }
                 secure_file(&index_path)?;
-                let bytes = fs::read(&index_path)?;
+                if metadata.len() > MAX_PROFILE_INDEX_BYTES {
+                    return Err(ProfileError::InvalidIndex(
+                        "index exceeds size limit".to_owned(),
+                    ));
+                }
+                let mut file = fs::File::open(&index_path)?;
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
+                Read::by_ref(&mut file)
+                    .take(MAX_PROFILE_INDEX_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_PROFILE_INDEX_BYTES {
+                    return Err(ProfileError::InvalidIndex(
+                        "index exceeds size limit".to_owned(),
+                    ));
+                }
                 let index: ProfileIndex = serde_json::from_slice(&bytes)
                     .map_err(|error| ProfileError::InvalidIndex(error.to_string()))?;
                 validate_index(&index)?;
@@ -197,9 +368,13 @@ impl ProfileStore {
         };
         Ok(Self {
             root,
+            root_guard,
+            _lock: lock,
             index: RwLock::new(index),
             #[cfg(test)]
             index_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            load_fault: std::sync::Mutex::new(None),
         })
     }
 
@@ -288,9 +463,12 @@ impl ProfileStore {
     ) -> Result<u64, ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
-        let store = PersistentSnapshotStore::open(self.validate_profile_directory(id)?)?;
+        let guard = self.guard_profile_directory(id)?;
+        guard.verify_unchanged()?;
+        let store = PersistentSnapshotStore::open(&guard.path)?;
         let (generation, _) = store.commit_with_generation((*snapshot).clone())?;
         drop(store);
+        guard.verify_unchanged()?;
         let (reloaded_generation, _) = self.load_profile(id)?;
         if reloaded_generation != generation {
             return Err(ProfileError::Unavailable(id.clone()));
@@ -339,14 +517,14 @@ impl ProfileStore {
         let index_commit = self.persist_index(&proposed)?;
         *index = proposed;
         let active = index.active_id.clone();
+        if let IndexCommit::MaintenanceDebt(source) = index_commit {
+            return Err(ProfileError::IndexMaintenanceDebt {
+                id: id.clone(),
+                source,
+            });
+        }
         match self.remove_profile_directory(id) {
-            Ok(()) => match index_commit {
-                IndexCommit::Clean => Ok(active),
-                IndexCommit::MaintenanceDebt(source) => Err(ProfileError::IndexMaintenanceDebt {
-                    id: id.clone(),
-                    source,
-                }),
-            },
+            Ok(()) => Ok(active),
             Err(source) => Err(ProfileError::CleanupDebt {
                 id: id.clone(),
                 source,
@@ -357,10 +535,12 @@ impl ProfileStore {
     pub fn find_exact_source(&self, trimmed_url: &str) -> Result<Option<ProfileId>, ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         for entry in &index.profiles {
-            if let Ok((_, snapshot)) = self.load_profile(&entry.id)
-                && snapshot.subscription_source_url() == Some(trimmed_url)
-            {
-                return Ok(Some(entry.id.clone()));
+            match self.load_profile(&entry.id) {
+                Ok((_, snapshot)) if snapshot.subscription_source_url() == Some(trimmed_url) => {
+                    return Ok(Some(entry.id.clone()));
+                }
+                Ok(_) | Err(ProfileError::Unavailable(_)) => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(None)
@@ -380,46 +560,66 @@ impl ProfileStore {
     }
 
     fn load_profile(&self, id: &ProfileId) -> Result<(u64, Arc<Snapshot>), ProfileError> {
-        let path = self.validate_profile_directory(id)?;
-        let store = PersistentSnapshotStore::open(path)?;
-        store
+        #[cfg(test)]
+        if self
+            .load_fault
+            .lock()
+            .expect("profile load fault lock poisoned")
+            .as_ref()
+            == Some(id)
+        {
+            return Err(ProfileError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected profile load failure",
+            )));
+        }
+        let guard = self.guard_profile_directory(id)?;
+        guard.verify_unchanged()?;
+        let store = PersistentSnapshotStore::open(&guard.path)?;
+        let result = store
             .current_with_generation()
-            .ok_or_else(|| ProfileError::Unavailable(id.clone()))
+            .ok_or_else(|| ProfileError::Unavailable(id.clone()));
+        guard.verify_unchanged()?;
+        result
     }
 
-    fn validate_profile_directory(&self, id: &ProfileId) -> Result<PathBuf, ProfileError> {
+    fn guard_profile_directory(&self, id: &ProfileId) -> Result<DirectoryGuard, ProfileError> {
+        self.root_guard.verify_unchanged()?;
         let path = self.profile_path(id);
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|_| ProfileError::Unavailable(id.clone()))?;
-        if !metadata.file_type().is_dir() || is_link_or_reparse(&metadata) {
-            return Err(ProfileError::Unavailable(id.clone()));
+        match DirectoryGuard::open(&path, true) {
+            Ok(guard) => Ok(guard),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                ) =>
+            {
+                Err(ProfileError::Unavailable(id.clone()))
+            }
+            Err(error) => Err(ProfileError::Io(error)),
         }
-        Ok(path)
     }
 
     fn remove_profile_directory(&self, id: &ProfileId) -> io::Result<()> {
         let path = self.profile_path(id);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+        self.root_guard.verify_unchanged()?;
+        let guard = match DirectoryGuard::open(&path, true) {
+            Ok(guard) => guard,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         };
-        if !metadata.file_type().is_dir() || is_link_or_reparse(&metadata) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "profile cleanup target is not a real directory",
-            ));
-        }
         if path.parent() != Some(self.root.as_path()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "profile cleanup target escaped its root",
             ));
         }
+        guard.verify_unchanged()?;
         fs::remove_dir_all(path)
     }
 
     fn persist_index(&self, index: &ProfileIndex) -> Result<IndexCommit, ProfileError> {
+        self.root_guard.verify_unchanged()?;
         validate_index(index)?;
         let bytes = serde_json::to_vec(index)
             .map_err(|error| ProfileError::InvalidIndex(error.to_string()))?;
@@ -472,6 +672,14 @@ impl ProfileStore {
     fn inject_index_fault(&self, point: u8) {
         self.index_fault
             .store(point, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_load_fault(&self, id: ProfileId) {
+        *self
+            .load_fault
+            .lock()
+            .expect("profile load fault lock poisoned") = Some(id);
     }
 
     #[cfg(test)]
@@ -591,29 +799,17 @@ fn atomic_replace(_source: &Path, _target: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
 
-    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDirectory(PathBuf);
+    struct TempDirectory(tempfile::TempDir);
 
     impl TempDirectory {
         fn new() -> Self {
-            let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "multicore-profile-index-fault-test-{}-{id}",
-                std::process::id()
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(tempfile::tempdir().unwrap())
         }
-    }
 
-    impl Drop for TempDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+        fn path(&self) -> &Path {
+            self.0.path()
         }
     }
 
@@ -632,17 +828,17 @@ mod tests {
     #[test]
     fn create_reverts_before_replace_and_reconciles_after_replace() {
         let pre_root = TempDirectory::new();
-        let pre = ProfileStore::open(&pre_root.0, None).unwrap();
+        let pre = ProfileStore::open(pre_root.path(), None).unwrap();
         pre.inject_index_fault(1);
         assert!(matches!(
             pre.create_profile(snapshot("https://pre.invalid/sub", "Pre")),
             Err(ProfileError::Io(_))
         ));
         assert!(pre.list().unwrap().is_empty());
-        assert!(!pre_root.0.join(INDEX_FILE).exists());
+        assert!(!pre_root.path().join(INDEX_FILE).exists());
 
         let post_root = TempDirectory::new();
-        let post = ProfileStore::open(&post_root.0, None).unwrap();
+        let post = ProfileStore::open(post_root.path(), None).unwrap();
         post.inject_index_fault(2);
         let id = match post.create_profile(snapshot("https://post.invalid/sub", "Post")) {
             Err(ProfileError::IndexMaintenanceDebt { id, .. }) => id,
@@ -650,7 +846,7 @@ mod tests {
         };
         assert_eq!(post.active_id(), Some(id.clone()));
         drop(post);
-        let reopened = ProfileStore::open(&post_root.0, None).unwrap();
+        let reopened = ProfileStore::open(post_root.path(), None).unwrap();
         assert_eq!(reopened.active_id(), Some(id));
         assert_eq!(reopened.list().unwrap().len(), 1);
     }
@@ -658,7 +854,7 @@ mod tests {
     #[test]
     fn activate_reverts_before_replace_and_reconciles_after_replace() {
         let root = TempDirectory::new();
-        let store = ProfileStore::open(&root.0, None).unwrap();
+        let store = ProfileStore::open(root.path(), None).unwrap();
         let first = store
             .create_profile(snapshot("https://one.invalid/sub", "One"))
             .unwrap();
@@ -679,7 +875,7 @@ mod tests {
         assert_eq!(store.active_id(), Some(first.clone()));
         drop(store);
         assert_eq!(
-            ProfileStore::open(&root.0, None).unwrap().active_id(),
+            ProfileStore::open(root.path(), None).unwrap().active_id(),
             Some(first)
         );
     }
@@ -687,7 +883,7 @@ mod tests {
     #[test]
     fn delete_reverts_before_replace_and_never_resurrects_after_replace() {
         let root = TempDirectory::new();
-        let store = ProfileStore::open(&root.0, None).unwrap();
+        let store = ProfileStore::open(root.path(), None).unwrap();
         let first = store
             .create_profile(snapshot("https://one.invalid/sub", "One"))
             .unwrap();
@@ -698,7 +894,7 @@ mod tests {
         store.inject_index_fault(1);
         assert!(matches!(store.delete(&first), Err(ProfileError::Io(_))));
         assert!(store.list().unwrap().iter().any(|item| item.id == first));
-        assert!(root.0.join(first.as_str()).is_dir());
+        assert!(root.path().join(first.as_str()).is_dir());
 
         store.inject_index_fault(2);
         assert!(matches!(
@@ -706,11 +902,47 @@ mod tests {
             Err(ProfileError::IndexMaintenanceDebt { .. })
         ));
         assert!(!store.list().unwrap().iter().any(|item| item.id == first));
-        assert!(!root.0.join(first.as_str()).exists());
+        assert!(
+            root.path().join(first.as_str()).is_dir(),
+            "post-replace sync debt must retain rollback material"
+        );
         drop(store);
 
-        let reopened = ProfileStore::open(&root.0, None).unwrap();
+        let reopened = ProfileStore::open(root.path(), None).unwrap();
         assert_eq!(reopened.active_id(), Some(second));
         assert!(!reopened.list().unwrap().iter().any(|item| item.id == first));
+    }
+
+    #[test]
+    fn exact_source_lookup_propagates_operational_load_failures() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        let id = store
+            .create_profile(snapshot("https://one.invalid/sub", "One"))
+            .unwrap();
+        store.inject_load_fault(id);
+        assert!(matches!(
+            store.find_exact_source("https://missing.invalid/sub"),
+            Err(ProfileError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn directory_guard_detects_a_component_identity_swap() {
+        let root = TempDirectory::new();
+        let guarded = root.path().join("guarded");
+        let original = root.path().join("original");
+        fs::create_dir(&guarded).unwrap();
+        let guard = DirectoryGuard::open(&guarded, true).unwrap();
+
+        fs::rename(&guarded, &original).unwrap();
+        fs::create_dir(&guarded).unwrap();
+        assert_eq!(
+            guard.verify_unchanged().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        fs::remove_dir(&guarded).unwrap();
+        fs::rename(&original, &guarded).unwrap();
     }
 }

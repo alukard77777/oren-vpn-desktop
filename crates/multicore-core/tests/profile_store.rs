@@ -1,18 +1,9 @@
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{fs, path::PathBuf, sync::Arc};
 
-use multicore_core::{MAX_PROFILES, ProfileError, ProfileStore, Snapshot};
+use multicore_core::{MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, ProfileError, ProfileStore, Snapshot};
 
 #[cfg(windows)]
 use std::path::Path;
-
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 fn snapshot(source: &str, name: &str) -> Arc<Snapshot> {
     let mihomo = format!(
@@ -26,27 +17,19 @@ fn snapshot(source: &str, name: &str) -> Arc<Snapshot> {
     )
 }
 
-struct TempDirectory(PathBuf);
+struct TempDirectory(tempfile::TempDir);
 
 impl TempDirectory {
     fn new() -> Self {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "multicore-profile-store-test-{}-{id}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(tempfile::tempdir().unwrap())
     }
 
     fn profiles(&self) -> PathBuf {
-        self.0.join("profiles")
+        self.0.path().join("profiles")
     }
-}
 
-impl Drop for TempDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
     }
 }
 
@@ -135,6 +118,38 @@ fn seventeenth_profile_is_rejected_without_changing_index() {
         fs::read(root.profiles().join("index.json")).unwrap(),
         before
     );
+}
+
+#[test]
+fn second_store_instance_is_rejected_until_lifetime_lock_is_released() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let first = ProfileStore::open(&profiles, None).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        ProfileStore::open(&profiles, None),
+        Err(ProfileError::Locked)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+    drop(first);
+    assert!(ProfileStore::open(&profiles, None).is_ok());
+}
+
+#[test]
+fn oversized_index_is_rejected_before_deserialization() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    fs::create_dir(&profiles).unwrap();
+    fs::write(
+        profiles.join("index.json"),
+        vec![b' '; MAX_PROFILE_INDEX_BYTES as usize + 1],
+    )
+    .unwrap();
+    assert!(matches!(
+        ProfileStore::open(profiles, None),
+        Err(ProfileError::InvalidIndex(reason)) if reason.contains("size limit")
+    ));
 }
 
 #[test]
@@ -315,7 +330,7 @@ fn malformed_empty_and_active_states_are_rejected_in_both_directions() {
     ];
     for (case, contents) in cases.into_iter().enumerate() {
         let root = TempDirectory::new();
-        let profiles = root.0.join(format!("profiles-{case}"));
+        let profiles = root.path().join(format!("profiles-{case}"));
         fs::create_dir(&profiles).unwrap();
         fs::write(profiles.join("index.json"), contents).unwrap();
         assert!(matches!(
@@ -357,7 +372,7 @@ fn delete_rejects_junction_child_without_touching_external_target_or_resurrectin
 fn hostile_cleanup_target_is_not_followed(create_link: impl FnOnce(&PathBuf, &PathBuf)) {
     let root = TempDirectory::new();
     let profiles = root.profiles();
-    let external = root.0.join("external");
+    let external = root.path().join("external");
     fs::create_dir(&external).unwrap();
     fs::write(external.join("sentinel.txt"), b"do not remove").unwrap();
 
@@ -366,7 +381,7 @@ fn hostile_cleanup_target_is_not_followed(create_link: impl FnOnce(&PathBuf, &Pa
         .create_profile(snapshot("https://hostile.invalid/sub", "Hostile"))
         .unwrap();
     let child = profiles.join(id.as_str());
-    let retired = root.0.join("retired-real-profile");
+    let retired = root.path().join("retired-real-profile");
     fs::rename(&child, &retired).unwrap();
     create_link(&external, &child);
 

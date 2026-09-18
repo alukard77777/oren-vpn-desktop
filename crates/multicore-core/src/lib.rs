@@ -24,7 +24,9 @@ pub use input::{
     parse_mihomo, parse_xray,
 };
 pub use network::default_ipv4_interface;
-pub use profile::{MAX_PROFILES, ProfileError, ProfileId, ProfileStore, ProfileSummary};
+pub use profile::{
+    MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, ProfileError, ProfileId, ProfileStore, ProfileSummary,
+};
 pub use service_logo::{
     MAX_SERVICE_LOGO_BYTES, MAX_SERVICE_LOGO_OUTPUT_BYTES, normalize_service_logo,
 };
