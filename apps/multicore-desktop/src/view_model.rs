@@ -5228,7 +5228,12 @@ mod tests {
             .map(|offset| first_wave + offset)
             .expect("home content follows ambient waves");
         let wave_layer = &source[first_wave..home_content];
-        assert!(source[first_wave.saturating_sub(80)..first_wave].contains("clip: true"));
+        let home_layer = source
+            .split("if root.visible-page == \"home\": Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("VerticalLayout {").next())
+            .expect("home ambient layer");
+        assert!(home_layer.contains("clip: true"));
         assert!(!wave_layer.contains("TouchArea"));
         assert!(!wave_layer.contains("blur"));
 
@@ -5237,24 +5242,37 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("ambient-wave-b := Path {").next())
             .expect("wave A block");
-        for required in ["x: -38px;", "y: 68px;", "opacity: 0.004;"] {
+        for required in [
+            "x: root.ambient-wave-phase ? -26px : -44px;",
+            "y: root.ambient-wave-phase ? 58px : 76px;",
+            "opacity: 0.026;",
+            "animate x { duration: 12000ms; easing: ease-in-out; }",
+            "animate y { duration: 12000ms; easing: ease-in-out; }",
+        ] {
             assert!(wave_a.contains(required), "wave A missing: {required}");
         }
-        let wave_a_delta = (8_i32, 6_i32);
-        assert!(wave_a_delta.0.pow(2) + wave_a_delta.1.pow(2) <= 10_i32.pow(2));
+        let wave_a_delta = (18_i32, 18_i32);
+        assert!(wave_a_delta.0.abs() <= 20 && wave_a_delta.1.abs() <= 20);
 
         let wave_b = source
             .split("ambient-wave-b := Path {")
             .nth(1)
             .and_then(|source| source.split("VerticalLayout {").next())
             .expect("wave B block");
-        for required in ["x: -38px;", "y: 272px;", "opacity: 0.004;"] {
+        for required in [
+            "x: root.ambient-wave-phase ? -48px : -30px;",
+            "y: root.ambient-wave-phase ? 282px : 264px;",
+            "opacity: 0.018;",
+            "animate x { duration: 12000ms; easing: ease-in-out; }",
+            "animate y { duration: 12000ms; easing: ease-in-out; }",
+        ] {
             assert!(wave_b.contains(required), "wave B missing: {required}");
         }
-        let wave_b_delta = (8_i32, 6_i32);
-        assert!(wave_b_delta.0.pow(2) + wave_b_delta.1.pow(2) <= 10_i32.pow(2));
-        assert!(!wave_layer.contains("animate x"));
-        assert!(!wave_layer.contains("animate y"));
+        let wave_b_delta = (18_i32, 18_i32);
+        assert!(wave_b_delta.0.abs() <= 20 && wave_b_delta.1.abs() <= 20);
+        assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
+        assert!(home_layer.contains("ambient-touch.mouse-x"));
+        assert!(home_layer.contains("ambient-touch.mouse-y"));
         for cursor in ["ns-resize", "ew-resize", "nwse-resize", "nesw-resize"] {
             assert!(source.contains(&format!("mouse-cursor: {cursor};")));
         }

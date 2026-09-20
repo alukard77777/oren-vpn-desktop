@@ -622,30 +622,54 @@ export component AppWindow inherits Window {
                 background: transparent;
                 clip: true;
 
+                ambient-touch := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    enabled: root.ambient-background-enabled;
+                }
+
+                ambient-pointer-glow := Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    visible: root.ambient-background-enabled;
+                    opacity: ambient-touch.has-hover ? 1 : 0;
+                    background: @radial-gradient(
+                        circle 360px at ambient-touch.mouse-x ambient-touch.mouse-y,
+                        #d7dde50b 0%,
+                        #b7c2cf06 38%,
+                        #00000000 76%
+                    );
+                    animate opacity { duration: 220ms; easing: ease-out; }
+                }
+
                 ambient-wave-a := Path {
                     visible: root.ambient-background-enabled;
-                    x: -38px;
-                    y: 68px;
+                    x: root.ambient-wave-phase ? -26px : -44px;
+                    y: root.ambient-wave-phase ? 58px : 76px;
                     width: parent.width + 76px;
                     height: 210px;
                     viewbox-width: 1000;
                     viewbox-height: 220;
                     commands: "M 0 124 C 160 40 340 36 500 112 C 668 192 824 184 1000 82 L 1000 220 L 0 220 Z";
                     fill: #c8cdd5;
-                    opacity: 0.004;
+                    opacity: 0.026;
+                    animate x { duration: 12000ms; easing: ease-in-out; }
+                    animate y { duration: 12000ms; easing: ease-in-out; }
                 }
 
                 ambient-wave-b := Path {
                     visible: root.ambient-background-enabled;
-                    x: -38px;
-                    y: 272px;
+                    x: root.ambient-wave-phase ? -48px : -30px;
+                    y: root.ambient-wave-phase ? 282px : 264px;
                     width: parent.width + 76px;
                     height: 240px;
                     viewbox-width: 1000;
                     viewbox-height: 240;
                     commands: "M 0 74 C 190 174 350 184 510 92 C 670 0 824 34 1000 142 L 1000 240 L 0 240 Z";
                     fill: #aeb5bf;
-                    opacity: 0.004;
+                    opacity: 0.018;
+                    animate x { duration: 12000ms; easing: ease-in-out; }
+                    animate y { duration: 12000ms; easing: ease-in-out; }
                 }
 
                 VerticalLayout {
