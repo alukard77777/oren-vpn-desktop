@@ -110,7 +110,14 @@ component SmallAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <bool> selected: false;
+    in property <int> focus-epoch: 0;
     callback activated();
+
+    changed focus-epoch => {
+        if (root.focus-epoch > 0) {
+            small-focus.focus();
+        }
+    }
 
     min-width: 88px;
     preferred-width: small-label.preferred-width + 28px;
@@ -446,6 +453,8 @@ export component AppWindow inherits Window {
     in-out property <string> local-page: "home";
     in-out property <string> settings-section: "general";
     in-out property <string> expanded-profile-id;
+    in-out property <string> profile-management-focus-id;
+    in-out property <int> profile-management-focus-serial;
     private property <string> visible-page: root.active-panel == "routes" ? "home" : root.active-panel == "events" ? "status" : root.local-page;
     private property <bool> profile-menu-open: root.active-panel == "subscription";
     private property <bool> profile-menu-was-open: false;
@@ -498,11 +507,11 @@ export component AppWindow inherits Window {
             root.profile-menu-was-open = true;
         } else {
             root.profile-delete-confirm-id = "";
-            root.profile-menu-keyboard-open = false;
-            if (root.profile-menu-was-open) {
-                root.profile-menu-was-open = false;
+            if (root.profile-menu-was-open && root.profile-menu-keyboard-open) {
                 root.profile-shelf-focus-serial += 1;
             }
+            root.profile-menu-was-open = false;
+            root.profile-menu-keyboard-open = false;
         }
     }
 
@@ -1172,7 +1181,7 @@ export component AppWindow inherits Window {
                                     Text { text: "Управление подписками"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
                                     Text { text: "URL хранится только в локальном сервисе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
                                 }
-                                SmallAction { width: root.width >= 800px ? 132px : 104px; label: root.width >= 800px ? "Добавить URL" : "Добавить"; enabled: !root.import-pending; activated => { root.add-subscription(); } }
+                                SmallAction { width: root.width >= 800px ? 132px : 104px; label: root.width >= 800px ? "Добавить URL" : "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
                             }
                             if root.replace-editor-open: Rectangle {
                                 height: 116px;
@@ -1204,7 +1213,7 @@ export component AppWindow inherits Window {
                                 clip: true;
                                 VerticalLayout {
                                     spacing: 0px;
-                                    for profile in root.subscription-profiles: settings-profile-row := Rectangle {
+                                    for profile[index] in root.subscription-profiles: settings-profile-row := Rectangle {
                                         height: root.expanded-profile-id == profile.id ? 220px : 64px;
                                         background: profile.active ? #4c9dff0c : settings-profile-touch.has-hover ? #ffffff06 : transparent;
                                         opacity: profile.available || profile.active ? 1 : 0.62;
@@ -1229,10 +1238,13 @@ export component AppWindow inherits Window {
                                         if profile.active: Rectangle { x: 48px; y: 25px; width: 3px; height: 14px; border-radius: 2px; background: Theme.accent-blue; }
                                         Path { x: parent.width - 24px; y: 28px; width: 10px; height: 7px; viewbox-width: 10; viewbox-height: 7; commands: root.expanded-profile-id == profile.id ? "M 1 6 L 5 2 L 9 6" : "M 1 1 L 5 5 L 9 1"; stroke: Theme.text-muted; stroke-width: 1.5px; fill: transparent; }
                                         settings-profile-focus := FocusScope {
+                                            property <int> focus-serial: root.profile-management-focus-serial;
                                             x: 0px; y: 0px; width: parent.width; height: 64px;
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Сведения о подписке " + profile.title;
                                             accessible-action-default => { root.expanded-profile-id = root.expanded-profile-id == profile.id ? "" : profile.id; root.profile-delete-confirm-id = ""; }
+                                            init => { if (root.profile-management-focus-id == profile.id && root.profile-management-focus-serial > 0) { self.focus(); } }
+                                            changed focus-serial => { if (root.profile-management-focus-id == profile.id) { self.focus(); } }
                                             Rectangle { x: 2px; y: 2px; width: parent.width - 4px; height: 60px; border-radius: 8px; border-color: parent.has-focus ? Theme.focus : transparent; border-width: parent.has-focus ? 1px : 0px; background: transparent; }
                                             key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.expanded-profile-id = root.expanded-profile-id == profile.id ? "" : profile.id; root.profile-delete-confirm-id = ""; return accept; } return reject; }
                                             settings-profile-touch := TouchArea { clicked => { root.expanded-profile-id = root.expanded-profile-id == profile.id ? "" : profile.id; root.profile-delete-confirm-id = ""; } }
