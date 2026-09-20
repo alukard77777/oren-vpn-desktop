@@ -40,6 +40,11 @@ single-subscription data under the legacy snapshot directory is migrated locally
 and offline on first profile-store startup. Activating or deleting a profile is
 blocked while connected.
 
+The subscription strip on the Home screen is a compact active-profile selector
+only. Adding, refreshing, inspecting, and deleting profiles lives under
+**Settings → Subscriptions**, so routine switching stays separate from profile
+management. Saved subscription URLs are not displayed back in the profile list.
+
 The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
 daemon. Requests use a random per-launch bearer token, bounded bodies, no proxy,
 and no redirects.

@@ -294,8 +294,8 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $mutableRoot 'logs') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $mutableRoot 'identity') -Force | Out-Null
     $utf8NoBom = [Text.UTF8Encoding]::new($false)
-    # This fixture uses the approved multi-sub disk contract. Task 7 must rerun this
-    # artifact smoke against the production ProfileStore after that loader lands.
+    # This fixture uses the production multi-sub disk contract and is reloaded through
+    # ProfileStore after the packaged update to verify exact profile preservation.
     [IO.File]::WriteAllText(
         (Join-Path $mutableRoot 'preferences.json'),
         "{`n  `"schema_version`": 1,`n  `"restored_bounds`": {`"x`":40,`"y`":60,`"width`":920,`"height`":700},`n  `"maximized`": true,`n  `"visible_page`": `"status`",`n  `"active_profile_hint`": `"$secondProfileId`",`n  `"last_group_by_profile`": {`"$profileId`":`"$profileGroupId`",`"$secondProfileId`":`"$secondProfileGroupId`"},`n  `"selections_by_profile`": {`"$profileId`":{`"$profileGroupId`":`"$profileNodeId`"},`"$secondProfileId`":{`"$secondProfileGroupId`":`"$secondProfileNodeId`"}},`n  `"ambient_background`": true`n}`n",
