@@ -68,6 +68,36 @@ function Assert-FileHashManifestEqual {
     }
 }
 
+function Assert-SafeChildPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Child,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $resolvedChild = [IO.Path]::GetFullPath($Child)
+    $rootPrefix = $resolvedRoot + [IO.Path]::DirectorySeparatorChar
+    Assert-True ($resolvedChild.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) `
+        "$Description must remain below its approved root"
+}
+
+function Assert-CredentialStoredOnlyAtExpectedPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath,
+        [Parameter(Mandatory = $true)][string]$Marker
+    )
+
+    $resolvedExpected = [IO.Path]::GetFullPath($ExpectedPath)
+    $matches = @(Get-ChildItem -LiteralPath $Root -File -Recurse | Where-Object {
+        $_.Length -le 1MB -and [IO.File]::ReadAllText($_.FullName).Contains($Marker)
+    })
+    Assert-True ($matches.Count -eq 1) 'credential marker must exist in exactly one private persisted file'
+    Assert-True ($matches[0].FullName -ceq $resolvedExpected) `
+        'credential marker must only exist in the expected private subscription snapshot'
+}
+
 $installer = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallerPath))
 $package = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PackagePath))
 Assert-True (Test-Path -LiteralPath $installer -PathType Leaf) 'installer must exist'
@@ -146,20 +176,26 @@ try {
     $testLocalAppData = Join-Path $testRoot 'local-app-data'
     $mutableRoot = Join-Path $testLocalAppData 'MultiCore'
     $profileId = '11111111-2222-4333-8444-555555555555'
+    $secondProfileId = '66666666-7777-4888-8999-aaaaaaaaaaaa'
     $profileRoot = Join-Path $mutableRoot (Join-Path 'profiles' $profileId)
+    $secondProfileRoot = Join-Path $mutableRoot (Join-Path 'profiles' $secondProfileId)
     $profileGeneration = Join-Path $profileRoot 'generations\snapshot-00000000000000000001'
+    $secondProfileGeneration = Join-Path $secondProfileRoot 'generations\snapshot-00000000000000000002'
+    Assert-SafeChildPath -Root $mutableRoot -Child $profileRoot -Description 'first profile root'
+    Assert-SafeChildPath -Root $mutableRoot -Child $secondProfileRoot -Description 'second profile root'
     New-Item -ItemType Directory -Path $profileGeneration -Force | Out-Null
+    New-Item -ItemType Directory -Path $secondProfileGeneration -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $mutableRoot 'logs') -Force | Out-Null
     $utf8NoBom = [Text.UTF8Encoding]::new($false)
     # This fixture uses the approved multi-sub disk contract. Task 7 must rerun this
     # artifact smoke against the production ProfileStore after that loader lands.
     [IO.File]::WriteAllText(
         (Join-Path $mutableRoot 'preferences.json'),
-        "{`n  `"schema_version`": 1,`n  `"restored_bounds`": {`"x`":40,`"y`":60,`"width`":920,`"height`":700},`n  `"maximized`": true,`n  `"visible_page`": `"status`",`n  `"active_profile_hint`": `"$profileId`",`n  `"last_group_by_profile`": {`"$profileId`":`"proxy-group`"},`n  `"selections_by_profile`": {`"$profileId`":{`"proxy-group`":`"node-smoke`"}},`n  `"ambient_background`": true`n}`n",
+        "{`n  `"schema_version`": 1,`n  `"restored_bounds`": {`"x`":40,`"y`":60,`"width`":920,`"height`":700},`n  `"maximized`": true,`n  `"visible_page`": `"status`",`n  `"active_profile_hint`": `"$secondProfileId`",`n  `"last_group_by_profile`": {`"$profileId`":`"proxy-group`",`"$secondProfileId`":`"fallback-group`"},`n  `"selections_by_profile`": {`"$profileId`":{`"proxy-group`":`"node-smoke`"},`"$secondProfileId`":{`"fallback-group`":`"node-backup`"}},`n  `"ambient_background`": true`n}`n",
         $utf8NoBom)
     [IO.File]::WriteAllText(
         (Join-Path $mutableRoot 'profiles\index.json'),
-        "{`n  `"schema_version`": 1,`n  `"active_profile_id`": `"$profileId`",`n  `"profiles`": [{`"id`":`"$profileId`",`"created_at_unix`":1757959100}]`n}`n",
+        "{`n  `"schema_version`": 1,`n  `"active_profile_id`": `"$secondProfileId`",`n  `"profiles`": [{`"id`":`"$profileId`",`"created_at_unix`":1757959100},{`"id`":`"$secondProfileId`",`"created_at_unix`":1757959150}]`n}`n",
         $utf8NoBom)
     [IO.File]::WriteAllText(
         (Join-Path $profileGeneration 'mihomo.yaml'),
@@ -178,6 +214,22 @@ try {
         "{`n  `"schema_version`": 1,`n  `"catalog_revision`": 73,`n  `"selections`": {`"proxy-group`": `"node-smoke`"}`n}`n",
         $utf8NoBom)
     [IO.File]::WriteAllText(
+        (Join-Path $secondProfileGeneration 'mihomo.yaml'),
+        "proxies:`n  - name: node-backup`n    type: http`n    server: 127.0.0.2`n    port: 8080`nproxy-groups:`n  - name: fallback-group`n    type: select`n    proxies:`n      - node-backup`nrules:`n  - MATCH,fallback-group`n",
+        $utf8NoBom)
+    [IO.File]::WriteAllText(
+        (Join-Path $secondProfileGeneration 'xray.json'),
+        "{`n  `"log`": {`"loglevel`":`"error`"},`n  `"outbounds`": [{`"protocol`":`"freedom`"}]`n}`n",
+        $utf8NoBom)
+    [IO.File]::WriteAllText(
+        (Join-Path $secondProfileGeneration 'subscription.json'),
+        "{`n  `"source_url`": `"https://backup.invalid/public-feed`",`n  `"info`": {`"source_host`":`"backup.invalid`",`"display_name`":`"Backup Profile`"},`n  `"targets`": {`"home_url`":null,`"support_url`":null,`"announcement_url`":null,`"logo_url`":null}`n}`n",
+        $utf8NoBom)
+    [IO.File]::WriteAllText(
+        (Join-Path $secondProfileRoot 'selections.json'),
+        "{`n  `"schema_version`": 1,`n  `"catalog_revision`": 91,`n  `"selections`": {`"fallback-group`": `"node-backup`"}`n}`n",
+        $utf8NoBom)
+    [IO.File]::WriteAllText(
         (Join-Path $mutableRoot 'device-identity'),
         "multicore-smoke-device-00000001`n",
         $utf8NoBom)
@@ -185,8 +237,13 @@ try {
         (Join-Path $mutableRoot 'logs\latest-core.log'),
         "2025-09-15T12:00:00Z INFO smoke sentinel log line`n",
         $utf8NoBom)
-    $mutableManifestBefore = Get-FileHashManifest -Root $mutableRoot
-    Assert-True ($mutableManifestBefore.Count -eq 8) 'mutable data fixture must contain all eight sentinel files'
+    $credentialPath = Join-Path $profileGeneration 'subscription.json'
+    Assert-CredentialStoredOnlyAtExpectedPath `
+        -Root $mutableRoot `
+        -ExpectedPath $credentialPath `
+        -Marker 'https://sentinel.invalid/private-token'
+    $protectedManifestBefore = Get-FileHashManifest -Root $testLocalAppData
+    Assert-True ($protectedManifestBefore.Count -eq 12) 'two-profile fixture must contain all twelve sentinel files'
 
     $updaterStdout = Join-Path $testRoot 'updater-stdout.log'
     $updaterStderr = Join-Path $testRoot 'updater-stderr.log'
@@ -209,8 +266,12 @@ try {
     }
     Assert-True ($apply.ExitCode -eq 0) "packaged updater exited with $($apply.ExitCode)"
 
-    $mutableManifestAfter = Get-FileHashManifest -Root $mutableRoot
-    Assert-FileHashManifestEqual -Expected $mutableManifestBefore -Actual $mutableManifestAfter
+    $protectedManifestAfter = Get-FileHashManifest -Root $testLocalAppData
+    Assert-FileHashManifestEqual -Expected $protectedManifestBefore -Actual $protectedManifestAfter
+    Assert-CredentialStoredOnlyAtExpectedPath `
+        -Root $mutableRoot `
+        -ExpectedPath $credentialPath `
+        -Marker 'https://sentinel.invalid/private-token'
 
     $stateReader = Join-Path $testRoot 'read persisted state.ps1'
     $stateSignal = Join-Path $testRoot 'state-read.ok'
@@ -228,6 +289,7 @@ function Assert-State {
 
 $root = Join-Path ([Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')) 'MultiCore'
 $expectedProfileId = '11111111-2222-4333-8444-555555555555'
+$expectedSecondProfileId = '66666666-7777-4888-8999-aaaaaaaaaaaa'
 $preferences = Get-Content -Raw -LiteralPath (Join-Path $root 'preferences.json') | ConvertFrom-Json
 $preferenceKeys = @($preferences.PSObject.Properties.Name | Sort-Object)
 Assert-State (($preferenceKeys -join ',') -ceq 'active_profile_hint,ambient_background,last_group_by_profile,maximized,restored_bounds,schema_version,selections_by_profile,visible_page') 'unexpected preferences fields'
@@ -241,28 +303,38 @@ Assert-State ($preferences.restored_bounds.width -eq 920 -and $preferences.resto
 Assert-State ($preferences.restored_bounds.height -eq 700 -and $preferences.restored_bounds.height -is [int]) 'unexpected restored height'
 Assert-State ($preferences.maximized -is [bool] -and $preferences.maximized) 'unexpected maximized preference'
 Assert-State ($preferences.visible_page -is [string] -and $preferences.visible_page -ceq 'status') 'unexpected visible page'
-Assert-State ($preferences.active_profile_hint -is [string] -and $preferences.active_profile_hint -ceq $expectedProfileId) 'unexpected active profile hint'
-Assert-State (@($preferences.last_group_by_profile.PSObject.Properties).Count -eq 1) 'unexpected last-group profile count'
+Assert-State ($preferences.active_profile_hint -is [string] -and $preferences.active_profile_hint -ceq $expectedSecondProfileId) 'unexpected active profile hint'
+Assert-State (@($preferences.last_group_by_profile.PSObject.Properties).Count -eq 2) 'unexpected last-group profile count'
 Assert-State ($preferences.last_group_by_profile.$expectedProfileId -is [string] -and $preferences.last_group_by_profile.$expectedProfileId -ceq 'proxy-group') 'unexpected last group ID'
-Assert-State (@($preferences.selections_by_profile.PSObject.Properties).Count -eq 1) 'unexpected selection profile count'
+Assert-State ($preferences.last_group_by_profile.$expectedSecondProfileId -is [string] -and $preferences.last_group_by_profile.$expectedSecondProfileId -ceq 'fallback-group') 'unexpected second-profile last group ID'
+Assert-State (@($preferences.selections_by_profile.PSObject.Properties).Count -eq 2) 'unexpected selection profile count'
 Assert-State (@($preferences.selections_by_profile.$expectedProfileId.PSObject.Properties).Count -eq 1) 'unexpected preference selection count'
 Assert-State ($preferences.selections_by_profile.$expectedProfileId.'proxy-group' -is [string] -and $preferences.selections_by_profile.$expectedProfileId.'proxy-group' -ceq 'node-smoke') 'unexpected preference selected node ID'
+Assert-State (@($preferences.selections_by_profile.$expectedSecondProfileId.PSObject.Properties).Count -eq 1) 'unexpected second-profile preference selection count'
+Assert-State ($preferences.selections_by_profile.$expectedSecondProfileId.'fallback-group' -is [string] -and $preferences.selections_by_profile.$expectedSecondProfileId.'fallback-group' -ceq 'node-backup') 'unexpected second-profile selected node ID'
 Assert-State ($preferences.ambient_background -is [bool] -and $preferences.ambient_background) 'unexpected ambient background preference'
 
 $index = Get-Content -Raw -LiteralPath (Join-Path $root 'profiles\index.json') | ConvertFrom-Json
 Assert-State ((@($index.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'active_profile_id,profiles,schema_version') 'unexpected profile index fields'
 Assert-State ($index.schema_version -eq 1) 'unexpected profiles schema'
 Assert-State ($index.schema_version -is [int]) 'profile index schema must be an integer'
-Assert-State ($index.active_profile_id -is [string] -and $index.active_profile_id -ceq $expectedProfileId) 'unexpected active profile'
+Assert-State ($index.active_profile_id -is [string] -and $index.active_profile_id -ceq $expectedSecondProfileId) 'unexpected active profile'
 Assert-State ($index.profiles -is [array]) 'ordered profiles must be an array'
-Assert-State ($index.profiles.Count -eq 1) 'unexpected ordered profile count'
+Assert-State ($index.profiles.Count -eq 2) 'unexpected ordered profile count'
 $profile = $index.profiles[0]
 Assert-State ((@($profile.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'created_at_unix,id') 'unexpected profile entry fields'
 Assert-State ($profile.id -is [string] -and $profile.id -ceq $expectedProfileId) 'unexpected ordered profile ID'
 Assert-State ($profile.id -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') 'profile ID must be UUID v4 shaped'
 Assert-State ($profile.created_at_unix -is [int] -and $profile.created_at_unix -eq 1757959100) 'unexpected profile creation timestamp'
+$secondProfile = $index.profiles[1]
+Assert-State ((@($secondProfile.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'created_at_unix,id') 'unexpected second profile entry fields'
+Assert-State ($secondProfile.id -is [string] -and $secondProfile.id -ceq $expectedSecondProfileId) 'unexpected second ordered profile ID'
+Assert-State ($secondProfile.id -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') 'second profile ID must be UUID v4 shaped'
+Assert-State ($secondProfile.created_at_unix -is [int] -and $secondProfile.created_at_unix -eq 1757959150) 'unexpected second profile creation timestamp'
 $profileRoot = Join-Path $root (Join-Path 'profiles' $expectedProfileId)
 $generation = Join-Path $profileRoot 'generations\snapshot-00000000000000000001'
+$secondProfileRoot = Join-Path $root (Join-Path 'profiles' $expectedSecondProfileId)
+$secondGeneration = Join-Path $secondProfileRoot 'generations\snapshot-00000000000000000002'
 
 $expectedMihomo = "proxies:`n  - name: node-smoke`n    type: socks5`n    server: 127.0.0.1`n    port: 1080`nproxy-groups:`n  - name: proxy-group`n    type: select`n    proxies:`n      - node-smoke`nrules:`n  - MATCH,proxy-group`n"
 Assert-State (([IO.File]::ReadAllText((Join-Path $generation 'mihomo.yaml'))) -ceq $expectedMihomo) 'mihomo generation changed'
@@ -299,6 +371,22 @@ Assert-State ($selections.schema_version -is [int]) 'selections schema must be a
 Assert-State ($selections.catalog_revision -eq 73 -and $selections.catalog_revision -is [int]) 'unexpected catalog revision'
 Assert-State (@($selections.selections.PSObject.Properties).Count -eq 1) 'unexpected persisted selection count'
 Assert-State ($selections.selections.'proxy-group' -is [string] -and $selections.selections.'proxy-group' -ceq 'node-smoke') 'selected node changed'
+
+$expectedSecondMihomo = "proxies:`n  - name: node-backup`n    type: http`n    server: 127.0.0.2`n    port: 8080`nproxy-groups:`n  - name: fallback-group`n    type: select`n    proxies:`n      - node-backup`nrules:`n  - MATCH,fallback-group`n"
+Assert-State (([IO.File]::ReadAllText((Join-Path $secondGeneration 'mihomo.yaml'))) -ceq $expectedSecondMihomo) 'second mihomo generation changed'
+$secondXray = Get-Content -Raw -LiteralPath (Join-Path $secondGeneration 'xray.json') | ConvertFrom-Json
+Assert-State ($secondXray.log.loglevel -is [string] -and $secondXray.log.loglevel -ceq 'error') 'unexpected second Xray log level'
+Assert-State (@($secondXray.outbounds).Count -eq 1 -and $secondXray.outbounds[0].protocol -ceq 'freedom') 'unexpected second Xray outbound'
+$secondSubscription = Get-Content -Raw -LiteralPath (Join-Path $secondGeneration 'subscription.json') | ConvertFrom-Json
+Assert-State ($secondSubscription.source_url -is [string] -and $secondSubscription.source_url -ceq 'https://backup.invalid/public-feed') 'second subscription source changed'
+Assert-State ($secondSubscription.info.source_host -ceq 'backup.invalid' -and $secondSubscription.info.display_name -ceq 'Backup Profile') 'second subscription presentation changed'
+$secondSelectionsPath = Join-Path $secondProfileRoot 'selections.json'
+$secondSelections = Get-Content -Raw -LiteralPath $secondSelectionsPath | ConvertFrom-Json
+Assert-State ((@($secondSelections.PSObject.Properties.Name | Sort-Object) -join ',') -ceq 'catalog_revision,schema_version,selections') 'unexpected second selections fields'
+Assert-State ($secondSelections.schema_version -is [int] -and $secondSelections.schema_version -eq 1) 'unexpected second selections schema'
+Assert-State ($secondSelections.catalog_revision -is [int] -and $secondSelections.catalog_revision -eq 91) 'unexpected second catalog revision'
+Assert-State (@($secondSelections.selections.PSObject.Properties).Count -eq 1) 'unexpected second persisted selection count'
+Assert-State ($secondSelections.selections.'fallback-group' -is [string] -and $secondSelections.selections.'fallback-group' -ceq 'node-backup') 'second selected node changed'
 Assert-State (([IO.File]::ReadAllText((Join-Path $root 'device-identity'))) -ceq "multicore-smoke-device-00000001`n") 'device identity changed'
 Assert-State (([IO.File]::ReadAllText((Join-Path $root 'logs\latest-core.log'))) -ceq "2025-09-15T12:00:00Z INFO smoke sentinel log line`n") 'core log changed'
 
