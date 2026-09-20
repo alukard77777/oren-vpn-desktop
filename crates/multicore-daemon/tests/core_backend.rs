@@ -5,14 +5,15 @@ use std::{
 };
 
 use multicore_core::{
-    CoreLogRecord, DiagnosticStream, Engine, FetchError, HttpClient, HttpResponse,
-    MihomoRuntimeControl, PersistentSnapshotStore, ProcessController, ProcessDiagnostics,
+    CoreLogRecord, DiagnosticStream, Engine, FetchError, HttpClient, HttpResponse, MAX_PROFILES,
+    MihomoRuntimeControl, ProcessController, ProcessDiagnostics, ProfileId, ProfileStore,
     RuntimeCheckState, Snapshot, SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO,
     UA_XRAY, stage_runtime_with_mihomo_control,
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectionState, CoreBackend, ImportSubscriptionRequest,
-    MAX_DIAGNOSTIC_MAPPINGS, PreparedController, RuntimeCheckDto, transactional_controller_factory,
+    MAX_DIAGNOSTIC_MAPPINGS, PreparedController, ProfileMutationError, RuntimeCheckDto,
+    SelectionRequest, transactional_controller_factory,
 };
 
 const MIHOMO: &str = r#"
@@ -209,10 +210,259 @@ impl HttpClient for OfflineHttp {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProfileHttp;
+
+impl HttpClient for ProfileHttp {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        user_agent: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+        Box::pin(async move {
+            let label = if url.contains("one.invalid") {
+                "One"
+            } else {
+                "Two"
+            };
+            let mihomo = format!(
+                "proxies:\n  - name: '{label} Node'\n    type: socks5\n  - name: '{label} Alt'\n    type: socks5\nproxy-groups:\n  - name: '{label}'\n    type: select\n    proxies: ['{label} Node', '{label} Alt']\n"
+            );
+            match user_agent {
+                UA_NATIVE => Ok(HttpResponse::new(
+                    200,
+                    format!("[{},{{}}]", serde_json::to_string(&mihomo).unwrap()).into_bytes(),
+                    std::iter::empty::<(&str, &str)>(),
+                )),
+                UA_MIHOMO => Ok(HttpResponse::new(
+                    200,
+                    mihomo.into_bytes(),
+                    std::iter::empty::<(&str, &str)>(),
+                )),
+                UA_XRAY => Ok(HttpResponse::new(
+                    200,
+                    b"{}".to_vec(),
+                    std::iter::empty::<(&str, &str)>(),
+                )),
+                _ => Err(FetchError::Network),
+            }
+        })
+    }
+}
+
+fn profile_id(value: &str) -> ProfileId {
+    ProfileId::parse(value).unwrap()
+}
+
+fn profile_backend(
+    root: &std::path::Path,
+) -> CoreBackend<
+    ProfileHttp,
+    RecordingController,
+    impl Fn(&Snapshot) -> Result<Arc<RecordingController>, BackendError> + use<>,
+> {
+    CoreBackend::new(
+        ProfileStore::open(root, None).unwrap(),
+        SubscriptionFetcher::new(ProfileHttp),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_not_activate() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let first = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "  https://one.invalid/sub  ".into(),
+        })
+        .await
+        .unwrap();
+    let first_id = first.active_profile_id.unwrap();
+    assert_eq!(first.profile.as_deref(), Some("One"));
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[0].id.clone(),
+            node_id: catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    let duplicate = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate.active_profile_id.as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(duplicate.current_node.as_deref(), Some("One Alt"));
+    assert_eq!(backend.list_subscriptions().unwrap().len(), 1);
+
+    let second = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    let second_id = second.active_profile_id.unwrap();
+    assert_ne!(first_id, second_id);
+    assert_eq!(second.profile.as_deref(), Some("Two"));
+    backend
+        .refresh_subscription_profile(&profile_id(&first_id))
+        .await
+        .unwrap();
+    let status = backend.status().await.unwrap();
+    assert_eq!(
+        status.active_profile_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    assert_eq!(status.profile.as_deref(), Some("Two"));
+}
+
+#[tokio::test]
+async fn active_deletion_selects_next_then_empty_and_active_id_survives_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let first_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    let second_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    drop(backend);
+
+    let backend = profile_backend(root.path());
+    assert_eq!(
+        backend.status().await.unwrap().active_profile_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    let next = backend
+        .delete_subscription(&profile_id(&second_id))
+        .await
+        .unwrap();
+    assert_eq!(next.active_profile_id.as_deref(), Some(first_id.as_str()));
+    assert_eq!(next.profile.as_deref(), Some("One"));
+    let empty = backend
+        .delete_subscription(&profile_id(&first_id))
+        .await
+        .unwrap();
+    assert_eq!(empty.state, ConnectionState::Empty);
+    assert_eq!(empty.active_profile_id, None);
+    assert!(backend.list_subscriptions().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unavailable_active_profile_keeps_authoritative_id_and_another_can_be_activated() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let first_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    let second_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    drop(backend);
+    std::fs::remove_dir_all(root.path().join(&second_id)).unwrap();
+
+    let backend = profile_backend(root.path());
+    let unavailable = backend.status().await.unwrap();
+    assert_eq!(unavailable.state, ConnectionState::Empty);
+    assert_eq!(
+        unavailable.active_profile_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    let restored = backend
+        .activate_subscription(&profile_id(&first_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.active_profile_id.as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(restored.profile.as_deref(), Some("One"));
+}
+
+#[tokio::test]
+async fn connected_profile_mutations_are_rejected_without_hot_swap() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let first_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    backend.connect().await.unwrap();
+    assert_eq!(
+        backend.activate_subscription(&profile_id(&first_id)).await,
+        Err(ProfileMutationError::Connected)
+    );
+    assert_eq!(
+        backend.delete_subscription(&profile_id(&first_id)).await,
+        Err(ProfileMutationError::Connected)
+    );
+    assert_eq!(
+        backend
+            .refresh_subscription_profile(&profile_id(&first_id))
+            .await,
+        Err(ProfileMutationError::Connected)
+    );
+}
+
+#[tokio::test]
+async fn profile_limit_is_reported_as_a_typed_mutation_error() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let snapshot = Arc::new(Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap());
+    for _ in 0..MAX_PROFILES {
+        store.create_profile(snapshot.clone()).unwrap();
+    }
+    let backend = CoreBackend::new(store, SubscriptionFetcher::new(ProfileHttp), |_snapshot| {
+        Ok(Arc::new(RecordingController::default()))
+    })
+    .unwrap();
+    assert_eq!(
+        backend
+            .import_subscription_profile(ImportSubscriptionRequest {
+                url: "https://one.invalid/new".into(),
+            })
+            .await,
+        Err(ProfileMutationError::LimitReached)
+    );
+    assert_eq!(backend.list_subscriptions().unwrap().len(), MAX_PROFILES);
+}
+
 #[tokio::test]
 async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitting_url() {
     let root = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
     let (http, expected_display_name, expected_group_name, expected_node_name) = maximal_fixture();
     let calls = http.calls.clone();
     let backend = CoreBackend::new(store, SubscriptionFetcher::new(http), |_snapshot| {
@@ -333,6 +583,17 @@ fn subscription_dto_deserializes_legacy_payloads_with_safe_defaults() {
     assert!(!info.support_available);
     assert!(!info.announcement_action_available);
     assert_eq!(info.service_logo_path, None);
+
+    let status: multicore_daemon::StatusDto = serde_json::from_value(serde_json::json!({
+        "state": "empty",
+        "profile": null,
+        "current_node": null,
+        "message": null,
+        "degraded": false,
+        "subscription": null
+    }))
+    .unwrap();
+    assert_eq!(status.active_profile_id, None);
 }
 
 fn assert_safe_subscription_metadata_eq(
@@ -367,7 +628,7 @@ fn assert_safe_subscription_metadata_eq(
 #[tokio::test]
 async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible() {
     let root = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
     let (http, _, expected_group_name, expected_node_name) = maximal_fixture();
     let backend = CoreBackend::new(store, SubscriptionFetcher::new(http), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
@@ -393,7 +654,7 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
     );
 
     drop(backend);
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
     let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
@@ -412,7 +673,7 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
     assert!(!format!("{after_failure:?}").contains("source-password"));
 
     drop(backend);
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
     let restarted = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
@@ -426,9 +687,9 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
 #[tokio::test]
 async fn legacy_persisted_subscription_without_display_name_uses_source_host_fallback() {
     let root = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
-    store
-        .commit(
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let profile_id = store
+        .create_profile(Arc::new(
             Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#)
                 .unwrap()
                 .with_subscription_source(
@@ -437,11 +698,11 @@ async fn legacy_persisted_subscription_without_display_name_uses_source_host_fal
                     1_789_405_200,
                 )
                 .unwrap(),
-        )
+        ))
         .unwrap();
     drop(store);
 
-    let generation = std::fs::read_dir(root.path())
+    let generation = std::fs::read_dir(root.path().join(profile_id.as_str()))
         .unwrap()
         .filter_map(Result::ok)
         .find(|entry| entry.file_name().to_string_lossy().starts_with("snapshot-"))
@@ -455,7 +716,7 @@ async fn legacy_persisted_subscription_without_display_name_uses_source_host_fal
         .remove("display_name");
     std::fs::write(&subscription_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
     let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
@@ -485,9 +746,11 @@ async fn diagnostics_exposes_bounded_safe_mihomo_to_xray_mappings_only() {
         "  - { name: Wrong, type: http, server: 127.0.0.1, port: 31992 }\n",
     ));
     let mihomo = format!("proxies:\n{proxies}");
-    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
     store
-        .commit(Snapshot::parse(mihomo.as_bytes(), br#"{ "secret": "opaque-xray" }"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(mihomo.as_bytes(), br#"{ "secret": "opaque-xray" }"#).unwrap(),
+        ))
         .unwrap();
     let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
@@ -648,7 +911,7 @@ impl ProcessController for RecordingController {
 #[tokio::test]
 async fn successful_fetch_persists_snapshot_and_updates_status_before_supervision() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let http = FixtureHttp::default();
     let http_calls = http.calls.clone();
     let controller = Arc::new(RecordingController::default());
@@ -715,14 +978,15 @@ async fn successful_fetch_persists_snapshot_and_updates_status_before_supervisio
     assert!(!serialized.contains("password"));
     assert!(!serialized.contains("token=secret"));
 
-    let reopened = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
-    assert!(reopened.current().is_some());
+    drop(backend);
+    let reopened = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    assert!(reopened.active_snapshot().unwrap().is_some());
 }
 
 #[tokio::test]
 async fn every_connect_reprepares_the_controller_from_the_current_snapshot() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let factory_calls_clone = factory_calls.clone();
     let controller = Arc::new(RecordingController::default());
@@ -755,9 +1019,11 @@ async fn every_connect_reprepares_the_controller_from_the_current_snapshot() {
 #[tokio::test]
 async fn persisted_profile_loads_without_network_preparation_until_connect() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     store
-        .commit(Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
         .unwrap();
     let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let factory_calls_clone = factory_calls.clone();
@@ -801,7 +1067,7 @@ fn status_states_serialize_exactly_as_the_desktop_contract() {
 #[tokio::test]
 async fn rollback_failure_is_reported_as_error_and_degraded_status() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let backend = CoreBackend::new(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
@@ -827,7 +1093,7 @@ async fn rollback_failure_is_reported_as_error_and_degraded_status() {
 #[tokio::test]
 async fn successful_rollback_returns_to_ready_without_degraded_mode() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     struct SafeRollbackController;
     impl ProcessController for SafeRollbackController {
         type Error = ();
@@ -869,7 +1135,7 @@ async fn successful_rollback_returns_to_ready_without_degraded_mode() {
 #[tokio::test]
 async fn degraded_mode_blocks_import_without_replacing_controller_until_cleanup() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let factory_calls_clone = factory_calls.clone();
     let controller = Arc::new(RecoverableController::default());
@@ -883,7 +1149,7 @@ async fn degraded_mode_blocks_import_without_replacing_controller_until_cleanup(
         },
     )
     .unwrap();
-    backend
+    let imported = backend
         .import_subscription(ImportSubscriptionRequest {
             url: "https://example.invalid/first".into(),
         })
@@ -891,6 +1157,15 @@ async fn degraded_mode_blocks_import_without_replacing_controller_until_cleanup(
         .unwrap();
     assert!(backend.connect().await.is_err());
     assert!(backend.status().await.unwrap().degraded);
+    let active_id = profile_id(imported.active_profile_id.as_deref().unwrap());
+    assert_eq!(
+        backend.activate_subscription(&active_id).await,
+        Err(ProfileMutationError::Connected)
+    );
+    assert_eq!(
+        backend.delete_subscription(&active_id).await,
+        Err(ProfileMutationError::Connected)
+    );
 
     assert!(
         backend
@@ -917,7 +1192,7 @@ async fn degraded_mode_blocks_import_without_replacing_controller_until_cleanup(
 #[tokio::test]
 async fn degraded_mode_blocks_reconnect_until_successful_disconnect_cleanup() {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let controller = Arc::new(RecoverableController::default());
     let controller_clone = controller.clone();
     let backend = CoreBackend::new(
@@ -980,7 +1255,7 @@ proxy-groups:
 "#;
     let directory = tempfile::tempdir().unwrap();
     let snapshots = directory.path().join("snapshots");
-    let store = PersistentSnapshotStore::open(&snapshots).unwrap();
+    let store = ProfileStore::open(&snapshots, None).unwrap();
     let backend = CoreBackend::new(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
@@ -997,7 +1272,7 @@ proxy-groups:
         .unwrap();
     drop(backend);
 
-    let store = PersistentSnapshotStore::open(&snapshots).unwrap();
+    let store = ProfileStore::open(&snapshots, None).unwrap();
     let backend = CoreBackend::new(
         store,
         SubscriptionFetcher::new(FixtureHttp::with_mihomo(REPLACEMENT)),
@@ -1020,8 +1295,18 @@ proxy-groups:
     );
     drop(backend);
 
-    let reopened = PersistentSnapshotStore::open(&snapshots).unwrap();
-    assert_eq!(reopened.current().unwrap().mihomo.groups()[0].name, "Main");
+    let reopened = ProfileStore::open(&snapshots, None).unwrap();
+    assert_eq!(
+        reopened
+            .active_snapshot()
+            .unwrap()
+            .unwrap()
+            .2
+            .mihomo
+            .groups()[0]
+            .name,
+        "Main"
+    );
 }
 
 #[tokio::test]
@@ -1035,9 +1320,18 @@ proxy-groups:
     let directory = tempfile::tempdir().unwrap();
     let snapshots = directory.path().join("snapshots");
     let runtime = directory.path().join("runtime");
-    let store = PersistentSnapshotStore::open(&snapshots).unwrap();
-    store
-        .commit(Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap())
+    let store = ProfileStore::open(&snapshots, None).unwrap();
+    let store_id = store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#)
+                .unwrap()
+                .with_subscription_source(
+                    "https://example.invalid/replacement",
+                    None,
+                    1_789_405_200,
+                )
+                .unwrap(),
+        ))
         .unwrap();
     let control =
         MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
@@ -1067,7 +1361,7 @@ proxy-groups:
         .collect();
     assert_eq!(active_before.len(), 1);
 
-    std::fs::create_dir(snapshots.join(format!(
+    std::fs::create_dir(snapshots.join(store_id.as_str()).join(format!(
         ".snapshot-00000000000000000002.staging-{}",
         std::process::id()
     )))

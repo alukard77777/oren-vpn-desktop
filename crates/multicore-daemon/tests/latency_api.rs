@@ -18,8 +18,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use multicore_core::{
-    Engine, FetchError, HttpClient, HttpResponse, PersistentSnapshotStore, ProcessController,
-    Snapshot, SubscriptionFetcher,
+    Engine, FetchError, HttpClient, HttpResponse, ProcessController, ProfileStore, Snapshot,
+    SubscriptionFetcher,
 };
 use multicore_daemon::{
     Backend, BackendError, CoreBackend, LatencyProbeError, LatencyRequest, LatencyStatus,
@@ -109,9 +109,11 @@ fn backend_with_mihomo(
     impl Fn(&Snapshot) -> Result<Arc<NoopController>, BackendError> + use<>,
 > {
     let root = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(root.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(root.path().join("profiles"), None).unwrap();
     store
-        .commit(Snapshot::parse(mihomo.as_bytes(), br#"{}"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(mihomo.as_bytes(), br#"{}"#).unwrap(),
+        ))
         .unwrap();
     CoreBackend::new_with_selector(
         store,

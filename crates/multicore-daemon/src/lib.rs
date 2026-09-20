@@ -26,8 +26,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState as CoreConnectionState, DiagnosticStream, Event,
-    HttpClient, PersistentSnapshotStore, ProcessController, ProcessDiagnostics, RuntimeCheckState,
-    Severity, Snapshot, StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
+    HttpClient, ProcessController, ProcessDiagnostics, ProfileError, ProfileId, ProfileStore,
+    ProfileSummary, RuntimeCheckState, Severity, Snapshot, StagedRuntime, StateMachine,
+    SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -76,6 +77,8 @@ pub enum ConnectionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StatusDto {
     pub state: ConnectionState,
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
     pub profile: Option<String>,
     pub current_node: Option<String>,
     pub message: Option<String>,
@@ -244,13 +247,27 @@ pub struct ApiErrorBody {
 
 #[derive(Clone, Debug)]
 pub struct BackendError {
-    _private: (),
+    profile_mutation: Option<ProfileMutationError>,
 }
 
 impl BackendError {
     #[must_use]
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {
+            profile_mutation: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_profile_mutation(error: ProfileMutationError) -> Self {
+        Self {
+            profile_mutation: Some(error),
+        }
+    }
+
+    #[must_use]
+    pub const fn profile_mutation(&self) -> Option<ProfileMutationError> {
+        self.profile_mutation
     }
 }
 
@@ -276,6 +293,22 @@ pub enum SelectionError {
     UnknownNode,
     SelectorFailed,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileMutationError {
+    NotFound,
+    Connected,
+    LimitReached,
+    Storage,
+}
+
+impl fmt::Display for ProfileMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("profile mutation was not completed")
+    }
+}
+
+impl std::error::Error for ProfileMutationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LatencyError {
@@ -1109,7 +1142,7 @@ where
     C: HttpClient,
     P: ProcessController,
 {
-    store: PersistentSnapshotStore,
+    store: ProfileStore,
     fetcher: SubscriptionFetcher<C>,
     controller_factory: Arc<PreparedFactory<P>>,
     factory_type: PhantomData<fn() -> F>,
@@ -1120,6 +1153,7 @@ where
 }
 
 struct CoreRuntime<P: ProcessController> {
+    active_profile_id: Option<ProfileId>,
     state: StateMachine,
     controller: Option<Arc<P>>,
     snapshot: Option<Arc<Snapshot>>,
@@ -1135,6 +1169,7 @@ struct CoreRuntime<P: ProcessController> {
 impl<P: ProcessController> CoreRuntime<P> {
     fn empty() -> Self {
         Self {
+            active_profile_id: None,
             state: StateMachine::default(),
             controller: None,
             snapshot: None,
@@ -1177,6 +1212,10 @@ impl<P: ProcessController> CoreRuntime<P> {
             });
         StatusDto {
             state: map_core_state(self.state.current()),
+            active_profile_id: self
+                .active_profile_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
             profile,
             current_node,
             message: self.message.clone(),
@@ -1217,17 +1256,37 @@ impl<P: ProcessController> CoreRuntime<P> {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: Arc<Snapshot>, controller: Arc<P>, revision: u64) {
+    fn apply_snapshot(
+        &mut self,
+        id: ProfileId,
+        snapshot: Arc<Snapshot>,
+        controller: Arc<P>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+    ) {
+        self.active_profile_id = Some(id);
         self.controller = Some(controller);
-        self.apply_snapshot_metadata(snapshot, revision);
+        self.apply_snapshot_metadata(snapshot, revision, selected_nodes);
     }
 
-    fn apply_snapshot_without_controller(&mut self, snapshot: Arc<Snapshot>, revision: u64) {
+    fn apply_snapshot_without_controller(
+        &mut self,
+        id: ProfileId,
+        snapshot: Arc<Snapshot>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+    ) {
+        self.active_profile_id = Some(id);
         self.controller = None;
-        self.apply_snapshot_metadata(snapshot, revision);
+        self.apply_snapshot_metadata(snapshot, revision, selected_nodes);
     }
 
-    fn apply_snapshot_metadata(&mut self, snapshot: Arc<Snapshot>, revision: u64) {
+    fn apply_snapshot_metadata(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+    ) {
         if matches!(
             self.state.current(),
             CoreConnectionState::Empty | CoreConnectionState::Error
@@ -1236,10 +1295,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         }
         let selectable = selectable_groups(&snapshot);
         self.profile = selectable.first().map(|group| group.name.to_owned());
-        self.selected_nodes = selectable
-            .iter()
-            .map(|group| group.nodes.first().map(|node| (*node).to_owned()))
-            .collect();
+        self.selected_nodes = selected_nodes;
         self.current_node = self.selected_nodes.first().cloned().flatten();
         self.catalog = build_catalog(
             &snapshot,
@@ -1248,6 +1304,22 @@ impl<P: ProcessController> CoreRuntime<P> {
             &self.selected_nodes,
         );
         self.snapshot = Some(snapshot);
+        self.message = None;
+        self.degraded = false;
+    }
+
+    fn clear_for_active(&mut self, active_profile_id: Option<ProfileId>) {
+        self.active_profile_id = active_profile_id;
+        self.state = StateMachine::default();
+        self.controller = None;
+        self.snapshot = None;
+        self.catalog = CatalogDto {
+            revision: 0,
+            groups: Vec::new(),
+        };
+        self.profile = None;
+        self.current_node = None;
+        self.selected_nodes.clear();
         self.message = None;
         self.degraded = false;
     }
@@ -1291,7 +1363,7 @@ where
     F: Fn(&Snapshot) -> Result<Arc<P>, BackendError> + Send + Sync + 'static,
 {
     pub fn new(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: F,
     ) -> Result<Self, BackendError> {
@@ -1304,7 +1376,7 @@ where
     }
 
     pub fn new_with_selector(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: F,
         selector: Arc<dyn MihomoSelector>,
@@ -1323,7 +1395,7 @@ where
     F: Fn(&Snapshot) -> Result<PreparedController<P>, BackendError> + Send + Sync + 'static,
 {
     pub fn new_transactional(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: TransactionalControllerFactory<F>,
     ) -> Result<Self, BackendError> {
@@ -1336,7 +1408,7 @@ where
     }
 
     pub fn new_transactional_with_selector(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: TransactionalControllerFactory<F>,
         selector: Arc<dyn MihomoSelector>,
@@ -1354,14 +1426,16 @@ where
     P: ProcessController,
 {
     fn from_prepared_factory(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: Arc<PreparedFactory<P>>,
         selector: Arc<dyn MihomoSelector>,
     ) -> Result<Self, BackendError> {
         let mut inner = CoreRuntime::empty();
-        if let Some((revision, snapshot)) = store.current_with_generation() {
-            inner.apply_snapshot_without_controller(snapshot, revision);
+        inner.active_profile_id = store.active_id();
+        if let Ok(Some((id, revision, snapshot))) = store.active_snapshot() {
+            let selections = initial_or_restored_selections(&store, &id, revision, &snapshot);
+            inner.apply_snapshot_without_controller(id, snapshot, revision, selections);
         }
         Ok(Self {
             store,
@@ -1373,6 +1447,397 @@ where
             operation: tokio::sync::Mutex::new(()),
             inner: RwLock::new(inner),
         })
+    }
+
+    pub fn list_subscriptions(&self) -> Result<Vec<ProfileSummary>, ProfileMutationError> {
+        self.store.list().map_err(map_profile_error)
+    }
+
+    pub async fn activate_subscription(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError> {
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        let (revision, snapshot) = self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let prepared =
+            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+        if let Err(error) = self.store.activate(id) {
+            if error.mutation_committed() {
+                self.reconcile_authoritative().await;
+            }
+            return Err(map_profile_error(error));
+        }
+        let selections = initial_or_restored_selections(&self.store, id, revision, &snapshot);
+        let controller = prepared.controller();
+        {
+            let mut state = self.inner.write().await;
+            state.clear_for_active(Some(id.clone()));
+            state.apply_snapshot(id.clone(), snapshot, controller, revision, selections);
+        }
+        if prepared.activate().is_err() {
+            self.reconcile_authoritative().await;
+            return Err(ProfileMutationError::Storage);
+        }
+        Ok(self.inner.read().await.status())
+    }
+
+    pub async fn refresh_subscription_profile(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        self.refresh_profile_locked(id).await
+    }
+
+    pub async fn import_subscription_profile(
+        &self,
+        request: ImportSubscriptionRequest,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let _operation = self.operation.lock().await;
+        self.import_profile_locked(&request.url).await
+    }
+
+    pub async fn delete_subscription(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError> {
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        let was_active = self.store.active_id().as_ref() == Some(id);
+        match self.store.delete(id) {
+            Ok(_) => {}
+            Err(error) => {
+                if error.mutation_committed() {
+                    self.reconcile_authoritative().await;
+                }
+                return Err(map_profile_error(error));
+            }
+        }
+        if was_active {
+            self.reconcile_authoritative().await;
+        }
+        Ok(self.inner.read().await.status())
+    }
+
+    async fn require_disconnected_mutation(&self) -> Result<(), ProfileMutationError> {
+        let state = self.inner.read().await;
+        if state.degraded
+            || matches!(
+                state.state.current(),
+                CoreConnectionState::Connecting | CoreConnectionState::Connected
+            )
+        {
+            Err(ProfileMutationError::Connected)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn reconcile_authoritative(&self) {
+        let authoritative_id = self.store.active_id();
+        let loaded = self.store.active_snapshot().ok().flatten();
+        let mut state = self.inner.write().await;
+        state.clear_for_active(authoritative_id);
+        if let Some((id, revision, snapshot)) = loaded {
+            let selections = initial_or_restored_selections(&self.store, &id, revision, &snapshot);
+            state.apply_snapshot_without_controller(id, snapshot, revision, selections);
+        }
+    }
+
+    async fn refresh_profile_locked(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let (previous_revision, previous) =
+            self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let previous_selections =
+            restored_selections(&self.store, id, previous_revision, &previous);
+        let source_url = previous
+            .subscription_source_url()
+            .ok_or(ProfileMutationError::Storage)?
+            .to_owned();
+        let staging = AtomicSnapshot::default();
+        let fetched = self
+            .fetcher
+            .refresh(&source_url, &staging)
+            .await
+            .map_err(|_| ProfileMutationError::Storage)?;
+        let (snapshot, _) = fetched.into_parts();
+        let active = self.store.active_id().as_ref() == Some(id);
+        let prepared = if active {
+            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?)
+        } else {
+            None
+        };
+        let revision = match self.store.replace_profile(id, snapshot.clone()) {
+            Ok(revision) => revision,
+            Err(error) => {
+                if error.mutation_committed() {
+                    self.reconcile_authoritative().await;
+                }
+                return Err(map_profile_error(error));
+            }
+        };
+        if let Err(error) = carry_valid_selections(
+            &self.store,
+            id,
+            revision,
+            &previous,
+            &previous_selections,
+            &snapshot,
+        ) {
+            if error.mutation_committed() {
+                self.reconcile_authoritative().await;
+            }
+            return Err(map_profile_error(error));
+        }
+        if !active {
+            return Ok(self.inner.read().await.status());
+        }
+        let prepared = prepared.expect("active refresh prepares a controller");
+        let selections = initial_or_restored_selections(&self.store, id, revision, &snapshot);
+        let controller = prepared.controller();
+        {
+            let mut state = self.inner.write().await;
+            state.clear_for_active(Some(id.clone()));
+            state.apply_snapshot(id.clone(), snapshot, controller, revision, selections);
+        }
+        if prepared.activate().is_err() {
+            self.reconcile_authoritative().await;
+            return Err(ProfileMutationError::Storage);
+        }
+        Ok(self.inner.read().await.status())
+    }
+
+    async fn import_profile_locked(&self, url: &str) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        self.require_disconnected_mutation().await?;
+        let trimmed_url = url.trim();
+        if trimmed_url.is_empty() {
+            return Err(ProfileMutationError::Storage);
+        }
+        let staging = AtomicSnapshot::default();
+        let fetched = self
+            .fetcher
+            .refresh(trimmed_url, &staging)
+            .await
+            .map_err(|_| ProfileMutationError::Storage)?;
+        let (snapshot, _) = fetched.into_parts();
+        let prepared =
+            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+        let existing = self
+            .store
+            .find_exact_source(trimmed_url)
+            .map_err(map_profile_error)?;
+        let id = if let Some(id) = existing {
+            let (previous_revision, previous) = self
+                .store
+                .profile_snapshot(&id)
+                .map_err(map_profile_error)?;
+            let previous_selections =
+                restored_selections(&self.store, &id, previous_revision, &previous);
+            let revision = match self.store.replace_profile(&id, snapshot.clone()) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    if error.mutation_committed() {
+                        self.reconcile_authoritative().await;
+                    }
+                    return Err(map_profile_error(error));
+                }
+            };
+            if let Err(error) = carry_valid_selections(
+                &self.store,
+                &id,
+                revision,
+                &previous,
+                &previous_selections,
+                &snapshot,
+            ) {
+                if error.mutation_committed() {
+                    self.reconcile_authoritative().await;
+                }
+                return Err(map_profile_error(error));
+            }
+            if let Err(error) = self.store.activate(&id) {
+                if error.mutation_committed() {
+                    self.reconcile_authoritative().await;
+                }
+                return Err(map_profile_error(error));
+            }
+            id
+        } else {
+            match self.store.create_profile(snapshot.clone()) {
+                Ok(id) => id,
+                Err(error) => {
+                    if error.mutation_committed() {
+                        self.reconcile_authoritative().await;
+                    }
+                    return Err(map_profile_error(error));
+                }
+            }
+        };
+        let (revision, persisted) = self
+            .store
+            .profile_snapshot(&id)
+            .map_err(map_profile_error)?;
+        let selections = initial_or_restored_selections(&self.store, &id, revision, &persisted);
+        let controller = prepared.controller();
+        {
+            let mut state = self.inner.write().await;
+            state.clear_for_active(Some(id.clone()));
+            state.apply_snapshot(id, persisted, controller, revision, selections);
+            state.push_event(
+                Severity::Info,
+                Component::Subscription,
+                "import",
+                "Subscription imported.",
+            );
+        }
+        if prepared.activate().is_err() {
+            self.reconcile_authoritative().await;
+            return Err(ProfileMutationError::Storage);
+        }
+        Ok(self.inner.read().await.status())
+    }
+}
+
+fn map_profile_error(error: ProfileError) -> ProfileMutationError {
+    match error {
+        ProfileError::NotFound(_) => ProfileMutationError::NotFound,
+        ProfileError::LimitReached => ProfileMutationError::LimitReached,
+        _ => ProfileMutationError::Storage,
+    }
+}
+
+fn default_selections(snapshot: &Snapshot) -> Vec<Option<String>> {
+    selectable_groups(snapshot)
+        .iter()
+        .map(|group| group.nodes.first().map(|node| (*node).to_owned()))
+        .collect()
+}
+
+fn restored_selections(
+    store: &ProfileStore,
+    id: &ProfileId,
+    revision: u64,
+    snapshot: &Snapshot,
+) -> Vec<Option<String>> {
+    let groups = selectable_groups(snapshot);
+    let catalog_ids: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            (
+                catalog_group_id(revision, group_index),
+                group
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(node_index, _)| catalog_node_id(revision, group_index, node_index))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let catalog: Vec<_> = catalog_ids
+        .iter()
+        .map(|(group, nodes)| {
+            (
+                group.as_str(),
+                nodes.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let catalog: Vec<_> = catalog
+        .iter()
+        .map(|(group, nodes)| (*group, nodes.as_slice()))
+        .collect();
+    let saved = store
+        .valid_selections(id, revision, &catalog)
+        .unwrap_or_default();
+    groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            let group_id = catalog_group_id(revision, group_index);
+            saved.get(&group_id).and_then(|node_id| {
+                group
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(node_index, node)| {
+                        (catalog_node_id(revision, group_index, node_index) == *node_id)
+                            .then(|| (*node).to_owned())
+                    })
+            })
+        })
+        .collect()
+}
+
+fn carry_valid_selections(
+    store: &ProfileStore,
+    id: &ProfileId,
+    revision: u64,
+    previous: &Snapshot,
+    previous_selections: &[Option<String>],
+    refreshed: &Snapshot,
+) -> Result<(), ProfileError> {
+    let previous_groups = selectable_groups(previous);
+    let refreshed_groups = selectable_groups(refreshed);
+    for (previous_index, selected_node) in previous_selections.iter().enumerate() {
+        let Some(selected_node) = selected_node else {
+            continue;
+        };
+        let Some(previous_group) = previous_groups.get(previous_index) else {
+            continue;
+        };
+        let Some((group_index, refreshed_group)) = refreshed_groups
+            .iter()
+            .enumerate()
+            .find(|(_, group)| group.name == previous_group.name)
+        else {
+            continue;
+        };
+        let Some(node_index) = refreshed_group
+            .nodes
+            .iter()
+            .position(|node| *node == selected_node)
+        else {
+            continue;
+        };
+        store.save_selection(
+            id,
+            revision,
+            &catalog_group_id(revision, group_index),
+            &catalog_node_id(revision, group_index, node_index),
+        )?;
+    }
+    Ok(())
+}
+
+fn initial_or_restored_selections(
+    store: &ProfileStore,
+    id: &ProfileId,
+    revision: u64,
+    snapshot: &Snapshot,
+) -> Vec<Option<String>> {
+    let restored = restored_selections(store, id, revision, snapshot);
+    if restored.iter().any(Option::is_some) {
+        restored
+    } else {
+        default_selections(snapshot)
     }
 }
 
@@ -1397,155 +1862,24 @@ where
         request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
-        {
-            let state = self.inner.read().await;
-            if matches!(
-                state.state.current(),
-                CoreConnectionState::Connecting | CoreConnectionState::Connected
-            ) || state.degraded
-            {
-                return Err(BackendError::new());
-            }
-        }
-
-        let staging = AtomicSnapshot::default();
-        let fetched = match self.fetcher.refresh(&request.url, &staging).await {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                let mut state = self.inner.write().await;
-                state.mark_error(
-                    "Импорт не выполнен. Проверьте ссылку и доступ к сети.",
-                    false,
-                );
-                state.push_event(
-                    Severity::Error,
-                    Component::Subscription,
-                    "import",
-                    "Импорт подписки завершился ошибкой.",
-                );
-                return Err(BackendError::new());
-            }
-        };
-        let (snapshot, staging_debt) = fetched.into_parts();
-        debug_assert!(
-            staging_debt.is_none(),
-            "in-memory snapshot staging cannot accumulate persistence debt"
-        );
-        let prepared = match (self.controller_factory)(&snapshot) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let mut state = self.inner.write().await;
-                state.mark_error(
-                    "Не удалось подготовить конфигурацию запуска. Повторите импорт.",
-                    false,
-                );
-                state.push_event(
-                    Severity::Error,
-                    Component::Core,
-                    "runtime_publish",
-                    "Подготовка конфигурации запуска завершилась ошибкой.",
-                );
-                return Err(error);
-            }
-        };
-
-        let outcome = match self
-            .store
-            .commit_with_generation_status((*snapshot).clone())
-        {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                drop(prepared);
-                let mut state = self.inner.write().await;
-                if state.snapshot.is_some() {
-                    if state.state.current() != CoreConnectionState::Ready {
-                        let _ = state.state.transition(CoreConnectionState::Ready);
-                    }
-                    state.message = Some(
-                        "Не удалось сохранить новый профиль. Предыдущий профиль сохранён."
-                            .to_owned(),
-                    );
-                    state.degraded = false;
-                } else {
-                    state.mark_error(
-                        "Не удалось сохранить профиль. Освободите место и повторите импорт.",
-                        false,
-                    );
-                }
-                state.push_event(
-                    Severity::Error,
-                    Component::Core,
-                    "snapshot_commit",
-                    "Сохранение профиля завершилось ошибкой.",
-                );
-                return Err(BackendError::new());
-            }
-        };
-        let ((revision, snapshot), maintenance_debt) = outcome.into_parts();
-
-        let mut state = self.inner.write().await;
-        let controller = prepared.controller();
-        state.apply_snapshot(snapshot, controller, revision);
-        if maintenance_debt.is_some() {
-            state.push_event(
-                Severity::Warning,
-                Component::Subscription,
-                "snapshot_maintenance",
-                "The new profile was committed, but its directory durability requires maintenance.",
-            );
-        }
-        state.push_event(
-            Severity::Info,
-            Component::Subscription,
-            "import",
-            "Подписка импортирована.",
-        );
-        let status = state.status();
-        drop(state);
-        prepared.activate()?;
-        Ok(status)
+        self.import_profile_locked(&request.url)
+            .await
+            .map_err(BackendError::from_profile_mutation)
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
-        let source_url = {
-            let state = self.inner.read().await;
-            if matches!(
-                state.state.current(),
-                CoreConnectionState::Connecting | CoreConnectionState::Connected
-            ) || state.degraded
-            {
-                return Err(BackendError::new());
-            }
-            state
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.subscription_source_url())
-                .map(ToOwned::to_owned)
-                .ok_or_else(BackendError::new)?
-        };
-        let result = self
-            .import_subscription(ImportSubscriptionRequest { url: source_url })
-            .await;
-        if result.is_err() {
-            let mut state = self.inner.write().await;
-            if state.snapshot.is_some() {
-                if state.state.current() != CoreConnectionState::Ready {
-                    let _ = state.state.transition(CoreConnectionState::Ready);
-                }
-                state.message =
-                    Some("Не удалось обновить подписку. Предыдущий профиль сохранён.".to_owned());
-                state.degraded = false;
-                state.push_event(
-                    Severity::Warning,
-                    Component::Subscription,
-                    "refresh",
-                    "Обновление подписки не выполнено; предыдущий профиль сохранён.",
-                );
-            }
-        }
-        result
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        let id = self
+            .store
+            .active_id()
+            .ok_or_else(|| BackendError::from_profile_mutation(ProfileMutationError::NotFound))?;
+        self.refresh_profile_locked(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)
     }
-
     async fn connect(&self) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
         let snapshot = {
@@ -1710,15 +2044,24 @@ where
 
     async fn select(&self, request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
         let _operation = self.operation.lock().await;
-        let (snapshot, group_index, raw_group, raw_node) = {
+        let (snapshot, active_profile_id, connected, group_index, raw_group, raw_node) = {
             let state = self.inner.read().await;
-            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+            if !matches!(
+                state.state.current(),
+                CoreConnectionState::Ready | CoreConnectionState::Connected
+            ) || state.degraded
+            {
                 return Err(SelectionError::NotConnected);
             }
             if request.revision != state.catalog.revision {
                 return Err(SelectionError::StaleRevision);
             }
             let snapshot = state.snapshot.clone().ok_or(SelectionError::UnknownGroup)?;
+            let active_profile_id = state
+                .active_profile_id
+                .clone()
+                .ok_or(SelectionError::UnknownGroup)?;
+            let connected = state.state.current() == CoreConnectionState::Connected;
             let groups = selectable_groups(&snapshot);
             let group_index = groups
                 .iter()
@@ -1739,13 +2082,48 @@ where
                 .ok_or(SelectionError::UnknownNode)?;
             let raw_group = group.name.to_owned();
             let raw_node = group.nodes[node_index].to_owned();
-            (snapshot, group_index, raw_group, raw_node)
+            (
+                snapshot,
+                active_profile_id,
+                connected,
+                group_index,
+                raw_group,
+                raw_node,
+            )
         };
 
-        self.selector
-            .select(&raw_group, &raw_node)
-            .await
-            .map_err(|_| SelectionError::SelectorFailed)?;
+        if connected {
+            self.selector
+                .select(&raw_group, &raw_node)
+                .await
+                .map_err(|_| SelectionError::SelectorFailed)?;
+        }
+
+        if let Err(error) = self.store.save_selection(
+            &active_profile_id,
+            request.revision,
+            &request.group_id,
+            &request.node_id,
+        ) {
+            if error.mutation_committed() {
+                let restored = restored_selections(
+                    &self.store,
+                    &active_profile_id,
+                    request.revision,
+                    &snapshot,
+                );
+                let mut state = self.inner.write().await;
+                state.selected_nodes = restored;
+                state.current_node = state.selected_nodes.first().cloned().flatten();
+                state.catalog = build_catalog(
+                    &snapshot,
+                    request.revision,
+                    state.profile.as_deref(),
+                    &state.selected_nodes,
+                );
+            }
+            return Err(SelectionError::SelectorFailed);
+        }
 
         let mut state = self.inner.write().await;
         // All state-changing operations share `operation`, so this revision cannot change while
@@ -2397,6 +2775,7 @@ impl MemoryState {
         let has_profile = self.subscriptions > 0;
         StatusDto {
             state: self.connection,
+            active_profile_id: None,
             profile: has_profile.then(|| "Основной профиль".to_owned()),
             current_node: has_profile.then(|| "Авто".to_owned()),
             message: None,

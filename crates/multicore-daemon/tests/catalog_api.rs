@@ -6,8 +6,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use multicore_core::{
-    Engine, FetchError, HttpClient, HttpResponse, PersistentSnapshotStore, ProcessController,
-    Snapshot, SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_XRAY,
+    Engine, FetchError, HttpClient, HttpResponse, ProcessController, ProfileStore, Snapshot,
+    SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_XRAY,
 };
 use multicore_daemon::{
     Backend, CatalogDto, CoreBackend, ImportSubscriptionRequest, MAX_CATALOG_GROUPS,
@@ -85,9 +85,11 @@ fn core_backend(
     impl Fn(&Snapshot) -> Result<Arc<NoopController>, multicore_daemon::BackendError> + use<>,
 > {
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     store
-        .commit(Snapshot::parse(mihomo.as_bytes(), br#"{}"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(mihomo.as_bytes(), br#"{}"#).unwrap(),
+        ))
         .unwrap();
     CoreBackend::new(store, SubscriptionFetcher::new(NeverHttp), |_snapshot| {
         Ok(Arc::new(NoopController))
@@ -157,15 +159,15 @@ rules:
   - MATCH,Main
 "#;
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     store
-        .commit(
+        .create_profile(Arc::new(
             Snapshot::parse(
                 mihomo.as_bytes(),
                 format!(r#"{{"secret":"{secret}"}}"#).as_bytes(),
             )
             .unwrap(),
-        )
+        ))
         .unwrap();
     let backend = CoreBackend::new(store, SubscriptionFetcher::new(NeverHttp), |_snapshot| {
         Ok(Arc::new(NoopController))
@@ -173,15 +175,16 @@ rules:
     .unwrap();
 
     let catalog = backend.catalog().await.unwrap();
-    assert_eq!(catalog.revision, 1);
+    assert_ne!(catalog.revision, 0);
+    let revision = catalog.revision;
     assert_eq!(catalog.groups.len(), 2);
     assert!(catalog.groups[0].selected);
-    assert_eq!(catalog.groups[0].id, "g-0000000000000001-0000");
+    assert_eq!(catalog.groups[0].id, format!("g-{revision:016x}-0000"));
     assert_eq!(catalog.groups[0].label, "Main");
     assert_eq!(catalog.groups[0].nodes.len(), 2);
     assert_eq!(
         catalog.groups[0].nodes[0].id,
-        "n-0000000000000001-0000-0000"
+        format!("n-{revision:016x}-0000-0000")
     );
     assert_eq!(catalog.groups[0].nodes[0].label, "NL One");
     assert!(catalog.groups[0].nodes[0].selected);
@@ -199,23 +202,23 @@ rules:
     assert_eq!(
         body,
         json!({
-            "revision": 1,
+            "revision": revision,
             "groups": [
                 {
-                    "id": "g-0000000000000001-0000",
+                    "id": format!("g-{revision:016x}-0000"),
                     "label": "Main",
                     "selected": true,
                     "nodes": [
-                        {"id": "n-0000000000000001-0000-0000", "label": "NL One", "selected": true},
-                        {"id": "n-0000000000000001-0000-0001", "label": "US Two", "selected": false}
+                        {"id": format!("n-{revision:016x}-0000-0000"), "label": "NL One", "selected": true},
+                        {"id": format!("n-{revision:016x}-0000-0001"), "label": "US Two", "selected": false}
                     ]
                 },
                 {
-                    "id": "g-0000000000000001-0001",
+                    "id": format!("g-{revision:016x}-0001"),
                     "label": "Backup",
                     "selected": false,
                     "nodes": [
-                        {"id": "n-0000000000000001-0001-0000", "label": "US Two", "selected": true}
+                        {"id": format!("n-{revision:016x}-0001-0000"), "label": "US Two", "selected": true}
                     ]
                 }
             ]
@@ -260,7 +263,7 @@ async fn catalog_conversion_caps_untrusted_counts_and_unicode_names() {
     let backend = core_backend(&mihomo);
 
     let CatalogDto { revision, groups } = backend.catalog().await.unwrap();
-    assert_eq!(revision, 1);
+    assert_ne!(revision, 0);
     assert_eq!(groups.len(), MAX_CATALOG_GROUPS);
     assert_eq!(groups[0].nodes.len(), MAX_CATALOG_NODES_PER_GROUP);
     assert_eq!(groups[0].label.chars().count(), MAX_CATALOG_NAME_CHARS);
@@ -576,7 +579,7 @@ proxy-groups:
     assert_eq!(status["current_node"], "Major");
 
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let import_backend = CoreBackend::new(
         store,
         SubscriptionFetcher::new(FixtureHttp {
@@ -638,7 +641,7 @@ proxy-groups:
         assert_eq!(status["current_node"], raw_label);
 
         let directory = tempfile::tempdir().unwrap();
-        let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+        let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
         let import_backend = CoreBackend::new(
             store,
             SubscriptionFetcher::new(FixtureHttp {
@@ -710,7 +713,7 @@ async fn authenticated_import_response_never_exposes_raw_selected_names() {
         "'550e8400-e29b-41d4-a716-446655440000'",
     ] {
         let directory = tempfile::tempdir().unwrap();
-        let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+        let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
         let backend = CoreBackend::new(
             store,
             SubscriptionFetcher::new(FixtureHttp {
@@ -852,9 +855,11 @@ proxy-groups:
     proxies: [Replacement Node]
 "#;
     let directory = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(directory.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     store
-        .commit(Snapshot::parse(initial.as_bytes(), br#"{}"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(initial.as_bytes(), br#"{}"#).unwrap(),
+        ))
         .unwrap();
     let backend = CoreBackend::new(
         store,
@@ -874,8 +879,9 @@ proxy-groups:
         .unwrap();
     let after = backend.catalog().await.unwrap();
 
-    assert_eq!(before.revision, 1);
-    assert_eq!(after.revision, 2);
+    assert_ne!(before.revision, 0);
+    assert_ne!(after.revision, 0);
+    assert_ne!(before.revision, after.revision);
     assert_ne!(before.groups[0].id, after.groups[0].id);
     assert_ne!(before.groups[0].nodes[0].id, after.groups[0].nodes[0].id);
     assert_eq!(after.groups[0].label, "Replacement Group");
@@ -889,9 +895,11 @@ async fn reconstructed_daemon_uses_persisted_generation_for_revision_and_ids() {
     let directory = tempfile::tempdir().unwrap();
     let snapshots = directory.path().join("snapshots");
 
-    let store = PersistentSnapshotStore::open(&snapshots).unwrap();
+    let store = ProfileStore::open(&snapshots, None).unwrap();
     store
-        .commit(Snapshot::parse(first.as_bytes(), br#"{}"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(first.as_bytes(), br#"{}"#).unwrap(),
+        ))
         .unwrap();
     let first_backend = CoreBackend::new(store, SubscriptionFetcher::new(NeverHttp), |_snapshot| {
         Ok(Arc::new(NoopController))
@@ -900,12 +908,15 @@ async fn reconstructed_daemon_uses_persisted_generation_for_revision_and_ids() {
     let first_catalog = first_backend.catalog().await.unwrap();
     drop(first_backend);
 
-    let store = PersistentSnapshotStore::open(&snapshots).unwrap();
+    let store = ProfileStore::open(&snapshots, None).unwrap();
     store
-        .commit(Snapshot::parse(second.as_bytes(), br#"{}"#).unwrap())
+        .replace_profile(
+            &store.active_id().unwrap(),
+            Arc::new(Snapshot::parse(second.as_bytes(), br#"{}"#).unwrap()),
+        )
         .unwrap();
     drop(store);
-    let store = PersistentSnapshotStore::open(&snapshots).unwrap();
+    let store = ProfileStore::open(&snapshots, None).unwrap();
     let second_backend =
         CoreBackend::new(store, SubscriptionFetcher::new(NeverHttp), |_snapshot| {
             Ok(Arc::new(NoopController))
@@ -913,8 +924,9 @@ async fn reconstructed_daemon_uses_persisted_generation_for_revision_and_ids() {
         .unwrap();
     let second_catalog = second_backend.catalog().await.unwrap();
 
-    assert_eq!(first_catalog.revision, 1);
-    assert_eq!(second_catalog.revision, 2);
+    assert_ne!(first_catalog.revision, 0);
+    assert_ne!(second_catalog.revision, 0);
+    assert_ne!(first_catalog.revision, second_catalog.revision);
     assert_ne!(first_catalog.groups[0].id, second_catalog.groups[0].id);
     assert_ne!(
         first_catalog.groups[0].nodes[0].id,

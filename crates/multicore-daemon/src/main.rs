@@ -7,7 +7,7 @@ use std::{
 };
 
 use multicore_core::{
-    DeviceIdentity, MihomoRuntimeControl, PersistentSnapshotStore, ReqwestHttpClient, Snapshot,
+    DeviceIdentity, MihomoRuntimeControl, ProfileStore, ReqwestHttpClient, Snapshot,
     SubscriptionFetcher, default_ipv4_interface, stage_runtime_with_mihomo_control,
     xray_outbound_server_domains,
 };
@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     drop(mihomo_controller_secret);
 
-    let store = PersistentSnapshotStore::open(data_directory.join("snapshots"))?;
+    let store = ProfileStore::open(
+        data_directory.join("profiles"),
+        Some(data_directory.join("snapshots")),
+    )?;
     let fetcher = SubscriptionFetcher::new(ReqwestHttpClient::new(device_identity)?);
     let runtime_root = data_directory.join("runtime");
     let elevated_factory = Mutex::new(None);
