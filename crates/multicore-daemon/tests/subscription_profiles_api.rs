@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
@@ -5,12 +6,64 @@ use axum::{
 use http_body_util::BodyExt;
 use multicore_core::MAX_PROFILES;
 use multicore_daemon::{
-    ApiErrorBody, MemoryBackend, StatusDto, SubscriptionListDto, router_with_event_epoch,
+    ApiErrorBody, Backend, BackendError, CatalogDto, ConnectionState, EventDto,
+    ImportSubscriptionRequest, MemoryBackend, ProfileMutationError, StatusDto, SubscriptionListDto,
+    router_with_event_epoch,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const TOKEN: &str = "profile-api-token";
+
+struct MutationErrorBackend(ProfileMutationError);
+
+#[async_trait]
+impl Backend for MutationErrorBackend {
+    async fn status(&self) -> Result<StatusDto, BackendError> {
+        Ok(StatusDto {
+            state: ConnectionState::Empty,
+            active_profile_id: None,
+            profile: None,
+            current_node: None,
+            message: None,
+            degraded: false,
+            subscription: None,
+        })
+    }
+
+    async fn catalog(&self) -> Result<CatalogDto, BackendError> {
+        Ok(CatalogDto {
+            revision: 0,
+            groups: Vec::new(),
+        })
+    }
+
+    async fn import_subscription(
+        &self,
+        _request: ImportSubscriptionRequest,
+    ) -> Result<StatusDto, BackendError> {
+        Err(BackendError::from_profile_mutation(self.0))
+    }
+
+    async fn refresh_subscription_profile(
+        &self,
+        _id: multicore_core::ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::from_profile_mutation(self.0))
+    }
+
+    async fn connect(&self) -> Result<StatusDto, BackendError> {
+        self.status().await
+    }
+
+    async fn disconnect(&self) -> Result<StatusDto, BackendError> {
+        self.status().await
+    }
+
+    async fn events_after(&self, _after: u64) -> Result<Vec<EventDto>, BackendError> {
+        Ok(Vec::new())
+    }
+}
 
 fn app() -> axum::Router {
     router_with_event_epoch(MemoryBackend::default(), TOKEN, "profiles-test")
@@ -291,4 +344,39 @@ async fn bodyless_profile_routes_reject_bodies_and_normalize_method_mismatches()
     let body = json_body(mismatch).await;
     assert_eq!(body["code"], "method_not_allowed");
     assert!(!body.to_string().contains(&id));
+}
+
+#[tokio::test]
+async fn backend_storage_and_degraded_conflicts_use_exact_redacted_errors() {
+    let id = "00000000-0000-4000-8000-000000000001";
+    for (mutation, status, code) in [
+        (
+            ProfileMutationError::Storage,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "backend_error",
+        ),
+        (
+            ProfileMutationError::Connected,
+            StatusCode::CONFLICT,
+            "profile_busy",
+        ),
+    ] {
+        let response =
+            router_with_event_epoch(MutationErrorBackend(mutation), TOKEN, "mutation-error-test")
+                .oneshot(request(
+                    Method::POST,
+                    &format!("/v1/subscriptions/{id}/refresh"),
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), status);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], code);
+        let serialized = body.to_string();
+        assert!(!serialized.contains(id));
+        assert!(!serialized.contains("Storage"));
+        assert!(!serialized.contains("Connected"));
+        assert!(!serialized.contains("https://"));
+    }
 }

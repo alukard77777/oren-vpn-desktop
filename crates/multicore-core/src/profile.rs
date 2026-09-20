@@ -112,6 +112,13 @@ pub struct ProfileSummary {
     pub available: bool,
 }
 
+#[derive(Clone)]
+pub struct LoadedProfile {
+    pub summary: ProfileSummary,
+    pub revision: Option<u64>,
+    pub snapshot: Option<Arc<Snapshot>>,
+}
+
 #[derive(Debug, Error)]
 pub enum ProfileError {
     #[error("profile storage operation failed")]
@@ -143,6 +150,12 @@ pub enum ProfileError {
         #[source]
         source: io::Error,
     },
+    #[error("profile snapshot became unreadable after the mutation committed")]
+    PostCommitRead {
+        id: ProfileId,
+        #[source]
+        source: Box<ProfileError>,
+    },
     #[error("profile selection mutation committed but durability maintenance is required")]
     SelectionMaintenanceDebt {
         id: ProfileId,
@@ -157,7 +170,9 @@ impl ProfileError {
     /// Reports whether the requested mutation was published before the error occurred.
     pub fn mutation_committed(&self) -> bool {
         match self {
-            Self::IndexMaintenanceDebt { .. } | Self::SelectionMaintenanceDebt { .. } => true,
+            Self::IndexMaintenanceDebt { .. }
+            | Self::SelectionMaintenanceDebt { .. }
+            | Self::PostCommitRead { .. } => true,
             Self::CleanupDebt {
                 mutation_committed, ..
             } => *mutation_committed,
@@ -200,6 +215,8 @@ pub struct ProfileStore {
     selection_fault: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     load_fault: std::sync::Mutex<Option<ProfileId>>,
+    #[cfg(test)]
+    load_calls: std::sync::atomic::AtomicUsize,
 }
 
 enum IndexCommit {
@@ -272,6 +289,8 @@ impl ProfileStore {
             selection_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             load_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            load_calls: std::sync::atomic::AtomicUsize::new(0),
         };
         if index_metadata.is_none()
             && let Some(legacy_root) = legacy_root
@@ -285,15 +304,40 @@ impl ProfileStore {
     }
 
     pub fn list(&self) -> Result<Vec<ProfileSummary>, ProfileError> {
+        self.map_loaded(|profile| profile.summary)
+    }
+
+    /// Enumerates the ordered index while loading each profile at most once.
+    ///
+    /// Unreadable profiles remain present with `available = false` and no snapshot metadata.
+    pub fn list_loaded(&self) -> Result<Vec<LoadedProfile>, ProfileError> {
+        self.map_loaded(std::convert::identity)
+    }
+
+    /// Projects each ordered profile while its single loaded snapshot is alive, bounding callers
+    /// that only retain presentation metadata to one full snapshot at a time.
+    pub fn map_loaded<T>(
+        &self,
+        mut project: impl FnMut(LoadedProfile) -> T,
+    ) -> Result<Vec<T>, ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         Ok(index
             .profiles
             .iter()
-            .map(|entry| ProfileSummary {
-                id: entry.id.clone(),
-                created_at_unix: entry.created_at_unix,
-                active: index.active_id.as_ref() == Some(&entry.id),
-                available: self.load_profile(&entry.id).is_ok(),
+            .map(|entry| {
+                let loaded = self.load_profile(&entry.id).ok();
+                project(LoadedProfile {
+                    summary: ProfileSummary {
+                        id: entry.id.clone(),
+                        created_at_unix: entry.created_at_unix,
+                        active: index.active_id.as_ref() == Some(&entry.id),
+                        available: loaded.is_some(),
+                    },
+                    revision: loaded
+                        .as_ref()
+                        .map(|(generation, _)| catalog_revision(&entry.id, *generation)),
+                    snapshot: loaded.map(|(_, snapshot)| snapshot),
+                })
             })
             .collect())
     }
@@ -304,6 +348,27 @@ impl ProfileStore {
             .expect("profile index lock poisoned")
             .active_id
             .clone()
+    }
+
+    pub fn contains(&self, id: &ProfileId) -> bool {
+        self.index
+            .read()
+            .expect("profile index lock poisoned")
+            .profiles
+            .iter()
+            .any(|entry| &entry.id == id)
+    }
+
+    /// Retries cleanup only after an ID is no longer authoritative in the profile index.
+    pub fn cleanup_unindexed_profile(&self, id: &ProfileId) -> Result<bool, ProfileError> {
+        if self.contains(id) {
+            return Ok(false);
+        }
+        match self.remove_profile_directory(id) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(ProfileError::Io(error)),
+        }
     }
 
     pub fn active_snapshot(&self) -> Result<Option<(ProfileId, u64, Arc<Snapshot>)>, ProfileError> {
@@ -413,6 +478,15 @@ impl ProfileStore {
         id: &ProfileId,
         snapshot: Arc<Snapshot>,
     ) -> Result<u64, ProfileError> {
+        self.replace_profile_loaded(id, snapshot)
+            .map(|(revision, _)| revision)
+    }
+
+    pub fn replace_profile_loaded(
+        &self,
+        id: &ProfileId,
+        snapshot: Arc<Snapshot>,
+    ) -> Result<(u64, Arc<Snapshot>), ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
         let profile = self.open_profile(id)?;
@@ -421,9 +495,17 @@ impl ProfileStore {
             .commit_with_generation_status((*snapshot).clone())?
             .into_parts();
         drop(store);
-        let (reloaded_generation, _) = self.load_profile(id)?;
+        let (reloaded_generation, reloaded) =
+            self.load_profile(id)
+                .map_err(|source| ProfileError::PostCommitRead {
+                    id: id.clone(),
+                    source: Box::new(source),
+                })?;
         if reloaded_generation != generation {
-            return Err(ProfileError::Unavailable(id.clone()));
+            return Err(ProfileError::PostCommitRead {
+                id: id.clone(),
+                source: Box::new(ProfileError::Unavailable(id.clone())),
+            });
         }
         match maintenance_debt {
             Some(source) => {
@@ -433,7 +515,7 @@ impl ProfileStore {
                     source,
                 })
             }
-            None => Ok(catalog_revision(id, generation)),
+            None => Ok((catalog_revision(id, generation), reloaded)),
         }
     }
 
@@ -695,6 +777,9 @@ impl ProfileStore {
     }
 
     fn load_profile(&self, id: &ProfileId) -> Result<(u64, Arc<Snapshot>), ProfileError> {
+        #[cfg(test)]
+        self.load_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(test)]
         if self
             .load_fault
@@ -1353,6 +1438,42 @@ mod tests {
         let reopened = ProfileStore::open(root.path(), None).unwrap();
         assert_eq!(reopened.active_id(), Some(second));
         assert!(!reopened.list().unwrap().iter().any(|item| item.id == first));
+    }
+
+    #[test]
+    fn loaded_enumeration_parses_each_profile_once() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        store
+            .create_profile(snapshot("https://one.invalid/sub", "One"))
+            .unwrap();
+        store
+            .create_profile(snapshot("https://two.invalid/sub", "Two"))
+            .unwrap();
+        store.load_calls.store(0, Ordering::SeqCst);
+
+        let loaded = store.list_loaded().unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|profile| profile.snapshot.is_some()));
+        assert_eq!(store.load_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn replace_load_failure_is_reported_as_committed() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        let id = store
+            .create_profile(snapshot("https://one.invalid/sub", "One"))
+            .unwrap();
+        store.inject_load_fault(id.clone());
+
+        let error = store
+            .replace_profile(&id, snapshot("https://one.invalid/sub", "Updated"))
+            .unwrap_err();
+
+        assert!(matches!(&error, ProfileError::PostCommitRead { .. }));
+        assert!(error.mutation_committed());
     }
 
     #[test]

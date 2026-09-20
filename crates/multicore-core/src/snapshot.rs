@@ -33,6 +33,21 @@ pub struct Snapshot {
     service_logo_file: Option<CapabilityFile>,
 }
 
+/// A lightweight lease that keeps a validated, app-owned service-logo file addressable.
+///
+/// On Linux the exposed path names the retained file descriptor. On Windows the retained handle
+/// prevents the validated file from being replaced while another process reads it.
+#[derive(Clone, Debug)]
+pub struct ServiceLogoLease {
+    retained: CapabilityFile,
+}
+
+impl ServiceLogoLease {
+    pub fn path(&self) -> Option<&Path> {
+        self.retained.path()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionInfo {
     pub source_host: String,
@@ -251,6 +266,13 @@ impl Snapshot {
 
     pub fn service_logo_path(&self) -> Option<&Path> {
         self.service_logo_path.as_deref()
+    }
+
+    pub fn service_logo_lease(&self) -> Option<ServiceLogoLease> {
+        self.service_logo_file
+            .as_ref()
+            .cloned()
+            .map(|retained| ServiceLogoLease { retained })
     }
 }
 

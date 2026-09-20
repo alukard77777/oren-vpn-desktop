@@ -99,6 +99,7 @@ const XRAY_BODY_CANARY: &str = "xray-body-canary";
 enum FixtureMetadata {
     Standard,
     Maximal,
+    Hostile,
 }
 
 #[derive(Clone)]
@@ -136,6 +137,13 @@ impl FixtureHttp {
             mihomo,
             xray,
             metadata: FixtureMetadata::Maximal,
+        }
+    }
+
+    fn hostile() -> Self {
+        Self {
+            metadata: FixtureMetadata::Hostile,
+            ..Self::default()
         }
     }
 }
@@ -209,6 +217,20 @@ fn metadata_headers(metadata: FixtureMetadata) -> Vec<(String, String)> {
             (
                 RAW_HEADER_NAME_CANARY.into(),
                 RAW_HEADER_VALUE_CANARY.into(),
+            ),
+        ],
+        FixtureMetadata::Hostile => vec![
+            (
+                "subscription-userinfo".into(),
+                "upload=3; download=4; total=20; expire=1792851157".into(),
+            ),
+            (
+                "profile-title".into(),
+                "Bearer token=password https://provider.invalid/raw-config".into(),
+            ),
+            (
+                "flclashx-servicelogo".into(),
+                "https://provider.invalid/private-logo.png".into(),
             ),
         ],
     }
@@ -693,6 +715,160 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
         [UA_NATIVE, UA_SERVICE_LOGO, UA_NATIVE, UA_SERVICE_LOGO]
     );
     assert!(!format!("{refreshed:?}").contains("source-password"));
+}
+
+#[tokio::test]
+async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(FixtureHttp::hostile()),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    let first = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://user:password@one.invalid/sub?token=first".into(),
+        })
+        .await
+        .unwrap();
+    let first_id = ProfileId::parse(first.active_profile_id.as_deref().unwrap()).unwrap();
+    let expected_logo = std::fs::read(
+        first
+            .subscription
+            .as_ref()
+            .unwrap()
+            .service_logo_path
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/raw-config?secret=second".into(),
+        })
+        .await
+        .unwrap();
+
+    let listed = Backend::list_subscriptions(&backend).await.unwrap();
+    assert_eq!(listed.profiles.len(), 2);
+    let inactive = &listed.profiles[0];
+    assert_eq!(inactive.id, first_id.as_str());
+    assert!(!inactive.active);
+    assert!(inactive.available);
+    assert_eq!(inactive.display_name, "one.invalid");
+    assert!(inactive.display_name.chars().count() <= 256);
+    assert_eq!(inactive.used_bytes, Some(7));
+    assert_eq!(inactive.total_bytes, Some(20));
+    let inactive_logo = inactive.service_logo_path.as_ref().unwrap().clone();
+    assert_eq!(std::fs::read(&inactive_logo).unwrap(), expected_logo);
+    assert_eq!(
+        backend
+            .retained_profile_logo_path_for_testing(&first_id)
+            .as_deref(),
+        Some(std::path::Path::new(&inactive_logo))
+    );
+
+    let serialized = serde_json::to_string(&listed).unwrap();
+    assert!(serialized.len() < 16 * 1024);
+    for forbidden in [
+        "https://",
+        "password",
+        "token",
+        "secret",
+        "raw-config",
+        MIHOMO,
+    ] {
+        assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+    }
+
+    let refreshed = Backend::refresh_subscription_profile(&backend, first_id.clone())
+        .await
+        .unwrap();
+    let refreshed_logo = refreshed.profiles[0].service_logo_path.as_ref().unwrap();
+    assert_ne!(refreshed_logo, &inactive_logo);
+    assert_eq!(std::fs::read(refreshed_logo).unwrap(), expected_logo);
+    assert_eq!(
+        backend
+            .retained_profile_logo_path_for_testing(&first_id)
+            .as_deref(),
+        Some(std::path::Path::new(refreshed_logo))
+    );
+
+    backend.delete_subscription(&first_id).await.unwrap();
+    assert_eq!(
+        backend.retained_profile_logo_path_for_testing(&first_id),
+        None
+    );
+    assert!(!std::path::Path::new(refreshed_logo).exists());
+    let after_delete = Backend::list_subscriptions(&backend).await.unwrap();
+    assert!(
+        after_delete
+            .profiles
+            .iter()
+            .all(|profile| profile.id != first_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn committed_refresh_load_failure_clears_stale_runtime_and_keeps_authoritative_id() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let imported = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    let id = ProfileId::parse(imported.active_profile_id.as_deref().unwrap()).unwrap();
+    assert!(imported.profile.is_some());
+    backend.inject_post_commit_load_fault_for_testing();
+
+    let error = Backend::refresh_subscription_profile(&backend, id.clone())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.profile_mutation(),
+        Some(ProfileMutationError::Storage)
+    );
+    let status = backend.status().await.unwrap();
+    assert_eq!(status.active_profile_id.as_deref(), Some(id.as_str()));
+    assert_eq!(status.state, ConnectionState::Empty);
+    assert_eq!(status.profile, None);
+    assert_eq!(status.current_node, None);
+    assert_eq!(status.subscription, None);
+    assert!(backend.catalog().await.unwrap().groups.is_empty());
+}
+
+#[tokio::test]
+async fn committed_import_load_failure_clears_runtime_and_keeps_new_authoritative_id() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    backend.inject_post_commit_load_fault_for_testing();
+
+    let error = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.profile_mutation(),
+        Some(ProfileMutationError::Storage)
+    );
+    let status = backend.status().await.unwrap();
+    let authoritative = status
+        .active_profile_id
+        .as_deref()
+        .expect("committed import remains authoritative");
+    assert!(ProfileId::parse(authoritative).is_ok());
+    assert_eq!(status.state, ConnectionState::Empty);
+    assert_eq!(status.profile, None);
+    assert_eq!(status.current_node, None);
+    assert_eq!(status.subscription, None);
+    assert!(backend.catalog().await.unwrap().groups.is_empty());
 }
 
 #[test]
