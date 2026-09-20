@@ -773,6 +773,7 @@ impl DesktopViewModel {
                 self.replace_profile_list(list);
                 self.profile_error = None;
                 self.profile_list_reconciliation_pending = false;
+                self.arm_profile_catalog_reconciliation();
             }
             Err(_) => {
                 self.profile_error =
@@ -1085,6 +1086,16 @@ impl DesktopViewModel {
         self.profile_status_reload_needed |= status;
         self.profile_reload_needed |= list;
         self.profile_catalog_reload_needed |= catalog;
+        self.arm_profile_catalog_reconciliation();
+    }
+
+    fn arm_profile_catalog_reconciliation(&mut self) {
+        if self.profile_catalog_reconciliation_pending
+            && !self.profile_status_reconciliation_pending
+            && !self.profile_list_reconciliation_pending
+        {
+            self.profile_catalog_reload_needed = true;
+        }
     }
 
     fn require_full_profile_reconciliation(&mut self) {
@@ -1124,11 +1135,9 @@ impl DesktopViewModel {
         let profile_id = profile_id.as_deref().and_then(safe_profile_id);
         if self.active_profile_id != profile_id {
             self.invalidate_profile_runtime();
-            if self.profile_catalog_reconciliation_pending {
-                self.profile_catalog_reload_needed = true;
-            }
             self.active_profile_id = profile_id;
             self.sync_profile_active_flags();
+            self.arm_profile_catalog_reconciliation();
         }
     }
 
@@ -1432,7 +1441,9 @@ impl DesktopViewModel {
         self.state = match result {
             Ok(status) => {
                 self.profile_status_reconciliation_pending = false;
-                self.apply_daemon_status(status)
+                let state = self.apply_daemon_status(status);
+                self.arm_profile_catalog_reconciliation();
+                state
             }
             Err(error) => {
                 if self.profile_status_reconciliation_pending {
@@ -1466,8 +1477,6 @@ impl DesktopViewModel {
                 self.profile_error = None;
                 self.profile_reload_needed = true;
                 self.profile_catalog_reload_needed = true;
-                self.profile_list_reconciliation_pending = true;
-                self.profile_catalog_reconciliation_pending = true;
                 self.state = self.apply_profile_changing_status(status);
                 self.import_error = None;
             }
@@ -1710,7 +1719,12 @@ impl DesktopViewModel {
     }
 
     pub(crate) fn begin_catalog_request(&mut self) -> Option<CatalogRequest> {
-        if self.catalog_request_pending.is_some() || self.profile_mutation_pending() {
+        if self.catalog_request_pending.is_some()
+            || self.profile_mutation_pending()
+            || (self.profile_catalog_reconciliation_pending
+                && (self.profile_status_reconciliation_pending
+                    || self.profile_list_reconciliation_pending))
+        {
             return None;
         }
         if self.active_selection.is_some() {
@@ -3090,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn import_success_invalidates_old_profile_workers_and_requires_a_list_reload() {
+    fn import_success_exposes_reload_intents_without_gating_the_current_shell() {
         let mut model = model_with_profiles();
         let old_catalog = model.begin_catalog_request().expect("old catalog request");
         let import = model
@@ -3119,6 +3133,19 @@ mod tests {
             Some("profile-new")
         );
         assert!(model.take_profile_list_reload_needed());
+        assert!(model.take_profile_catalog_reload_needed());
+        assert!(!model.profile_reconciliation_required());
+        assert!(model.presentation().primary_enabled);
+        assert!(model.begin_primary_action().is_some());
+
+        let main = include_str!("main.rs");
+        let import_worker = main
+            .split("fn run_import(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_connect(").next())
+            .expect("run_import source");
+        assert!(import_worker.contains("model.finish_import(mutation, result)"));
+        assert!(!import_worker.contains("begin_profile_list"));
     }
 
     #[test]
@@ -3169,6 +3196,7 @@ mod tests {
         assert!(model.take_profile_status_reload_needed());
         assert!(model.take_profile_list_reload_needed());
         assert!(model.take_profile_catalog_reload_needed());
+        assert!(model.begin_catalog_request().is_none());
         assert!(model.profile_reconciliation_required());
         assert!(model.begin_primary_action().is_none());
         assert!(model.begin_profile_activation("profile-b").is_none());
@@ -3240,6 +3268,74 @@ mod tests {
             Err(DaemonError::ambiguous("unsafe delete transport details")),
         ));
         assert_full_profile_reconciliation_required(&mut deletion);
+    }
+
+    #[test]
+    fn ambiguous_profile_reconciliation_sequences_catalog_after_status_and_list_in_every_order() {
+        const ORDERS: [[&str; 3]; 6] = [
+            ["status", "list", "catalog"],
+            ["status", "catalog", "list"],
+            ["list", "status", "catalog"],
+            ["list", "catalog", "status"],
+            ["catalog", "status", "list"],
+            ["catalog", "list", "status"],
+        ];
+
+        for order in ORDERS {
+            let mut model = model_with_profiles();
+            let mutation = model
+                .begin_profile_activation("profile-b")
+                .expect("activation");
+            assert!(!model.finish_profile_activation(
+                mutation,
+                Err(DaemonError::ambiguous("unsafe transport details")),
+            ));
+            assert!(model.take_profile_catalog_reload_needed());
+
+            let status = model.begin_refresh();
+            let list = model.begin_profile_list().expect("profile list");
+            let mut catalog_finished = false;
+            for phase in order {
+                match phase {
+                    "status" => model.finish_refresh(
+                        status,
+                        Ok(DaemonStatus {
+                            state: "ready".into(),
+                            active_profile_id: Some("profile-b".into()),
+                            profile: Some("Beta".into()),
+                            ..DaemonStatus::default()
+                        }),
+                    ),
+                    "list" => {
+                        assert!(model.finish_profile_list(
+                            list,
+                            Ok(profile_list(
+                                Some("profile-b"),
+                                vec![profile("profile-b", true, "Beta")],
+                            )),
+                        ));
+                    }
+                    "catalog" => {
+                        if let Some(request) = model.begin_catalog_request() {
+                            model.finish_catalog(request.token, Ok(catalog_fixture()));
+                            catalog_finished = true;
+                        }
+                    }
+                    _ => unreachable!("fixed reconciliation phase"),
+                }
+            }
+
+            if !catalog_finished {
+                assert!(model.take_profile_catalog_reload_needed());
+                let request = model
+                    .begin_catalog_request()
+                    .expect("catalog is armed after status and list");
+                model.finish_catalog(request.token, Ok(catalog_fixture()));
+            }
+            assert!(!model.catalog_presentation().groups.is_empty(), "{order:?}");
+            assert!(!model.profile_reconciliation_required(), "{order:?}");
+            assert!(model.presentation().primary_enabled, "{order:?}");
+        }
     }
 
     #[test]
