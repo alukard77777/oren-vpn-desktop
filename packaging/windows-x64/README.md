@@ -31,13 +31,16 @@ Build the updater asset for the official anonymous channel with:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -DestinationPath dist\multicore-windows-x64 `
-  -UpdateRepository fatyzzz/multicore `
+  -UpdateRepository fatyzzz/multicore-releases `
   -ReleaseAssetPath dist\release\multicore-windows-x64.zip
 ```
 
 The updater accepts the latest public, non-draft `vX.Y.Z` GitHub Release, requires
 the asset name `multicore-windows-x64.zip` and GitHub `sha256:` digest, then also
 verifies this package's internal checksums before replacing the full bundle.
+The application source repository is private; the public release-only repository
+contains binary releases so installed clients can update anonymously without an
+embedded GitHub credential.
 
 This preview is not Authenticode-signed, and its elevated binaries are stored in
 a user-writable directory. Do not publish it as a stable production update.

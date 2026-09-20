@@ -5199,13 +5199,19 @@ mod tests {
     #[test]
     fn home_background_is_bounded_pausable_and_non_interactive() {
         let source = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
 
         for required in [
             "in-out property <bool> ambient-background-enabled",
             "in-out property <bool> shell-active",
             "in property <bool> reduced-motion",
             "wave-timer := Timer",
-            "running: root.ambient-background-enabled && root.shell-active && !root.reduced-motion",
+            "wave-kickoff := Timer",
+            "private property <bool> ambient-wave-started: false",
+            "running: root.ambient-motion-active && !root.ambient-wave-started",
+            "interval: 80ms",
+            "root.ambient-wave-started = true",
+            "root.ambient-wave-phase = !root.ambient-wave-phase",
             "private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == \"home\"",
             "interval: 12s",
         ] {
@@ -5243,39 +5249,64 @@ mod tests {
             .and_then(|source| source.split("ambient-wave-b := Path {").next())
             .expect("wave A block");
         for required in [
-            "x: root.ambient-wave-phase ? -26px : -44px;",
-            "y: root.ambient-wave-phase ? 58px : 76px;",
+            "x: root.ambient-wave-phase ? -12px : -48px;",
+            "y: root.ambient-wave-phase ? 48px : 76px;",
             "opacity: 0.026;",
             "animate x { duration: 12000ms; easing: ease-in-out; }",
             "animate y { duration: 12000ms; easing: ease-in-out; }",
         ] {
             assert!(wave_a.contains(required), "wave A missing: {required}");
         }
-        let wave_a_delta = (18_i32, 18_i32);
-        assert!(wave_a_delta.0.abs() <= 20 && wave_a_delta.1.abs() <= 20);
-
         let wave_b = source
             .split("ambient-wave-b := Path {")
             .nth(1)
             .and_then(|source| source.split("VerticalLayout {").next())
             .expect("wave B block");
         for required in [
-            "x: root.ambient-wave-phase ? -48px : -30px;",
-            "y: root.ambient-wave-phase ? 282px : 264px;",
+            "x: root.ambient-wave-phase ? -58px : -22px;",
+            "y: root.ambient-wave-phase ? 288px : 254px;",
             "opacity: 0.018;",
             "animate x { duration: 12000ms; easing: ease-in-out; }",
             "animate y { duration: 12000ms; easing: ease-in-out; }",
         ] {
             assert!(wave_b.contains(required), "wave B missing: {required}");
         }
-        let wave_b_delta = (18_i32, 18_i32);
-        assert!(wave_b_delta.0.abs() <= 20 && wave_b_delta.1.abs() <= 20);
+        assert!(source.contains("background: root.status-tone == \"success\" ? #101a16 : root.status-tone == \"danger\" ? #1a1215 : #101721;"));
+        assert!(components.contains("background: root.selected ? #172433 : Theme.surface;"));
         assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
         assert!(home_layer.contains("ambient-touch.mouse-x"));
         assert!(home_layer.contains("ambient-touch.mouse-y"));
         for cursor in ["ns-resize", "ew-resize", "nwse-resize", "nesw-resize"] {
             assert!(source.contains(&format!("mouse-cursor: {cursor};")));
         }
+    }
+
+    #[test]
+    fn status_and_settings_keep_stable_bottom_rhythm_and_build_identity() {
+        let source = include_str!("../ui/app.slint");
+        let status = source
+            .split("if root.visible-page == \"status\": Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("if root.visible-page == \"settings\"").next())
+            .expect("status page block");
+        for padding in [
+            "padding-left: 28px;",
+            "padding-right: 28px;",
+            "padding-top: 28px;",
+            "padding-bottom: 40px;",
+        ] {
+            assert!(status.contains(padding), "status missing {padding}");
+        }
+
+        assert_eq!(
+            source
+                .matches("MultiCore · Mihomo 1.19.30 · Xray 26.9.9")
+                .count(),
+            1
+        );
+        assert!(source.contains(
+            "if root.visible-page == \"settings\": Text { height: 24px; text: \"MultiCore · Mihomo 1.19.30 · Xray 26.9.9\";"
+        ));
     }
 
     #[test]

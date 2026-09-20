@@ -22,12 +22,13 @@ foreach ($token in @(
     'tags:',
     "- 'v*'",
     'permissions:',
-    'contents: write',
+    'contents: read',
     'runs-on: windows-latest',
     'cargo test --workspace --all-targets --locked',
     'cargo clippy --workspace --all-targets --locked -- -D warnings',
     '-AssertReleaseReady',
-    '-UpdateRepository fatyzzz/multicore',
+    'GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}',
+    '-UpdateRepository fatyzzz/multicore-releases',
     'multicore-windows-x64.zip',
     'MultiCore-Setup-x64.exe',
     'test-windows-installer-contract.ps1',
@@ -46,6 +47,7 @@ foreach ($token in @(
     'Xray-core-source.zip',
     'mihomo-source.zip',
     'gh release create',
+    '--repo fatyzzz/multicore-releases',
     '--draft',
     'Create unsigned preview as draft',
     'Keep this release as a draft'
@@ -55,6 +57,7 @@ foreach ($token in @(
 
 Assert-True (-not $workflow.Contains('pull_request_target')) 'release workflow must not run in pull_request_target'
 Assert-True (-not $workflow.Contains('MULTICORE_DAEMON_TOKEN')) 'release workflow must not embed runtime secrets'
+Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-repository release must not use the source repository token'
 Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must not publish the draft release'
 Assert-True (-not $workflow.Contains('--draft=false')) 'unsigned workflow must not clear draft state'
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'

@@ -2,7 +2,7 @@ param(
     [string]$OutputDirectory = "artifacts/screenshots",
     [int]$Port = 18787,
     [string]$DesktopExecutablePath,
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
     [string[]]$OnlyScenario
 )
 
@@ -65,6 +65,7 @@ $scenarios = @(
     @{ Name = "selection-pending"; State = "connected"; Width = 820; Height = 760; SelectionDelay = 5000; SelectRoute = $true; OpenDiagnostics = $false; OpenSettings = $false },
     @{ Name = "diagnostics"; State = "connected"; Width = 900; Height = 760; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $true; OpenSettings = $false },
     @{ Name = "settings"; State = "ready"; Width = 820; Height = 760; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $false; OpenSettings = $true },
+    @{ Name = "settings-updates"; State = "ready"; Width = 820; Height = 760; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $false; OpenSettings = $true; OpenUpdates = $true },
     @{ Name = "profiles-empty-small"; State = "ready"; ProfileState = "empty"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
     @{ Name = "profiles-one-small"; State = "ready"; ProfileState = "one"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
     @{ Name = "profiles-many-small"; State = "ready"; ProfileState = "many"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
@@ -135,6 +136,7 @@ foreach ($scenario in $scenarios) {
         if ($scenario.ContainsKey("HoverConnection") -and $scenario.HoverConnection) { $captureArgs += "-HoverConnection" }
         if ($scenario.OpenDiagnostics) { $captureArgs += "-OpenDiagnostics" }
         if ($scenario.OpenSettings) { $captureArgs += "-OpenSettings" }
+        if ($scenario.ContainsKey("OpenUpdates") -and $scenario.OpenUpdates) { $captureArgs += "-OpenUpdates" }
         if ($scenario.ContainsKey("OpenProfiles") -and $scenario.OpenProfiles) { $captureArgs += "-OpenProfiles" }
         if ($scenario.ContainsKey("OpenSubscriptionSettings") -and $scenario.OpenSubscriptionSettings) { $captureArgs += "-OpenSubscriptionSettings" }
         if ($scenario.ContainsKey("ExpandProfile") -and $scenario.ExpandProfile) { $captureArgs += "-ExpandProfile" }

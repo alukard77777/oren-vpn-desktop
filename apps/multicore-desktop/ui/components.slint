@@ -158,7 +158,7 @@ export component QuietChip inherits Rectangle {
     min-height: Theme.interactive-min;
     preferred-width: chip-label.preferred-width + Theme.space-3 * 2 + (root.icon == "" ? 0px : 22px);
     preferred-height: Theme.interactive-min;
-    background: root.selected ? #4c9dff1f : #ffffff08;
+    background: root.selected ? #172433 : Theme.surface;
     border-color: chip-focus.has-focus ? Theme.focus : root.selected ? #4c9dff66 : #ffffff12;
     border-width: chip-focus.has-focus ? Theme.focus-width : 1px;
     border-radius: 14px;
@@ -257,7 +257,7 @@ export component RouteNodeRow inherits Rectangle {
     min-height: Theme.interactive-min;
     preferred-height: 46px;
     max-height: 46px;
-    background: root.selected ? #4c9dff17 : #ffffff06;
+    background: root.selected ? #172433 : Theme.surface;
     border-color: row-focus.has-focus ? Theme.focus : root.selected ? #4c9dff59 : #ffffff12;
     border-width: row-focus.has-focus ? Theme.focus-width : 1px;
     border-radius: 14px;

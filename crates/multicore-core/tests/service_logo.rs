@@ -231,6 +231,45 @@ impl HttpClient for LogoHttp {
     }
 }
 
+#[derive(Clone)]
+struct VendorLogoHttp {
+    calls: Arc<Mutex<Vec<(String, &'static str)>>>,
+}
+
+impl HttpClient for VendorLogoHttp {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        user_agent: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_owned(), user_agent));
+            if user_agent == UA_NATIVE {
+                Ok(HttpResponse::new(
+                    200,
+                    bundle(),
+                    [
+                        ("ajsdjddj-servicelogo", "https://logos.example/vendor.png"),
+                        (
+                            "ajsdjddj-background",
+                            "https://logos.example/must-ignore.png",
+                        ),
+                    ],
+                ))
+            } else {
+                Ok(HttpResponse::new(
+                    200,
+                    encoded(ImageFormat::Png),
+                    [] as [(&str, &str); 0],
+                ))
+            }
+        })
+    }
+}
+
 fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "multicore-service-logo-{name}-{}-{}",
@@ -290,6 +329,35 @@ async fn valid_native_bundle_is_terminal_and_fetches_logo_once_after_parsing() {
     );
     drop(reopened_snapshot);
     drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn arbitrary_vendor_prefix_is_accepted_only_for_safe_service_logo_suffix() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let root = temp_root("vendor-prefix");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    let snapshot = SubscriptionFetcher::new(VendorLogoHttp {
+        calls: calls.clone(),
+    })
+    .refresh("https://subscription.example/private", &store)
+    .await
+    .unwrap();
+
+    assert!(snapshot.service_logo_path().is_some());
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[
+            ("https://subscription.example/private".to_owned(), UA_NATIVE),
+            (
+                "https://logos.example/vendor.png".to_owned(),
+                UA_SERVICE_LOGO
+            ),
+        ]
+    );
+
+    drop(snapshot);
+    drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
 

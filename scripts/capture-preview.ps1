@@ -8,12 +8,13 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Height,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
     [string]$ExpectedState,
     [switch]$HoverConnection,
     [switch]$SelectSecondRoute,
     [switch]$OpenDiagnostics,
     [switch]$OpenSettings,
+    [switch]$OpenUpdates,
     [switch]$OpenProfiles,
     [switch]$OpenSubscriptionSettings,
     [switch]$ExpandProfile,
@@ -290,7 +291,7 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
         }
     }
 
-    if ($ExpectedState -notin @("empty", "settings")) {
+    if ($ExpectedState -notin @("empty", "settings", "settings-updates")) {
         $routeTop = [Math]::Min(400, $Bitmap.Height - 120)
         if ((Get-BrightPixelCount $Bitmap 20 $routeTop ($Bitmap.Width - 20) ($Bitmap.Height - 12)) -lt 35) {
             $Failure.Value = "missing populated route-region text"
@@ -344,6 +345,7 @@ function Save-Preview([IntPtr]$Handle) {
     $directory = Split-Path -Parent $OutputPath
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
     $requiredStableFrames = 2
+    $allowsAmbientMotion = $ExpectedState -in @("ready", "glow-hover", "connected", "populated-catalog", "announcement", "selection-pending")
     $stableFrames = 0
     $previousSignature = ""
     $lastFailure = "no frame rendered"
@@ -382,7 +384,9 @@ function Save-Preview([IntPtr]$Handle) {
             }
 
             $signature = Get-PreviewFrameSignature $bitmap
-            if ($signature -eq $previousSignature) {
+            if ($allowsAmbientMotion) {
+                $stableFrames++
+            } elseif ($signature -eq $previousSignature) {
                 $stableFrames++
             } else {
                 $previousSignature = $signature
@@ -422,6 +426,9 @@ try {
     }
     if ($OpenSettings) {
         Click-Preview $handle 88 226
+    }
+    if ($OpenUpdates) {
+        Click-Preview $handle 250 190
     }
     if ($OpenProfiles) {
         # The shelf body ends before the nested refresh target on the right.

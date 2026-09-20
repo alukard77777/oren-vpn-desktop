@@ -112,15 +112,27 @@ impl SubscriptionMetadataHeaders {
             })
             .map(|(_, value)| value.as_str())
     }
+
+    pub(crate) fn vendor_suffix_values<'a>(
+        &'a self,
+        suffix: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.fields
+            .iter()
+            .filter(move |(candidate, _)| {
+                candidate
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('-'))
+            })
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 fn is_metadata_header(name: &str) -> bool {
     matches!(
         name,
         "profile-title"
-            | "flclashx-servicename"
             | "content-disposition"
-            | "flclashx-servicelogo"
             | "profile-update-interval"
             | "profile-web-page-url"
             | "support-url"
@@ -133,7 +145,10 @@ fn is_metadata_header(name: &str) -> bool {
             | "sub-info-button-text"
             | "banner-button-text"
             | "sub-info-color"
-    ) || name == "subscription-userinfo"
+    ) || ["servicename", "servicelogo"].iter().any(|suffix| {
+        name.strip_suffix(suffix)
+            .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('-'))
+    }) || name == "subscription-userinfo"
         || name.ends_with("-subscription-userinfo")
 }
 

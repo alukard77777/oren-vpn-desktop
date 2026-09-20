@@ -440,6 +440,7 @@ export component AppWindow inherits Window {
     in-out property <bool> shell-active: true;
     in property <bool> reduced-motion: false;
     private property <bool> ambient-wave-phase: false;
+    private property <bool> ambient-wave-started: false;
     private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
     in-out property <bool> replace-editor-open: false;
     in-out property <int> import-success-serial: 0;
@@ -492,10 +493,25 @@ export component AppWindow inherits Window {
     callback window-close();
     callback update-action();
 
+    wave-kickoff := Timer {
+        interval: 80ms;
+        running: root.ambient-motion-active && !root.ambient-wave-started;
+        triggered => {
+            root.ambient-wave-started = true;
+            root.ambient-wave-phase = !root.ambient-wave-phase;
+        }
+    }
+
     wave-timer := Timer {
         interval: 12s;
-        running: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
+        running: root.ambient-motion-active && root.ambient-wave-started;
         triggered => { root.ambient-wave-phase = !root.ambient-wave-phase; }
+    }
+
+    changed ambient-motion-active => {
+        if (!root.ambient-motion-active) {
+            root.ambient-wave-started = false;
+        }
     }
 
     changed import-success-serial => {
@@ -644,8 +660,8 @@ export component AppWindow inherits Window {
 
                 ambient-wave-a := Path {
                     visible: root.ambient-background-enabled;
-                    x: root.ambient-wave-phase ? -26px : -44px;
-                    y: root.ambient-wave-phase ? 58px : 76px;
+                    x: root.ambient-wave-phase ? -12px : -48px;
+                    y: root.ambient-wave-phase ? 48px : 76px;
                     width: parent.width + 76px;
                     height: 210px;
                     viewbox-width: 1000;
@@ -659,8 +675,8 @@ export component AppWindow inherits Window {
 
                 ambient-wave-b := Path {
                     visible: root.ambient-background-enabled;
-                    x: root.ambient-wave-phase ? -48px : -30px;
-                    y: root.ambient-wave-phase ? 282px : 264px;
+                    x: root.ambient-wave-phase ? -58px : -22px;
+                    y: root.ambient-wave-phase ? 288px : 254px;
                     width: parent.width + 76px;
                     height: 240px;
                     viewbox-width: 1000;
@@ -678,7 +694,7 @@ export component AppWindow inherits Window {
 
                     connection-strip := Rectangle {
                         height: 96px;
-                        background: root.status-tone == "success" ? #3ccb7f0b : root.status-tone == "danger" ? #f06a6a0a : #4c9dff09;
+                        background: root.status-tone == "success" ? #101a16 : root.status-tone == "danger" ? #1a1215 : #101721;
                         border-color: root.status-tone == "success" ? #3ccb7f66 : root.status-tone == "danger" ? #f06a6a66 : #4c9dff55;
                         border-width: 1px;
                         border-radius: 18px;
@@ -945,7 +961,7 @@ export component AppWindow inherits Window {
 
                     if root.subscription-announcement-text != "": Rectangle {
                         height: 44px;
-                        background: root.subscription-announcement-tone == "danger" ? #f06a6a12 : root.subscription-announcement-tone == "success" ? #3ccb7f12 : #4c9dff12;
+                        background: root.subscription-announcement-tone == "danger" ? #211619 : root.subscription-announcement-tone == "success" ? #13231b : #131d29;
                         border-radius: 12px;
                         border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
                         border-width: 1px;
@@ -1059,7 +1075,10 @@ export component AppWindow inherits Window {
             if root.visible-page == "status": Rectangle {
                 background: transparent;
                 VerticalLayout {
-                    padding: 28px;
+                    padding-left: 28px;
+                    padding-right: 28px;
+                    padding-top: 28px;
+                    padding-bottom: 40px;
                     spacing: 16px;
                     HorizontalLayout {
                         height: 34px;
@@ -1175,7 +1194,6 @@ export component AppWindow inherits Window {
                             }
                             if root.preference-error != "": Text { height: 34px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             Rectangle { vertical-stretch: 1; background: transparent; }
-                            Text { height: 24px; text: "MultiCore · Mihomo 1.19.30 · Xray 26.9.9"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
                         }
 
                         if root.visible-page == "settings" && root.settings-section == "updates": VerticalLayout {
@@ -1196,6 +1214,8 @@ export component AppWindow inherits Window {
                             }
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
+
+                        if root.visible-page == "settings": Text { height: 24px; text: "MultiCore · Mihomo 1.19.30 · Xray 26.9.9"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
 
                         if root.visible-page == "subscriptions": VerticalLayout {
                             spacing: 12px;

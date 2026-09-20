@@ -322,7 +322,7 @@ impl ParsedSubscriptionMetadata {
     fn parse(headers: &SubscriptionMetadataHeaders) -> Self {
         let mut metadata = Self {
             title: first_decoded_text(headers, "profile-title", 128, true)
-                .or_else(|| first_decoded_text(headers, "flclashx-servicename", 128, true))
+                .or_else(|| first_vendor_decoded_text(headers, "servicename", 128, true))
                 .or_else(|| content_disposition_title(headers)),
             ..Self::default()
         };
@@ -351,7 +351,7 @@ impl ParsedSubscriptionMetadata {
             true,
             false,
         );
-        metadata.targets.logo_url = first_url(headers, &["flclashx-servicelogo"], false, true);
+        metadata.targets.logo_url = first_vendor_url(headers, "servicelogo", false, true);
         metadata
     }
 
@@ -422,6 +422,22 @@ fn first_decoded_text(
     reject_credential_like: bool,
 ) -> Option<String> {
     headers.values(name).find_map(|value| {
+        let decoded = decode_text(value)?;
+        if reject_credential_like {
+            sanitize_title_candidate(&decoded, limit)
+        } else {
+            sanitize_text(&decoded, limit)
+        }
+    })
+}
+
+fn first_vendor_decoded_text(
+    headers: &SubscriptionMetadataHeaders,
+    suffix: &str,
+    limit: usize,
+    reject_credential_like: bool,
+) -> Option<String> {
+    headers.vendor_suffix_values(suffix).find_map(|value| {
         let decoded = decode_text(value)?;
         if reject_credential_like {
             sanitize_title_candidate(&decoded, limit)
@@ -568,6 +584,17 @@ fn first_url(
             .values(name)
             .find_map(|value| validate_url(value, allow_tg, https_only))
     })
+}
+
+fn first_vendor_url(
+    headers: &SubscriptionMetadataHeaders,
+    suffix: &str,
+    allow_tg: bool,
+    https_only: bool,
+) -> Option<String> {
+    headers
+        .vendor_suffix_values(suffix)
+        .find_map(|value| validate_url(value, allow_tg, https_only))
 }
 
 fn validate_url(value: &str, allow_tg: bool, https_only: bool) -> Option<String> {

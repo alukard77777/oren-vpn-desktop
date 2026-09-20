@@ -99,13 +99,17 @@ Core diagnostics are bounded and redacted before they are exposed through the
 authenticated local API and UI. The current elevated-host path retains them in
 memory; it does not promise a persistent `latest-core.log`.
 
-Updater builds are pinned to the public repository `fatyzzz/multicore`. The
+Updater builds are pinned to the public release-only repository
+`fatyzzz/multicore-releases`. The
 client reads the latest non-draft `vX.Y.Z` GitHub Release anonymously and expects
 `multicore-windows-x64.zip` with GitHub's SHA-256 asset digest. It then verifies
 the archive's internal `SHA256SUMS.txt`, stages a sibling directory, swaps the
 complete bundle transactionally, and relaunches the client. Updates are blocked
 while connected. A private repository or private release is incompatible with
-anonymous update checks.
+anonymous update checks, so source remains private while release assets remain
+public. The private source workflow needs a dedicated least-privilege
+`RELEASES_TOKEN` Actions secret with permission to create releases in the public
+release repository; the token is never embedded in the client.
 
 ## Build, verify, and package
 
@@ -130,7 +134,7 @@ Create the verified portable bundle and updater asset:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -DestinationPath dist\multicore-windows-x64 `
-  -UpdateRepository fatyzzz/multicore `
+  -UpdateRepository fatyzzz/multicore-releases `
   -ReleaseAssetPath dist\release\multicore-windows-x64.zip
 ```
 

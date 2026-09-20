@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -19,7 +19,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-msvc
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
 
     steps:
       - name: Checkout tagged source
@@ -30,6 +30,13 @@ jobs:
       - name: Enforce privileged broker release gate
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady
+
+      - name: Require dedicated release credential
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw 'RELEASES_TOKEN is required to publish into fatyzzz/multicore-releases'
+          }
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -67,7 +74,7 @@ jobs:
         run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
             -DestinationPath dist/release/multicore-windows-x64 `
-            -UpdateRepository fatyzzz/multicore `
+            -UpdateRepository fatyzzz/multicore-releases `
             -ReleaseAssetPath dist/release/multicore-windows-x64.zip
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
             -DesktopExecutablePath dist/release/multicore-windows-x64/MultiCore.exe `
@@ -147,6 +154,8 @@ jobs:
           @"
           MultiCore $env:APP_VERSION for Windows x64.
 
+          Source commit: $env:GITHUB_SHA (private source repository).
+
           - `MultiCore-Setup-x64.exe` — per-user installer.
           - `multicore-windows-x64.zip` — verified portable bundle and updater asset.
           - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
@@ -166,7 +175,8 @@ jobs:
             'dist/release/RELEASE-SHA256SUMS.txt'
           )
           gh release create $env:GITHUB_REF_NAME @assets `
-            --verify-tag `
+            --repo fatyzzz/multicore-releases `
+            --target main `
             --draft `
             --title "MultiCore $env:APP_VERSION" `
             --notes-file dist/release/RELEASE_NOTES.md
