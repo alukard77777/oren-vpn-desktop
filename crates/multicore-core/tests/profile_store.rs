@@ -1,6 +1,9 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use multicore_core::{MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, ProfileError, ProfileStore, Snapshot};
+use multicore_core::{
+    MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, MAX_SELECTIONS, PersistentSnapshotStore, ProfileError,
+    ProfileStore, Snapshot,
+};
 
 #[cfg(windows)]
 use std::path::Path;
@@ -193,7 +196,7 @@ fn create_replace_activate_delete_and_exact_lookup_stay_isolated() {
             snapshot("https://same.invalid/sub?a=1", "FirstUpdated"),
         )
         .unwrap();
-    assert_eq!(generation, 2);
+    assert_ne!(generation, 0);
     assert_eq!(
         store
             .active_snapshot()
@@ -215,6 +218,250 @@ fn create_replace_activate_delete_and_exact_lookup_stay_isolated() {
     assert!(profiles.join(second.as_str()).exists());
     assert_eq!(store.delete(&second).unwrap(), None);
     assert_eq!(store.active_id(), None);
+}
+
+#[test]
+fn legacy_generation_migrates_offline_and_remains_as_rollback_material() {
+    let root = TempDirectory::new();
+    let legacy = root.path().join("snapshots");
+    let expected = snapshot("https://legacy.invalid/secret", "Legacy");
+    PersistentSnapshotStore::open(&legacy)
+        .unwrap()
+        .commit((*expected).clone())
+        .unwrap();
+
+    let store = ProfileStore::open(root.profiles(), Some(legacy.clone())).unwrap();
+    let (_, revision, migrated) = store.active_snapshot().unwrap().unwrap();
+    assert_ne!(revision, 0);
+    assert_eq!(
+        migrated.subscription_source_url(),
+        Some("https://legacy.invalid/secret")
+    );
+    assert_eq!(migrated.subscription_info(), expected.subscription_info());
+    assert_eq!(migrated.mihomo.raw_yaml(), expected.mihomo.raw_yaml());
+    assert_eq!(migrated.xray.raw_bytes(), expected.xray.raw_bytes());
+    assert!(legacy.join("snapshot-00000000000000000001").is_dir());
+}
+
+#[test]
+fn migration_is_idempotent_and_an_existing_index_wins() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let first_legacy = root.path().join("legacy-one");
+    PersistentSnapshotStore::open(&first_legacy)
+        .unwrap()
+        .commit((*snapshot("https://legacy.invalid/one", "One")).clone())
+        .unwrap();
+    let first = ProfileStore::open(&profiles, Some(first_legacy)).unwrap();
+    let id = first.active_id().unwrap();
+    drop(first);
+
+    let second_legacy = root.path().join("legacy-two");
+    PersistentSnapshotStore::open(&second_legacy)
+        .unwrap()
+        .commit((*snapshot("https://legacy.invalid/two", "Two")).clone())
+        .unwrap();
+    let reopened = ProfileStore::open(&profiles, Some(second_legacy)).unwrap();
+    assert_eq!(reopened.active_id(), Some(id));
+    assert_eq!(reopened.list().unwrap().len(), 1);
+    assert_eq!(
+        reopened
+            .active_snapshot()
+            .unwrap()
+            .unwrap()
+            .2
+            .subscription_source_url(),
+        Some("https://legacy.invalid/one")
+    );
+}
+
+#[test]
+fn invalid_existing_index_is_not_replaced_from_legacy() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    fs::create_dir(&profiles).unwrap();
+    fs::write(profiles.join("index.json"), b"{broken").unwrap();
+    let before = fs::read(profiles.join("index.json")).unwrap();
+    let legacy = root.path().join("legacy");
+    PersistentSnapshotStore::open(&legacy)
+        .unwrap()
+        .commit((*snapshot("https://legacy.invalid/sub", "Legacy")).clone())
+        .unwrap();
+
+    assert!(matches!(
+        ProfileStore::open(&profiles, Some(legacy)),
+        Err(ProfileError::InvalidIndex(_))
+    ));
+    assert_eq!(fs::read(profiles.join("index.json")).unwrap(), before);
+    assert_eq!(fs::read_dir(&profiles).unwrap().count(), 2);
+}
+
+#[test]
+fn inactive_snapshot_access_does_not_activate_and_revisions_are_profile_scoped() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    let first = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    let second = store
+        .create_profile(snapshot("https://two.invalid/sub", "Two"))
+        .unwrap();
+    let active = store.active_id();
+    let (first_revision, first_snapshot) = store.profile_snapshot(&first).unwrap();
+    let (second_revision, _) = store.profile_snapshot(&second).unwrap();
+    assert_eq!(store.active_id(), active);
+    assert_eq!(first_snapshot.mihomo.proxy_names(), &["One"]);
+    assert_ne!(first_revision, 0);
+    assert_ne!(first_revision, second_revision);
+    drop(store);
+
+    let reopened = ProfileStore::open(&profiles, None).unwrap();
+    assert_eq!(reopened.profile_snapshot(&first).unwrap().0, first_revision);
+}
+
+#[test]
+fn selections_are_isolated_filtered_and_reset_on_revision_change_or_corruption() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    let first = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    let second = store
+        .create_profile(snapshot("https://two.invalid/sub", "Two"))
+        .unwrap();
+    let revision = store.profile_snapshot(&first).unwrap().0;
+    store
+        .save_selection(&first, revision, "group-a", "node-b")
+        .unwrap();
+    store
+        .save_selection(&first, revision, "group-c", "node-d")
+        .unwrap();
+    let catalog: &[(&str, &[&str])] = &[
+        ("group-a", &["node-b", "node-c"]),
+        ("group-c", &["missing"]),
+    ];
+    assert_eq!(
+        store.valid_selections(&first, revision, catalog).unwrap()["group-a"],
+        "node-b"
+    );
+    assert_eq!(
+        store
+            .valid_selections(&first, revision, catalog)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .valid_selections(&second, revision, catalog)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .valid_selections(&first, revision.wrapping_add(1), catalog)
+            .unwrap()
+            .is_empty()
+    );
+
+    fs::write(
+        profiles.join(first.as_str()).join("selections.json"),
+        b"{broken",
+    )
+    .unwrap();
+    assert!(
+        store
+            .valid_selections(&first, revision, catalog)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn selection_bounds_are_checked_before_existing_data_changes() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    let id = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    let revision = store.profile_snapshot(&id).unwrap().0;
+    for index in 0..MAX_SELECTIONS {
+        store
+            .save_selection(
+                &id,
+                revision,
+                &format!("group-{index:02}"),
+                &format!("node-{index:02}"),
+            )
+            .unwrap();
+    }
+    let path = profiles.join(id.as_str()).join("selections.json");
+    let before = fs::read(&path).unwrap();
+    assert!(matches!(
+        store.save_selection(&id, revision, "overflow", "node"),
+        Err(ProfileError::InvalidSelection(_))
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    for invalid in ["", "space id", "slash/id", "back\\slash", "\u{7f}"] {
+        assert!(matches!(
+            store.save_selection(&id, revision, invalid, "node"),
+            Err(ProfileError::InvalidSelection(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn concurrent_selection_saves_preserve_every_group() {
+    let root = TempDirectory::new();
+    let store = Arc::new(ProfileStore::open(root.profiles(), None).unwrap());
+    let id = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    let revision = store.profile_snapshot(&id).unwrap().0;
+    let mut threads = Vec::new();
+    for index in 0..16 {
+        let store = Arc::clone(&store);
+        let id = id.clone();
+        threads.push(std::thread::spawn(move || {
+            store
+                .save_selection(
+                    &id,
+                    revision,
+                    &format!("group-{index:02}"),
+                    &format!("node-{index:02}"),
+                )
+                .unwrap();
+        }));
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let groups = (0..16)
+        .map(|index| format!("group-{index:02}"))
+        .collect::<Vec<_>>();
+    let nodes = (0..16)
+        .map(|index| format!("node-{index:02}"))
+        .collect::<Vec<_>>();
+    let catalog_storage = groups
+        .iter()
+        .zip(&nodes)
+        .map(|(group, node)| (group.as_str(), vec![node.as_str()]))
+        .collect::<Vec<_>>();
+    let catalog = catalog_storage
+        .iter()
+        .map(|(group, nodes)| (*group, nodes.as_slice()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        store
+            .valid_selections(&id, revision, &catalog)
+            .unwrap()
+            .len(),
+        16
+    );
 }
 
 #[test]
@@ -440,10 +687,9 @@ fn hostile_cleanup_target_is_not_followed(create_link: impl FnOnce(&PathBuf, &Pa
     fs::rename(&child, &retired).unwrap();
     create_link(&external, &child);
 
-    assert!(matches!(
-        store.delete(&id),
-        Err(ProfileError::CleanupDebt { .. })
-    ));
+    let cleanup = store.delete(&id).unwrap_err();
+    assert!(matches!(&cleanup, ProfileError::CleanupDebt { .. }));
+    assert!(cleanup.mutation_committed());
     assert_eq!(
         fs::read(external.join("sentinel.txt")).unwrap(),
         b"do not remove"

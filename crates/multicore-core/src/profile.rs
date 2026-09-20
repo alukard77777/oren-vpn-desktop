@@ -1,13 +1,17 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     ffi::OsStr,
     fmt, fs, io,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -17,9 +21,15 @@ use crate::{
 
 pub const MAX_PROFILES: usize = 16;
 pub const MAX_PROFILE_INDEX_BYTES: u64 = 16 * 1024;
+pub const MAX_SELECTIONS_BYTES: u64 = 128 * 1024;
+pub const MAX_SELECTIONS: usize = 64;
 const INDEX_SCHEMA_VERSION: u32 = 1;
+const SELECTIONS_SCHEMA_VERSION: u32 = 1;
 const INDEX_FILE: &str = "index.json";
 const INDEX_TEMP_FILE: &str = "index.json.tmp";
+const SELECTIONS_FILE: &str = "selections.json";
+const SELECTIONS_TEMP_FILE: &str = "selections.json.tmp";
+const REVISION_DOMAIN: &[u8] = b"multicore.catalog-revision.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -120,9 +130,10 @@ pub enum ProfileError {
     NotFound(ProfileId),
     #[error("profile is unavailable")]
     Unavailable(ProfileId),
-    #[error("profile was deleted but its files require cleanup")]
+    #[error("profile files require cleanup")]
     CleanupDebt {
         id: ProfileId,
+        mutation_committed: bool,
         #[source]
         source: io::Error,
     },
@@ -132,6 +143,27 @@ pub enum ProfileError {
         #[source]
         source: io::Error,
     },
+    #[error("profile selection mutation committed but durability maintenance is required")]
+    SelectionMaintenanceDebt {
+        id: ProfileId,
+        #[source]
+        source: io::Error,
+    },
+    #[error("profile selection is invalid: {0}")]
+    InvalidSelection(&'static str),
+}
+
+impl ProfileError {
+    /// Reports whether the requested mutation was published before the error occurred.
+    pub fn mutation_committed(&self) -> bool {
+        match self {
+            Self::IndexMaintenanceDebt { .. } | Self::SelectionMaintenanceDebt { .. } => true,
+            Self::CleanupDebt {
+                mutation_committed, ..
+            } => *mutation_committed,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,13 +179,25 @@ struct ProfileIndexEntry {
     created_at_unix: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedSelections {
+    schema_version: u32,
+    catalog_revision: u64,
+    selections: BTreeMap<String, String>,
+}
+
 #[derive(Debug)]
 pub struct ProfileStore {
     root: DirectoryCapability,
     _lock: StoreLock,
     index: RwLock<ProfileIndex>,
+    selection_lock: Mutex<()>,
+    maintenance_debt: AtomicBool,
     #[cfg(test)]
     index_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    selection_fault: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     load_fault: std::sync::Mutex<Option<ProfileId>>,
 }
@@ -166,13 +210,14 @@ enum IndexCommit {
 impl ProfileStore {
     pub fn open(
         root: impl Into<PathBuf>,
-        _legacy_root: Option<PathBuf>,
+        legacy_root: Option<PathBuf>,
     ) -> Result<Self, ProfileError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let root = DirectoryCapability::open(&root).map_err(map_root_open_error)?;
         let lock = root.lock_exclusive().map_err(map_lock_error)?;
-        let index = match root.file_metadata(OsStr::new(INDEX_FILE))? {
+        let index_metadata = root.file_metadata(OsStr::new(INDEX_FILE))?;
+        let index = match index_metadata {
             Some((regular, len)) => {
                 if !regular {
                     return Err(ProfileError::InvalidIndex(
@@ -200,16 +245,28 @@ impl ProfileStore {
         // unindexed rollback material. A crash must not resurrect an old index that names
         // a directory cleanup has already removed.
         root.sync()?;
-        cleanup_unindexed_profile_directories(&root, &index)?;
-        Ok(Self {
+        let store = Self {
             root,
             _lock: lock,
             index: RwLock::new(index),
+            selection_lock: Mutex::new(()),
+            maintenance_debt: AtomicBool::new(false),
             #[cfg(test)]
             index_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
+            selection_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
             load_fault: std::sync::Mutex::new(None),
-        })
+        };
+        if index_metadata.is_none()
+            && let Some(legacy_root) = legacy_root
+        {
+            store.migrate_legacy(&legacy_root)?;
+        }
+        let index = store.index.read().expect("profile index lock poisoned");
+        cleanup_unindexed_profile_directories(&store.root, &index)?;
+        drop(index);
+        Ok(store)
     }
 
     pub fn list(&self) -> Result<Vec<ProfileSummary>, ProfileError> {
@@ -239,7 +296,23 @@ impl ProfileStore {
             return Ok(None);
         };
         let (generation, snapshot) = self.load_profile(&id)?;
-        Ok(Some((id, generation, snapshot)))
+        Ok(Some((
+            id.clone(),
+            catalog_revision(&id, generation),
+            snapshot,
+        )))
+    }
+
+    /// Loads an indexed profile without changing which profile is active.
+    pub fn profile_snapshot(&self, id: &ProfileId) -> Result<(u64, Arc<Snapshot>), ProfileError> {
+        let index = self.index.read().expect("profile index lock poisoned");
+        self.require_entry(&index, id)?;
+        let (generation, snapshot) = self.load_profile(id)?;
+        Ok((catalog_revision(id, generation), snapshot))
+    }
+
+    pub fn has_maintenance_debt(&self) -> bool {
+        self.maintenance_debt.load(Ordering::Acquire)
     }
 
     pub fn create_profile(&self, snapshot: Arc<Snapshot>) -> Result<ProfileId, ProfileError> {
@@ -270,7 +343,12 @@ impl ProfileStore {
             Ok(debt) => debt,
             Err(error) => {
                 if let Err(source) = self.remove_profile_directory(&id) {
-                    return Err(ProfileError::CleanupDebt { id, source });
+                    self.maintenance_debt.store(true, Ordering::Release);
+                    return Err(ProfileError::CleanupDebt {
+                        id,
+                        mutation_committed: false,
+                        source,
+                    });
                 }
                 return Err(error);
             }
@@ -286,12 +364,16 @@ impl ProfileStore {
             Ok(IndexCommit::Clean) => {
                 *index = proposed;
                 match snapshot_debt {
-                    Some(source) => Err(ProfileError::IndexMaintenanceDebt { id, source }),
+                    Some(source) => {
+                        self.maintenance_debt.store(true, Ordering::Release);
+                        Err(ProfileError::IndexMaintenanceDebt { id, source })
+                    }
                     None => Ok(id),
                 }
             }
             Ok(IndexCommit::MaintenanceDebt(source)) => {
                 *index = proposed;
+                self.maintenance_debt.store(true, Ordering::Release);
                 Err(ProfileError::IndexMaintenanceDebt {
                     id,
                     source: combine_maintenance_debt(snapshot_debt, source),
@@ -299,7 +381,14 @@ impl ProfileStore {
             }
             Err(error) => match self.remove_profile_directory(&id) {
                 Ok(()) => Err(error),
-                Err(source) => Err(ProfileError::CleanupDebt { id, source }),
+                Err(source) => {
+                    self.maintenance_debt.store(true, Ordering::Release);
+                    Err(ProfileError::CleanupDebt {
+                        id,
+                        mutation_committed: false,
+                        source,
+                    })
+                }
             },
         }
     }
@@ -322,11 +411,14 @@ impl ProfileStore {
             return Err(ProfileError::Unavailable(id.clone()));
         }
         match maintenance_debt {
-            Some(source) => Err(ProfileError::IndexMaintenanceDebt {
-                id: id.clone(),
-                source,
-            }),
-            None => Ok(generation),
+            Some(source) => {
+                self.maintenance_debt.store(true, Ordering::Release);
+                Err(ProfileError::IndexMaintenanceDebt {
+                    id: id.clone(),
+                    source,
+                })
+            }
+            None => Ok(catalog_revision(id, generation)),
         }
     }
 
@@ -341,6 +433,7 @@ impl ProfileStore {
                 IndexCommit::Clean => *index = proposed,
                 IndexCommit::MaintenanceDebt(source) => {
                     *index = proposed;
+                    self.maintenance_debt.store(true, Ordering::Release);
                     return Err(ProfileError::IndexMaintenanceDebt {
                         id: id.clone(),
                         source,
@@ -372,6 +465,7 @@ impl ProfileStore {
         *index = proposed;
         let active = index.active_id.clone();
         if let IndexCommit::MaintenanceDebt(source) = index_commit {
+            self.maintenance_debt.store(true, Ordering::Release);
             return Err(ProfileError::IndexMaintenanceDebt {
                 id: id.clone(),
                 source,
@@ -379,10 +473,14 @@ impl ProfileStore {
         }
         match self.remove_profile_directory(id) {
             Ok(()) => Ok(active),
-            Err(source) => Err(ProfileError::CleanupDebt {
-                id: id.clone(),
-                source,
-            }),
+            Err(source) => {
+                self.maintenance_debt.store(true, Ordering::Release);
+                Err(ProfileError::CleanupDebt {
+                    id: id.clone(),
+                    mutation_committed: true,
+                    source,
+                })
+            }
         }
     }
 
@@ -398,6 +496,166 @@ impl ProfileStore {
             }
         }
         Ok(None)
+    }
+
+    pub fn save_selection(
+        &self,
+        id: &ProfileId,
+        revision: u64,
+        group_id: &str,
+        node_id: &str,
+    ) -> Result<(), ProfileError> {
+        validate_selection_id(group_id)?;
+        validate_selection_id(node_id)?;
+        if revision == 0 {
+            return Err(ProfileError::InvalidSelection("catalog revision is zero"));
+        }
+
+        let _guard = self
+            .selection_lock
+            .lock()
+            .expect("profile selection lock poisoned");
+        let index = self.index.read().expect("profile index lock poisoned");
+        self.require_entry(&index, id)?;
+        let profile = self.open_profile(id)?;
+        let mut persisted = load_selections(&profile)
+            .filter(|saved| {
+                saved.schema_version == SELECTIONS_SCHEMA_VERSION
+                    && saved.catalog_revision == revision
+                    && selections_are_valid(&saved.selections)
+            })
+            .unwrap_or_else(|| PersistedSelections {
+                schema_version: SELECTIONS_SCHEMA_VERSION,
+                catalog_revision: revision,
+                selections: BTreeMap::new(),
+            });
+        if !persisted.selections.contains_key(group_id)
+            && persisted.selections.len() >= MAX_SELECTIONS
+        {
+            return Err(ProfileError::InvalidSelection("selection limit reached"));
+        }
+        persisted
+            .selections
+            .insert(group_id.to_owned(), node_id.to_owned());
+        let bytes = serde_json::to_vec(&persisted)
+            .map_err(|_| ProfileError::InvalidSelection("selection serialization failed"))?;
+        if bytes.len() as u64 > MAX_SELECTIONS_BYTES {
+            return Err(ProfileError::InvalidSelection(
+                "selections exceed size limit",
+            ));
+        }
+        #[cfg(test)]
+        let selection_fault = self.selection_fault.swap(0, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let selection_fault = 0;
+        match persist_selections(&profile, &bytes, selection_fault) {
+            Ok(IndexCommit::Clean) => Ok(()),
+            Ok(IndexCommit::MaintenanceDebt(source)) => {
+                self.maintenance_debt.store(true, Ordering::Release);
+                Err(ProfileError::SelectionMaintenanceDebt {
+                    id: id.clone(),
+                    source,
+                })
+            }
+            Err(error) => Err(ProfileError::Io(error)),
+        }
+    }
+
+    pub fn valid_selections(
+        &self,
+        id: &ProfileId,
+        revision: u64,
+        catalog: &[(&str, &[&str])],
+    ) -> Result<BTreeMap<String, String>, ProfileError> {
+        let index = self.index.read().expect("profile index lock poisoned");
+        self.require_entry(&index, id)?;
+        let profile = self.open_profile(id)?;
+        let Some(saved) = load_selections(&profile) else {
+            return Ok(BTreeMap::new());
+        };
+        if saved.schema_version != SELECTIONS_SCHEMA_VERSION
+            || saved.catalog_revision != revision
+            || !selections_are_valid(&saved.selections)
+        {
+            return Ok(BTreeMap::new());
+        }
+        Ok(saved
+            .selections
+            .into_iter()
+            .filter(|(group, node)| {
+                catalog.iter().any(|(catalog_group, catalog_nodes)| {
+                    group == catalog_group
+                        && catalog_nodes
+                            .iter()
+                            .any(|catalog_node| node == catalog_node)
+                })
+            })
+            .collect())
+    }
+
+    fn migrate_legacy(&self, legacy_path: &std::path::Path) -> Result<(), ProfileError> {
+        let legacy = match DirectoryCapability::open(legacy_path) {
+            Ok(legacy) => legacy,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ProfileError::Io(error)),
+        };
+        let legacy = PersistentSnapshotStore::open_capability(legacy)?;
+        let Some(snapshot) = legacy.current() else {
+            return Ok(());
+        };
+        if snapshot.subscription_info().is_none() || snapshot.subscription_source_url().is_none() {
+            return Ok(());
+        }
+
+        let id = loop {
+            let candidate = ProfileId::generate()?;
+            if self
+                .root
+                .file_metadata(OsStr::new(candidate.as_str()))?
+                .is_none()
+            {
+                break candidate;
+            }
+        };
+        let profile = self.root.create_child(OsStr::new(id.as_str()))?;
+        let migration = (|| {
+            let destination = PersistentSnapshotStore::open_capability(profile)?;
+            let (_, snapshot_debt) = destination.commit_status((*snapshot).clone())?.into_parts();
+            drop(destination);
+            self.load_profile(&id)?;
+            let proposed = ProfileIndex {
+                schema_version: INDEX_SCHEMA_VERSION,
+                profiles: vec![ProfileIndexEntry {
+                    id: id.clone(),
+                    created_at_unix: unix_timestamp(),
+                }],
+                active_id: Some(id.clone()),
+            };
+            let index_commit = self.persist_index(&proposed)?;
+            *self.index.write().expect("profile index lock poisoned") = proposed;
+            Ok::<_, ProfileError>((snapshot_debt, index_commit))
+        })();
+        match migration {
+            Ok((snapshot_debt, index_commit)) => {
+                if snapshot_debt.is_some()
+                    || matches!(index_commit, IndexCommit::MaintenanceDebt(_))
+                {
+                    self.maintenance_debt.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
+            Err(error) => match self.remove_profile_directory(&id) {
+                Ok(()) => Err(error),
+                Err(source) => {
+                    self.maintenance_debt.store(true, Ordering::Release);
+                    Err(ProfileError::CleanupDebt {
+                        id,
+                        mutation_committed: false,
+                        source,
+                    })
+                }
+            },
+        }
     }
 
     fn require_entry(&self, index: &ProfileIndex, id: &ProfileId) -> Result<usize, ProfileError> {
@@ -510,6 +768,11 @@ impl ProfileStore {
     }
 
     #[cfg(test)]
+    fn inject_selection_fault(&self, point: u8) {
+        self.selection_fault.store(point, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     fn take_index_fault(&self, point: u8) -> bool {
         self.index_fault
             .compare_exchange(
@@ -559,6 +822,7 @@ fn cleanup_unindexed_profile_directories(
                 if removed_any && let Err(sync) = root.sync() {
                     return Err(ProfileError::CleanupDebt {
                         id,
+                        mutation_committed: false,
                         source: io::Error::new(
                             source.kind(),
                             format!(
@@ -567,7 +831,11 @@ fn cleanup_unindexed_profile_directories(
                         ),
                     });
                 }
-                return Err(ProfileError::CleanupDebt { id, source });
+                return Err(ProfileError::CleanupDebt {
+                    id,
+                    mutation_committed: false,
+                    source,
+                });
             }
             removed_any = true;
         }
@@ -589,6 +857,101 @@ fn occupied_profile_slots(
         .collect::<HashSet<_>>();
     occupied.extend(profile_entry_ids(root)?);
     Ok(occupied.len())
+}
+
+fn catalog_revision(id: &ProfileId, physical_generation: u64) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(REVISION_DOMAIN);
+    digest.update(id.as_str().as_bytes());
+    digest.update(physical_generation.to_be_bytes());
+    let bytes: [u8; 8] = digest.finalize()[..8]
+        .try_into()
+        .expect("SHA-256 prefix has fixed length");
+    u64::from_be_bytes(bytes) | (1_u64 << 63)
+}
+
+fn validate_selection_id(value: &str) -> Result<(), ProfileError> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(ProfileError::InvalidSelection(
+            "identifier length is out of bounds",
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| (0x21..=0x7e).contains(&byte) && !matches!(byte, b'/' | b'\\'))
+    {
+        return Err(ProfileError::InvalidSelection(
+            "identifier contains an unsafe byte",
+        ));
+    }
+    Ok(())
+}
+
+fn selections_are_valid(selections: &BTreeMap<String, String>) -> bool {
+    selections.len() <= MAX_SELECTIONS
+        && selections.iter().all(|(group, node)| {
+            validate_selection_id(group).is_ok() && validate_selection_id(node).is_ok()
+        })
+}
+
+fn load_selections(profile: &DirectoryCapability) -> Option<PersistedSelections> {
+    let (regular, len) = profile
+        .file_metadata(OsStr::new(SELECTIONS_FILE))
+        .ok()
+        .flatten()?;
+    if !regular || len > MAX_SELECTIONS_BYTES {
+        return None;
+    }
+    let bytes = profile
+        .read_file(OsStr::new(SELECTIONS_FILE), MAX_SELECTIONS_BYTES)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn persist_selections(
+    profile: &DirectoryCapability,
+    bytes: &[u8],
+    fault_point: u8,
+) -> io::Result<IndexCommit> {
+    let result = (|| {
+        if profile
+            .file_metadata(OsStr::new(SELECTIONS_TEMP_FILE))?
+            .is_some()
+        {
+            profile.remove_entry_nofollow(OsStr::new(SELECTIONS_TEMP_FILE))?;
+        }
+        profile.write_file(OsStr::new(SELECTIONS_TEMP_FILE), bytes)?;
+        if fault_point == 1 {
+            return Err(io::Error::other("injected pre-replace selection failure"));
+        }
+        profile.replace_file(
+            OsStr::new(SELECTIONS_TEMP_FILE),
+            OsStr::new(SELECTIONS_FILE),
+        )?;
+        if fault_point == 2 {
+            return Ok(IndexCommit::MaintenanceDebt(io::Error::other(
+                "injected post-replace selection failure",
+            )));
+        }
+        Ok(match profile.sync() {
+            Ok(()) => IndexCommit::Clean,
+            Err(error) => IndexCommit::MaintenanceDebt(error),
+        })
+    })();
+    match result {
+        Ok(commit) => Ok(commit),
+        Err(error) => {
+            if let Err(cleanup) = profile.remove_entry_nofollow(OsStr::new(SELECTIONS_TEMP_FILE)) {
+                return Err(io::Error::new(
+                    cleanup.kind(),
+                    format!(
+                        "selection update failed ({error}); temporary selection cleanup failed: {cleanup}"
+                    ),
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 fn combine_maintenance_debt(snapshot: Option<io::Error>, index: io::Error) -> io::Error {
@@ -759,6 +1122,45 @@ mod tests {
         assert_eq!(
             ProfileStore::open(root.path(), None).unwrap().active_id(),
             Some(id)
+        );
+    }
+
+    #[test]
+    fn selection_faults_distinguish_uncommitted_and_committed_outcomes() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        let id = store
+            .create_profile(snapshot("https://selection.invalid/sub", "Selection"))
+            .unwrap();
+        let revision = store.profile_snapshot(&id).unwrap().0;
+
+        store.inject_selection_fault(1);
+        let pre = store
+            .save_selection(&id, revision, "group-pre", "node-pre")
+            .unwrap_err();
+        assert!(!pre.mutation_committed());
+        assert!(
+            store
+                .valid_selections(&id, revision, &[("group-pre", &["node-pre"])])
+                .unwrap()
+                .is_empty()
+        );
+
+        store.inject_selection_fault(2);
+        let post = store
+            .save_selection(&id, revision, "group-post", "node-post")
+            .unwrap_err();
+        assert!(matches!(
+            &post,
+            ProfileError::SelectionMaintenanceDebt { .. }
+        ));
+        assert!(post.mutation_committed());
+        assert!(store.has_maintenance_debt());
+        assert_eq!(
+            store
+                .valid_selections(&id, revision, &[("group-post", &["node-post"])])
+                .unwrap()["group-post"],
+            "node-post"
         );
     }
 
