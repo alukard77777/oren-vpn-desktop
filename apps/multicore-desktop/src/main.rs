@@ -1420,6 +1420,12 @@ struct DeleteFocusPlan {
     successful_target: DeleteFocusTarget,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DeleteFocusState {
+    AwaitingCompletion(DeleteFocusPlan),
+    Immediate(DeleteFocusTarget),
+}
+
 impl DeleteFocusPlan {
     fn completion(&self, succeeded: bool) -> DeleteFocusTarget {
         if succeeded {
@@ -1434,9 +1440,11 @@ fn delete_focus_plan(
     profile_ids: &[&str],
     deleting_profile_id: &str,
     accepted: bool,
-) -> Option<DeleteFocusPlan> {
+) -> DeleteFocusState {
     if !accepted {
-        return None;
+        return DeleteFocusState::Immediate(DeleteFocusTarget::DeleteControl(
+            deleting_profile_id.to_owned(),
+        ));
     }
     let successful_target = profile_ids
         .iter()
@@ -1453,7 +1461,7 @@ fn delete_focus_plan(
         })
         .map(|profile_id| DeleteFocusTarget::ManagementProfile(profile_id.to_owned()))
         .unwrap_or(DeleteFocusTarget::AddSubscription);
-    Some(DeleteFocusPlan {
+    DeleteFocusState::AwaitingCompletion(DeleteFocusPlan {
         deleting_profile_id: deleting_profile_id.to_owned(),
         successful_target,
     })
@@ -1616,7 +1624,7 @@ fn wire_profile_switcher(
     let weak = ui.as_weak();
     let delete_model = model;
     ui.on_delete_profile(move |profile_id| {
-        let (token, client, current, focus_plan) = {
+        let (token, client, current, focus_state) = {
             let mut model = delete_model.lock().expect("view model lock");
             let profiles = model.profile_presentation().profiles;
             let profile_ids = profiles
@@ -1624,16 +1632,23 @@ fn wire_profile_switcher(
                 .map(|profile| profile.id.as_str())
                 .collect::<Vec<_>>();
             let token = model.begin_profile_delete(profile_id.as_str());
-            let focus_plan = delete_focus_plan(&profile_ids, profile_id.as_str(), token.is_some());
-            (token, model.daemon_client(), snapshot(&model), focus_plan)
+            let focus_state = delete_focus_plan(&profile_ids, profile_id.as_str(), token.is_some());
+            (token, model.daemon_client(), snapshot(&model), focus_state)
         };
         if let Some(ui) = weak.upgrade() {
             apply_snapshot(&ui, &current);
-            if token.is_some() {
-                ui.set_profile_delete_confirm_id("".into());
+            match &focus_state {
+                DeleteFocusState::AwaitingCompletion(_) => {
+                    ui.set_profile_delete_confirm_id("".into());
+                }
+                DeleteFocusState::Immediate(completion) => {
+                    apply_delete_focus_completion(&ui, completion.clone());
+                }
             }
         }
-        if let (Some(token), Some(focus_plan)) = (token, focus_plan) {
+        if let (Some(token), DeleteFocusState::AwaitingCompletion(focus_plan)) =
+            (token, focus_state)
+        {
             run_profile_delete(
                 weak.clone(),
                 delete_model.clone(),
@@ -2592,7 +2607,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
+        DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
         PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriter,
         ProfilePreferenceReconciler, WindowObservation, WriterCommand, WriterResult,
         activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
@@ -2883,12 +2898,15 @@ mod window_tests {
     fn delete_focus_plan_waits_for_completion_and_covers_every_outcome() {
         assert_eq!(
             delete_focus_plan(&["profile-a", "profile-b"], "profile-a", false),
-            None,
-            "preflight rejection keeps the confirmation and its focus"
+            DeleteFocusState::Immediate(DeleteFocusTarget::DeleteControl("profile-a".into())),
+            "preflight rejection closes confirmation and restores its delete control"
         );
 
-        let middle = delete_focus_plan(&["profile-a", "profile-b", "profile-c"], "profile-b", true)
-            .expect("accepted middle-row deletion");
+        let DeleteFocusState::AwaitingCompletion(middle) =
+            delete_focus_plan(&["profile-a", "profile-b", "profile-c"], "profile-b", true)
+        else {
+            panic!("accepted middle-row deletion must wait for completion");
+        };
         assert_eq!(
             middle.completion(true),
             DeleteFocusTarget::ManagementProfile("profile-c".into())
@@ -2898,15 +2916,21 @@ mod window_tests {
             DeleteFocusTarget::DeleteControl("profile-b".into())
         );
 
-        let last = delete_focus_plan(&["profile-a", "profile-b"], "profile-b", true)
-            .expect("accepted last-row deletion");
+        let DeleteFocusState::AwaitingCompletion(last) =
+            delete_focus_plan(&["profile-a", "profile-b"], "profile-b", true)
+        else {
+            panic!("accepted last-row deletion must wait for completion");
+        };
         assert_eq!(
             last.completion(true),
             DeleteFocusTarget::ManagementProfile("profile-a".into())
         );
 
-        let single = delete_focus_plan(&["profile-a"], "profile-a", true)
-            .expect("accepted single-row deletion");
+        let DeleteFocusState::AwaitingCompletion(single) =
+            delete_focus_plan(&["profile-a"], "profile-a", true)
+        else {
+            panic!("accepted single-row deletion must wait for completion");
+        };
         assert_eq!(single.completion(true), DeleteFocusTarget::AddSubscription);
     }
 
@@ -2943,6 +2967,21 @@ mod window_tests {
                     .find("apply_delete_focus_completion(&ui, completion);")
                     .expect("focus completion after snapshot")
         );
+        let delete_wiring = main
+            .split("ui.on_delete_profile(move |profile_id| {")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_primary_action(").next())
+            .expect("delete callback wiring");
+        assert!(delete_wiring.contains("DeleteFocusState::Immediate(completion)"));
+        assert!(
+            delete_wiring
+                .find("apply_snapshot(&ui, &current);")
+                .expect("preflight rejection snapshot")
+                < delete_wiring
+                    .find("apply_delete_focus_completion(&ui, completion.clone());")
+                    .expect("preflight rejection focus restoration")
+        );
+        assert!(main.contains("ui.set_profile_delete_confirm_id(\"\".into());"));
         assert!(ui.contains("root.profile-delete-control-focus-id = profile.id;"));
         assert!(ui.contains("root.profile-delete-control-focus-serial += 1;"));
         assert!(
