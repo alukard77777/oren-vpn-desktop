@@ -3,6 +3,8 @@ param(
     [int]$Port = 18787,
     [ValidateSet("empty", "ready", "connected", "error")]
     [string]$InitialState = "ready",
+    [ValidateSet("empty", "one", "many", "loading", "error")]
+    [string]$ProfileState = "many",
     [int]$SelectionDelayMilliseconds = 0,
     [switch]$Announcement,
     [string]$AuthorizationValue = "preview-local-only"
@@ -37,12 +39,70 @@ $copy = @'
   "manual_route": "\u0411\u0435\u0437 VPN",
   "announcement": "\u041f\u043b\u0430\u043d\u043e\u0432\u044b\u0435 \u0440\u0430\u0431\u043e\u0442\u044b \u0441\u0435\u0433\u043e\u0434\u043d\u044f \u0432 23:00",
   "local_profile": "\u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0439 \u043f\u0440\u043e\u0444\u0438\u043b\u044c",
+  "work_profile": "\u0420\u0430\u0431\u043e\u0447\u0438\u0439",
+  "travel_profile": "\u041f\u043e\u0435\u0437\u0434\u043a\u0438",
+  "reserve_profile": "\u0420\u0435\u0437\u0435\u0440\u0432",
   "error": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u0438\u043c\u0435\u043d\u0438\u0442\u044c \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u0443\u044e \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0443. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u043f\u043e\u043f\u044b\u0442\u043a\u0443.",
   "log_xray": "\u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 SOCKS-\u043c\u043e\u0441\u0442\u044b \u0433\u043e\u0442\u043e\u0432\u044b.",
   "log_mihomo": "\u041a\u043e\u043d\u0442\u0440\u043e\u043b\u043b\u0435\u0440 \u0438 TUN MultiCore \u0433\u043e\u0442\u043e\u0432\u044b."
 }
 '@ | ConvertFrom-Json
 $serviceLogoPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\apps\multicore-desktop\assets\app-icon.svg"))
+$profileRows = @()
+if ($ProfileState -ne "empty") {
+    $profileRows += @{
+        id = "profile-main"
+        active = $true
+        available = $true
+        display_name = $copy.local_profile
+        used_bytes = 939449482934
+        total_bytes = $null
+        expires_at_unix = 1792851157
+        service_logo_path = $serviceLogoPath
+    }
+}
+if ($ProfileState -in @("many", "loading", "error")) {
+    $profileRows += @{
+        id = "profile-work"
+        active = $false
+        available = $true
+        display_name = $copy.work_profile
+        used_bytes = 64424509440
+        total_bytes = 214748364800
+        expires_at_unix = 1795529557
+        service_logo_path = $null
+    }
+    $profileRows += @{
+        id = "profile-travel"
+        active = $false
+        available = $false
+        display_name = $copy.travel_profile
+        used_bytes = $null
+        total_bytes = $null
+        expires_at_unix = $null
+        service_logo_path = $null
+    }
+    foreach ($index in 1..3) {
+        $profileRows += @{
+            id = "profile-reserve-$index"
+            active = $false
+            available = $true
+            display_name = "$($copy.reserve_profile) $index"
+            used_bytes = (10737418240 * $index)
+            total_bytes = 107374182400
+            expires_at_unix = 1795529557
+            service_logo_path = $null
+        }
+    }
+}
+$activeProfileId = if ($profileRows.Count -gt 0) { "profile-main" } else { $null }
+
+function Get-Subscriptions {
+    return @{
+        active_profile_id = $activeProfileId
+        profiles = @($profileRows)
+    }
+}
 
 function Get-Catalog {
     if ($state -eq "empty") {
@@ -76,6 +136,7 @@ function Get-Status {
     }
     return @{
         state = $state
+        active_profile_id = if ($state -eq "empty") { $null } else { $activeProfileId }
         profile = if ($state -eq "empty") { $null } else { $copy.local_profile }
         current_node = if ($state -eq "empty") { $null } else { $node }
         message = if ($state -eq "error") { $copy.error } else { $null }
@@ -110,7 +171,7 @@ function Send-JsonResponse([System.Net.Sockets.NetworkStream]$Stream, [int]$Stat
     $Stream.Flush()
 }
 
-Write-Host "MultiCore preview fixture listening on http://${Address}:$Port in $InitialState state"
+Write-Host "MultiCore preview fixture listening on http://${Address}:$Port in $InitialState/$ProfileState state"
 
 try {
     while ($true) {
@@ -155,6 +216,40 @@ try {
             $path = $parts[1]
 
             if ($method -eq "GET" -and $path.StartsWith("/v1/status")) {
+                Send-JsonResponse $stream 200 (Get-Status)
+            } elseif ($method -eq "GET" -and $path -eq "/v1/subscriptions") {
+                if ($ProfileState -eq "loading") {
+                    Start-Sleep -Milliseconds 5000
+                }
+                if ($ProfileState -eq "error") {
+                    Send-JsonResponse $stream 500 @{ code = "profiles_unavailable"; message = "Unavailable"; correlation_id = "preview" }
+                } else {
+                    Send-JsonResponse $stream 200 (Get-Subscriptions)
+                }
+            } elseif ($method -eq "PUT" -and $path -match '^/v1/subscriptions/([^/]+)/activate$') {
+                $targetId = [System.Uri]::UnescapeDataString($Matches[1])
+                $target = @($profileRows | Where-Object { $_.id -eq $targetId })
+                if ($target.Count -eq 0) {
+                    Send-JsonResponse $stream 404 @{ code = "profile_not_found"; message = "Not found"; correlation_id = "preview" }
+                } else {
+                    $activeProfileId = $targetId
+                    foreach ($profile in $profileRows) { $profile.active = ($profile.id -eq $targetId) }
+                    Send-JsonResponse $stream 200 (Get-Status)
+                }
+            } elseif ($method -eq "POST" -and $path -match '^/v1/subscriptions/([^/]+)/refresh$') {
+                $targetId = [System.Uri]::UnescapeDataString($Matches[1])
+                if (@($profileRows | Where-Object { $_.id -eq $targetId }).Count -eq 0) {
+                    Send-JsonResponse $stream 404 @{ code = "profile_not_found"; message = "Not found"; correlation_id = "preview" }
+                } else {
+                    Send-JsonResponse $stream 200 (Get-Subscriptions)
+                }
+            } elseif ($method -eq "DELETE" -and $path -match '^/v1/subscriptions/([^/]+)$') {
+                $targetId = [System.Uri]::UnescapeDataString($Matches[1])
+                $profileRows = @($profileRows | Where-Object { $_.id -ne $targetId })
+                if ($activeProfileId -eq $targetId) {
+                    $activeProfileId = if ($profileRows.Count -gt 0) { [string]$profileRows[0].id } else { $null }
+                    foreach ($profile in $profileRows) { $profile.active = ($profile.id -eq $activeProfileId) }
+                }
                 Send-JsonResponse $stream 200 (Get-Status)
             } elseif ($method -eq "POST" -and $path.StartsWith("/v1/connect")) {
                 $state = "connected"

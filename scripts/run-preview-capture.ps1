@@ -2,7 +2,7 @@ param(
     [string]$OutputDirectory = "artifacts/screenshots",
     [int]$Port = 18787,
     [string]$DesktopExecutablePath,
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large")]
     [string[]]$OnlyScenario
 )
 
@@ -64,7 +64,17 @@ $scenarios = @(
     @{ Name = "error"; State = "error"; Width = 700; Height = 660; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $false; OpenSettings = $false },
     @{ Name = "selection-pending"; State = "connected"; Width = 820; Height = 760; SelectionDelay = 5000; SelectRoute = $true; OpenDiagnostics = $false; OpenSettings = $false },
     @{ Name = "diagnostics"; State = "connected"; Width = 900; Height = 760; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $true; OpenSettings = $false },
-    @{ Name = "settings"; State = "ready"; Width = 820; Height = 760; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $false; OpenSettings = $true }
+    @{ Name = "settings"; State = "ready"; Width = 820; Height = 760; SelectionDelay = 0; SelectRoute = $false; OpenDiagnostics = $false; OpenSettings = $true },
+    @{ Name = "profiles-empty-small"; State = "ready"; ProfileState = "empty"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-one-small"; State = "ready"; ProfileState = "one"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-many-small"; State = "ready"; ProfileState = "many"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-loading-small"; State = "ready"; ProfileState = "loading"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-error-small"; State = "ready"; ProfileState = "error"; Width = 700; Height = 620; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-empty-large"; State = "ready"; ProfileState = "empty"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-one-large"; State = "ready"; ProfileState = "one"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-loading-large"; State = "ready"; ProfileState = "loading"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-error-large"; State = "ready"; ProfileState = "error"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true }
 )
 if ($OnlyScenario.Count -gt 0) {
     $scenarios = @($scenarios | Where-Object { $_.Name -in $OnlyScenario })
@@ -86,7 +96,8 @@ foreach ($scenario in $scenarios) {
         $fixtureInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $fixtureInfo.FileName = "powershell.exe"
         $announcementArgument = if ($scenario.ContainsKey("Announcement") -and $scenario.Announcement) { " -Announcement" } else { "" }
-        $fixtureInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$fixturePath`" -Port $Port -InitialState $($scenario.State) -SelectionDelayMilliseconds $($scenario.SelectionDelay) -AuthorizationValue $authorizationValue$announcementArgument"
+        $profileStateArgument = if ($scenario.ContainsKey("ProfileState")) { " -ProfileState $($scenario.ProfileState)" } else { "" }
+        $fixtureInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$fixturePath`" -Port $Port -InitialState $($scenario.State) -SelectionDelayMilliseconds $($scenario.SelectionDelay) -AuthorizationValue $authorizationValue$announcementArgument$profileStateArgument"
         $fixtureInfo.UseShellExecute = $false
         $fixtureInfo.CreateNoWindow = $true
         $fixtureInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
@@ -118,6 +129,7 @@ foreach ($scenario in $scenarios) {
         if ($scenario.ContainsKey("HoverConnection") -and $scenario.HoverConnection) { $captureArgs += "-HoverConnection" }
         if ($scenario.OpenDiagnostics) { $captureArgs += "-OpenDiagnostics" }
         if ($scenario.OpenSettings) { $captureArgs += "-OpenSettings" }
+        if ($scenario.ContainsKey("OpenProfiles") -and $scenario.OpenProfiles) { $captureArgs += "-OpenProfiles" }
         & powershell.exe @captureArgs
         if ($LASTEXITCODE -ne 0) {
             throw "Capture helper failed for $($scenario.Name)."

@@ -12,7 +12,7 @@ mod windows_settings;
 mod windows_shell;
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -31,7 +31,8 @@ use updater::{UpdateAction, UpdateState};
 use view_model::{
     CatalogDisplayKind, CatalogPresentation, DesktopViewModel, DiagnosticsPresentation,
     LatencyPresentation, LatencyRequest, MutationToken, NodeSelectionRequest, Panel, PrimaryAction,
-    QueuedNodeSelection, SemanticTone, StatePresentation, SubscriptionPresentation,
+    ProfileRequestToken, QueuedNodeSelection, SemanticTone, StatePresentation,
+    SubscriptionPresentation, SubscriptionProfileOperation, SubscriptionProfilesPresentation,
     derive_catalog_display,
 };
 use windows_settings::LaunchAtSignInState;
@@ -50,9 +51,52 @@ struct UiSnapshot {
     import_pending: bool,
     import_error: String,
     subscription: SubscriptionPresentation,
+    profiles: SubscriptionProfilesPresentation,
     catalog: CatalogPresentation,
     diagnostics: DiagnosticsPresentation,
     latency: LatencyPresentation,
+}
+
+struct ProfilePreferenceReconciler {
+    loaded: AppPreferences,
+    restored_profiles: BTreeSet<String>,
+    tracker: Arc<Mutex<PersistenceTracker>>,
+}
+
+impl ProfilePreferenceReconciler {
+    fn new(loaded: AppPreferences, tracker: Arc<Mutex<PersistenceTracker>>) -> Self {
+        Self {
+            loaded,
+            restored_profiles: BTreeSet::new(),
+            tracker,
+        }
+    }
+
+    fn reconcile(&mut self, model: &mut DesktopViewModel) {
+        let active_id = model.profile_presentation().active_id;
+        self.tracker
+            .lock()
+            .expect("preference tracker lock")
+            .set_active_profile_hint(active_id.clone());
+        let Some(active_id) = active_id else {
+            return;
+        };
+        if !self.restored_profiles.insert(active_id.clone()) {
+            return;
+        }
+        let selected_group = self
+            .loaded
+            .last_group_by_profile
+            .get(&active_id)
+            .map(String::as_str);
+        let selections = self
+            .loaded
+            .selections_by_profile
+            .get(&active_id)
+            .cloned()
+            .unwrap_or_default();
+        model.restore_route_preferences(selected_group, &selections);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +143,6 @@ impl PersistenceTracker {
         selected_group: Option<String>,
         selections: BTreeMap<String, String>,
     ) {
-        self.desired.active_profile_hint = Some(profile.clone());
         if let Some(group) = selected_group {
             self.desired
                 .last_group_by_profile
@@ -110,6 +153,10 @@ impl PersistenceTracker {
         self.desired
             .selections_by_profile
             .insert(profile, selections);
+    }
+
+    fn set_active_profile_hint(&mut self, profile: Option<String>) {
+        self.desired.active_profile_hint = profile;
     }
 
     fn observe(&mut self, observation: Option<WindowObservation>) -> Option<AppPreferences> {
@@ -369,20 +416,11 @@ fn main() -> Result<(), slint::PlatformError> {
     )));
     let preference_writer = Arc::new(Mutex::new(PreferenceWriter::start(preference_store)));
 
-    let mut desktop_model = DesktopViewModel::new(client);
-    if let Some(profile) = loaded_preferences.active_profile_hint.as_deref() {
-        let selected_group = loaded_preferences
-            .last_group_by_profile
-            .get(profile)
-            .map(String::as_str);
-        let selections = loaded_preferences
-            .selections_by_profile
-            .get(profile)
-            .cloned()
-            .unwrap_or_default();
-        desktop_model.restore_route_preferences(selected_group, &selections);
-    }
-    let model = Arc::new(Mutex::new(desktop_model));
+    let model = Arc::new(Mutex::new(DesktopViewModel::new(client)));
+    let profile_preferences = Arc::new(Mutex::new(ProfilePreferenceReconciler::new(
+        loaded_preferences.clone(),
+        preference_tracker.clone(),
+    )));
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
 
     let ui = AppWindow::new()?;
@@ -412,9 +450,10 @@ fn main() -> Result<(), slint::PlatformError> {
     );
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
-    wire_import(&ui, model.clone());
+    wire_import(&ui, model.clone(), profile_preferences.clone());
     wire_subscription_refresh(&ui, model.clone());
-    wire_primary_action(&ui, model.clone());
+    wire_profile_switcher(&ui, model.clone(), profile_preferences.clone());
+    wire_primary_action(&ui, model.clone(), profile_preferences.clone());
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
@@ -454,7 +493,7 @@ fn main() -> Result<(), slint::PlatformError> {
     if updater::configured_repository().ok().flatten().is_some() {
         run_update_check(ui.as_weak(), model.clone(), update_state);
     }
-    run_refresh(ui.as_weak(), model.clone());
+    run_refresh(ui.as_weak(), model.clone(), profile_preferences);
     let starts_visible = initial_window_visible(launch_mode, tray_runtime.is_some());
     ui.set_shell_active(starts_visible);
     if starts_visible {
@@ -1227,7 +1266,11 @@ fn apply_launch_at_sign_in(ui: &AppWindow, state: std::io::Result<LaunchAtSignIn
     }
 }
 
-fn wire_import(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+fn wire_import(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
     let weak = ui.as_weak();
     ui.on_import_url(move |url| {
         let url = url.trim().to_owned();
@@ -1244,7 +1287,14 @@ fn wire_import(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
             return;
         };
 
-        run_import(weak.clone(), model.clone(), client, mutation, url);
+        run_import(
+            weak.clone(),
+            model.clone(),
+            client,
+            mutation,
+            url,
+            profile_preferences.clone(),
+        );
     });
 }
 
@@ -1275,7 +1325,137 @@ fn wire_subscription_refresh(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>
     });
 }
 
-fn wire_primary_action(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+fn wire_profile_switcher(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
+    let weak = ui.as_weak();
+    let open_model = model.clone();
+    let open_preferences = profile_preferences.clone();
+    ui.on_open_profile_menu(move || {
+        let current = {
+            let mut model = open_model.lock().expect("view model lock");
+            model.open_panel(Panel::Subscription);
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        load_profile_list(
+            weak.clone(),
+            open_model.clone(),
+            open_preferences.clone(),
+            false,
+        );
+    });
+
+    let weak = ui.as_weak();
+    let close_model = model.clone();
+    ui.on_close_profile_menu(move || {
+        let current = {
+            let mut model = close_model.lock().expect("view model lock");
+            model.open_panel(Panel::None);
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let add_model = model.clone();
+    ui.on_add_subscription(move || {
+        let current = {
+            let mut model = add_model.lock().expect("view model lock");
+            model.open_panel(Panel::None);
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+            ui.set_local_page("settings".into());
+            ui.set_subscription_draft("".into());
+            ui.set_replace_editor_open(true);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let activate_model = model.clone();
+    let activate_preferences = profile_preferences.clone();
+    ui.on_activate_profile(move |profile_id| {
+        let (token, client, current) = {
+            let mut model = activate_model.lock().expect("view model lock");
+            let token = model.begin_profile_activation(profile_id.as_str());
+            (token, model.daemon_client(), snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if let Some(token) = token {
+            run_profile_activation(
+                weak.clone(),
+                activate_model.clone(),
+                activate_preferences.clone(),
+                client,
+                token,
+                profile_id.to_string(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let refresh_model = model.clone();
+    let refresh_preferences = profile_preferences.clone();
+    ui.on_refresh_profile(move |profile_id| {
+        let (token, client, current) = {
+            let mut model = refresh_model.lock().expect("view model lock");
+            let token = model.begin_profile_target_refresh(profile_id.as_str());
+            (token, model.daemon_client(), snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if let Some(token) = token {
+            run_profile_target_refresh(
+                weak.clone(),
+                refresh_model.clone(),
+                refresh_preferences.clone(),
+                client,
+                token,
+                profile_id.to_string(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let delete_model = model;
+    ui.on_delete_profile(move |profile_id| {
+        let (token, client, current) = {
+            let mut model = delete_model.lock().expect("view model lock");
+            let token = model.begin_profile_delete(profile_id.as_str());
+            (token, model.daemon_client(), snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if let Some(token) = token {
+            run_profile_delete(
+                weak.clone(),
+                delete_model.clone(),
+                profile_preferences.clone(),
+                client,
+                token,
+                profile_id.to_string(),
+            );
+        }
+    });
+}
+
+fn wire_primary_action(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
     let weak = ui.as_weak();
     ui.on_primary_action(move || {
         let (action, client, queued, current) = {
@@ -1297,7 +1477,13 @@ fn wire_primary_action(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
                 run_disconnect(weak.clone(), model.clone(), client, mutation);
             }
             Some((PrimaryAction::Retry, mutation)) => {
-                run_status(weak.clone(), model.clone(), client, mutation);
+                run_status(
+                    weak.clone(),
+                    model.clone(),
+                    client,
+                    mutation,
+                    profile_preferences.clone(),
+                );
             }
             Some((PrimaryAction::None, _)) | None => {}
         }
@@ -1454,7 +1640,11 @@ fn close_panel(
     }
 }
 
-fn run_refresh(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewModel>>) {
+fn run_refresh(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
     let (client, mutation, current) = {
         let mut model = model.lock().expect("view model lock");
         let mutation = model.begin_refresh();
@@ -1463,7 +1653,7 @@ fn run_refresh(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewModel>>
     if let Some(ui) = weak.upgrade() {
         apply_snapshot(&ui, &current);
     }
-    run_status(weak, model, client, mutation);
+    run_status(weak, model, client, mutation, profile_preferences);
 }
 
 fn run_status(
@@ -1471,6 +1661,7 @@ fn run_status(
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
 ) {
     thread::spawn(move || {
         let result = client.status();
@@ -1480,7 +1671,14 @@ fn run_status(
             model.finish_refresh(mutation, result);
             snapshot(&model)
         };
-        apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            if refresh_catalog {
+                load_profile_list(weak, model, profile_preferences, true);
+            }
+        });
     });
 }
 
@@ -1490,17 +1688,27 @@ fn run_import(
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
     url: String,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
 ) {
     thread::spawn(move || {
         let result = client.import_subscription(&url);
         let import_succeeded = result.is_ok();
-        let refresh_catalog = import_succeeded;
         let current = {
             let mut model = model.lock().expect("view model lock");
             model.finish_import(mutation, result);
             snapshot(&model)
         };
-        apply_snapshot_from_worker(weak, current, model, refresh_catalog, import_succeeded);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+                if import_succeeded {
+                    ui.set_import_success_serial(ui.get_import_success_serial().wrapping_add(1));
+                }
+            }
+            if import_succeeded {
+                advance_profile_reconciliation(weak, model, profile_preferences, true);
+            }
+        });
     });
 }
 
@@ -1534,6 +1742,196 @@ fn run_connect(
             snapshot(&model)
         };
         apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
+    });
+}
+
+fn run_profile_activation(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    client: Arc<dyn DaemonClient>,
+    token: ProfileRequestToken,
+    profile_id: String,
+) {
+    thread::spawn(move || {
+        let result = client.activate_subscription(&profile_id);
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            let succeeded = model.finish_profile_activation(token, result);
+            if succeeded {
+                model.open_panel(Panel::None);
+            }
+            snapshot(&model)
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            advance_profile_reconciliation(weak, model, profile_preferences, false);
+        });
+    });
+}
+
+fn run_profile_target_refresh(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    client: Arc<dyn DaemonClient>,
+    token: ProfileRequestToken,
+    profile_id: String,
+) {
+    thread::spawn(move || {
+        let result = client.refresh_subscription_by_id(&profile_id);
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.finish_profile_target_refresh(token, result);
+            snapshot(&model)
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            advance_profile_reconciliation(weak, model, profile_preferences, false);
+        });
+    });
+}
+
+fn run_profile_delete(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    client: Arc<dyn DaemonClient>,
+    token: ProfileRequestToken,
+    profile_id: String,
+) {
+    thread::spawn(move || {
+        let result = client.delete_subscription(&profile_id);
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.finish_profile_delete(token, result);
+            snapshot(&model)
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            advance_profile_reconciliation(weak, model, profile_preferences, false);
+        });
+    });
+}
+
+fn load_profile_list(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    catalog_after: bool,
+) {
+    let (token, client, current) = {
+        let mut model = model.lock().expect("view model lock");
+        if matches!(
+            model.profile_presentation().pending_operation,
+            Some(
+                SubscriptionProfileOperation::Activate
+                    | SubscriptionProfileOperation::Refresh
+                    | SubscriptionProfileOperation::Delete
+            )
+        ) {
+            return;
+        }
+        let token = model.begin_profile_list();
+        (token, model.daemon_client(), snapshot(&model))
+    };
+    if let Some(ui) = weak.upgrade() {
+        apply_snapshot(&ui, &current);
+    }
+    let Some(token) = token else {
+        return;
+    };
+    thread::spawn(move || {
+        let result = client.subscriptions();
+        let succeeded = result.is_ok();
+        let (accepted, current) = {
+            let mut model = model.lock().expect("view model lock");
+            let accepted = model.finish_profile_list(token, result);
+            if accepted && succeeded {
+                profile_preferences
+                    .lock()
+                    .expect("profile preference reconciler lock")
+                    .reconcile(&mut model);
+            }
+            (accepted, snapshot(&model))
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            if accepted && succeeded {
+                advance_profile_reconciliation(weak, model, profile_preferences, catalog_after);
+            }
+        });
+    });
+}
+
+fn advance_profile_reconciliation(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    catalog_after: bool,
+) {
+    let (close_menu, reload_status, reload_list, reload_catalog) = {
+        let mut model = model.lock().expect("view model lock");
+        let close_menu = model.take_profile_close_intent();
+        if close_menu {
+            model.open_panel(Panel::None);
+        }
+        let reload_status = model.take_profile_status_reload_needed();
+        let reload_list = !reload_status && model.take_profile_list_reload_needed();
+        let reload_catalog =
+            !reload_status && !reload_list && model.take_profile_catalog_reload_needed();
+        (close_menu, reload_status, reload_list, reload_catalog)
+    };
+    if close_menu && let Some(ui) = weak.upgrade() {
+        apply_snapshot(&ui, &snapshot(&model.lock().expect("view model lock")));
+    }
+    if reload_status {
+        run_profile_status_reconciliation(weak, model, profile_preferences, catalog_after);
+    } else if reload_list {
+        load_profile_list(weak, model, profile_preferences, catalog_after);
+    } else if reload_catalog || catalog_after {
+        load_catalog(weak, model);
+    }
+}
+
+fn run_profile_status_reconciliation(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    catalog_after: bool,
+) {
+    let (client, mutation, current) = {
+        let mut model = model.lock().expect("view model lock");
+        let mutation = model.begin_refresh();
+        (model.daemon_client(), mutation, snapshot(&model))
+    };
+    if let Some(ui) = weak.upgrade() {
+        apply_snapshot(&ui, &current);
+    }
+    thread::spawn(move || {
+        let result = client.status();
+        let succeeded = result.is_ok();
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.finish_refresh(mutation, result);
+            snapshot(&model)
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            if succeeded {
+                advance_profile_reconciliation(weak, model, profile_preferences, catalog_after);
+            }
+        });
     });
 }
 
@@ -1791,6 +2189,7 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         import_pending: model.import_pending(),
         import_error: model.import_error().unwrap_or_default().to_owned(),
         subscription: model.subscription_presentation(),
+        profiles: model.profile_presentation(),
         catalog: model.catalog_presentation(),
         diagnostics: model.diagnostics_presentation(),
         latency: model.latency_presentation(),
@@ -1842,6 +2241,56 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
         snapshot
             .subscription
             .error
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_subscription_profiles(ModelRc::new(VecModel::from(
+        snapshot
+            .profiles
+            .profiles
+            .iter()
+            .map(|profile| {
+                let logo = profile
+                    .service_logo_path
+                    .as_deref()
+                    .and_then(|path| slint::Image::load_from_path(Path::new(path)).ok());
+                UiSubscriptionProfile {
+                    id: profile.id.clone().into(),
+                    title: profile.title.clone().into(),
+                    usage: profile.usage.clone().into(),
+                    expiry: profile.expiry.clone().into(),
+                    active: profile.active,
+                    available: profile.available,
+                    has_logo: logo.is_some(),
+                    logo: logo.unwrap_or_default(),
+                    fallback: profile
+                        .title
+                        .chars()
+                        .next()
+                        .map(|letter| letter.to_uppercase().to_string())
+                        .unwrap_or_else(|| "M".into())
+                        .into(),
+                }
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_profile_menu_loading(snapshot.profiles.loading);
+    ui.set_profile_menu_error(snapshot.profiles.error.clone().unwrap_or_default().into());
+    ui.set_profile_pending_operation(
+        match snapshot.profiles.pending_operation {
+            Some(SubscriptionProfileOperation::List) => "list",
+            Some(SubscriptionProfileOperation::Activate) => "activate",
+            Some(SubscriptionProfileOperation::Refresh) => "refresh",
+            Some(SubscriptionProfileOperation::Delete) => "delete",
+            None => "none",
+        }
+        .into(),
+    );
+    ui.set_profile_pending_id(
+        snapshot
+            .profiles
+            .pending_id
             .clone()
             .unwrap_or_default()
             .into(),
@@ -2010,6 +2459,8 @@ mod window_tests {
             Some("group-a".to_owned()),
             selections.clone(),
         );
+        assert_eq!(tracker.latest_desired().active_profile_hint, None);
+        tracker.set_active_profile_hint(Some("profile-a".to_owned()));
         let saved = tracker.snapshot_for_flush(None);
         assert_eq!(saved.active_profile_hint.as_deref(), Some("profile-a"));
         assert_eq!(
@@ -2025,8 +2476,74 @@ mod window_tests {
         );
 
         let source = include_str!("main.rs");
-        assert!(source.contains("desktop_model.restore_route_preferences("));
+        assert!(source.contains("model.restore_route_preferences("));
+        assert!(source.contains("set_active_profile_hint(active_id.clone())"));
         assert!(source.contains("tracker.set_route_preferences("));
+    }
+
+    #[test]
+    fn authoritative_profile_hint_is_updated_independently_of_route_preferences() {
+        let mut tracker = PersistenceTracker::new(AppPreferences {
+            active_profile_hint: Some("old-profile".into()),
+            ..AppPreferences::default()
+        });
+        tracker.set_route_preferences("new-profile".into(), None, Default::default());
+        assert_eq!(
+            tracker.latest_desired().active_profile_hint.as_deref(),
+            Some("old-profile")
+        );
+        tracker.set_active_profile_hint(Some("daemon-profile".into()));
+        assert_eq!(
+            tracker.latest_desired().active_profile_hint.as_deref(),
+            Some("daemon-profile")
+        );
+        tracker.set_active_profile_hint(None);
+        assert_eq!(tracker.latest_desired().active_profile_hint, None);
+    }
+
+    #[test]
+    fn compact_profile_switcher_source_contract() {
+        let ui = include_str!("../ui/app.slint");
+        let main = include_str!("main.rs");
+        let fixture = include_str!("../../../scripts/preview-fixture.ps1");
+        let capture = include_str!("../../../scripts/capture-preview.ps1");
+
+        for required in [
+            "export struct UiSubscriptionProfile",
+            "root.active-panel == \"subscription\"",
+            "callback activate-profile(string);",
+            "callback refresh-profile(string);",
+            "callback delete-profile(string);",
+            "callback add-subscription();",
+            "profile-menu := Rectangle",
+            "profile-scroll := ScrollView",
+            "Подписок пока нет",
+            "Удалить профиль?",
+            "Добавить подписку",
+            "accessible-label: \"Выбрать профиль подписки\"",
+        ] {
+            assert!(
+                ui.contains(required),
+                "missing profile UI contract: {required}"
+            );
+        }
+        assert!(!ui.contains("label: \"Профили\";"));
+        assert!(main.contains("model.finish_profile_list(token, result)"));
+        assert!(main.contains("model.finish_profile_activation(token, result)"));
+        assert!(main.contains("model.finish_profile_target_refresh(token, result)"));
+        assert!(main.contains("model.finish_profile_delete(token, result)"));
+        assert!(main.contains("slint::invoke_from_event_loop"));
+        assert!(main.contains("set_active_profile_hint(active_id.clone())"));
+        for route in [
+            "GET\" -and $path -eq \"/v1/subscriptions",
+            "PUT\" -and $path -match '^/v1/subscriptions/([^/]+)/activate$'",
+            "POST\" -and $path -match '^/v1/subscriptions/([^/]+)/refresh$'",
+            "DELETE\" -and $path -match '^/v1/subscriptions/([^/]+)$'",
+        ] {
+            assert!(fixture.contains(route), "missing fixture route: {route}");
+        }
+        assert!(capture.contains("Click-Preview $handle 276 203"));
+        assert!(capture.contains("profile menu replaced the navigation rail"));
     }
 
     #[test]
@@ -2042,9 +2559,11 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("fn activation_for_launch_arguments").next())
             .expect("common post-event-loop shutdown");
-        assert!(shutdown.contains(
-            "flush_preferences(&ui, &model, &preference_writer, &preference_tracker);"
-        ));
+        assert!(
+            shutdown.contains(
+                "flush_preferences(&ui, &model, &preference_writer, &preference_tracker);"
+            )
+        );
         assert!(shutdown.find("flush_preferences").unwrap() < shutdown.find("ui.hide()").unwrap());
         assert!(!shutdown.contains(".stop();"));
 

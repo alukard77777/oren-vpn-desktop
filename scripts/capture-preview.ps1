@@ -8,12 +8,13 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Height,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large")]
     [string]$ExpectedState,
     [switch]$HoverConnection,
     [switch]$SelectSecondRoute,
     [switch]$OpenDiagnostics,
-    [switch]$OpenSettings
+    [switch]$OpenSettings,
+    [switch]$OpenProfiles
 )
 
 $ErrorActionPreference = "Stop"
@@ -213,6 +214,23 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
         }
         return $true
     }
+    if ($ExpectedState.StartsWith("profiles-")) {
+        if (-not (Test-ColorNear $Bitmap.GetPixel(10, 40) 10 12 15 8)) {
+            $Failure.Value = "profile menu replaced the navigation rail"
+            return $false
+        }
+        $overlayText = Get-BrightPixelCount $Bitmap 205 230 ([Math]::Min(555, $Bitmap.Width - 24)) ([Math]::Min(560, $Bitmap.Height - 24))
+        if ($overlayText -lt 30) {
+            $Failure.Value = "missing anchored profile-menu content"
+            return $false
+        }
+        $footerAccent = Get-SemanticPixelCountInRegion $Bitmap 76 157 255 205 ([Math]::Min(350, $Bitmap.Height - 90)) ([Math]::Min(555, $Bitmap.Width - 24)) ($Bitmap.Height - 20)
+        if ($footerAccent -lt 2) {
+            $Failure.Value = "missing visible add-subscription footer or capped scroll region"
+            return $false
+        }
+        return $true
+    }
     $checks = @(
         @{ Pass = (Test-ColorNear $Bitmap.GetPixel($mid, 15) 10 12 15 8); Name = "title-bar background" },
         @{ Pass = (Test-ColorNear $Bitmap.GetPixel(10, 40) 10 12 15 6); Name = "navigation rail" },
@@ -358,6 +376,10 @@ try {
     }
     if ($OpenSettings) {
         Click-Preview $handle 88 174
+    }
+    if ($OpenProfiles) {
+        # The shelf body ends before the nested refresh target on the right.
+        Click-Preview $handle 276 203
     }
     Save-Preview $handle
 } finally {
