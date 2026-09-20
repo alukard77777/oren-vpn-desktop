@@ -292,6 +292,7 @@ pub enum SelectionError {
     UnknownGroup,
     UnknownNode,
     SelectorFailed,
+    StorageFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -878,6 +879,11 @@ async fn select_node(
                 "selector_failed",
                 "Mihomo не применил выбор маршрута. Повторите попытку.",
             ),
+            SelectionError::StorageFailed => ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "selection_storage_failed",
+                "Не удалось сохранить выбор маршрута. Повторите попытку.",
+            ),
         })
 }
 
@@ -1457,29 +1463,52 @@ where
         &self,
         id: &ProfileId,
     ) -> Result<StatusDto, ProfileMutationError> {
+        self.require_disconnected_mutation().await?;
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
-        let (revision, snapshot) = self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let (mut revision, mut snapshot) =
+            self.store.profile_snapshot(id).map_err(map_profile_error)?;
         let prepared =
             (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
-        if let Err(error) = self.store.activate(id) {
-            if error.mutation_committed() {
-                self.reconcile_authoritative().await;
+        let maintenance_debt = match self.store.activate(id) {
+            Ok(_) => false,
+            Err(error) if error.mutation_committed() => {
+                let Some((active_id, active_revision, active_snapshot)) =
+                    self.store.active_snapshot().map_err(map_profile_error)?
+                else {
+                    self.reconcile_authoritative().await;
+                    return Err(ProfileMutationError::Storage);
+                };
+                if active_id != *id {
+                    self.reconcile_authoritative().await;
+                    return Err(ProfileMutationError::Storage);
+                }
+                revision = active_revision;
+                snapshot = active_snapshot;
+                true
             }
-            return Err(map_profile_error(error));
-        }
+            Err(error) => return Err(map_profile_error(error)),
+        };
         let selections = initial_or_restored_selections(&self.store, id, revision, &snapshot);
         let controller = prepared.controller();
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
             state.apply_snapshot(id.clone(), snapshot, controller, revision, selections);
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Core,
+                    "profile_maintenance",
+                    "Profile activation committed with maintenance debt.",
+                );
+            }
         }
         if prepared.activate().is_err() {
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Storage);
         }
-        Ok(self.inner.read().await.status())
+        Ok(self.current_status().await)
     }
 
     pub async fn refresh_subscription_profile(
@@ -1509,22 +1538,22 @@ where
         &self,
         id: &ProfileId,
     ) -> Result<StatusDto, ProfileMutationError> {
+        self.require_disconnected_mutation().await?;
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
         let was_active = self.store.active_id().as_ref() == Some(id);
-        match self.store.delete(id) {
-            Ok(_) => {}
-            Err(error) => {
-                if error.mutation_committed() {
-                    self.reconcile_authoritative().await;
-                }
-                return Err(map_profile_error(error));
-            }
-        }
+        let maintenance_debt = match self.store.delete(id) {
+            Ok(_) => false,
+            Err(error) if error.mutation_committed() => true,
+            Err(error) => return Err(map_profile_error(error)),
+        };
         if was_active {
             self.reconcile_authoritative().await;
         }
-        Ok(self.inner.read().await.status())
+        if maintenance_debt {
+            self.record_maintenance_debt("profile_delete").await;
+        }
+        Ok(self.current_status().await)
     }
 
     async fn require_disconnected_mutation(&self) -> Result<(), ProfileMutationError> {
@@ -1552,6 +1581,21 @@ where
         }
     }
 
+    async fn current_status(&self) -> StatusDto {
+        let mut status = self.inner.read().await.status();
+        status.active_profile_id = self.store.active_id().map(|id| id.as_str().to_owned());
+        status
+    }
+
+    async fn record_maintenance_debt(&self, phase: &str) {
+        self.inner.write().await.push_event(
+            Severity::Warning,
+            Component::Core,
+            phase,
+            "Profile mutation committed with maintenance debt.",
+        );
+    }
+
     async fn refresh_profile_locked(
         &self,
         id: &ProfileId,
@@ -1559,10 +1603,7 @@ where
     where
         C: 'static,
     {
-        let (previous_revision, previous) =
-            self.store.profile_snapshot(id).map_err(map_profile_error)?;
-        let previous_selections =
-            restored_selections(&self.store, id, previous_revision, &previous);
+        let (_, previous) = self.store.profile_snapshot(id).map_err(map_profile_error)?;
         let source_url = previous
             .subscription_source_url()
             .ok_or(ProfileMutationError::Storage)?
@@ -1580,44 +1621,43 @@ where
         } else {
             None
         };
-        let revision = match self.store.replace_profile(id, snapshot.clone()) {
-            Ok(revision) => revision,
-            Err(error) => {
-                if error.mutation_committed() {
-                    self.reconcile_authoritative().await;
+        let (revision, persisted, maintenance_debt) =
+            match self.store.replace_profile(id, snapshot.clone()) {
+                Ok(revision) => (revision, snapshot, false),
+                Err(error) if error.mutation_committed() => {
+                    let (revision, persisted) =
+                        self.store.profile_snapshot(id).map_err(map_profile_error)?;
+                    (revision, persisted, true)
                 }
-                return Err(map_profile_error(error));
-            }
-        };
-        if let Err(error) = carry_valid_selections(
-            &self.store,
-            id,
-            revision,
-            &previous,
-            &previous_selections,
-            &snapshot,
-        ) {
-            if error.mutation_committed() {
-                self.reconcile_authoritative().await;
-            }
-            return Err(map_profile_error(error));
-        }
+                Err(error) => return Err(map_profile_error(error)),
+            };
         if !active {
-            return Ok(self.inner.read().await.status());
+            if maintenance_debt {
+                self.record_maintenance_debt("profile_refresh").await;
+            }
+            return Ok(self.current_status().await);
         }
         let prepared = prepared.expect("active refresh prepares a controller");
-        let selections = initial_or_restored_selections(&self.store, id, revision, &snapshot);
+        let selections = initial_or_restored_selections(&self.store, id, revision, &persisted);
         let controller = prepared.controller();
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(id.clone(), snapshot, controller, revision, selections);
+            state.apply_snapshot(id.clone(), persisted, controller, revision, selections);
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "profile_refresh",
+                    "Profile refresh committed with maintenance debt.",
+                );
+            }
         }
         if prepared.activate().is_err() {
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Storage);
         }
-        Ok(self.inner.read().await.status())
+        Ok(self.current_status().await)
     }
 
     async fn import_profile_locked(&self, url: &str) -> Result<StatusDto, ProfileMutationError>
@@ -1642,51 +1682,36 @@ where
             .store
             .find_exact_source(trimmed_url)
             .map_err(map_profile_error)?;
-        let id = if let Some(id) = existing {
-            let (previous_revision, previous) = self
-                .store
-                .profile_snapshot(&id)
-                .map_err(map_profile_error)?;
-            let previous_selections =
-                restored_selections(&self.store, &id, previous_revision, &previous);
-            let revision = match self.store.replace_profile(&id, snapshot.clone()) {
-                Ok(revision) => revision,
+        let (id, maintenance_debt) = if let Some(id) = existing {
+            let replace_debt = match self.store.replace_profile(&id, snapshot.clone()) {
+                Ok(_) => false,
+                Err(error) if error.mutation_committed() => {
+                    self.store
+                        .profile_snapshot(&id)
+                        .map_err(map_profile_error)?;
+                    true
+                }
+                Err(error) => return Err(map_profile_error(error)),
+            };
+            let activate_debt = match self.store.activate(&id) {
+                Ok(_) => false,
+                Err(error) if error.mutation_committed() => true,
                 Err(error) => {
-                    if error.mutation_committed() {
-                        self.reconcile_authoritative().await;
-                    }
+                    self.reconcile_authoritative().await;
                     return Err(map_profile_error(error));
                 }
             };
-            if let Err(error) = carry_valid_selections(
-                &self.store,
-                &id,
-                revision,
-                &previous,
-                &previous_selections,
-                &snapshot,
-            ) {
-                if error.mutation_committed() {
-                    self.reconcile_authoritative().await;
-                }
-                return Err(map_profile_error(error));
-            }
-            if let Err(error) = self.store.activate(&id) {
-                if error.mutation_committed() {
-                    self.reconcile_authoritative().await;
-                }
-                return Err(map_profile_error(error));
-            }
-            id
+            (id, replace_debt || activate_debt)
         } else {
             match self.store.create_profile(snapshot.clone()) {
-                Ok(id) => id,
-                Err(error) => {
-                    if error.mutation_committed() {
-                        self.reconcile_authoritative().await;
-                    }
-                    return Err(map_profile_error(error));
-                }
+                Ok(id) => (id, false),
+                Err(error) if error.mutation_committed() => (
+                    self.store
+                        .active_id()
+                        .ok_or(ProfileMutationError::Storage)?,
+                    true,
+                ),
+                Err(error) => return Err(map_profile_error(error)),
             }
         };
         let (revision, persisted) = self
@@ -1705,12 +1730,20 @@ where
                 "import",
                 "Subscription imported.",
             );
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "profile_import",
+                    "Profile import committed with maintenance debt.",
+                );
+            }
         }
         if prepared.activate().is_err() {
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Storage);
         }
-        Ok(self.inner.read().await.status())
+        Ok(self.current_status().await)
     }
 }
 
@@ -1786,59 +1819,22 @@ fn restored_selections(
         .collect()
 }
 
-fn carry_valid_selections(
-    store: &ProfileStore,
-    id: &ProfileId,
-    revision: u64,
-    previous: &Snapshot,
-    previous_selections: &[Option<String>],
-    refreshed: &Snapshot,
-) -> Result<(), ProfileError> {
-    let previous_groups = selectable_groups(previous);
-    let refreshed_groups = selectable_groups(refreshed);
-    for (previous_index, selected_node) in previous_selections.iter().enumerate() {
-        let Some(selected_node) = selected_node else {
-            continue;
-        };
-        let Some(previous_group) = previous_groups.get(previous_index) else {
-            continue;
-        };
-        let Some((group_index, refreshed_group)) = refreshed_groups
-            .iter()
-            .enumerate()
-            .find(|(_, group)| group.name == previous_group.name)
-        else {
-            continue;
-        };
-        let Some(node_index) = refreshed_group
-            .nodes
-            .iter()
-            .position(|node| *node == selected_node)
-        else {
-            continue;
-        };
-        store.save_selection(
-            id,
-            revision,
-            &catalog_group_id(revision, group_index),
-            &catalog_node_id(revision, group_index, node_index),
-        )?;
-    }
-    Ok(())
-}
-
 fn initial_or_restored_selections(
     store: &ProfileStore,
     id: &ProfileId,
     revision: u64,
     snapshot: &Snapshot,
 ) -> Vec<Option<String>> {
-    let restored = restored_selections(store, id, revision, snapshot);
-    if restored.iter().any(Option::is_some) {
-        restored
-    } else {
-        default_selections(snapshot)
+    let mut selections = default_selections(snapshot);
+    for (selected, restored) in selections
+        .iter_mut()
+        .zip(restored_selections(store, id, revision, snapshot))
+    {
+        if restored.is_some() {
+            *selected = restored;
+        }
     }
+    selections
 }
 
 #[async_trait]
@@ -1849,7 +1845,7 @@ where
     F: 'static,
 {
     async fn status(&self) -> Result<StatusDto, BackendError> {
-        Ok(self.inner.read().await.status())
+        Ok(self.current_status().await)
     }
 
     async fn catalog(&self) -> Result<CatalogDto, BackendError> {
@@ -1882,7 +1878,7 @@ where
     }
     async fn connect(&self) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
-        let snapshot = {
+        let (snapshot, queued_selections) = {
             let state = self.inner.read().await;
             if state.degraded {
                 return Err(BackendError::new());
@@ -1890,7 +1886,16 @@ where
             if state.state.current() != CoreConnectionState::Ready {
                 return Err(BackendError::new());
             }
-            state.snapshot.clone().ok_or_else(BackendError::new)?
+            let snapshot = state.snapshot.clone().ok_or_else(BackendError::new)?;
+            let queued_selections = selectable_groups(&snapshot)
+                .iter()
+                .zip(&state.selected_nodes)
+                .filter_map(|(group, node)| {
+                    node.as_ref()
+                        .map(|node| (group.name.to_owned(), node.clone()))
+                })
+                .collect::<Vec<_>>();
+            (snapshot, queued_selections)
         };
         let prepared = match (self.controller_factory)(&snapshot) {
             Ok(prepared) => prepared,
@@ -1935,7 +1940,38 @@ where
             );
         }
 
-        let result = Supervisor::new(controller).connect().await;
+        let result = Supervisor::new(controller.clone()).connect().await;
+        if result.is_ok() {
+            for (group, node) in queued_selections {
+                if self.selector.select(&group, &node).await.is_err() {
+                    let rollback = Supervisor::new(controller.clone()).disconnect().await;
+                    let mut state = self.inner.write().await;
+                    if rollback.is_ok() {
+                        state
+                            .state
+                            .transition(CoreConnectionState::Ready)
+                            .map_err(|_| BackendError::new())?;
+                        state.message = Some(
+                            "Mihomo did not apply the queued route selection; connection was rolled back."
+                                .to_owned(),
+                        );
+                        state.degraded = false;
+                    } else {
+                        state.mark_error(
+                            "Mihomo route selection failed and core rollback was incomplete.",
+                            true,
+                        );
+                    }
+                    state.push_event(
+                        Severity::Error,
+                        Component::Mihomo,
+                        "selection_replay",
+                        "Queued Mihomo selection replay failed during connection startup.",
+                    );
+                    return Err(BackendError::new());
+                }
+            }
+        }
         let mut state = self.inner.write().await;
         match result {
             Ok(()) => {
@@ -2044,7 +2080,15 @@ where
 
     async fn select(&self, request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
         let _operation = self.operation.lock().await;
-        let (snapshot, active_profile_id, connected, group_index, raw_group, raw_node) = {
+        let (
+            snapshot,
+            active_profile_id,
+            connected,
+            group_index,
+            raw_group,
+            raw_node,
+            previous_raw_node,
+        ) = {
             let state = self.inner.read().await;
             if !matches!(
                 state.state.current(),
@@ -2082,6 +2126,7 @@ where
                 .ok_or(SelectionError::UnknownNode)?;
             let raw_group = group.name.to_owned();
             let raw_node = group.nodes[node_index].to_owned();
+            let previous_raw_node = state.selected_nodes[group_index].clone();
             (
                 snapshot,
                 active_profile_id,
@@ -2089,6 +2134,7 @@ where
                 group_index,
                 raw_group,
                 raw_node,
+                previous_raw_node,
             )
         };
 
@@ -2099,31 +2145,38 @@ where
                 .map_err(|_| SelectionError::SelectorFailed)?;
         }
 
-        if let Err(error) = self.store.save_selection(
+        let maintenance_debt = match self.store.save_selection(
             &active_profile_id,
             request.revision,
             &request.group_id,
             &request.node_id,
         ) {
-            if error.mutation_committed() {
-                let restored = restored_selections(
-                    &self.store,
-                    &active_profile_id,
-                    request.revision,
-                    &snapshot,
-                );
-                let mut state = self.inner.write().await;
-                state.selected_nodes = restored;
-                state.current_node = state.selected_nodes.first().cloned().flatten();
-                state.catalog = build_catalog(
-                    &snapshot,
-                    request.revision,
-                    state.profile.as_deref(),
-                    &state.selected_nodes,
-                );
+            Ok(()) => false,
+            Err(error) if error.mutation_committed() => true,
+            Err(_) => {
+                if connected
+                    && let Some(previous_raw_node) = previous_raw_node
+                    && self
+                        .selector
+                        .select(&raw_group, &previous_raw_node)
+                        .await
+                        .is_err()
+                {
+                    let mut state = self.inner.write().await;
+                    state.mark_error(
+                        "Mihomo selection changed but persistence and live compensation failed.",
+                        true,
+                    );
+                    state.push_event(
+                        Severity::Error,
+                        Component::Mihomo,
+                        "selection_compensation",
+                        "Mihomo selection compensation failed after a storage error.",
+                    );
+                }
+                return Err(SelectionError::StorageFailed);
             }
-            return Err(SelectionError::SelectorFailed);
-        }
+        };
 
         let mut state = self.inner.write().await;
         // All state-changing operations share `operation`, so this revision cannot change while
@@ -2131,9 +2184,19 @@ where
         if state.catalog.revision != request.revision {
             return Err(SelectionError::StaleRevision);
         }
-        state.selected_nodes[group_index] = Some(raw_node.clone());
-        if group_index == 0 {
-            state.current_node = Some(raw_node);
+        if maintenance_debt {
+            state.selected_nodes = initial_or_restored_selections(
+                &self.store,
+                &active_profile_id,
+                request.revision,
+                &snapshot,
+            );
+            state.current_node = state.selected_nodes.first().cloned().flatten();
+        } else {
+            state.selected_nodes[group_index] = Some(raw_node.clone());
+            if group_index == 0 {
+                state.current_node = Some(raw_node);
+            }
         }
         state.catalog = build_catalog(
             &snapshot,
@@ -2147,6 +2210,14 @@ where
             "selection",
             "Маршрут Mihomo изменён.",
         );
+        if maintenance_debt {
+            state.push_event(
+                Severity::Warning,
+                Component::Core,
+                "selection_maintenance",
+                "Selection committed with maintenance debt.",
+            );
+        }
         Ok(state.catalog.clone())
     }
 

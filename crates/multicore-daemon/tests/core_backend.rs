@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use async_trait::async_trait;
 use multicore_core::{
     CoreLogRecord, DiagnosticStream, Engine, FetchError, HttpClient, HttpResponse, MAX_PROFILES,
     MihomoRuntimeControl, ProcessController, ProcessDiagnostics, ProfileId, ProfileStore,
@@ -12,8 +13,8 @@ use multicore_core::{
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectionState, CoreBackend, ImportSubscriptionRequest,
-    MAX_DIAGNOSTIC_MAPPINGS, PreparedController, ProfileMutationError, RuntimeCheckDto,
-    SelectionRequest, transactional_controller_factory,
+    MAX_DIAGNOSTIC_MAPPINGS, MihomoSelector, PreparedController, ProfileMutationError,
+    RuntimeCheckDto, SelectionRequest, SelectorError, transactional_controller_factory,
 };
 
 const MIHOMO: &str = r#"
@@ -25,6 +26,62 @@ proxy-groups:
     type: select
     proxies: [Test Node]
 "#;
+
+struct ConfirmingSelector;
+
+#[async_trait]
+impl MihomoSelector for ConfirmingSelector {
+    async fn select(&self, _group: &str, _node: &str) -> Result<(), SelectorError> {
+        Ok(())
+    }
+}
+
+struct BlockingStartController {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl ProcessController for BlockingStartController {
+    type Error = ();
+
+    fn start<'a>(
+        &'a self,
+        engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if engine == Engine::Xray {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        })
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn test_backend<C, P, F>(
+    store: ProfileStore,
+    fetcher: SubscriptionFetcher<C>,
+    controller_factory: F,
+) -> Result<CoreBackend<C, P, F>, BackendError>
+where
+    C: HttpClient,
+    P: ProcessController,
+    F: Fn(&Snapshot) -> Result<Arc<P>, BackendError> + Send + Sync + 'static,
+{
+    CoreBackend::new_with_selector(
+        store,
+        fetcher,
+        controller_factory,
+        Arc::new(ConfirmingSelector),
+    )
+}
 
 const SOURCE_URL_CANARY: &str =
     "https://user:source-password@source-canary.invalid/sub?source_token=source-canary";
@@ -210,8 +267,10 @@ impl HttpClient for OfflineHttp {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ProfileHttp;
+#[derive(Clone, Default)]
+struct ProfileHttp {
+    update_one: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl HttpClient for ProfileHttp {
     fn get<'a>(
@@ -221,7 +280,11 @@ impl HttpClient for ProfileHttp {
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
         Box::pin(async move {
             let label = if url.contains("one.invalid") {
-                "One"
+                if self.update_one.load(std::sync::atomic::Ordering::SeqCst) {
+                    "One Updated"
+                } else {
+                    "One"
+                }
             } else {
                 "Two"
             };
@@ -261,9 +324,20 @@ fn profile_backend(
     RecordingController,
     impl Fn(&Snapshot) -> Result<Arc<RecordingController>, BackendError> + use<>,
 > {
-    CoreBackend::new(
+    profile_backend_with_http(root, ProfileHttp::default())
+}
+
+fn profile_backend_with_http(
+    root: &std::path::Path,
+    http: ProfileHttp,
+) -> CoreBackend<
+    ProfileHttp,
+    RecordingController,
+    impl Fn(&Snapshot) -> Result<Arc<RecordingController>, BackendError> + use<>,
+> {
+    test_backend(
         ProfileStore::open(root, None).unwrap(),
-        SubscriptionFetcher::new(ProfileHttp),
+        SubscriptionFetcher::new(http),
         |_snapshot| Ok(Arc::new(RecordingController::default())),
     )
     .unwrap()
@@ -272,7 +346,8 @@ fn profile_backend(
 #[tokio::test]
 async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_not_activate() {
     let root = tempfile::tempdir().unwrap();
-    let backend = profile_backend(root.path());
+    let http = ProfileHttp::default();
+    let backend = profile_backend_with_http(root.path(), http.clone());
     let first = backend
         .import_subscription(ImportSubscriptionRequest {
             url: "  https://one.invalid/sub  ".into(),
@@ -300,7 +375,8 @@ async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_n
         duplicate.active_profile_id.as_deref(),
         Some(first_id.as_str())
     );
-    assert_eq!(duplicate.current_node.as_deref(), Some("One Alt"));
+    assert_eq!(duplicate.current_node.as_deref(), Some("One Node"));
+    let first_revision = backend.catalog().await.unwrap().revision;
     assert_eq!(backend.list_subscriptions().unwrap().len(), 1);
 
     let second = backend
@@ -312,6 +388,8 @@ async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_n
     let second_id = second.active_profile_id.unwrap();
     assert_ne!(first_id, second_id);
     assert_eq!(second.profile.as_deref(), Some("Two"));
+    http.update_one
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     backend
         .refresh_subscription_profile(&profile_id(&first_id))
         .await
@@ -322,6 +400,12 @@ async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_n
         Some(second_id.as_str())
     );
     assert_eq!(status.profile.as_deref(), Some("Two"));
+    let activated = backend
+        .activate_subscription(&profile_id(&first_id))
+        .await
+        .unwrap();
+    assert_eq!(activated.profile.as_deref(), Some("One Updated"));
+    assert_ne!(backend.catalog().await.unwrap().revision, first_revision);
 }
 
 #[tokio::test]
@@ -437,6 +521,56 @@ async fn connected_profile_mutations_are_rejected_without_hot_swap() {
 }
 
 #[tokio::test]
+async fn connecting_profile_mutations_reject_immediately_without_waiting_for_operation_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let id = store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered_wait = entered.notified();
+    let controller = Arc::new(BlockingStartController {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let backend = Arc::new(
+        CoreBackend::new_with_selector(
+            store,
+            SubscriptionFetcher::new(OfflineHttp),
+            move |_snapshot| Ok(controller.clone()),
+            Arc::new(ConfirmingSelector),
+        )
+        .unwrap(),
+    );
+    let connecting = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.connect().await })
+    };
+    entered_wait.await;
+
+    let activation = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        backend.activate_subscription(&id),
+    )
+    .await
+    .expect("activation must not wait for the operation mutex");
+    assert_eq!(activation, Err(ProfileMutationError::Connected));
+    let deletion = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        backend.delete_subscription(&id),
+    )
+    .await
+    .expect("deletion must not wait for the operation mutex");
+    assert_eq!(deletion, Err(ProfileMutationError::Connected));
+
+    release.notify_one();
+    connecting.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn profile_limit_is_reported_as_a_typed_mutation_error() {
     let root = tempfile::tempdir().unwrap();
     let store = ProfileStore::open(root.path(), None).unwrap();
@@ -444,9 +578,11 @@ async fn profile_limit_is_reported_as_a_typed_mutation_error() {
     for _ in 0..MAX_PROFILES {
         store.create_profile(snapshot.clone()).unwrap();
     }
-    let backend = CoreBackend::new(store, SubscriptionFetcher::new(ProfileHttp), |_snapshot| {
-        Ok(Arc::new(RecordingController::default()))
-    })
+    let backend = test_backend(
+        store,
+        SubscriptionFetcher::new(ProfileHttp::default()),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
     .unwrap();
     assert_eq!(
         backend
@@ -465,7 +601,7 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
     let store = ProfileStore::open(root.path(), None).unwrap();
     let (http, expected_display_name, expected_group_name, expected_node_name) = maximal_fixture();
     let calls = http.calls.clone();
-    let backend = CoreBackend::new(store, SubscriptionFetcher::new(http), |_snapshot| {
+    let backend = test_backend(store, SubscriptionFetcher::new(http), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
     .unwrap();
@@ -630,7 +766,7 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
     let root = tempfile::tempdir().unwrap();
     let store = ProfileStore::open(root.path(), None).unwrap();
     let (http, _, expected_group_name, expected_node_name) = maximal_fixture();
-    let backend = CoreBackend::new(store, SubscriptionFetcher::new(http), |_snapshot| {
+    let backend = test_backend(store, SubscriptionFetcher::new(http), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
     .unwrap();
@@ -655,7 +791,7 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
 
     drop(backend);
     let store = ProfileStore::open(root.path(), None).unwrap();
-    let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
+    let backend = test_backend(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
     .unwrap();
@@ -674,7 +810,7 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
 
     drop(backend);
     let store = ProfileStore::open(root.path(), None).unwrap();
-    let restarted = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
+    let restarted = test_backend(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
     .unwrap();
@@ -717,7 +853,7 @@ async fn legacy_persisted_subscription_without_display_name_uses_source_host_fal
     std::fs::write(&subscription_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
     let store = ProfileStore::open(root.path(), None).unwrap();
-    let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
+    let backend = test_backend(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
     .unwrap();
@@ -752,7 +888,7 @@ async fn diagnostics_exposes_bounded_safe_mihomo_to_xray_mappings_only() {
             Snapshot::parse(mihomo.as_bytes(), br#"{ "secret": "opaque-xray" }"#).unwrap(),
         ))
         .unwrap();
-    let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
+    let backend = test_backend(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
         Ok(Arc::new(RecordingController::default()))
     })
     .unwrap();
@@ -916,7 +1052,7 @@ async fn successful_fetch_persists_snapshot_and_updates_status_before_supervisio
     let http_calls = http.calls.clone();
     let controller = Arc::new(RecordingController::default());
     let controller_for_factory = controller.clone();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(http),
         move |_snapshot: &Snapshot| -> Result<Arc<RecordingController>, BackendError> {
@@ -991,7 +1127,7 @@ async fn every_connect_reprepares_the_controller_from_the_current_snapshot() {
     let factory_calls_clone = factory_calls.clone();
     let controller = Arc::new(RecordingController::default());
     let controller_clone = controller.clone();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
         move |_snapshot: &Snapshot| -> Result<Arc<RecordingController>, BackendError> {
@@ -1027,7 +1163,7 @@ async fn persisted_profile_loads_without_network_preparation_until_connect() {
         .unwrap();
     let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let factory_calls_clone = factory_calls.clone();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(OfflineHttp),
         move |_snapshot: &Snapshot| -> Result<Arc<RecordingController>, BackendError> {
@@ -1068,7 +1204,7 @@ fn status_states_serialize_exactly_as_the_desktop_contract() {
 async fn rollback_failure_is_reported_as_error_and_degraded_status() {
     let directory = tempfile::tempdir().unwrap();
     let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
         |_snapshot: &Snapshot| -> Result<Arc<RollbackFailingController>, BackendError> {
@@ -1110,7 +1246,7 @@ async fn successful_rollback_returns_to_ready_without_degraded_mode() {
             Box::pin(async { Ok(()) })
         }
     }
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
         |_snapshot: &Snapshot| -> Result<Arc<SafeRollbackController>, BackendError> {
@@ -1140,7 +1276,7 @@ async fn degraded_mode_blocks_import_without_replacing_controller_until_cleanup(
     let factory_calls_clone = factory_calls.clone();
     let controller = Arc::new(RecoverableController::default());
     let controller_clone = controller.clone();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
         move |_snapshot: &Snapshot| -> Result<Arc<RecoverableController>, BackendError> {
@@ -1195,7 +1331,7 @@ async fn degraded_mode_blocks_reconnect_until_successful_disconnect_cleanup() {
     let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
     let controller = Arc::new(RecoverableController::default());
     let controller_clone = controller.clone();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
         move |_snapshot: &Snapshot| -> Result<Arc<RecoverableController>, BackendError> {
@@ -1256,7 +1392,7 @@ proxy-groups:
     let directory = tempfile::tempdir().unwrap();
     let snapshots = directory.path().join("snapshots");
     let store = ProfileStore::open(&snapshots, None).unwrap();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::default()),
         |_snapshot: &Snapshot| -> Result<Arc<RecordingController>, BackendError> {
@@ -1273,7 +1409,7 @@ proxy-groups:
     drop(backend);
 
     let store = ProfileStore::open(&snapshots, None).unwrap();
-    let backend = CoreBackend::new(
+    let backend = test_backend(
         store,
         SubscriptionFetcher::new(FixtureHttp::with_mihomo(REPLACEMENT)),
         |snapshot: &Snapshot| -> Result<Arc<RecordingController>, BackendError> {
@@ -1345,10 +1481,11 @@ proxy-groups:
         });
         Ok(PreparedController::with_runtime(controller, staged))
     });
-    let backend = CoreBackend::new_transactional(
+    let backend = CoreBackend::new_transactional_with_selector(
         store,
         SubscriptionFetcher::new(FixtureHttp::with_mihomo(REPLACEMENT)),
         factory,
+        Arc::new(ConfirmingSelector),
     )
     .unwrap();
     assert!(backend.connect().await.is_ok());
