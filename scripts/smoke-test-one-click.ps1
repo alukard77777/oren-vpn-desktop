@@ -3,6 +3,7 @@ param(
     [string]$PackagePath,
     [string]$DesktopExecutableName = 'MultiCore.exe',
     [string]$DiagnosticErrorPath,
+    [switch]$Background,
     [switch]$CrashCleanup
 )
 
@@ -72,6 +73,20 @@ foreach ($file in @($desktopExe, $daemonExe, $coreHostExe, $xrayExe, $mihomoExe)
         throw "Package executable is a reparse point: $file"
     }
 }
+if ($Background -and $CrashCleanup) { throw 'Background and CrashCleanup modes are mutually exclusive' }
+
+$desktopNames = @('MultiCore.exe', [IO.Path]::GetFileName($desktopExe))
+$existingSingletons = @(Get-CimInstance Win32_Process | Where-Object {
+    $desktopNames -contains $_.Name
+})
+if ($existingSingletons.Count -ne 0) {
+    throw 'Refusing to disturb an existing MultiCore singleton; close it before running the smoke test'
+}
+foreach ($path in @($desktopExe, $daemonExe, $coreHostExe, $xrayExe, $mihomoExe)) {
+    if (@(Get-ExactProcess $path).Count -ne 0) {
+        throw "Refusing to adopt a pre-existing exact-package process: $path"
+    }
+}
 
 $smokeRoot = Join-Path ([IO.Path]::GetTempPath()) ('multicore-task4-smoke-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($smokeRoot) | Out-Null
@@ -87,6 +102,7 @@ $hadSmokeClose = Test-Path Env:MULTICORE_SMOKE_EXIT_ON_CLOSE
 $savedSmokeClose = $env:MULTICORE_SMOKE_EXIT_ON_CLOSE
 $desktop = $null
 $daemonPid = $null
+$windows = @()
 $succeeded = $false
 
 try {
@@ -104,15 +120,24 @@ try {
     if ($DiagnosticErrorPath) {
         $startArguments.RedirectStandardError = [IO.Path]::GetFullPath($DiagnosticErrorPath)
     }
+    if ($Background) {
+        $startArguments.ArgumentList = @('--background')
+    }
     $desktop = Start-Process @startArguments
-    $windowDeadline = [DateTime]::UtcNow.AddSeconds(20)
-    do {
-        Start-Sleep -Milliseconds 100
+    if ($Background) {
+        Start-Sleep -Milliseconds 250
         $desktop.Refresh()
-        $windows = @(Get-MultiCoreWindow $desktop.Id)
-    } until ($desktop.HasExited -or $windows.Count -eq 1 -or [DateTime]::UtcNow -ge $windowDeadline)
-    if ($desktop.HasExited -or $windows.Count -ne 1) {
-        throw 'GUI did not appear after the authenticated bootstrap deadline'
+        if ($desktop.HasExited) { throw 'Background desktop exited before daemon bootstrap' }
+    } else {
+        $windowDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        do {
+            Start-Sleep -Milliseconds 100
+            $desktop.Refresh()
+            $windows = @(Get-MultiCoreWindow $desktop.Id)
+        } until ($desktop.HasExited -or $windows.Count -eq 1 -or [DateTime]::UtcNow -ge $windowDeadline)
+        if ($desktop.HasExited -or $windows.Count -ne 1) {
+            throw 'GUI did not appear after the authenticated bootstrap deadline'
+        }
     }
 
     $childDeadline = [DateTime]::UtcNow.AddSeconds(10)
@@ -142,6 +167,10 @@ try {
     if ($coreHostsBeforeConnect.Count -ne 0) {
         throw "Core host started before explicit Connect; observed $($coreHostsBeforeConnect.Count)"
     }
+    $coresBeforeConnect = @((Get-ExactProcess $xrayExe) + (Get-ExactProcess $mihomoExe))
+    if ($coresBeforeConnect.Count -ne 0) {
+        throw "Core executable started before explicit Connect; observed $($coresBeforeConnect.Count)"
+    }
 
     $status = $null
     try {
@@ -156,7 +185,13 @@ try {
     }
     if ($status -ne 401) { throw "Tokenless daemon status returned $status instead of 401" }
 
-    if ($CrashCleanup) {
+    if ($Background) {
+        $ownedDesktop = @(Get-ExactProcess $desktopExe | Where-Object { $_.ProcessId -eq $desktop.Id })
+        if ($ownedDesktop.Count -ne 1) { throw 'Background desktop ownership changed before cleanup' }
+        Stop-Process -Id $desktop.Id
+        if (-not $desktop.WaitForExit(10000)) { throw 'Background desktop did not exit by exact PID' }
+        $shutdown = 'background-exact-pid'
+    } elseif ($CrashCleanup) {
         Stop-Process -Id $desktop.Id -Force
         if (-not $desktop.WaitForExit(5000)) { throw 'Desktop process could not be terminated by exact PID' }
         $shutdown = 'forced-crash-check'
@@ -188,6 +223,7 @@ try {
         TokenlessStatus = $status
         CoreHostBeforeConnect = 'absent'
         LiveConnectUac = 'manual release gate (not exercised)'
+        LaunchMode = $(if ($Background) { 'background' } else { 'foreground' })
         DesktopShutdown = $shutdown
         Cleanup = 'verified'
     } | Format-List

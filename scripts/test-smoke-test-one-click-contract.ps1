@@ -6,16 +6,33 @@ Set-StrictMode -Version Latest
 
 $smokePath = Join-Path $PSScriptRoot 'smoke-test-one-click.ps1'
 $source = Get-Content -Raw -LiteralPath $smokePath
+$parseTokens = $null
+$parseErrors = $null
+[void][Management.Automation.Language.Parser]::ParseFile(
+    $smokePath,
+    [ref]$parseTokens,
+    [ref]$parseErrors
+)
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
 }
 
+Assert-True ($parseErrors.Count -eq 0) 'one-click smoke must parse as valid PowerShell'
+
 foreach ($required in @(
     "'runtime\multicore-core-host.exe'",
     'Get-ExactProcess $coreHostExe',
     'Core host started before explicit Connect',
+    'Core executable started before explicit Connect',
+    '[switch]$Background',
+    '$startArguments.ArgumentList = @(''--background'')',
+    'Background desktop exited before daemon bootstrap',
+    'Background desktop ownership changed before cleanup',
+    'LaunchMode = $(if ($Background) { ''background'' } else { ''foreground'' })',
+    'Refusing to disturb an existing MultiCore singleton',
+    "shutdown = 'background-exact-pid'",
     "CoreHostBeforeConnect = 'absent'",
     "LiveConnectUac = 'manual release gate (not exercised)'"
 )) {

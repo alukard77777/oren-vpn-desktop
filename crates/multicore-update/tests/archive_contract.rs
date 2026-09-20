@@ -11,12 +11,14 @@ use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 
 fn fake_pe() -> Vec<u8> {
-    let mut bytes = vec![0_u8; 256];
+    let mut bytes = vec![0_u8; 512];
     bytes[0..2].copy_from_slice(b"MZ");
     bytes[0x3c..0x40].copy_from_slice(&(0x80_u32).to_le_bytes());
     bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
     bytes[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+    bytes[0x86..0x88].copy_from_slice(&1_u16.to_le_bytes());
     bytes[0x94..0x96].copy_from_slice(&0x00f0_u16.to_le_bytes());
+    bytes[0x96..0x98].copy_from_slice(&0x0002_u16.to_le_bytes());
     bytes[0x98..0x9a].copy_from_slice(&0x020b_u16.to_le_bytes());
     bytes
 }
@@ -284,6 +286,43 @@ fn missing_or_non_pe32_plus_amd64_core_host_is_rejected() {
 
     let error = extract_verified_bundle(&archive, &temp.path().join("pe32-out")).unwrap_err();
     assert!(error.to_string().contains("PE32+ AMD64"), "{error}");
+}
+
+#[test]
+fn malformed_core_host_pe_structure_and_image_flags_are_rejected() {
+    let cases = [
+        ("zero-sections", {
+            let mut pe = fake_pe();
+            pe[0x86..0x88].copy_from_slice(&0_u16.to_le_bytes());
+            pe
+        }),
+        ("truncated-section-table", {
+            let mut pe = fake_pe();
+            pe.truncate(0x188);
+            pe
+        }),
+        ("not-executable", {
+            let mut pe = fake_pe();
+            pe[0x96..0x98].copy_from_slice(&0_u16.to_le_bytes());
+            pe
+        }),
+        ("dll", {
+            let mut pe = fake_pe();
+            pe[0x96..0x98].copy_from_slice(&0x2002_u16.to_le_bytes());
+            pe
+        }),
+    ];
+
+    for (name, core_host) in cases {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join(format!("{name}.zip"));
+        let mut files = required_files();
+        files.insert("runtime/multicore-core-host.exe".into(), core_host);
+        write_bundle(&archive, &files, &files);
+
+        let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+        assert!(error.to_string().contains("PE32+ AMD64"), "{name}: {error}");
+    }
 }
 
 #[test]

@@ -590,31 +590,64 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
-    let mut file = File::open(path)?;
-    let mut header = [0_u8; 64];
-    file.read_exact(&mut header)?;
-    if &header[0..2] != b"MZ" {
-        return Err(UpdateError::InvalidBundle(format!(
-            "required executable is not PE: {}",
+    const PE_SIGNATURE_AND_COFF_SIZE: u64 = 24;
+    const PE32_PLUS_STANDARD_OPTIONAL_SIZE: u16 = 112;
+    const SECTION_HEADER_SIZE: u64 = 40;
+    const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
+    const IMAGE_FILE_DLL: u16 = 0x2000;
+
+    let invalid = || {
+        UpdateError::InvalidBundle(format!(
+            "required executable is not PE32+ AMD64: {}",
             path.display()
-        )));
+        ))
+    };
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0_u8; 64];
+    if file_len < header.len() as u64 || file.read_exact(&mut header).is_err() {
+        return Err(invalid());
     }
-    let pe_offset = u32::from_le_bytes(header[0x3c..0x40].try_into().expect("fixed slice"));
-    if pe_offset > 16 * 1024 * 1024 {
-        return Err(UpdateError::InvalidBundle("invalid PE offset".into()));
+    if &header[0..2] != b"MZ" {
+        return Err(invalid());
+    }
+    let pe_offset = u32::from_le_bytes(header[0x3c..0x40].try_into().expect("fixed slice")) as u64;
+    let coff_end = pe_offset
+        .checked_add(PE_SIGNATURE_AND_COFF_SIZE)
+        .ok_or_else(&invalid)?;
+    if pe_offset < header.len() as u64 || pe_offset > 16 * 1024 * 1024 || coff_end > file_len {
+        return Err(invalid());
     }
     use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(pe_offset as u64))?;
-    let mut pe_header = [0_u8; 26];
-    file.read_exact(&mut pe_header)?;
-    if &pe_header[..4] != b"PE\0\0"
-        || u16::from_le_bytes(pe_header[4..6].try_into().expect("fixed slice")) != 0x8664
-        || u16::from_le_bytes(pe_header[20..22].try_into().expect("fixed slice")) < 2
-        || u16::from_le_bytes(pe_header[24..26].try_into().expect("fixed slice")) != 0x020b
+    file.seek(SeekFrom::Start(pe_offset))?;
+    let mut coff = [0_u8; PE_SIGNATURE_AND_COFF_SIZE as usize];
+    file.read_exact(&mut coff).map_err(|_| invalid())?;
+    let machine = u16::from_le_bytes(coff[4..6].try_into().expect("fixed slice"));
+    let sections = u16::from_le_bytes(coff[6..8].try_into().expect("fixed slice"));
+    let optional_size = u16::from_le_bytes(coff[20..22].try_into().expect("fixed slice"));
+    let characteristics = u16::from_le_bytes(coff[22..24].try_into().expect("fixed slice"));
+    if &coff[..4] != b"PE\0\0"
+        || machine != 0x8664
+        || sections == 0
+        || optional_size < PE32_PLUS_STANDARD_OPTIONAL_SIZE
+        || characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0
+        || characteristics & IMAGE_FILE_DLL != 0
     {
-        return Err(UpdateError::InvalidBundle(
-            "required executable is not PE32+ AMD64".into(),
-        ));
+        return Err(invalid());
+    }
+    let optional_end = coff_end
+        .checked_add(u64::from(optional_size))
+        .ok_or_else(&invalid)?;
+    let section_table_end = optional_end
+        .checked_add(u64::from(sections) * SECTION_HEADER_SIZE)
+        .ok_or_else(&invalid)?;
+    if section_table_end > file_len {
+        return Err(invalid());
+    }
+    let mut magic = [0_u8; 2];
+    file.read_exact(&mut magic).map_err(|_| invalid())?;
+    if u16::from_le_bytes(magic) != 0x020b {
+        return Err(invalid());
     }
     Ok(())
 }

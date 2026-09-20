@@ -58,6 +58,7 @@ jobs:
           cargo test --workspace --all-targets --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
 
@@ -73,6 +74,11 @@ jobs:
             -DaemonExecutablePath dist/release/multicore-windows-x64/runtime/multicore-daemon.exe `
             -UpdaterExecutablePath dist/release/multicore-windows-x64/runtime/multicore-updater.exe `
             -CoreHostExecutablePath dist/release/multicore-windows-x64/runtime/multicore-core-host.exe
+          $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x64.zip').Path
+          cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-one-click.ps1 `
+            -PackagePath dist/release/multicore-windows-x64 `
+            -Background
 
       - name: Install pinned Inno Setup
         shell: pwsh
