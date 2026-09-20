@@ -108,6 +108,7 @@ struct FixtureHttp {
     mihomo: String,
     xray: String,
     metadata: FixtureMetadata,
+    include_logo: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for FixtureHttp {
@@ -117,6 +118,7 @@ impl Default for FixtureHttp {
             mihomo: MIHOMO.to_owned(),
             xray: "{}".to_owned(),
             metadata: FixtureMetadata::Standard,
+            include_logo: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 }
@@ -128,6 +130,7 @@ impl FixtureHttp {
             mihomo: mihomo.to_owned(),
             xray: "{}".to_owned(),
             metadata: FixtureMetadata::Standard,
+            include_logo: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -137,6 +140,7 @@ impl FixtureHttp {
             mihomo,
             xray,
             metadata: FixtureMetadata::Maximal,
+            include_logo: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -145,6 +149,11 @@ impl FixtureHttp {
             metadata: FixtureMetadata::Hostile,
             ..Self::default()
         }
+    }
+
+    fn hostile_with_logo_toggle() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let http = Self::hostile();
+        (http.clone(), http.include_logo)
     }
 }
 
@@ -246,12 +255,15 @@ impl HttpClient for FixtureHttp {
         let mihomo = self.mihomo.clone();
         let xray = self.xray.clone();
         let metadata = self.metadata;
+        let include_logo = self.include_logo.load(std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             let response = match user_agent {
                 UA_NATIVE => HttpResponse::new(
                     200,
                     format!("[{},{}]", serde_json::to_string(&mihomo).unwrap(), xray).into_bytes(),
-                    metadata_headers(metadata),
+                    metadata_headers(metadata).into_iter().filter(|(name, _)| {
+                        include_logo || !name.eq_ignore_ascii_case("flclashx-servicelogo")
+                    }),
                 ),
                 UA_MIHOMO => HttpResponse::new(
                     200,
@@ -807,6 +819,111 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
             .profiles
             .iter()
             .all(|profile| profile.id != first_id.as_str())
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn deleting_active_logo_drops_all_leases_before_cleanup_and_recovers_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(FixtureHttp::hostile()),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    let imported = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://active-logo.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    let id = ProfileId::parse(imported.active_profile_id.as_deref().unwrap()).unwrap();
+    let profile_directory = root.path().join(id.as_str());
+    let logo_path = imported
+        .subscription
+        .as_ref()
+        .unwrap()
+        .service_logo_path
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(profile_directory.is_dir());
+    assert!(std::path::Path::new(&logo_path).is_file());
+
+    backend.delete_subscription(&id).await.unwrap();
+
+    assert!(!profile_directory.exists());
+    assert!(!std::path::Path::new(&logo_path).exists());
+    for index in 0..MAX_PROFILES {
+        backend
+            .import_subscription(ImportSubscriptionRequest {
+                url: format!("https://capacity-{index}.invalid/sub"),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(backend.list_subscriptions().unwrap().len(), MAX_PROFILES);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_list_cannot_replace_a_refreshed_inactive_logo_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let (http, include_logo) = FixtureHttp::hostile_with_logo_toggle();
+    let backend = Arc::new(
+        test_backend(
+            ProfileStore::open(root.path(), None).unwrap(),
+            SubscriptionFetcher::new(http),
+            |_snapshot| Ok(Arc::new(RecordingController::default())),
+        )
+        .unwrap(),
+    );
+    let first = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    let first_id = ProfileId::parse(first.active_profile_id.as_deref().unwrap()).unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+
+    let (reached, resume) = backend.inject_list_logo_publish_hook_for_testing();
+    let listing_backend = backend.clone();
+    let listing = tokio::spawn(async move {
+        Backend::list_subscriptions(listing_backend.as_ref())
+            .await
+            .unwrap()
+    });
+    tokio::task::spawn_blocking(move || {
+        reached
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("list reached the pre-publication hook")
+    })
+    .await
+    .unwrap();
+
+    include_logo.store(false, std::sync::atomic::Ordering::SeqCst);
+    let refreshed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        Backend::refresh_subscription_profile(backend.as_ref(), first_id.clone()),
+    )
+    .await;
+    resume.send(()).unwrap();
+    let refreshed = refreshed
+        .expect("refresh did not wait for the stale list")
+        .unwrap();
+    assert_eq!(refreshed.profiles[0].service_logo_path, None);
+    let stale_list = listing.await.unwrap();
+
+    assert_eq!(stale_list.profiles[0].service_logo_path, None);
+    assert_eq!(
+        backend.retained_profile_logo_path_for_testing(&first_id),
+        None
     );
 }
 

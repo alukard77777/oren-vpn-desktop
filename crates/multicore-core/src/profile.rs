@@ -116,8 +116,11 @@ pub struct ProfileSummary {
 pub struct LoadedProfile {
     pub summary: ProfileSummary,
     pub revision: Option<u64>,
+    pub physical_generation: Option<u64>,
     pub snapshot: Option<Arc<Snapshot>>,
 }
+
+pub type ActiveSnapshotGeneration = (ProfileId, u64, u64, Arc<Snapshot>);
 
 #[derive(Debug, Error)]
 pub enum ProfileError {
@@ -336,6 +339,7 @@ impl ProfileStore {
                     revision: loaded
                         .as_ref()
                         .map(|(generation, _)| catalog_revision(&entry.id, *generation)),
+                    physical_generation: loaded.as_ref().map(|(generation, _)| *generation),
                     snapshot: loaded.map(|(_, snapshot)| snapshot),
                 })
             })
@@ -372,6 +376,14 @@ impl ProfileStore {
     }
 
     pub fn active_snapshot(&self) -> Result<Option<(ProfileId, u64, Arc<Snapshot>)>, ProfileError> {
+        Ok(self
+            .active_snapshot_generation()?
+            .map(|(id, revision, _, snapshot)| (id, revision, snapshot)))
+    }
+
+    pub fn active_snapshot_generation(
+        &self,
+    ) -> Result<Option<ActiveSnapshotGeneration>, ProfileError> {
         let Some(id) = self.active_id() else {
             return Ok(None);
         };
@@ -379,16 +391,25 @@ impl ProfileStore {
         Ok(Some((
             id.clone(),
             catalog_revision(&id, generation),
+            generation,
             snapshot,
         )))
     }
 
     /// Loads an indexed profile without changing which profile is active.
     pub fn profile_snapshot(&self, id: &ProfileId) -> Result<(u64, Arc<Snapshot>), ProfileError> {
+        self.profile_snapshot_generation(id)
+            .map(|(revision, _, snapshot)| (revision, snapshot))
+    }
+
+    pub fn profile_snapshot_generation(
+        &self,
+        id: &ProfileId,
+    ) -> Result<(u64, u64, Arc<Snapshot>), ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
         let (generation, snapshot) = self.load_profile(id)?;
-        Ok((catalog_revision(id, generation), snapshot))
+        Ok((catalog_revision(id, generation), generation, snapshot))
     }
 
     pub fn has_maintenance_debt(&self) -> bool {
@@ -479,14 +500,14 @@ impl ProfileStore {
         snapshot: Arc<Snapshot>,
     ) -> Result<u64, ProfileError> {
         self.replace_profile_loaded(id, snapshot)
-            .map(|(revision, _)| revision)
+            .map(|(revision, _, _)| revision)
     }
 
     pub fn replace_profile_loaded(
         &self,
         id: &ProfileId,
         snapshot: Arc<Snapshot>,
-    ) -> Result<(u64, Arc<Snapshot>), ProfileError> {
+    ) -> Result<(u64, u64, Arc<Snapshot>), ProfileError> {
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
         let profile = self.open_profile(id)?;
@@ -515,7 +536,7 @@ impl ProfileStore {
                     source,
                 })
             }
-            None => Ok((catalog_revision(id, generation), reloaded)),
+            None => Ok((catalog_revision(id, generation), generation, reloaded)),
         }
     }
 

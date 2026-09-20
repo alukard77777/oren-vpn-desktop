@@ -1275,6 +1275,16 @@ pub fn transactional_controller_factory<F>(factory: F) -> TransactionalControlle
 type PreparedFactory<P> =
     dyn Fn(&Snapshot) -> Result<PreparedController<P>, BackendError> + Send + Sync;
 
+struct ProfileLogoLease {
+    physical_generation: u64,
+    lease: Option<ServiceLogoLease>,
+}
+
+struct ListLogoPublishHook {
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
 pub struct CoreBackend<C, P, F>
 where
     C: HttpClient,
@@ -1288,7 +1298,8 @@ where
     latency_permits: Arc<tokio::sync::Semaphore>,
     operation: tokio::sync::Mutex<()>,
     post_commit_load_fault: AtomicBool,
-    profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ServiceLogoLease>>,
+    list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
+    profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
     inner: RwLock<CoreRuntime<P>>,
 }
 
@@ -1581,10 +1592,16 @@ where
         let mut inner = CoreRuntime::empty();
         let mut profile_logo_leases = HashMap::new();
         inner.active_profile_id = store.active_id();
-        if let Ok(Some((id, revision, snapshot))) = store.active_snapshot() {
-            if let Some(lease) = snapshot.service_logo_lease() {
-                profile_logo_leases.insert(id.clone(), lease);
-            }
+        if let Ok(Some((id, revision, physical_generation, snapshot))) =
+            store.active_snapshot_generation()
+        {
+            profile_logo_leases.insert(
+                id.clone(),
+                ProfileLogoLease {
+                    physical_generation,
+                    lease: snapshot.service_logo_lease(),
+                },
+            );
             let (selections, explicit_selections) =
                 initial_and_explicit_selections(&store, &id, revision, &snapshot);
             inner.apply_snapshot_without_controller(
@@ -1604,6 +1621,7 @@ where
             latency_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES)),
             operation: tokio::sync::Mutex::new(()),
             post_commit_load_fault: AtomicBool::new(false),
+            list_logo_publish_hook: std::sync::Mutex::new(None),
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
             inner: RwLock::new(inner),
         })
@@ -1619,6 +1637,25 @@ where
     }
 
     #[doc(hidden)]
+    pub fn inject_list_logo_publish_hook_for_testing(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
+        *self
+            .list_logo_publish_hook
+            .lock()
+            .expect("list logo publish hook lock poisoned") = Some(ListLogoPublishHook {
+            reached,
+            resume: resume_rx,
+        });
+        (reached_rx, resume)
+    }
+
+    #[doc(hidden)]
     pub fn retained_profile_logo_path_for_testing(
         &self,
         id: &ProfileId,
@@ -1627,6 +1664,7 @@ where
             .lock()
             .expect("profile logo lease lock poisoned")
             .get(id)
+            .and_then(|entry| entry.lease.as_ref())
             .and_then(ServiceLogoLease::path)
             .map(std::path::Path::to_owned)
     }
@@ -1634,37 +1672,40 @@ where
     fn subscription_list_dto(&self) -> Result<SubscriptionListDto, ProfileMutationError> {
         let mut active_profile_id = None;
         let mut index = 0;
-        let profiles =
-            self.store
-                .map_loaded(|loaded| {
-                    let profile_index = index;
-                    index += 1;
-                    if loaded.summary.active {
-                        active_profile_id = Some(loaded.summary.id.as_str().to_owned());
-                    }
-                    let info = loaded
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.subscription_info());
-                    let display_name = info.map_or_else(
-                        || format!("Профиль {}", profile_index + 1),
-                        |info| safe_catalog_label(&info.display_name, "Профиль", profile_index),
-                    );
-                    let service_logo_path = loaded.snapshot.as_ref().and_then(|snapshot| {
-                        self.retain_profile_logo(&loaded.summary.id, snapshot)
-                    });
-                    SubscriptionProfileDto {
-                        id: loaded.summary.id.as_str().to_owned(),
-                        active: loaded.summary.active,
-                        available: loaded.summary.available,
-                        display_name,
-                        used_bytes: info.and_then(|info| info.used_bytes()),
-                        total_bytes: info.and_then(|info| info.total_bytes),
-                        expires_at_unix: info.and_then(|info| info.expires_at_unix),
-                        service_logo_path,
-                    }
-                })
-                .map_err(map_profile_error)?;
+        let profiles = self
+            .store
+            .map_loaded(|loaded| {
+                let profile_index = index;
+                index += 1;
+                if loaded.summary.active {
+                    active_profile_id = Some(loaded.summary.id.as_str().to_owned());
+                }
+                let info = loaded
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.subscription_info());
+                let display_name = info.map_or_else(
+                    || format!("Профиль {}", profile_index + 1),
+                    |info| safe_catalog_label(&info.display_name, "Профиль", profile_index),
+                );
+                let service_logo_path = loaded.snapshot.as_ref().and_then(|snapshot| {
+                    loaded.physical_generation.and_then(|physical_generation| {
+                        self.wait_for_list_logo_publish_hook();
+                        self.retain_profile_logo(&loaded.summary.id, physical_generation, snapshot)
+                    })
+                });
+                SubscriptionProfileDto {
+                    id: loaded.summary.id.as_str().to_owned(),
+                    active: loaded.summary.active,
+                    available: loaded.summary.available,
+                    display_name,
+                    used_bytes: info.and_then(|info| info.used_bytes()),
+                    total_bytes: info.and_then(|info| info.total_bytes),
+                    expires_at_unix: info.and_then(|info| info.expires_at_unix),
+                    service_logo_path,
+                }
+            })
+            .map_err(map_profile_error)?;
         Ok(SubscriptionListDto {
             active_profile_id,
             profiles,
@@ -1679,28 +1720,54 @@ where
         }
     }
 
-    fn retain_profile_logo(&self, id: &ProfileId, snapshot: &Snapshot) -> Option<String> {
-        let lease = snapshot
+    fn retain_profile_logo(
+        &self,
+        id: &ProfileId,
+        physical_generation: u64,
+        snapshot: &Snapshot,
+    ) -> Option<String> {
+        let candidate = snapshot
             .service_logo_lease()
             .filter(|lease| lease.path().is_some_and(|path| path.is_file()));
-        let path = lease
-            .as_ref()
-            .and_then(ServiceLogoLease::path)
-            .and_then(std::path::Path::to_str)
-            .map(ToOwned::to_owned);
         let mut leases = self
             .profile_logo_leases
             .lock()
             .expect("profile logo lease lock poisoned");
-        match lease {
-            Some(lease) => {
-                leases.insert(id.clone(), lease);
-            }
-            None => {
-                leases.remove(id);
-            }
+        if let Some(current) = leases.get(id)
+            && current.physical_generation > physical_generation
+        {
+            return current
+                .lease
+                .as_ref()
+                .and_then(ServiceLogoLease::path)
+                .and_then(std::path::Path::to_str)
+                .map(ToOwned::to_owned);
         }
+        let path = candidate
+            .as_ref()
+            .and_then(ServiceLogoLease::path)
+            .and_then(std::path::Path::to_str)
+            .map(ToOwned::to_owned);
+        leases.insert(
+            id.clone(),
+            ProfileLogoLease {
+                physical_generation,
+                lease: candidate,
+            },
+        );
         path
+    }
+
+    fn wait_for_list_logo_publish_hook(&self) {
+        let hook = self
+            .list_logo_publish_hook
+            .lock()
+            .expect("list logo publish hook lock poisoned")
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(());
+            let _ = hook.resume.recv();
+        }
     }
 
     fn remove_profile_logo(&self, id: &ProfileId) {
@@ -1717,16 +1784,18 @@ where
         self.require_disconnected_mutation().await?;
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
-        let (mut revision, mut snapshot) =
-            self.store.profile_snapshot(id).map_err(map_profile_error)?;
-        self.retain_profile_logo(id, &snapshot);
+        let (mut revision, physical_generation, mut snapshot) = self
+            .store
+            .profile_snapshot_generation(id)
+            .map_err(map_profile_error)?;
+        self.retain_profile_logo(id, physical_generation, &snapshot);
         let prepared =
             (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
         let maintenance_debt = match self.store.activate(id) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => {
-                let (active_id, active_revision, active_snapshot) =
-                    match self.store.active_snapshot() {
+                let (active_id, active_revision, _, active_snapshot) =
+                    match self.store.active_snapshot_generation() {
                         Ok(Some(loaded)) => loaded,
                         Ok(None) | Err(_) => {
                             self.reconcile_authoritative().await;
@@ -1810,11 +1879,11 @@ where
             Err(error) => return Err(map_profile_error(error)),
         };
         self.remove_profile_logo(id);
-        if maintenance_debt {
-            let _ = self.store.cleanup_unindexed_profile(id);
-        }
         if was_active {
             self.reconcile_authoritative().await;
+        }
+        if maintenance_debt {
+            let _ = self.store.cleanup_unindexed_profile(id);
         }
         if maintenance_debt {
             self.record_maintenance_debt("profile_delete").await;
@@ -1838,17 +1907,17 @@ where
 
     async fn reconcile_authoritative(&self) {
         let authoritative_id = self.store.active_id();
-        let loaded = self.store.active_snapshot().ok().flatten();
+        let loaded = self.store.active_snapshot_generation().ok().flatten();
         match (&authoritative_id, &loaded) {
-            (_, Some((id, _, snapshot))) => {
-                self.retain_profile_logo(id, snapshot);
+            (_, Some((id, _, physical_generation, snapshot))) => {
+                self.retain_profile_logo(id, *physical_generation, snapshot);
             }
             (Some(id), None) => self.remove_profile_logo(id),
             (None, None) => {}
         }
         let mut state = self.inner.write().await;
         state.clear_for_active(authoritative_id);
-        if let Some((id, revision, snapshot)) = loaded {
+        if let Some((id, revision, _, snapshot)) = loaded {
             let (selections, explicit_selections) =
                 initial_and_explicit_selections(&self.store, &id, revision, &snapshot);
             state.apply_snapshot_without_controller(
@@ -1887,13 +1956,13 @@ where
     async fn profile_snapshot_after_commit(
         &self,
         id: &ProfileId,
-    ) -> Result<(u64, Arc<Snapshot>), ProfileMutationError> {
+    ) -> Result<(u64, u64, Arc<Snapshot>), ProfileMutationError> {
         if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
             self.remove_profile_logo(id);
             self.reconcile_authoritative_unreadable().await;
             return Err(ProfileMutationError::Storage);
         }
-        match self.store.profile_snapshot(id) {
+        match self.store.profile_snapshot_generation(id) {
             Ok(loaded) => Ok(loaded),
             Err(error) => {
                 self.remove_profile_logo(id);
@@ -1928,12 +1997,15 @@ where
         } else {
             None
         };
-        let (revision, persisted, maintenance_debt) =
+        let (revision, physical_generation, persisted, maintenance_debt) =
             match self.store.replace_profile_loaded(id, snapshot.clone()) {
-                Ok((revision, persisted)) => (revision, persisted, false),
+                Ok((revision, physical_generation, persisted)) => {
+                    (revision, physical_generation, persisted, false)
+                }
                 Err(error) if error.mutation_committed() => {
-                    let (revision, persisted) = self.profile_snapshot_after_commit(id).await?;
-                    (revision, persisted, true)
+                    let (revision, physical_generation, persisted) =
+                        self.profile_snapshot_after_commit(id).await?;
+                    (revision, physical_generation, persisted, true)
                 }
                 Err(error) => return Err(map_profile_error(error)),
             };
@@ -1942,7 +2014,7 @@ where
             self.reconcile_authoritative_unreadable().await;
             return Err(ProfileMutationError::Storage);
         }
-        self.retain_profile_logo(id, &persisted);
+        self.retain_profile_logo(id, physical_generation, &persisted);
         if !active {
             if maintenance_debt {
                 self.record_maintenance_debt("profile_refresh").await;
@@ -2033,8 +2105,9 @@ where
                 Err(error) => return Err(map_profile_error(error)),
             }
         };
-        let (revision, persisted) = self.profile_snapshot_after_commit(&id).await?;
-        self.retain_profile_logo(&id, &persisted);
+        let (revision, physical_generation, persisted) =
+            self.profile_snapshot_after_commit(&id).await?;
+        self.retain_profile_logo(&id, physical_generation, &persisted);
         let (selections, explicit_selections) =
             initial_and_explicit_selections(&self.store, &id, revision, &persisted);
         let controller = prepared.controller();
