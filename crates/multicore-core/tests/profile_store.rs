@@ -82,6 +82,7 @@ fn index_keeps_owner_only_protected_acl_across_atomic_replacements() {
     let profiles = root.profiles();
     let index = profiles.join("index.json");
     let store = ProfileStore::open(&profiles, None).unwrap();
+    assert_protected_single_principal_dacl(&profiles.join(".index.lock"));
 
     let first = store
         .create_profile(snapshot("https://one.invalid/sub", "One"))
@@ -338,6 +339,60 @@ fn malformed_empty_and_active_states_are_rejected_in_both_directions() {
             Err(ProfileError::InvalidIndex(_))
         ));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_profile_root_capability_ignores_path_replacement() {
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let original = root.path().join("original-profiles");
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+
+    fs::rename(&profiles, &original).unwrap();
+    fs::create_dir(&profiles).unwrap();
+    fs::write(profiles.join("sentinel"), b"replacement").unwrap();
+    store
+        .create_profile(snapshot("https://two.invalid/sub", "Two"))
+        .unwrap();
+
+    assert_eq!(store.list().unwrap().len(), 2);
+    assert_eq!(fs::read(profiles.join("sentinel")).unwrap(), b"replacement");
+    assert!(!profiles.join("index.json").exists());
+    assert!(original.join("index.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn index_symlink_replacement_is_replaced_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let external = root.path().join("external-index");
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+
+    fs::write(&external, b"external sentinel").unwrap();
+    fs::remove_file(profiles.join("index.json")).unwrap();
+    symlink(&external, profiles.join("index.json")).unwrap();
+    store
+        .create_profile(snapshot("https://two.invalid/sub", "Two"))
+        .unwrap();
+
+    assert_eq!(fs::read(&external).unwrap(), b"external sentinel");
+    assert!(
+        !fs::symlink_metadata(profiles.join("index.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(store.list().unwrap().len(), 2);
 }
 
 #[cfg(unix)]

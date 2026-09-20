@@ -9,6 +9,7 @@ mod service_logo;
 mod sidecar;
 mod snapshot;
 mod state;
+mod store_root;
 mod supervisor;
 #[cfg(windows)]
 mod windows_job;

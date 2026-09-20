@@ -183,6 +183,43 @@ fn failed_staging_write_keeps_last_good_in_memory_and_on_restart() {
     assert_eq!(reopened.current().unwrap().xray.raw_bytes(), XRAY_ONE);
 }
 
+#[cfg(unix)]
+#[test]
+fn retained_store_capability_ignores_snapshot_root_path_replacement() {
+    let parent = TempDirectory::new();
+    let root = parent.path().join("snapshots");
+    let original = parent.path().join("original-snapshots");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    store
+        .commit(Snapshot::parse(&mihomo("First", 31001), XRAY_ONE).unwrap())
+        .unwrap();
+
+    fs::rename(&root, &original).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("sentinel"), b"replacement").unwrap();
+
+    store
+        .commit(Snapshot::parse(&mihomo("Second", 31002), XRAY_TWO).unwrap())
+        .unwrap();
+    assert!(original.join("snapshot-00000000000000000002").is_dir());
+    assert!(!root.join("snapshot-00000000000000000002").exists());
+    assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"replacement");
+}
+
+#[cfg(windows)]
+#[test]
+fn retained_store_handle_prevents_snapshot_root_path_replacement() {
+    let parent = TempDirectory::new();
+    let root = parent.path().join("snapshots");
+    let replacement = parent.path().join("replacement");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    assert!(fs::rename(&root, &replacement).is_err());
+    store
+        .commit(Snapshot::parse(&mihomo("StillOriginal", 31001), XRAY_ONE).unwrap())
+        .unwrap();
+    assert!(root.join("snapshot-00000000000000000001").is_dir());
+}
+
 #[test]
 fn runtime_publication_is_byte_exact_and_exposes_only_complete_pairs() {
     let root = TempDirectory::new();

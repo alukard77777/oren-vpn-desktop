@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
     net::{IpAddr, SocketAddr},
@@ -15,10 +16,11 @@ use serde_yaml_ng::Value as YamlValue;
 use thiserror::Error;
 
 use crate::{
-    ConfigError, MihomoConfig, XrayConfig,
+    ConfigError, MAX_CONFIG_BYTES, MihomoConfig, XrayConfig,
     fetch::SubscriptionMetadataHeaders,
     parse_mihomo, parse_xray,
     service_logo::{MAX_SERVICE_LOGO_OUTPUT_BYTES, is_canonical_service_logo},
+    store_root::DirectoryCapability,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,7 +601,8 @@ pub enum PersistenceError {
 
 #[derive(Debug)]
 pub struct PersistentSnapshotStore {
-    root: PathBuf,
+    root: DirectoryCapability,
+    display_root: PathBuf,
     current: RwLock<Option<(u64, Arc<Snapshot>)>>,
     next_generation: AtomicU64,
     commit_lock: Mutex<()>,
@@ -747,28 +750,29 @@ impl PersistentSnapshotStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
+        Self::open_capability(DirectoryCapability::open(&root)?)
+    }
+
+    pub(crate) fn open_capability(root: DirectoryCapability) -> Result<Self, PersistenceError> {
+        let display_root = root.display_path().to_path_buf();
 
         let mut generations = generation_directories(&root)?;
         for (_, directory) in &generations {
-            secure_directory(directory)?;
             for config in [
                 "mihomo.yaml",
                 "xray.json",
                 "subscription.json",
                 "service-logo.png",
             ] {
-                let path = directory.join(config);
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.file_type().is_file() => secure_file(&path)?,
-                    Ok(_) if config != "service-logo.png" => {
+                match directory.file_metadata(OsStr::new(config))? {
+                    Some((true, _)) => {}
+                    Some((false, _)) if config != "service-logo.png" => {
                         return Err(PersistenceError::Io(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "snapshot config is not a regular file",
                         )));
                     }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(PersistenceError::Io(error)),
+                    Some((false, _)) | None => {}
                 }
             }
         }
@@ -784,6 +788,7 @@ impl PersistentSnapshotStore {
 
         Ok(Self {
             root,
+            display_root,
             current: RwLock::new(current),
             next_generation: AtomicU64::new(highest_id.saturating_add(1).max(1)),
             commit_lock: Mutex::new(()),
@@ -825,36 +830,33 @@ impl PersistentSnapshotStore {
             .expect("snapshot commit lock poisoned");
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let published_name = format!("snapshot-{generation:020}");
-        let published = self.root.join(&published_name);
-        let staging = self
-            .root
-            .join(format!(".{published_name}.staging-{}", std::process::id()));
+        let published = self.display_root.join(&published_name);
+        let (staging_name, staging) = create_snapshot_staging(&self.root, &published_name)?;
 
         let result = (|| {
-            fs::create_dir(&staging)?;
-            secure_directory(&staging)?;
-            write_synced(
-                &staging.join("mihomo.yaml"),
+            staging.write_file(
+                OsStr::new("mihomo.yaml"),
                 snapshot.mihomo.raw_yaml().as_bytes(),
             )?;
-            write_synced(&staging.join("xray.json"), snapshot.xray.raw_bytes())?;
+            staging.write_file(OsStr::new("xray.json"), snapshot.xray.raw_bytes())?;
             if let Some(subscription) = &snapshot.subscription {
                 let mut persisted = subscription.clone();
                 persisted.targets.logo_url = None;
                 let encoded = serde_json::to_vec(&persisted).map_err(io::Error::other)?;
-                write_synced(&staging.join("subscription.json"), &encoded)?;
+                staging.write_file(OsStr::new("subscription.json"), &encoded)?;
             }
             if let Some(logo) = &snapshot.service_logo_png {
-                write_synced(&staging.join("service-logo.png"), logo)?;
+                staging.write_file(OsStr::new("service-logo.png"), logo)?;
             }
-            sync_directory(&staging)?;
-            fs::rename(&staging, &published)?;
-            sync_directory(&self.root)?;
+            staging.sync()?;
+            self.root
+                .rename_child(&staging, OsStr::new(&published_name))?;
+            self.root.sync()?;
             Ok::<_, io::Error>(())
         })();
 
         if let Err(error) = result {
-            let _ = fs::remove_dir_all(&staging);
+            let _ = self.root.remove_child_tree(&staging_name);
             return Err(PersistenceError::Io(error));
         }
         snapshot.service_logo_path = snapshot
@@ -1195,14 +1197,15 @@ fn remove_staged_runtime(root: &Path, staged: &Path) -> Result<(), PersistenceEr
     Ok(())
 }
 
-fn generation_directories(root: &Path) -> Result<Vec<(u64, PathBuf)>, io::Error> {
+fn generation_directories(
+    root: &DirectoryCapability,
+) -> Result<Vec<(u64, DirectoryCapability)>, io::Error> {
     let mut generations = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    for entry in root.entries()? {
+        if !entry.is_directory {
             continue;
         }
-        let name = entry.file_name();
+        let name = entry.name;
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -1212,7 +1215,7 @@ fn generation_directories(root: &Path) -> Result<Vec<(u64, PathBuf)>, io::Error>
         else {
             continue;
         };
-        generations.push((id, entry.path()));
+        generations.push((id, root.open_child(OsStr::new(name))?));
     }
     Ok(generations)
 }
@@ -1234,14 +1237,20 @@ fn next_named_generation(root: &Path, prefix: &str) -> Result<u64, io::Error> {
     Ok(highest.saturating_add(1).max(1))
 }
 
-fn load_generation(directory: &Path) -> Option<Snapshot> {
-    let mihomo = fs::read(directory.join("mihomo.yaml")).ok()?;
-    let xray = fs::read(directory.join("xray.json")).ok()?;
+fn load_generation(directory: &DirectoryCapability) -> Option<Snapshot> {
+    let mihomo = directory
+        .read_file(OsStr::new("mihomo.yaml"), MAX_CONFIG_BYTES as u64)
+        .ok()?;
+    let xray = directory
+        .read_file(OsStr::new("xray.json"), MAX_CONFIG_BYTES as u64)
+        .ok()?;
     let mut snapshot = Snapshot::parse(&mihomo, &xray).ok()?;
-    let subscription_path = directory.join("subscription.json");
-    if subscription_path.is_file()
-        && subscription_path.metadata().ok()?.len() <= 16 * 1024
-        && let Ok(bytes) = fs::read(subscription_path)
+    if directory
+        .file_metadata(OsStr::new("subscription.json"))
+        .ok()
+        .flatten()
+        .is_some_and(|(regular, len)| regular && len <= 16 * 1024)
+        && let Ok(bytes) = directory.read_file(OsStr::new("subscription.json"), 16 * 1024)
         && let Ok(mut record) = serde_json::from_slice::<SubscriptionRecord>(&bytes)
         && let Ok(parsed) = reqwest::Url::parse(&record.source_url)
         && record.source_url.len() <= 8192
@@ -1256,16 +1265,31 @@ fn load_generation(directory: &Path) -> Option<Snapshot> {
         }
         snapshot.subscription = Some(record);
     }
-    let logo_path = directory.join("service-logo.png");
-    if logo_path.symlink_metadata().ok().is_some_and(|metadata| {
-        metadata.file_type().is_file() && metadata.len() <= MAX_SERVICE_LOGO_OUTPUT_BYTES as u64
-    }) && let Ok(bytes) = fs::read(&logo_path)
+    let logo_path = directory.display_path().join("service-logo.png");
+    if directory
+        .file_metadata(OsStr::new("service-logo.png"))
+        .ok()
+        .flatten()
+        .is_some_and(|(regular, len)| regular && len <= MAX_SERVICE_LOGO_OUTPUT_BYTES as u64)
+        && let Ok(bytes) = directory.read_file(
+            OsStr::new("service-logo.png"),
+            MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
+        )
         && is_canonical_service_logo(&bytes)
     {
         snapshot.service_logo_png = Some(bytes);
         snapshot.service_logo_path = Some(logo_path);
     }
     Some(snapshot)
+}
+
+fn create_snapshot_staging(
+    root: &DirectoryCapability,
+    published_name: &str,
+) -> Result<(OsString, DirectoryCapability), PersistenceError> {
+    let name = OsString::from(format!(".{published_name}.staging-{}", std::process::id()));
+    let child = root.create_child(&name)?;
+    Ok((name, child))
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {

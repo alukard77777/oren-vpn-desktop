@@ -3088,6 +3088,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.5",
  "resvg",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serde_yaml_ng",
