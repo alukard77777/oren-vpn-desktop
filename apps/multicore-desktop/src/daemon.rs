@@ -14,12 +14,16 @@ const EVENTS_RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const DIAGNOSTICS_RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const CATALOG_RESPONSE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const LATENCIES_RESPONSE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+#[allow(dead_code)] // The profile client is wired into the desktop event loop in Task 6.
+const SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const API_ERROR_RESPONSE_LIMIT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DaemonStatus {
     #[serde(default)]
     pub state: String,
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
     #[serde(default, alias = "profile_name")]
     pub profile: Option<String>,
     #[serde(default, alias = "node")]
@@ -30,6 +34,38 @@ pub struct DaemonStatus {
     pub degraded: bool,
     #[serde(default)]
     pub subscription: Option<DaemonSubscriptionInfo>,
+}
+
+/// Safe subscription collection returned by the daemon. Source URLs deliberately have no
+/// representation in the desktop process.
+#[allow(dead_code)] // The profile client is wired into the desktop event loop in Task 6.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DaemonSubscriptionList {
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<DaemonSubscriptionProfile>,
+}
+
+/// Bounded presentation metadata for one daemon-owned subscription profile.
+#[allow(dead_code)] // The profile client is wired into the desktop event loop in Task 6.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DaemonSubscriptionProfile {
+    pub id: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub expires_at_unix: Option<u64>,
+    #[serde(default)]
+    pub service_logo_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -164,12 +200,16 @@ pub struct DaemonLatencyEntry {
     pub status: String,
 }
 
+#[allow(dead_code)] // Profile-specific variants are consumed by Task 6 UI workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DaemonErrorKind {
     Other,
     StaleRevision,
     DefinitiveHttp,
     Ambiguous,
+    ProfileNotFound,
+    ProfileConflict,
+    ProfileServer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +241,24 @@ impl DaemonError {
     /// not safely decode its response. Callers should refresh state before making another choice.
     pub(crate) fn requires_reconciliation(&self) -> bool {
         self.kind == DaemonErrorKind::Ambiguous
+    }
+
+    #[allow(dead_code)] // Consumed by Task 6 UI workers.
+    pub(crate) fn is_profile_not_found(&self) -> bool {
+        self.kind == DaemonErrorKind::ProfileNotFound
+    }
+
+    #[allow(dead_code)] // Consumed by Task 6 UI workers.
+    pub(crate) fn is_profile_conflict(&self) -> bool {
+        self.kind == DaemonErrorKind::ProfileConflict
+    }
+
+    #[allow(dead_code)] // Consumed through the Task 6 profile client calls.
+    fn profile_http(kind: DaemonErrorKind, message: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
     }
 
     fn definitive_http(message: impl Into<String>) -> Self {
@@ -254,6 +312,33 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Обновление подписки недоступно."))
     }
 
+    /// GET /v1/subscriptions. The response intentionally contains no source URL.
+    #[allow(dead_code)] // Wired into the desktop event loop in Task 6.
+    fn subscriptions(&self) -> Result<DaemonSubscriptionList, DaemonError> {
+        Err(DaemonError::new("Subscription profiles are unavailable."))
+    }
+
+    /// PUT /v1/subscriptions/{profile_id}/activate.
+    #[allow(dead_code)] // Wired into the desktop event loop in Task 6.
+    fn activate_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+        Err(DaemonError::new("Subscription activation is unavailable."))
+    }
+
+    /// POST /v1/subscriptions/{profile_id}/refresh.
+    #[allow(dead_code)] // Wired into the desktop event loop in Task 6.
+    fn refresh_subscription_by_id(
+        &self,
+        _profile_id: &str,
+    ) -> Result<DaemonSubscriptionList, DaemonError> {
+        Err(DaemonError::new("Subscription refresh is unavailable."))
+    }
+
+    /// DELETE /v1/subscriptions/{profile_id}.
+    #[allow(dead_code)] // Wired into the desktop event loop in Task 6.
+    fn delete_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+        Err(DaemonError::new("Subscription deletion is unavailable."))
+    }
+
     /// POST /v1/connect. Group and node choices remain daemon DTO values; the UI
     /// never interprets Xray JSON or constructs proxy mappings.
     fn connect(&self) -> Result<DaemonStatus, DaemonError>;
@@ -304,6 +389,25 @@ impl DaemonClient for UnavailableDaemonClient {
     }
 
     fn refresh_subscription(&self) -> Result<DaemonStatus, DaemonError> {
+        self.unavailable()
+    }
+
+    fn subscriptions(&self) -> Result<DaemonSubscriptionList, DaemonError> {
+        self.unavailable()
+    }
+
+    fn activate_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+        self.unavailable()
+    }
+
+    fn refresh_subscription_by_id(
+        &self,
+        _profile_id: &str,
+    ) -> Result<DaemonSubscriptionList, DaemonError> {
+        self.unavailable()
+    }
+
+    fn delete_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
         self.unavailable()
     }
 
@@ -378,6 +482,52 @@ impl HttpDaemonClient {
         endpoint.set_path(path);
         endpoint.set_query(None);
         endpoint
+    }
+
+    #[allow(dead_code)] // Used by profile HTTP calls wired in Task 6.
+    fn endpoint_with_segment(
+        &self,
+        prefix: &str,
+        segment: &str,
+        suffix: Option<&str>,
+    ) -> Result<reqwest::Url, DaemonError> {
+        let mut endpoint = self.endpoint(prefix);
+        let mut segments = endpoint
+            .path_segments_mut()
+            .map_err(|()| DaemonError::new("Invalid background service address."))?;
+        segments.pop_if_empty().push(segment);
+        if let Some(suffix) = suffix {
+            segments.push(suffix);
+        }
+        drop(segments);
+        Ok(endpoint)
+    }
+
+    #[allow(dead_code)] // Used by profile HTTP calls wired in Task 6.
+    fn send_profile_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        response_limit: usize,
+    ) -> Result<T, DaemonError> {
+        let response = request.bearer_auth(&self.token).send().map_err(map_error)?;
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND => Err(DaemonError::profile_http(
+                DaemonErrorKind::ProfileNotFound,
+                "Subscription profile was not found.",
+            )),
+            reqwest::StatusCode::CONFLICT => Err(DaemonError::profile_http(
+                DaemonErrorKind::ProfileConflict,
+                "Subscription profile cannot be changed right now.",
+            )),
+            status if status.is_server_error() => Err(DaemonError::profile_http(
+                DaemonErrorKind::ProfileServer,
+                "Background service could not change the subscription profile.",
+            )),
+            status if !status.is_success() => Err(DaemonError::definitive_http(
+                "Background service rejected the subscription profile request.",
+            )),
+            _ => decode_bounded_json(response, response_limit),
+        }
     }
 
     fn send_json<T: DeserializeOwned>(
@@ -498,6 +648,33 @@ impl DaemonClient for HttpDaemonClient {
 
     fn refresh_subscription(&self) -> Result<DaemonStatus, DaemonError> {
         self.parse_status(self.http.post(self.endpoint("/v1/subscriptions/refresh")))
+    }
+
+    fn subscriptions(&self) -> Result<DaemonSubscriptionList, DaemonError> {
+        self.send_profile_json(
+            self.http.get(self.endpoint("/v1/subscriptions")),
+            SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES,
+        )
+    }
+
+    fn activate_subscription(&self, profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+        let endpoint =
+            self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("activate"))?;
+        self.send_profile_json(self.http.put(endpoint), STATUS_RESPONSE_LIMIT_BYTES)
+    }
+
+    fn refresh_subscription_by_id(
+        &self,
+        profile_id: &str,
+    ) -> Result<DaemonSubscriptionList, DaemonError> {
+        let endpoint =
+            self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("refresh"))?;
+        self.send_profile_json(self.http.post(endpoint), SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES)
+    }
+
+    fn delete_subscription(&self, profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+        let endpoint = self.endpoint_with_segment("/v1/subscriptions/", profile_id, None)?;
+        self.send_profile_json(self.http.delete(endpoint), STATUS_RESPONSE_LIMIT_BYTES)
     }
 
     fn connect(&self) -> Result<DaemonStatus, DaemonError> {
@@ -636,6 +813,8 @@ pub(crate) mod test_support {
         pub fail_catalog: bool,
         pub latencies: DaemonLatencies,
         pub fail_latencies: bool,
+        #[allow(dead_code)]
+        pub subscriptions: DaemonSubscriptionList,
     }
 
     impl MockDaemonClient {
@@ -656,6 +835,7 @@ pub(crate) mod test_support {
                 fail_catalog: false,
                 latencies: DaemonLatencies::default(),
                 fail_latencies: false,
+                subscriptions: DaemonSubscriptionList::default(),
             }
         }
 
@@ -683,6 +863,29 @@ pub(crate) mod test_support {
 
         fn refresh_subscription(&self) -> Result<DaemonStatus, DaemonError> {
             self.record("POST /v1/subscriptions/refresh");
+            Ok(self.status.clone())
+        }
+
+        fn subscriptions(&self) -> Result<DaemonSubscriptionList, DaemonError> {
+            self.record("GET /v1/subscriptions");
+            Ok(self.subscriptions.clone())
+        }
+
+        fn activate_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+            self.record("PUT /v1/subscriptions/{opaque}/activate");
+            Ok(self.status.clone())
+        }
+
+        fn refresh_subscription_by_id(
+            &self,
+            _profile_id: &str,
+        ) -> Result<DaemonSubscriptionList, DaemonError> {
+            self.record("POST /v1/subscriptions/{opaque}/refresh");
+            Ok(self.subscriptions.clone())
+        }
+
+        fn delete_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
+            self.record("DELETE /v1/subscriptions/{opaque}");
             Ok(self.status.clone())
         }
 
@@ -826,6 +1029,31 @@ mod http_tests {
         assert!(json.get("url").is_none());
     }
 
+    #[test]
+    fn profile_list_decodes_exact_safe_dto_without_a_source_url_field() {
+        let value = serde_json::json!({
+            "active_profile_id": "profile-a",
+            "profiles": [{
+                "id": "profile-a",
+                "active": true,
+                "available": true,
+                "display_name": "Work",
+                "used_bytes": 1,
+                "total_bytes": 2,
+                "expires_at_unix": null,
+                "service_logo_path": null
+            }]
+        });
+        let list: DaemonSubscriptionList =
+            serde_json::from_value(value.clone()).expect("safe profile list DTO");
+
+        assert_eq!(list.active_profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(list.profiles[0].display_name, "Work");
+        assert_eq!(value["profiles"][0].as_object().expect("profile").len(), 8);
+        assert!(value["profiles"][0].get("url").is_none());
+        assert!(!format!("{list:?}").contains("https://"));
+    }
+
     fn start_server(request_count: usize) -> (String, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
         let address = listener.local_addr().expect("test server address");
@@ -850,9 +1078,13 @@ mod http_tests {
                 let is_catalog = request.starts_with("GET /v1/catalog ");
                 let is_latencies = request.starts_with("POST /v1/latencies ");
                 let is_diagnostics = request.starts_with("GET /v1/diagnostics ");
+                let is_subscriptions = request.starts_with("GET /v1/subscriptions ")
+                    || request.starts_with("POST /v1/subscriptions/");
                 requests.push(request);
 
-                let body = if is_latencies {
+                let body = if is_subscriptions {
+                    r#"{"active_profile_id":"profile-a","profiles":[{"id":"profile-a","active":true,"available":true,"display_name":"Work","used_bytes":1,"total_bytes":2,"expires_at_unix":null,"service_logo_path":null}]}"#
+                } else if is_latencies {
                     r#"{"entries":[{"group_id":"group:auto","node_id":"node:a","latency_ms":42,"status":"ok"},{"group_id":"group:auto","node_id":"node:b","latency_ms":null,"status":"timeout"}]}"#
                 } else if is_diagnostics {
                     r#"{"xray":"ready","mihomo":"ready","tun":"ready","logs":[{"id":7,"timestamp":"11","component":"mihomo","level":"error","message":"safe core line"}],"mappings":[{"proxy_name":"Sweden [se]","address":"127.0.0.1:31006","xray_label":"Sweden [se]"}]}"#
@@ -1053,7 +1285,7 @@ mod http_tests {
 
     #[test]
     fn every_v1_request_sends_the_configured_bearer_token() {
-        let (base_url, server) = start_server(9);
+        let (base_url, server) = start_server(13);
         let client = HttpDaemonClient::new(base_url, "test-daemon-token")
             .expect("construct authenticated client");
 
@@ -1064,6 +1296,16 @@ mod http_tests {
         client
             .refresh_subscription()
             .expect("refresh subscription request");
+        client.subscriptions().expect("subscriptions request");
+        client
+            .activate_subscription("profile-a")
+            .expect("activate subscription request");
+        client
+            .refresh_subscription_by_id("profile-a")
+            .expect("targeted subscription refresh request");
+        client
+            .delete_subscription("profile-a")
+            .expect("delete subscription request");
         client.connect().expect("connect request");
         client.disconnect().expect("disconnect request");
         client.events(0, None).expect("events request");
@@ -1074,7 +1316,7 @@ mod http_tests {
         client.diagnostics().expect("diagnostics request");
 
         let requests = server.join().expect("join test HTTP server");
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 13);
         for request in requests {
             assert!(
                 request
@@ -1454,6 +1696,112 @@ mod http_tests {
         );
         assert_eq!(body, r#"{"revision":91,"node_id":"opaque-node"}"#);
         assert_eq!(catalog.revision, 91);
+    }
+
+    #[test]
+    fn profile_requests_use_exact_methods_auth_and_one_percent_encoded_id_segment() {
+        let id = "opaque/profile ?#%";
+        let encoded = "opaque%2Fprofile%20%3F%23%25";
+        let list_body = r#"{"active_profile_id":"profile-a","profiles":[]}"#;
+        let status_body = r#"{"state":"ready","active_profile_id":"profile-a"}"#;
+
+        let (base_url, server) = start_selection_server("200 OK", list_body);
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("list client");
+        client.subscriptions().expect("list profiles");
+        let request = server.join().expect("list server");
+        assert_profile_request(&request, "GET /v1/subscriptions", "profile-token");
+
+        let (base_url, server) = start_selection_server("200 OK", status_body);
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("activate client");
+        client.activate_subscription(id).expect("activate profile");
+        let request = server.join().expect("activate server");
+        assert_profile_request(
+            &request,
+            &format!("PUT /v1/subscriptions/{encoded}/activate"),
+            "profile-token",
+        );
+
+        let (base_url, server) = start_selection_server("200 OK", list_body);
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("refresh client");
+        client
+            .refresh_subscription_by_id(id)
+            .expect("refresh profile");
+        let request = server.join().expect("refresh server");
+        assert_profile_request(
+            &request,
+            &format!("POST /v1/subscriptions/{encoded}/refresh"),
+            "profile-token",
+        );
+
+        let (base_url, server) = start_selection_server("200 OK", status_body);
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("delete client");
+        client.delete_subscription(id).expect("delete profile");
+        let request = server.join().expect("delete server");
+        assert_profile_request(
+            &request,
+            &format!("DELETE /v1/subscriptions/{encoded}"),
+            "profile-token",
+        );
+    }
+
+    fn assert_profile_request(request: &str, request_line: &str, token: &str) {
+        let (headers, body) = request.split_once("\r\n\r\n").expect("HTTP request");
+        assert!(
+            headers.starts_with(&format!("{request_line} HTTP/1.1\r\n")),
+            "unexpected request: {headers}"
+        );
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {token}\r\n"))
+        );
+        assert!(body.is_empty(), "profile mutation sent a request body");
+    }
+
+    #[test]
+    fn profile_http_errors_are_typed_and_never_reflect_body_id_or_token() {
+        let sensitive_id = "private-profile-marker";
+        let sensitive_token = "private-token-marker";
+        let sensitive_body = r#"{"code":"private","message":"https://private.invalid/?token=private-token-marker private-profile-marker"}"#;
+
+        for (status, not_found, conflict) in [
+            ("404 Not Found", true, false),
+            ("409 Conflict", false, true),
+            ("500 Internal Server Error", false, false),
+        ] {
+            let (base_url, server) = start_selection_server(status, sensitive_body);
+            let client = HttpDaemonClient::new(base_url, sensitive_token).expect("profile client");
+            let error = client
+                .activate_subscription(sensitive_id)
+                .expect_err("profile request must fail");
+            server.join().expect("profile error server");
+
+            assert_eq!(error.is_profile_not_found(), not_found);
+            assert_eq!(error.is_profile_conflict(), conflict);
+            let text = error.to_string();
+            assert!(!text.contains(sensitive_id));
+            assert!(!text.contains(sensitive_token));
+            assert!(!text.contains("https://"));
+        }
+    }
+
+    #[test]
+    fn profile_list_response_is_bounded_before_json_decoding() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES + 1
+        )
+        .into_bytes();
+        let (base_url, server) = start_raw_response_server(response);
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("profile client");
+
+        let error = client
+            .subscriptions()
+            .expect_err("oversized profile list must fail");
+
+        server.join().expect("oversized profile server");
+        assert!(error.requires_reconciliation());
+        assert!(!error.to_string().contains("profile-token"));
     }
 
     #[test]
