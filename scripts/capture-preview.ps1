@@ -262,6 +262,17 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
                 $Failure.Value = "selector error and retry state is missing"
                 return $false
             }
+            if ($ExpectedState -like "profiles-loading-*") {
+                $loadingSurface = Test-ColorNear $Bitmap.GetPixel(210, 250) 28 32 38 7
+                $firstSkeletonLogo = Test-ColorNear $Bitmap.GetPixel(230, 290) 42 46 52 7
+                $firstSkeletonLine = Test-ColorNear $Bitmap.GetPixel(400, 285) 48 51 57 7
+                $secondSkeletonLogo = Test-ColorNear $Bitmap.GetPixel(230, 342) 40 44 50 7
+                $secondSkeletonLine = Test-ColorNear $Bitmap.GetPixel(370, 337) 46 49 55 7
+                if (-not ($loadingSurface -and $firstSkeletonLogo -and $firstSkeletonLine -and $secondSkeletonLogo -and $secondSkeletonLine)) {
+                    $Failure.Value = "loading selector is missing its surface or two skeleton rows"
+                    return $false
+                }
+            }
         }
         return $true
     }
