@@ -185,6 +185,46 @@ fn failed_staging_write_keeps_last_good_in_memory_and_on_restart() {
 
 #[cfg(unix)]
 #[test]
+fn startup_repairs_owner_only_modes_in_every_persisted_generation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = PersistentSnapshotStore::open(root.path()).unwrap();
+    store
+        .commit(Snapshot::parse(&mihomo("One", 31001), XRAY_ONE).unwrap())
+        .unwrap();
+    store
+        .commit(Snapshot::parse(&mihomo("Two", 31002), XRAY_TWO).unwrap())
+        .unwrap();
+    drop(store);
+
+    for generation in 1..=2 {
+        for config in ["mihomo.yaml", "xray.json"] {
+            let path = root
+                .path()
+                .join(format!("snapshot-{generation:020}"))
+                .join(config);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    drop(PersistentSnapshotStore::open(root.path()).unwrap());
+    for generation in 1..=2 {
+        for config in ["mihomo.yaml", "xray.json"] {
+            let path = root
+                .path()
+                .join(format!("snapshot-{generation:020}"))
+                .join(config);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn retained_store_capability_ignores_snapshot_root_path_replacement() {
     let parent = TempDirectory::new();
     let root = parent.path().join("snapshots");

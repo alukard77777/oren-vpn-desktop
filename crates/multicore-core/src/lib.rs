@@ -38,8 +38,8 @@ pub use sidecar::{
 };
 pub use snapshot::{
     AtomicSnapshot, MihomoRuntimeControl, PersistenceError, PersistentSnapshotStore,
-    PublishedRuntime, Snapshot, SnapshotSink, StagedRuntime, SubscriptionInfo, publish_runtime,
-    publish_runtime_with_mihomo_control, stage_runtime_with_mihomo_control,
+    PublishedRuntime, Snapshot, SnapshotCommit, SnapshotSink, StagedRuntime, SubscriptionInfo,
+    publish_runtime, publish_runtime_with_mihomo_control, stage_runtime_with_mihomo_control,
     xray_outbound_server_domains,
 };
 pub use state::{ConnectionState, StateError, StateMachine};

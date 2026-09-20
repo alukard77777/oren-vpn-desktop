@@ -59,11 +59,12 @@ impl DirectoryCapability {
     pub(crate) fn lock_exclusive(&self) -> io::Result<StoreLock> {
         #[cfg(unix)]
         {
-            let duplicate = fd_into_file(rustix::io::dup(&self.fd)?);
-            fs2::FileExt::try_lock_exclusive(&duplicate)?;
-            // Keep the duplicate alive. This is required on Solaris, where fs2 emulates
-            // flock with process-associated fcntl locks, and is harmless on flock systems.
-            Ok(StoreLock { _file: duplicate })
+            #[cfg(target_os = "solaris")]
+            let file = open_unix_lock_file(self, OsStr::new(".index.lock"))?;
+            #[cfg(not(target_os = "solaris"))]
+            let file = fd_into_file(rustix::io::dup(&self.fd)?);
+            fs2::FileExt::try_lock_exclusive(&file)?;
+            Ok(StoreLock { _file: file })
         }
         #[cfg(windows)]
         {
@@ -167,6 +168,11 @@ impl DirectoryCapability {
         remove_child_tree(self, name)
     }
 
+    pub(crate) fn remove_entry_nofollow(&self, name: &OsStr) -> io::Result<()> {
+        validate_component(name)?;
+        remove_entry_nofollow(self, name)
+    }
+
     pub(crate) fn remove_file(&self, name: &OsStr) -> io::Result<()> {
         validate_component(name)?;
         remove_file(self, name)
@@ -181,6 +187,12 @@ impl DirectoryCapability {
             }
         }
         sync_capability(self)
+    }
+
+    pub(crate) fn secure_regular_file(&self, name: &OsStr) -> io::Result<()> {
+        validate_component(name)?;
+        drop(open_file_read(self, name)?);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -344,6 +356,26 @@ fn open_file_create_new(directory: &DirectoryCapability, name: &OsStr) -> io::Re
     Ok(fd_into_file(fd))
 }
 
+#[cfg(all(unix, target_os = "solaris"))]
+fn open_unix_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, fchmod, openat};
+    let fd = openat(
+        &directory.fd,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let stat = rustix::fs::fstat(&fd)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "profile lock is not a regular file",
+        ));
+    }
+    fchmod(&fd, Mode::from_raw_mode(0o600))?;
+    Ok(fd_into_file(fd))
+}
+
 #[cfg(unix)]
 fn rename_child(
     parent: &DirectoryCapability,
@@ -393,6 +425,19 @@ fn remove_child_tree(parent: &DirectoryCapability, name: &OsStr) -> io::Result<(
 fn remove_file(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
     match rustix::fs::unlinkat(&parent.fd, name, rustix::fs::AtFlags::empty()) {
         Ok(()) => Ok(()),
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn remove_entry_nofollow(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, statat};
+    match statat(&parent.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
+            remove_child_tree(parent, name)
+        }
+        Ok(_) => remove_file(parent, name),
         Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -491,6 +536,7 @@ fn open_windows_file(
     directory: &DirectoryCapability,
     name: &OsStr,
     create_new: bool,
+    mutation: bool,
 ) -> io::Result<fs::File> {
     use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
     use windows_sys::Win32::{
@@ -502,10 +548,14 @@ fn open_windows_file(
         },
     };
     let path = directory.display_path.join(name);
-    let access = if create_new {
-        GENERIC_WRITE | DELETE
+    let access = if create_new || mutation {
+        if create_new {
+            GENERIC_WRITE | DELETE
+        } else {
+            GENERIC_READ | GENERIC_WRITE | DELETE
+        }
     } else {
-        GENERIC_READ | GENERIC_WRITE | DELETE
+        GENERIC_READ
     };
     let file = fs::OpenOptions::new()
         .read(!create_new)
@@ -566,7 +616,7 @@ fn open_windows_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::
 
 #[cfg(windows)]
 fn file_metadata(directory: &DirectoryCapability, name: &OsStr) -> io::Result<Option<(bool, u64)>> {
-    match open_windows_file(directory, name, false) {
+    match open_windows_file(directory, name, false, false) {
         Ok(file) => Ok(Some((true, file.metadata()?.len()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(Some((false, 0))),
@@ -576,12 +626,12 @@ fn file_metadata(directory: &DirectoryCapability, name: &OsStr) -> io::Result<Op
 
 #[cfg(windows)]
 fn open_file_read(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
-    open_windows_file(directory, name, false)
+    open_windows_file(directory, name, false, false)
 }
 
 #[cfg(windows)]
 fn open_file_create_new(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
-    open_windows_file(directory, name, true)
+    open_windows_file(directory, name, true, true)
 }
 
 #[cfg(windows)]
@@ -599,7 +649,7 @@ fn replace_file(
     old_name: &OsStr,
     new_name: &OsStr,
 ) -> io::Result<()> {
-    let file = open_windows_file(parent, old_name, false)?;
+    let file = open_windows_file(parent, old_name, false, true)?;
     rename_windows_handle(parent, &file, new_name, true)
 }
 
@@ -679,8 +729,7 @@ fn remove_child_tree(parent: &DirectoryCapability, name: &OsStr) -> io::Result<(
                 if entry.is_directory {
                     remove_child_tree(&child, &entry.name)?;
                 } else {
-                    let file = open_windows_file(&child, &entry.name, false)?;
-                    mark_delete(&file)?;
+                    remove_entry_nofollow(&child, &entry.name)?;
                 }
             }
             mark_delete(&child.handle)?;
@@ -693,11 +742,45 @@ fn remove_child_tree(parent: &DirectoryCapability, name: &OsStr) -> io::Result<(
 
 #[cfg(windows)]
 fn remove_file(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
-    match open_windows_file(parent, name, false) {
+    match open_windows_file(parent, name, false, true) {
         Ok(file) => mark_delete(&file),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+fn remove_entry_nofollow(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
+    use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+    let path = parent.display_path.join(name);
+    let file = match fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH,
+        )
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+        && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    {
+        drop(file);
+        return remove_child_tree(parent, name);
+    }
+    mark_delete(&file)
 }
 
 #[cfg(windows)]

@@ -454,8 +454,11 @@ fn hostile_cleanup_target_is_not_followed(create_link: impl FnOnce(&PathBuf, &Pa
     let reopened = ProfileStore::open(&profiles, None).unwrap();
     assert!(reopened.list().unwrap().is_empty());
     assert_eq!(reopened.active_id(), None);
-
-    fs::remove_dir(&child).unwrap();
+    assert!(!child.exists(), "startup must remove the UUID link itself");
+    assert_eq!(
+        fs::read(external.join("sentinel.txt")).unwrap(),
+        b"do not remove"
+    );
 }
 
 #[cfg(windows)]

@@ -605,6 +605,33 @@ pub enum PersistenceError {
 }
 
 #[derive(Debug)]
+pub struct SnapshotCommit<T> {
+    committed: T,
+    maintenance_debt: Option<io::Error>,
+}
+
+impl<T> SnapshotCommit<T> {
+    pub fn committed(&self) -> &T {
+        &self.committed
+    }
+
+    pub fn maintenance_debt(&self) -> Option<&io::Error> {
+        self.maintenance_debt.as_ref()
+    }
+
+    pub fn into_parts(self) -> (T, Option<io::Error>) {
+        (self.committed, self.maintenance_debt)
+    }
+
+    fn into_legacy_result(self) -> Result<T, PersistenceError> {
+        match self.maintenance_debt {
+            Some(error) => Err(PersistenceError::MaintenanceDebt(error)),
+            None => Ok(self.committed),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct PersistentSnapshotStore {
     root: DirectoryCapability,
     current: RwLock<Option<(u64, Arc<Snapshot>)>>,
@@ -767,7 +794,7 @@ impl PersistentSnapshotStore {
                 "service-logo.png",
             ] {
                 match directory.file_metadata(OsStr::new(config))? {
-                    Some((true, _)) => {}
+                    Some((true, _)) => directory.secure_regular_file(OsStr::new(config))?,
                     Some((false, _)) if config != "service-logo.png" => {
                         return Err(PersistenceError::Io(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -817,14 +844,33 @@ impl PersistentSnapshotStore {
     }
 
     pub fn commit(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        self.commit_with_generation(snapshot)
-            .map(|(_, snapshot)| snapshot)
+        self.commit_status(snapshot)?.into_legacy_result()
+    }
+
+    pub fn commit_status(
+        &self,
+        snapshot: Snapshot,
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        let outcome = self.commit_with_generation_status(snapshot)?;
+        let ((_, snapshot), maintenance_debt) = outcome.into_parts();
+        Ok(SnapshotCommit {
+            committed: snapshot,
+            maintenance_debt,
+        })
     }
 
     pub fn commit_with_generation(
         &self,
-        mut snapshot: Snapshot,
+        snapshot: Snapshot,
     ) -> Result<(u64, Arc<Snapshot>), PersistenceError> {
+        self.commit_with_generation_status(snapshot)?
+            .into_legacy_result()
+    }
+
+    pub fn commit_with_generation_status(
+        &self,
+        mut snapshot: Snapshot,
+    ) -> Result<SnapshotCommit<(u64, Arc<Snapshot>)>, PersistenceError> {
         let _guard = self
             .commit_lock
             .lock()
@@ -883,16 +929,23 @@ impl PersistentSnapshotStore {
             .current
             .write()
             .expect("persistent snapshot lock poisoned") = Some((generation, snapshot.clone()));
-        match directory_sync {
-            Ok(()) => Ok((generation, snapshot)),
-            Err(error) => Err(PersistenceError::MaintenanceDebt(error)),
-        }
+        Ok(SnapshotCommit {
+            committed: (generation, snapshot),
+            maintenance_debt: directory_sync.err(),
+        })
     }
 }
 
 impl SnapshotSink for PersistentSnapshotStore {
     fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
         self.commit(snapshot)
+    }
+}
+
+#[cfg(test)]
+impl PersistentSnapshotStore {
+    fn inject_directory_sync_failure(&self) {
+        self.root.inject_sync_failure();
     }
 }
 
@@ -1497,4 +1550,28 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
 #[cfg(windows)]
 pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
     DirectoryCapability::open(path)?.sync()
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn committed_outcome_carries_snapshot_when_post_publication_sync_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        store.inject_directory_sync_failure();
+        let snapshot = Snapshot::parse(
+            b"proxies: []\nproxy-groups: []\nrules: []\n",
+            br#"{"outbounds":[]}"#,
+        )
+        .unwrap();
+
+        let outcome = store.commit_with_generation_status(snapshot).unwrap();
+        assert!(outcome.maintenance_debt().is_some());
+        let ((generation, committed), debt) = outcome.into_parts();
+        assert_eq!(generation, 1);
+        assert!(debt.is_some());
+        assert!(Arc::ptr_eq(&committed, &store.current().unwrap()));
+    }
 }

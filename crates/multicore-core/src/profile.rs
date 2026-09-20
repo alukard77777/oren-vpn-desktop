@@ -126,7 +126,7 @@ pub enum ProfileError {
         #[source]
         source: io::Error,
     },
-    #[error("profile index mutation committed but durability maintenance is required")]
+    #[error("profile mutation committed but durability maintenance is required")]
     IndexMaintenanceDebt {
         id: ProfileId,
         #[source]
@@ -196,6 +196,10 @@ impl ProfileStore {
                 active_id: None,
             },
         };
+        // Establish the validated index (or its absence) durably before deleting any
+        // unindexed rollback material. A crash must not resurrect an old index that names
+        // a directory cleanup has already removed.
+        root.sync()?;
         cleanup_unindexed_profile_directories(&root, &index)?;
         Ok(Self {
             root,
@@ -257,17 +261,20 @@ impl ProfileStore {
         let profile = self.root.create_child(OsStr::new(id.as_str()))?;
         let result = (|| {
             let store = PersistentSnapshotStore::open_capability(profile)?;
-            store.commit((*snapshot).clone())?;
+            let (_, maintenance_debt) = store.commit_status((*snapshot).clone())?.into_parts();
             drop(store);
             self.load_profile(&id)?;
-            Ok::<_, ProfileError>(())
+            Ok::<_, ProfileError>(maintenance_debt)
         })();
-        if let Err(error) = result {
-            if let Err(source) = self.remove_profile_directory(&id) {
-                return Err(ProfileError::CleanupDebt { id, source });
+        let snapshot_debt = match result {
+            Ok(debt) => debt,
+            Err(error) => {
+                if let Err(source) = self.remove_profile_directory(&id) {
+                    return Err(ProfileError::CleanupDebt { id, source });
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
 
         let mut proposed = index.clone();
         proposed.profiles.push(ProfileIndexEntry {
@@ -278,11 +285,17 @@ impl ProfileStore {
         match self.persist_index(&proposed) {
             Ok(IndexCommit::Clean) => {
                 *index = proposed;
-                Ok(id)
+                match snapshot_debt {
+                    Some(source) => Err(ProfileError::IndexMaintenanceDebt { id, source }),
+                    None => Ok(id),
+                }
             }
             Ok(IndexCommit::MaintenanceDebt(source)) => {
                 *index = proposed;
-                Err(ProfileError::IndexMaintenanceDebt { id, source })
+                Err(ProfileError::IndexMaintenanceDebt {
+                    id,
+                    source: combine_maintenance_debt(snapshot_debt, source),
+                })
             }
             Err(error) => match self.remove_profile_directory(&id) {
                 Ok(()) => Err(error),
@@ -300,13 +313,21 @@ impl ProfileStore {
         self.require_entry(&index, id)?;
         let profile = self.open_profile(id)?;
         let store = PersistentSnapshotStore::open_capability(profile)?;
-        let (generation, _) = store.commit_with_generation((*snapshot).clone())?;
+        let ((generation, _), maintenance_debt) = store
+            .commit_with_generation_status((*snapshot).clone())?
+            .into_parts();
         drop(store);
         let (reloaded_generation, _) = self.load_profile(id)?;
         if reloaded_generation != generation {
             return Err(ProfileError::Unavailable(id.clone()));
         }
-        Ok(generation)
+        match maintenance_debt {
+            Some(source) => Err(ProfileError::IndexMaintenanceDebt {
+                id: id.clone(),
+                source,
+            }),
+            None => Ok(generation),
+        }
     }
 
     pub fn activate(&self, id: &ProfileId) -> Result<Arc<Snapshot>, ProfileError> {
@@ -511,11 +532,10 @@ impl ProfileStore {
     }
 }
 
-fn profile_directory_ids(root: &DirectoryCapability) -> Result<Vec<ProfileId>, ProfileError> {
+fn profile_entry_ids(root: &DirectoryCapability) -> Result<Vec<ProfileId>, ProfileError> {
     let mut ids = root
         .entries()?
         .into_iter()
-        .filter(|entry| entry.is_directory)
         .filter_map(|entry| entry.name.into_string().ok())
         .filter_map(|name| ProfileId::parse(&name).ok())
         .collect::<Vec<_>>();
@@ -532,14 +552,28 @@ fn cleanup_unindexed_profile_directories(
         .iter()
         .map(|entry| &entry.id)
         .collect::<HashSet<_>>();
-    for id in profile_directory_ids(root)? {
-        if !indexed.contains(&id)
-            && let Err(source) = root
-                .remove_child_tree(OsStr::new(id.as_str()))
-                .and_then(|()| root.sync())
-        {
-            return Err(ProfileError::CleanupDebt { id, source });
+    let mut removed_any = false;
+    for id in profile_entry_ids(root)? {
+        if !indexed.contains(&id) {
+            if let Err(source) = root.remove_entry_nofollow(OsStr::new(id.as_str())) {
+                if removed_any && let Err(sync) = root.sync() {
+                    return Err(ProfileError::CleanupDebt {
+                        id,
+                        source: io::Error::new(
+                            source.kind(),
+                            format!(
+                                "orphan cleanup failed ({source}); prior cleanup sync failed: {sync}"
+                            ),
+                        ),
+                    });
+                }
+                return Err(ProfileError::CleanupDebt { id, source });
+            }
+            removed_any = true;
         }
+    }
+    if removed_any {
+        root.sync()?;
     }
     Ok(())
 }
@@ -553,8 +587,20 @@ fn occupied_profile_slots(
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<HashSet<_>>();
-    occupied.extend(profile_directory_ids(root)?);
+    occupied.extend(profile_entry_ids(root)?);
     Ok(occupied.len())
+}
+
+fn combine_maintenance_debt(snapshot: Option<io::Error>, index: io::Error) -> io::Error {
+    match snapshot {
+        Some(snapshot) => io::Error::new(
+            index.kind(),
+            format!(
+                "snapshot directory sync failed ({snapshot}); index directory sync failed ({index})"
+            ),
+        ),
+        None => index,
+    }
 }
 
 fn validate_index(index: &ProfileIndex) -> Result<(), ProfileError> {
@@ -717,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_removes_only_unindexed_uuid_directories() {
+    fn startup_removes_only_unindexed_uuid_entries() {
         let root = TempDirectory::new();
         let store = ProfileStore::open(root.path(), None).unwrap();
         let indexed = store
@@ -726,12 +772,15 @@ mod tests {
         drop(store);
 
         let orphan = ProfileId::generate().unwrap();
+        let orphan_file = ProfileId::generate().unwrap();
         fs::create_dir(root.path().join(orphan.as_str())).unwrap();
+        fs::write(root.path().join(orphan_file.as_str()), b"rollback debris").unwrap();
         fs::create_dir(root.path().join("operator-notes")).unwrap();
 
         let reopened = ProfileStore::open(root.path(), None).unwrap();
         assert!(root.path().join(indexed.as_str()).is_dir());
         assert!(!root.path().join(orphan.as_str()).exists());
+        assert!(!root.path().join(orphan_file.as_str()).exists());
         assert!(root.path().join("operator-notes").is_dir());
         assert_eq!(reopened.list().unwrap().len(), 1);
     }
@@ -754,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn unindexed_uuid_directories_consume_live_store_capacity() {
+    fn every_unindexed_uuid_entry_consumes_live_store_capacity() {
         let root = TempDirectory::new();
         let store = ProfileStore::open(root.path(), None).unwrap();
         for index in 0..MAX_PROFILES - 1 {
@@ -766,7 +815,11 @@ mod tests {
                 .unwrap();
         }
         let orphan = ProfileId::generate().unwrap();
-        fs::create_dir(root.path().join(orphan.as_str())).unwrap();
+        fs::write(
+            root.path().join(orphan.as_str()),
+            b"not a profile directory",
+        )
+        .unwrap();
 
         assert!(matches!(
             store.create_profile(snapshot("https://overflow.invalid/sub", "Overflow")),

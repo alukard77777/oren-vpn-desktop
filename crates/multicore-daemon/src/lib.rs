@@ -1444,8 +1444,11 @@ where
             }
         };
 
-        let (revision, snapshot) = match self.store.commit_with_generation((*snapshot).clone()) {
-            Ok(persisted) => persisted,
+        let outcome = match self
+            .store
+            .commit_with_generation_status((*snapshot).clone())
+        {
+            Ok(outcome) => outcome,
             Err(_) => {
                 drop(prepared);
                 let mut state = self.inner.write().await;
@@ -1473,10 +1476,19 @@ where
                 return Err(BackendError::new());
             }
         };
+        let ((revision, snapshot), maintenance_debt) = outcome.into_parts();
 
         let mut state = self.inner.write().await;
         let controller = prepared.controller();
         state.apply_snapshot(snapshot, controller, revision);
+        if maintenance_debt.is_some() {
+            state.push_event(
+                Severity::Warning,
+                Component::Subscription,
+                "snapshot_maintenance",
+                "The new profile was committed, but its directory durability requires maintenance.",
+            );
+        }
         state.push_event(
             Severity::Info,
             Component::Subscription,
