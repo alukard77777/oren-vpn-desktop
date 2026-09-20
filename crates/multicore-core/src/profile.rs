@@ -196,6 +196,7 @@ impl ProfileStore {
                 active_id: None,
             },
         };
+        cleanup_unindexed_profile_directories(&root, &index)?;
         Ok(Self {
             root,
             _lock: lock,
@@ -239,7 +240,7 @@ impl ProfileStore {
 
     pub fn create_profile(&self, snapshot: Arc<Snapshot>) -> Result<ProfileId, ProfileError> {
         let mut index = self.index.write().expect("profile index lock poisoned");
-        if index.profiles.len() >= MAX_PROFILES {
+        if occupied_profile_slots(&self.root, &index)? >= MAX_PROFILES {
             return Err(ProfileError::LimitReached);
         }
         let id = loop {
@@ -262,7 +263,9 @@ impl ProfileStore {
             Ok::<_, ProfileError>(())
         })();
         if let Err(error) = result {
-            let _ = self.root.remove_child_tree(OsStr::new(id.as_str()));
+            if let Err(source) = self.remove_profile_directory(&id) {
+                return Err(ProfileError::CleanupDebt { id, source });
+            }
             return Err(error);
         }
 
@@ -281,10 +284,10 @@ impl ProfileStore {
                 *index = proposed;
                 Err(ProfileError::IndexMaintenanceDebt { id, source })
             }
-            Err(error) => {
-                let _ = self.root.remove_child_tree(OsStr::new(id.as_str()));
-                Err(error)
-            }
+            Err(error) => match self.remove_profile_directory(&id) {
+                Ok(()) => Err(error),
+                Err(source) => Err(ProfileError::CleanupDebt { id, source }),
+            },
         }
     }
 
@@ -421,7 +424,8 @@ impl ProfileStore {
     }
 
     fn remove_profile_directory(&self, id: &ProfileId) -> io::Result<()> {
-        self.root.remove_child_tree(OsStr::new(id.as_str()))
+        self.root.remove_child_tree(OsStr::new(id.as_str()))?;
+        self.root.sync()
     }
 
     fn persist_index(&self, index: &ProfileIndex) -> Result<IndexCommit, ProfileError> {
@@ -454,10 +458,20 @@ impl ProfileStore {
                 Err(error) => IndexCommit::MaintenanceDebt(error),
             })
         })();
-        if result.is_err() {
-            let _ = self.root.remove_file(OsStr::new(INDEX_TEMP_FILE));
+        match result {
+            Ok(commit) => Ok(commit),
+            Err(error) => {
+                if let Err(cleanup) = self.root.remove_file(OsStr::new(INDEX_TEMP_FILE)) {
+                    return Err(ProfileError::Io(io::Error::new(
+                        cleanup.kind(),
+                        format!(
+                            "index update failed ({error}); temporary index cleanup failed: {cleanup}"
+                        ),
+                    )));
+                }
+                Err(ProfileError::Io(error))
+            }
         }
-        result.map_err(ProfileError::Io)
     }
 
     #[cfg(test)]
@@ -485,6 +499,62 @@ impl ProfileStore {
             )
             .is_ok()
     }
+
+    #[cfg(test)]
+    fn inject_directory_sync_fault(&self) {
+        self.root.inject_sync_failure();
+    }
+
+    #[cfg(test)]
+    fn directory_sync_call_count(&self) -> usize {
+        self.root.sync_call_count()
+    }
+}
+
+fn profile_directory_ids(root: &DirectoryCapability) -> Result<Vec<ProfileId>, ProfileError> {
+    let mut ids = root
+        .entries()?
+        .into_iter()
+        .filter(|entry| entry.is_directory)
+        .filter_map(|entry| entry.name.into_string().ok())
+        .filter_map(|name| ProfileId::parse(&name).ok())
+        .collect::<Vec<_>>();
+    ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    Ok(ids)
+}
+
+fn cleanup_unindexed_profile_directories(
+    root: &DirectoryCapability,
+    index: &ProfileIndex,
+) -> Result<(), ProfileError> {
+    let indexed = index
+        .profiles
+        .iter()
+        .map(|entry| &entry.id)
+        .collect::<HashSet<_>>();
+    for id in profile_directory_ids(root)? {
+        if !indexed.contains(&id)
+            && let Err(source) = root
+                .remove_child_tree(OsStr::new(id.as_str()))
+                .and_then(|()| root.sync())
+        {
+            return Err(ProfileError::CleanupDebt { id, source });
+        }
+    }
+    Ok(())
+}
+
+fn occupied_profile_slots(
+    root: &DirectoryCapability,
+    index: &ProfileIndex,
+) -> Result<usize, ProfileError> {
+    let mut occupied = index
+        .profiles
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<HashSet<_>>();
+    occupied.extend(profile_directory_ids(root)?);
+    Ok(occupied.len())
 }
 
 fn validate_index(index: &ProfileIndex) -> Result<(), ProfileError> {
@@ -621,6 +691,87 @@ mod tests {
         let reopened = ProfileStore::open(post_root.path(), None).unwrap();
         assert_eq!(reopened.active_id(), Some(id));
         assert_eq!(reopened.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn post_publication_directory_sync_failure_is_maintenance_debt() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        let before = store.directory_sync_call_count();
+        store.inject_directory_sync_fault();
+
+        let id = match store.create_profile(snapshot("https://sync.invalid/sub", "Sync")) {
+            Err(ProfileError::IndexMaintenanceDebt { id, source }) => {
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+                id
+            }
+            result => panic!("expected post-publication maintenance debt, got {result:?}"),
+        };
+        assert_eq!(store.directory_sync_call_count(), before + 1);
+        assert_eq!(store.active_id(), Some(id.clone()));
+        drop(store);
+        assert_eq!(
+            ProfileStore::open(root.path(), None).unwrap().active_id(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn startup_removes_only_unindexed_uuid_directories() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        let indexed = store
+            .create_profile(snapshot("https://indexed.invalid/sub", "Indexed"))
+            .unwrap();
+        drop(store);
+
+        let orphan = ProfileId::generate().unwrap();
+        fs::create_dir(root.path().join(orphan.as_str())).unwrap();
+        fs::create_dir(root.path().join("operator-notes")).unwrap();
+
+        let reopened = ProfileStore::open(root.path(), None).unwrap();
+        assert!(root.path().join(indexed.as_str()).is_dir());
+        assert!(!root.path().join(orphan.as_str()).exists());
+        assert!(root.path().join("operator-notes").is_dir());
+        assert_eq!(reopened.list().unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_surfaces_unresolved_orphan_cleanup() {
+        let root = TempDirectory::new();
+        let orphan = ProfileId::generate().unwrap();
+        let orphan_path = root.path().join(orphan.as_str());
+        fs::create_dir(&orphan_path).unwrap();
+        let blocker = DirectoryCapability::open(&orphan_path).unwrap();
+
+        assert!(matches!(
+            ProfileStore::open(root.path(), None),
+            Err(ProfileError::CleanupDebt { id, .. }) if id == orphan
+        ));
+        drop(blocker);
+        assert!(ProfileStore::open(root.path(), None).is_ok());
+    }
+
+    #[test]
+    fn unindexed_uuid_directories_consume_live_store_capacity() {
+        let root = TempDirectory::new();
+        let store = ProfileStore::open(root.path(), None).unwrap();
+        for index in 0..MAX_PROFILES - 1 {
+            store
+                .create_profile(snapshot(
+                    &format!("https://{index}.invalid/sub"),
+                    &format!("Node{index}"),
+                ))
+                .unwrap();
+        }
+        let orphan = ProfileId::generate().unwrap();
+        fs::create_dir(root.path().join(orphan.as_str())).unwrap();
+
+        assert!(matches!(
+            store.create_profile(snapshot("https://overflow.invalid/sub", "Overflow")),
+            Err(ProfileError::LimitReached)
+        ));
     }
 
     #[test]

@@ -3,7 +3,11 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Debug)]
 pub(crate) struct DirectoryCapability {
@@ -12,6 +16,27 @@ pub(crate) struct DirectoryCapability {
     fd: rustix::fd::OwnedFd,
     #[cfg(windows)]
     handle: fs::File,
+    #[cfg(test)]
+    sync_probe: Arc<SyncProbe>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SyncProbe {
+    fail_next: AtomicBool,
+    calls: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CapabilityFile {
+    file: Arc<fs::File>,
+    stable_path: Option<PathBuf>,
+}
+
+impl CapabilityFile {
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.stable_path.as_deref()
+    }
 }
 
 #[derive(Debug)]
@@ -22,7 +47,7 @@ pub(crate) struct CapabilityEntry {
 
 #[derive(Debug)]
 pub(crate) struct StoreLock {
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     _file: fs::File,
 }
 
@@ -31,16 +56,14 @@ impl DirectoryCapability {
         open_directory(path)
     }
 
-    pub(crate) fn display_path(&self) -> &Path {
-        &self.display_path
-    }
-
     pub(crate) fn lock_exclusive(&self) -> io::Result<StoreLock> {
         #[cfg(unix)]
         {
             let duplicate = fd_into_file(rustix::io::dup(&self.fd)?);
             fs2::FileExt::try_lock_exclusive(&duplicate)?;
-            Ok(StoreLock {})
+            // Keep the duplicate alive. This is required on Solaris, where fs2 emulates
+            // flock with process-associated fcntl locks, and is harmless on flock systems.
+            Ok(StoreLock { _file: duplicate })
         }
         #[cfg(windows)]
         {
@@ -93,6 +116,33 @@ impl DirectoryCapability {
         Ok(bytes)
     }
 
+    pub(crate) fn read_file_retained(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> io::Result<(Vec<u8>, CapabilityFile)> {
+        validate_component(name)?;
+        let mut file = open_file_read(self, name)?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "capability-relative file exceeds size limit",
+            ));
+        }
+        let stable_path = stable_file_path(self, name, &file);
+        Ok((
+            bytes,
+            CapabilityFile {
+                file: Arc::new(file),
+                stable_path,
+            },
+        ))
+    }
+
     pub(crate) fn write_file(&self, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
         validate_component(name)?;
         let mut file = open_file_create_new(self, name)?;
@@ -123,7 +173,30 @@ impl DirectoryCapability {
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.sync_probe.calls.fetch_add(1, Ordering::SeqCst);
+            if self.sync_probe.fail_next.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+        }
         sync_capability(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sync_failure(&self) {
+        self.sync_probe.fail_next.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_call_count(&self) -> usize {
+        self.sync_probe.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl PartialEq for CapabilityFile {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.file, &other.file) || self.stable_path == other.stable_path
     }
 }
 
@@ -150,6 +223,8 @@ fn open_directory(path: &Path) -> io::Result<DirectoryCapability> {
     Ok(DirectoryCapability {
         display_path: absolute_display_path(path)?,
         fd,
+        #[cfg(test)]
+        sync_probe: Arc::default(),
     })
 }
 
@@ -166,6 +241,8 @@ fn open_child(parent: &DirectoryCapability, name: &OsStr) -> io::Result<Director
     Ok(DirectoryCapability {
         display_path: parent.display_path.join(name),
         fd,
+        #[cfg(test)]
+        sync_probe: Arc::default(),
     })
 }
 
@@ -215,7 +292,7 @@ fn fd_into_file(fd: rustix::fd::OwnedFd) -> fs::File {
 
 #[cfg(unix)]
 fn open_file_read(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
-    use rustix::fs::{Mode, OFlags, openat};
+    use rustix::fs::{Mode, OFlags, fchmod, openat};
     let fd = openat(
         &directory.fd,
         name,
@@ -229,7 +306,29 @@ fn open_file_read(directory: &DirectoryCapability, name: &OsStr) -> io::Result<f
             "not a regular file",
         ));
     }
+    fchmod(&fd, Mode::from_raw_mode(0o600))?;
     Ok(fd_into_file(fd))
+}
+
+#[cfg(unix)]
+fn stable_file_path(
+    _directory: &DirectoryCapability,
+    _name: &OsStr,
+    file: &fs::File,
+) -> Option<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        let fd_root = format!("/proc/{}/fd", std::process::id());
+        return Some(PathBuf::from(fd_root).join(file.as_raw_fd().to_string()));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = file;
+        // /dev/fd is process-relative and this path is handed to a separate UI process.
+        // Suppress the optional logo instead of exposing a path that could name unrelated bytes.
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -319,18 +418,20 @@ fn open_child(parent: &DirectoryCapability, name: &OsStr) -> io::Result<Director
 fn open_windows_directory(path: &Path, removable: bool) -> io::Result<DirectoryCapability> {
     use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
     use windows_sys::Win32::{
-        Foundation::GENERIC_READ,
+        Foundation::{GENERIC_READ, GENERIC_WRITE},
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
         },
     };
     let handle = fs::OpenOptions::new()
         .read(true)
-        .access_mode(GENERIC_READ | if removable { DELETE } else { 0 })
+        .access_mode(GENERIC_READ | GENERIC_WRITE | if removable { DELETE } else { 0 })
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH,
+        )
         .open(path)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
@@ -348,7 +449,20 @@ fn open_windows_directory(path: &Path, removable: bool) -> io::Result<DirectoryC
     Ok(DirectoryCapability {
         display_path: absolute_display_path(path)?,
         handle,
+        #[cfg(test)]
+        sync_probe: Arc::default(),
     })
+}
+
+#[cfg(windows)]
+fn stable_file_path(
+    directory: &DirectoryCapability,
+    name: &OsStr,
+    _file: &fs::File,
+) -> Option<PathBuf> {
+    // The retained file handle denies delete sharing, so this name cannot be replaced
+    // while a Snapshot exposes it.
+    Some(directory.display_path.join(name))
 }
 
 #[cfg(windows)]
@@ -358,11 +472,15 @@ fn create_child(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
 
 #[cfg(windows)]
 fn entries(directory: &DirectoryCapability) -> io::Result<Vec<CapabilityEntry>> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     let mut result = Vec::new();
     for entry in fs::read_dir(&directory.display_path)? {
         let entry = entry?;
         let name = entry.file_name();
-        let is_directory = directory.open_child(&name).is_ok();
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let is_directory =
+            metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
         result.push(CapabilityEntry { name, is_directory });
     }
     Ok(result)
@@ -379,15 +497,15 @@ fn open_windows_file(
         Foundation::{GENERIC_READ, GENERIC_WRITE},
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, GetFileInformationByHandle,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
         },
     };
     let path = directory.display_path.join(name);
     let access = if create_new {
         GENERIC_WRITE | DELETE
     } else {
-        GENERIC_READ | DELETE
+        GENERIC_READ | GENERIC_WRITE | DELETE
     };
     let file = fs::OpenOptions::new()
         .read(!create_new)
@@ -395,7 +513,7 @@ fn open_windows_file(
         .create_new(create_new)
         .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
         .open(&path)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
@@ -492,12 +610,12 @@ fn rename_windows_handle(
     new_name: &OsStr,
     replace: bool,
 ) -> io::Result<()> {
-    use std::{os::windows::ffi::OsStrExt, os::windows::io::AsRawHandle, ptr};
+    use std::{os::windows::ffi::OsStrExt, os::windows::io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
     };
-    // The parent's retained handle denies delete sharing, so its display path cannot be
-    // renamed or replaced while this absolute target name is consumed by the kernel.
+    // The retained parent handle denies delete sharing, so this absolute path cannot be
+    // redirected by replacing the capability root while the kernel consumes it.
     let target = parent.display_path.join(new_name);
     let name: Vec<u16> = target.as_os_str().encode_wide().collect();
     let bytes = std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * 2;
@@ -506,7 +624,9 @@ fn rename_windows_handle(
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
         (*info).Anonymous.ReplaceIfExists = replace;
-        (*info).RootDirectory = ptr::null_mut();
+        // The source handle was opened with FILE_FLAG_WRITE_THROUGH, so successful rename
+        // completion is the Windows metadata durability barrier.
+        (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = (name.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -581,8 +701,24 @@ fn remove_file(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_capability(_directory: &DirectoryCapability) -> io::Result<()> {
-    Ok(())
+fn sync_capability(directory: &DirectoryCapability) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::ERROR_INVALID_HANDLE, Storage::FileSystem::FlushFileBuffers,
+    };
+    if unsafe { FlushFileBuffers(directory.handle.as_raw_handle()) } == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_HANDLE as i32) {
+            // FlushFileBuffers is not supported for directory handles on every Windows
+            // filesystem. Publication remains durable because all capability-relative
+            // rename source handles use FILE_FLAG_WRITE_THROUGH.
+            Ok(())
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(())
+    }
 }
 
 fn absolute_display_path(path: &Path) -> io::Result<PathBuf> {
@@ -590,5 +726,29 @@ fn absolute_display_path(path: &Path) -> io::Result<PathBuf> {
         Ok(path.to_path_buf())
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn opening_existing_regular_file_restores_owner_only_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config");
+        fs::write(&path, b"secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let directory = DirectoryCapability::open(temp.path()).unwrap();
+        assert_eq!(
+            directory.read_file(OsStr::new("config"), 32).unwrap(),
+            b"secret"
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

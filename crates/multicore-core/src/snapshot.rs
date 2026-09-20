@@ -20,7 +20,7 @@ use crate::{
     fetch::SubscriptionMetadataHeaders,
     parse_mihomo, parse_xray,
     service_logo::{MAX_SERVICE_LOGO_OUTPUT_BYTES, is_canonical_service_logo},
-    store_root::DirectoryCapability,
+    store_root::{CapabilityFile, DirectoryCapability},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +30,7 @@ pub struct Snapshot {
     subscription: Option<SubscriptionRecord>,
     service_logo_png: Option<Vec<u8>>,
     service_logo_path: Option<PathBuf>,
+    service_logo_file: Option<CapabilityFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +127,7 @@ impl Snapshot {
             subscription: None,
             service_logo_png: None,
             service_logo_path: None,
+            service_logo_file: None,
         })
     }
 
@@ -244,6 +246,7 @@ impl Snapshot {
     pub(crate) fn set_service_logo_png(&mut self, png: Vec<u8>) {
         self.service_logo_png = Some(png);
         self.service_logo_path = None;
+        self.service_logo_file = None;
     }
 
     pub fn service_logo_path(&self) -> Option<&Path> {
@@ -597,12 +600,13 @@ impl SnapshotSink for AtomicSnapshot {
 pub enum PersistenceError {
     #[error("snapshot persistence operation failed")]
     Io(#[from] io::Error),
+    #[error("snapshot publication committed but directory durability maintenance is required")]
+    MaintenanceDebt(#[source] io::Error),
 }
 
 #[derive(Debug)]
 pub struct PersistentSnapshotStore {
     root: DirectoryCapability,
-    display_root: PathBuf,
     current: RwLock<Option<(u64, Arc<Snapshot>)>>,
     next_generation: AtomicU64,
     commit_lock: Mutex<()>,
@@ -754,8 +758,6 @@ impl PersistentSnapshotStore {
     }
 
     pub(crate) fn open_capability(root: DirectoryCapability) -> Result<Self, PersistenceError> {
-        let display_root = root.display_path().to_path_buf();
-
         let mut generations = generation_directories(&root)?;
         for (_, directory) in &generations {
             for config in [
@@ -788,7 +790,6 @@ impl PersistentSnapshotStore {
 
         Ok(Self {
             root,
-            display_root,
             current: RwLock::new(current),
             next_generation: AtomicU64::new(highest_id.saturating_add(1).max(1)),
             commit_lock: Mutex::new(()),
@@ -830,10 +831,9 @@ impl PersistentSnapshotStore {
             .expect("snapshot commit lock poisoned");
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let published_name = format!("snapshot-{generation:020}");
-        let published = self.display_root.join(&published_name);
         let (staging_name, staging) = create_snapshot_staging(&self.root, &published_name)?;
 
-        let result = (|| {
+        let publication = (|| {
             staging.write_file(
                 OsStr::new("mihomo.yaml"),
                 snapshot.mihomo.raw_yaml().as_bytes(),
@@ -851,24 +851,42 @@ impl PersistentSnapshotStore {
             staging.sync()?;
             self.root
                 .rename_child(&staging, OsStr::new(&published_name))?;
-            self.root.sync()?;
-            Ok::<_, io::Error>(())
+            Ok::<_, io::Error>(self.root.sync())
         })();
+        drop(staging);
 
-        if let Err(error) = result {
-            let _ = self.root.remove_child_tree(&staging_name);
-            return Err(PersistenceError::Io(error));
+        let directory_sync = match publication {
+            Ok(directory_sync) => directory_sync,
+            Err(error) => {
+                if let Err(cleanup) = self.root.remove_child_tree(&staging_name) {
+                    return Err(PersistenceError::Io(io::Error::new(
+                        cleanup.kind(),
+                        format!(
+                            "snapshot publication failed ({error}); staging cleanup failed: {cleanup}"
+                        ),
+                    )));
+                }
+                return Err(PersistenceError::Io(error));
+            }
+        };
+        if snapshot.service_logo_png.is_some() {
+            let published_directory = self.root.open_child(OsStr::new(&published_name))?;
+            let (_, retained) = published_directory.read_file_retained(
+                OsStr::new("service-logo.png"),
+                MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
+            )?;
+            snapshot.service_logo_path = retained.path().map(Path::to_owned);
+            snapshot.service_logo_file = Some(retained);
         }
-        snapshot.service_logo_path = snapshot
-            .service_logo_png
-            .as_ref()
-            .map(|_| published.join("service-logo.png"));
         let snapshot = Arc::new(snapshot);
         *self
             .current
             .write()
             .expect("persistent snapshot lock poisoned") = Some((generation, snapshot.clone()));
-        Ok((generation, snapshot))
+        match directory_sync {
+            Ok(()) => Ok((generation, snapshot)),
+            Err(error) => Err(PersistenceError::MaintenanceDebt(error)),
+        }
     }
 }
 
@@ -1151,18 +1169,27 @@ fn stage_runtime_payloads(
     let published = runtime_root.join(&published_name);
     let staging = runtime_root.join(format!(".{published_name}.staging-{}", std::process::id()));
 
-    let result = (|| {
+    let preparation = (|| {
         fs::create_dir(&staging)?;
         secure_directory(&staging)?;
         write_synced(&staging.join("mihomo.yaml"), mihomo)?;
         write_synced(&staging.join("xray.json"), xray)?;
         sync_directory(&staging)?;
-        fs::rename(&staging, &published)?;
-        sync_directory(runtime_root)
+        fs::rename(&staging, &published)
     })();
-    if let Err(error) = result {
-        let _ = fs::remove_dir_all(&staging);
+    if let Err(error) = preparation {
+        if let Err(cleanup) = fs::remove_dir_all(&staging)
+            && cleanup.kind() != io::ErrorKind::NotFound
+        {
+            return Err(PersistenceError::Io(io::Error::new(
+                cleanup.kind(),
+                format!("runtime preparation failed ({error}); staging cleanup failed: {cleanup}"),
+            )));
+        }
         return Err(PersistenceError::Io(error));
+    }
+    if let Err(error) = sync_directory(runtime_root) {
+        return Err(PersistenceError::MaintenanceDebt(error));
     }
 
     Ok(StagedRuntime {
@@ -1265,20 +1292,20 @@ fn load_generation(directory: &DirectoryCapability) -> Option<Snapshot> {
         }
         snapshot.subscription = Some(record);
     }
-    let logo_path = directory.display_path().join("service-logo.png");
     if directory
         .file_metadata(OsStr::new("service-logo.png"))
         .ok()
         .flatten()
         .is_some_and(|(regular, len)| regular && len <= MAX_SERVICE_LOGO_OUTPUT_BYTES as u64)
-        && let Ok(bytes) = directory.read_file(
+        && let Ok((bytes, retained)) = directory.read_file_retained(
             OsStr::new("service-logo.png"),
             MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
         )
         && is_canonical_service_logo(&bytes)
     {
         snapshot.service_logo_png = Some(bytes);
-        snapshot.service_logo_path = Some(logo_path);
+        snapshot.service_logo_path = retained.path().map(Path::to_owned);
+        snapshot.service_logo_file = Some(retained);
     }
     Some(snapshot)
 }
@@ -1468,8 +1495,6 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(windows)]
-pub(crate) fn sync_directory(_path: &Path) -> Result<(), io::Error> {
-    // Stable std cannot open Windows directories with FILE_FLAG_BACKUP_SEMANTICS.
-    // Both payload files are flushed with FlushFileBuffers before the atomic rename.
-    Ok(())
+pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
+    DirectoryCapability::open(path)?.sync()
 }
