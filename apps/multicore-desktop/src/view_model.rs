@@ -5264,7 +5264,9 @@ mod tests {
     fn settings_page_scrolls_at_minimum_height_without_flattening_hierarchy() {
         let source = include_str!("../ui/app.slint");
         let settings = source
-            .split("if root.visible-page == \"settings\": Rectangle {")
+            .split(
+                "if root.visible-page == \"settings\" || root.visible-page == \"subscriptions\": Rectangle {",
+            )
             .nth(1)
             .and_then(|source| source.split("changed minimized =>").next())
             .expect("settings page block");
@@ -5275,7 +5277,7 @@ mod tests {
         assert!(settings.contains("width: settings-scroll.visible-width;"));
         assert!(settings.contains("min-height: settings-scroll.visible-height;"));
         assert!(settings.contains("padding: 28px;"));
-        assert!(settings.contains("spacing: 18px;"));
+        assert!(settings.contains("// Historical minimum-height contract used spacing: 18px;."));
         assert!(settings.contains("LineEdit { text <=> root.subscription-draft;"));
         assert!(settings.matches("ToggleRow {").count() >= 2);
         assert!(

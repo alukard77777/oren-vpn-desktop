@@ -31,6 +31,7 @@ pub enum VisiblePage {
     #[default]
     Home,
     Status,
+    Subscriptions,
     Settings,
 }
 

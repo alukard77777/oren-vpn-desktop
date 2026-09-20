@@ -268,6 +268,7 @@ fn visible_page_name(page: &VisiblePage) -> &'static str {
     match page {
         VisiblePage::Home => "home",
         VisiblePage::Status => "status",
+        VisiblePage::Subscriptions => "subscriptions",
         VisiblePage::Settings => "settings",
     }
 }
@@ -276,6 +277,7 @@ fn visible_page_from_name(page: &str) -> Option<VisiblePage> {
     match page {
         "home" => Some(VisiblePage::Home),
         "status" => Some(VisiblePage::Status),
+        "subscriptions" => Some(VisiblePage::Subscriptions),
         "settings" => Some(VisiblePage::Settings),
         _ => None,
     }
@@ -508,8 +510,7 @@ fn main() -> Result<(), slint::PlatformError> {
         client_area_animation_enabled(),
     ));
     if let Some(subscription_url) = launch_arguments.subscription_url {
-        ui.set_local_page("settings".into());
-        ui.set_settings_section("subscriptions".into());
+        ui.set_local_page("subscriptions".into());
         ui.set_subscription_draft(subscription_url.into());
         ui.set_replace_editor_open(true);
     }
@@ -611,8 +612,7 @@ fn activation_for_launch_arguments(arguments: &LaunchArguments) -> single_instan
 }
 
 fn prefill_subscription(ui: &AppWindow, subscription_url: String) {
-    ui.set_local_page("settings".into());
-    ui.set_settings_section("subscriptions".into());
+    ui.set_local_page("subscriptions".into());
     ui.set_subscription_draft(subscription_url.into());
     ui.set_replace_editor_open(true);
 }
@@ -1756,9 +1756,7 @@ fn wire_profile_switcher(
     let retry_preferences = profile_preferences.clone();
     ui.on_retry_profile_menu(move || {
         if weak.upgrade().is_some_and(|ui| {
-            ui.get_active_panel() == "subscription"
-                || (ui.get_local_page() == "settings"
-                    && ui.get_settings_section() == "subscriptions")
+            ui.get_active_panel() == "subscription" || ui.get_local_page() == "subscriptions"
         }) {
             load_profile_list(
                 weak.clone(),
@@ -1792,8 +1790,7 @@ fn wire_profile_switcher(
         };
         if let Some(ui) = weak.upgrade() {
             apply_snapshot(&ui, &current);
-            ui.set_local_page("settings".into());
-            ui.set_settings_section("subscriptions".into());
+            ui.set_local_page("subscriptions".into());
             ui.set_subscription_draft("".into());
             ui.set_replace_editor_open(true);
         }
@@ -3300,7 +3297,7 @@ mod window_tests {
             "profile-scroll := ScrollView",
             "Подписок пока нет",
             "Удалить подписку?",
-            "Управление подписками",
+            "До 16 подписок · активна только одна",
             "Источник сохранён локально",
             "root.settings-section == \"updates\"",
             "profile-menu-keyboard-open",
@@ -3435,11 +3432,34 @@ mod window_tests {
         for page in [
             VisiblePage::Home,
             VisiblePage::Status,
+            VisiblePage::Subscriptions,
             VisiblePage::Settings,
         ] {
             assert_eq!(visible_page_from_name(visible_page_name(&page)), Some(page));
         }
         assert_eq!(visible_page_from_name("routes"), None);
+    }
+
+    #[test]
+    fn subscriptions_are_a_persisted_top_level_page() {
+        let ui = include_str!("../ui/app.slint");
+        let rust = include_str!("main.rs");
+        let preferences = include_str!("preferences.rs");
+
+        for required in [
+            "label: \"Подписки\"; active: root.visible-page == \"subscriptions\"",
+            "if root.visible-page == \"subscriptions\"",
+            "VisiblePage::Subscriptions => \"subscriptions\"",
+            "\"subscriptions\" => Some(VisiblePage::Subscriptions)",
+            "Subscriptions,",
+        ] {
+            assert!(
+                ui.contains(required) || rust.contains(required) || preferences.contains(required),
+                "missing top-level subscriptions contract: {required}"
+            );
+        }
+        assert!(!ui.contains("SettingsNavItem { width: parent.width; label: \"Подписки\""));
+        assert!(!rust.contains("set_settings_section(\"subscriptions\""));
     }
 
     #[test]
@@ -3920,7 +3940,7 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("apply_update_state(").next())
             .expect("installer launch UI setup");
-        assert!(setup.contains("ui.set_local_page(\"settings\".into())"));
+        assert!(setup.contains("ui.set_local_page(\"subscriptions\".into())"));
         assert!(setup.contains("ui.set_subscription_draft(subscription_url.into())"));
         assert!(setup.contains("ui.set_replace_editor_open(true)"));
         assert!(!setup.contains("invoke_import_url"));

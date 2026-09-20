@@ -608,6 +608,7 @@ export component AppWindow inherits Window {
 
                 NavItem { icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
                 NavItem { icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
+                NavItem { icon-source: @image-url("../assets/link.svg"); label: "Подписки"; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
                 NavItem { icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
@@ -888,8 +889,7 @@ export component AppWindow inherits Window {
                             accessible-action-default => {
                                 if (root.profile-menu-open) { root.close-profile-menu(); }
                                 else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
-                                    root.settings-section = "subscriptions";
-                                    root.local-page = "settings";
+                                    root.local-page = "subscriptions";
                                     root.close-panel();
                                 } else { root.profile-menu-keyboard-open = true; root.open-profile-menu(); }
                             }
@@ -898,8 +898,7 @@ export component AppWindow inherits Window {
                                 if (event.text == " " || event.text == "\n") {
                                     if (root.profile-menu-open) { root.close-profile-menu(); }
                                     else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
-                                        root.settings-section = "subscriptions";
-                                        root.local-page = "settings";
+                                        root.local-page = "subscriptions";
                                         root.close-panel();
                                     }
                                     else { root.profile-menu-keyboard-open = true; root.open-profile-menu(); }
@@ -911,8 +910,7 @@ export component AppWindow inherits Window {
                                 clicked => {
                                     if (root.profile-menu-open) { root.close-profile-menu(); }
                                     else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
-                                        root.settings-section = "subscriptions";
-                                        root.local-page = "settings";
+                                        root.local-page = "subscriptions";
                                         root.close-panel();
                                     }
                                     else { root.profile-menu-keyboard-open = false; root.open-profile-menu(); }
@@ -1106,7 +1104,7 @@ export component AppWindow inherits Window {
                 }
             }
 
-            if root.visible-page == "settings": Rectangle {
+            if root.visible-page == "settings" || root.visible-page == "subscriptions": Rectangle {
                 background: transparent;
                 settings-scroll := ScrollView {
                     vertical-stretch: 1;
@@ -1116,20 +1114,20 @@ export component AppWindow inherits Window {
                         min-height: settings-scroll.visible-height;
                         padding: 28px;
                         spacing: 16px;
-                        Text { height: 30px; text: "Настройки"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; }
+                        Text { height: 30px; text: root.visible-page == "subscriptions" ? "Подписки" : "Настройки"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; }
                         HorizontalLayout {
-                            spacing: root.width >= 800px ? 16px : 12px;
+                            spacing: root.visible-page == "settings" ? (root.width >= 800px ? 16px : 12px) : 0px;
                             VerticalLayout {
-                                width: root.width >= 800px ? 132px : 112px;
+                                visible: root.visible-page == "settings";
+                                width: root.visible-page == "settings" ? (root.width >= 800px ? 132px : 112px) : 0px;
                                 horizontal-stretch: 0;
                                 spacing: 4px;
                                 SettingsNavItem { width: parent.width; label: "Общие"; selected: root.settings-section == "general"; activated => { root.settings-section = "general"; root.profile-delete-confirm-id = ""; root.expanded-profile-id = ""; } }
-                                SettingsNavItem { width: parent.width; label: "Подписки"; selected: root.settings-section == "subscriptions"; activated => { root.settings-section = "subscriptions"; } }
                                 SettingsNavItem { width: parent.width; label: "Обновления"; selected: root.settings-section == "updates"; activated => { root.settings-section = "updates"; root.profile-delete-confirm-id = ""; root.expanded-profile-id = ""; } }
                                 Rectangle { vertical-stretch: 1; background: transparent; }
                             }
                             settings-section-body := VerticalLayout {
-                                width: root.width >= 800px ? root.width - 380px : root.width - 356px;
+                                width: root.visible-page == "subscriptions" ? root.width - 232px : root.width >= 800px ? root.width - 380px : root.width - 356px;
                                 horizontal-stretch: 1;
                                 spacing: 16px;
 
@@ -1175,18 +1173,17 @@ export component AppWindow inherits Window {
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
-                        if root.settings-section == "subscriptions": VerticalLayout {
+                        if root.visible-page == "subscriptions": VerticalLayout {
                             spacing: 12px;
-                            VerticalLayout {
-                                height: 100px;
-                                spacing: 8px;
+                            HorizontalLayout {
+                                height: 52px;
+                                spacing: 16px;
                                 VerticalLayout {
-                                    height: 44px;
                                     spacing: 2px;
-                                    Text { text: "Управление подписками"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
-                                    Text { text: "URL хранится только в локальном сервисе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                                    Text { text: "До 16 подписок · активна только одна"; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                                    Text { text: "Ссылки хранятся локально и не показываются в интерфейсе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
                                 }
-                                SmallAction { width: root.width >= 800px ? 132px : 104px; label: root.width >= 800px ? "Добавить URL" : "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
+                                SmallAction { width: 112px; label: "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
                             }
                             if root.replace-editor-open: Rectangle {
                                 height: 116px;
