@@ -143,13 +143,13 @@ jobs:
 
           - `MultiCore-Setup-x64.exe` — per-user installer.
           - `multicore-windows-x64.zip` — verified portable bundle and updater asset.
-          - Normal launch triggers the standard Windows UAC prompt required by Mihomo TUN; manual "Run as administrator" is not needed.
+          - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
           - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
 
-          The binaries are not Authenticode-signed yet, so Windows SmartScreen may show a warning.
+          UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn. Keep this release as a draft until a signed-production review explicitly approves publication.
           "@ | Set-Content -LiteralPath dist/release/RELEASE_NOTES.md -Encoding utf8
 
-      - name: Publish draft release atomically
+      - name: Create unsigned preview as draft
         shell: pwsh
         run: |
           $assets = @(
@@ -164,4 +164,3 @@ jobs:
             --draft `
             --title "MultiCore $env:APP_VERSION" `
             --notes-file dist/release/RELEASE_NOTES.md
-          gh release edit $env:GITHUB_REF_NAME --draft=false

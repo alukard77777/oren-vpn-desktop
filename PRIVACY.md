@@ -1,71 +1,66 @@
 # Privacy
 
-MultiCore is a native Windows client. It does not operate a MultiCore account,
-analytics service, telemetry endpoint, or hosted subscription service. The
-application does not intentionally send usage analytics or crash reports to
-the project.
+MultiCore is a native Windows client. The project does not operate a MultiCore
+account, analytics, telemetry, crash-reporting, or hosted subscription service.
 
-## Data stored on this Windows device
+## Data on this device
 
-Runtime state is stored under `%LOCALAPPDATA%\\MultiCore`. Depending on the
-features used, this can include:
+Application data is stored under `%LOCALAPPDATA%\MultiCore`. It can contain
+subscription URLs, downloaded Mihomo/Xray snapshots, the stable local device
+identifier, profile metadata, per-profile selector choices, generated runtime
+configuration, UI preferences, and updater downloads/results. The per-user
+installer places program files under `%LOCALAPPDATA%\Programs\MultiCore\current`.
 
-- subscription URLs and the downloaded subscription snapshot/configuration;
-- selected profiles, route selections, window placement, and other
-  preferences;
-- local device identity and runtime state needed by the client; and
-- diagnostic output from the bundled cores.
+Core stdout/stderr is bounded and redacted before it is returned by the
+authenticated diagnostics endpoint or shown in the UI. In the current elevated
+core-host architecture, that feed is kept in memory; MultiCore does not promise
+a persistent `logs\latest-core.log`. Redaction is defense in depth, so review any
+diagnostic text before sharing it.
 
-The latest persistent core log is kept at
-`%LOCALAPPDATA%\\MultiCore\\logs\\latest-core.log` and is capped at 1 MiB.
-Diagnostic output is redacted by the application before it is retained or
-shown, but users should still review and redact logs before sharing them.
-The application does not claim to encrypt these files. File access is subject
-to the Windows account and filesystem permissions.
-
-The installer removes the installed program and its installation-specific
-state, but it does not promise to remove `%LOCALAPPDATA%\\MultiCore` data.
-Delete that directory separately after exiting MultiCore if you want to remove
-local profiles, subscription data, preferences, and logs. The updater may
-retain temporary rollback/staging directories under the installation directory
-until its cleanup completes.
+These files are not claimed to be encrypted. Access is controlled by the current
+Windows account and filesystem permissions. Uninstalling the program does not
+promise to remove `%LOCALAPPDATA%\MultiCore`; delete that directory after exiting
+MultiCore if you also want to remove profiles and local state. The updater uses
+`%LOCALAPPDATA%\MultiCore\updates` and temporary sibling staging/rollback
+directories beside the installed or portable package while applying an update.
 
 ## Network requests
 
-When a user imports or refreshes a subscription, MultiCore sends requests to
-the provider URL selected by that user. The subscription fetcher uses these
-documented User-Agent values for the corresponding requests:
+Importing or refreshing a profile sends requests to the URL supplied by the
+user. Configuration requests use `multicore-json-massive`, `multicore-mihomo`,
+or `multicore-xray` and include these identity headers:
 
-- `multicore-json-massive` for the combined Mihomo/Xray response;
-- `multicore-mihomo` for the Mihomo YAML response;
-- `multicore-xray` for the Xray JSON response; and
-- `multicore-service-logo` when fetching a provider-supplied service logo.
+- `x-hwid`: stable installation identifier;
+- `x-device-os`: `windows`;
+- `x-ver-os`: bounded Windows version;
+- `x-device-model`: bounded device model.
 
-The provider can therefore receive the network information normally visible to
-an HTTP service, such as the request IP, timing, and requested URL. Provider
-privacy practices are outside MultiCore's control. Subscription contents and
-provider metadata are processed locally for the client UI and runtime.
+An optional provider logo request uses `multicore-service-logo` and deliberately
+omits all four identity headers. The provider can still observe normal HTTP
+information such as the source IP, timing, requested URL, and User-Agent.
+Provider privacy practices are outside MultiCore's control.
 
-The desktop and daemon communicate through authenticated local loopback
-interfaces. This local traffic is part of the application and is not a
-MultiCore-operated remote service.
+The desktop and daemon communicate only through authenticated loopback HTTP. A
+separate authenticated, local-only named pipe connects the daemon to the elevated
+core host after the user chooses Connect. These are local application channels,
+not project-operated network services.
 
-The updater checks GitHub Releases only when a release repository has been
-configured into the build. It requests the configured repository's latest
-stable release metadata and, when an update is selected, its release asset.
-Without that configuration, no GitHub update channel is enabled. GitHub's own
-privacy practices apply to those requests.
+If an update repository is compiled into the client, update checks request the
+latest stable release metadata and selected asset from GitHub. Official updater
+builds use the public `fatyzzz/multicore` repository and require anonymous access;
+no GitHub access token is embedded in the client. GitHub's privacy terms apply.
 
-## Elevated Windows components
+## Elevation and preview security
 
-To provide the Mihomo TUN functionality, the packaged runtime can launch the
-bundled cores through `multicore-core-host` with the Windows elevation required
-by the release. The elevated host runs locally, communicates with the desktop
-and daemon through the authenticated local broker, and does not create a
-MultiCore network service. Windows security and account policies still apply.
+Normal desktop and daemon processes run as the current user. Connect can invoke
+Windows UAC for `multicore-core-host.exe`, which owns Xray and Mihomo and their
+cleanup. The host does not expose a remote MultiCore service.
 
-## Changes
+Current preview binaries are unsigned, so SmartScreen may warn. The elevated host
+and core executables are also stored in a user-writable portable/per-user
+installation. Treat this as preview-grade rather than a hardened privilege
+boundary; production distribution requires signed binaries and a hardened
+installation/update policy.
 
-This notice describes the current client behavior and may change with future
-releases. Check the release source and packaging documentation for the version
-you install.
+This notice describes the current feature branch. Recheck the notice and release
+documentation for the exact version you install.

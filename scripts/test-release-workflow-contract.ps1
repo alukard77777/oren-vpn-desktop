@@ -38,13 +38,15 @@ foreach ($token in @(
     'mihomo-source.zip',
     'gh release create',
     '--draft',
-    'gh release edit',
-    '--draft=false'
+    'Create unsigned preview as draft',
+    'Keep this release as a draft'
 )) {
     Assert-True ($workflow.Contains($token)) "release workflow is missing: $token"
 }
 
 Assert-True (-not $workflow.Contains('pull_request_target')) 'release workflow must not run in pull_request_target'
 Assert-True (-not $workflow.Contains('MULTICORE_DAEMON_TOKEN')) 'release workflow must not embed runtime secrets'
+Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must not publish the draft release'
+Assert-True (-not $workflow.Contains('--draft=false')) 'unsigned workflow must not clear draft state'
 
 Write-Output 'PASS: GitHub release workflow contract'
