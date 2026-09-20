@@ -2,7 +2,7 @@ param(
     [string]$OutputDirectory = "artifacts/screenshots",
     [int]$Port = 18787,
     [string]$DesktopExecutablePath,
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large")]
     [string[]]$OnlyScenario
 )
 
@@ -74,7 +74,11 @@ $scenarios = @(
     @{ Name = "profiles-one-large"; State = "ready"; ProfileState = "one"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
     @{ Name = "profiles-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
     @{ Name = "profiles-loading-large"; State = "ready"; ProfileState = "loading"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
-    @{ Name = "profiles-error-large"; State = "ready"; ProfileState = "error"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true }
+    @{ Name = "profiles-error-large"; State = "ready"; ProfileState = "error"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
+    @{ Name = "profiles-delete-small"; State = "ready"; ProfileState = "one"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true; ConfirmProfileDelete = $true },
+    @{ Name = "profiles-pending-small"; State = "ready"; ProfileState = "one"; ProfileDelay = 5000; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true; RefreshProfile = $true },
+    @{ Name = "profiles-settings-many-small"; State = "ready"; ProfileState = "many"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true },
+    @{ Name = "profiles-settings-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true }
 )
 if ($OnlyScenario.Count -gt 0) {
     $scenarios = @($scenarios | Where-Object { $_.Name -in $OnlyScenario })
@@ -97,7 +101,8 @@ foreach ($scenario in $scenarios) {
         $fixtureInfo.FileName = "powershell.exe"
         $announcementArgument = if ($scenario.ContainsKey("Announcement") -and $scenario.Announcement) { " -Announcement" } else { "" }
         $profileStateArgument = if ($scenario.ContainsKey("ProfileState")) { " -ProfileState $($scenario.ProfileState)" } else { "" }
-        $fixtureInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$fixturePath`" -Port $Port -InitialState $($scenario.State) -SelectionDelayMilliseconds $($scenario.SelectionDelay) -AuthorizationValue $authorizationValue$announcementArgument$profileStateArgument"
+        $profileDelayArgument = if ($scenario.ContainsKey("ProfileDelay")) { " -ProfileDelayMilliseconds $($scenario.ProfileDelay)" } else { "" }
+        $fixtureInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$fixturePath`" -Port $Port -InitialState $($scenario.State) -SelectionDelayMilliseconds $($scenario.SelectionDelay) -AuthorizationValue $authorizationValue$announcementArgument$profileStateArgument$profileDelayArgument"
         $fixtureInfo.UseShellExecute = $false
         $fixtureInfo.CreateNoWindow = $true
         $fixtureInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
@@ -130,6 +135,10 @@ foreach ($scenario in $scenarios) {
         if ($scenario.OpenDiagnostics) { $captureArgs += "-OpenDiagnostics" }
         if ($scenario.OpenSettings) { $captureArgs += "-OpenSettings" }
         if ($scenario.ContainsKey("OpenProfiles") -and $scenario.OpenProfiles) { $captureArgs += "-OpenProfiles" }
+        if ($scenario.ContainsKey("OpenSubscriptionSettings") -and $scenario.OpenSubscriptionSettings) { $captureArgs += "-OpenSubscriptionSettings" }
+        if ($scenario.ContainsKey("ExpandProfile") -and $scenario.ExpandProfile) { $captureArgs += "-ExpandProfile" }
+        if ($scenario.ContainsKey("ConfirmProfileDelete") -and $scenario.ConfirmProfileDelete) { $captureArgs += "-ConfirmProfileDelete" }
+        if ($scenario.ContainsKey("RefreshProfile") -and $scenario.RefreshProfile) { $captureArgs += "-RefreshProfile" }
         & powershell.exe @captureArgs
         if ($LASTEXITCODE -ne 0) {
             throw "Capture helper failed for $($scenario.Name)."

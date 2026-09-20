@@ -135,6 +135,7 @@ export component QuietChip inherits Rectangle {
     in property <string> state-label:
         root.label + (root.selected ? ", " + root.selected-state-label : "");
     in property <bool> enabled: true;
+    in property <bool> modal-enabled: true;
     in property <bool> selected: false;
     in property <bool> focus-on-init: false;
     in property <int> focus-epoch: 0;
@@ -162,12 +163,12 @@ export component QuietChip inherits Rectangle {
     border-width: chip-focus.has-focus ? Theme.focus-width : 1px;
     border-radius: 14px;
     clip: true;
-    opacity: root.enabled ? 1 : 0.5;
+    opacity: root.enabled && root.modal-enabled ? 1 : 0.5;
     accessible-role: button;
     accessible-label: root.state-label;
-    accessible-enabled: root.enabled;
+    accessible-enabled: root.enabled && root.modal-enabled;
     accessible-action-default => {
-        if (root.enabled) {
+        if (root.enabled && root.modal-enabled) {
             root.activated();
         }
     }
@@ -214,7 +215,7 @@ export component QuietChip inherits Rectangle {
     }
 
     chip-focus := FocusScope {
-        enabled: root.enabled;
+        enabled: root.enabled && root.modal-enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
         key-pressed(event) => {
@@ -226,7 +227,7 @@ export component QuietChip inherits Rectangle {
         }
 
         chip-touch := TouchArea {
-            enabled: root.enabled;
+            enabled: root.enabled && root.modal-enabled;
             clicked => { root.activated(); }
         }
     }

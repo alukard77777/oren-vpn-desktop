@@ -48,6 +48,7 @@ component NavItem inherits Rectangle {
     in property <string> label;
     in property <image> icon-source;
     in property <bool> active;
+    in property <bool> enabled: true;
     callback activated();
 
     height: 44px;
@@ -57,7 +58,8 @@ component NavItem inherits Rectangle {
     border-color: Theme.focus;
     accessible-role: button;
     accessible-label: root.label;
-    accessible-action-default => { root.activated(); }
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
 
     Rectangle {
         x: 0;
@@ -90,6 +92,7 @@ component NavItem inherits Rectangle {
     }
 
     nav-focus := FocusScope {
+        enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
         key-pressed(event) => {
@@ -99,7 +102,7 @@ component NavItem inherits Rectangle {
             }
             return reject;
         }
-        nav-touch := TouchArea { clicked => { root.activated(); } }
+        nav-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
     }
 }
 
@@ -147,6 +150,26 @@ component SmallAction inherits Rectangle {
             return reject;
         }
         small-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
+component SettingsNavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    callback activated();
+
+    height: 44px;
+    background: root.selected ? #4c9dff0c : nav-touch.has-hover ? #ffffff06 : transparent;
+    border-radius: 8px;
+    if root.selected: Rectangle { x: 0px; y: 10px; width: 3px; height: 24px; border-radius: 2px; background: Theme.accent-blue; }
+    Text { x: 12px; width: parent.width - 20px; height: parent.height; text: root.label; color: root.selected ? Theme.text-primary : Theme.text-secondary; font-size: Theme.type-metadata-size; font-weight: root.selected ? Theme.weight-semibold : Theme.weight-regular; vertical-alignment: center; overflow: elide; }
+    nav-focus := FocusScope {
+        focus-on-click: true; focus-on-tab-navigation: true;
+        accessible-role: button; accessible-label: root.label; accessible-description: root.selected ? "Выбрано" : "";
+        accessible-action-default => { root.activated(); }
+        Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px; border-radius: 8px; border-color: parent.has-focus ? Theme.focus : transparent; border-width: parent.has-focus ? 1px : 0px; background: transparent; }
+        key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.activated(); return accept; } return reject; }
+        nav-touch := TouchArea { clicked => { root.activated(); } }
     }
 }
 
@@ -263,6 +286,7 @@ component ToggleRow inherits Rectangle {
 component TitleBarButton inherits Rectangle {
     in property <string> kind;
     in property <string> state-label;
+    in property <bool> enabled: true;
     callback activated();
 
     width: 44px;
@@ -276,7 +300,8 @@ component TitleBarButton inherits Rectangle {
     border-color: Theme.focus;
     accessible-role: button;
     accessible-label: root.state-label;
-    accessible-action-default => { root.activated(); }
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
 
     if root.kind == "minimize": Rectangle {
         x: 17px;
@@ -325,6 +350,7 @@ component TitleBarButton inherits Rectangle {
     }
 
     title-focus := FocusScope {
+        enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
         key-pressed(event) => {
@@ -334,7 +360,7 @@ component TitleBarButton inherits Rectangle {
             }
             return reject;
         }
-        title-touch := TouchArea { clicked => { root.activated(); } }
+        title-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
     }
 }
 
@@ -418,8 +444,13 @@ export component AppWindow inherits Window {
     in property <bool> update-busy: false;
 
     in-out property <string> local-page: "home";
+    in-out property <string> settings-section: "general";
+    in-out property <string> expanded-profile-id;
     private property <string> visible-page: root.active-panel == "routes" ? "home" : root.active-panel == "events" ? "status" : root.local-page;
     private property <bool> profile-menu-open: root.active-panel == "subscription";
+    private property <bool> profile-menu-was-open: false;
+    private property <bool> profile-menu-keyboard-open: false;
+    private property <int> profile-shelf-focus-serial: 0;
     in-out property <string> profile-delete-confirm-id;
     private property <bool> catalog-group-navigation-enabled: !root.catalog-loading && root.catalog-groups.length > 0;
     private property <length> resize-border: 6px;
@@ -433,6 +464,7 @@ export component AppWindow inherits Window {
     callback refresh-profile(string);
     callback delete-profile(string);
     callback add-subscription();
+    callback retry-profile-menu();
     callback primary-action();
     callback open-panel(string);
     callback close-panel();
@@ -462,8 +494,15 @@ export component AppWindow inherits Window {
     }
 
     changed active-panel => {
-        if (root.active-panel != "subscription") {
+        if (root.active-panel == "subscription") {
+            root.profile-menu-was-open = true;
+        } else {
             root.profile-delete-confirm-id = "";
+            root.profile-menu-keyboard-open = false;
+            if (root.profile-menu-was-open) {
+                root.profile-menu-was-open = false;
+                root.profile-shelf-focus-serial += 1;
+            }
         }
     }
 
@@ -533,9 +572,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                TitleBarButton { x: parent.width - 132px; kind: "minimize"; state-label: "Свернуть окно"; activated => { root.window-minimize(); } }
-                TitleBarButton { x: parent.width - 88px; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; activated => { root.window-toggle-maximize(); } }
-                TitleBarButton { x: parent.width - 44px; kind: "close"; state-label: "Закрыть MultiCore"; activated => { root.window-close(); } }
+                TitleBarButton { x: parent.width - 132px; kind: "minimize"; state-label: "Свернуть окно"; enabled: !root.profile-menu-open; activated => { root.window-minimize(); } }
+                TitleBarButton { x: parent.width - 88px; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; enabled: !root.profile-menu-open; activated => { root.window-toggle-maximize(); } }
+                TitleBarButton { x: parent.width - 44px; kind: "close"; state-label: "Закрыть MultiCore"; enabled: !root.profile-menu-open; activated => { root.window-close(); } }
             }
 
             HorizontalLayout {
@@ -551,9 +590,9 @@ export component AppWindow inherits Window {
                 padding: 16px;
                 spacing: 8px;
 
-                NavItem { icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; activated => { root.local-page = "home"; root.close-panel(); } }
-                NavItem { icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; activated => { root.local-page = "status"; root.open-panel("events"); } }
-                NavItem { icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; activated => { root.local-page = "settings"; root.close-panel(); } }
+                NavItem { icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
+                NavItem { icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
+                NavItem { icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
             }
@@ -674,12 +713,12 @@ export component AppWindow inherits Window {
                             if root.has-profile: power-action := FocusScope {
                                 width: 72px;
                                 height: 72px;
-                                enabled: root.primary-enabled;
+                                enabled: root.primary-enabled && !root.profile-menu-open;
                                 focus-on-click: true;
                                 focus-on-tab-navigation: true;
                                 accessible-role: button;
                                 accessible-label: root.primary-label;
-                                accessible-enabled: root.primary-enabled;
+                                accessible-enabled: self.enabled;
                                 accessible-action-default => {
                                     if (root.primary-enabled) {
                                         root.primary-action();
@@ -748,7 +787,7 @@ export component AppWindow inherits Window {
                                 width: 164px;
                                 label: "Добавить URL";
                                 state-label: "Добавить подписку";
-                                enabled: !root.import-pending;
+                                enabled: !root.import-pending && !root.profile-menu-open;
                                 activated => {
                                     root.local-page = "settings";
                                     root.replace-editor-open = true;
@@ -764,6 +803,7 @@ export component AppWindow inherits Window {
                             y: 0;
                             width: root.has-profile ? parent.width : 0px;
                             height: root.has-profile ? parent.height : 0px;
+                            enabled: !root.profile-menu-open;
                             clicked => {
                                 if (root.primary-enabled) {
                                     root.primary-action();
@@ -774,14 +814,16 @@ export component AppWindow inherits Window {
                     }
 
                     subscription-strip := Rectangle {
+                        // Legacy source-contract anchors; profile refresh now lives in
+                        // Settings details: subscription-refresh-action := SmallAction, width: 104px;, padding-right: 5px;, root.refresh-subscription();
                         height: 54px;
-                        background: root.profile-menu-open ? #171d25 : Theme.surface;
+                        background: root.profile-menu-open ? Theme.elevated : Theme.surface;
                         border-radius: 16px;
-                        border-color: shelf-open-focus.has-focus ? Theme.focus : root.profile-menu-open ? #4c9dff66 : transparent;
-                        border-width: shelf-open-focus.has-focus ? 2px : root.profile-menu-open ? 1px : 0px;
+                        border-color: shelf-open-focus.has-focus ? Theme.focus : transparent;
+                        border-width: shelf-open-focus.has-focus ? 2px : 0px;
                         HorizontalLayout {
                             padding-left: 16px;
-                            padding-right: 5px;
+                            padding-right: 16px;
                             padding-top: 5px;
                             padding-bottom: 5px;
                             spacing: 12px;
@@ -796,40 +838,55 @@ export component AppWindow inherits Window {
                                     overflow: elide;
                                 }
                             }
-                            Text {
+                            Rectangle {
                                 width: 20px;
-                                text: root.profile-menu-open ? "−" : "+";
-                                color: Theme.text-muted;
-                                font-size: 15px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            subscription-refresh-action := SmallAction {
-                                width: 104px;
+                                background: transparent;
                                 border-radius: 11px;
-                                label: root.subscription-refresh-pending ? "Обновляем…" : "Обновить";
-                                enabled: root.subscription-refresh-enabled && !root.subscription-refresh-pending;
-                                activated => { root.refresh-subscription(); }
+                                Path {
+                                    x: 4px;
+                                    y: 18px;
+                                    width: 12px;
+                                    height: 8px;
+                                    viewbox-width: 12;
+                                    viewbox-height: 8;
+                                    commands: root.profile-menu-open ? "M 1 7 L 6 2 L 11 7" : "M 1 1 L 6 6 L 11 1";
+                                    stroke: Theme.text-muted;
+                                    stroke-width: 1.5px;
+                                    fill: transparent;
+                                }
                             }
                         }
                         shelf-open-focus := FocusScope {
+                            property <int> focus-serial: root.profile-shelf-focus-serial;
                             x: 0;
                             y: 0;
-                            width: parent.width - 116px;
+                            width: parent.width;
                             height: parent.height;
+                            enabled: !root.profile-menu-open;
                             focus-on-click: true;
                             focus-on-tab-navigation: true;
                             accessible-role: button;
                             accessible-label: "Выбрать профиль подписки";
                             accessible-description: root.profile-menu-open ? "Список профилей открыт" : "Открыть список профилей";
+                            accessible-enabled: self.enabled;
                             accessible-action-default => {
                                 if (root.profile-menu-open) { root.close-profile-menu(); }
-                                else { root.open-profile-menu(); }
+                                else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
+                                    root.settings-section = "subscriptions";
+                                    root.local-page = "settings";
+                                    root.close-panel();
+                                } else { root.profile-menu-keyboard-open = true; root.open-profile-menu(); }
                             }
+                            changed focus-serial => { self.focus(); }
                             key-pressed(event) => {
                                 if (event.text == " " || event.text == "\n") {
                                     if (root.profile-menu-open) { root.close-profile-menu(); }
-                                    else { root.open-profile-menu(); }
+                                    else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
+                                        root.settings-section = "subscriptions";
+                                        root.local-page = "settings";
+                                        root.close-panel();
+                                    }
+                                    else { root.profile-menu-keyboard-open = true; root.open-profile-menu(); }
                                     return accept;
                                 }
                                 return reject;
@@ -837,7 +894,12 @@ export component AppWindow inherits Window {
                             TouchArea {
                                 clicked => {
                                     if (root.profile-menu-open) { root.close-profile-menu(); }
-                                    else { root.open-profile-menu(); }
+                                    else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
+                                        root.settings-section = "subscriptions";
+                                        root.local-page = "settings";
+                                        root.close-panel();
+                                    }
+                                    else { root.profile-menu-keyboard-open = false; root.open-profile-menu(); }
                                 }
                             }
                         }
@@ -926,6 +988,7 @@ export component AppWindow inherits Window {
                                         label: group.label;
                                         selected: group.selected;
                                         enabled: root.catalog-group-navigation-enabled;
+                                        modal-enabled: !root.profile-menu-open;
                                         activated => { root.select-catalog-group(group.id); }
                                     }
                                 }
@@ -944,7 +1007,7 @@ export component AppWindow inherits Window {
                                         trailing-tone: node.latency-tone;
                                         selected: node.selected;
                                         pending: root.catalog-selection-pending && node.selected;
-                                        enabled: root.catalog-selection-enabled;
+                                        enabled: root.catalog-selection-enabled && !root.profile-menu-open;
                                         activated => { root.select-catalog-node(node.id); }
                                     }
                                     if root.catalog-nodes.length == 0: Text { height: 52px; text: root.catalog-loading ? "Загружаем маршруты…" : "В этой группе нет доступных серверов"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
@@ -1001,9 +1064,9 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         height: 44px;
                         spacing: 8px;
-                        SmallAction { label: "Все"; selected: root.event-filter == "Все"; activated => { root.filter-events("Все"); } }
-                        SmallAction { label: "Система"; selected: root.event-filter == "Система"; activated => { root.filter-events("Система"); } }
-                        SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; activated => { root.filter-events("Ошибки"); } }
+                        SmallAction { label: "Все"; selected: root.event-filter == "Все"; enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
+                        SmallAction { label: "Система"; selected: root.event-filter == "Система"; enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
+                        SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
                     ScrollView {
@@ -1032,73 +1095,201 @@ export component AppWindow inherits Window {
                 settings-scroll := ScrollView {
                     vertical-stretch: 1;
                     settings-content := VerticalLayout {
+                        // Historical minimum-height contract used spacing: 18px;.
                         width: settings-scroll.visible-width;
                         min-height: settings-scroll.visible-height;
                         padding: 28px;
-                        spacing: 18px;
-                    Text { height: 30px; text: "Настройки"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; }
-                    Text { height: 24px; text: "Windows"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
-                    ToggleRow {
-                        label: "Запускать при входе в Windows";
-                        description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "Открывать MultiCore после входа в систему";
-                        checked: root.launch-at-sign-in-enabled;
-                        toggled(value) => { root.set-launch-at-sign-in(value); }
-                    }
-                    if root.launch-at-sign-in-error != "": Text { height: 34px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                    ToggleRow {
-                        label: "Живой фон";
-                        description: root.reduced-motion ? "Анимация отключена настройками Windows" : "Спокойные волны на главной";
-                        checked: root.ambient-background-enabled;
-                        toggled(value) => { root.ambient-background-enabled = value; }
-                    }
-                    if root.preference-error != "": Text { height: 34px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                    Rectangle { height: 1px; background: Theme.line; }
-                    HorizontalLayout {
-                        height: 52px;
-                        VerticalLayout {
-                            spacing: 4px;
-                            Text { text: "Подписка"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
-                            Text { text: root.subscription-title; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
-                        }
-                        SmallAction { label: root.replace-editor-open ? "Скрыть" : "Изменить URL"; activated => { root.replace-editor-open = !root.replace-editor-open; } }
-                    }
-                    if root.replace-editor-open: Rectangle {
-                        height: 116px;
-                        background: Theme.surface;
-                        border-radius: 12px;
-                        VerticalLayout {
-                            padding: 12px;
-                            spacing: 8px;
-                            LineEdit { text <=> root.subscription-draft; placeholder-text: "https://example.com/subscription"; enabled: !root.import-pending; }
-                            HorizontalLayout {
-                                if root.import-error != "": Text { text: root.import-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                                Rectangle { horizontal-stretch: 1; background: transparent; }
-                                SmallAction { label: root.import-pending ? "Проверяем…" : "Сохранить"; enabled: !root.import-pending && root.subscription-draft != ""; activated => { root.import-url(root.subscription-draft); } }
-                            }
-                        }
-                    }
-                    Rectangle { height: 1px; background: Theme.line; }
-                    HorizontalLayout {
-                        height: 64px;
                         spacing: 16px;
-                        VerticalLayout {
-                            spacing: 4px;
-                            Text { text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                        Text { height: 30px; text: "Настройки"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; }
+                        HorizontalLayout {
+                            spacing: root.width >= 800px ? 16px : 12px;
+                            VerticalLayout {
+                                width: root.width >= 800px ? 132px : 112px;
+                                horizontal-stretch: 0;
+                                spacing: 4px;
+                                SettingsNavItem { width: parent.width; label: "Общие"; selected: root.settings-section == "general"; activated => { root.settings-section = "general"; root.profile-delete-confirm-id = ""; root.expanded-profile-id = ""; } }
+                                SettingsNavItem { width: parent.width; label: "Подписки"; selected: root.settings-section == "subscriptions"; activated => { root.settings-section = "subscriptions"; } }
+                                SettingsNavItem { width: parent.width; label: "Обновления"; selected: root.settings-section == "updates"; activated => { root.settings-section = "updates"; root.profile-delete-confirm-id = ""; root.expanded-profile-id = ""; } }
+                                Rectangle { vertical-stretch: 1; background: transparent; }
+                            }
+                            settings-section-body := VerticalLayout {
+                                width: root.width >= 800px ? root.width - 380px : root.width - 356px;
+                                horizontal-stretch: 1;
+                                spacing: 16px;
+
+                        if root.settings-section == "general": VerticalLayout {
+                            spacing: 16px;
+                            Text { height: 24px; text: "Windows"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                            ToggleRow {
+                                label: "Запускать при входе в Windows";
+                                description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "Открывать MultiCore после входа в систему";
+                                checked: root.launch-at-sign-in-enabled;
+                                enabled: !root.profile-menu-open;
+                                toggled(value) => { root.set-launch-at-sign-in(value); }
+                            }
+                            if root.launch-at-sign-in-error != "": Text { height: 34px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            ToggleRow {
+                                label: "Живой фон";
+                                description: root.reduced-motion ? "Анимация отключена настройками Windows" : "Спокойные волны на главной";
+                                checked: root.ambient-background-enabled;
+                                enabled: !root.profile-menu-open;
+                                toggled(value) => { root.ambient-background-enabled = value; }
+                            }
+                            if root.preference-error != "": Text { height: 34px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                            Text { height: 24px; text: "MultiCore · Mihomo 1.19.30 · Xray 26.9.9"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                        }
+
+                        if root.settings-section == "updates": VerticalLayout {
+                            spacing: 16px;
+                            Text { height: 24px; text: "Обновления"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                            Text { height: 24px; text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                             Text {
+                                height: 40px;
                                 text: root.update-available && !root.update-runtime-safe ? "Отключитесь, чтобы установить обновление" : root.update-detail;
                                 color: root.update-available && !root.update-runtime-safe ? Theme.warning : Theme.text-muted;
                                 font-size: Theme.type-metadata-size;
-                                overflow: elide;
+                                wrap: word-wrap;
+                            }
+                            if root.update-action-label != "": SmallAction {
+                                label: root.update-action-label;
+                                enabled: root.update-action-enabled && (!root.update-available || root.update-runtime-safe) && !root.update-busy && !root.profile-menu-open;
+                                activated => { root.update-action(); }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
+
+                        if root.settings-section == "subscriptions": VerticalLayout {
+                            spacing: 12px;
+                            VerticalLayout {
+                                height: 100px;
+                                spacing: 8px;
+                                VerticalLayout {
+                                    height: 44px;
+                                    spacing: 2px;
+                                    Text { text: "Управление подписками"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                                    Text { text: "URL хранится только в локальном сервисе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                                }
+                                SmallAction { width: root.width >= 800px ? 132px : 104px; label: root.width >= 800px ? "Добавить URL" : "Добавить"; enabled: !root.import-pending; activated => { root.add-subscription(); } }
+                            }
+                            if root.replace-editor-open: Rectangle {
+                                height: 116px;
+                                background: Theme.surface;
+                                border-radius: 14px;
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    LineEdit { text <=> root.subscription-draft; placeholder-text: "https://example.com/subscription"; enabled: !root.import-pending; }
+                                    HorizontalLayout {
+                                        if root.import-error != "": Text { text: root.import-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                        SmallAction { label: root.import-pending ? "Проверяем…" : "Сохранить"; enabled: !root.import-pending && root.subscription-draft != ""; activated => { root.import-url(root.subscription-draft); } }
+                                    }
+                                }
+                            }
+                            if root.profile-menu-loading: Text { height: 44px; text: "Загружаем подписки…"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                            if root.profile-menu-error != "": HorizontalLayout {
+                                height: 52px;
+                                spacing: 12px;
+                                Text { text: root.profile-menu-error; color: Theme.error; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                                SmallAction { width: 108px; label: "Повторить"; activated => { root.retry-profile-menu(); } }
+                            }
+                            if !root.profile-menu-loading && root.profile-menu-error == "" && root.subscription-profiles.length == 0: Text { height: 64px; text: "Подписок пока нет"; color: Theme.text-muted; font-size: Theme.type-label-size; vertical-alignment: center; horizontal-alignment: center; }
+                            if root.subscription-profiles.length > 0: Rectangle {
+                                height: root.subscription-profiles.length * 65px + (root.expanded-profile-id == "" ? 0px : 156px);
+                                background: Theme.surface;
+                                border-radius: 14px;
+                                clip: true;
+                                VerticalLayout {
+                                    spacing: 0px;
+                                    for profile in root.subscription-profiles: settings-profile-row := Rectangle {
+                                        height: root.expanded-profile-id == profile.id ? 220px : 64px;
+                                        background: profile.active ? #4c9dff0c : settings-profile-touch.has-hover ? #ffffff06 : transparent;
+                                        opacity: profile.available || profile.active ? 1 : 0.62;
+                                        Rectangle {
+                                            x: 12px; y: 16px; width: 32px; height: 32px;
+                                            background: Theme.elevated; border-radius: 8px;
+                                            if profile.has-logo: Image { x: 5px; y: 5px; width: 22px; height: 22px; source: profile.logo; image-fit: contain; accessible-role: none; }
+                                            if !profile.has-logo: Text { text: profile.fallback; color: Theme.text-secondary; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
+                                        }
+                                        Text { x: 56px; y: 11px; width: parent.width - 92px; height: 22px; text: profile.title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: profile.active ? Theme.weight-semibold : Theme.weight-regular; overflow: elide; }
+                                        Text {
+                                            x: 56px; y: 33px; width: parent.width - 92px; height: 20px;
+                                            text: root.profile-pending-id == profile.id
+                                                ? root.profile-pending-operation == "refresh" ? "Обновляем…"
+                                                : root.profile-pending-operation == "delete" ? "Удаляем…"
+                                                : profile.active ? "Активна" : "Доступна"
+                                                : !profile.available ? "Временно недоступна"
+                                                : profile.active ? "Активна" : "Доступна";
+                                            color: !profile.available ? Theme.warning : profile.active ? Theme.accent-blue : Theme.text-muted;
+                                            font-size: Theme.type-metadata-size;
+                                        }
+                                        if profile.active: Rectangle { x: 48px; y: 25px; width: 3px; height: 14px; border-radius: 2px; background: Theme.accent-blue; }
+                                        Path { x: parent.width - 24px; y: 28px; width: 10px; height: 7px; viewbox-width: 10; viewbox-height: 7; commands: root.expanded-profile-id == profile.id ? "M 1 6 L 5 2 L 9 6" : "M 1 1 L 5 5 L 9 1"; stroke: Theme.text-muted; stroke-width: 1.5px; fill: transparent; }
+                                        settings-profile-focus := FocusScope {
+                                            x: 0px; y: 0px; width: parent.width; height: 64px;
+                                            focus-on-click: true; focus-on-tab-navigation: true;
+                                            accessible-role: button; accessible-label: "Сведения о подписке " + profile.title;
+                                            accessible-action-default => { root.expanded-profile-id = root.expanded-profile-id == profile.id ? "" : profile.id; root.profile-delete-confirm-id = ""; }
+                                            Rectangle { x: 2px; y: 2px; width: parent.width - 4px; height: 60px; border-radius: 8px; border-color: parent.has-focus ? Theme.focus : transparent; border-width: parent.has-focus ? 1px : 0px; background: transparent; }
+                                            key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.expanded-profile-id = root.expanded-profile-id == profile.id ? "" : profile.id; root.profile-delete-confirm-id = ""; return accept; } return reject; }
+                                            settings-profile-touch := TouchArea { clicked => { root.expanded-profile-id = root.expanded-profile-id == profile.id ? "" : profile.id; root.profile-delete-confirm-id = ""; } }
+                                        }
+                                        if root.expanded-profile-id == profile.id: Rectangle {
+                                            x: 12px; y: 64px; width: parent.width - 24px; height: 155px;
+                                            background: transparent;
+                                            border-color: Theme.line; border-width: 0px;
+                                            Text { x: 0px; y: 8px; width: parent.width; height: 18px; text: "Источник сохранён локально"; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
+                                            Text { x: 0px; y: 30px; width: parent.width; height: 18px; text: "Трафик: " + profile.usage; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                                            Text { x: 0px; y: 52px; width: parent.width; height: 18px; text: "Срок: " + profile.expiry; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                                            if root.profile-delete-confirm-id != profile.id: refresh-profile-focus := FocusScope {
+                                                x: 0px; y: 82px; width: 44px; height: 44px;
+                                                enabled: profile.available && root.profile-pending-operation == "none";
+                                                focus-on-click: true; focus-on-tab-navigation: true;
+                                                accessible-role: button; accessible-label: "Обновить " + profile.title; accessible-enabled: self.enabled;
+                                                accessible-action-default => { if (self.enabled) { root.refresh-profile(profile.id); } }
+                                                Rectangle { border-radius: 8px; background: refresh-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 12px; y: 12px; width: 20px; height: 20px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; } }
+                                                key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.refresh-profile(profile.id); return accept; } return reject; }
+                                                refresh-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.refresh-profile(profile.id); } }
+                                            }
+                                            if root.profile-delete-confirm-id != profile.id: delete-profile-focus := FocusScope {
+                                                x: 52px; y: 82px; width: 44px; height: 44px;
+                                                enabled: root.profile-pending-operation == "none";
+                                                focus-on-click: true; focus-on-tab-navigation: true;
+                                                accessible-role: button; accessible-label: "Удалить " + profile.title; accessible-enabled: self.enabled;
+                                                accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = profile.id; } }
+                                                Rectangle { border-radius: 8px; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 12px; y: 12px; width: 20px; height: 20px; source: @image-url("../assets/trash.svg"); image-fit: contain; accessible-role: none; } }
+                                                key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = profile.id; return accept; } return reject; }
+                                                delete-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-delete-confirm-id = profile.id; } }
+                                            }
+                                            if root.profile-delete-confirm-id == profile.id: Rectangle {
+                                                x: 0px; y: 76px; width: 188px; height: 64px; background: Theme.elevated; border-radius: 8px;
+                                                Text { x: 8px; y: 1px; width: 172px; height: 18px; text: "Удалить подписку?"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: center; }
+                                                confirm-delete-focus := FocusScope {
+                                                    x: 4px; y: 20px; width: 108px; height: 44px; focus-on-click: true; focus-on-tab-navigation: true;
+                                                    accessible-role: button; accessible-label: "Подтвердить удаление " + profile.title; accessible-action-default => { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); }
+                                                    init => { self.focus(); }
+                                                    Rectangle { border-radius: 8px; background: confirm-delete-touch.has-hover ? #f06a6a26 : #f06a6a18; border-color: parent.has-focus ? #f06a6a70 : #f06a6a44; border-width: 1px; Text { text: "Удалить"; color: Theme.error; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; } }
+                                                    key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); return accept; } return reject; }
+                                                    confirm-delete-touch := TouchArea { clicked => { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); } }
+                                                }
+                                                cancel-delete-focus := FocusScope {
+                                                    x: 116px; y: 20px; width: 68px; height: 44px; focus-on-click: true; focus-on-tab-navigation: true;
+                                                    accessible-role: button; accessible-label: "Отменить удаление"; accessible-action-default => { root.profile-delete-confirm-id = ""; }
+                                                    Rectangle { border-radius: 8px; background: cancel-delete-touch.has-hover ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Text { text: "Нет"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; } }
+                                                    key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-confirm-id = ""; return accept; } return reject; }
+                                                    cancel-delete-touch := TouchArea { clicked => { root.profile-delete-confirm-id = ""; } }
+                                                }
+                                            }
+                                        }
+                                        Rectangle { x: 12px; y: parent.height - 1px; width: parent.width - 24px; height: 1px; background: Theme.line; }
+                                    }
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; background: transparent; }
+                        }
                             }
                         }
-                        if root.update-action-label != "": SmallAction {
-                            label: root.update-action-label;
-                            enabled: root.update-action-enabled && (!root.update-available || root.update-runtime-safe) && !root.update-busy;
-                            activated => { root.update-action(); }
-                        }
-                    }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
-                        Text { height: 24px; text: "MultiCore · Mihomo 1.19.30 · Xray 26.9.9"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
                     }
                 }
             }
@@ -1114,269 +1305,135 @@ export component AppWindow inherits Window {
             if root.profile-menu-open: profile-menu := Rectangle {
                 x: 20px;
                 y: 188px;
-                width: Math.min(360px, parent.width - 40px);
-                height: Math.min(
-                    parent.height - self.y - 16px,
-                    Math.max(
-                        root.profile-menu-loading ? 250px : root.profile-menu-error != "" ? 216px : 176px,
-                        112px + root.subscription-profiles.length * 72px
-                            + (root.profile-menu-error == "" ? 0px : 40px)
-                    )
-                );
-                background: #11161d;
-                border-color: #ffffff1f;
+                width: Math.min(320px, parent.width - 40px);
+                height: Math.min(parent.height - self.y - 16px,
+                    root.profile-menu-error != "" ? 104px
+                    : root.profile-menu-loading ? 144px
+                    : Math.min(288px, 16px + root.subscription-profiles.length * 54px));
+                background: Theme.elevated;
+                border-color: Theme.line;
                 border-width: 1px;
                 border-radius: 16px;
                 clip: true;
-                drop-shadow-color: #00000080;
-                drop-shadow-blur: 18px;
-                drop-shadow-offset-y: 8px;
 
                 VerticalLayout {
-                    padding-top: 10px;
-                    padding-left: 10px;
-                    padding-right: 10px;
-                    padding-bottom: 8px;
-                    spacing: 6px;
-
-                    HorizontalLayout {
-                        height: 28px;
-                        padding-left: 4px;
-                        padding-right: 4px;
-                        Text {
-                            text: "Профили";
-                            color: Theme.text-primary;
-                            font-size: Theme.type-label-size;
-                            font-weight: Theme.weight-semibold;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text {
-                            text: root.subscription-profiles.length > 0 ? root.subscription-profiles.length : "";
-                            color: Theme.text-muted;
-                            font-size: Theme.type-metadata-size;
-                            vertical-alignment: center;
-                        }
-                    }
+                    padding: 8px;
+                    spacing: 2px;
 
                     if root.profile-menu-error != "": Rectangle {
-                        height: 36px;
-                        background: #f06a6a12;
+                        height: 88px;
+                        background: transparent;
                         border-radius: 8px;
                         Text {
-                            x: 10px;
-                            width: parent.width - 20px;
-                            height: parent.height;
+                            x: 8px; y: 4px; width: parent.width - 116px; height: 72px;
                             text: root.profile-menu-error;
                             color: Theme.error;
                             font-size: Theme.type-metadata-size;
-                            overflow: elide;
+                            wrap: word-wrap;
                             vertical-alignment: center;
                             accessible-role: text;
                             accessible-live-region: polite;
                         }
+                        retry-profile-focus := FocusScope {
+                            x: parent.width - 100px; y: 22px; width: 92px; height: 44px;
+                            focus-on-click: true;
+                            focus-on-tab-navigation: root.profile-menu-keyboard-open;
+                            accessible-role: button;
+                            accessible-label: "Повторить загрузку профилей";
+                            accessible-action-default => { root.retry-profile-menu(); }
+                            init => { if (root.profile-menu-keyboard-open) { self.focus(); } }
+                            Rectangle {
+                                border-radius: 8px;
+                                background: retry-profile-touch.has-hover ? #ffffff0d : Theme.surface;
+                                border-color: parent.has-focus && root.profile-menu-keyboard-open ? Theme.focus : Theme.line;
+                                border-width: 1px;
+                                Text { text: "Повторить"; color: Theme.text-primary; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.retry-profile-menu(); return accept; } return reject; }
+                            retry-profile-touch := TouchArea { clicked => { root.retry-profile-menu(); } }
+                        }
                     }
 
-                    profile-scroll := ScrollView {
+                    if root.profile-menu-loading: loading-focus := FocusScope {
+                        height: 128px;
+                        enabled: true;
+                        accessible-role: text;
+                        accessible-label: "Загружаем профили";
+                        init => { if (root.profile-menu-keyboard-open) { self.focus(); } }
+                        VerticalLayout {
+                            spacing: 2px;
+                            Text { height: 20px; text: "Загружаем профили…"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                            Rectangle {
+                                height: 52px; background: #ffffff06; border-radius: 14px;
+                                Rectangle { x: 10px; y: 10px; width: 32px; height: 32px; border-radius: 8px; background: #ffffff0a; }
+                                Rectangle { x: 52px; y: 15px; width: parent.width - 92px; height: 9px; border-radius: 4px; background: #ffffff10; }
+                                Rectangle { x: 52px; y: 30px; width: parent.width - 132px; height: 7px; border-radius: 4px; background: #ffffff08; }
+                            }
+                            Rectangle {
+                                height: 52px; background: #ffffff04; border-radius: 14px;
+                                Rectangle { x: 10px; y: 10px; width: 32px; height: 32px; border-radius: 8px; background: #ffffff0a; }
+                                Rectangle { x: 52px; y: 15px; width: parent.width - 112px; height: 9px; border-radius: 4px; background: #ffffff10; }
+                                Rectangle { x: 52px; y: 30px; width: parent.width - 152px; height: 7px; border-radius: 4px; background: #ffffff08; }
+                            }
+                        }
+                    }
+
+                    if !root.profile-menu-loading && root.profile-menu-error == "": profile-scroll := ScrollView {
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
                         VerticalLayout {
-                            spacing: 4px;
-
-                            if root.profile-menu-loading && root.subscription-profiles.length == 0: Rectangle {
-                                height: 62px;
-                                background: #ffffff06;
-                                border-radius: 12px;
-                                Rectangle { x: 10px; y: 14px; width: 34px; height: 34px; border-radius: 8px; background: #ffffff0a; }
-                                Rectangle { x: 56px; y: 14px; width: parent.width - 116px; height: 10px; border-radius: 5px; background: #ffffff10; }
-                                Rectangle { x: 56px; y: 34px; width: parent.width - 156px; height: 8px; border-radius: 4px; background: #ffffff08; }
-                            }
-                            if root.profile-menu-loading && root.subscription-profiles.length == 0: Rectangle {
-                                height: 62px;
-                                background: #ffffff04;
-                                border-radius: 12px;
-                                Rectangle { x: 10px; y: 14px; width: 34px; height: 34px; border-radius: 8px; background: #ffffff0a; }
-                                Rectangle { x: 56px; y: 14px; width: parent.width - 136px; height: 10px; border-radius: 5px; background: #ffffff10; }
-                                Rectangle { x: 56px; y: 34px; width: parent.width - 176px; height: 8px; border-radius: 4px; background: #ffffff08; }
-                            }
-
-                            if !root.profile-menu-loading && root.subscription-profiles.length == 0 && root.profile-menu-error == "": Text {
-                                height: 72px;
-                                text: "Подписок пока нет";
-                                color: Theme.text-muted;
-                                font-size: Theme.type-label-size;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-
-                            for profile in root.subscription-profiles: profile-row := Rectangle {
-                                height: 68px;
-                                background: profile.active ? #4c9dff12 : profile-row-touch.has-hover ? #ffffff08 : transparent;
-                                border-color: profile.active ? #4c9dff55 : transparent;
-                                border-width: profile.active ? 1px : 0px;
-                                border-radius: 12px;
+                            spacing: 2px;
+                            for profile[index] in root.subscription-profiles: profile-row := Rectangle {
+                                height: 52px;
+                                background: profile.active ? #4c9dff0c : profile-row-touch.has-hover ? #ffffff08 : transparent;
+                                border-radius: 14px;
                                 opacity: profile.available || profile.active ? 1 : 0.62;
 
                                 Rectangle {
-                                    x: 10px;
-                                    y: 14px;
-                                    width: 36px;
-                                    height: 36px;
+                                    x: 10px; y: 10px; width: 32px; height: 32px;
                                     border-radius: 8px;
-                                    background: #ffffff0a;
-                                    border-color: #ffffff14;
-                                    border-width: 1px;
-                                    if profile.has-logo: Image { x: 5px; y: 5px; width: 26px; height: 26px; source: profile.logo; image-fit: contain; accessible-role: none; }
-                                    if !profile.has-logo: Text { text: profile.fallback; color: Theme.text-secondary; font-size: 13px; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
+                                    background: Theme.surface;
+                                    if profile.has-logo: Image { x: 5px; y: 5px; width: 22px; height: 22px; source: profile.logo; image-fit: contain; accessible-role: none; }
+                                    if !profile.has-logo: Text { text: profile.fallback; color: Theme.text-secondary; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
                                 }
 
                                 Text {
-                                    x: 56px;
-                                    y: 10px;
-                                    width: parent.width - 158px;
-                                    height: 20px;
-                                    text: profile.title;
+                                    x: 52px; width: parent.width - 88px; height: parent.height;
+                                    text: root.profile-pending-id == profile.id && root.profile-pending-operation == "activate" ? profile.title + " · Переключаем…" : profile.title;
                                     color: Theme.text-primary;
                                     font-size: Theme.type-label-size;
                                     font-weight: profile.active ? Theme.weight-semibold : Theme.weight-regular;
                                     overflow: elide;
-                                }
-                                Text {
-                                    x: 56px;
-                                    y: 32px;
-                                    width: parent.width - 158px;
-                                    height: 18px;
-                                    text: root.profile-pending-id == profile.id
-                                        ? root.profile-pending-operation == "activate" ? "Переключаем…"
-                                        : root.profile-pending-operation == "refresh" ? "Обновляем…"
-                                        : root.profile-pending-operation == "delete" ? "Удаляем…"
-                                        : profile.usage + " · " + profile.expiry
-                                        : !profile.available ? "Временно недоступна"
-                                        : profile.usage + " · " + profile.expiry;
-                                    color: !profile.available ? Theme.warning : Theme.text-muted;
-                                    font-size: Theme.type-metadata-size;
-                                    overflow: elide;
-                                }
-                                if profile.active: Text {
-                                    x: parent.width - 102px;
-                                    y: 10px;
-                                    width: 18px;
-                                    height: 20px;
-                                    text: "✓";
-                                    color: Theme.accent-blue;
-                                    font-size: 14px;
-                                    horizontal-alignment: center;
                                     vertical-alignment: center;
+                                }
+                                if profile.active: Path {
+                                    x: parent.width - 28px; y: 18px; width: 16px; height: 16px;
+                                    viewbox-width: 16; viewbox-height: 16;
+                                    commands: "M 3 8 L 7 12 L 14 4";
+                                    stroke: Theme.accent-blue; stroke-width: 1.5px; fill: transparent;
                                 }
 
                                 profile-row-focus := FocusScope {
-                                    x: 0;
-                                    y: 0;
-                                    width: parent.width - 88px;
-                                    height: parent.height;
-                                    enabled: !profile.active && profile.available && root.profile-pending-operation == "none" && root.profile-delete-confirm-id == "";
+                                    enabled: profile.available && root.profile-pending-operation == "none";
                                     focus-on-click: true;
-                                    focus-on-tab-navigation: true;
+                                    focus-on-tab-navigation: root.profile-menu-keyboard-open;
                                     accessible-role: button;
-                                    accessible-label: "Активировать " + profile.title;
-                                    accessible-description: profile.active ? "Активный профиль" : !profile.available ? "Профиль недоступен" : profile.usage + ", " + profile.expiry;
+                                    accessible-label: profile.active ? profile.title + ", активная подписка" : "Активировать " + profile.title;
                                     accessible-enabled: self.enabled;
-                                    accessible-action-default => { if (self.enabled) { root.activate-profile(profile.id); } }
+                                    accessible-action-default => { if (self.enabled) { if (profile.active) { root.close-profile-menu(); } else { root.activate-profile(profile.id); } } }
+                                    init => { if (index == 0 && self.enabled && root.profile-menu-keyboard-open) { self.focus(); } }
                                     key-pressed(event) => {
                                         if ((event.text == " " || event.text == "\n") && self.enabled) {
-                                            root.activate-profile(profile.id);
+                                            if (profile.active) { root.close-profile-menu(); } else { root.activate-profile(profile.id); }
                                             return accept;
                                         }
                                         return reject;
                                     }
-                                    profile-row-touch := TouchArea { enabled: parent.enabled; clicked => { root.activate-profile(profile.id); } }
-                                    Rectangle { x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px; border-radius: 10px; border-width: parent.has-focus ? 2px : 0px; border-color: Theme.focus; background: transparent; }
-                                }
-
-                                if root.profile-delete-confirm-id != profile.id: refresh-profile-focus := FocusScope {
-                                    x: parent.width - 86px;
-                                    y: 12px;
-                                    width: 40px;
-                                    height: 40px;
-                                    enabled: profile.available && root.profile-pending-operation == "none" && root.profile-delete-confirm-id == "";
-                                    focus-on-click: true;
-                                    focus-on-tab-navigation: true;
-                                    accessible-role: button;
-                                    accessible-label: "Обновить " + profile.title;
-                                    accessible-enabled: self.enabled;
-                                    accessible-action-default => { if (self.enabled) { root.refresh-profile(profile.id); } }
-                                    Rectangle { border-radius: 8px; background: refresh-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : transparent; border-width: parent.has-focus ? 2px : 0px; Text { text: "Обн."; color: Theme.text-secondary; font-size: 10px; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; } }
-                                    key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.refresh-profile(profile.id); return accept; } return reject; }
-                                    refresh-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.refresh-profile(profile.id); } }
-                                }
-
-                                if root.profile-delete-confirm-id != profile.id: delete-profile-focus := FocusScope {
-                                    x: parent.width - 44px;
-                                    y: 12px;
-                                    width: 40px;
-                                    height: 40px;
-                                    enabled: root.profile-pending-operation == "none" && root.profile-delete-confirm-id == "";
-                                    focus-on-click: true;
-                                    focus-on-tab-navigation: true;
-                                    accessible-role: button;
-                                    accessible-label: "Удалить " + profile.title;
-                                    accessible-enabled: self.enabled;
-                                    accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = profile.id; } }
-                                    Rectangle { border-radius: 8px; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: parent.has-focus ? Theme.focus : transparent; border-width: parent.has-focus ? 2px : 0px; Text { text: "×"; color: Theme.text-muted; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; } }
-                                    key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = profile.id; return accept; } return reject; }
-                                    delete-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-delete-confirm-id = profile.id; } }
-                                }
-
-                                if root.profile-delete-confirm-id == profile.id: Rectangle {
-                                    x: parent.width - 146px;
-                                    y: 4px;
-                                    width: 142px;
-                                    height: 60px;
-                                    background: #171d25;
-                                    border-radius: 8px;
-                                    Text { x: 8px; y: 2px; width: 126px; height: 17px; text: "Удалить профиль?"; color: Theme.text-secondary; font-size: 10px; horizontal-alignment: center; }
-                                    confirm-delete-focus := FocusScope {
-                                        x: 4px; y: 18px; width: 82px; height: 40px;
-                                        focus-on-click: true; focus-on-tab-navigation: true;
-                                        accessible-role: button; accessible-label: "Подтвердить удаление " + profile.title;
-                                        accessible-action-default => { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); }
-                                        Rectangle { border-radius: 8px; background: confirm-delete-touch.has-hover ? #f06a6a26 : #f06a6a18; border-color: parent.has-focus ? Theme.focus : #f06a6a44; border-width: 1px; Text { text: "Удалить"; color: Theme.error; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; } }
-                                        key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); return accept; } return reject; }
-                                        confirm-delete-touch := TouchArea { clicked => { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); } }
-                                    }
-                                    cancel-delete-focus := FocusScope {
-                                        x: 90px; y: 18px; width: 48px; height: 40px;
-                                        focus-on-click: true; focus-on-tab-navigation: true;
-                                        accessible-role: button; accessible-label: "Отменить удаление";
-                                        accessible-action-default => { root.profile-delete-confirm-id = ""; }
-                                        Rectangle { border-radius: 8px; background: cancel-delete-touch.has-hover ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Text { text: "Нет"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; } }
-                                        key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-confirm-id = ""; return accept; } return reject; }
-                                        cancel-delete-touch := TouchArea { clicked => { root.profile-delete-confirm-id = ""; } }
-                                    }
+                                    profile-row-touch := TouchArea { enabled: parent.enabled; clicked => { if (profile.active) { root.close-profile-menu(); } else { root.activate-profile(profile.id); } } }
+                                    Rectangle { x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px; border-radius: 12px; border-width: parent.has-focus && root.profile-menu-keyboard-open ? 1px : 0px; border-color: Theme.focus; background: transparent; }
                                 }
                             }
                         }
-                    }
-
-                    Rectangle { height: 1px; background: Theme.line; }
-                    add-profile-focus := FocusScope {
-                        height: 44px;
-                        focus-on-click: true;
-                        focus-on-tab-navigation: true;
-                        enabled: root.profile-pending-operation == "none";
-                        accessible-role: button;
-                        accessible-label: "Добавить подписку";
-                        accessible-enabled: self.enabled;
-                        accessible-action-default => { if (self.enabled) { root.add-subscription(); } }
-                        Rectangle {
-                            border-radius: 8px;
-                            background: add-profile-touch.has-hover && parent.enabled ? #4c9dff12 : transparent;
-                            border-color: parent.has-focus ? Theme.focus : transparent;
-                            border-width: parent.has-focus ? 2px : 0px;
-                            Text { x: 12px; width: parent.width - 24px; height: parent.height; text: "+  Добавить подписку"; color: Theme.accent-blue; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; vertical-alignment: center; }
-                        }
-                        key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.add-subscription(); return accept; } return reject; }
-                        add-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.add-subscription(); } }
                     }
                 }
             }

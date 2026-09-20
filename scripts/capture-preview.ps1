@@ -8,13 +8,17 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Height,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large")]
     [string]$ExpectedState,
     [switch]$HoverConnection,
     [switch]$SelectSecondRoute,
     [switch]$OpenDiagnostics,
     [switch]$OpenSettings,
-    [switch]$OpenProfiles
+    [switch]$OpenProfiles,
+    [switch]$OpenSubscriptionSettings,
+    [switch]$ExpandProfile,
+    [switch]$ConfirmProfileDelete,
+    [switch]$RefreshProfile
 )
 
 $ErrorActionPreference = "Stop"
@@ -216,18 +220,48 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
     }
     if ($ExpectedState.StartsWith("profiles-")) {
         if (-not (Test-ColorNear $Bitmap.GetPixel(10, 40) 10 12 15 8)) {
-            $Failure.Value = "profile menu replaced the navigation rail"
+            $Failure.Value = "profile flow replaced the navigation rail"
             return $false
         }
-        $overlayText = Get-BrightPixelCount $Bitmap 205 230 ([Math]::Min(555, $Bitmap.Width - 24)) ([Math]::Min(560, $Bitmap.Height - 24))
-        if ($overlayText -lt 30) {
-            $Failure.Value = "missing anchored profile-menu content"
-            return $false
-        }
-        $footerAccent = Get-SemanticPixelCountInRegion $Bitmap 76 157 255 205 ([Math]::Min(350, $Bitmap.Height - 90)) ([Math]::Min(555, $Bitmap.Width - 24)) ($Bitmap.Height - 20)
-        if ($footerAccent -lt 2) {
-            $Failure.Value = "missing visible add-subscription footer or capped scroll region"
-            return $false
+        $settingsProfileState = $ExpectedState -like "profiles-empty-*" -or
+            $ExpectedState -like "profiles-settings-*" -or
+            $ExpectedState -in @("profiles-delete-small", "profiles-pending-small")
+        if ($settingsProfileState) {
+            $settingsText = Get-BrightPixelCount $Bitmap 205 66 ($Bitmap.Width - 20) ($Bitmap.Height - 24)
+            if ($settingsText -lt 90) {
+                $Failure.Value = "missing Settings subscription-management content"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-settings-many-*" -and $settingsText -lt 220) {
+                $Failure.Value = "missing populated shared subscription list"
+                return $false
+            }
+            if ($ExpectedState -eq "profiles-delete-small" -and (Get-SemanticPixelCountInRegion $Bitmap 240 106 106 340 360 560 460) -lt 2) {
+                $Failure.Value = "delete confirmation controls are missing from expanded Settings details"
+                return $false
+            }
+            if ($ExpectedState -eq "profiles-pending-small" -and $settingsText -lt 140) {
+                $Failure.Value = "target refresh pending details are missing"
+                return $false
+            }
+        } else {
+            $selectorText = Get-BrightPixelCount $Bitmap 205 190 ([Math]::Min(515, $Bitmap.Width - 24)) ([Math]::Min(476, $Bitmap.Height - 24))
+            if ($selectorText -lt 20) {
+                $Failure.Value = "missing compact anchored selector content"
+                return $false
+            }
+            if (($ExpectedState -like "profiles-one-*" -or $ExpectedState -like "profiles-many-*") -and $selectorText -lt 45) {
+                $Failure.Value = "selector rows are missing from populated state"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-many-*" -and -not (Test-ColorNear $Bitmap.GetPixel(205, 470) 28 32 38 10)) {
+                $Failure.Value = "many-profile selector is not capped at its compact scroll surface"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-error-*" -and (Get-SemanticPixelCountInRegion $Bitmap 240 106 106 205 190 515 292) -lt 3) {
+                $Failure.Value = "selector error and retry state is missing"
+                return $false
+            }
         }
         return $true
     }
@@ -380,6 +414,19 @@ try {
     if ($OpenProfiles) {
         # The shelf body ends before the nested refresh target on the right.
         Click-Preview $handle 276 203
+    }
+    if ($OpenSubscriptionSettings) {
+        Click-Preview $handle 88 174
+        Click-Preview $handle 266 188
+    }
+    if ($ExpandProfile) {
+        Click-Preview $handle ([Math]::Max(430, $Width - 210)) 260
+    }
+    if ($ConfirmProfileDelete) {
+        Click-Preview $handle 426 404
+    }
+    if ($RefreshProfile) {
+        Click-Preview $handle 374 404
     }
     Save-Preview $handle
 } finally {

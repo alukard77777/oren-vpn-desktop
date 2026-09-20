@@ -5,6 +5,7 @@ param(
     [string]$InitialState = "ready",
     [ValidateSet("empty", "one", "many", "loading", "error")]
     [string]$ProfileState = "many",
+    [int]$ProfileDelayMilliseconds = 0,
     [int]$SelectionDelayMilliseconds = 0,
     [switch]$Announcement,
     [string]$AuthorizationValue = "preview-local-only"
@@ -60,6 +61,9 @@ if ($ProfileState -ne "empty") {
         expires_at_unix = 1792851157
         service_logo_path = $serviceLogoPath
     }
+}
+if ($ProfileDelayMilliseconds -lt 0 -or $ProfileDelayMilliseconds -gt 15000) {
+    throw "ProfileDelayMilliseconds must be between 0 and 15000."
 }
 if ($ProfileState -in @("many", "loading", "error")) {
     $profileRows += @{
@@ -227,6 +231,7 @@ try {
                     Send-JsonResponse $stream 200 (Get-Subscriptions)
                 }
             } elseif ($method -eq "PUT" -and $path -match '^/v1/subscriptions/([^/]+)/activate$') {
+                if ($ProfileDelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $ProfileDelayMilliseconds }
                 $targetId = [System.Uri]::UnescapeDataString($Matches[1])
                 $target = @($profileRows | Where-Object { $_.id -eq $targetId })
                 if ($target.Count -eq 0) {
@@ -237,6 +242,7 @@ try {
                     Send-JsonResponse $stream 200 (Get-Status)
                 }
             } elseif ($method -eq "POST" -and $path -match '^/v1/subscriptions/([^/]+)/refresh$') {
+                if ($ProfileDelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $ProfileDelayMilliseconds }
                 $targetId = [System.Uri]::UnescapeDataString($Matches[1])
                 if (@($profileRows | Where-Object { $_.id -eq $targetId }).Count -eq 0) {
                     Send-JsonResponse $stream 404 @{ code = "profile_not_found"; message = "Not found"; correlation_id = "preview" }
@@ -244,6 +250,7 @@ try {
                     Send-JsonResponse $stream 200 (Get-Subscriptions)
                 }
             } elseif ($method -eq "DELETE" -and $path -match '^/v1/subscriptions/([^/]+)$') {
+                if ($ProfileDelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $ProfileDelayMilliseconds }
                 $targetId = [System.Uri]::UnescapeDataString($Matches[1])
                 $profileRows = @($profileRows | Where-Object { $_.id -ne $targetId })
                 if ($activeProfileId -eq $targetId) {

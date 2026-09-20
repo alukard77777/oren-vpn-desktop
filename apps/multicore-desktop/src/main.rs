@@ -12,7 +12,7 @@ mod windows_settings;
 mod windows_shell;
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -58,45 +58,104 @@ struct UiSnapshot {
 }
 
 struct ProfilePreferenceReconciler {
-    loaded: AppPreferences,
-    restored_profiles: BTreeSet<String>,
+    hints: AppPreferences,
+    current_profile: Option<String>,
+    pending_ready_profile: Option<String>,
     tracker: Arc<Mutex<PersistenceTracker>>,
 }
 
 impl ProfilePreferenceReconciler {
     fn new(loaded: AppPreferences, tracker: Arc<Mutex<PersistenceTracker>>) -> Self {
         Self {
-            loaded,
-            restored_profiles: BTreeSet::new(),
+            hints: loaded,
+            current_profile: None,
+            pending_ready_profile: None,
             tracker,
         }
     }
 
-    fn reconcile(&mut self, model: &mut DesktopViewModel) {
-        let active_id = model.profile_presentation().active_id;
+    fn capture_current(&mut self, model: &DesktopViewModel) {
+        let Some((profile, selected_group, selections)) = model.route_preferences() else {
+            return;
+        };
+        self.record_hint(profile, selected_group, selections);
+    }
+
+    fn record_hint(
+        &mut self,
+        profile: String,
+        selected_group: Option<String>,
+        selections: BTreeMap<String, String>,
+    ) {
+        if let Some(group) = &selected_group {
+            self.hints
+                .last_group_by_profile
+                .insert(profile.clone(), group.clone());
+        } else {
+            self.hints.last_group_by_profile.remove(&profile);
+        }
+        self.hints
+            .selections_by_profile
+            .insert(profile.clone(), selections.clone());
+        self.tracker
+            .lock()
+            .expect("preference tracker lock")
+            .set_route_preferences(profile, selected_group, selections);
+    }
+
+    fn reconcile_profile_list(&mut self, model: &DesktopViewModel) {
+        self.set_authoritative_profile(model.profile_presentation().active_id);
+    }
+
+    fn set_authoritative_profile(&mut self, active_id: Option<String>) {
         self.tracker
             .lock()
             .expect("preference tracker lock")
             .set_active_profile_hint(active_id.clone());
-        let Some(active_id) = active_id else {
-            return;
-        };
-        if !self.restored_profiles.insert(active_id.clone()) {
+        if self.current_profile == active_id {
             return;
         }
-        let selected_group = self
-            .loaded
-            .last_group_by_profile
-            .get(&active_id)
-            .map(String::as_str);
+        self.current_profile.clone_from(&active_id);
+        self.pending_ready_profile = active_id;
+    }
+
+    fn apply_ready_hints_after_catalog(&mut self, model: &mut DesktopViewModel) {
+        let presentation = model.presentation();
+        if presentation.is_connected {
+            self.pending_ready_profile = None;
+            return;
+        }
+        if !route_hints_apply_to(&presentation) {
+            return;
+        }
+        let Some(profile) = self.pending_ready_profile.take() else {
+            return;
+        };
+        let selected_group = self.hints.last_group_by_profile.get(&profile).cloned();
         let selections = self
-            .loaded
+            .hints
             .selections_by_profile
-            .get(&active_id)
+            .get(&profile)
             .cloned()
             .unwrap_or_default();
-        model.restore_route_preferences(selected_group, &selections);
+        let catalog_group = model.catalog_presentation().selected_group_id;
+        model.restore_route_preferences(selected_group.as_deref(), &BTreeMap::new());
+        for (group_id, node_id) in &selections {
+            if model.select_catalog_group(group_id) {
+                let _ = model.begin_node_selection(node_id);
+            }
+        }
+        let restored_group = selected_group
+            .as_deref()
+            .is_some_and(|group_id| model.select_catalog_group(group_id));
+        if !restored_group && let Some(group_id) = catalog_group {
+            let _ = model.select_catalog_group(&group_id);
+        }
     }
+}
+
+fn route_hints_apply_to(presentation: &StatePresentation) -> bool {
+    presentation.primary_action == PrimaryAction::Connect && !presentation.is_connected
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,6 +499,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ));
     if let Some(subscription_url) = launch_arguments.subscription_url {
         ui.set_local_page("settings".into());
+        ui.set_settings_section("subscriptions".into());
         ui.set_subscription_draft(subscription_url.into());
         ui.set_replace_editor_open(true);
     }
@@ -460,7 +520,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_catalog_node(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     wire_windows_settings(&ui);
-    wire_external_activations(&ui, activations);
+    wire_external_activations(&ui, activations, model.clone());
     let tray_model = tray_menu_model(&model.lock().expect("view model lock"));
     let tray_model_source = model.clone();
     let tray_action_ui = ui.as_weak();
@@ -516,6 +576,7 @@ fn activation_for_launch_arguments(arguments: &LaunchArguments) -> single_instan
 
 fn prefill_subscription(ui: &AppWindow, subscription_url: String) {
     ui.set_local_page("settings".into());
+    ui.set_settings_section("subscriptions".into());
     ui.set_subscription_draft(subscription_url.into());
     ui.set_replace_editor_open(true);
 }
@@ -523,11 +584,13 @@ fn prefill_subscription(ui: &AppWindow, subscription_url: String) {
 fn wire_external_activations(
     ui: &AppWindow,
     activations: std::sync::mpsc::Receiver<single_instance::Activation>,
+    model: Arc<Mutex<DesktopViewModel>>,
 ) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         while let Ok(activation) = activations.recv() {
             let weak = weak.clone();
+            let model = model.clone();
             if slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak.upgrade() else {
                     return;
@@ -536,6 +599,12 @@ fn wire_external_activations(
                     single_instance::Activation::Background => {}
                     single_instance::Activation::Show => restore_and_focus(&ui),
                     single_instance::Activation::InstallSubscription(url) => {
+                        let current = {
+                            let mut model = model.lock().expect("view model lock");
+                            model.open_panel(Panel::None);
+                            snapshot(&model)
+                        };
+                        apply_snapshot(&ui, &current);
                         prefill_subscription(&ui, url);
                         restore_and_focus(&ui);
                     }
@@ -1276,6 +1345,10 @@ fn wire_import(
         let url = url.trim().to_owned();
         let (mutation, client, current) = {
             let mut model = model.lock().expect("view model lock");
+            profile_preferences
+                .lock()
+                .expect("profile preference reconciler lock")
+                .capture_current(&model);
             let mutation = model.begin_import(&url);
             let client = model.daemon_client();
             (mutation, client, snapshot(&model))
@@ -1351,6 +1424,24 @@ fn wire_profile_switcher(
     });
 
     let weak = ui.as_weak();
+    let retry_model = model.clone();
+    let retry_preferences = profile_preferences.clone();
+    ui.on_retry_profile_menu(move || {
+        if weak.upgrade().is_some_and(|ui| {
+            ui.get_active_panel() == "subscription"
+                || (ui.get_local_page() == "settings"
+                    && ui.get_settings_section() == "subscriptions")
+        }) {
+            load_profile_list(
+                weak.clone(),
+                retry_model.clone(),
+                retry_preferences.clone(),
+                false,
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
     let close_model = model.clone();
     ui.on_close_profile_menu(move || {
         let current = {
@@ -1374,6 +1465,7 @@ fn wire_profile_switcher(
         if let Some(ui) = weak.upgrade() {
             apply_snapshot(&ui, &current);
             ui.set_local_page("settings".into());
+            ui.set_settings_section("subscriptions".into());
             ui.set_subscription_draft("".into());
             ui.set_replace_editor_open(true);
         }
@@ -1385,6 +1477,10 @@ fn wire_profile_switcher(
     ui.on_activate_profile(move |profile_id| {
         let (token, client, current) = {
             let mut model = activate_model.lock().expect("view model lock");
+            activate_preferences
+                .lock()
+                .expect("profile preference reconciler lock")
+                .capture_current(&model);
             let token = model.begin_profile_activation(profile_id.as_str());
             (token, model.daemon_client(), snapshot(&model))
         };
@@ -1857,7 +1953,7 @@ fn load_profile_list(
                 profile_preferences
                     .lock()
                     .expect("profile preference reconciler lock")
-                    .reconcile(&mut model);
+                    .reconcile_profile_list(&model);
             }
             (accepted, snapshot(&model))
         };
@@ -1898,7 +1994,7 @@ fn advance_profile_reconciliation(
     } else if reload_list {
         load_profile_list(weak, model, profile_preferences, catalog_after);
     } else if reload_catalog || catalog_after {
-        load_catalog(weak, model);
+        load_profile_catalog(weak, model, profile_preferences);
     }
 }
 
@@ -2075,6 +2171,22 @@ fn load_diagnostics(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewMo
 }
 
 fn load_catalog(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewModel>>) {
+    load_catalog_impl(weak, model, None);
+}
+
+fn load_profile_catalog(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
+    load_catalog_impl(weak, model, Some(profile_preferences));
+}
+
+fn load_catalog_impl(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Option<Arc<Mutex<ProfilePreferenceReconciler>>>,
+) {
     let (request, current) = {
         let mut model = model.lock().expect("view model lock");
         let request = model.begin_catalog_request();
@@ -2090,9 +2202,15 @@ fn load_catalog(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewModel>
         let result = request.client.catalog();
         let current = {
             let mut model = model.lock().expect("view model lock");
-            model
-                .finish_catalog(request.token, result)
-                .map(|_| snapshot(&model))
+            model.finish_catalog(request.token, result).map(|_| {
+                if let Some(preferences) = &profile_preferences {
+                    preferences
+                        .lock()
+                        .expect("profile preference reconciler lock")
+                        .apply_ready_hints_after_catalog(&mut model);
+                }
+                snapshot(&model)
+            })
         };
         let Some(current) = current else {
             return;
@@ -2371,11 +2489,11 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS, PREFERENCE_SAVE_ERROR_RU,
-        PersistenceTracker, PreferenceWriter, WindowObservation, WriterCommand, WriterResult,
-        activation_for_launch_arguments, ambient_motion_allowed, drain_latest_write,
-        initial_window_visible, next_maximized, parse_launch_arguments,
+        PersistenceTracker, PreferenceWriter, ProfilePreferenceReconciler, WindowObservation,
+        WriterCommand, WriterResult, activation_for_launch_arguments, ambient_motion_allowed,
+        drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
         preference_error_for_result, reduced_motion_from_client_area_animation,
-        retry_delay_after_failure, runtime_allows_update, scale_factor_milli,
+        retry_delay_after_failure, route_hints_apply_to, runtime_allows_update, scale_factor_milli,
         shell_active_after_native_minimize_change, visible_page_from_name, visible_page_name,
     };
     use crate::preferences::{AppPreferences, PreferenceStore, VisiblePage, WindowBounds};
@@ -2385,6 +2503,7 @@ mod window_tests {
         CloseDisposition, MinimizeDisposition, close_disposition, minimize_disposition,
         parse_resize_edge,
     };
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn maximize_toggle_inverts_current_window_state() {
@@ -2502,6 +2621,68 @@ mod window_tests {
     }
 
     #[test]
+    fn route_hints_are_mutable_across_a_b_a_and_apply_only_while_ready() {
+        let tracker = Arc::new(Mutex::new(PersistenceTracker::new(
+            AppPreferences::default(),
+        )));
+        let mut reconciler = ProfilePreferenceReconciler::new(AppPreferences::default(), tracker);
+        reconciler.record_hint(
+            "profile-a".into(),
+            Some("group-a".into()),
+            std::collections::BTreeMap::from([("group-a".into(), "node-a".into())]),
+        );
+        reconciler.set_authoritative_profile(Some("profile-a".into()));
+        assert_eq!(
+            reconciler.pending_ready_profile.as_deref(),
+            Some("profile-a")
+        );
+        reconciler.record_hint(
+            "profile-b".into(),
+            Some("group-b".into()),
+            std::collections::BTreeMap::from([("group-b".into(), "node-b".into())]),
+        );
+        reconciler.set_authoritative_profile(Some("profile-b".into()));
+        assert_eq!(
+            reconciler.pending_ready_profile.as_deref(),
+            Some("profile-b")
+        );
+        reconciler.set_authoritative_profile(Some("profile-a".into()));
+        assert_eq!(
+            reconciler.pending_ready_profile.as_deref(),
+            Some("profile-a")
+        );
+        assert_eq!(
+            reconciler
+                .hints
+                .last_group_by_profile
+                .get("profile-a")
+                .map(String::as_str),
+            Some("group-a")
+        );
+        assert_eq!(
+            reconciler
+                .hints
+                .last_group_by_profile
+                .get("profile-b")
+                .map(String::as_str),
+            Some("group-b")
+        );
+
+        let ready = UiState::Ready {
+            profile: "A".into(),
+            node: "auto".into(),
+        }
+        .presentation();
+        let connected = UiState::Connected {
+            profile: "A".into(),
+            node: "daemon".into(),
+        }
+        .presentation();
+        assert!(route_hints_apply_to(&ready));
+        assert!(!route_hints_apply_to(&connected));
+    }
+
+    #[test]
     fn compact_profile_switcher_source_contract() {
         let ui = include_str!("../ui/app.slint");
         let main = include_str!("main.rs");
@@ -2515,12 +2696,21 @@ mod window_tests {
             "callback refresh-profile(string);",
             "callback delete-profile(string);",
             "callback add-subscription();",
+            "callback retry-profile-menu();",
             "profile-menu := Rectangle",
             "profile-scroll := ScrollView",
             "Подписок пока нет",
-            "Удалить профиль?",
-            "Добавить подписку",
+            "Удалить подписку?",
+            "Управление подписками",
+            "Источник сохранён локально",
+            "root.settings-section == \"updates\"",
+            "profile-menu-keyboard-open",
+            "parent.has-focus && root.profile-menu-keyboard-open",
             "accessible-label: \"Выбрать профиль подписки\"",
+            "Загружаем профили…",
+            "Повторить загрузку профилей",
+            "@image-url(\"../assets/refresh.svg\")",
+            "@image-url(\"../assets/trash.svg\")",
         ] {
             assert!(
                 ui.contains(required),
@@ -2528,12 +2718,20 @@ mod window_tests {
             );
         }
         assert!(!ui.contains("label: \"Профили\";"));
+        assert!(!ui.contains("drop-shadow-blur: 18px"));
+        assert!(!ui.contains("text: \"Обн.\""));
+        assert!(!ui.contains("text: \"×\""));
+        assert!(ui.contains("width: Math.min(320px, parent.width - 40px);"));
+        assert!(ui.contains("Math.min(288px, 16px + root.subscription-profiles.length * 54px)"));
+        assert!(!ui.contains("text: \"Профили\""));
         assert!(main.contains("model.finish_profile_list(token, result)"));
         assert!(main.contains("model.finish_profile_activation(token, result)"));
         assert!(main.contains("model.finish_profile_target_refresh(token, result)"));
         assert!(main.contains("model.finish_profile_delete(token, result)"));
         assert!(main.contains("slint::invoke_from_event_loop"));
         assert!(main.contains("set_active_profile_hint(active_id.clone())"));
+        assert!(main.contains("capture_current(&model)"));
+        assert!(main.contains("apply_ready_hints_after_catalog(&mut model)"));
         for route in [
             "GET\" -and $path -eq \"/v1/subscriptions",
             "PUT\" -and $path -match '^/v1/subscriptions/([^/]+)/activate$'",
@@ -2543,7 +2741,7 @@ mod window_tests {
             assert!(fixture.contains(route), "missing fixture route: {route}");
         }
         assert!(capture.contains("Click-Preview $handle 276 203"));
-        assert!(capture.contains("profile menu replaced the navigation rail"));
+        assert!(capture.contains("profile flow replaced the navigation rail"));
     }
 
     #[test]
@@ -3128,5 +3326,16 @@ mod window_tests {
         assert!(setup.contains("ui.set_replace_editor_open(true)"));
         assert!(!setup.contains("invoke_import_url"));
         assert!(!setup.contains("run_import"));
+
+        let secondary = source
+            .split("single_instance::Activation::InstallSubscription(url) => {")
+            .nth(1)
+            .and_then(|source| source.split(".is_err()").next())
+            .expect("secondary installer activation");
+        assert!(secondary.contains("model.open_panel(Panel::None)"));
+        assert!(
+            secondary.find("model.open_panel(Panel::None)").unwrap()
+                < secondary.find("prefill_subscription(&ui, url)").unwrap()
+        );
     }
 }
