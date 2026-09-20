@@ -212,7 +212,22 @@ impl ProfileStore {
         root: impl Into<PathBuf>,
         legacy_root: Option<PathBuf>,
     ) -> Result<Self, ProfileError> {
-        let root = root.into();
+        Self::open_impl(root.into(), legacy_root, false)
+    }
+
+    #[cfg(test)]
+    fn open_with_migration_snapshot_sync_fault(
+        root: impl Into<PathBuf>,
+        legacy_root: Option<PathBuf>,
+    ) -> Result<Self, ProfileError> {
+        Self::open_impl(root.into(), legacy_root, true)
+    }
+
+    fn open_impl(
+        root: PathBuf,
+        legacy_root: Option<PathBuf>,
+        migration_snapshot_sync_fault: bool,
+    ) -> Result<Self, ProfileError> {
         fs::create_dir_all(&root)?;
         let root = DirectoryCapability::open(&root).map_err(map_root_open_error)?;
         let lock = root.lock_exclusive().map_err(map_lock_error)?;
@@ -261,7 +276,7 @@ impl ProfileStore {
         if index_metadata.is_none()
             && let Some(legacy_root) = legacy_root
         {
-            store.migrate_legacy(&legacy_root)?;
+            store.migrate_legacy(&legacy_root, migration_snapshot_sync_fault)?;
         }
         let index = store.index.read().expect("profile index lock poisoned");
         cleanup_unindexed_profile_directories(&store.root, &index)?;
@@ -518,7 +533,7 @@ impl ProfileStore {
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
         let profile = self.open_profile(id)?;
-        let mut persisted = load_selections(&profile)
+        let mut persisted = load_selections(&profile)?
             .filter(|saved| {
                 saved.schema_version == SELECTIONS_SCHEMA_VERSION
                     && saved.catalog_revision == revision
@@ -567,10 +582,14 @@ impl ProfileStore {
         revision: u64,
         catalog: &[(&str, &[&str])],
     ) -> Result<BTreeMap<String, String>, ProfileError> {
+        let _guard = self
+            .selection_lock
+            .lock()
+            .expect("profile selection lock poisoned");
         let index = self.index.read().expect("profile index lock poisoned");
         self.require_entry(&index, id)?;
         let profile = self.open_profile(id)?;
-        let Some(saved) = load_selections(&profile) else {
+        let Some(saved) = load_selections(&profile)? else {
             return Ok(BTreeMap::new());
         };
         if saved.schema_version != SELECTIONS_SCHEMA_VERSION
@@ -593,19 +612,21 @@ impl ProfileStore {
             .collect())
     }
 
-    fn migrate_legacy(&self, legacy_path: &std::path::Path) -> Result<(), ProfileError> {
-        let legacy = match DirectoryCapability::open(legacy_path) {
-            Ok(legacy) => legacy,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(ProfileError::Io(error)),
+    fn migrate_legacy(
+        &self,
+        legacy_path: &std::path::Path,
+        snapshot_sync_fault: bool,
+    ) -> Result<(), ProfileError> {
+        let snapshot = match PersistentSnapshotStore::load_latest_readonly(legacy_path) {
+            Ok(snapshot) => snapshot,
+            Err(PersistenceError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(ProfileError::Snapshot(error)),
         };
-        let legacy = PersistentSnapshotStore::open_capability(legacy)?;
-        let Some(snapshot) = legacy.current() else {
+        let Some(snapshot) = snapshot else {
             return Ok(());
         };
-        if snapshot.subscription_info().is_none() || snapshot.subscription_source_url().is_none() {
-            return Ok(());
-        }
 
         let id = loop {
             let candidate = ProfileId::generate()?;
@@ -620,7 +641,16 @@ impl ProfileStore {
         let profile = self.root.create_child(OsStr::new(id.as_str()))?;
         let migration = (|| {
             let destination = PersistentSnapshotStore::open_capability(profile)?;
+            #[cfg(test)]
+            if snapshot_sync_fault {
+                destination.inject_directory_sync_failure();
+            }
+            #[cfg(not(test))]
+            let _ = snapshot_sync_fault;
             let (_, snapshot_debt) = destination.commit_status((*snapshot).clone())?.into_parts();
+            if let Some(source) = snapshot_debt {
+                return Err(ProfileError::Io(source));
+            }
             drop(destination);
             self.load_profile(&id)?;
             let proposed = ProfileIndex {
@@ -633,13 +663,11 @@ impl ProfileStore {
             };
             let index_commit = self.persist_index(&proposed)?;
             *self.index.write().expect("profile index lock poisoned") = proposed;
-            Ok::<_, ProfileError>((snapshot_debt, index_commit))
+            Ok::<_, ProfileError>(index_commit)
         })();
         match migration {
-            Ok((snapshot_debt, index_commit)) => {
-                if snapshot_debt.is_some()
-                    || matches!(index_commit, IndexCommit::MaintenanceDebt(_))
-                {
+            Ok(index_commit) => {
+                if matches!(index_commit, IndexCommit::MaintenanceDebt(_)) {
                     self.maintenance_debt.store(true, Ordering::Release);
                 }
                 Ok(())
@@ -894,18 +922,26 @@ fn selections_are_valid(selections: &BTreeMap<String, String>) -> bool {
         })
 }
 
-fn load_selections(profile: &DirectoryCapability) -> Option<PersistedSelections> {
-    let (regular, len) = profile
-        .file_metadata(OsStr::new(SELECTIONS_FILE))
-        .ok()
-        .flatten()?;
+fn load_selections(profile: &DirectoryCapability) -> io::Result<Option<PersistedSelections>> {
+    let Some((regular, len)) = profile.file_metadata(OsStr::new(SELECTIONS_FILE))? else {
+        return Ok(None);
+    };
     if !regular || len > MAX_SELECTIONS_BYTES {
-        return None;
+        return Ok(None);
     }
-    let bytes = profile
-        .read_file(OsStr::new(SELECTIONS_FILE), MAX_SELECTIONS_BYTES)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = match profile.read_file(OsStr::new(SELECTIONS_FILE), MAX_SELECTIONS_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(serde_json::from_slice(&bytes).ok())
 }
 
 fn persist_selections(
@@ -1162,6 +1198,34 @@ mod tests {
                 .unwrap()["group-post"],
             "node-post"
         );
+    }
+
+    #[test]
+    fn migration_snapshot_sync_debt_never_publishes_the_index() {
+        let root = TempDirectory::new();
+        let legacy_path = root.path().join("legacy");
+        PersistentSnapshotStore::open(&legacy_path)
+            .unwrap()
+            .commit((*snapshot("https://legacy.invalid/sub", "Legacy")).clone())
+            .unwrap();
+        let profiles = root.path().join("profiles");
+
+        let error = ProfileStore::open_with_migration_snapshot_sync_fault(
+            &profiles,
+            Some(legacy_path.clone()),
+        )
+        .unwrap_err();
+        assert!(!error.mutation_committed());
+        assert!(!profiles.join(INDEX_FILE).exists());
+        assert!(
+            profile_entry_ids(&DirectoryCapability::open(&profiles).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(legacy_path.join("snapshot-00000000000000000001").is_dir());
+
+        let retried = ProfileStore::open(&profiles, Some(legacy_path)).unwrap();
+        assert_eq!(retried.list().unwrap().len(), 1);
     }
 
     #[test]

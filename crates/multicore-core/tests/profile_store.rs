@@ -1,8 +1,8 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc, time::SystemTime};
 
 use multicore_core::{
     MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, MAX_SELECTIONS, PersistentSnapshotStore, ProfileError,
-    ProfileStore, Snapshot,
+    ProfileStore, Snapshot, normalize_service_logo,
 };
 
 #[cfg(windows)]
@@ -33,6 +33,104 @@ impl TempDirectory {
 
     fn path(&self) -> &std::path::Path {
         self.0.path()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    directory: bool,
+    bytes: Vec<u8>,
+    len: u64,
+    readonly: bool,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+fn capture_tree(root: &std::path::Path) -> BTreeMap<String, TreeEntry> {
+    fn entry_state(path: &std::path::Path, directory: bool) -> TreeEntry {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        };
+        TreeEntry {
+            directory,
+            bytes: if directory {
+                Vec::new()
+            } else {
+                fs::read(path).unwrap()
+            },
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            mode,
+        }
+    }
+
+    fn walk(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        result: &mut BTreeMap<String, TreeEntry>,
+    ) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let directory = metadata.is_dir();
+            result.insert(
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                entry_state(&path, directory),
+            );
+            if directory {
+                walk(root, &path, result);
+            }
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    result.insert(".".to_owned(), entry_state(root, true));
+    walk(root, root, &mut result);
+    result
+}
+
+#[cfg(unix)]
+fn set_legacy_modes(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+    for (index, path) in fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .enumerate()
+    {
+        let mode = if path.is_dir() {
+            0o751
+        } else {
+            0o640 + index as u32 % 8
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        if path.is_dir() {
+            for (child_index, child) in fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .enumerate()
+            {
+                fs::set_permissions(
+                    child,
+                    fs::Permissions::from_mode(0o640 + child_index as u32 % 8),
+                )
+                .unwrap();
+            }
+        }
     }
 }
 
@@ -229,6 +327,20 @@ fn legacy_generation_migrates_offline_and_remains_as_rollback_material() {
         .unwrap()
         .commit((*expected).clone())
         .unwrap();
+    let logo = normalize_service_logo(
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path fill="#123456" d="M0 0h2v2H0z"/></svg>"##,
+    )
+    .unwrap();
+    fs::write(
+        legacy
+            .join("snapshot-00000000000000000001")
+            .join("service-logo.png"),
+        &logo,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    set_legacy_modes(&legacy);
+    let legacy_before = capture_tree(&legacy);
 
     let store = ProfileStore::open(root.profiles(), Some(legacy.clone())).unwrap();
     let (_, revision, migrated) = store.active_snapshot().unwrap().unwrap();
@@ -240,7 +352,36 @@ fn legacy_generation_migrates_offline_and_remains_as_rollback_material() {
     assert_eq!(migrated.subscription_info(), expected.subscription_info());
     assert_eq!(migrated.mihomo.raw_yaml(), expected.mihomo.raw_yaml());
     assert_eq!(migrated.xray.raw_bytes(), expected.xray.raw_bytes());
+    assert_eq!(
+        fs::read(migrated.service_logo_path().unwrap()).unwrap(),
+        logo
+    );
     assert!(legacy.join("snapshot-00000000000000000001").is_dir());
+    assert_eq!(capture_tree(&legacy), legacy_before);
+}
+
+#[test]
+fn config_only_legacy_snapshot_is_migrated() {
+    let root = TempDirectory::new();
+    let legacy = root.path().join("snapshots");
+    let config_only = Snapshot::parse(
+        b"proxies: []\nproxy-groups: []\nrules: []\n",
+        br#"{"outbounds":[]}"#,
+    )
+    .unwrap();
+    PersistentSnapshotStore::open(&legacy)
+        .unwrap()
+        .commit(config_only)
+        .unwrap();
+
+    let store = ProfileStore::open(root.profiles(), Some(legacy)).unwrap();
+    let (_, _, migrated) = store.active_snapshot().unwrap().unwrap();
+    assert_eq!(migrated.subscription_source_url(), None);
+    assert_eq!(
+        migrated.mihomo.raw_yaml(),
+        "proxies: []\nproxy-groups: []\nrules: []\n"
+    );
+    assert_eq!(migrated.xray.raw_bytes(), br#"{"outbounds":[]}"#);
 }
 
 #[test]
@@ -416,12 +557,25 @@ fn selection_bounds_are_checked_before_existing_data_changes() {
 
 #[test]
 fn concurrent_selection_saves_preserve_every_group() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let root = TempDirectory::new();
     let store = Arc::new(ProfileStore::open(root.profiles(), None).unwrap());
     let id = store
         .create_profile(snapshot("https://one.invalid/sub", "One"))
         .unwrap();
     let revision = store.profile_snapshot(&id).unwrap().0;
+    let stop_reader = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let store = Arc::clone(&store);
+        let id = id.clone();
+        let stop_reader = Arc::clone(&stop_reader);
+        std::thread::spawn(move || {
+            while !stop_reader.load(Ordering::Acquire) {
+                store.valid_selections(&id, revision, &[]).unwrap();
+            }
+        })
+    };
     let mut threads = Vec::new();
     for index in 0..16 {
         let store = Arc::clone(&store);
@@ -440,6 +594,8 @@ fn concurrent_selection_saves_preserve_every_group() {
     for thread in threads {
         thread.join().unwrap();
     }
+    stop_reader.store(true, Ordering::Release);
+    reader.join().unwrap();
     let groups = (0..16)
         .map(|index| format!("group-{index:02}"))
         .collect::<Vec<_>>();
@@ -461,6 +617,78 @@ fn concurrent_selection_saves_preserve_every_group() {
             .unwrap()
             .len(),
         16
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_selection_file_is_not_treated_as_corrupt_or_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    let id = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    let revision = store.profile_snapshot(&id).unwrap().0;
+    store
+        .save_selection(&id, revision, "existing", "node-existing")
+        .unwrap();
+    let path = profiles.join(id.as_str()).join("selections.json");
+    let before = fs::read(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+
+    assert!(matches!(
+        store.save_selection(&id, revision, "new", "node-new"),
+        Err(ProfileError::Io(_))
+    ));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(
+        store
+            .valid_selections(&id, revision, &[("existing", &["node-existing"])])
+            .unwrap()["existing"],
+        "node-existing"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn sharing_blocked_selection_file_is_not_treated_as_corrupt_or_overwritten() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+
+    let root = TempDirectory::new();
+    let profiles = root.profiles();
+    let store = ProfileStore::open(&profiles, None).unwrap();
+    let id = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    let revision = store.profile_snapshot(&id).unwrap().0;
+    store
+        .save_selection(&id, revision, "existing", "node-existing")
+        .unwrap();
+    let path = profiles.join(id.as_str()).join("selections.json");
+    let before = fs::read(&path).unwrap();
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+
+    assert!(matches!(
+        store.save_selection(&id, revision, "new", "node-new"),
+        Err(ProfileError::Io(_))
+    ));
+    drop(blocker);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(
+        store
+            .valid_selections(&id, revision, &[("existing", &["node-existing"])])
+            .unwrap()["existing"],
+        "node-existing"
     );
 }
 

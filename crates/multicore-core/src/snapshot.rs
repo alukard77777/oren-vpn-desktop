@@ -835,6 +835,19 @@ impl PersistentSnapshotStore {
         })
     }
 
+    /// Loads the newest valid generation from an existing legacy root without creating,
+    /// locking, permission-repairing, or otherwise mutating that tree.
+    pub(crate) fn load_latest_readonly(
+        root: &Path,
+    ) -> Result<Option<Arc<Snapshot>>, PersistenceError> {
+        let root = DirectoryCapability::open_readonly(root)?;
+        let mut generations = generation_directories(&root)?;
+        generations.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        Ok(generations
+            .into_iter()
+            .find_map(|(_, directory)| load_generation(&directory).map(Arc::new)))
+    }
+
     pub fn current(&self) -> Option<Arc<Snapshot>> {
         self.current_with_generation().map(|(_, snapshot)| snapshot)
     }

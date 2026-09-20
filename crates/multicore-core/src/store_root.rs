@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[derive(Debug)]
 pub(crate) struct DirectoryCapability {
     display_path: PathBuf,
+    repair_permissions: bool,
     #[cfg(unix)]
     fd: rustix::fd::OwnedFd,
     #[cfg(windows)]
@@ -53,10 +54,16 @@ pub(crate) struct StoreLock {
 
 impl DirectoryCapability {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
-        open_directory(path)
+        open_directory(path, true)
+    }
+
+    /// Opens an existing directory without creating entries or repairing ACLs/modes.
+    pub(crate) fn open_readonly(path: &Path) -> io::Result<Self> {
+        open_directory(path, false)
     }
 
     pub(crate) fn lock_exclusive(&self) -> io::Result<StoreLock> {
+        self.require_mutable()?;
         #[cfg(unix)]
         {
             #[cfg(target_os = "solaris")]
@@ -87,10 +94,11 @@ impl DirectoryCapability {
 
     pub(crate) fn open_child(&self, name: &OsStr) -> io::Result<Self> {
         validate_component(name)?;
-        open_child(self, name)
+        open_child(self, name, self.repair_permissions)
     }
 
     pub(crate) fn create_child(&self, name: &OsStr) -> io::Result<Self> {
+        self.require_mutable()?;
         validate_component(name)?;
         create_child(self, name)?;
         self.open_child(name)
@@ -103,7 +111,7 @@ impl DirectoryCapability {
 
     pub(crate) fn read_file(&self, name: &OsStr, max_bytes: u64) -> io::Result<Vec<u8>> {
         validate_component(name)?;
-        let mut file = open_file_read(self, name)?;
+        let mut file = open_file_read(self, name, self.repair_permissions)?;
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(max_bytes.saturating_add(1))
@@ -123,7 +131,7 @@ impl DirectoryCapability {
         max_bytes: u64,
     ) -> io::Result<(Vec<u8>, CapabilityFile)> {
         validate_component(name)?;
-        let mut file = open_file_read(self, name)?;
+        let mut file = open_file_read(self, name, self.repair_permissions)?;
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
             .take(max_bytes.saturating_add(1))
@@ -145,6 +153,7 @@ impl DirectoryCapability {
     }
 
     pub(crate) fn write_file(&self, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(name)?;
         let mut file = open_file_create_new(self, name)?;
         file.write_all(bytes)?;
@@ -153,32 +162,38 @@ impl DirectoryCapability {
     }
 
     pub(crate) fn rename_child(&self, old: &Self, new_name: &OsStr) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(new_name)?;
         rename_child(self, old, new_name)
     }
 
     pub(crate) fn replace_file(&self, old_name: &OsStr, new_name: &OsStr) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(old_name)?;
         validate_component(new_name)?;
         replace_file(self, old_name, new_name)
     }
 
     pub(crate) fn remove_child_tree(&self, name: &OsStr) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(name)?;
         remove_child_tree(self, name)
     }
 
     pub(crate) fn remove_entry_nofollow(&self, name: &OsStr) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(name)?;
         remove_entry_nofollow(self, name)
     }
 
     pub(crate) fn remove_file(&self, name: &OsStr) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(name)?;
         remove_file(self, name)
     }
 
     pub(crate) fn sync(&self) -> io::Result<()> {
+        self.require_mutable()?;
         #[cfg(test)]
         {
             self.sync_probe.calls.fetch_add(1, Ordering::SeqCst);
@@ -190,9 +205,21 @@ impl DirectoryCapability {
     }
 
     pub(crate) fn secure_regular_file(&self, name: &OsStr) -> io::Result<()> {
+        self.require_mutable()?;
         validate_component(name)?;
-        drop(open_file_read(self, name)?);
+        drop(open_file_read(self, name, self.repair_permissions)?);
         Ok(())
+    }
+
+    fn require_mutable(&self) -> io::Result<()> {
+        if self.repair_permissions {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read-only directory capability cannot mutate storage",
+            ))
+        }
     }
 
     #[cfg(test)]
@@ -224,16 +251,19 @@ fn validate_component(name: &OsStr) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn open_directory(path: &Path) -> io::Result<DirectoryCapability> {
+fn open_directory(path: &Path, repair_permissions: bool) -> io::Result<DirectoryCapability> {
     use rustix::fs::{Mode, OFlags, fchmod, open};
     let fd = open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    fchmod(&fd, Mode::from_raw_mode(0o700))?;
+    if repair_permissions {
+        fchmod(&fd, Mode::from_raw_mode(0o700))?;
+    }
     Ok(DirectoryCapability {
         display_path: absolute_display_path(path)?,
+        repair_permissions,
         fd,
         #[cfg(test)]
         sync_probe: Arc::default(),
@@ -241,7 +271,11 @@ fn open_directory(path: &Path) -> io::Result<DirectoryCapability> {
 }
 
 #[cfg(unix)]
-fn open_child(parent: &DirectoryCapability, name: &OsStr) -> io::Result<DirectoryCapability> {
+fn open_child(
+    parent: &DirectoryCapability,
+    name: &OsStr,
+    repair_permissions: bool,
+) -> io::Result<DirectoryCapability> {
     use rustix::fs::{Mode, OFlags, fchmod, openat};
     let fd = openat(
         &parent.fd,
@@ -249,9 +283,12 @@ fn open_child(parent: &DirectoryCapability, name: &OsStr) -> io::Result<Director
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    fchmod(&fd, Mode::from_raw_mode(0o700))?;
+    if repair_permissions {
+        fchmod(&fd, Mode::from_raw_mode(0o700))?;
+    }
     Ok(DirectoryCapability {
         display_path: parent.display_path.join(name),
+        repair_permissions,
         fd,
         #[cfg(test)]
         sync_probe: Arc::default(),
@@ -303,7 +340,11 @@ fn fd_into_file(fd: rustix::fd::OwnedFd) -> fs::File {
 }
 
 #[cfg(unix)]
-fn open_file_read(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
+fn open_file_read(
+    directory: &DirectoryCapability,
+    name: &OsStr,
+    repair_permissions: bool,
+) -> io::Result<fs::File> {
     use rustix::fs::{Mode, OFlags, fchmod, openat};
     let fd = openat(
         &directory.fd,
@@ -318,7 +359,9 @@ fn open_file_read(directory: &DirectoryCapability, name: &OsStr) -> io::Result<f
             "not a regular file",
         ));
     }
-    fchmod(&fd, Mode::from_raw_mode(0o600))?;
+    if repair_permissions {
+        fchmod(&fd, Mode::from_raw_mode(0o600))?;
+    }
     Ok(fd_into_file(fd))
 }
 
@@ -450,17 +493,29 @@ fn sync_capability(directory: &DirectoryCapability) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn open_directory(path: &Path) -> io::Result<DirectoryCapability> {
-    open_windows_directory(path, false)
+fn open_directory(path: &Path, repair_permissions: bool) -> io::Result<DirectoryCapability> {
+    open_windows_directory(path, false, repair_permissions)
 }
 
 #[cfg(windows)]
-fn open_child(parent: &DirectoryCapability, name: &OsStr) -> io::Result<DirectoryCapability> {
-    open_windows_directory(&parent.display_path.join(name), true)
+fn open_child(
+    parent: &DirectoryCapability,
+    name: &OsStr,
+    repair_permissions: bool,
+) -> io::Result<DirectoryCapability> {
+    open_windows_directory(
+        &parent.display_path.join(name),
+        repair_permissions,
+        repair_permissions,
+    )
 }
 
 #[cfg(windows)]
-fn open_windows_directory(path: &Path, removable: bool) -> io::Result<DirectoryCapability> {
+fn open_windows_directory(
+    path: &Path,
+    removable: bool,
+    repair_permissions: bool,
+) -> io::Result<DirectoryCapability> {
     use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
     use windows_sys::Win32::{
         Foundation::{GENERIC_READ, GENERIC_WRITE},
@@ -470,9 +525,12 @@ fn open_windows_directory(path: &Path, removable: bool) -> io::Result<DirectoryC
             FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
         },
     };
+    let access = GENERIC_READ
+        | if repair_permissions { GENERIC_WRITE } else { 0 }
+        | if removable { DELETE } else { 0 };
     let handle = fs::OpenOptions::new()
         .read(true)
-        .access_mode(GENERIC_READ | GENERIC_WRITE | if removable { DELETE } else { 0 })
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH,
@@ -490,9 +548,12 @@ fn open_windows_directory(path: &Path, removable: bool) -> io::Result<DirectoryC
             "directory capability target is reparse-backed or not a directory",
         ));
     }
-    super::snapshot::secure_directory(path)?;
+    if repair_permissions {
+        super::snapshot::secure_directory(path)?;
+    }
     Ok(DirectoryCapability {
         display_path: absolute_display_path(path)?,
+        repair_permissions,
         handle,
         #[cfg(test)]
         sync_probe: Arc::default(),
@@ -537,6 +598,7 @@ fn open_windows_file(
     name: &OsStr,
     create_new: bool,
     mutation: bool,
+    repair_permissions: bool,
 ) -> io::Result<fs::File> {
     use std::{os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
     use windows_sys::Win32::{
@@ -575,7 +637,9 @@ fn open_windows_file(
             "not a regular file",
         ));
     }
-    super::snapshot::secure_file(&path)?;
+    if repair_permissions {
+        super::snapshot::secure_file(&path)?;
+    }
     Ok(file)
 }
 
@@ -616,7 +680,7 @@ fn open_windows_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::
 
 #[cfg(windows)]
 fn file_metadata(directory: &DirectoryCapability, name: &OsStr) -> io::Result<Option<(bool, u64)>> {
-    match open_windows_file(directory, name, false, false) {
+    match open_windows_file(directory, name, false, false, directory.repair_permissions) {
         Ok(file) => Ok(Some((true, file.metadata()?.len()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(Some((false, 0))),
@@ -625,13 +689,17 @@ fn file_metadata(directory: &DirectoryCapability, name: &OsStr) -> io::Result<Op
 }
 
 #[cfg(windows)]
-fn open_file_read(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
-    open_windows_file(directory, name, false, false)
+fn open_file_read(
+    directory: &DirectoryCapability,
+    name: &OsStr,
+    repair_permissions: bool,
+) -> io::Result<fs::File> {
+    open_windows_file(directory, name, false, false, repair_permissions)
 }
 
 #[cfg(windows)]
 fn open_file_create_new(directory: &DirectoryCapability, name: &OsStr) -> io::Result<fs::File> {
-    open_windows_file(directory, name, true, true)
+    open_windows_file(directory, name, true, true, true)
 }
 
 #[cfg(windows)]
@@ -649,7 +717,7 @@ fn replace_file(
     old_name: &OsStr,
     new_name: &OsStr,
 ) -> io::Result<()> {
-    let file = open_windows_file(parent, old_name, false, true)?;
+    let file = open_windows_file(parent, old_name, false, true, true)?;
     rename_windows_handle(parent, &file, new_name, true)
 }
 
@@ -742,7 +810,7 @@ fn remove_child_tree(parent: &DirectoryCapability, name: &OsStr) -> io::Result<(
 
 #[cfg(windows)]
 fn remove_file(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
-    match open_windows_file(parent, name, false, true) {
+    match open_windows_file(parent, name, false, true, true) {
         Ok(file) => mark_delete(&file),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
