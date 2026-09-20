@@ -14,6 +14,7 @@ use crate::daemon::{
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
 const MAX_SUBSCRIPTION_PROFILES: usize = 16;
+const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiState {
@@ -560,6 +561,7 @@ pub struct DesktopViewModel {
     subscription_profiles: Vec<SubscriptionProfilePresentation>,
     profile_error: Option<String>,
     profile_reload_needed: bool,
+    profile_catalog_reload_needed: bool,
     #[allow(dead_code)] // Consumed by the profile menu in Task 6.
     profile_close_intent: bool,
     next_profile_generation: u64,
@@ -617,6 +619,7 @@ impl DesktopViewModel {
             subscription_profiles: Vec::new(),
             profile_error: None,
             profile_reload_needed: false,
+            profile_catalog_reload_needed: false,
             profile_close_intent: false,
             next_profile_generation: 0,
             active_profile_request: None,
@@ -788,6 +791,7 @@ impl DesktopViewModel {
                 self.state = self.apply_profile_changing_status(status);
                 self.profile_error = None;
                 self.profile_reload_needed = true;
+                self.profile_catalog_reload_needed = true;
                 true
             }
             Err(error) => {
@@ -823,6 +827,7 @@ impl DesktopViewModel {
         let Some(profile_id) = request.profile_id else {
             return false;
         };
+        let refreshes_active_profile = self.active_profile_id.as_deref() == Some(&profile_id);
         match result {
             Ok(list) => {
                 if let Some(profile) = list
@@ -840,6 +845,10 @@ impl DesktopViewModel {
                     let mut profile = profile;
                     profile.active = existing.active;
                     *existing = profile;
+                }
+                if refreshes_active_profile {
+                    self.invalidate_catalog_runtime();
+                    self.profile_catalog_reload_needed = true;
                 }
                 self.profile_error = None;
                 self.profile_reload_needed = true;
@@ -877,9 +886,13 @@ impl DesktopViewModel {
         };
         match result {
             Ok(status) => {
+                let previous_active = self.active_profile_id.clone();
                 self.subscription_profiles
                     .retain(|profile| profile.id != profile_id);
                 self.state = self.apply_daemon_status(status);
+                if self.active_profile_id != previous_active {
+                    self.profile_catalog_reload_needed = true;
+                }
                 self.profile_close_intent = self.subscription_profiles.is_empty();
                 self.profile_error = None;
                 self.profile_reload_needed = true;
@@ -898,6 +911,10 @@ impl DesktopViewModel {
 
     pub(crate) fn take_profile_close_intent(&mut self) -> bool {
         std::mem::take(&mut self.profile_close_intent)
+    }
+
+    pub(crate) fn take_profile_catalog_reload_needed(&mut self) -> bool {
+        std::mem::take(&mut self.profile_catalog_reload_needed)
     }
 
     fn next_profile_request(
@@ -941,6 +958,10 @@ impl DesktopViewModel {
             UiState::Connected { .. } | UiState::Connecting { .. }
         ) {
             self.profile_error = Some("Отключитесь перед изменением подписки.".into());
+            return false;
+        }
+        if matches!(self.state, UiState::DaemonDegraded { .. }) {
+            self.profile_error = Some("Дождитесь восстановления фонового сервиса.".into());
             return false;
         }
         if self.active_profile_request.is_some()
@@ -996,6 +1017,7 @@ impl DesktopViewModel {
         if self.active_profile_id != profile_id {
             self.invalidate_profile_runtime();
             self.active_profile_id = profile_id;
+            self.sync_profile_active_flags();
         }
     }
 
@@ -1005,14 +1027,25 @@ impl DesktopViewModel {
             .active_profile_id
             .as_deref()
             .and_then(safe_profile_id);
+        self.sync_profile_active_flags();
         self.subscription = status.subscription.clone();
         state_from_status(status)
+    }
+
+    fn sync_profile_active_flags(&mut self) {
+        for profile in &mut self.subscription_profiles {
+            profile.active = self.active_profile_id.as_deref() == Some(profile.id.as_str());
+        }
     }
 
     fn invalidate_profile_runtime(&mut self) {
         self.subscription = None;
         self.subscription_refresh_error = None;
 
+        self.invalidate_catalog_runtime();
+    }
+
+    fn invalidate_catalog_runtime(&mut self) {
         self.next_catalog_generation = self.next_catalog_generation.wrapping_add(1);
         self.catalog_request_pending = None;
         self.catalog_request_deferred = false;
@@ -1292,6 +1325,7 @@ impl DesktopViewModel {
                 self.subscription_profiles.clear();
                 self.profile_error = None;
                 self.profile_reload_needed = true;
+                self.profile_catalog_reload_needed = true;
                 self.state = self.apply_profile_changing_status(status);
                 self.import_error = None;
             }
@@ -2313,7 +2347,8 @@ fn local_logo_path(value: &str) -> Option<String> {
     use std::path::{Component, Prefix};
 
     let value = value.trim();
-    if value.is_empty() || is_non_file_reference(value) {
+    if value.is_empty() || value.len() > MAX_SERVICE_LOGO_PATH_BYTES || is_non_file_reference(value)
+    {
         return None;
     }
     let path = Path::new(value);
@@ -2327,7 +2362,8 @@ fn local_logo_path(value: &str) -> Option<String> {
 #[cfg(not(windows))]
 fn local_logo_path(value: &str) -> Option<String> {
     let value = value.trim();
-    if value.is_empty() || is_non_file_reference(value) {
+    if value.is_empty() || value.len() > MAX_SERVICE_LOGO_PATH_BYTES || is_non_file_reference(value)
+    {
         return None;
     }
     Path::new(value).is_absolute().then(|| value.to_owned())
@@ -2558,6 +2594,42 @@ mod tests {
             model.profile_presentation().active_id.as_deref(),
             Some("profile-b")
         );
+        let rows = model.profile_presentation().profiles;
+        assert!(!rows[0].active);
+        assert!(rows[1].active);
+
+        let failed_reload = model.begin_profile_list().expect("failed list reload");
+        assert!(model.finish_profile_list(
+            failed_reload,
+            Err(crate::daemon::DaemonError::new("unsafe list details")),
+        ));
+        let rows_after_failure = model.profile_presentation().profiles;
+        assert!(!rows_after_failure[0].active);
+        assert!(rows_after_failure[1].active);
+    }
+
+    #[test]
+    fn active_delete_immediately_reconciles_cached_row_flags() {
+        let mut model = model_with_profiles();
+        let deletion = model
+            .begin_profile_delete("profile-a")
+            .expect("delete active profile");
+
+        assert!(model.finish_profile_delete(
+            deletion,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                profile: Some("Beta".into()),
+                ..DaemonStatus::default()
+            }),
+        ));
+
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.active_id.as_deref(), Some("profile-b"));
+        assert_eq!(presentation.profiles.len(), 1);
+        assert_eq!(presentation.profiles[0].id, "profile-b");
+        assert!(presentation.profiles[0].active);
     }
 
     #[test]
@@ -2603,10 +2675,10 @@ mod tests {
     }
 
     #[test]
-    fn targeted_refresh_updates_only_matching_metadata_until_list_reload() {
+    fn inactive_targeted_refresh_updates_only_matching_metadata_until_list_reload() {
         let mut model = model_with_profiles();
         let refresh = model
-            .begin_profile_target_refresh("profile-a")
+            .begin_profile_target_refresh("profile-b")
             .expect("targeted refresh");
 
         assert!(model.finish_profile_target_refresh(
@@ -2614,18 +2686,78 @@ mod tests {
             Ok(profile_list(
                 Some("profile-b"),
                 vec![
-                    profile("profile-a", false, "Alpha updated"),
-                    profile("profile-b", true, "Wrong speculative update"),
+                    profile("profile-a", false, "Wrong speculative update"),
+                    profile("profile-b", true, "Beta updated"),
                 ],
             )),
         ));
         let presentation = model.profile_presentation();
         assert_eq!(presentation.active_id.as_deref(), Some("profile-a"));
-        assert_eq!(presentation.profiles[0].title, "Alpha updated");
+        assert_eq!(presentation.profiles[0].title, "Alpha");
         assert!(presentation.profiles[0].active);
-        assert_eq!(presentation.profiles[1].title, "Beta");
+        assert_eq!(presentation.profiles[1].title, "Beta updated");
         assert!(!presentation.profiles[1].active);
         assert!(model.take_profile_list_reload_needed());
+        assert!(!model.take_profile_catalog_reload_needed());
+    }
+
+    #[test]
+    fn active_targeted_refresh_invalidates_old_catalog_and_latency_workers() {
+        let mut catalog_model = model_with_profiles();
+        let old_catalog = catalog_model
+            .begin_catalog_request()
+            .expect("in-flight old catalog");
+        let refresh = catalog_model
+            .begin_profile_target_refresh("profile-a")
+            .expect("active targeted refresh");
+        assert!(catalog_model.finish_profile_target_refresh(
+            refresh,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![profile("profile-a", true, "Alpha refreshed")],
+            )),
+        ));
+        assert!(
+            catalog_model
+                .finish_catalog(old_catalog.token, Ok(catalog_fixture()))
+                .is_none()
+        );
+        assert!(catalog_model.catalog_presentation().groups.is_empty());
+        assert!(catalog_model.take_profile_catalog_reload_needed());
+
+        let mut latency_model = model_with_profiles();
+        let catalog = latency_model
+            .begin_catalog_request()
+            .expect("catalog before latency");
+        latency_model.finish_catalog(catalog.token, Ok(catalog_fixture()));
+        latency_model.state = UiState::Connected {
+            profile: "Alpha".into(),
+            node: "Auto".into(),
+        };
+        let old_latency = latency_model
+            .begin_latency_request()
+            .expect("in-flight old latency");
+        latency_model.state = UiState::Ready {
+            profile: "Alpha".into(),
+            node: "Auto".into(),
+        };
+        let refresh = latency_model
+            .begin_profile_target_refresh("profile-a")
+            .expect("active refresh after disconnect");
+        assert!(latency_model.finish_profile_target_refresh(
+            refresh,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![profile("profile-a", true, "Alpha refreshed")],
+            )),
+        ));
+        assert!(
+            latency_model
+                .finish_latencies(old_latency.token, Ok(DaemonLatencies::default()))
+                .is_none()
+        );
+        assert!(latency_model.catalog_presentation().groups.is_empty());
+        assert!(latency_model.take_profile_catalog_reload_needed());
     }
 
     #[test]
@@ -2652,7 +2784,14 @@ mod tests {
         let profiles = (0..32)
             .map(|index| {
                 let mut item = profile(&format!("profile-{index}"), index == 0, &"x".repeat(512));
-                item.service_logo_path = Some("https://private.invalid/logo.png".into());
+                item.service_logo_path = Some(if index == 1 {
+                    format!(
+                        r"C:\cache\{}\logo.png",
+                        "x".repeat(MAX_SERVICE_LOGO_PATH_BYTES)
+                    )
+                } else {
+                    "https://private.invalid/logo.png".into()
+                });
                 item
             })
             .collect();
@@ -2725,6 +2864,25 @@ mod tests {
         assert!(model.begin_profile_target_refresh("profile-b").is_none());
         let error = model.profile_presentation().error.expect("inline error");
         assert!(error.chars().count() < 128);
+        assert!(!error.contains("profile-b"));
+    }
+
+    #[test]
+    fn degraded_profile_mutations_are_rejected_without_issuing_tokens() {
+        let mut model = model_with_profiles();
+        model.state = UiState::DaemonDegraded {
+            message: "unsafe https://private.invalid token=secret".into(),
+        };
+
+        assert!(model.begin_profile_activation("profile-b").is_none());
+        assert!(model.begin_profile_delete("profile-b").is_none());
+        assert!(model.begin_profile_target_refresh("profile-b").is_none());
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.pending_operation, None);
+        let error = presentation.error.expect("bounded degraded error");
+        assert!(error.chars().count() < 128);
+        assert!(!error.contains("private.invalid"));
+        assert!(!error.contains("secret"));
         assert!(!error.contains("profile-b"));
     }
 
