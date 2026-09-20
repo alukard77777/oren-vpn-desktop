@@ -119,7 +119,14 @@ impl ProfilePreferenceReconciler {
         self.pending_ready_profile = active_id;
     }
 
-    fn apply_ready_hints_after_catalog(&mut self, model: &mut DesktopViewModel) {
+    fn apply_ready_hints_after_catalog(
+        &mut self,
+        model: &mut DesktopViewModel,
+        catalog_succeeded: bool,
+    ) {
+        if !catalog_succeeded {
+            return;
+        }
         let presentation = model.presentation();
         if presentation.is_connected {
             self.pending_ready_profile = None;
@@ -155,7 +162,9 @@ impl ProfilePreferenceReconciler {
 }
 
 fn route_hints_apply_to(presentation: &StatePresentation) -> bool {
-    presentation.primary_action == PrimaryAction::Connect && !presentation.is_connected
+    presentation.primary_action == PrimaryAction::Connect
+        && presentation.primary_enabled
+        && !presentation.is_connected
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2200,6 +2209,7 @@ fn load_catalog_impl(
     };
     thread::spawn(move || {
         let result = request.client.catalog();
+        let catalog_succeeded = result.is_ok();
         let current = {
             let mut model = model.lock().expect("view model lock");
             model.finish_catalog(request.token, result).map(|_| {
@@ -2207,7 +2217,7 @@ fn load_catalog_impl(
                     preferences
                         .lock()
                         .expect("profile preference reconciler lock")
-                        .apply_ready_hints_after_catalog(&mut model);
+                        .apply_ready_hints_after_catalog(&mut model, catalog_succeeded);
                 }
                 snapshot(&model)
             })
@@ -2496,9 +2506,13 @@ mod window_tests {
         retry_delay_after_failure, route_hints_apply_to, runtime_allows_update, scale_factor_milli,
         shell_active_after_native_minimize_change, visible_page_from_name, visible_page_name,
     };
+    use crate::daemon::test_support::MockDaemonClient;
+    use crate::daemon::{
+        DaemonCatalog, DaemonCatalogGroup, DaemonCatalogNode, DaemonError, DaemonStatus,
+    };
     use crate::preferences::{AppPreferences, PreferenceStore, VisiblePage, WindowBounds};
     use crate::single_instance::Activation;
-    use crate::view_model::UiState;
+    use crate::view_model::{DesktopViewModel, UiState};
     use crate::windows_shell::{
         CloseDisposition, MinimizeDisposition, close_disposition, minimize_disposition,
         parse_resize_edge,
@@ -2680,6 +2694,94 @@ mod window_tests {
         .presentation();
         assert!(route_hints_apply_to(&ready));
         assert!(!route_hints_apply_to(&connected));
+    }
+
+    #[test]
+    fn failed_catalog_keeps_pending_profile_hints_for_a_successful_retry() {
+        let tracker = Arc::new(Mutex::new(PersistenceTracker::new(
+            AppPreferences::default(),
+        )));
+        let mut reconciler = ProfilePreferenceReconciler::new(AppPreferences::default(), tracker);
+        reconciler.record_hint(
+            "profile-a".into(),
+            Some("group-a".into()),
+            std::collections::BTreeMap::from([("group-a".into(), "node-a-saved".into())]),
+        );
+        reconciler.set_authoritative_profile(Some("profile-a".into()));
+
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let status = model.begin_refresh();
+        model.finish_refresh(
+            status,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Profile A".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+
+        let failed = model
+            .begin_catalog_request()
+            .expect("failed catalog request");
+        model.finish_catalog(failed.token, Err(DaemonError::new("temporary failure")));
+        reconciler.apply_ready_hints_after_catalog(&mut model, false);
+        assert_eq!(
+            reconciler.pending_ready_profile.as_deref(),
+            Some("profile-a"),
+            "a transient catalog error must not consume the profile hint"
+        );
+
+        let retry = model.begin_catalog_request().expect("catalog retry");
+        model.finish_catalog(
+            retry.token,
+            Ok(DaemonCatalog {
+                revision: 7,
+                groups: vec![DaemonCatalogGroup {
+                    id: "group-a".into(),
+                    label: "Primary".into(),
+                    selected: true,
+                    nodes: vec![
+                        DaemonCatalogNode {
+                            id: "node-a-default".into(),
+                            label: "Default".into(),
+                            selected: true,
+                            delay_ms: None,
+                        },
+                        DaemonCatalogNode {
+                            id: "node-a-saved".into(),
+                            label: "Saved".into(),
+                            selected: false,
+                            delay_ms: None,
+                        },
+                    ],
+                }],
+            }),
+        );
+        reconciler.apply_ready_hints_after_catalog(&mut model, true);
+
+        assert_eq!(reconciler.pending_ready_profile, None);
+        let (_, selected_group, selections) = model
+            .route_preferences()
+            .expect("restored route preferences");
+        assert_eq!(selected_group.as_deref(), Some("group-a"));
+        assert_eq!(
+            selections.get("group-a").map(String::as_str),
+            Some("node-a-saved")
+        );
+    }
+
+    #[test]
+    fn settings_delete_confirmation_consumes_escape_before_panel_close() {
+        let source = include_str!("../ui/app.slint");
+        let escape_handler = source
+            .split("visual-frame := FocusScope {")
+            .nth(1)
+            .and_then(|source| source.split("VerticalLayout {").next())
+            .expect("visual frame Escape handler");
+        assert!(escape_handler.contains("if (root.profile-delete-confirm-id != \"\")"));
+        assert!(escape_handler.contains("root.profile-delete-confirm-id = \"\";"));
+        assert!(escape_handler.contains("else { root.escape-pressed(); }"));
     }
 
     #[test]

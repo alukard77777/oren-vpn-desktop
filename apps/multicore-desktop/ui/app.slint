@@ -513,7 +513,9 @@ export component AppWindow inherits Window {
         height: parent.height - 2 * root.resize-border;
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                root.escape-pressed();
+                if (root.profile-delete-confirm-id != "") {
+                    root.profile-delete-confirm-id = "";
+                } else { root.escape-pressed(); }
                 return accept;
             }
             return reject;
