@@ -15,6 +15,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -37,9 +38,9 @@ use view_model::{
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
-    CloseDisposition, MinimizeDisposition, MonitorRect, MonitorSignature, close_disposition,
-    minimize_disposition, monitor_cap_changed, next_maximized, parse_resize_edge,
-    restore_placement,
+    CloseDisposition, MinimizeDisposition, MonitorRect, MonitorSignature, PhysicalPosition,
+    close_disposition, minimize_disposition, monitor_cap_changed, next_maximized,
+    parse_resize_edge, place_tray_popup, restore_placement,
 };
 
 slint::include_modules!();
@@ -530,17 +531,31 @@ fn main() -> Result<(), slint::PlatformError> {
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     wire_windows_settings(&ui);
     wire_external_activations(&ui, activations, model.clone());
+    let tray_popup = TrayPopup::new()?;
+    let tray_popup_open = Rc::new(Cell::new(false));
+    wire_tray_popup_actions(
+        &tray_popup,
+        ui.as_weak(),
+        model.clone(),
+        preference_writer.clone(),
+        preference_tracker.clone(),
+        tray_popup_open.clone(),
+    );
+    let _tray_popup_focus_timer = wire_tray_popup_focus_loss(&tray_popup, tray_popup_open.clone());
     let tray_model = tray_menu_model(&model.lock().expect("view model lock"));
     let tray_model_source = model.clone();
     let tray_action_ui = ui.as_weak();
     let tray_action_model = model.clone();
     let tray_preference_writer = preference_writer.clone();
     let tray_preference_tracker = preference_tracker.clone();
+    let tray_interaction_popup = tray_popup.as_weak();
+    let tray_interaction_popup_open = tray_popup_open.clone();
     let tray_runtime = tray::start(
         tray_model,
         move || tray_menu_model(&tray_model_source.lock().expect("view model lock")),
-        move |interaction| {
-            if let TrayInteraction::Command(command) = interaction {
+        move |interaction| match interaction {
+            TrayInteraction::Command(command) => {
+                hide_tray_popup(&tray_interaction_popup, &tray_interaction_popup_open);
                 handle_tray_command(
                     &tray_action_ui,
                     &tray_action_model,
@@ -548,6 +563,15 @@ fn main() -> Result<(), slint::PlatformError> {
                     &tray_preference_writer,
                     &tray_preference_tracker,
                 )
+            }
+            TrayInteraction::ShowMenu { x, y } => {
+                toggle_tray_popup(
+                    &tray_interaction_popup,
+                    &tray_action_ui,
+                    &tray_action_model,
+                    &tray_interaction_popup_open,
+                    PhysicalPosition { x, y },
+                );
             }
         },
     )
@@ -572,6 +596,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     let result = slint::run_event_loop();
     flush_preferences(&ui, &model, &preference_writer, &preference_tracker);
+    let _ = tray_popup.hide();
     let _ = ui.hide();
     drop(tray_runtime);
     result
@@ -1232,6 +1257,209 @@ fn hide_window_to_tray(ui: &AppWindow) {
     let _ = ui.window().with_winit_window(|window| {
         window.set_visible(false);
     });
+}
+
+fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
+    let groups = model
+        .groups
+        .iter()
+        .take(12)
+        .filter_map(|entry| match &entry.command {
+            TrayCommand::SelectGroup { group_id } => Some(TrayMenuRow {
+                id: group_id.clone().into(),
+                group_id: "".into(),
+                label: entry.label.clone().into(),
+                selected: entry.checked,
+                enabled: entry.enabled,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let nodes = model
+        .nodes
+        .iter()
+        .take(16)
+        .filter_map(|entry| match &entry.command {
+            TrayCommand::SelectNode { group_id, node_id } => Some(TrayMenuRow {
+                id: node_id.clone().into(),
+                group_id: group_id.clone().into(),
+                label: entry.label.clone().into(),
+                selected: entry.checked,
+                enabled: entry.enabled,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    popup.set_status_text(model.status.into());
+    popup.set_connection_label(model.connection_label.into());
+    popup.set_connection_enabled(model.connection_enabled);
+    popup.set_group_rows(ModelRc::new(VecModel::from(groups)));
+    popup.set_node_rows(ModelRc::new(VecModel::from(nodes)));
+}
+
+fn hide_tray_popup(weak: &slint::Weak<TrayPopup>, open: &Rc<Cell<bool>>) {
+    if let Some(popup) = weak.upgrade() {
+        let _ = popup.hide();
+    }
+    open.set(false);
+}
+
+fn toggle_tray_popup(
+    popup_weak: &slint::Weak<TrayPopup>,
+    main_weak: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    open: &Rc<Cell<bool>>,
+    anchor: PhysicalPosition,
+) {
+    if open.get() {
+        hide_tray_popup(popup_weak, open);
+        return;
+    }
+    let (Some(popup), Some(main)) = (popup_weak.upgrade(), main_weak.upgrade()) else {
+        return;
+    };
+    apply_tray_popup_model(
+        &popup,
+        tray_menu_model(&model.lock().expect("view model lock")),
+    );
+    let _ = popup.show();
+    let monitors = main
+        .window()
+        .with_winit_window(monitor_rects)
+        .unwrap_or_default();
+    let popup_size = popup
+        .window()
+        .with_winit_window(|window| window.outer_size())
+        .map(|size| (size.width, size.height))
+        .unwrap_or((304, 460));
+    if let Some(position) = place_tray_popup(anchor, popup_size, &monitors) {
+        let _ = popup.window().with_winit_window(|window| {
+            use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
+            use slint::winit_030::winit::window::WindowLevel;
+            window.set_window_level(WindowLevel::AlwaysOnTop);
+            window.set_outer_position(WinitPhysicalPosition::new(position.x, position.y));
+            window.focus_window();
+            window.request_redraw();
+        });
+    }
+    open.set(true);
+}
+
+fn dispatch_tray_popup_command(
+    popup: &slint::Weak<TrayPopup>,
+    open: &Rc<Cell<bool>>,
+    ui: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    command: TrayCommand,
+    preference_writer: &Arc<Mutex<PreferenceWriter>>,
+    preference_tracker: &Arc<Mutex<PersistenceTracker>>,
+) {
+    hide_tray_popup(popup, open);
+    handle_tray_command(ui, model, command, preference_writer, preference_tracker);
+}
+
+fn wire_tray_popup_actions(
+    popup: &TrayPopup,
+    ui: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    preference_writer: Arc<Mutex<PreferenceWriter>>,
+    preference_tracker: Arc<Mutex<PersistenceTracker>>,
+    open: Rc<Cell<bool>>,
+) {
+    let popup_weak = popup.as_weak();
+    let dismiss_popup = popup_weak.clone();
+    let dismiss_open = open.clone();
+    popup.on_dismiss(move || hide_tray_popup(&dismiss_popup, &dismiss_open));
+
+    let wire_command = |command: TrayCommand| {
+        let popup = popup_weak.clone();
+        let open = open.clone();
+        let ui = ui.clone();
+        let model = model.clone();
+        let writer = preference_writer.clone();
+        let tracker = preference_tracker.clone();
+        move || {
+            dispatch_tray_popup_command(
+                &popup,
+                &open,
+                &ui,
+                &model,
+                command.clone(),
+                &writer,
+                &tracker,
+            );
+        }
+    };
+    popup.on_toggle_connection(wire_command(TrayCommand::ToggleConnection));
+    popup.on_open_main(wire_command(TrayCommand::ShowWindow));
+    popup.on_exit_app(wire_command(TrayCommand::Exit));
+
+    let group_popup = popup_weak.clone();
+    let group_open = open.clone();
+    let group_ui = ui.clone();
+    let group_model = model.clone();
+    let group_writer = preference_writer.clone();
+    let group_tracker = preference_tracker.clone();
+    popup.on_select_group(move |group_id| {
+        dispatch_tray_popup_command(
+            &group_popup,
+            &group_open,
+            &group_ui,
+            &group_model,
+            TrayCommand::SelectGroup {
+                group_id: group_id.to_string(),
+            },
+            &group_writer,
+            &group_tracker,
+        );
+    });
+
+    let node_popup = popup_weak;
+    let node_open = open;
+    popup.on_select_node(move |group_id, node_id| {
+        dispatch_tray_popup_command(
+            &node_popup,
+            &node_open,
+            &ui,
+            &model,
+            TrayCommand::SelectNode {
+                group_id: group_id.to_string(),
+                node_id: node_id.to_string(),
+            },
+            &preference_writer,
+            &preference_tracker,
+        );
+    });
+}
+
+fn wire_tray_popup_focus_loss(popup: &TrayPopup, open: Rc<Cell<bool>>) -> Timer {
+    let timer = Timer::default();
+    let weak = popup.as_weak();
+    let grace_ticks = Rc::new(Cell::new(0_u8));
+    let timer_grace = grace_ticks.clone();
+    timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
+        if !open.get() {
+            timer_grace.set(2);
+            return;
+        }
+        if timer_grace.get() > 0 {
+            timer_grace.set(timer_grace.get() - 1);
+            return;
+        }
+        let Some(popup) = weak.upgrade() else {
+            return;
+        };
+        let focused = popup
+            .window()
+            .with_winit_window(|window| window.has_focus())
+            .unwrap_or(false);
+        if !focused {
+            let _ = popup.hide();
+            open.set(false);
+        }
+    });
+    timer
 }
 
 fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
@@ -2657,6 +2885,50 @@ mod window_tests {
         assert!(!ambient_motion_allowed(true, true, true, false, true));
         assert!(!ambient_motion_allowed(true, true, false, true, true));
         assert!(!ambient_motion_allowed(true, true, false, false, false));
+    }
+
+    #[test]
+    fn branded_tray_popup_source_contract() {
+        let app = include_str!("../ui/app.slint");
+        let popup = include_str!("../ui/tray_popup.slint");
+        let rust = include_str!("main.rs");
+
+        for required in [
+            "export { TrayPopup, TrayMenuRow } from \"tray_popup.slint\";",
+            "export component TrayPopup inherits Window",
+            "no-frame: true;",
+            "always-on-top: true;",
+            "TrayInteraction::ShowMenu",
+            "place_tray_popup(",
+            ".take(12)",
+            ".take(16)",
+        ] {
+            assert!(
+                app.contains(required) || popup.contains(required) || rust.contains(required),
+                "missing branded tray popup contract: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn tray_popup_lifecycle_contract_closes_before_dispatch_and_on_focus_loss() {
+        let popup = include_str!("../ui/tray_popup.slint");
+        let rust = include_str!("main.rs");
+
+        assert!(popup.contains("event.text == Key.Escape"));
+        assert!(popup.contains("root.dismiss();"));
+        let dispatch = rust
+            .split("fn dispatch_tray_popup_command(")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_tray_popup_actions(").next())
+            .expect("tray popup command dispatcher");
+        assert!(
+            dispatch.find("hide_tray_popup").unwrap()
+                < dispatch.find("handle_tray_command").unwrap()
+        );
+        assert!(rust.contains("if open.get() {\n        hide_tray_popup"));
+        assert!(rust.contains("with_winit_window(|window| window.has_focus())"));
+        assert!(rust.contains("let _ = tray_popup.hide();"));
     }
 
     #[test]
