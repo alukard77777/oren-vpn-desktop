@@ -37,12 +37,28 @@ async fn json_body(response: axum::response::Response) -> Value {
 async fn all_v1_routes_require_bearer_authentication() {
     let routes = [
         ("GET", "/v1/status", Body::empty()),
+        ("GET", "/v1/subscriptions", Body::empty()),
         (
             "POST",
             "/v1/subscriptions/import",
             Body::from(r#"{"url":"https://example.invalid/sub"}"#),
         ),
         ("POST", "/v1/subscriptions/refresh", Body::empty()),
+        (
+            "PUT",
+            "/v1/subscriptions/00000000-0000-4000-8000-000000000001/activate",
+            Body::empty(),
+        ),
+        (
+            "POST",
+            "/v1/subscriptions/00000000-0000-4000-8000-000000000001/refresh",
+            Body::empty(),
+        ),
+        (
+            "DELETE",
+            "/v1/subscriptions/00000000-0000-4000-8000-000000000001",
+            Body::empty(),
+        ),
         ("POST", "/v1/connect", Body::empty()),
         ("POST", "/v1/disconnect", Body::empty()),
         ("GET", "/v1/events?after=0", Body::empty()),
@@ -383,6 +399,19 @@ async fn events_requires_after_query_parameter() {
 async fn bodyless_routes_reject_body_without_content_length() {
     let routes = [
         ("GET", "/v1/status"),
+        ("GET", "/v1/subscriptions"),
+        (
+            "PUT",
+            "/v1/subscriptions/00000000-0000-4000-8000-000000000001/activate",
+        ),
+        (
+            "POST",
+            "/v1/subscriptions/00000000-0000-4000-8000-000000000001/refresh",
+        ),
+        (
+            "DELETE",
+            "/v1/subscriptions/00000000-0000-4000-8000-000000000001",
+        ),
         ("POST", "/v1/connect"),
         ("POST", "/v1/disconnect"),
         ("GET", "/v1/events?after=0"),

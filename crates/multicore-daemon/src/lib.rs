@@ -21,14 +21,14 @@ use axum::{
     http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState as CoreConnectionState, DiagnosticStream, Event,
-    HttpClient, ProcessController, ProcessDiagnostics, ProfileError, ProfileId, ProfileStore,
-    ProfileSummary, RuntimeCheckState, Severity, Snapshot, StagedRuntime, StateMachine,
-    SubscriptionFetcher, Supervisor,
+    HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError, ProfileId,
+    ProfileStore, ProfileSummary, RuntimeCheckState, Severity, Snapshot, StagedRuntime,
+    StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -116,6 +116,24 @@ pub struct SubscriptionInfoDto {
     #[serde(default)]
     pub service_logo_path: Option<String>,
     pub refresh_available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionListDto {
+    pub active_profile_id: Option<String>,
+    pub profiles: Vec<SubscriptionProfileDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionProfileDto {
+    pub id: String,
+    pub active: bool,
+    pub available: bool,
+    pub display_name: String,
+    pub used_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub expires_at_unix: Option<u64>,
+    pub service_logo_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -578,6 +596,21 @@ pub trait Backend: Send + Sync + 'static {
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
         Err(BackendError::new())
     }
+    async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn activate_subscription(&self, _id: ProfileId) -> Result<StatusDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn refresh_subscription_profile(
+        &self,
+        _id: ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn delete_subscription(&self, _id: ProfileId) -> Result<StatusDto, BackendError> {
+        Err(BackendError::new())
+    }
     async fn connect(&self) -> Result<StatusDto, BackendError>;
     async fn disconnect(&self) -> Result<StatusDto, BackendError>;
     async fn select(&self, _request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
@@ -654,8 +687,18 @@ where
         .route("/catalog", get(catalog))
         .route("/latencies", post(latencies))
         .route("/selections/{group_id}", put(select_node))
+        .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions/import", post(import_subscription))
         .route("/subscriptions/refresh", post(refresh_subscription))
+        .route(
+            "/subscriptions/{profile_id}/activate",
+            put(activate_subscription),
+        )
+        .route(
+            "/subscriptions/{profile_id}/refresh",
+            post(refresh_subscription_profile),
+        )
+        .route("/subscriptions/{profile_id}", delete(delete_subscription))
         .route("/connect", post(connect))
         .route("/disconnect", post(disconnect))
         .route("/events", get(events))
@@ -887,6 +930,93 @@ async fn select_node(
         })
 }
 
+async fn list_subscriptions(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SubscriptionListDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    state
+        .backend
+        .list_subscriptions()
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось получить список подписок."))
+}
+
+async fn activate_subscription(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<StatusDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let profile_id = parse_profile_id(&profile_id)?;
+    state
+        .backend
+        .activate_subscription(profile_id)
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось активировать профиль."))
+}
+
+async fn refresh_subscription_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<SubscriptionListDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let profile_id = parse_profile_id(&profile_id)?;
+    state
+        .backend
+        .refresh_subscription_profile(profile_id)
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось обновить профиль."))
+}
+
+async fn delete_subscription(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<StatusDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let profile_id = parse_profile_id(&profile_id)?;
+    state
+        .backend
+        .delete_subscription(profile_id)
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось удалить профиль."))
+}
+
+fn parse_profile_id(value: &str) -> Result<ProfileId, ApiError> {
+    ProfileId::parse(value).map_err(|_| profile_not_found())
+}
+
+fn profile_api_error(error: BackendError, internal_message: &str) -> ApiError {
+    match error.profile_mutation() {
+        Some(ProfileMutationError::NotFound) => profile_not_found(),
+        Some(ProfileMutationError::Connected) => ApiError::new(
+            StatusCode::CONFLICT,
+            "profile_busy",
+            "Отключитесь перед изменением профиля.",
+        ),
+        Some(ProfileMutationError::LimitReached) => ApiError::new(
+            StatusCode::CONFLICT,
+            "profile_limit",
+            "Достигнут предел количества профилей.",
+        ),
+        Some(ProfileMutationError::Storage) | None => ApiError::backend(internal_message),
+    }
+}
+
+fn profile_not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "profile_not_found",
+        "Профиль не найден. Обновите список подписок.",
+    )
+}
+
 async fn import_subscription(
     State(state): State<AppState>,
     payload: Result<Json<ImportSubscriptionRequest>, JsonRejection>,
@@ -902,8 +1032,9 @@ async fn import_subscription(
         .import_subscription(request)
         .await
         .map(Json)
-        .map_err(|_| {
-            ApiError::backend(
+        .map_err(|error| {
+            profile_api_error(
+                error,
                 "Не удалось импортировать подписку. Проверьте ссылку и повторите попытку.",
             )
         })
@@ -919,8 +1050,9 @@ async fn refresh_subscription(
         .refresh_subscription()
         .await
         .map(Json)
-        .map_err(|_| {
-            ApiError::backend(
+        .map_err(|error| {
+            profile_api_error(
+                error,
                 "Не удалось обновить подписку. Если профиль старый, укажите ссылку ещё раз.",
             )
         })
@@ -1473,6 +1605,67 @@ where
         self.store.list().map_err(map_profile_error)
     }
 
+    fn subscription_list_dto(&self) -> Result<SubscriptionListDto, ProfileMutationError> {
+        let summaries = self.store.list().map_err(map_profile_error)?;
+        let active_profile_id = summaries
+            .iter()
+            .find(|summary| summary.active)
+            .map(|summary| summary.id.as_str().to_owned());
+        let profiles = summaries
+            .into_iter()
+            .enumerate()
+            .map(|(index, summary)| {
+                let loaded = summary
+                    .available
+                    .then(|| self.store.profile_snapshot(&summary.id).ok())
+                    .flatten()
+                    .map(|(_, snapshot)| snapshot);
+                let info = loaded
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.subscription_info());
+                let display_name = info.map_or_else(
+                    || format!("Профиль {}", index + 1),
+                    |info| safe_catalog_label(&info.display_name, "Профиль", index),
+                );
+                let service_logo_path = loaded.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .service_logo_path()
+                        .filter(|path| path.is_file())
+                        .and_then(std::path::Path::to_str)
+                        .map(ToOwned::to_owned)
+                });
+                SubscriptionProfileDto {
+                    id: summary.id.as_str().to_owned(),
+                    active: summary.active,
+                    available: loaded.is_some(),
+                    display_name,
+                    used_bytes: info.and_then(|info| info.used_bytes()),
+                    total_bytes: info.and_then(|info| info.total_bytes),
+                    expires_at_unix: info.and_then(|info| info.expires_at_unix),
+                    service_logo_path,
+                }
+            })
+            .collect();
+        Ok(SubscriptionListDto {
+            active_profile_id,
+            profiles,
+        })
+    }
+
+    fn require_profile(&self, id: &ProfileId) -> Result<(), ProfileMutationError> {
+        if self
+            .store
+            .list()
+            .map_err(map_profile_error)?
+            .iter()
+            .any(|summary| &summary.id == id)
+        {
+            Ok(())
+        } else {
+            Err(ProfileMutationError::NotFound)
+        }
+    }
+
     pub async fn activate_subscription(
         &self,
         id: &ProfileId,
@@ -1919,6 +2112,46 @@ where
             .await
             .map_err(BackendError::from_profile_mutation)
     }
+
+    async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
+        let _operation = self.operation.lock().await;
+        self.subscription_list_dto()
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn activate_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        self.activate_subscription(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn refresh_subscription_profile(
+        &self,
+        id: ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.refresh_profile_locked(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.subscription_list_dto()
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn delete_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        self.delete_subscription(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)
+    }
+
     async fn connect(&self) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
         let (snapshot, queued_selections) = {
@@ -2880,24 +3113,83 @@ pub struct MemoryBackend {
     inner: RwLock<MemoryState>,
 }
 
-#[derive(Default)]
 struct MemoryState {
     connection: ConnectionState,
-    subscriptions: u64,
+    profiles: Vec<MemoryProfile>,
+    active_profile_id: Option<ProfileId>,
+    next_profile_id: u64,
     events: EventBuffer<EventDto>,
+}
+
+impl Default for MemoryState {
+    fn default() -> Self {
+        Self {
+            connection: ConnectionState::Empty,
+            profiles: Vec::new(),
+            active_profile_id: None,
+            next_profile_id: 1,
+            events: EventBuffer::default(),
+        }
+    }
+}
+
+struct MemoryProfile {
+    id: ProfileId,
+    source_url: String,
+    display_name: String,
 }
 
 impl MemoryState {
     fn status(&self) -> StatusDto {
-        let has_profile = self.subscriptions > 0;
+        let active = self.active_profile_id.as_ref().and_then(|active_id| {
+            self.profiles
+                .iter()
+                .find(|profile| &profile.id == active_id)
+        });
         StatusDto {
             state: self.connection,
-            active_profile_id: None,
-            profile: has_profile.then(|| "Основной профиль".to_owned()),
-            current_node: has_profile.then(|| "Авто".to_owned()),
+            active_profile_id: active.map(|profile| profile.id.as_str().to_owned()),
+            profile: active.map(|profile| profile.display_name.clone()),
+            current_node: active.map(|_| "Авто".to_owned()),
             message: None,
             degraded: false,
             subscription: None,
+        }
+    }
+
+    fn subscriptions(&self) -> SubscriptionListDto {
+        SubscriptionListDto {
+            active_profile_id: self
+                .active_profile_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            profiles: self
+                .profiles
+                .iter()
+                .map(|profile| SubscriptionProfileDto {
+                    id: profile.id.as_str().to_owned(),
+                    active: self.active_profile_id.as_ref() == Some(&profile.id),
+                    available: true,
+                    display_name: profile.display_name.clone(),
+                    used_bytes: None,
+                    total_bytes: None,
+                    expires_at_unix: None,
+                    service_logo_path: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn require_mutable(&self) -> Result<(), BackendError> {
+        if matches!(
+            self.connection,
+            ConnectionState::Connecting | ConnectionState::Connected
+        ) {
+            Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Connected,
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -2926,12 +3218,107 @@ impl Backend for MemoryBackend {
 
     async fn import_subscription(
         &self,
-        _request: ImportSubscriptionRequest,
+        request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
         let mut state = self.inner.write().await;
-        state.subscriptions += 1;
+        state.require_mutable()?;
+        let source_url = request.url.trim();
+        if let Some(existing_id) = state
+            .profiles
+            .iter()
+            .find(|profile| profile.source_url == source_url)
+            .map(|profile| profile.id.clone())
+        {
+            state.active_profile_id = Some(existing_id);
+        } else {
+            if state.profiles.len() >= MAX_PROFILES {
+                return Err(BackendError::from_profile_mutation(
+                    ProfileMutationError::LimitReached,
+                ));
+            }
+            let id = ProfileId::parse(&format!(
+                "00000000-0000-4000-8000-{:012x}",
+                state.next_profile_id
+            ))
+            .map_err(|_| BackendError::new())?;
+            state.next_profile_id = state.next_profile_id.saturating_add(1);
+            let display_name = format!("Профиль {}", state.profiles.len() + 1);
+            state.profiles.push(MemoryProfile {
+                id: id.clone(),
+                source_url: source_url.to_owned(),
+                display_name,
+            });
+            state.active_profile_id = Some(id);
+        }
         state.connection = ConnectionState::Ready;
         state.push_event("info", "Подписка импортирована.");
+        Ok(state.status())
+    }
+
+    async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
+        let state = self.inner.read().await;
+        state.require_mutable()?;
+        if state.active_profile_id.is_none() {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        }
+        Ok(state.status())
+    }
+
+    async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
+        Ok(self.inner.read().await.subscriptions())
+    }
+
+    async fn activate_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        let mut state = self.inner.write().await;
+        if !state.profiles.iter().any(|profile| profile.id == id) {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        }
+        state.require_mutable()?;
+        state.active_profile_id = Some(id);
+        state.connection = ConnectionState::Ready;
+        Ok(state.status())
+    }
+
+    async fn refresh_subscription_profile(
+        &self,
+        id: ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        let state = self.inner.read().await;
+        if !state.profiles.iter().any(|profile| profile.id == id) {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        }
+        state.require_mutable()?;
+        Ok(state.subscriptions())
+    }
+
+    async fn delete_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        let mut state = self.inner.write().await;
+        let Some(position) = state.profiles.iter().position(|profile| profile.id == id) else {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        };
+        state.require_mutable()?;
+        let was_active = state.active_profile_id.as_ref() == Some(&id);
+        state.profiles.remove(position);
+        if was_active {
+            state.active_profile_id = state
+                .profiles
+                .get(position)
+                .or_else(|| state.profiles.last())
+                .map(|profile| profile.id.clone());
+        }
+        state.connection = if state.profiles.is_empty() {
+            ConnectionState::Empty
+        } else {
+            ConnectionState::Ready
+        };
         Ok(state.status())
     }
 
@@ -2944,10 +3331,10 @@ impl Backend for MemoryBackend {
 
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
         let mut state = self.inner.write().await;
-        state.connection = if state.subscriptions > 0 {
-            ConnectionState::Ready
-        } else {
+        state.connection = if state.profiles.is_empty() {
             ConnectionState::Empty
+        } else {
+            ConnectionState::Ready
         };
         state.push_event("info", "Подключение остановлено.");
         Ok(state.status())
