@@ -455,6 +455,8 @@ export component AppWindow inherits Window {
     in-out property <string> expanded-profile-id;
     in-out property <string> profile-management-focus-id;
     in-out property <int> profile-management-focus-serial;
+    in-out property <string> profile-delete-control-focus-id;
+    in-out property <int> profile-delete-control-focus-serial;
     private property <string> visible-page: root.active-panel == "routes" ? "home" : root.active-panel == "events" ? "status" : root.local-page;
     private property <bool> profile-menu-open: root.active-panel == "subscription";
     private property <bool> profile-menu-was-open: false;
@@ -523,7 +525,9 @@ export component AppWindow inherits Window {
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 if (root.profile-delete-confirm-id != "") {
+                    root.profile-delete-control-focus-id = root.profile-delete-confirm-id;
                     root.profile-delete-confirm-id = "";
+                    root.profile-delete-control-focus-serial += 1;
                 } else { root.escape-pressed(); }
                 return accept;
             }
@@ -1267,11 +1271,14 @@ export component AppWindow inherits Window {
                                                 refresh-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.refresh-profile(profile.id); } }
                                             }
                                             if root.profile-delete-confirm-id != profile.id: delete-profile-focus := FocusScope {
+                                                property <int> focus-serial: root.profile-delete-control-focus-serial;
                                                 x: 52px; y: 82px; width: 44px; height: 44px;
                                                 enabled: root.profile-pending-operation == "none";
                                                 focus-on-click: true; focus-on-tab-navigation: true;
                                                 accessible-role: button; accessible-label: "Удалить " + profile.title; accessible-enabled: self.enabled;
                                                 accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = profile.id; } }
+                                                init => { if (root.profile-delete-control-focus-id == profile.id && root.profile-delete-control-focus-serial > 0) { self.focus(); } }
+                                                changed focus-serial => { if (root.profile-delete-control-focus-id == profile.id && self.enabled) { self.focus(); } }
                                                 Rectangle { border-radius: 8px; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 12px; y: 12px; width: 20px; height: 20px; source: @image-url("../assets/trash.svg"); image-fit: contain; accessible-role: none; } }
                                                 key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = profile.id; return accept; } return reject; }
                                                 delete-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-delete-confirm-id = profile.id; } }
@@ -1281,18 +1288,18 @@ export component AppWindow inherits Window {
                                                 Text { x: 8px; y: 1px; width: 172px; height: 18px; text: "Удалить подписку?"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: center; }
                                                 confirm-delete-focus := FocusScope {
                                                     x: 4px; y: 20px; width: 108px; height: 44px; focus-on-click: true; focus-on-tab-navigation: true;
-                                                    accessible-role: button; accessible-label: "Подтвердить удаление " + profile.title; accessible-action-default => { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); }
+                                                    accessible-role: button; accessible-label: "Подтвердить удаление " + profile.title; accessible-action-default => { root.delete-profile(profile.id); }
                                                     init => { self.focus(); }
                                                     Rectangle { border-radius: 8px; background: confirm-delete-touch.has-hover ? #f06a6a26 : #f06a6a18; border-color: parent.has-focus ? #f06a6a70 : #f06a6a44; border-width: 1px; Text { text: "Удалить"; color: Theme.error; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; } }
-                                                    key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); return accept; } return reject; }
-                                                    confirm-delete-touch := TouchArea { clicked => { root.profile-delete-confirm-id = ""; root.delete-profile(profile.id); } }
+                                                    key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.delete-profile(profile.id); return accept; } return reject; }
+                                                    confirm-delete-touch := TouchArea { clicked => { root.delete-profile(profile.id); } }
                                                 }
                                                 cancel-delete-focus := FocusScope {
                                                     x: 116px; y: 20px; width: 68px; height: 44px; focus-on-click: true; focus-on-tab-navigation: true;
-                                                    accessible-role: button; accessible-label: "Отменить удаление"; accessible-action-default => { root.profile-delete-confirm-id = ""; }
+                                                    accessible-role: button; accessible-label: "Отменить удаление"; accessible-action-default => { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; }
                                                     Rectangle { border-radius: 8px; background: cancel-delete-touch.has-hover ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Text { text: "Нет"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; } }
-                                                    key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-confirm-id = ""; return accept; } return reject; }
-                                                    cancel-delete-touch := TouchArea { clicked => { root.profile-delete-confirm-id = ""; } }
+                                                    key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; return accept; } return reject; }
+                                                    cancel-delete-touch := TouchArea { clicked => { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; } }
                                                 }
                                             }
                                         }
