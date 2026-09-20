@@ -16,6 +16,8 @@ fn fake_pe() -> Vec<u8> {
     bytes[0x3c..0x40].copy_from_slice(&(0x80_u32).to_le_bytes());
     bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
     bytes[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+    bytes[0x94..0x96].copy_from_slice(&0x00f0_u16.to_le_bytes());
+    bytes[0x98..0x9a].copy_from_slice(&0x020b_u16.to_le_bytes());
     bytes
 }
 
@@ -28,6 +30,7 @@ fn required_files() -> BTreeMap<String, Vec<u8>> {
         ("cores/xray.exe".into(), fake_pe()),
         ("licenses/Xray-core-MPL-2.0.txt".into(), b"mpl".to_vec()),
         ("licenses/mihomo-GPL-3.0.txt".into(), b"gpl".to_vec()),
+        ("runtime/multicore-core-host.exe".into(), fake_pe()),
         ("runtime/multicore-daemon.exe".into(), fake_pe()),
         ("runtime/multicore-updater.exe".into(), fake_pe()),
         ("versions.json".into(), b"{}".to_vec()),
@@ -89,7 +92,7 @@ fn valid_bundle_extracts_and_verifies_every_file() {
 
     let destination = temp.path().join("out");
     let inventory = extract_verified_bundle(&archive, &destination).unwrap();
-    assert_eq!(inventory.files(), 11);
+    assert_eq!(inventory.files(), 12);
     assert_eq!(
         std::fs::read(destination.join("MultiCore.exe")).unwrap(),
         fake_pe()
@@ -253,5 +256,51 @@ fn missing_required_updater_is_rejected() {
         error
             .to_string()
             .contains("required bundle file is missing")
+    );
+}
+
+#[test]
+fn missing_or_non_pe32_plus_amd64_core_host_is_rejected() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("missing-core-host.zip");
+    let mut files = required_files();
+    files.remove("runtime/multicore-core-host.exe");
+    write_bundle(&archive, &files, &files);
+
+    let error = extract_verified_bundle(&archive, &temp.path().join("missing-out")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("required bundle file is missing: runtime/multicore-core-host.exe"),
+        "{error}"
+    );
+
+    let archive = temp.path().join("pe32-core-host.zip");
+    let mut files = required_files();
+    let mut pe32 = fake_pe();
+    pe32[0x98..0x9a].copy_from_slice(&0x010b_u16.to_le_bytes());
+    files.insert("runtime/multicore-core-host.exe".into(), pe32);
+    write_bundle(&archive, &files, &files);
+
+    let error = extract_verified_bundle(&archive, &temp.path().join("pe32-out")).unwrap_err();
+    assert!(error.to_string().contains("PE32+ AMD64"), "{error}");
+}
+
+#[test]
+#[ignore = "requires a locally built release ZIP named by MULTICORE_RELEASE_BUNDLE"]
+fn built_release_bundle_matches_updater_contract() {
+    let archive = std::env::var_os("MULTICORE_RELEASE_BUNDLE")
+        .map(std::path::PathBuf::from)
+        .expect("MULTICORE_RELEASE_BUNDLE must name the built release ZIP");
+    let temp = TempDir::new().unwrap();
+    let destination = temp.path().join("release");
+
+    let inventory = extract_verified_bundle(&archive, &destination).unwrap();
+
+    assert_eq!(inventory.files(), 12);
+    assert!(
+        destination
+            .join("runtime/multicore-core-host.exe")
+            .is_file()
     );
 }

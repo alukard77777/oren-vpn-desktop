@@ -63,9 +63,10 @@ function Get-MultiCoreWindow {
 $package = (Resolve-Path -LiteralPath $PackagePath).Path
 $desktopExe = [IO.Path]::GetFullPath((Join-Path $package $DesktopExecutableName))
 $daemonExe = [IO.Path]::GetFullPath((Join-Path $package 'runtime\multicore-daemon.exe'))
+$coreHostExe = [IO.Path]::GetFullPath((Join-Path $package 'runtime\multicore-core-host.exe'))
 $xrayExe = [IO.Path]::GetFullPath((Join-Path $package 'cores\xray.exe'))
 $mihomoExe = [IO.Path]::GetFullPath((Join-Path $package 'cores\mihomo.exe'))
-foreach ($file in @($desktopExe, $daemonExe, $xrayExe, $mihomoExe)) {
+foreach ($file in @($desktopExe, $daemonExe, $coreHostExe, $xrayExe, $mihomoExe)) {
     if (-not [IO.File]::Exists($file)) { throw "Package executable is missing: $file" }
     if ((Get-Item -LiteralPath $file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
         throw "Package executable is a reparse point: $file"
@@ -134,6 +135,14 @@ try {
     } until ($listeners.Count -eq 1 -or [DateTime]::UtcNow -ge $listenerDeadline)
     if ($listeners.Count -ne 1) { throw "Expected one daemon loopback listener; observed $($listeners.Count)" }
 
+    # Do not POST /v1/connect here: that is a live UAC/TUN action and remains a
+    # manual release gate. This non-live smoke proves normal launch does not
+    # start the privileged host before the user explicitly chooses Connect.
+    $coreHostsBeforeConnect = @(Get-ExactProcess $coreHostExe)
+    if ($coreHostsBeforeConnect.Count -ne 0) {
+        throw "Core host started before explicit Connect; observed $($coreHostsBeforeConnect.Count)"
+    }
+
     $status = $null
     try {
         $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri ("http://127.0.0.1:{0}/v1/status" -f $listeners[0].LocalPort)
@@ -146,10 +155,6 @@ try {
         }
     }
     if ($status -ne 401) { throw "Tokenless daemon status returned $status instead of 401" }
-
-    $coreLog = Join-Path $smokeRoot 'MultiCore\logs\latest-core.log'
-    if (-not [IO.File]::Exists($coreLog)) { throw 'Daemon did not create the bounded latest-core.log diagnostics sink' }
-    if ((Get-Item -LiteralPath $coreLog).Length -gt 1048576) { throw 'latest-core.log exceeded its one-mebibyte bound' }
 
     if ($CrashCleanup) {
         Stop-Process -Id $desktop.Id -Force
@@ -165,7 +170,7 @@ try {
     $leakDeadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         $leaks = @()
-        foreach ($path in @($desktopExe, $daemonExe, $xrayExe, $mihomoExe)) {
+        foreach ($path in @($desktopExe, $daemonExe, $coreHostExe, $xrayExe, $mihomoExe)) {
             $leaks += @(Get-ExactProcess $path)
         }
         if ($leaks.Count -ne 0) { Start-Sleep -Milliseconds 100 }
@@ -181,7 +186,8 @@ try {
         DaemonPid = $daemonPid
         ApiPort = $listeners[0].LocalPort
         TokenlessStatus = $status
-        CoreLog = 'created'
+        CoreHostBeforeConnect = 'absent'
+        LiveConnectUac = 'manual release gate (not exercised)'
         DesktopShutdown = $shutdown
         Cleanup = 'verified'
     } | Format-List

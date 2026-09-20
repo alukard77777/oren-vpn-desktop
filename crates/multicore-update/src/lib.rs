@@ -507,6 +507,7 @@ const REQUIRED_BUNDLE_FILES: &[&str] = &[
     "cores/xray.exe",
     "licenses/Xray-core-MPL-2.0.txt",
     "licenses/mihomo-GPL-3.0.txt",
+    "runtime/multicore-core-host.exe",
     "runtime/multicore-daemon.exe",
     "runtime/multicore-updater.exe",
     "versions.json",
@@ -516,6 +517,7 @@ const REQUIRED_PE_FILES: &[&str] = &[
     "MultiCore.exe",
     "cores/mihomo.exe",
     "cores/xray.exe",
+    "runtime/multicore-core-host.exe",
     "runtime/multicore-daemon.exe",
     "runtime/multicore-updater.exe",
 ];
@@ -603,11 +605,12 @@ fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
     }
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(pe_offset as u64))?;
-    let mut signature_and_machine = [0_u8; 6];
-    file.read_exact(&mut signature_and_machine)?;
-    if &signature_and_machine[..4] != b"PE\0\0"
-        || u16::from_le_bytes(signature_and_machine[4..6].try_into().expect("fixed slice"))
-            != 0x8664
+    let mut pe_header = [0_u8; 26];
+    file.read_exact(&mut pe_header)?;
+    if &pe_header[..4] != b"PE\0\0"
+        || u16::from_le_bytes(pe_header[4..6].try_into().expect("fixed slice")) != 0x8664
+        || u16::from_le_bytes(pe_header[20..22].try_into().expect("fixed slice")) < 2
+        || u16::from_le_bytes(pe_header[24..26].try_into().expect("fixed slice")) != 0x020b
     {
         return Err(UpdateError::InvalidBundle(
             "required executable is not PE32+ AMD64".into(),
@@ -675,6 +678,11 @@ fn transactional_swap_with(
     Ok(())
 }
 
+#[doc(hidden)]
+pub fn archive_entry_unix_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Option<u32> {
+    entry.unix_mode()
+}
+
 #[cfg(test)]
 mod publication_tests {
     use super::{MAX_EXPANDED_BYTES, effective_expanded_limit, transactional_swap_with};
@@ -733,9 +741,4 @@ mod publication_tests {
         assert!(backup.join("old.txt").is_file());
         assert!(!staged.exists());
     }
-}
-
-#[doc(hidden)]
-pub fn archive_entry_unix_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Option<u32> {
-    entry.unix_mode()
 }

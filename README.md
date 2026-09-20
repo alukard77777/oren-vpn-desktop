@@ -7,9 +7,11 @@ transports through local SOCKS inbounds. No WebView is used.
 
 The desktop and its private daemon run as the current user. Windows UAC is
 requested only when **Connect** launches `multicore-core-host.exe`. That elevated
-host owns Xray and Mihomo in a kill-on-close Job Object and shuts them down when
-the authenticated named pipe closes. Normal launch, subscription refresh,
-settings, autostart, and update checks do not require elevation.
+host is reused across Connect operations for the daemon lifetime and owns Xray
+and Mihomo in a kill-on-close Job Object. Disconnect stops both cores; closing
+the authenticated named pipe stops the cores and exits the host. Normal launch,
+subscription refresh, settings, autostart, and update checks do not require
+elevation.
 
 > **Preview status:** this feature branch is a preview until it is merged and a
 > signed production release is published. Current binaries are not
@@ -44,17 +46,18 @@ and no redirects.
 
 ## Provider HTTP contract
 
-One subscription URL supports four fixed User-Agent values:
+The subscription URL supports three fixed configuration User-Agent values:
 
 | User-Agent | Response |
 | --- | --- |
 | `multicore-json-massive` | `["<Mihomo YAML>", {<Xray JSON>}]` JSON tuple |
 | `multicore-mihomo` | complete Mihomo YAML |
 | `multicore-xray` | one Xray JSON object |
-| `multicore-service-logo` | optional provider logo image |
 
 Configuration requests include `x-hwid`, `x-device-os`, `x-ver-os`, and
-`x-device-model`. Logo requests deliberately omit those identity headers. A
+`x-device-model`. Provider metadata may supply a separate optional logo URL;
+MultiCore fetches that URL with `multicore-service-logo` and deliberately omits
+the configuration identity headers. A
 successful HTTP response to `multicore-json-massive` is authoritative: parsing
 failure is reported and does not fall back. Only an unavailable or explicitly
 unsupported massive response triggers the atomic Mihomo + Xray fallback pair.
@@ -65,9 +68,11 @@ needed to bootstrap before TUN. See the complete
 [subscription HTTP contract](docs/subscription-http-contract.md) and the
 [provider implementation contract](docs/contracts/multicore-subscription-backend-prompt.md).
 
-The provider sees the usual HTTP request data, the subscription URL, the four
-configuration identity headers, and the selected User-Agent. MultiCore does not
-operate analytics, telemetry, crash-reporting, account, or subscription
+The configuration provider sees the usual HTTP request data, the subscription
+URL, the four configuration identity headers, and the selected configuration
+User-Agent. A metadata-provided logo endpoint sees its logo URL and the
+`multicore-service-logo` User-Agent, but not those identity headers. MultiCore
+does not operate analytics, telemetry, crash-reporting, account, or subscription
 services. See [PRIVACY.md](PRIVACY.md).
 
 ## Data, runtime, and updates
