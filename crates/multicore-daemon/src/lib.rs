@@ -1409,7 +1409,7 @@ where
         }
 
         let staging = AtomicSnapshot::default();
-        let snapshot = match self.fetcher.refresh(&request.url, &staging).await {
+        let fetched = match self.fetcher.refresh(&request.url, &staging).await {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 let mut state = self.inner.write().await;
@@ -1426,6 +1426,11 @@ where
                 return Err(BackendError::new());
             }
         };
+        let (snapshot, staging_debt) = fetched.into_parts();
+        debug_assert!(
+            staging_debt.is_none(),
+            "in-memory snapshot staging cannot accumulate persistence debt"
+        );
         let prepared = match (self.controller_factory)(&snapshot) {
             Ok(prepared) => prepared,
             Err(error) => {

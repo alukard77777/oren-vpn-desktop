@@ -389,12 +389,12 @@ async fn failed_logo_generation_staging_keeps_the_last_good_logo_path() {
         std::process::id()
     )))
     .unwrap();
-    assert_eq!(
+    assert!(matches!(
         SubscriptionFetcher::new(http)
             .refresh("https://subscription.example/private", &store)
             .await,
         Err(FetchError::Persistence)
-    );
+    ));
     assert_eq!(
         store.current().unwrap().service_logo_path(),
         Some(last_good.as_path())
@@ -479,7 +479,7 @@ async fn invalid_config_never_triggers_a_logo_request() {
             &multicore_core::AtomicSnapshot::default(),
         )
         .await;
-    assert_eq!(result, Err(FetchError::InvalidBundle));
+    assert!(matches!(result, Err(FetchError::InvalidBundle)));
     assert_eq!(*calls.lock().unwrap(), [UA_NATIVE]);
 }
 

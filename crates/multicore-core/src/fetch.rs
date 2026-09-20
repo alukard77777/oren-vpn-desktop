@@ -11,8 +11,8 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
-    DeviceIdentity, MAX_CONFIG_BYTES, MAX_SERVICE_LOGO_BYTES, Snapshot, SnapshotSink,
-    normalize_service_logo,
+    DeviceIdentity, MAX_CONFIG_BYTES, MAX_SERVICE_LOGO_BYTES, Snapshot, SnapshotCommit,
+    SnapshotSink, normalize_service_logo,
 };
 
 pub const UA_NATIVE: &str = "multicore-json-massive";
@@ -372,7 +372,7 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         &self,
         url: &str,
         store: &S,
-    ) -> Result<Arc<Snapshot>, FetchError> {
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, FetchError> {
         if let Ok(response) = self.client.get(url, UA_NATIVE).await
             && response.status_is_success()
         {
@@ -623,5 +623,56 @@ mod logo_network_tests {
             Err(FetchError::TooLarge)
         );
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod persistence_outcome_tests {
+    use super::*;
+    use crate::PersistentSnapshotStore;
+
+    #[derive(Clone)]
+    struct NativeBundleClient;
+
+    impl HttpClient for NativeBundleClient {
+        fn get<'a>(
+            &'a self,
+            _url: &'a str,
+            _user_agent: &'static str,
+        ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+            Box::pin(async move {
+                let mihomo = "proxies: []\nproxy-groups: []\nrules: []\n";
+                let bundle = format!(
+                    "[{},{}]",
+                    serde_json::to_string(mihomo).unwrap(),
+                    r#"{"outbounds":[]}"#
+                );
+                Ok(HttpResponse::new(
+                    200,
+                    bundle.into_bytes(),
+                    std::iter::empty::<(&str, &str)>(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_committed_snapshot_with_directory_sync_debt() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        store.inject_directory_sync_failure();
+
+        let outcome = SubscriptionFetcher::new(NativeBundleClient)
+            .refresh("https://subscription.invalid/private", &store)
+            .await
+            .expect("post-publication debt is a committed fetch outcome");
+        assert!(outcome.maintenance_debt().is_some());
+        let (committed, debt) = outcome.into_parts();
+        assert!(debt.is_some());
+        assert!(Arc::ptr_eq(&committed, &store.current().unwrap()));
+        assert_eq!(
+            committed.subscription_source_url(),
+            Some("https://subscription.invalid/private")
+        );
     }
 }

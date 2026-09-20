@@ -587,12 +587,15 @@ impl AtomicSnapshot {
 }
 
 pub trait SnapshotSink: Send + Sync {
-    fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError>;
+    fn save(&self, snapshot: Snapshot) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError>;
 }
 
 impl SnapshotSink for AtomicSnapshot {
-    fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        Ok(self.commit(snapshot))
+    fn save(&self, snapshot: Snapshot) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        Ok(SnapshotCommit {
+            committed: self.commit(snapshot),
+            maintenance_debt: None,
+        })
     }
 }
 
@@ -623,11 +626,16 @@ impl<T> SnapshotCommit<T> {
         (self.committed, self.maintenance_debt)
     }
 
-    fn into_legacy_result(self) -> Result<T, PersistenceError> {
-        match self.maintenance_debt {
-            Some(error) => Err(PersistenceError::MaintenanceDebt(error)),
-            None => Ok(self.committed),
-        }
+    pub fn into_committed(self) -> T {
+        self.committed
+    }
+}
+
+impl<T> std::ops::Deref for SnapshotCommit<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.committed
     }
 }
 
@@ -637,6 +645,8 @@ pub struct PersistentSnapshotStore {
     current: RwLock<Option<(u64, Arc<Snapshot>)>>,
     next_generation: AtomicU64,
     commit_lock: Mutex<()>,
+    #[cfg(test)]
+    logo_retention_fault: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -820,6 +830,8 @@ impl PersistentSnapshotStore {
             current: RwLock::new(current),
             next_generation: AtomicU64::new(highest_id.saturating_add(1).max(1)),
             commit_lock: Mutex::new(()),
+            #[cfg(test)]
+            logo_retention_fault: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -843,8 +855,11 @@ impl PersistentSnapshotStore {
             .map(|(generation, _)| *generation)
     }
 
-    pub fn commit(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        self.commit_status(snapshot)?.into_legacy_result()
+    pub fn commit(
+        &self,
+        snapshot: Snapshot,
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        self.commit_status(snapshot)
     }
 
     pub fn commit_status(
@@ -862,9 +877,8 @@ impl PersistentSnapshotStore {
     pub fn commit_with_generation(
         &self,
         snapshot: Snapshot,
-    ) -> Result<(u64, Arc<Snapshot>), PersistenceError> {
-        self.commit_with_generation_status(snapshot)?
-            .into_legacy_result()
+    ) -> Result<SnapshotCommit<(u64, Arc<Snapshot>)>, PersistenceError> {
+        self.commit_with_generation_status(snapshot)
     }
 
     pub fn commit_with_generation_status(
@@ -878,6 +892,8 @@ impl PersistentSnapshotStore {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let published_name = format!("snapshot-{generation:020}");
         let (staging_name, staging) = create_snapshot_staging(&self.root, &published_name)?;
+        snapshot.service_logo_path = None;
+        snapshot.service_logo_file = None;
 
         let publication = (|| {
             staging.write_file(
@@ -915,14 +931,39 @@ impl PersistentSnapshotStore {
                 return Err(PersistenceError::Io(error));
             }
         };
+        let mut maintenance_debt = directory_sync.err();
         if snapshot.service_logo_png.is_some() {
-            let published_directory = self.root.open_child(OsStr::new(&published_name))?;
-            let (_, retained) = published_directory.read_file_retained(
-                OsStr::new("service-logo.png"),
-                MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
-            )?;
-            snapshot.service_logo_path = retained.path().map(Path::to_owned);
-            snapshot.service_logo_file = Some(retained);
+            #[cfg(test)]
+            let inject_retention_failure = self
+                .logo_retention_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let inject_retention_failure = false;
+            let retention = if inject_retention_failure {
+                Err(io::Error::other(
+                    "injected post-publication logo retention failure",
+                ))
+            } else {
+                self.root
+                    .open_child(OsStr::new(&published_name))
+                    .and_then(|directory| {
+                        directory
+                            .read_file_retained(
+                                OsStr::new("service-logo.png"),
+                                MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
+                            )
+                            .map(|(_, retained)| retained)
+                    })
+            };
+            match retention {
+                Ok(retained) => {
+                    snapshot.service_logo_path = retained.path().map(Path::to_owned);
+                    snapshot.service_logo_file = Some(retained);
+                }
+                Err(error) => {
+                    maintenance_debt = Some(combine_persistence_debt(maintenance_debt, error));
+                }
+            }
         }
         let snapshot = Arc::new(snapshot);
         *self
@@ -931,21 +972,26 @@ impl PersistentSnapshotStore {
             .expect("persistent snapshot lock poisoned") = Some((generation, snapshot.clone()));
         Ok(SnapshotCommit {
             committed: (generation, snapshot),
-            maintenance_debt: directory_sync.err(),
+            maintenance_debt,
         })
     }
 }
 
 impl SnapshotSink for PersistentSnapshotStore {
-    fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        self.commit(snapshot)
+    fn save(&self, snapshot: Snapshot) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        self.commit_status(snapshot)
     }
 }
 
 #[cfg(test)]
 impl PersistentSnapshotStore {
-    fn inject_directory_sync_failure(&self) {
+    pub(crate) fn inject_directory_sync_failure(&self) {
         self.root.inject_sync_failure();
+    }
+
+    fn inject_logo_retention_failure(&self) {
+        self.logo_retention_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1372,6 +1418,18 @@ fn create_snapshot_staging(
     Ok((name, child))
 }
 
+fn combine_persistence_debt(existing: Option<io::Error>, next: io::Error) -> io::Error {
+    match existing {
+        Some(existing) => io::Error::new(
+            next.kind(),
+            format!(
+                "directory sync failed ({existing}); post-publication maintenance failed: {next}"
+            ),
+        ),
+        None => next,
+    }
+}
+
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     secure_file(path)?;
@@ -1567,11 +1625,39 @@ mod persistence_tests {
         )
         .unwrap();
 
-        let outcome = store.commit_with_generation_status(snapshot).unwrap();
+        let outcome = store.commit_with_generation(snapshot).unwrap();
         assert!(outcome.maintenance_debt().is_some());
         let ((generation, committed), debt) = outcome.into_parts();
         assert_eq!(generation, 1);
         assert!(debt.is_some());
         assert!(Arc::ptr_eq(&committed, &store.current().unwrap()));
+    }
+
+    #[test]
+    fn committed_outcome_survives_post_publication_logo_retention_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let mut snapshot = Snapshot::parse(
+            b"proxies: []\nproxy-groups: []\nrules: []\n",
+            br#"{"outbounds":[]}"#,
+        )
+        .unwrap();
+        snapshot.set_service_logo_png(b"persisted logo bytes".to_vec());
+        let first = store.commit(snapshot).unwrap().into_committed();
+        assert!(first.service_logo_path().is_some());
+
+        store.inject_logo_retention_failure();
+        let outcome = store.commit_with_generation((*first).clone()).unwrap();
+        assert!(outcome.maintenance_debt().is_some());
+        let ((generation, committed), debt) = outcome.into_parts();
+        assert_eq!(generation, 2);
+        assert!(debt.is_some());
+        assert!(committed.service_logo_path().is_none());
+        assert!(Arc::ptr_eq(&committed, &store.current().unwrap()));
+        assert!(
+            root.path()
+                .join("snapshot-00000000000000000002/service-logo.png")
+                .is_file()
+        );
     }
 }
