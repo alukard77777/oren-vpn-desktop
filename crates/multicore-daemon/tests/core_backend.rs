@@ -1186,6 +1186,58 @@ async fn persisted_profile_loads_without_network_preparation_until_connect() {
     );
 }
 
+#[tokio::test]
+async fn default_constructor_connects_without_replaying_an_implicit_catalog_default() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let backend = CoreBackend::new(store, SubscriptionFetcher::new(OfflineHttp), |_snapshot| {
+        Ok(Arc::new(RecordingController::default()))
+    })
+    .unwrap();
+
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[0].selected);
+    assert_eq!(
+        backend.connect().await.unwrap().state,
+        ConnectionState::Connected
+    );
+}
+
+#[tokio::test]
+async fn default_transactional_constructor_connects_without_replaying_an_implicit_default() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = directory.path().join("runtime");
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let factory = transactional_controller_factory(move |snapshot: &Snapshot| {
+        let staged = stage_runtime_with_mihomo_control(snapshot, &runtime, &control)
+            .map_err(|_| BackendError::new())?;
+        Ok(PreparedController::with_runtime(
+            Arc::new(RecordingController::default()),
+            staged,
+        ))
+    });
+    let backend =
+        CoreBackend::new_transactional(store, SubscriptionFetcher::new(OfflineHttp), factory)
+            .unwrap();
+
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[0].selected);
+    assert_eq!(
+        backend.connect().await.unwrap().state,
+        ConnectionState::Connected
+    );
+}
+
 #[test]
 fn status_states_serialize_exactly_as_the_desktop_contract() {
     let cases = [

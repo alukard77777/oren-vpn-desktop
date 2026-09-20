@@ -90,7 +90,6 @@ struct RecordingSelector {
 struct BlockingSelector {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
-    call_count: std::sync::atomic::AtomicUsize,
 }
 
 struct SequencedSelector {
@@ -118,9 +117,6 @@ impl MihomoSelector for SequencedSelector {
 #[async_trait]
 impl MihomoSelector for BlockingSelector {
     async fn select(&self, _group: &str, _node: &str) -> Result<(), SelectorError> {
-        if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Ok(());
-        }
         self.entered.notify_one();
         self.release.notified().await;
         Ok(())
@@ -311,7 +307,6 @@ async fn select_and_import_are_serialized_by_the_shared_operation_mutex() {
             Arc::new(BlockingSelector {
                 entered: entered.clone(),
                 release: release.clone(),
-                call_count: std::sync::atomic::AtomicUsize::new(0),
             }),
         )
         .unwrap(),
@@ -433,6 +428,15 @@ async fn failed_startup_selection_replay_rolls_cores_back_to_ready() {
         fail: AtomicBool::new(true),
     });
     let backend = backend(selector);
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[0].id.clone(),
+            node_id: catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
     assert!(backend.connect().await.is_err());
     let status = backend.status().await.unwrap();
     assert_eq!(status.state, multicore_daemon::ConnectionState::Ready);
@@ -557,7 +561,7 @@ async fn failed_live_selection_compensation_marks_runtime_degraded() {
     let selector = Arc::new(SequencedSelector {
         calls: Mutex::new(Vec::new()),
         call_count: std::sync::atomic::AtomicUsize::new(0),
-        fail_on_call: 3,
+        fail_on_call: 2,
     });
     let backend = CoreBackend::new_with_selector(
         store,

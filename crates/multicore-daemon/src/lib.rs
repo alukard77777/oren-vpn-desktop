@@ -1167,6 +1167,7 @@ struct CoreRuntime<P: ProcessController> {
     profile: Option<String>,
     current_node: Option<String>,
     selected_nodes: Vec<Option<String>>,
+    explicit_selected_nodes: Vec<Option<String>>,
     message: Option<String>,
     degraded: bool,
     events: EventBuffer<Event>,
@@ -1186,6 +1187,7 @@ impl<P: ProcessController> CoreRuntime<P> {
             profile: None,
             current_node: None,
             selected_nodes: Vec::new(),
+            explicit_selected_nodes: Vec::new(),
             message: None,
             degraded: false,
             events: EventBuffer::default(),
@@ -1269,10 +1271,11 @@ impl<P: ProcessController> CoreRuntime<P> {
         controller: Arc<P>,
         revision: u64,
         selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
     ) {
         self.active_profile_id = Some(id);
         self.controller = Some(controller);
-        self.apply_snapshot_metadata(snapshot, revision, selected_nodes);
+        self.apply_snapshot_metadata(snapshot, revision, selected_nodes, explicit_selected_nodes);
     }
 
     fn apply_snapshot_without_controller(
@@ -1281,10 +1284,11 @@ impl<P: ProcessController> CoreRuntime<P> {
         snapshot: Arc<Snapshot>,
         revision: u64,
         selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
     ) {
         self.active_profile_id = Some(id);
         self.controller = None;
-        self.apply_snapshot_metadata(snapshot, revision, selected_nodes);
+        self.apply_snapshot_metadata(snapshot, revision, selected_nodes, explicit_selected_nodes);
     }
 
     fn apply_snapshot_metadata(
@@ -1292,6 +1296,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         snapshot: Arc<Snapshot>,
         revision: u64,
         selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
     ) {
         if matches!(
             self.state.current(),
@@ -1302,6 +1307,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         let selectable = selectable_groups(&snapshot);
         self.profile = selectable.first().map(|group| group.name.to_owned());
         self.selected_nodes = selected_nodes;
+        self.explicit_selected_nodes = explicit_selected_nodes;
         self.current_node = self.selected_nodes.first().cloned().flatten();
         self.catalog = build_catalog(
             &snapshot,
@@ -1326,6 +1332,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         self.profile = None;
         self.current_node = None;
         self.selected_nodes.clear();
+        self.explicit_selected_nodes.clear();
         self.message = None;
         self.degraded = false;
     }
@@ -1440,8 +1447,15 @@ where
         let mut inner = CoreRuntime::empty();
         inner.active_profile_id = store.active_id();
         if let Ok(Some((id, revision, snapshot))) = store.active_snapshot() {
-            let selections = initial_or_restored_selections(&store, &id, revision, &snapshot);
-            inner.apply_snapshot_without_controller(id, snapshot, revision, selections);
+            let (selections, explicit_selections) =
+                initial_and_explicit_selections(&store, &id, revision, &snapshot);
+            inner.apply_snapshot_without_controller(
+                id,
+                snapshot,
+                revision,
+                selections,
+                explicit_selections,
+            );
         }
         Ok(Self {
             store,
@@ -1489,12 +1503,20 @@ where
             }
             Err(error) => return Err(map_profile_error(error)),
         };
-        let selections = initial_or_restored_selections(&self.store, id, revision, &snapshot);
+        let (selections, explicit_selections) =
+            initial_and_explicit_selections(&self.store, id, revision, &snapshot);
         let controller = prepared.controller();
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(id.clone(), snapshot, controller, revision, selections);
+            state.apply_snapshot(
+                id.clone(),
+                snapshot,
+                controller,
+                revision,
+                selections,
+                explicit_selections,
+            );
             if maintenance_debt {
                 state.push_event(
                     Severity::Warning,
@@ -1576,8 +1598,15 @@ where
         let mut state = self.inner.write().await;
         state.clear_for_active(authoritative_id);
         if let Some((id, revision, snapshot)) = loaded {
-            let selections = initial_or_restored_selections(&self.store, &id, revision, &snapshot);
-            state.apply_snapshot_without_controller(id, snapshot, revision, selections);
+            let (selections, explicit_selections) =
+                initial_and_explicit_selections(&self.store, &id, revision, &snapshot);
+            state.apply_snapshot_without_controller(
+                id,
+                snapshot,
+                revision,
+                selections,
+                explicit_selections,
+            );
         }
     }
 
@@ -1638,12 +1667,20 @@ where
             return Ok(self.current_status().await);
         }
         let prepared = prepared.expect("active refresh prepares a controller");
-        let selections = initial_or_restored_selections(&self.store, id, revision, &persisted);
+        let (selections, explicit_selections) =
+            initial_and_explicit_selections(&self.store, id, revision, &persisted);
         let controller = prepared.controller();
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(id.clone(), persisted, controller, revision, selections);
+            state.apply_snapshot(
+                id.clone(),
+                persisted,
+                controller,
+                revision,
+                selections,
+                explicit_selections,
+            );
             if maintenance_debt {
                 state.push_event(
                     Severity::Warning,
@@ -1718,12 +1755,20 @@ where
             .store
             .profile_snapshot(&id)
             .map_err(map_profile_error)?;
-        let selections = initial_or_restored_selections(&self.store, &id, revision, &persisted);
+        let (selections, explicit_selections) =
+            initial_and_explicit_selections(&self.store, &id, revision, &persisted);
         let controller = prepared.controller();
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(id, persisted, controller, revision, selections);
+            state.apply_snapshot(
+                id,
+                persisted,
+                controller,
+                revision,
+                selections,
+                explicit_selections,
+            );
             state.push_event(
                 Severity::Info,
                 Component::Subscription,
@@ -1819,22 +1864,20 @@ fn restored_selections(
         .collect()
 }
 
-fn initial_or_restored_selections(
+fn initial_and_explicit_selections(
     store: &ProfileStore,
     id: &ProfileId,
     revision: u64,
     snapshot: &Snapshot,
-) -> Vec<Option<String>> {
+) -> (Vec<Option<String>>, Vec<Option<String>>) {
+    let explicit = restored_selections(store, id, revision, snapshot);
     let mut selections = default_selections(snapshot);
-    for (selected, restored) in selections
-        .iter_mut()
-        .zip(restored_selections(store, id, revision, snapshot))
-    {
+    for (selected, restored) in selections.iter_mut().zip(&explicit) {
         if restored.is_some() {
-            *selected = restored;
+            selected.clone_from(restored);
         }
     }
-    selections
+    (selections, explicit)
 }
 
 #[async_trait]
@@ -1889,7 +1932,7 @@ where
             let snapshot = state.snapshot.clone().ok_or_else(BackendError::new)?;
             let queued_selections = selectable_groups(&snapshot)
                 .iter()
-                .zip(&state.selected_nodes)
+                .zip(&state.explicit_selected_nodes)
                 .filter_map(|(group, node)| {
                     node.as_ref()
                         .map(|node| (group.name.to_owned(), node.clone()))
@@ -2185,15 +2228,18 @@ where
             return Err(SelectionError::StaleRevision);
         }
         if maintenance_debt {
-            state.selected_nodes = initial_or_restored_selections(
+            let (selected_nodes, explicit_selected_nodes) = initial_and_explicit_selections(
                 &self.store,
                 &active_profile_id,
                 request.revision,
                 &snapshot,
             );
+            state.selected_nodes = selected_nodes;
+            state.explicit_selected_nodes = explicit_selected_nodes;
             state.current_node = state.selected_nodes.first().cloned().flatten();
         } else {
             state.selected_nodes[group_index] = Some(raw_node.clone());
+            state.explicit_selected_nodes[group_index] = Some(raw_node.clone());
             if group_index == 0 {
                 state.current_node = Some(raw_node);
             }
