@@ -42,8 +42,15 @@ blocked while connected.
 
 The subscription strip on the Home screen is a compact active-profile selector
 only. Adding, refreshing, inspecting, and deleting profiles lives under
-**Settings → Subscriptions**, so routine switching stays separate from profile
-management. Saved subscription URLs are not displayed back in the profile list.
+the top-level **Subscriptions** page, so routine switching stays separate from
+profile management. Expanded rows keep metadata and actions compact; saved
+subscription URLs are not displayed back in the profile list.
+
+The tray icon uses exact mouse behavior: left click restores the main window;
+right click toggles MultiCore's own compact control popup with connection,
+group, node, open, and exit actions. The Home page's ambient signal waves are
+bounded behind content and stop while hidden, minimized, or when Windows asks
+applications to reduce motion.
 
 The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
 daemon. Requests use a random per-launch bearer token, bounded bodies, no proxy,

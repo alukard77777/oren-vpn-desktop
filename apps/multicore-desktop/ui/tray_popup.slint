@@ -153,7 +153,7 @@ export component TrayPopup inherits Window {
                     label: root.connection-label;
                     marker: "●";
                     enabled: root.connection-enabled;
-                    selected: root.status-text == "В сети";
+                    selected: root.connection-label == "Отключиться";
                     activated => { root.toggle-connection(); }
                 }
 

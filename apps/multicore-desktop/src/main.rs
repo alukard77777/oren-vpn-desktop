@@ -3298,7 +3298,7 @@ mod window_tests {
             "Подписок пока нет",
             "Удалить подписку?",
             "До 16 подписок · активна только одна",
-            "Источник сохранён локально",
+            "Локальный источник",
             "root.settings-section == \"updates\"",
             "profile-menu-keyboard-open",
             "parent.has-focus && root.profile-menu-keyboard-open",
@@ -3452,6 +3452,8 @@ mod window_tests {
             "VisiblePage::Subscriptions => \"subscriptions\"",
             "\"subscriptions\" => Some(VisiblePage::Subscriptions)",
             "Subscriptions,",
+            "if root.visible-page == \"settings\" && root.settings-section == \"general\"",
+            "if root.visible-page == \"settings\" && root.settings-section == \"updates\"",
         ] {
             assert!(
                 ui.contains(required) || rust.contains(required) || preferences.contains(required),
@@ -3460,6 +3462,27 @@ mod window_tests {
         }
         assert!(!ui.contains("SettingsNavItem { width: parent.width; label: \"Подписки\""));
         assert!(!rust.contains("set_settings_section(\"subscriptions\""));
+    }
+
+    #[test]
+    fn expanded_subscription_details_stay_compact_and_aligned() {
+        let ui = include_str!("../ui/app.slint");
+        let details = ui
+            .split("if root.expanded-profile-id == profile.id: Rectangle {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("Rectangle { x: 12px; y: parent.height - 1px;")
+                    .next()
+            })
+            .expect("expanded subscription details");
+
+        assert!(ui.contains("height: root.expanded-profile-id == profile.id ? 140px : 64px;"));
+        assert!(ui.contains("(root.expanded-profile-id == \"\" ? 0px : 76px)"));
+        assert!(details.contains("x: 56px; y: 64px;"));
+        assert!(details.contains("width: parent.width - 68px; height: 75px;"));
+        assert!(details.contains("profile.usage + \" · \" + profile.expiry"));
+        assert!(!details.contains("y: 82px"));
     }
 
     #[test]

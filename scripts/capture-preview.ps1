@@ -8,7 +8,7 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Height,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
     [string]$ExpectedState,
     [switch]$HoverConnection,
     [switch]$SelectSecondRoute,
@@ -225,11 +225,12 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
         }
         $settingsProfileState = $ExpectedState -like "profiles-empty-*" -or
             $ExpectedState -like "profiles-settings-*" -or
+            $ExpectedState -eq "profiles-expanded-large" -or
             $ExpectedState -in @("profiles-delete-small", "profiles-pending-small")
         if ($settingsProfileState) {
             $settingsText = Get-BrightPixelCount $Bitmap 205 66 ($Bitmap.Width - 20) ($Bitmap.Height - 24)
             if ($settingsText -lt 90) {
-                $Failure.Value = "missing Settings subscription-management content"
+                $Failure.Value = "missing top-level subscription-management content"
                 return $false
             }
             if ($ExpectedState -like "profiles-settings-many-*" -and $settingsText -lt 220) {
@@ -237,7 +238,7 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
                 return $false
             }
             if ($ExpectedState -eq "profiles-delete-small" -and (Get-SemanticPixelCountInRegion $Bitmap 240 106 106 340 360 560 460) -lt 2) {
-                $Failure.Value = "delete confirmation controls are missing from expanded Settings details"
+                $Failure.Value = "delete confirmation controls are missing from expanded subscription details"
                 return $false
             }
             if ($ExpectedState -eq "profiles-pending-small" -and $settingsText -lt 140) {
@@ -420,7 +421,7 @@ try {
         Click-Preview $handle 88 122
     }
     if ($OpenSettings) {
-        Click-Preview $handle 88 174
+        Click-Preview $handle 88 226
     }
     if ($OpenProfiles) {
         # The shelf body ends before the nested refresh target on the right.
@@ -428,7 +429,6 @@ try {
     }
     if ($OpenSubscriptionSettings) {
         Click-Preview $handle 88 174
-        Click-Preview $handle 266 188
     }
     if ($ExpandProfile) {
         Click-Preview $handle ([Math]::Max(430, $Width - 210)) 260

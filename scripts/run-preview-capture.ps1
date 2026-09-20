@@ -2,7 +2,7 @@ param(
     [string]$OutputDirectory = "artifacts/screenshots",
     [int]$Port = 18787,
     [string]$DesktopExecutablePath,
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
     [string[]]$OnlyScenario
 )
 
@@ -78,7 +78,8 @@ $scenarios = @(
     @{ Name = "profiles-delete-small"; State = "ready"; ProfileState = "one"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true; ConfirmProfileDelete = $true },
     @{ Name = "profiles-pending-small"; State = "ready"; ProfileState = "one"; ProfileDelay = 5000; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true; RefreshProfile = $true },
     @{ Name = "profiles-settings-many-small"; State = "ready"; ProfileState = "many"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true },
-    @{ Name = "profiles-settings-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true }
+    @{ Name = "profiles-settings-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true },
+    @{ Name = "profiles-expanded-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true }
 )
 if ($OnlyScenario.Count -gt 0) {
     $scenarios = @($scenarios | Where-Object { $_.Name -in $OnlyScenario })
