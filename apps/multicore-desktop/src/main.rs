@@ -26,7 +26,7 @@ use slint::winit_030::WinitWindowAccessor;
 use slint::{
     CloseRequestResponse, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
-use tray::{TrayCommand, TrayGroup, TrayInput, TrayMenuModel, build_menu_model};
+use tray::{TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayMenuModel, build_menu_model};
 use updater::{UpdateAction, UpdateState};
 use view_model::{
     CatalogDisplayKind, CatalogPresentation, DesktopViewModel, DiagnosticsPresentation,
@@ -539,14 +539,16 @@ fn main() -> Result<(), slint::PlatformError> {
     let tray_runtime = tray::start(
         tray_model,
         move || tray_menu_model(&tray_model_source.lock().expect("view model lock")),
-        move |command| {
-            handle_tray_command(
-                &tray_action_ui,
-                &tray_action_model,
-                command,
-                &tray_preference_writer,
-                &tray_preference_tracker,
-            )
+        move |interaction| {
+            if let TrayInteraction::Command(command) = interaction {
+                handle_tray_command(
+                    &tray_action_ui,
+                    &tray_action_model,
+                    command,
+                    &tray_preference_writer,
+                    &tray_preference_tracker,
+                )
+            }
         },
     )
     .map_err(|error| eprintln!("tray unavailable: {error}"))

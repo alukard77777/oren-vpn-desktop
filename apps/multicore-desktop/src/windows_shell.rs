@@ -77,6 +77,51 @@ pub struct LogicalSize {
     pub height: u32,
 }
 
+pub fn place_tray_popup(
+    anchor: PhysicalPosition,
+    popup_size: (u32, u32),
+    monitors: &[MonitorRect],
+) -> Option<PhysicalPosition> {
+    let monitor = monitors
+        .iter()
+        .filter(|monitor| valid_monitor(monitor))
+        .min_by_key(|monitor| {
+            let right = i64::from(monitor.x) + i64::from(monitor.width);
+            let bottom = i64::from(monitor.y) + i64::from(monitor.height);
+            let x = i64::from(anchor.x);
+            let y = i64::from(anchor.y);
+            let dx = if x < i64::from(monitor.x) {
+                i64::from(monitor.x) - x
+            } else if x > right {
+                x - right
+            } else {
+                0
+            };
+            let dy = if y < i64::from(monitor.y) {
+                i64::from(monitor.y) - y
+            } else if y > bottom {
+                y - bottom
+            } else {
+                0
+            };
+            dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+        })?;
+
+    let width = i64::from(popup_size.0.min(monitor.width));
+    let height = i64::from(popup_size.1.min(monitor.height));
+    let min_x = i64::from(monitor.x);
+    let min_y = i64::from(monitor.y);
+    let max_x = min_x + i64::from(monitor.width) - width;
+    let max_y = min_y + i64::from(monitor.height) - height;
+    let desired_x = i64::from(anchor.x) - width;
+    let desired_y = i64::from(anchor.y) - height - 10;
+
+    Some(PhysicalPosition {
+        x: desired_x.clamp(min_x, max_x) as i32,
+        y: desired_y.clamp(min_y, max_y) as i32,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestoredPlacement {
     pub position: PhysicalPosition,
@@ -410,8 +455,9 @@ impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
 mod tests {
     use super::{
         CloseDisposition, DEFAULT_HEIGHT, DEFAULT_WIDTH, MinimizeDisposition, MonitorRect,
-        MonitorSignature, ResizeEdge, ResizeHitLayout, close_disposition, minimize_disposition,
-        monitor_cap_changed, next_maximized, parse_resize_edge, restore_bounds, restore_placement,
+        MonitorSignature, PhysicalPosition, ResizeEdge, ResizeHitLayout, close_disposition,
+        minimize_disposition, monitor_cap_changed, next_maximized, parse_resize_edge,
+        place_tray_popup, restore_bounds, restore_placement,
     };
     use crate::preferences::WindowBounds;
 
@@ -424,6 +470,33 @@ mod tests {
             scale_milli: 1_000,
             primary,
         }
+    }
+
+    #[test]
+    fn tray_popup_stays_inside_bottom_right_work_area() {
+        assert_eq!(
+            place_tray_popup(
+                PhysicalPosition { x: 1_910, y: 1_070 },
+                (304, 460),
+                &[monitor(0, 0, 1_920, 1_040, true)],
+            ),
+            Some(PhysicalPosition { x: 1_606, y: 580 })
+        );
+    }
+
+    #[test]
+    fn tray_popup_supports_negative_monitor_coordinates() {
+        assert_eq!(
+            place_tray_popup(
+                PhysicalPosition { x: -10, y: 900 },
+                (304, 460),
+                &[
+                    monitor(-1_280, 0, 1_280, 984, false),
+                    monitor(0, 0, 1_920, 1_040, true),
+                ],
+            ),
+            Some(PhysicalPosition { x: -314, y: 430 })
+        );
     }
 
     #[test]
