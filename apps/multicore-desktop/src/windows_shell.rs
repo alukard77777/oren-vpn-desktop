@@ -460,7 +460,6 @@ pub fn next_maximized(current: bool) -> bool {
     !current
 }
 
-#[cfg(windows)]
 impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
     fn from(edge: ResizeEdge) -> Self {
         use slint::winit_030::winit::window::ResizeDirection;
@@ -767,7 +766,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn maps_all_resize_edges_to_winit_030() {
         use slint::winit_030::winit::window::ResizeDirection;

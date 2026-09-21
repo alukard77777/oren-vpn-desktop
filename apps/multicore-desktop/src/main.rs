@@ -1220,10 +1220,7 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
         if let Some(ui) = weak.upgrade() {
             let _ = ui.window().with_winit_window(|window| {
                 let _ = set_current_monitor_max_size(window);
-                #[cfg(windows)]
                 let _ = window.drag_resize_window(edge.into());
-                #[cfg(not(windows))]
-                let _ = edge;
             });
         }
     });
