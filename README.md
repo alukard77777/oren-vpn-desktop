@@ -159,7 +159,7 @@ Create the per-user installer from that bundle:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
   -PackagePath dist\multicore-windows-x64 `
   -OutputDirectory dist\release `
-  -AppVersion 0.1.8
+  -AppVersion 0.1.9
 ```
 
 Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes

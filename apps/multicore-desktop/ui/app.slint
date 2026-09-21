@@ -453,7 +453,7 @@ export component AppWindow inherits Window {
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
     in property <bool> update-runtime-safe: false;
-    in property <string> update-status: "MultiCore 0.1.8";
+    in property <string> update-status: "MultiCore 0.1.9";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
@@ -1117,7 +1117,8 @@ export component AppWindow inherits Window {
                             accessible-enabled: self.enabled;
                             accessible-action-default => { if (self.enabled) { root.refresh-subscription(); } }
                             Rectangle {
-                                height: 22px;
+                                y: 5px;
+                                height: 34px;
                                 border-radius: Theme.radius-small;
                                 background: subscription-refresh-touch.pressed && parent.enabled ? Theme.elevated : subscription-refresh-touch.has-hover && parent.enabled ? #ffffff0d : transparent;
                                 border-color: parent.has-focus ? Theme.focus : Theme.line;

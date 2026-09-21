@@ -4121,6 +4121,22 @@ mod tests {
     }
 
     #[test]
+    fn home_subscription_refresh_button_has_balanced_vertical_padding() {
+        let app = include_str!("../ui/app.slint");
+        let refresh_action = app
+            .split("subscription-refresh-action := FocusScope")
+            .nth(1)
+            .and_then(|source| source.split("if root.profile-menu-open").next())
+            .expect("home subscription refresh action source");
+
+        assert!(refresh_action.contains("width: 92px;"));
+        assert!(refresh_action.contains("height: 44px;"));
+        assert!(refresh_action.contains(
+            "Rectangle {\n                                y: 5px;\n                                height: 34px;"
+        ));
+    }
+
+    #[test]
     fn state_eyebrows_are_sentence_case_and_ready_has_one_route_label() {
         let states = [
             UiState::Empty,
