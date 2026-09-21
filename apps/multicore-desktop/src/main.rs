@@ -1376,7 +1376,7 @@ fn toggle_tray_popup(
         .with_winit_window(|window| window.outer_size())
         .map(|size| (size.width, size.height))
         .unwrap_or((304, 460));
-    if let Some(position) = place_tray_popup(anchor, popup_size, &monitors) {
+    if let Some(position) = place_tray_popup(anchor, popup_size, &monitors, None) {
         let _ = popup.window().with_winit_window(|window| {
             use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
             use slint::winit_030::winit::window::WindowLevel;
