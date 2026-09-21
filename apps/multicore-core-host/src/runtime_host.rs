@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use multicore_core::{
     CoreLogBuffer, Engine, ProcessController, ProcessDiagnostics, RuntimeCheckState,
-    SidecarProcessController, WindowsJobLauncher,
+    SidecarProcessController,
     elevation_protocol::{
         BrokerErrorCode, ElevatedDiagnosticStream, ElevatedEngine, ElevatedLogRecord,
         ElevatedRuntimeState, ElevationCommand, ElevationResponse, MAX_ELEVATION_FRAME_BYTES,
@@ -10,7 +10,14 @@ use multicore_core::{
     },
 };
 
+#[cfg(windows)]
 use crate::runtime_paths::{ResolvedRuntime, resolve_current};
+#[cfg(unix)]
+use crate::unix_runtime_paths::{ResolvedRuntime, resolve_current};
+#[cfg(unix)]
+use multicore_core::UnixGroupLauncher as PlatformLauncher;
+#[cfg(windows)]
+use multicore_core::WindowsJobLauncher as PlatformLauncher;
 
 trait Controller: Send + Sync {
     fn start<'a>(
@@ -25,7 +32,7 @@ trait Controller: Send + Sync {
 }
 
 struct ProductionController {
-    controller: SidecarProcessController<WindowsJobLauncher>,
+    controller: SidecarProcessController<PlatformLauncher>,
     _validated_files: ResolvedRuntime,
 }
 impl Controller for ProductionController {
@@ -57,7 +64,7 @@ impl Factory for ProductionFactory {
     fn create(&self, generation: u64) -> Result<Box<dyn Controller>, ()> {
         let resolved = resolve_current(generation).map_err(|_| ())?;
         let logs = Arc::new(CoreLogBuffer::with_limits(128, 1024));
-        let launcher = WindowsJobLauncher::for_runtime(
+        let launcher = PlatformLauncher::for_runtime(
             resolved.paths.clone(),
             logs,
             std::time::Duration::from_secs(12),

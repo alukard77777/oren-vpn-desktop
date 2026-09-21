@@ -60,7 +60,7 @@ fn windows_data_root(local_app_data: Option<&OsStr>) -> io::Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn unix_data_root(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> io::Result<PathBuf> {
+pub fn unix_data_root(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> io::Result<PathBuf> {
     let base = match absolute(xdg_data_home) {
         Some(base) => base.to_path_buf(),
         None => absolute(home)
