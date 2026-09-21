@@ -23,8 +23,6 @@ pub(crate) enum BootstrapError {
     Startup,
     Readiness,
     Authentication,
-    #[cfg(not(windows))]
-    Unsupported,
 }
 
 impl BootstrapError {
@@ -38,8 +36,6 @@ impl BootstrapError {
             Self::Startup => "Не удалось запустить фоновый сервис.",
             Self::Readiness => "Фоновый сервис запустился некорректно.",
             Self::Authentication => "Фоновый сервис не прошёл проверку подлинности.",
-            #[cfg(not(windows))]
-            Self::Unsupported => "Автоматический запуск доступен только в Windows-пакете.",
         }
     }
 }
@@ -487,18 +483,112 @@ fn parse_readiness(bytes: &[u8]) -> Result<SocketAddr, BootstrapError> {
     Ok(address)
 }
 
-#[cfg(not(windows))]
-struct OwnedDaemon;
+#[cfg(windows)]
+use windows_bootstrap as platform_bootstrap;
 
 #[cfg(not(windows))]
-fn start_packaged() -> Result<Bootstrap, BootstrapError> {
-    Err(BootstrapError::Unsupported)
+use unix_bootstrap as platform_bootstrap;
+
+use platform_bootstrap::OwnedDaemon;
+
+const DAEMON_ENVIRONMENT_KEYS: &[&str] = &[
+    "MULTICORE_DAEMON_URL",
+    "MULTICORE_DAEMON_TOKEN",
+    "MULTICORE_DAEMON_READY_STDOUT",
+    "MULTICORE_DAEMON_ADDR",
+    "MULTICORE_DAEMON_DATA_DIR",
+    "MULTICORE_XRAY_BIN",
+    "MULTICORE_MIHOMO_BIN",
+    "MULTICORE_MIHOMO_CONTROLLER_ADDR",
+];
+
+fn daemon_environment(paths: &PackagePaths, token: &str) -> Vec<(OsString, OsString)> {
+    vec![
+        (
+            OsString::from("MULTICORE_DAEMON_TOKEN"),
+            OsString::from(token),
+        ),
+        (
+            OsString::from("MULTICORE_DAEMON_READY_STDOUT"),
+            OsString::from("1"),
+        ),
+        (
+            OsString::from("MULTICORE_DAEMON_ADDR"),
+            OsString::from("127.0.0.1:0"),
+        ),
+        (
+            OsString::from("MULTICORE_DAEMON_DATA_DIR"),
+            paths.data_dir.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("MULTICORE_XRAY_BIN"),
+            paths.xray.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("MULTICORE_MIHOMO_BIN"),
+            paths.mihomo.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("MULTICORE_MIHOMO_CONTROLLER_ADDR"),
+            OsString::from("127.0.0.1:19090"),
+        ),
+    ]
 }
 
-#[cfg(windows)]
-use windows_bootstrap::OwnedDaemon;
+type ReadinessReceiver = std::sync::mpsc::Receiver<Result<SocketAddr, BootstrapError>>;
 
-#[cfg(windows)]
+fn spawn_readiness_reader(
+    mut pipe: impl Read + Send + 'static,
+) -> Result<ReadinessReceiver, BootstrapError> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("multicore-readiness".into())
+        .spawn(move || {
+            let mut bytes = Vec::with_capacity(READINESS_LIMIT);
+            let result = loop {
+                let mut byte = [0_u8; 1];
+                match pipe.read(&mut byte) {
+                    Ok(0) => break Err(BootstrapError::Readiness),
+                    Ok(_) => {
+                        bytes.push(byte[0]);
+                        if bytes.len() > READINESS_LIMIT {
+                            break Err(BootstrapError::Readiness);
+                        }
+                        if byte[0] == b'\n' {
+                            break parse_readiness(&bytes);
+                        }
+                    }
+                    Err(_) => break Err(BootstrapError::Readiness),
+                }
+            };
+            let _ = sender.send(result);
+        })
+        .map_err(|_| BootstrapError::Startup)?;
+    Ok(receiver)
+}
+
+fn await_readiness_signal(
+    receiver: ReadinessReceiver,
+    deadline: Instant,
+    mut has_exited: impl FnMut() -> Result<bool, BootstrapError>,
+) -> Result<SocketAddr, BootstrapError> {
+    loop {
+        if has_exited()? {
+            return Err(BootstrapError::Startup);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(BootstrapError::Startup)?;
+        match receiver.recv_timeout(Duration::from_millis(20).min(remaining)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BootstrapError::Readiness);
+            }
+        }
+    }
+}
+
 fn start_packaged() -> Result<Bootstrap, BootstrapError> {
     let current_exe = std::env::current_exe().map_err(|_| BootstrapError::Package)?;
     let data_dir =
@@ -510,7 +600,7 @@ fn start_packaged() -> Result<Bootstrap, BootstrapError> {
     })?;
     let token = generate_token()?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let owned = windows_bootstrap::spawn(paths, &token).inspect_err(|_| {
+    let owned = platform_bootstrap::spawn(paths, &token).inspect_err(|_| {
         eprintln!("bootstrap stage failed: process-create");
     })?;
     let (owned, address) = await_owned_readiness(owned, deadline).inspect_err(|_| {
@@ -530,7 +620,6 @@ fn start_packaged() -> Result<Bootstrap, BootstrapError> {
     })
 }
 
-#[cfg(windows)]
 fn verify_status(
     url: &str,
     token: &str,
@@ -578,7 +667,6 @@ fn verify_status(
     )
 }
 
-#[cfg(windows)]
 fn await_owned_readiness(
     mut owned: OwnedDaemon,
     deadline: Instant,
@@ -587,7 +675,6 @@ fn await_owned_readiness(
     Ok((owned, address))
 }
 
-#[cfg(windows)]
 fn await_owned_status_with(
     mut owned: OwnedDaemon,
     deadline: Instant,
@@ -640,7 +727,6 @@ mod windows_bootstrap {
         mem::{size_of, zeroed},
         os::windows::{ffi::OsStrExt, io::FromRawHandle},
         ptr::{null, null_mut},
-        sync::mpsc,
     };
     use windows_sys::Win32::{
         Foundation::{
@@ -763,7 +849,7 @@ mod windows_bootstrap {
     pub(super) struct OwnedDaemon {
         process: Handle,
         job: Handle,
-        readiness: Option<mpsc::Receiver<Result<SocketAddr, BootstrapError>>>,
+        readiness: Option<ReadinessReceiver>,
         _package_locks: Vec<File>,
         cleaned: bool,
     }
@@ -862,21 +948,7 @@ mod windows_bootstrap {
             deadline: Instant,
         ) -> Result<SocketAddr, BootstrapError> {
             let receiver = self.readiness.take().ok_or(BootstrapError::Readiness)?;
-            loop {
-                if self.has_exited()? {
-                    return Err(BootstrapError::Startup);
-                }
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(BootstrapError::Startup)?;
-                match receiver.recv_timeout(Duration::from_millis(20).min(remaining)) {
-                    Ok(result) => return result,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(BootstrapError::Readiness);
-                    }
-                }
-            }
+            await_readiness_signal(receiver, deadline, || self.has_exited())
         }
 
         #[cfg(test)]
@@ -1041,7 +1113,9 @@ mod windows_bootstrap {
         drop(nul);
         drop(attributes);
 
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let raw_read = stdout_read.into_raw();
+        let pipe = unsafe { File::from_raw_handle(raw_read) };
+        let receiver = spawn_readiness_reader(pipe)?;
         let owned = OwnedDaemon {
             process,
             job,
@@ -1049,33 +1123,6 @@ mod windows_bootstrap {
             _package_locks: paths.locks,
             cleaned: false,
         };
-        let raw_read = stdout_read.into_raw();
-        let pipe = unsafe { File::from_raw_handle(raw_read) };
-        std::thread::Builder::new()
-            .name("multicore-readiness".into())
-            .spawn(move || {
-                let mut pipe = pipe;
-                let mut bytes = Vec::with_capacity(READINESS_LIMIT);
-                let result = loop {
-                    let mut byte = [0_u8; 1];
-                    match pipe.read(&mut byte) {
-                        Ok(0) => break Err(BootstrapError::Readiness),
-                        Ok(_) => {
-                            bytes.push(byte[0]);
-                            if bytes.len() > READINESS_LIMIT {
-                                break Err(BootstrapError::Readiness);
-                            }
-                            if byte[0] == b'\n' {
-                                break parse_readiness(&bytes);
-                            }
-                        }
-                        Err(_) => break Err(BootstrapError::Readiness),
-                    }
-                };
-                let _ = sender.send(result);
-            })
-            .map_err(|_| BootstrapError::Startup)?;
-
         Ok(owned)
     }
 
@@ -1104,55 +1151,16 @@ mod windows_bootstrap {
     }
 
     fn environment_block(paths: &PackagePaths, token: &str) -> Vec<u16> {
-        const REPLACED: &[&str] = &[
-            "MULTICORE_DAEMON_URL",
-            "MULTICORE_DAEMON_TOKEN",
-            "MULTICORE_DAEMON_READY_STDOUT",
-            "MULTICORE_DAEMON_ADDR",
-            "MULTICORE_DAEMON_DATA_DIR",
-            "MULTICORE_XRAY_BIN",
-            "MULTICORE_MIHOMO_BIN",
-            "MULTICORE_MIHOMO_CONTROLLER_ADDR",
-        ];
         let mut values: Vec<(OsString, OsString)> = std::env::vars_os()
             .filter(|(name, _)| {
                 name.to_str().is_none_or(|name| {
-                    !REPLACED
+                    !DAEMON_ENVIRONMENT_KEYS
                         .iter()
                         .any(|candidate| name.eq_ignore_ascii_case(candidate))
                 })
             })
             .collect();
-        values.extend([
-            (
-                OsString::from("MULTICORE_DAEMON_TOKEN"),
-                OsString::from(token),
-            ),
-            (
-                OsString::from("MULTICORE_DAEMON_READY_STDOUT"),
-                OsString::from("1"),
-            ),
-            (
-                OsString::from("MULTICORE_DAEMON_ADDR"),
-                OsString::from("127.0.0.1:0"),
-            ),
-            (
-                OsString::from("MULTICORE_DAEMON_DATA_DIR"),
-                paths.data_dir.as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("MULTICORE_XRAY_BIN"),
-                paths.xray.as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("MULTICORE_MIHOMO_BIN"),
-                paths.mihomo.as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("MULTICORE_MIHOMO_CONTROLLER_ADDR"),
-                OsString::from("127.0.0.1:19090"),
-            ),
-        ]);
+        values.extend(daemon_environment(paths, token));
         values.sort_by(|left, right| {
             left.0
                 .to_string_lossy()
@@ -1168,6 +1176,137 @@ mod windows_bootstrap {
         }
         block.push(0);
         block
+    }
+}
+
+#[cfg(not(windows))]
+mod unix_bootstrap {
+    use super::*;
+    use rustix::process::{Pid, Signal, getpid, getppid, kill_process_group};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+    const REAP_POLL: Duration = Duration::from_millis(20);
+
+    pub(super) struct OwnedDaemon {
+        child: Child,
+        readiness: Option<ReadinessReceiver>,
+        _package_locks: Vec<File>,
+        cleaned: bool,
+    }
+
+    impl OwnedDaemon {
+        pub(super) fn has_exited(&mut self) -> Result<bool, BootstrapError> {
+            self.child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|_| BootstrapError::Startup)
+        }
+
+        pub(super) fn readiness(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<SocketAddr, BootstrapError> {
+            let receiver = self.readiness.take().ok_or(BootstrapError::Readiness)?;
+            await_readiness_signal(receiver, deadline, || self.has_exited())
+        }
+
+        #[cfg(test)]
+        pub(super) fn pid(&self) -> i32 {
+            self.child.id() as i32
+        }
+
+        pub(super) fn terminate_and_reap(&mut self) -> Result<(), BootstrapError> {
+            if self.cleaned {
+                return Ok(());
+            }
+            let group = Pid::from_child(&self.child);
+            let _ = kill_process_group(group, Signal::TERM);
+            let deadline = Instant::now() + TERMINATION_GRACE;
+            let reaped = loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => break true,
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(REAP_POLL),
+                    Ok(None) => break false,
+                    Err(_) => return Err(BootstrapError::Startup),
+                }
+            };
+            let _ = kill_process_group(group, Signal::KILL);
+            if !reaped {
+                self.child.wait().map_err(|_| BootstrapError::Startup)?;
+            }
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for OwnedDaemon {
+        fn drop(&mut self) {
+            let _ = self.terminate_and_reap();
+        }
+    }
+
+    pub(super) fn spawn(paths: PackagePaths, token: &str) -> Result<OwnedDaemon, BootstrapError> {
+        spawn_with_args(paths, token, &[])
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn_for_test(
+        paths: PackagePaths,
+        token: &str,
+        args: &[OsString],
+    ) -> Result<OwnedDaemon, BootstrapError> {
+        spawn_with_args(paths, token, args)
+    }
+
+    fn spawn_with_args(
+        paths: PackagePaths,
+        token: &str,
+        args: &[OsString],
+    ) -> Result<OwnedDaemon, BootstrapError> {
+        let parent = getpid();
+        let mut command = Command::new(&paths.daemon);
+        command
+            .args(args)
+            .current_dir(&paths.package_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        for key in DAEMON_ENVIRONMENT_KEYS {
+            command.env_remove(key);
+        }
+        command.envs(daemon_environment(&paths, token));
+        unsafe {
+            command.pre_exec(move || {
+                rustix::process::set_parent_process_death_signal(Some(Signal::TERM))?;
+                if getppid() != Some(parent) {
+                    return Err(std::io::Error::other("desktop exited before daemon start"));
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            eprintln!(
+                "bootstrap process-create error: {}",
+                error.raw_os_error().unwrap_or_default()
+            );
+            BootstrapError::Startup
+        })?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BootstrapError::Startup);
+        };
+        let mut owned = OwnedDaemon {
+            child,
+            readiness: None,
+            _package_locks: paths.locks,
+            cleaned: false,
+        };
+        owned.readiness = Some(spawn_readiness_reader(stdout)?);
+        Ok(owned)
     }
 }
 
@@ -1947,5 +2086,167 @@ mod tests {
         fs::rename(&cores, &moved).unwrap();
         symlink(&moved, &cores).unwrap();
         assert!(derive_and_validate_paths(&desktop, &data).is_err());
+    }
+
+    #[cfg(not(windows))]
+    fn shell_daemon_paths(root: &Path) -> PackagePaths {
+        PackagePaths {
+            package_root: root.to_path_buf(),
+            daemon: PathBuf::from("/bin/sh"),
+            xray: root.join("cores").join("xray"),
+            mihomo: root.join("cores").join("mihomo"),
+            data_dir: root.join("data"),
+            locks: Vec::new(),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn shell_arguments(script: &str, extra: &Path) -> Vec<OsString> {
+        vec![
+            OsString::from("-c"),
+            OsString::from(script),
+            OsString::from("sh"),
+            extra.as_os_str().to_owned(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn process_is_gone(pid: i32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        condition()
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_daemon_reports_readiness_and_owner_drop_terminates_its_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("grandchild");
+        let script = "sleep 60 & echo \"$!\" > \"$1\"; printf 'MULTICORE_READY 127.0.0.1:4567\\n'; exec sleep 60";
+        let mut owned = unix_bootstrap::spawn_for_test(
+            shell_daemon_paths(temp.path()),
+            "token",
+            &shell_arguments(script, &pid_file),
+        )
+        .unwrap();
+        let address = owned
+            .readiness(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(address.port(), 4567);
+        assert!(!owned.has_exited().unwrap());
+        let daemon = owned.pid();
+        let grandchild: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        drop(owned);
+        assert!(eventually(Duration::from_secs(3), || {
+            process_is_gone(daemon) && process_is_gone(grandchild)
+        }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_daemon_ignoring_sigterm_is_killed_after_the_bounded_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let script =
+            "trap '' TERM; printf 'MULTICORE_READY 127.0.0.1:4567\\n'; while :; do sleep 1; done";
+        let mut owned = unix_bootstrap::spawn_for_test(
+            shell_daemon_paths(temp.path()),
+            "token",
+            &shell_arguments(script, temp.path()),
+        )
+        .unwrap();
+        owned
+            .readiness(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let daemon = owned.pid();
+        let started = Instant::now();
+        owned.terminate_and_reap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(process_is_gone(daemon));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_daemon_early_exit_fails_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut owned = unix_bootstrap::spawn_for_test(
+            shell_daemon_paths(temp.path()),
+            "token",
+            &shell_arguments("exit 3", temp.path()),
+        )
+        .unwrap();
+        assert!(
+            owned
+                .readiness(Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_daemon_receives_the_bootstrap_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("environment");
+        let script = "printf '%s\\n' \"$MULTICORE_DAEMON_TOKEN\" \"$MULTICORE_DAEMON_READY_STDOUT\" \"$MULTICORE_DAEMON_ADDR\" \"$MULTICORE_DAEMON_DATA_DIR\" \"$MULTICORE_XRAY_BIN\" \"$MULTICORE_MIHOMO_BIN\" \"$MULTICORE_MIHOMO_CONTROLLER_ADDR\" \"$PWD\" > \"$1\"; printf 'MULTICORE_READY 127.0.0.1:4567\\n'; exec sleep 60";
+        let paths = shell_daemon_paths(temp.path());
+        let expected = [
+            "secret-token".to_owned(),
+            "1".to_owned(),
+            "127.0.0.1:0".to_owned(),
+            paths.data_dir.display().to_string(),
+            paths.xray.display().to_string(),
+            paths.mihomo.display().to_string(),
+            "127.0.0.1:19090".to_owned(),
+            temp.path().canonicalize().unwrap().display().to_string(),
+        ];
+        let mut owned = unix_bootstrap::spawn_for_test(
+            paths,
+            "secret-token",
+            &shell_arguments(script, &output),
+        )
+        .unwrap();
+        owned
+            .readiness(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let written = fs::read_to_string(&output).unwrap();
+        assert_eq!(written.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_daemon_dies_with_the_thread_that_spawned_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = shell_daemon_paths(temp.path());
+        let arguments = shell_arguments("exec sleep 60", temp.path());
+        let daemon = std::thread::spawn(move || {
+            let owned = unix_bootstrap::spawn_for_test(paths, "token", &arguments).unwrap();
+            let pid = owned.pid();
+            std::mem::forget(owned);
+            pid
+        })
+        .join()
+        .unwrap();
+        assert!(eventually(Duration::from_secs(3), || process_is_gone(
+            daemon
+        )));
     }
 }
