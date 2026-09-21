@@ -109,7 +109,7 @@ try {
     $env:LOCALAPPDATA = $smokeRoot
     Remove-Item Env:MULTICORE_DAEMON_URL -ErrorAction SilentlyContinue
     Remove-Item Env:MULTICORE_DAEMON_TOKEN -ErrorAction SilentlyContinue
-    $env:MULTICORE_MIHOMO_CONTROLLER_ADDR = '192.0.2.1:19090'
+    $env:MULTICORE_MIHOMO_CONTROLLER_ADDR = '127.0.0.1:19090'
     $env:MULTICORE_SMOKE_EXIT_ON_CLOSE = '1'
 
     $startArguments = @{

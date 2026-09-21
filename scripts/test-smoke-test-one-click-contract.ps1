@@ -31,6 +31,7 @@ foreach ($required in @(
     'Background desktop exited before daemon bootstrap',
     'Background desktop ownership changed before cleanup',
     'LaunchMode = $(if ($Background) { ''background'' } else { ''foreground'' })',
+    '$env:MULTICORE_MIHOMO_CONTROLLER_ADDR = ''127.0.0.1:19090''',
     'Refusing to disturb an existing MultiCore singleton',
     "shutdown = 'background-exact-pid'",
     "CoreHostBeforeConnect = 'absent'",
