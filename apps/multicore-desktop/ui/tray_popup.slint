@@ -1,24 +1,29 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import "../assets/fonts/Twemoji.Mozilla.ttf";
 
 export struct TrayMenuRow {
     id: string,
     group-id: string,
+    icon: string,
     label: string,
     detail: string,
     selected: bool,
     enabled: bool,
+    expanded: bool,
+    node-count: int,
 }
 
 component PopupAction inherits Rectangle {
     in property <string> label;
-    in property <string> marker;
+    in property <string> icon;
+    in property <string> icon-kind;
     in property <bool> selected: false;
     in property <bool> enabled: true;
     callback activated();
 
-    height: 38px;
-    border-radius: 7px;
+    height: 40px;
+    border-radius: Theme.radius-small;
     background: root.selected ? #4c9dff16 : action-touch.has-hover ? #ffffff0b : transparent;
     opacity: root.enabled ? 1 : 0.42;
     accessible-role: button;
@@ -26,21 +31,47 @@ component PopupAction inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
 
-    Text {
+    if root.icon != "": Text {
         x: 10px;
-        width: 20px;
+        width: 22px;
         height: parent.height;
-        text: root.marker;
-        color: root.selected ? Theme.accent-blue : Theme.text-muted;
+        text: root.icon;
+        color: Theme.text-secondary;
         font-family: Theme.emoji-font-family;
-        font-size: 13px;
+        font-size: 15px;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 
+    if root.icon-kind == "window": Path {
+        x: 12px;
+        y: 11px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        commands: "M 2.5 4.5 L 15.5 4.5 L 15.5 15.5 L 2.5 15.5 Z M 10 2.5 L 15.5 2.5 L 15.5 8 M 15 3 L 9 9";
+        stroke: Theme.text-secondary;
+        stroke-width: 1.5px;
+        fill: transparent;
+    }
+
+    if root.icon-kind == "exit": Path {
+        x: 12px;
+        y: 11px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        commands: "M 8 3 L 3 3 L 3 15 L 8 15 M 10 6 L 14 9 L 10 12 M 14 9 L 7 9";
+        stroke: Theme.text-muted;
+        stroke-width: 1.5px;
+        fill: transparent;
+    }
+
     Text {
-        x: 40px;
-        width: parent.width - 54px;
+        x: root.icon != "" || root.icon-kind != "" ? 40px : 12px;
+        width: parent.width - self.x - (root.selected ? 36px : 12px);
         height: parent.height;
         text: root.label;
         color: root.selected ? Theme.text-primary : Theme.text-secondary;
@@ -51,7 +82,24 @@ component PopupAction inherits Rectangle {
         overflow: elide;
     }
 
+    if root.selected: Path {
+        x: parent.width - 25px;
+        y: 14px;
+        width: 12px;
+        height: 10px;
+        viewbox-width: 12;
+        viewbox-height: 10;
+        commands: "M 1 5 L 4.5 8.5 L 11 1.5";
+        stroke: Theme.accent-blue;
+        stroke-width: 1.6px;
+        fill: transparent;
+    }
+
     action-focus := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
         enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
@@ -67,12 +115,133 @@ component PopupAction inherits Rectangle {
             y: 1px;
             width: parent.width - 2px;
             height: parent.height - 2px;
-            border-radius: 7px;
+            border-radius: Theme.radius-small;
             border-width: parent.has-focus ? 1px : 0px;
             border-color: Theme.focus;
             background: transparent;
         }
         action-touch := TouchArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            enabled: root.enabled;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+component TrayConnectAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> connected: false;
+    in property <bool> enabled: true;
+    callback activated();
+
+    height: 56px;
+    border-radius: Theme.radius-large;
+    border-width: connect-focus.has-focus ? Theme.focus-width : 1px;
+    border-color: connect-focus.has-focus ? Theme.focus : root.connected ? #3ccb7f80 : #4c9dff80;
+    background: root.connected ? #101a16 : #101721;
+    clip: true;
+    opacity: root.enabled ? 1 : 0.46;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    connect-mesh-field := Rectangle {
+        property <bool> active: connect-touch.has-hover || connect-focus.has-focus;
+        property <length> cursor-x: connect-touch.has-hover ? connect-touch.mouse-x : 28px;
+        property <length> cursor-y: connect-touch.has-hover ? connect-touch.mouse-y : 28px;
+        property <color> glow-strong: root.connected ? #22c55e32 : #0091ff3d;
+        property <color> glow-medium: root.connected ? #22c55e1d : #0091ff24;
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: @radial-gradient(
+            circle 108px at cursor-x cursor-y,
+            glow-strong 0%,
+            glow-medium 36%,
+            #00000000 76%
+        );
+        opacity: self.active ? 1 : 0;
+        animate opacity { duration: 150ms; easing: ease-out; }
+
+        for _[grid-x] in 48: Rectangle {
+            x: grid-x * 6px;
+            y: 0px;
+            width: 6px;
+            height: parent.height;
+            background: transparent;
+            for _[grid-y] in 10: Rectangle {
+                property <float> dx: (grid-x * 6px + 3px - connect-mesh-field.cursor-x) / 112px;
+                property <float> dy: (grid-y * 6px + 3px - connect-mesh-field.cursor-y) / 48px;
+                property <float> distance: Math.sqrt(self.dx * self.dx + self.dy * self.dy);
+                x: 0px;
+                y: grid-y * 6px;
+                width: 6px;
+                height: 6px;
+                background: transparent;
+                border-width: 0.5px;
+                border-color: root.connected ? #8ea39758 : #8f9eae58;
+                opacity: connect-mesh-field.active ? Math.max(0, 1 - self.distance) : 0;
+            }
+        }
+    }
+
+    Rectangle {
+        x: 12px;
+        y: 10px;
+        width: 36px;
+        height: 36px;
+        border-radius: 18px;
+        background: root.connected ? #0d1814e8 : #101722e8;
+        border-color: root.connected ? Theme.accent-green : Theme.accent-blue;
+        border-width: 1px;
+        Image {
+            x: 8px;
+            y: 8px;
+            width: 20px;
+            height: 20px;
+            source: @image-url("../assets/power.svg");
+            image-fit: contain;
+            accessible-role: none;
+        }
+    }
+
+    Text {
+        x: 60px;
+        width: parent.width - 76px;
+        height: parent.height;
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: 14px;
+        font-weight: Theme.weight-semibold;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    connect-focus := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        connect-touch := TouchArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
             enabled: root.enabled;
             clicked => { root.activated(); }
         }
@@ -80,6 +249,7 @@ component PopupAction inherits Rectangle {
 }
 
 component RouteGroupAction inherits Rectangle {
+    in property <string> icon;
     in property <string> label;
     in property <string> detail;
     in property <bool> expanded: false;
@@ -87,7 +257,7 @@ component RouteGroupAction inherits Rectangle {
     callback activated();
 
     height: 48px;
-    border-radius: 9px;
+    border-radius: Theme.radius-small;
     background: root.expanded ? #4c9dff14 : route-group-touch.has-hover ? #ffffff0b : transparent;
     opacity: root.enabled ? 1 : 0.42;
     accessible-role: button;
@@ -97,9 +267,9 @@ component RouteGroupAction inherits Rectangle {
     accessible-action-default => { if (root.enabled) { root.activated(); } }
 
     VerticalLayout {
-        x: 12px;
+        x: 44px;
         y: 7px;
-        width: parent.width - 42px;
+        width: parent.width - 76px;
         height: 34px;
         spacing: 1px;
         Text {
@@ -115,6 +285,18 @@ component RouteGroupAction inherits Rectangle {
             font-size: 11px;
             overflow: elide;
         }
+    }
+
+    Text {
+        x: 12px;
+        width: 22px;
+        height: parent.height;
+        text: root.icon;
+        color: Theme.text-secondary;
+        font-family: Theme.emoji-font-family;
+        font-size: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 
     Path {
@@ -150,7 +332,7 @@ component RouteGroupAction inherits Rectangle {
             y: 1px;
             width: parent.width - 2px;
             height: parent.height - 2px;
-            border-radius: 9px;
+            border-radius: Theme.radius-small;
             border-width: parent.has-focus ? 1px : 0px;
             border-color: Theme.focus;
             background: transparent;
@@ -179,10 +361,9 @@ export component TrayPopup inherits Window {
     in property <bool> connection-enabled: true;
     in property <[TrayMenuRow]> group-rows;
     in property <[TrayMenuRow]> node-rows;
-    in-out property <string> expanded-group-id;
 
     callback toggle-connection();
-    callback select-group(string);
+    callback toggle-group(string);
     callback select-node(string, string);
     callback open-main();
     callback exit-app();
@@ -207,7 +388,7 @@ export component TrayPopup inherits Window {
             background: #15181dfa;
             border-color: #343a43;
             border-width: 1px;
-            border-radius: 12px;
+            border-radius: Theme.radius-large;
 
             VerticalLayout {
                 padding: 14px;
@@ -220,7 +401,7 @@ export component TrayPopup inherits Window {
                     Rectangle {
                         width: 24px;
                         height: 24px;
-                        border-radius: 7px;
+                        border-radius: Theme.radius-small;
                         background: #4c9dff18;
                         Text {
                             text: "∞";
@@ -238,11 +419,10 @@ export component TrayPopup inherits Window {
                     }
                 }
 
-                connect-action := PopupAction {
+                connect-action := TrayConnectAction {
                     label: root.connection-label;
-                    marker: "●";
                     enabled: root.connection-enabled;
-                    selected: root.connection-label == "Отключиться";
+                    connected: root.connection-label == "Отключиться";
                     activated => { root.toggle-connection(); }
                 }
 
@@ -251,11 +431,10 @@ export component TrayPopup inherits Window {
                 Text {
                     height: 18px;
                     vertical-stretch: 0;
-                    text: "МАРШРУТ";
+                    text: "Маршруты";
                     color: Theme.text-muted;
-                    font-size: 10px;
+                    font-size: 11px;
                     font-weight: Theme.weight-semibold;
-                    letter-spacing: 0.8px;
                     vertical-alignment: center;
                 }
 
@@ -267,38 +446,42 @@ export component TrayPopup inherits Window {
                         width: route-scroll.viewport-width;
                         spacing: 2px;
                         for group in root.group-rows: Rectangle {
-                            height: 48px + (root.expanded-group-id == group.id ? root.node-rows.length * 40px + 2px : 0px);
+                            height: 48px + (group.expanded ? group.node-count * 42px + 2px : 0px);
                             background: transparent;
                             route-group := RouteGroupAction {
                                 x: 0px;
                                 y: 0px;
                                 width: parent.width;
+                                icon: group.icon;
                                 label: group.label;
                                 detail: group.detail;
-                                expanded: root.expanded-group-id == group.id;
+                                expanded: group.expanded;
                                 enabled: group.enabled;
-                                activated => {
-                                    if (root.expanded-group-id == group.id) {
-                                        root.expanded-group-id = "";
-                                    } else {
-                                        root.expanded-group-id = group.id;
-                                        root.select-group(group.id);
-                                    }
-                                }
+                                activated => { root.toggle-group(group.id); }
                             }
-                            if root.expanded-group-id == group.id: VerticalLayout {
+                            if group.expanded: VerticalLayout {
                                 x: 12px;
                                 y: 48px;
                                 width: parent.width - 12px;
                                 spacing: 2px;
                                 for node in root.node-rows: PopupAction {
+                                    visible: node.group-id == group.id;
+                                    height: self.visible ? 40px : 0px;
                                     label: node.label;
-                                    marker: node.selected ? "✓" : "";
+                                    icon: node.icon;
                                     selected: node.selected;
                                     enabled: node.enabled;
                                     activated => { root.select-node(node.group-id, node.id); }
                                 }
                             }
+                        }
+                        if root.group-rows.length == 0: Text {
+                            height: 48px;
+                            text: "Маршруты пока недоступны";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
                         }
                     }
                 }
@@ -306,11 +489,11 @@ export component TrayPopup inherits Window {
                 Rectangle { height: 1px; vertical-stretch: 0; background: Theme.line; }
 
                 HorizontalLayout {
-                    height: 38px;
+                    height: 40px;
                     vertical-stretch: 0;
                     spacing: 4px;
-                    PopupAction { horizontal-stretch: 1; label: "Открыть"; marker: "↗"; activated => { root.open-main(); } }
-                    PopupAction { width: 96px; horizontal-stretch: 0; label: "Выйти"; marker: ""; activated => { root.exit-app(); } }
+                    PopupAction { horizontal-stretch: 1; label: "Открыть"; icon-kind: "window"; activated => { root.open-main(); } }
+                    PopupAction { width: 104px; horizontal-stretch: 0; label: "Выйти"; icon-kind: "exit"; activated => { root.exit-app(); } }
                 }
             }
         }

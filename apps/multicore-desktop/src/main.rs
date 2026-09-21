@@ -11,7 +11,7 @@ mod view_model;
 mod windows_settings;
 mod windows_shell;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -27,7 +27,10 @@ use slint::winit_030::WinitWindowAccessor;
 use slint::{
     CloseRequestResponse, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
-use tray::{TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayMenuModel, build_menu_model};
+use tray::{
+    TrayAccordionState, TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayMenuModel,
+    TrayNode, TrayPopupModelCache, build_menu_model,
+};
 use updater::{UpdateAction, UpdateState};
 use view_model::{
     CatalogDisplayKind, CatalogPresentation, DesktopViewModel, DiagnosticsPresentation,
@@ -536,6 +539,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_external_activations(&ui, activations, model.clone());
     let tray_popup = TrayPopup::new()?;
     let tray_popup_open = Rc::new(Cell::new(false));
+    let tray_accordion = Rc::new(RefCell::new(TrayAccordionState::default()));
     wire_tray_popup_actions(
         &tray_popup,
         ui.as_weak(),
@@ -543,9 +547,14 @@ fn main() -> Result<(), slint::PlatformError> {
         preference_writer.clone(),
         preference_tracker.clone(),
         tray_popup_open.clone(),
+        tray_accordion.clone(),
     );
-    let _tray_popup_focus_timer =
-        wire_tray_popup_focus_loss(&tray_popup, tray_popup_open.clone(), model.clone());
+    let _tray_popup_focus_timer = wire_tray_popup_focus_loss(
+        &tray_popup,
+        tray_popup_open.clone(),
+        model.clone(),
+        tray_accordion.clone(),
+    );
     let tray_model = tray_menu_model(&model.lock().expect("view model lock"));
     let tray_model_source = model.clone();
     let tray_action_ui = ui.as_weak();
@@ -554,6 +563,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let tray_preference_tracker = preference_tracker.clone();
     let tray_interaction_popup = tray_popup.as_weak();
     let tray_interaction_popup_open = tray_popup_open.clone();
+    let tray_interaction_accordion = tray_accordion;
     let tray_runtime = tray::start(
         tray_model,
         move || tray_menu_model(&tray_model_source.lock().expect("view model lock")),
@@ -574,6 +584,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     &tray_action_ui,
                     &tray_action_model,
                     &tray_interaction_popup_open,
+                    &tray_interaction_accordion,
                     PhysicalPosition { x, y },
                 );
             }
@@ -1262,7 +1273,39 @@ fn hide_window_to_tray(ui: &AppWindow) {
     });
 }
 
-fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
+fn apply_tray_popup_model(
+    popup: &TrayPopup,
+    model: TrayMenuModel,
+    accordion: &mut TrayAccordionState,
+) {
+    let nodes = model
+        .nodes
+        .iter()
+        .take(64)
+        .filter_map(|entry| match &entry.command {
+            TrayCommand::SelectNode { group_id, node_id } => Some(TrayMenuRow {
+                id: node_id.clone().into(),
+                group_id: group_id.clone().into(),
+                icon: entry.icon.clone().into(),
+                label: entry.label.clone().into(),
+                detail: "".into(),
+                selected: entry.checked,
+                enabled: entry.enabled,
+                expanded: false,
+                node_count: 0,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    accordion.retain_available(
+        model
+            .groups
+            .iter()
+            .filter_map(|entry| match &entry.command {
+                TrayCommand::SelectGroup { group_id } => Some(group_id.as_str()),
+                _ => None,
+            }),
+    );
     let groups = model
         .groups
         .iter()
@@ -1271,26 +1314,16 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
             TrayCommand::SelectGroup { group_id } => Some(TrayMenuRow {
                 id: group_id.clone().into(),
                 group_id: "".into(),
+                icon: entry.icon.clone().into(),
                 label: entry.label.clone().into(),
                 detail: entry.detail.clone().into(),
-                selected: entry.checked,
+                selected: false,
                 enabled: entry.enabled,
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let nodes = model
-        .nodes
-        .iter()
-        .take(16)
-        .filter_map(|entry| match &entry.command {
-            TrayCommand::SelectNode { group_id, node_id } => Some(TrayMenuRow {
-                id: node_id.clone().into(),
-                group_id: group_id.clone().into(),
-                label: entry.label.clone().into(),
-                detail: "".into(),
-                selected: entry.checked,
-                enabled: entry.enabled,
+                expanded: accordion.is_expanded(group_id),
+                node_count: nodes
+                    .iter()
+                    .filter(|node| node.group_id.as_str() == group_id)
+                    .count() as i32,
             }),
             _ => None,
         })
@@ -1315,6 +1348,7 @@ fn toggle_tray_popup(
     main_weak: &slint::Weak<AppWindow>,
     model: &Arc<Mutex<DesktopViewModel>>,
     open: &Rc<Cell<bool>>,
+    accordion: &Rc<RefCell<TrayAccordionState>>,
     anchor: PhysicalPosition,
 ) {
     if open.get() {
@@ -1327,6 +1361,7 @@ fn toggle_tray_popup(
     apply_tray_popup_model(
         &popup,
         tray_menu_model(&model.lock().expect("view model lock")),
+        &mut accordion.borrow_mut(),
     );
     let _ = popup.show();
     let monitors = main
@@ -1371,12 +1406,44 @@ fn dispatch_tray_popup_selection(
     command: TrayCommand,
     preference_writer: &Arc<Mutex<PreferenceWriter>>,
     preference_tracker: &Arc<Mutex<PersistenceTracker>>,
+    accordion: &Rc<RefCell<TrayAccordionState>>,
 ) {
     handle_tray_command(ui, model, command, preference_writer, preference_tracker);
     if let Some(popup) = popup.upgrade() {
         apply_tray_popup_model(
             &popup,
             tray_menu_model(&model.lock().expect("view model lock")),
+            &mut accordion.borrow_mut(),
+        );
+    }
+}
+
+fn dispatch_tray_popup_group_toggle(
+    popup: &slint::Weak<TrayPopup>,
+    ui: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    group_id: String,
+    preference_writer: &Arc<Mutex<PreferenceWriter>>,
+    preference_tracker: &Arc<Mutex<PersistenceTracker>>,
+    accordion: &Rc<RefCell<TrayAccordionState>>,
+) {
+    let expanded = accordion.borrow_mut().toggle(&group_id);
+    if expanded {
+        handle_tray_command(
+            ui,
+            model,
+            TrayCommand::SelectGroup {
+                group_id: group_id.clone(),
+            },
+            preference_writer,
+            preference_tracker,
+        );
+    }
+    if let Some(popup) = popup.upgrade() {
+        apply_tray_popup_model(
+            &popup,
+            tray_menu_model(&model.lock().expect("view model lock")),
+            &mut accordion.borrow_mut(),
         );
     }
 }
@@ -1388,6 +1455,7 @@ fn wire_tray_popup_actions(
     preference_writer: Arc<Mutex<PreferenceWriter>>,
     preference_tracker: Arc<Mutex<PersistenceTracker>>,
     open: Rc<Cell<bool>>,
+    accordion: Rc<RefCell<TrayAccordionState>>,
 ) {
     let popup_weak = popup.as_weak();
     let dismiss_popup = popup_weak.clone();
@@ -1422,20 +1490,21 @@ fn wire_tray_popup_actions(
     let group_model = model.clone();
     let group_writer = preference_writer.clone();
     let group_tracker = preference_tracker.clone();
-    popup.on_select_group(move |group_id| {
-        dispatch_tray_popup_selection(
+    let group_accordion = accordion.clone();
+    popup.on_toggle_group(move |group_id| {
+        dispatch_tray_popup_group_toggle(
             &group_popup,
             &group_ui,
             &group_model,
-            TrayCommand::SelectGroup {
-                group_id: group_id.to_string(),
-            },
+            group_id.to_string(),
             &group_writer,
             &group_tracker,
+            &group_accordion,
         );
     });
 
     let node_popup = popup_weak;
+    let node_accordion = accordion;
     popup.on_select_node(move |group_id, node_id| {
         dispatch_tray_popup_selection(
             &node_popup,
@@ -1447,6 +1516,7 @@ fn wire_tray_popup_actions(
             },
             &preference_writer,
             &preference_tracker,
+            &node_accordion,
         );
     });
 }
@@ -1455,11 +1525,15 @@ fn wire_tray_popup_focus_loss(
     popup: &TrayPopup,
     open: Rc<Cell<bool>>,
     model: Arc<Mutex<DesktopViewModel>>,
+    accordion: Rc<RefCell<TrayAccordionState>>,
 ) -> Timer {
     let timer = Timer::default();
     let weak = popup.as_weak();
     let grace_ticks = Rc::new(Cell::new(0_u8));
     let timer_grace = grace_ticks.clone();
+    let mut initial_model_cache = TrayPopupModelCache::default();
+    initial_model_cache.observe(&tray_menu_model(&model.lock().expect("view model lock")));
+    let model_cache = Rc::new(RefCell::new(initial_model_cache));
     timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
         if !open.get() {
             timer_grace.set(2);
@@ -1472,10 +1546,10 @@ fn wire_tray_popup_focus_loss(
         let Some(popup) = weak.upgrade() else {
             return;
         };
-        apply_tray_popup_model(
-            &popup,
-            tray_menu_model(&model.lock().expect("view model lock")),
-        );
+        let next_model = tray_menu_model(&model.lock().expect("view model lock"));
+        if model_cache.borrow_mut().observe(&next_model) {
+            apply_tray_popup_model(&popup, next_model, &mut accordion.borrow_mut());
+        }
         let focused = popup
             .window()
             .with_winit_window(|window| window.has_focus())
@@ -1491,6 +1565,7 @@ fn wire_tray_popup_focus_loss(
 fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
     let presentation = model.presentation();
     let catalog = model.catalog_presentation();
+    let tray_groups = model.tray_catalog_groups(12, 64);
     let status = if presentation.is_connected {
         format!("В сети · {}", presentation.node)
     } else {
@@ -1501,21 +1576,33 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
         connection_label: presentation.primary_label.into(),
         connection_enabled: presentation.primary_enabled
             && presentation.primary_action != PrimaryAction::None,
-        groups: catalog
-            .groups
+        groups: tray_groups
             .into_iter()
-            .map(|group| TrayGroup {
-                id: group.id,
-                label: group.label,
-                selected: group.selected,
-                selected_node_label: group.selected_node_label,
+            .map(|group| {
+                let group_display = derive_catalog_display(&group.label, CatalogDisplayKind::Group);
+                let selected_node =
+                    derive_catalog_display(&group.selected_node_label, CatalogDisplayKind::Node);
+                let nodes = group
+                    .nodes
+                    .into_iter()
+                    .map(|node| {
+                        let display = derive_catalog_display(&node.label, CatalogDisplayKind::Node);
+                        TrayNode {
+                            id: node.id,
+                            label: display.label,
+                            icon: display.icon,
+                            selected: node.selected,
+                        }
+                    })
+                    .collect();
+                TrayGroup {
+                    id: group.id,
+                    label: group_display.label,
+                    icon: group_display.icon,
+                    selected_node_label: selected_node.label,
+                    nodes,
+                }
             })
-            .collect(),
-        selected_group_id: catalog.selected_group_id,
-        nodes: catalog
-            .nodes
-            .into_iter()
-            .map(|node| (node.id, node.label, node.selected))
             .collect(),
         route_selection_enabled: catalog.selection_enabled,
     })
@@ -3040,14 +3127,23 @@ mod window_tests {
             "export component TrayPopup inherits Window",
             "no-frame: true;",
             "always-on-top: true;",
+            "import \"../assets/fonts/Twemoji.Mozilla.ttf\";",
+            "icon: string,",
             "detail: string,",
-            "in-out property <string> expanded-group-id;",
+            "expanded: bool,",
+            "node-count: int,",
+            "callback toggle-group(string);",
+            "component TrayConnectAction inherits Rectangle",
+            "connect-mesh-field := Rectangle",
+            "icon-kind: \"window\"",
             "detail: group.detail;",
-            "root.expanded-group-id == group.id",
+            "expanded: group.expanded;",
+            "visible: node.group-id == group.id;",
             "TrayInteraction::ShowMenu",
+            "TrayAccordionState",
             "place_tray_popup(",
             ".take(12)",
-            ".take(16)",
+            ".take(64)",
         ] {
             assert!(
                 app.contains(required) || popup.contains(required) || rust.contains(required),
@@ -3055,6 +3151,8 @@ mod window_tests {
             );
         }
         assert!(!popup.contains("text: \"УЗЕЛ\";"));
+        assert!(!popup.contains("expanded-group-id"));
+        assert!(!popup.contains("marker: \"↗\""));
     }
 
     #[test]
@@ -3081,9 +3179,14 @@ mod window_tests {
         assert!(!selection_dispatch.contains("hide_tray_popup"));
         assert!(selection_dispatch.contains("handle_tray_command"));
         assert!(selection_dispatch.contains("apply_tray_popup_model"));
-        let compact_rust = rust.split_whitespace().collect::<String>();
-        assert!(compact_rust.contains(
-            "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone())"
+        let main_entry = rust
+            .split("fn main()")
+            .nth(1)
+            .and_then(|source| source.split("fn activation_for_launch_arguments(").next())
+            .expect("desktop main entrypoint");
+        let compact_main = main_entry.split_whitespace().collect::<String>();
+        assert!(compact_main.contains(
+            "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone(),tray_accordion.clone(),)"
         ));
         assert!(rust.contains("if open.get() {\n        hide_tray_popup"));
         assert!(rust.contains("with_winit_window(|window| window.has_focus())"));
@@ -3174,10 +3277,9 @@ mod window_tests {
         for required in [
             "in property <string> subscription-updated",
             "in property <bool> subscription-updated-stale",
-            "updated-copy := VerticalLayout",
-            "text: \"Обновлено\"",
+            "updated-meta := Rectangle",
+            "source: @image-url(\"../assets/refresh.svg\")",
             "text: root.subscription-updated",
-            "clock-face := Rectangle",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
         ] {
             assert!(
@@ -3185,13 +3287,14 @@ mod window_tests {
                 "missing updated-at UI contract: {required}"
             );
         }
-        let updated_copy = ui
-            .split("updated-copy := VerticalLayout")
+        let updated_meta = ui
+            .split("updated-meta := Rectangle")
             .nth(1)
             .and_then(|source| source.split("shelf-chevron := Rectangle").next())
-            .expect("updated-at column source");
-        assert!(!updated_copy.contains("Theme.warning"));
-        assert!(!updated_copy.contains("subscription-updated-stale ?"));
+            .expect("updated-at metadata source");
+        assert!(!updated_meta.contains("text: \"Обновлено\""));
+        assert!(!updated_meta.contains("Theme.warning"));
+        assert!(!updated_meta.contains("subscription-updated-stale ?"));
     }
 
     #[test]
@@ -3712,6 +3815,13 @@ mod window_tests {
         assert!(ui.contains("root.replace-profile-source(profile.id, root.profile-edit-draft);"));
         assert!(ui.contains("profile.usage + \" · \" + profile.expiry"));
         assert!(ui.contains("accessible-label: \"Изменить URL \" + profile.title"));
+        assert!(ui.contains("@image-url(\"../assets/edit.svg\")"));
+        let edit_control = ui
+            .split("edit-profile-focus := FocusScope")
+            .nth(1)
+            .and_then(|source| source.split("delete-profile-focus := FocusScope").next())
+            .expect("profile edit control source");
+        assert!(!edit_control.contains("@image-url(\"../assets/link.svg\")"));
         assert!(!ui.contains("expanded-profile-id"));
         assert!(!ui.contains("Локальный источник"));
     }

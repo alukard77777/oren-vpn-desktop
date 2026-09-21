@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TrayCommand {
     ShowWindow,
@@ -11,8 +13,17 @@ pub(crate) enum TrayCommand {
 pub(crate) struct TrayGroup {
     pub(crate) id: String,
     pub(crate) label: String,
-    pub(crate) selected: bool,
+    pub(crate) icon: String,
     pub(crate) selected_node_label: String,
+    pub(crate) nodes: Vec<TrayNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrayNode {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) icon: String,
+    pub(crate) selected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,13 +32,12 @@ pub(crate) struct TrayInput {
     pub(crate) connection_label: String,
     pub(crate) connection_enabled: bool,
     pub(crate) groups: Vec<TrayGroup>,
-    pub(crate) selected_group_id: Option<String>,
-    pub(crate) nodes: Vec<(String, String, bool)>,
     pub(crate) route_selection_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrayMenuEntry {
+    pub(crate) icon: String,
     pub(crate) label: String,
     pub(crate) detail: String,
     pub(crate) checked: bool,
@@ -44,37 +54,76 @@ pub(crate) struct TrayMenuModel {
     pub(crate) nodes: Vec<TrayMenuEntry>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrayPopupModelCache {
+    last: Option<TrayMenuModel>,
+}
+
+impl TrayPopupModelCache {
+    pub(crate) fn observe(&mut self, model: &TrayMenuModel) -> bool {
+        if self.last.as_ref() == Some(model) {
+            false
+        } else {
+            self.last = Some(model.clone());
+            true
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrayAccordionState {
+    expanded_group_ids: BTreeSet<String>,
+}
+
+impl TrayAccordionState {
+    pub(crate) fn toggle(&mut self, group_id: &str) -> bool {
+        if self.expanded_group_ids.remove(group_id) {
+            false
+        } else {
+            self.expanded_group_ids.insert(group_id.to_owned());
+            true
+        }
+    }
+
+    pub(crate) fn is_expanded(&self, group_id: &str) -> bool {
+        self.expanded_group_ids.contains(group_id)
+    }
+
+    pub(crate) fn retain_available<'a>(&mut self, group_ids: impl Iterator<Item = &'a str>) {
+        let available = group_ids.collect::<BTreeSet<_>>();
+        self.expanded_group_ids
+            .retain(|group_id| available.contains(group_id.as_str()));
+    }
+}
+
 pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
+    let mut nodes = Vec::new();
     let groups = input
         .groups
         .into_iter()
-        .map(|group| TrayMenuEntry {
-            label: group.label,
-            detail: group.selected_node_label,
-            checked: group.selected,
-            enabled: input.route_selection_enabled,
-            command: TrayCommand::SelectGroup { group_id: group.id },
+        .map(|group| {
+            let group_id = group.id;
+            nodes.extend(group.nodes.into_iter().map(|node| TrayMenuEntry {
+                icon: node.icon,
+                label: node.label,
+                detail: String::new(),
+                checked: node.selected,
+                enabled: input.route_selection_enabled,
+                command: TrayCommand::SelectNode {
+                    group_id: group_id.clone(),
+                    node_id: node.id,
+                },
+            }));
+            TrayMenuEntry {
+                icon: group.icon,
+                label: group.label,
+                detail: group.selected_node_label,
+                checked: false,
+                enabled: input.route_selection_enabled,
+                command: TrayCommand::SelectGroup { group_id },
+            }
         })
         .collect();
-    let nodes = input
-        .selected_group_id
-        .map(|group_id| {
-            input
-                .nodes
-                .into_iter()
-                .map(|(node_id, label, selected)| TrayMenuEntry {
-                    label,
-                    detail: String::new(),
-                    checked: selected,
-                    enabled: input.route_selection_enabled,
-                    command: TrayCommand::SelectNode {
-                        group_id: group_id.clone(),
-                        node_id,
-                    },
-                })
-                .collect()
-        })
-        .unwrap_or_default();
 
     TrayMenuModel {
         status: input.status,
@@ -224,12 +273,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayPointerButton, TrayPointerState,
-        build_menu_model, pointer_interaction,
+        TrayAccordionState, TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayNode,
+        TrayPointerButton, TrayPointerState, TrayPopupModelCache, build_menu_model,
+        pointer_interaction,
     };
 
     #[test]
-    fn menu_exposes_contextual_connection_and_current_group_nodes() {
+    fn menu_exposes_every_groups_nodes_and_icons_without_treating_groups_as_alternatives() {
         let input = TrayInput {
             status: "В сети".into(),
             connection_label: "Отключиться".into(),
@@ -238,18 +288,28 @@ mod tests {
                 TrayGroup {
                     id: "server:opaque".into(),
                     label: "Сервер".into(),
-                    selected: true,
+                    icon: "🌍".into(),
                     selected_node_label: "Швеция".into(),
+                    nodes: vec![TrayNode {
+                        id: "node:a".into(),
+                        label: "Швеция".into(),
+                        icon: "🇸🇪".into(),
+                        selected: true,
+                    }],
                 },
                 TrayGroup {
                     id: "games:opaque".into(),
                     label: "Игры".into(),
-                    selected: false,
+                    icon: "🎮".into(),
                     selected_node_label: "Direct".into(),
+                    nodes: vec![TrayNode {
+                        id: "node:b".into(),
+                        label: "Direct".into(),
+                        icon: "↗".into(),
+                        selected: true,
+                    }],
                 },
             ],
-            selected_group_id: Some("server:opaque".into()),
-            nodes: vec![("node:a".into(), "Швеция".into(), true)],
             route_selection_enabled: true,
         };
 
@@ -259,7 +319,9 @@ mod tests {
         assert_eq!(model.groups.len(), 2);
         assert_eq!(model.groups[0].detail, "Швеция");
         assert_eq!(model.groups[1].detail, "Direct");
-        assert_eq!(model.nodes.len(), 1);
+        assert_eq!(model.groups[0].icon, "🌍");
+        assert_eq!(model.nodes.len(), 2);
+        assert_eq!(model.nodes[0].icon, "🇸🇪");
         assert_eq!(
             model.nodes[0].command,
             TrayCommand::SelectNode {
@@ -267,22 +329,64 @@ mod tests {
                 node_id: "node:a".into(),
             }
         );
+        assert_eq!(
+            model.nodes[1].command,
+            TrayCommand::SelectNode {
+                group_id: "games:opaque".into(),
+                node_id: "node:b".into(),
+            }
+        );
     }
 
     #[test]
-    fn nodes_are_disabled_without_a_current_group() {
+    fn empty_groups_never_leak_nodes() {
         let model = build_menu_model(TrayInput {
             status: "Готово".into(),
             connection_label: "Подключиться".into(),
             connection_enabled: false,
             groups: Vec::new(),
-            selected_group_id: None,
-            nodes: vec![("stale".into(), "Старый".into(), false)],
             route_selection_enabled: true,
         });
 
         assert!(model.nodes.is_empty());
         assert!(!model.connection_enabled);
+    }
+
+    #[test]
+    fn accordion_expands_multiple_route_groups_independently() {
+        let mut accordion = TrayAccordionState::default();
+
+        assert!(accordion.toggle("server"));
+        assert!(accordion.toggle("games"));
+        assert!(accordion.is_expanded("server"));
+        assert!(accordion.is_expanded("games"));
+
+        assert!(!accordion.toggle("server"));
+        assert!(!accordion.is_expanded("server"));
+        assert!(accordion.is_expanded("games"));
+
+        accordion.retain_available(["server"].into_iter());
+        assert!(!accordion.is_expanded("games"));
+    }
+
+    #[test]
+    fn popup_model_cache_suppresses_identical_timer_rebinds() {
+        let model = build_menu_model(TrayInput {
+            status: "Готово".into(),
+            connection_label: "Подключиться".into(),
+            connection_enabled: true,
+            groups: Vec::new(),
+            route_selection_enabled: true,
+        });
+        let mut cache = TrayPopupModelCache::default();
+
+        assert!(cache.observe(&model));
+        assert!(!cache.observe(&model));
+
+        let mut changed = model;
+        changed.status = "В сети".into();
+        assert!(cache.observe(&changed));
+        assert!(!cache.observe(&changed));
     }
 
     #[test]

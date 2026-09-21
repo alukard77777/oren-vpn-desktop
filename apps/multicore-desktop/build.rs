@@ -43,6 +43,7 @@ export component ComponentCheck inherits Window {{
     println!("cargo:rerun-if-changed=assets/fonts/Twemoji.Mozilla.ttf");
     println!("cargo:rerun-if-changed=assets/power.svg");
     println!("cargo:rerun-if-changed=assets/link.svg");
+    println!("cargo:rerun-if-changed=assets/edit.svg");
     println!("cargo:rerun-if-changed=assets/diagnostics.svg");
     println!("cargo:rerun-if-changed=assets/app-icon.svg");
     println!("cargo:rerun-if-changed=assets/close.svg");

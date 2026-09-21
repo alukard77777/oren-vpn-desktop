@@ -180,6 +180,14 @@ pub(crate) struct CatalogGroupPresentation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrayCatalogGroupPresentation {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) selected_node_label: String,
+    pub(crate) nodes: Vec<CatalogNodePresentation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogNodePresentation {
     pub(crate) id: String,
     pub(crate) label: String,
@@ -2259,6 +2267,38 @@ impl DesktopViewModel {
             selection_queued: !self.queued_selections.is_empty(),
             error: self.catalog_error.clone(),
         }
+    }
+
+    pub(crate) fn tray_catalog_groups(
+        &self,
+        max_groups: usize,
+        max_nodes: usize,
+    ) -> Vec<TrayCatalogGroupPresentation> {
+        let mut remaining_nodes = max_nodes;
+        self.catalog_groups
+            .iter()
+            .take(max_groups)
+            .map(|group| {
+                let nodes = group
+                    .nodes
+                    .iter()
+                    .take(remaining_nodes)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                remaining_nodes = remaining_nodes.saturating_sub(nodes.len());
+                TrayCatalogGroupPresentation {
+                    id: group.id.clone(),
+                    label: group.label.clone(),
+                    selected_node_label: group
+                        .nodes
+                        .iter()
+                        .find(|node| node.selected)
+                        .map(|node| node.label.clone())
+                        .unwrap_or_else(|| "Не выбран".into()),
+                    nodes,
+                }
+            })
+            .collect()
     }
 
     fn replace_catalog(&mut self, catalog: DaemonCatalog) {
@@ -4944,6 +4984,25 @@ mod tests {
         assert_eq!(catalog.nodes[0].delay_ms, Some(37));
         assert!(!catalog.groups[0].label.contains("private.invalid"));
         assert!(catalog.error.is_none());
+    }
+
+    #[test]
+    fn tray_catalog_snapshot_bounds_groups_and_total_nodes() {
+        let view_model = connected_view_model_with_catalog();
+
+        let one_group = view_model.tray_catalog_groups(1, 1);
+        assert_eq!(one_group.len(), 1);
+        assert_eq!(one_group[0].nodes.len(), 1);
+
+        let all_groups = view_model.tray_catalog_groups(12, 1);
+        assert_eq!(all_groups.len(), 2);
+        assert_eq!(
+            all_groups
+                .iter()
+                .map(|group| group.nodes.len())
+                .sum::<usize>(),
+            1
+        );
     }
 
     #[test]

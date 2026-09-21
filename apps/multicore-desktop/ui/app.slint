@@ -910,37 +910,27 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            updated-copy := VerticalLayout {
-                                width: 112px;
+                            updated-meta := Rectangle {
+                                width: 104px;
                                 horizontal-stretch: 0;
-                                padding-top: 2px;
-                                spacing: 0px;
-                                Text {
-                                    height: 20px;
-                                    text: "Обновлено";
-                                    color: Theme.text-muted;
-                                    font-size: Theme.type-metadata-size;
-                                    horizontal-alignment: right;
-                                    vertical-alignment: center;
-                                }
                                 HorizontalLayout {
+                                    x: 0px;
+                                    y: 22px;
+                                    width: parent.width;
                                     height: 18px;
-                                    spacing: 7px;
-                                    clock-slot := Rectangle {
-                                        width: 14px;
+                                    spacing: 6px;
+                                    Rectangle {
+                                        width: 16px;
                                         height: 18px;
                                         background: transparent;
-                                        clock-face := Rectangle {
+                                        Image {
                                             x: 1px;
-                                            y: 3px;
-                                            width: 12px;
-                                            height: 12px;
-                                            background: transparent;
-                                            border-radius: 6px;
-                                            border-width: 1px;
-                                            border-color: Theme.text-muted;
-                                            Rectangle { x: 5px; y: 2px; width: 1px; height: 4px; background: Theme.text-muted; }
-                                            Rectangle { x: 5px; y: 5px; width: 3px; height: 1px; background: Theme.text-muted; }
+                                            y: 2px;
+                                            width: 14px;
+                                            height: 14px;
+                                            source: @image-url("../assets/refresh.svg");
+                                            image-fit: contain;
+                                            accessible-role: none;
                                         }
                                     }
                                     Text {
@@ -948,7 +938,7 @@ export component AppWindow inherits Window {
                                         text: root.subscription-updated;
                                         color: Theme.text-muted;
                                         font-size: Theme.type-metadata-size;
-                                        horizontal-alignment: right;
+                                        horizontal-alignment: left;
                                         vertical-alignment: center;
                                     }
                                 }
@@ -1378,7 +1368,7 @@ export component AppWindow inherits Window {
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Изменить URL " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
-                                            Rectangle { border-radius: 8px; background: edit-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 11px; y: 11px; width: 18px; height: 18px; source: @image-url("../assets/link.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; background: edit-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 11px; y: 11px; width: 18px; height: 18px; source: @image-url("../assets/edit.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; return accept; } return reject; }
                                             edit-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
                                         }
