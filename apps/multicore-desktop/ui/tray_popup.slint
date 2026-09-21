@@ -353,7 +353,7 @@ export component TrayPopup inherits Window {
     height: 460px;
     no-frame: true;
     always-on-top: true;
-    background: transparent;
+    background: #15181d;
     default-font-family: Theme.font-family;
 
     in property <string> status-text: "Готово";
@@ -446,7 +446,7 @@ export component TrayPopup inherits Window {
                         width: route-scroll.viewport-width;
                         spacing: 2px;
                         for group in root.group-rows: Rectangle {
-                            height: 48px + (group.expanded ? group.node-count * 42px + 2px : 0px);
+                            height: 48px + (group.expanded ? group.node-count * 42px : 0px);
                             background: transparent;
                             route-group := RouteGroupAction {
                                 x: 0px;
@@ -463,15 +463,22 @@ export component TrayPopup inherits Window {
                                 x: 12px;
                                 y: 48px;
                                 width: parent.width - 12px;
-                                spacing: 2px;
-                                for node in root.node-rows: PopupAction {
-                                    visible: node.group-id == group.id;
-                                    height: self.visible ? 40px : 0px;
-                                    label: node.label;
-                                    icon: node.icon;
-                                    selected: node.selected;
-                                    enabled: node.enabled;
-                                    activated => { root.select-node(node.group-id, node.id); }
+                                spacing: 0px;
+                                for node in root.node-rows: Rectangle {
+                                    height: node.group-id == group.id ? 42px : 0px;
+                                    background: transparent;
+                                    PopupAction {
+                                        x: 0px;
+                                        y: 2px;
+                                        width: parent.width;
+                                        height: 40px;
+                                        visible: parent.height > 0px;
+                                        label: node.label;
+                                        icon: node.icon;
+                                        selected: node.selected;
+                                        enabled: node.enabled;
+                                        activated => { root.select-node(node.group-id, node.id); }
+                                    }
                                 }
                             }
                         }

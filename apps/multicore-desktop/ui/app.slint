@@ -911,36 +911,18 @@ export component AppWindow inherits Window {
                                 }
                             }
                             updated-meta := Rectangle {
-                                width: 104px;
+                                width: 92px;
                                 horizontal-stretch: 0;
-                                HorizontalLayout {
+                                Text {
                                     x: 0px;
                                     y: 22px;
                                     width: parent.width;
                                     height: 18px;
-                                    spacing: 6px;
-                                    Rectangle {
-                                        width: 16px;
-                                        height: 18px;
-                                        background: transparent;
-                                        Image {
-                                            x: 1px;
-                                            y: 2px;
-                                            width: 14px;
-                                            height: 14px;
-                                            source: @image-url("../assets/refresh.svg");
-                                            image-fit: contain;
-                                            accessible-role: none;
-                                        }
-                                    }
-                                    Text {
-                                        horizontal-stretch: 1;
-                                        text: root.subscription-updated;
-                                        color: Theme.text-muted;
-                                        font-size: Theme.type-metadata-size;
-                                        horizontal-alignment: left;
-                                        vertical-alignment: center;
-                                    }
+                                    text: root.subscription-updated;
+                                    color: Theme.text-muted;
+                                    font-size: Theme.type-metadata-size;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
                                 }
                             }
                             shelf-chevron := Rectangle {

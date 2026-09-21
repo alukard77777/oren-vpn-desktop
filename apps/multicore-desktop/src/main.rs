@@ -42,8 +42,8 @@ use view_model::{
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
     CloseDisposition, MinimizeDisposition, MonitorRect, MonitorSignature, PhysicalPosition,
-    close_disposition, minimize_disposition, monitor_cap_changed, next_maximized,
-    parse_resize_edge, place_tray_popup, restore_placement,
+    apply_tray_popup_native_rounding, close_disposition, minimize_disposition, monitor_cap_changed,
+    next_maximized, parse_resize_edge, place_tray_popup, restore_placement,
 };
 
 slint::include_modules!();
@@ -1377,6 +1377,7 @@ fn toggle_tray_popup(
         let _ = popup.window().with_winit_window(|window| {
             use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
             use slint::winit_030::winit::window::WindowLevel;
+            apply_tray_popup_native_rounding(window);
             window.set_window_level(WindowLevel::AlwaysOnTop);
             window.set_outer_position(WinitPhysicalPosition::new(position.x, position.y));
             window.focus_window();
@@ -3156,6 +3157,39 @@ mod window_tests {
     }
 
     #[test]
+    fn tray_popup_hidden_nodes_do_not_accumulate_layout_spacing() {
+        let popup = include_str!("../ui/tray_popup.slint");
+        let expanded_nodes = popup
+            .split("if group.expanded: VerticalLayout")
+            .nth(1)
+            .and_then(|source| source.split("if root.group-rows.length == 0").next())
+            .expect("expanded tray node layout");
+
+        assert!(expanded_nodes.contains("spacing: 0px;"));
+        assert!(expanded_nodes.contains("height: node.group-id == group.id ? 42px : 0px;"));
+        assert!(!expanded_nodes.contains("height: self.visible ? 40px : 0px;"));
+    }
+
+    #[test]
+    fn tray_popup_uses_an_opaque_fallback_and_native_windows_rounding() {
+        let popup = include_str!("../ui/tray_popup.slint");
+        let rust = include_str!("main.rs");
+        let shell = include_str!("windows_shell.rs");
+        let window_header = popup
+            .split("export component TrayPopup inherits Window")
+            .nth(1)
+            .and_then(|source| source.split("in property <string> status-text").next())
+            .expect("tray popup window header");
+
+        assert!(window_header.contains("background: #15181d;"));
+        assert!(!window_header.contains("background: transparent;"));
+        assert!(rust.contains("apply_tray_popup_native_rounding(window)"));
+        assert!(shell.contains("DwmSetWindowAttribute"));
+        assert!(shell.contains("DWMWA_WINDOW_CORNER_PREFERENCE"));
+        assert!(shell.contains("DWMWCP_ROUND"));
+    }
+
+    #[test]
     fn tray_popup_lifecycle_keeps_route_accordion_open_but_closes_terminal_actions() {
         let popup = include_str!("../ui/tray_popup.slint");
         let rust = include_str!("main.rs");
@@ -3278,7 +3312,6 @@ mod window_tests {
             "in property <string> subscription-updated",
             "in property <bool> subscription-updated-stale",
             "updated-meta := Rectangle",
-            "source: @image-url(\"../assets/refresh.svg\")",
             "text: root.subscription-updated",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
         ] {
@@ -3293,6 +3326,7 @@ mod window_tests {
             .and_then(|source| source.split("shelf-chevron := Rectangle").next())
             .expect("updated-at metadata source");
         assert!(!updated_meta.contains("text: \"Обновлено\""));
+        assert!(!updated_meta.contains("refresh.svg"));
         assert!(!updated_meta.contains("Theme.warning"));
         assert!(!updated_meta.contains("subscription-updated-stale ?"));
     }

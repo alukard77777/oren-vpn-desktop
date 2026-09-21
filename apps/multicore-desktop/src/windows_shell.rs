@@ -7,6 +7,33 @@ pub const DEFAULT_HEIGHT: u32 = 720;
 
 const REACHABLE_TITLE_BAR: i64 = 64;
 
+#[cfg(target_os = "windows")]
+pub fn apply_tray_popup_native_rounding(window: &slint::winit_030::winit::window::Window) {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    };
+
+    let Ok(window_handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = window_handle.as_raw() else {
+        return;
+    };
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            win32.hwnd.get() as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&preference as *const i32).cast(),
+            std::mem::size_of_val(&preference) as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_tray_popup_native_rounding(_window: &slint::winit_030::winit::window::Window) {}
+
 #[cfg(test)]
 pub const RESIZE_BORDER: u32 = 6;
 
