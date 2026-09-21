@@ -131,6 +131,10 @@ component RouteGroupAction inherits Rectangle {
     }
 
     route-group-focus := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
         enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
@@ -152,6 +156,10 @@ component RouteGroupAction inherits Rectangle {
             background: transparent;
         }
         route-group-touch := TouchArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
             enabled: root.enabled;
             clicked => { root.activated(); }
         }
@@ -259,7 +267,7 @@ export component TrayPopup inherits Window {
                         width: route-scroll.viewport-width;
                         spacing: 2px;
                         for group in root.group-rows: Rectangle {
-                            height: 48px + (root.expanded-group-id == group.id && group.selected ? root.node-rows.length * 40px + 2px : 0px);
+                            height: 48px + (root.expanded-group-id == group.id ? root.node-rows.length * 40px + 2px : 0px);
                             background: transparent;
                             route-group := RouteGroupAction {
                                 x: 0px;
@@ -274,11 +282,11 @@ export component TrayPopup inherits Window {
                                         root.expanded-group-id = "";
                                     } else {
                                         root.expanded-group-id = group.id;
-                                        if (!group.selected) { root.select-group(group.id); }
+                                        root.select-group(group.id);
                                     }
                                 }
                             }
-                            if root.expanded-group-id == group.id && group.selected: VerticalLayout {
+                            if root.expanded-group-id == group.id: VerticalLayout {
                                 x: 12px;
                                 y: 48px;
                                 width: parent.width - 12px;

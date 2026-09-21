@@ -892,6 +892,7 @@ export component AppWindow inherits Window {
                             padding-bottom: 5px;
                             spacing: 12px;
                             subscription-copy := VerticalLayout {
+                                horizontal-stretch: 1;
                                 padding-top: 2px;
                                 spacing: 0px;
                                 HorizontalLayout {
@@ -900,7 +901,6 @@ export component AppWindow inherits Window {
                                 }
                                 HorizontalLayout {
                                     height: 18px;
-                                    spacing: 7px;
                                     Text {
                                         horizontal-stretch: 1;
                                         text: root.subscription-refresh-error != "" ? root.subscription-refresh-error : root.subscription-usage + " · " + root.subscription-expiry;
@@ -908,6 +908,24 @@ export component AppWindow inherits Window {
                                         font-size: Theme.type-metadata-size;
                                         overflow: elide;
                                     }
+                                }
+                            }
+                            updated-copy := VerticalLayout {
+                                width: 112px;
+                                horizontal-stretch: 0;
+                                padding-top: 2px;
+                                spacing: 0px;
+                                Text {
+                                    height: 20px;
+                                    text: "Обновлено";
+                                    color: Theme.text-muted;
+                                    font-size: Theme.type-metadata-size;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                }
+                                HorizontalLayout {
+                                    height: 18px;
+                                    spacing: 7px;
                                     clock-slot := Rectangle {
                                         width: 14px;
                                         height: 18px;
@@ -920,21 +938,13 @@ export component AppWindow inherits Window {
                                             background: transparent;
                                             border-radius: 6px;
                                             border-width: 1px;
-                                            border-color: root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
-                                            Rectangle { x: 5px; y: 2px; width: 1px; height: 4px; background: root.subscription-updated-stale ? Theme.warning : Theme.text-muted; }
-                                            Rectangle { x: 5px; y: 5px; width: 3px; height: 1px; background: root.subscription-updated-stale ? Theme.warning : Theme.text-muted; }
-                                        }
-                                        if root.subscription-updated-stale: Rectangle {
-                                            x: 10px;
-                                            y: 2px;
-                                            width: 4px;
-                                            height: 4px;
-                                            border-radius: 2px;
-                                            background: Theme.warning;
+                                            border-color: Theme.text-muted;
+                                            Rectangle { x: 5px; y: 2px; width: 1px; height: 4px; background: Theme.text-muted; }
+                                            Rectangle { x: 5px; y: 5px; width: 3px; height: 1px; background: Theme.text-muted; }
                                         }
                                     }
                                     Text {
-                                        horizontal-stretch: 0;
+                                        horizontal-stretch: 1;
                                         text: root.subscription-updated;
                                         color: Theme.text-muted;
                                         font-size: Theme.type-metadata-size;
@@ -943,7 +953,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            Rectangle {
+                            shelf-chevron := Rectangle {
                                 width: 20px;
                                 background: transparent;
                                 border-radius: 11px;

@@ -3091,6 +3091,33 @@ mod window_tests {
     }
 
     #[test]
+    fn tray_route_group_uses_the_whole_row_as_its_accordion_trigger() {
+        let popup = include_str!("../ui/tray_popup.slint");
+        let route_group = popup
+            .split("component RouteGroupAction inherits Rectangle")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("export component TrayPopup inherits Window")
+                    .next()
+            })
+            .expect("route group component source");
+
+        for required in [
+            "route-group-focus := FocusScope",
+            "width: parent.width;",
+            "height: parent.height;",
+            "route-group-touch := TouchArea",
+            "clicked => { root.activated(); }",
+        ] {
+            assert!(
+                route_group.contains(required),
+                "route-group row must expose a full-surface accordion trigger: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn native_minimize_and_restore_drive_shell_activity_without_tray_wakeup() {
         assert!(!shell_active_after_native_minimize_change(true));
         assert!(shell_active_after_native_minimize_change(false));
@@ -3147,6 +3174,8 @@ mod window_tests {
         for required in [
             "in property <string> subscription-updated",
             "in property <bool> subscription-updated-stale",
+            "updated-copy := VerticalLayout",
+            "text: \"Обновлено\"",
             "text: root.subscription-updated",
             "clock-face := Rectangle",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
@@ -3156,6 +3185,13 @@ mod window_tests {
                 "missing updated-at UI contract: {required}"
             );
         }
+        let updated_copy = ui
+            .split("updated-copy := VerticalLayout")
+            .nth(1)
+            .and_then(|source| source.split("shelf-chevron := Rectangle").next())
+            .expect("updated-at column source");
+        assert!(!updated_copy.contains("Theme.warning"));
+        assert!(!updated_copy.contains("subscription-updated-stale ?"));
     }
 
     #[test]
