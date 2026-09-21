@@ -822,6 +822,20 @@ fn runtime_allows_update(presentation: &StatePresentation) -> bool {
         && !presentation.is_degraded
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateInstallIntent {
+    InstallNow,
+    ConfirmRestart,
+}
+
+fn update_install_intent(runtime_idle: bool) -> UpdateInstallIntent {
+    if runtime_idle {
+        UpdateInstallIntent::InstallNow
+    } else {
+        UpdateInstallIntent::ConfirmRestart
+    }
+}
+
 fn apply_update_state(ui: &AppWindow, state: &UpdateState, runtime_idle: bool) {
     let presentation = state.presentation(runtime_idle);
     ui.set_update_status(presentation.status.into());
@@ -1141,50 +1155,93 @@ fn wire_updater(
     state: Arc<Mutex<UpdateState>>,
 ) {
     let weak = ui.as_weak();
+    let action_model = model.clone();
+    let action_state = state.clone();
     ui.on_update_action(move || {
         let runtime_idle =
-            runtime_allows_update(&model.lock().expect("view model lock").presentation());
-        let action = state
+            runtime_allows_update(&action_model.lock().expect("view model lock").presentation());
+        let action = action_state
             .lock()
             .expect("update state lock")
             .presentation(runtime_idle)
             .action;
         match action {
-            UpdateAction::Check => run_update_check(weak.clone(), model.clone(), state.clone()),
-            UpdateAction::Install if runtime_idle => {
-                let release = state.lock().expect("update state lock").available_release();
-                let Some(release) = release else {
-                    return;
-                };
-                {
-                    let mut current = state.lock().expect("update state lock");
-                    *current = UpdateState::Downloading(release.clone());
+            UpdateAction::Check => {
+                run_update_check(weak.clone(), action_model.clone(), action_state.clone())
+            }
+            UpdateAction::Install => match update_install_intent(runtime_idle) {
+                UpdateInstallIntent::InstallNow => {
+                    start_update_install(weak.clone(), action_state.clone());
+                }
+                UpdateInstallIntent::ConfirmRestart => {
                     if let Some(ui) = weak.upgrade() {
-                        apply_update_state(&ui, &current, true);
+                        ui.set_update_confirm_open(true);
                     }
                 }
-                let weak = weak.clone();
-                let state = state.clone();
-                thread::spawn(move || match updater::download_and_start_apply(&release) {
-                    Ok(()) => {
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let _keep_state_alive = state;
-                            let _keep_window_alive = weak;
-                            let _ = slint::quit_event_loop();
-                        });
-                    }
-                    Err(error) => {
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let mut current = state.lock().expect("update state lock");
-                            *current = UpdateState::Error(error);
-                            if let Some(ui) = weak.upgrade() {
-                                apply_update_state(&ui, &current, true);
-                            }
-                        });
-                    }
-                });
-            }
-            UpdateAction::None | UpdateAction::Install => {}
+            },
+            UpdateAction::None => {}
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_cancel_update_restart(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_update_confirm_open(false);
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_confirm_update_restart(move || {
+        let (runtime_idle, action, client, current) = {
+            let mut model = model.lock().expect("view model lock");
+            let runtime_idle = runtime_allows_update(&model.presentation());
+            let action = (!runtime_idle)
+                .then(|| model.begin_primary_action())
+                .flatten();
+            let client = model.daemon_client();
+            (runtime_idle, action, client, snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            ui.set_update_confirm_open(false);
+            apply_snapshot(&ui, &current);
+        }
+        if runtime_idle {
+            start_update_install(weak.clone(), state.clone());
+        } else if let Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)) = action
+        {
+            run_disconnect_for_update(weak.clone(), model.clone(), client, mutation, state.clone());
+        }
+    });
+}
+
+fn start_update_install(weak: slint::Weak<AppWindow>, state: Arc<Mutex<UpdateState>>) {
+    let release = state.lock().expect("update state lock").available_release();
+    let Some(release) = release else {
+        return;
+    };
+    {
+        let mut current = state.lock().expect("update state lock");
+        *current = UpdateState::Downloading(release.clone());
+        if let Some(ui) = weak.upgrade() {
+            apply_update_state(&ui, &current, true);
+        }
+    }
+    thread::spawn(move || match updater::download_and_start_apply(&release) {
+        Ok(()) => {
+            let _ = slint::invoke_from_event_loop(move || {
+                let _keep_state_alive = state;
+                let _keep_window_alive = weak;
+                let _ = slint::quit_event_loop();
+            });
+        }
+        Err(error) => {
+            let _ = slint::invoke_from_event_loop(move || {
+                let mut current = state.lock().expect("update state lock");
+                *current = UpdateState::Error(error);
+                if let Some(ui) = weak.upgrade() {
+                    apply_update_state(&ui, &current, true);
+                }
+            });
         }
     });
 }
@@ -2697,6 +2754,26 @@ fn run_disconnect(
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
 ) {
+    run_disconnect_with_update(weak, model, client, mutation, None);
+}
+
+fn run_disconnect_for_update(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    client: Arc<dyn DaemonClient>,
+    mutation: MutationToken,
+    update_state: Arc<Mutex<UpdateState>>,
+) {
+    run_disconnect_with_update(weak, model, client, mutation, Some(update_state));
+}
+
+fn run_disconnect_with_update(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    client: Arc<dyn DaemonClient>,
+    mutation: MutationToken,
+    update_state: Option<Arc<Mutex<UpdateState>>>,
+) {
     thread::spawn(move || {
         let result = client.disconnect();
         let (reconciliation, current) = {
@@ -2705,18 +2782,34 @@ fn run_disconnect(
             let reconciliation = reconcile_status.then(|| model.begin_disconnect_reconciliation());
             (reconciliation, snapshot(&model))
         };
-        apply_snapshot_from_worker(weak.clone(), current, model.clone(), false, false);
+        if update_state.is_some() {
+            apply_disconnect_snapshot_from_worker(
+                weak.clone(),
+                current,
+                model.clone(),
+                update_state.clone(),
+            );
+        } else {
+            apply_snapshot_from_worker(weak.clone(), current, model.clone(), false, false);
+        }
         if let Some(reconciliation) = reconciliation {
-            run_disconnect_reconciliation(weak, model, client, reconciliation);
+            run_disconnect_reconciliation_with_update(
+                weak,
+                model,
+                client,
+                reconciliation,
+                update_state,
+            );
         }
     });
 }
 
-fn run_disconnect_reconciliation(
+fn run_disconnect_reconciliation_with_update(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
+    update_state: Option<Arc<Mutex<UpdateState>>>,
 ) {
     thread::spawn(move || {
         let result = client.status();
@@ -2730,7 +2823,30 @@ fn run_disconnect_reconciliation(
         let Some(current) = current else {
             return;
         };
-        apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
+        if update_state.is_some() {
+            apply_disconnect_snapshot_from_worker(weak, current, model, update_state);
+        } else {
+            apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
+        }
+    });
+}
+
+fn apply_disconnect_snapshot_from_worker(
+    weak: slint::Weak<AppWindow>,
+    current: UiSnapshot,
+    model: Arc<Mutex<DesktopViewModel>>,
+    update_state: Option<Arc<Mutex<UpdateState>>>,
+) {
+    let runtime_idle = runtime_allows_update(&current.presentation);
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if runtime_idle && let Some(update_state) = update_state {
+            start_update_install(weak, update_state);
+        } else if current.presentation.has_profile {
+            load_catalog(weak, model);
+        }
     });
 }
 
@@ -2966,7 +3082,6 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_node_name(presentation.node.clone().into());
     ui.set_has_profile(presentation.has_profile);
     ui.set_state_busy(presentation.is_busy);
-    ui.set_update_runtime_safe(runtime_allows_update(presentation));
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
     ui.set_status_label(SharedString::from(presentation.pill_label));
@@ -3154,13 +3269,13 @@ mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
         PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
-        ProfilePreferenceReconciler, WindowObservation, WriterCommand, WriterResult,
-        activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
+        ProfilePreferenceReconciler, UpdateInstallIntent, WindowObservation, WriterCommand,
+        WriterResult, activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
         drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
         preference_error_for_result, preference_failure_is_terminal,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
-        visible_page_from_name, visible_page_name,
+        update_install_intent, visible_page_from_name, visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -3910,6 +4025,48 @@ mod window_tests {
             .and_then(|source| source.split("fn run_update_check").next())
             .expect("updater wiring");
         assert!(updater_exit.contains("slint::quit_event_loop()"));
+    }
+
+    #[test]
+    fn connected_update_uses_confirmation_and_managed_disconnect() {
+        assert_eq!(
+            update_install_intent(false),
+            UpdateInstallIntent::ConfirmRestart
+        );
+        assert_eq!(update_install_intent(true), UpdateInstallIntent::InstallNow);
+
+        let rust = include_str!("main.rs");
+        let updater = rust
+            .split("fn wire_updater(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_update_check").next())
+            .expect("updater wiring");
+        for required in [
+            "ui.on_confirm_update_restart",
+            "ui.on_cancel_update_restart",
+            "run_disconnect_for_update",
+            "start_update_install",
+        ] {
+            assert!(
+                updater.contains(required),
+                "missing updater flow: {required}"
+            );
+        }
+
+        let ui = include_str!("../ui/app.slint");
+        for required in [
+            "in-out property <bool> update-confirm-open",
+            "callback confirm-update-restart()",
+            "callback cancel-update-restart()",
+            "Скачать обновление и перезапустить клиент?",
+            "label: \"Да\"",
+            "label: \"Нет\"",
+        ] {
+            assert!(
+                ui.contains(required),
+                "missing update confirmation UI: {required}"
+            );
+        }
     }
 
     #[test]

@@ -89,11 +89,11 @@ impl UpdateState {
                 detail: if runtime_idle {
                     "Будет заменён весь portable-пакет".into()
                 } else {
-                    "Отключитесь, чтобы установить обновление".into()
+                    "Туннель будет остановлен, а клиент перезапущен".into()
                 },
                 action_label: "Обновить".into(),
                 action: UpdateAction::Install,
-                action_enabled: runtime_idle,
+                action_enabled: true,
                 available: true,
                 busy: false,
             },
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn available_update_is_installable_only_while_runtime_is_idle() {
+    fn available_update_can_request_a_managed_restart_while_connected() {
         let state = UpdateState::Available(release());
         let idle = state.presentation(true);
         assert_eq!(idle.action, UpdateAction::Install);
@@ -358,8 +358,8 @@ mod tests {
 
         let connected = state.presentation(false);
         assert_eq!(connected.action, UpdateAction::Install);
-        assert!(!connected.action_enabled);
-        assert!(connected.detail.contains("Отключитесь"));
+        assert!(connected.action_enabled);
+        assert!(connected.detail.contains("перезапущен"));
     }
 
     #[test]

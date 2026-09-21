@@ -6099,7 +6099,7 @@ mod tests {
             "callback paste-subscription();",
             "callback update-action();",
             "root.update-action();",
-            "Отключитесь, чтобы установить обновление",
+            "Скачать обновление и перезапустить клиент?",
         ] {
             assert!(
                 source.contains(required),

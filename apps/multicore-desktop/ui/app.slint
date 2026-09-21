@@ -452,12 +452,12 @@ export component AppWindow inherits Window {
     private property <int> first-run-trigger-focus-serial: 0;
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
-    in property <bool> update-runtime-safe: false;
     in property <string> update-status: "MultiCore 0.1.9";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
     in property <bool> update-busy: false;
+    in-out property <bool> update-confirm-open: false;
 
     in-out property <string> local-page: "home";
     in-out property <string> settings-section: "general";
@@ -503,6 +503,8 @@ export component AppWindow inherits Window {
     callback window-toggle-maximize();
     callback window-close();
     callback update-action();
+    callback confirm-update-restart();
+    callback cancel-update-restart();
 
     wave-kickoff := Timer {
         interval: 80ms;
@@ -560,7 +562,10 @@ export component AppWindow inherits Window {
         height: parent.height - 2 * root.resize-border;
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                if (!root.has-profile && root.first-run-manual-open) {
+                if (root.update-confirm-open) {
+                    root.update-confirm-open = false;
+                    root.cancel-update-restart();
+                } else if (!root.has-profile && root.first-run-manual-open) {
                     root.first-run-manual-open = false;
                     root.subscription-draft = "";
                     root.dismiss-first-run-import();
@@ -1408,14 +1413,14 @@ export component AppWindow inherits Window {
                             Text { height: 24px; text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                             Text {
                                 height: 40px;
-                                text: root.update-available && !root.update-runtime-safe ? "Отключитесь, чтобы установить обновление" : root.update-detail;
-                                color: root.update-available && !root.update-runtime-safe ? Theme.warning : Theme.text-muted;
+                                text: root.update-detail;
+                                color: Theme.text-muted;
                                 font-size: Theme.type-metadata-size;
                                 wrap: word-wrap;
                             }
                             if root.update-action-label != "": SmallAction {
                                 label: root.update-action-label;
-                                enabled: root.update-action-enabled && (!root.update-available || root.update-runtime-safe) && !root.update-busy && !root.profile-menu-open;
+                                enabled: root.update-action-enabled && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open;
                                 activated => { root.update-action(); }
                             }
                             Rectangle { vertical-stretch: 1; background: transparent; }
@@ -1717,6 +1722,76 @@ export component AppWindow inherits Window {
             }
             }
         }
+        }
+    }
+
+    if root.update-confirm-open: Rectangle {
+        x: root.resize-border;
+        y: root.resize-border;
+        width: parent.width - 2 * root.resize-border;
+        height: parent.height - 2 * root.resize-border;
+        background: #05070bc7;
+        opacity: root.update-confirm-open ? 1 : 0;
+        animate opacity { duration: 140ms; easing: ease-out; }
+        TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+        }
+
+        update-confirm-card := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: Math.min(420px, parent.width - 48px);
+            height: 210px;
+            background: Theme.elevated;
+            border-color: Theme.line;
+            border-width: 1px;
+            border-radius: 16px;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 12px;
+                Text {
+                    height: 26px;
+                    text: "Обновить MultiCore?";
+                    color: Theme.text-primary;
+                    font-family: Theme.font-family;
+                    font-size: Theme.type-label-size;
+                    font-weight: Theme.weight-semibold;
+                    vertical-alignment: center;
+                }
+                Text {
+                    height: 54px;
+                    text: "Скачать обновление и перезапустить клиент?\nАктивный туннель будет корректно остановлен.";
+                    color: Theme.text-secondary;
+                    font-family: Theme.font-family;
+                    font-size: Theme.type-metadata-size;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                HorizontalLayout {
+                    height: 44px;
+                    alignment: end;
+                    spacing: 8px;
+                    SmallAction {
+                        width: 88px;
+                        label: "Нет";
+                        activated => {
+                            root.update-confirm-open = false;
+                            root.cancel-update-restart();
+                        }
+                    }
+                    SmallAction {
+                        width: 88px;
+                        label: "Да";
+                        selected: true;
+                        activated => { root.confirm-update-restart(); }
+                    }
+                }
+            }
         }
     }
 
