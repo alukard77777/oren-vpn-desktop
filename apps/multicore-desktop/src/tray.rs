@@ -163,8 +163,12 @@ mod native {
 
     impl NativeTray {
         fn new(model: TrayMenuModel) -> Result<Self, String> {
-            let icon = Icon::from_rgba(crate::app_icon::rgba(32), 32, 32)
-                .map_err(|error| format!("invalid tray icon: {error}"))?;
+            let icon = Icon::from_rgba(
+                crate::app_icon::tray_rgba(),
+                crate::app_icon::TRAY_ICON_SIZE,
+                crate::app_icon::TRAY_ICON_SIZE,
+            )
+            .map_err(|error| format!("invalid tray icon: {error}"))?;
             let tray = TrayIconBuilder::new()
                 .with_id("multicore-main")
                 .with_guid(TRAY_GUID)

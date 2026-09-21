@@ -1,6 +1,6 @@
 [package]
 name = "multicore-desktop"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license.workspace = true
 publish = false
@@ -36,4 +36,5 @@ tempfile = "3"
 [build-dependencies]
 embed-resource = "=3.0.11"
 ico = "=0.5.0"
+resvg.workspace = true
 slint-build = "=1.17.0"

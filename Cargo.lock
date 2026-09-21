@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "multicore-desktop"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "copypasta",
  "embed-resource",
@@ -3147,6 +3147,7 @@ dependencies = [
  "multicore-release",
  "regex",
  "reqwest 0.12.28",
+ "resvg",
  "serde",
  "serde_json",
  "slint",
