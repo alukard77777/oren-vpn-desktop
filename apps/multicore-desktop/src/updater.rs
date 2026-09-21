@@ -323,11 +323,9 @@ fn download_release(release: &GitHubRelease, destination: &Path) -> Result<(), S
 }
 
 fn update_directory() -> Result<PathBuf, String> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| "LOCALAPPDATA недоступна".to_owned())?;
-    Ok(base.join("MultiCore").join("updates"))
+    multicore_platform::dirs::user_data_root()
+        .map(|root| root.join("updates"))
+        .map_err(|_| "Каталог данных MultiCore недоступен".to_owned())
 }
 
 #[cfg(test)]

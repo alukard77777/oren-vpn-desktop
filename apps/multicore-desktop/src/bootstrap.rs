@@ -116,7 +116,7 @@ struct PackagePaths {
 
 fn derive_and_validate_paths(
     current_exe: &Path,
-    local_app_data: impl AsRef<Path>,
+    data_dir: impl AsRef<Path>,
 ) -> Result<PackagePaths, BootstrapError> {
     let package_root = current_exe
         .parent()
@@ -149,7 +149,7 @@ fn derive_and_validate_paths(
         daemon,
         xray,
         mihomo,
-        data_dir: local_app_data.as_ref().join("MultiCore"),
+        data_dir: data_dir.as_ref().to_path_buf(),
         locks,
     })
 }
@@ -400,10 +400,9 @@ use windows_bootstrap::OwnedDaemon;
 #[cfg(windows)]
 fn start_packaged() -> Result<Bootstrap, BootstrapError> {
     let current_exe = std::env::current_exe().map_err(|_| BootstrapError::Package)?;
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .filter(|value| !value.is_empty())
-        .ok_or(BootstrapError::Package)?;
-    let paths = derive_and_validate_paths(&current_exe, local_app_data)?;
+    let data_dir =
+        multicore_platform::dirs::user_data_root().map_err(|_| BootstrapError::Package)?;
+    let paths = derive_and_validate_paths(&current_exe, data_dir)?;
     std::fs::create_dir_all(&paths.data_dir).map_err(|_| {
         eprintln!("bootstrap stage failed: data-directory");
         BootstrapError::Startup
@@ -1332,8 +1331,11 @@ mod tests {
         ] {
             write_test_pe(&path, 0x8664, 0x20b, 0x0022);
         }
-        let paths =
-            derive_and_validate_paths(&desktop, temp.path().join("Local App Data")).unwrap();
+        let paths = derive_and_validate_paths(
+            &desktop,
+            temp.path().join("Local App Data").join("MultiCore"),
+        )
+        .unwrap();
         assert_eq!(paths.package_root, package);
         assert_eq!(
             paths.data_dir,

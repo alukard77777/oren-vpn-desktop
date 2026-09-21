@@ -804,7 +804,7 @@ fn apply_update_state(ui: &AppWindow, state: &UpdateState, runtime_idle: bool) {
 }
 
 fn load_preferences() -> (Option<PreferenceStore>, AppPreferences) {
-    let store = match PreferenceStore::from_local_app_data() {
+    let store = match PreferenceStore::from_user_data_root() {
         Ok(store) => store,
         Err(_) => {
             eprintln!("preferences unavailable");
@@ -4131,7 +4131,7 @@ mod window_tests {
         assert!(rust.contains("ui.on_window_resize"));
         assert!(rust.contains("parse_resize_edge"));
         assert!(rust.contains("drag_resize_window"));
-        assert!(rust.contains("PreferenceStore::from_local_app_data()"));
+        assert!(rust.contains("PreferenceStore::from_user_data_root()"));
         assert!(rust.contains("TimerMode::Repeated, Duration::from_millis(500)"));
         assert!(rust.contains("stop_and_flush"));
         let exit_branch = rust
