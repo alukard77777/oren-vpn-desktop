@@ -3,6 +3,8 @@
 mod app_icon;
 mod bootstrap;
 mod daemon;
+#[cfg(target_os = "linux")]
+mod linux_display;
 mod preferences;
 mod service_logo;
 mod single_instance;
@@ -488,6 +490,8 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    #[cfg(target_os = "linux")]
+    linux_display::prefer_desktop_scale();
     let launch_arguments =
         parse_launch_arguments(std::env::args_os().skip(1)).unwrap_or_else(|error| {
             eprintln!("launch arguments rejected: {error}");
