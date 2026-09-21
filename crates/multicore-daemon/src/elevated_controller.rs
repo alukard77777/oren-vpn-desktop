@@ -1728,6 +1728,11 @@ pub mod unix {
                         return Err(launch_exit_error(status));
                     }
                     if started.elapsed() >= timeout {
+                        if let Some(child) = host.child.as_mut()
+                            && child.kill().is_ok()
+                        {
+                            let _ = child.wait();
+                        }
                         return Err(ElevationError::TimedOut);
                     }
                     std::thread::sleep(ACCEPT_POLL);
@@ -2205,6 +2210,33 @@ mod tests {
             );
             assert_eq!(result.err(), Some(ElevationError::TimedOut));
             assert_eq!(std::fs::read_dir(runtime.path()).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn authorization_timeout_kills_the_waiting_launcher() {
+            let runtime = tempfile::tempdir().unwrap();
+            let launched = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let recorded = launched.clone();
+            let result = connect_with(
+                runtime.path(),
+                move |_, _| {
+                    let child = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg("exec sleep 60")
+                        .spawn()
+                        .unwrap();
+                    *recorded.lock().unwrap() = Some(child.id());
+                    Ok(LaunchedHost {
+                        pid: child.id(),
+                        child: Some(child),
+                    })
+                },
+                uid(),
+                Duration::from_millis(200),
+            );
+            assert_eq!(result.err(), Some(ElevationError::TimedOut));
+            let pid = launched.lock().unwrap().unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         }
 
         #[test]

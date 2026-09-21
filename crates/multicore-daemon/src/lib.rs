@@ -63,6 +63,12 @@ pub const MAX_EVENT_PAGE_SIZE: usize = 256;
 /// Maximum byte length of the single readiness line written for an owning launcher.
 pub const MAX_READINESS_LINE_BYTES: usize = 80;
 
+#[cfg(windows)]
+const CONNECTING_MESSAGE: &str = "Запускается подключение.";
+#[cfg(not(windows))]
+const CONNECTING_MESSAGE: &str =
+    "Запускается подключение. Подтвердите права администратора в системном окне.";
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
@@ -2461,7 +2467,7 @@ where
                 .state
                 .transition(CoreConnectionState::Connecting)
                 .map_err(|_| BackendError::new())?;
-            state.message = Some("Запускается подключение.".to_owned());
+            state.message = Some(CONNECTING_MESSAGE.to_owned());
             state.push_event(
                 Severity::Info,
                 Component::Core,
