@@ -310,6 +310,7 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
 
+    #[cfg(windows)]
     #[test]
     fn launch_command_is_exactly_quoted_and_backgrounded() {
         assert_eq!(
@@ -318,6 +319,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn only_the_exact_background_command_is_enabled() {
         let executable = Path::new(r"C:\Apps\MultiCore.exe");
@@ -340,6 +342,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn persistence_is_reread_and_verified_without_real_registry_access() {
         let executable = Path::new(r"C:\Apps\MultiCore.exe");

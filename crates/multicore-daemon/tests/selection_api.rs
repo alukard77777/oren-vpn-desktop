@@ -156,8 +156,8 @@ fn backend_with_mihomo(
     NoopController,
     impl Fn(&Snapshot) -> Result<Arc<NoopController>, BackendError> + use<>,
 > {
-    let root = tempfile::tempdir().unwrap();
-    let store = ProfileStore::open(root.path().join("profiles"), None).unwrap();
+    let root = tempfile::tempdir().unwrap().keep();
+    let store = ProfileStore::open(root.join("profiles"), None).unwrap();
     store
         .create_profile(Arc::new(
             Snapshot::parse(mihomo.as_bytes(), br#"{ "xray": "exact" }"#).unwrap(),
@@ -170,6 +170,17 @@ fn backend_with_mihomo(
         selector,
     )
     .unwrap()
+}
+
+fn obstruct_selection_storage(profile: &std::path::Path) {
+    #[cfg(windows)]
+    std::fs::create_dir(profile.join("selections.json.tmp")).unwrap();
+    #[cfg(unix)]
+    {
+        let target = profile.join("selections.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("obstruction"), b"").unwrap();
+    }
 }
 
 fn persisted_backend(
@@ -490,7 +501,7 @@ async fn live_selection_storage_failure_compensates_to_the_previous_confirmed_ch
     .unwrap();
     backend.connect().await.unwrap();
     selector.calls.lock().unwrap().clear();
-    std::fs::create_dir(root.path().join(id.as_str()).join("selections.json.tmp")).unwrap();
+    obstruct_selection_storage(&root.path().join(id.as_str()));
     let before = backend.catalog().await.unwrap();
     let error = backend
         .select(SelectionRequest {
@@ -529,7 +540,7 @@ async fn live_selection_storage_failure_has_a_distinct_safe_http_error() {
     )
     .unwrap();
     backend.connect().await.unwrap();
-    std::fs::create_dir(root.path().join(id.as_str()).join("selections.json.tmp")).unwrap();
+    obstruct_selection_storage(&root.path().join(id.as_str()));
     let catalog = backend.catalog().await.unwrap();
     let group = &catalog.groups[0];
     let response = router(backend, TOKEN)
@@ -571,7 +582,7 @@ async fn failed_live_selection_compensation_marks_runtime_degraded() {
     )
     .unwrap();
     backend.connect().await.unwrap();
-    std::fs::create_dir(root.path().join(id.as_str()).join("selections.json.tmp")).unwrap();
+    obstruct_selection_storage(&root.path().join(id.as_str()));
     let catalog = backend.catalog().await.unwrap();
     assert_eq!(
         backend

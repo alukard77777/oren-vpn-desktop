@@ -1743,6 +1743,7 @@ mod tests {
         assert_eq!(state.connects.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn runtime_generation_requires_exact_fixed_width_name() {
         assert_eq!(

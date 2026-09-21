@@ -1258,6 +1258,7 @@ mod tests {
         fs::write(path, image).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn pe_validation_rejects_incoherent_or_unbounded_headers_and_sections() {
         let temp = tempfile::tempdir().unwrap();

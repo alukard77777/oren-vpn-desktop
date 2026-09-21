@@ -1544,7 +1544,7 @@ mod tests {
             b"original"
         );
 
-        fs::remove_dir(&guarded).unwrap();
+        fs::remove_dir_all(&guarded).unwrap();
         fs::rename(&original, &guarded).unwrap();
     }
 
