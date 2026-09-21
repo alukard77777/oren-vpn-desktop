@@ -11,6 +11,8 @@ mod snapshot;
 mod state;
 mod store_root;
 mod supervisor;
+#[cfg(unix)]
+mod unix_group;
 #[cfg(windows)]
 mod windows_job;
 
@@ -45,5 +47,7 @@ pub use snapshot::{
 };
 pub use state::{ConnectionState, StateError, StateMachine};
 pub use supervisor::{Engine, ProcessController, Supervisor, SupervisorError};
+#[cfg(unix)]
+pub use unix_group::{UnixGroupLauncher, UnixGroupManagedChild};
 #[cfg(windows)]
 pub use windows_job::{WindowsJobLauncher, WindowsJobManagedChild};

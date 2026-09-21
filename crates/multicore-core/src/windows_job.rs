@@ -1,7 +1,6 @@
 use std::{
     ffi::{OsStr, OsString, c_void},
     future::Future,
-    io::Read,
     mem::{size_of, zeroed},
     os::windows::{
         ffi::OsStrExt,
@@ -36,7 +35,7 @@ use windows_sys::Win32::{
 use crate::{
     CommandSpec, CoreLogBuffer, DiagnosticStream, Engine, ManagedChild, ProcessError,
     ProcessLauncher, RuntimeCheckState, RuntimePaths, TokioProcessLauncher,
-    sidecar::BoundedLogDecoder,
+    sidecar::{spawn_blocking_log_reader, wait_for_runtime_readiness},
 };
 
 /// Windows launcher whose single job is the lifetime owner of every launched core.
@@ -223,28 +222,12 @@ impl ProcessLauncher for WindowsJobLauncher {
         command: &'a CommandSpec,
         child: &'a mut Self::Child,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProcessError>> + Send + 'a>> {
-        Box::pin(async move {
-            let Some(readiness) = &self.readiness else {
-                return if child.has_exited()? {
-                    Err(ProcessError::ReadinessFailed(command.engine))
-                } else {
-                    Ok(())
-                };
-            };
-            let deadline = tokio::time::Instant::now() + self.readiness_timeout;
-            loop {
-                if child.has_exited()? {
-                    return Err(ProcessError::ReadinessFailed(command.engine));
-                }
-                if readiness.current_ready(command.engine).await {
-                    return Ok(());
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ProcessError::ReadinessFailed(command.engine));
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
+        Box::pin(wait_for_runtime_readiness(
+            self.readiness.as_ref(),
+            self.readiness_timeout,
+            command,
+            child,
+        ))
     }
     fn current_ready<'a>(
         &'a self,
@@ -291,21 +274,7 @@ fn spawn_reader(
     stream: DiagnosticStream,
     handle: OwnedHandle,
 ) {
-    std::thread::spawn(move || {
-        let mut file = std::fs::File::from(handle);
-        let mut chunk = [0_u8; 4096];
-        let mut decoder = BoundedLogDecoder::default();
-        loop {
-            match file.read(&mut chunk) {
-                Ok(0) => {
-                    decoder.finish(|line| logs.push(engine, stream, line));
-                    break;
-                }
-                Ok(read) => decoder.feed(&chunk[..read], |line| logs.push(engine, stream, line)),
-                Err(_) => break,
-            }
-        }
-    });
+    spawn_blocking_log_reader(logs, engine, stream, std::fs::File::from(handle));
 }
 
 struct AttributeList {

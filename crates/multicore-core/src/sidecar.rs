@@ -559,6 +559,56 @@ fn spawn_log_reader<R>(
 
 const MAX_CAPTURED_LOG_LINE_BYTES: usize = 4096;
 
+pub(crate) fn spawn_blocking_log_reader(
+    logs: Arc<CoreLogBuffer>,
+    engine: Engine,
+    stream: DiagnosticStream,
+    mut reader: impl std::io::Read + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        let mut decoder = BoundedLogDecoder::default();
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    decoder.finish(|line| logs.push(engine, stream, line));
+                    break;
+                }
+                Ok(read) => decoder.feed(&chunk[..read], |line| logs.push(engine, stream, line)),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
+    readiness: Option<&TokioProcessLauncher>,
+    timeout: Duration,
+    command: &CommandSpec,
+    child: &mut C,
+) -> Result<(), ProcessError> {
+    let Some(readiness) = readiness else {
+        return if child.has_exited()? {
+            Err(ProcessError::ReadinessFailed(command.engine))
+        } else {
+            Ok(())
+        };
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if child.has_exited()? {
+            return Err(ProcessError::ReadinessFailed(command.engine));
+        }
+        if readiness.current_ready(command.engine).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ProcessError::ReadinessFailed(command.engine));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 pub(crate) struct BoundedLogDecoder {
     line: Vec<u8>,
     overflowed: bool,
