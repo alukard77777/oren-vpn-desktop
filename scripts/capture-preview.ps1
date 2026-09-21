@@ -8,12 +8,18 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Height,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-edit-large")]
     [string]$ExpectedState,
     [switch]$HoverConnection,
     [switch]$SelectSecondRoute,
     [switch]$OpenDiagnostics,
-    [switch]$OpenSettings
+    [switch]$OpenSettings,
+    [switch]$OpenUpdates,
+    [switch]$OpenProfiles,
+    [switch]$OpenSubscriptionSettings,
+    [switch]$EditProfile,
+    [switch]$ConfirmProfileDelete,
+    [switch]$RefreshProfile
 )
 
 $ErrorActionPreference = "Stop"
@@ -213,6 +219,65 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
         }
         return $true
     }
+    if ($ExpectedState.StartsWith("profiles-")) {
+        if (-not (Test-ColorNear $Bitmap.GetPixel(10, 40) 10 12 15 8)) {
+            $Failure.Value = "profile flow replaced the navigation rail"
+            return $false
+        }
+        $settingsProfileState = $ExpectedState -like "profiles-empty-*" -or
+            $ExpectedState -like "profiles-settings-*" -or
+            $ExpectedState -eq "profiles-edit-large" -or
+            $ExpectedState -in @("profiles-delete-small", "profiles-pending-small")
+        if ($settingsProfileState) {
+            $settingsText = Get-BrightPixelCount $Bitmap 205 66 ($Bitmap.Width - 20) ($Bitmap.Height - 24)
+            if ($settingsText -lt 90) {
+                $Failure.Value = "missing top-level subscription-management content"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-settings-many-*" -and $settingsText -lt 220) {
+                $Failure.Value = "missing populated shared subscription list"
+                return $false
+            }
+            if ($ExpectedState -eq "profiles-delete-small" -and (Get-SemanticPixelCountInRegion $Bitmap 240 106 106 340 360 560 460) -lt 2) {
+                $Failure.Value = "delete confirmation controls are missing from expanded subscription details"
+                return $false
+            }
+            if ($ExpectedState -eq "profiles-pending-small" -and $settingsText -lt 140) {
+                $Failure.Value = "target refresh pending details are missing"
+                return $false
+            }
+        } else {
+            $selectorText = Get-BrightPixelCount $Bitmap 205 190 ([Math]::Min(515, $Bitmap.Width - 24)) ([Math]::Min(476, $Bitmap.Height - 24))
+            if ($selectorText -lt 20) {
+                $Failure.Value = "missing compact anchored selector content"
+                return $false
+            }
+            if (($ExpectedState -like "profiles-one-*" -or $ExpectedState -like "profiles-many-*") -and $selectorText -lt 45) {
+                $Failure.Value = "selector rows are missing from populated state"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-many-*" -and -not (Test-ColorNear $Bitmap.GetPixel(205, 470) 28 32 38 10)) {
+                $Failure.Value = "many-profile selector is not capped at its compact scroll surface"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-error-*" -and (Get-SemanticPixelCountInRegion $Bitmap 240 106 106 205 190 515 292) -lt 3) {
+                $Failure.Value = "selector error and retry state is missing"
+                return $false
+            }
+            if ($ExpectedState -like "profiles-loading-*") {
+                $loadingSurface = Test-ColorNear $Bitmap.GetPixel(210, 250) 28 32 38 7
+                $firstSkeletonLogo = Test-ColorNear $Bitmap.GetPixel(230, 290) 42 46 52 7
+                $firstSkeletonLine = Test-ColorNear $Bitmap.GetPixel(400, 285) 48 51 57 7
+                $secondSkeletonLogo = Test-ColorNear $Bitmap.GetPixel(230, 342) 40 44 50 7
+                $secondSkeletonLine = Test-ColorNear $Bitmap.GetPixel(370, 337) 46 49 55 7
+                if (-not ($loadingSurface -and $firstSkeletonLogo -and $firstSkeletonLine -and $secondSkeletonLogo -and $secondSkeletonLine)) {
+                    $Failure.Value = "loading selector is missing its surface or two skeleton rows"
+                    return $false
+                }
+            }
+        }
+        return $true
+    }
     $checks = @(
         @{ Pass = (Test-ColorNear $Bitmap.GetPixel($mid, 15) 10 12 15 8); Name = "title-bar background" },
         @{ Pass = (Test-ColorNear $Bitmap.GetPixel(10, 40) 10 12 15 6); Name = "navigation rail" },
@@ -226,7 +291,7 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
         }
     }
 
-    if ($ExpectedState -notin @("empty", "settings")) {
+    if ($ExpectedState -notin @("empty", "settings", "settings-updates")) {
         $routeTop = [Math]::Min(400, $Bitmap.Height - 120)
         if ((Get-BrightPixelCount $Bitmap 20 $routeTop ($Bitmap.Width - 20) ($Bitmap.Height - 12)) -lt 35) {
             $Failure.Value = "missing populated route-region text"
@@ -280,6 +345,7 @@ function Save-Preview([IntPtr]$Handle) {
     $directory = Split-Path -Parent $OutputPath
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
     $requiredStableFrames = 2
+    $allowsAmbientMotion = $ExpectedState -in @("ready", "glow-hover", "connected", "populated-catalog", "announcement", "selection-pending")
     $stableFrames = 0
     $previousSignature = ""
     $lastFailure = "no frame rendered"
@@ -318,7 +384,9 @@ function Save-Preview([IntPtr]$Handle) {
             }
 
             $signature = Get-PreviewFrameSignature $bitmap
-            if ($signature -eq $previousSignature) {
+            if ($allowsAmbientMotion) {
+                $stableFrames++
+            } elseif ($signature -eq $previousSignature) {
                 $stableFrames++
             } else {
                 $previousSignature = $signature
@@ -357,7 +425,26 @@ try {
         Click-Preview $handle 88 122
     }
     if ($OpenSettings) {
+        Click-Preview $handle 88 226
+    }
+    if ($OpenUpdates) {
+        Click-Preview $handle 250 190
+    }
+    if ($OpenProfiles) {
+        # The shelf body ends before the nested refresh target on the right.
+        Click-Preview $handle 276 203
+    }
+    if ($OpenSubscriptionSettings) {
         Click-Preview $handle 88 174
+    }
+    if ($EditProfile) {
+        Click-Preview $handle ($Width - 92) 224
+    }
+    if ($ConfirmProfileDelete) {
+        Click-Preview $handle ($Width - 44) 224
+    }
+    if ($RefreshProfile) {
+        Click-Preview $handle ($Width - 140) 224
     }
     Save-Preview $handle
 } finally {

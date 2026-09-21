@@ -333,22 +333,40 @@ pub fn extract_verified_bundle(
     archive_path: &Path,
     destination: &Path,
 ) -> Result<BundleInventory, UpdateError> {
+    extract_verified_bundle_with_limit(archive_path, destination, MAX_EXPANDED_BYTES)
+}
+
+/// Extract and verify a bundle with an explicit expanded-size ceiling.
+///
+/// The limit parameter is useful to callers that need a tighter policy than the
+/// release-wide default (and keeps boundary behavior directly testable).
+pub fn extract_verified_bundle_with_limit(
+    archive_path: &Path,
+    destination: &Path,
+    max_expanded_bytes: u64,
+) -> Result<BundleInventory, UpdateError> {
+    let max_expanded_bytes = effective_expanded_limit(max_expanded_bytes);
     if destination.exists() {
         return Err(UpdateError::InvalidBundle(
             "extraction destination already exists".into(),
         ));
     }
     fs::create_dir(destination)?;
-    let result = extract_verified_bundle_inner(archive_path, destination);
+    let result = extract_verified_bundle_inner(archive_path, destination, max_expanded_bytes);
     if result.is_err() {
         let _ = fs::remove_dir_all(destination);
     }
     result
 }
 
+fn effective_expanded_limit(requested: u64) -> u64 {
+    requested.min(MAX_EXPANDED_BYTES)
+}
+
 fn extract_verified_bundle_inner(
     archive_path: &Path,
     destination: &Path,
+    max_expanded_bytes: u64,
 ) -> Result<BundleInventory, UpdateError> {
     let archive_file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(archive_file)?;
@@ -380,7 +398,7 @@ fn extract_verified_bundle_inner(
             expanded_bytes = expanded_bytes.checked_add(entry.size()).ok_or_else(|| {
                 UpdateError::InvalidBundle("expanded archive size overflow".into())
             })?;
-            if expanded_bytes > MAX_EXPANDED_BYTES {
+            if expanded_bytes > max_expanded_bytes {
                 return Err(UpdateError::InvalidBundle(
                     "expanded archive is too large".into(),
                 ));
@@ -449,7 +467,7 @@ fn extract_verified_bundle_inner(
             written = written
                 .checked_add(read as u64)
                 .ok_or_else(|| UpdateError::InvalidBundle("file size overflow".into()))?;
-            if written > entry.size() || written > MAX_EXPANDED_BYTES {
+            if written > entry.size() || written > max_expanded_bytes {
                 return Err(UpdateError::InvalidBundle(
                     "archive entry exceeded its declared size".into(),
                 ));
@@ -489,6 +507,7 @@ const REQUIRED_BUNDLE_FILES: &[&str] = &[
     "cores/xray.exe",
     "licenses/Xray-core-MPL-2.0.txt",
     "licenses/mihomo-GPL-3.0.txt",
+    "runtime/multicore-core-host.exe",
     "runtime/multicore-daemon.exe",
     "runtime/multicore-updater.exe",
     "versions.json",
@@ -498,6 +517,7 @@ const REQUIRED_PE_FILES: &[&str] = &[
     "MultiCore.exe",
     "cores/mihomo.exe",
     "cores/xray.exe",
+    "runtime/multicore-core-host.exe",
     "runtime/multicore-daemon.exe",
     "runtime/multicore-updater.exe",
 ];
@@ -570,30 +590,64 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
-    let mut file = File::open(path)?;
-    let mut header = [0_u8; 64];
-    file.read_exact(&mut header)?;
-    if &header[0..2] != b"MZ" {
-        return Err(UpdateError::InvalidBundle(format!(
-            "required executable is not PE: {}",
+    const PE_SIGNATURE_AND_COFF_SIZE: u64 = 24;
+    const PE32_PLUS_STANDARD_OPTIONAL_SIZE: u16 = 112;
+    const SECTION_HEADER_SIZE: u64 = 40;
+    const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
+    const IMAGE_FILE_DLL: u16 = 0x2000;
+
+    let invalid = || {
+        UpdateError::InvalidBundle(format!(
+            "required executable is not PE32+ AMD64: {}",
             path.display()
-        )));
+        ))
+    };
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0_u8; 64];
+    if file_len < header.len() as u64 || file.read_exact(&mut header).is_err() {
+        return Err(invalid());
     }
-    let pe_offset = u32::from_le_bytes(header[0x3c..0x40].try_into().expect("fixed slice"));
-    if pe_offset > 16 * 1024 * 1024 {
-        return Err(UpdateError::InvalidBundle("invalid PE offset".into()));
+    if &header[0..2] != b"MZ" {
+        return Err(invalid());
+    }
+    let pe_offset = u32::from_le_bytes(header[0x3c..0x40].try_into().expect("fixed slice")) as u64;
+    let coff_end = pe_offset
+        .checked_add(PE_SIGNATURE_AND_COFF_SIZE)
+        .ok_or_else(&invalid)?;
+    if pe_offset < header.len() as u64 || pe_offset > 16 * 1024 * 1024 || coff_end > file_len {
+        return Err(invalid());
     }
     use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(pe_offset as u64))?;
-    let mut signature_and_machine = [0_u8; 6];
-    file.read_exact(&mut signature_and_machine)?;
-    if &signature_and_machine[..4] != b"PE\0\0"
-        || u16::from_le_bytes(signature_and_machine[4..6].try_into().expect("fixed slice"))
-            != 0x8664
+    file.seek(SeekFrom::Start(pe_offset))?;
+    let mut coff = [0_u8; PE_SIGNATURE_AND_COFF_SIZE as usize];
+    file.read_exact(&mut coff).map_err(|_| invalid())?;
+    let machine = u16::from_le_bytes(coff[4..6].try_into().expect("fixed slice"));
+    let sections = u16::from_le_bytes(coff[6..8].try_into().expect("fixed slice"));
+    let optional_size = u16::from_le_bytes(coff[20..22].try_into().expect("fixed slice"));
+    let characteristics = u16::from_le_bytes(coff[22..24].try_into().expect("fixed slice"));
+    if &coff[..4] != b"PE\0\0"
+        || machine != 0x8664
+        || sections == 0
+        || optional_size < PE32_PLUS_STANDARD_OPTIONAL_SIZE
+        || characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0
+        || characteristics & IMAGE_FILE_DLL != 0
     {
-        return Err(UpdateError::InvalidBundle(
-            "required executable is not PE32+ AMD64".into(),
-        ));
+        return Err(invalid());
+    }
+    let optional_end = coff_end
+        .checked_add(u64::from(optional_size))
+        .ok_or_else(&invalid)?;
+    let section_table_end = optional_end
+        .checked_add(u64::from(sections) * SECTION_HEADER_SIZE)
+        .ok_or_else(&invalid)?;
+    if section_table_end > file_len {
+        return Err(invalid());
+    }
+    let mut magic = [0_u8; 2];
+    file.read_exact(&mut magic).map_err(|_| invalid())?;
+    if u16::from_le_bytes(magic) != 0x020b {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -657,12 +711,26 @@ fn transactional_swap_with(
     Ok(())
 }
 
+#[doc(hidden)]
+pub fn archive_entry_unix_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Option<u32> {
+    entry.unix_mode()
+}
+
 #[cfg(test)]
 mod publication_tests {
-    use super::transactional_swap_with;
+    use super::{MAX_EXPANDED_BYTES, effective_expanded_limit, transactional_swap_with};
     use std::fs;
     use std::io;
     use tempfile::TempDir;
+
+    #[test]
+    fn requested_expanded_limit_never_exceeds_global_ceiling() {
+        assert_eq!(effective_expanded_limit(1), 1);
+        assert_eq!(
+            effective_expanded_limit(MAX_EXPANDED_BYTES + 1),
+            MAX_EXPANDED_BYTES
+        );
+    }
 
     #[test]
     fn failed_publication_restores_previous_install_directory() {
@@ -687,5 +755,23 @@ mod publication_tests {
         assert_eq!(fs::read(target.join("old.txt")).unwrap(), b"old");
         assert!(!backup.exists());
         assert!(staged.exists());
+    }
+
+    #[test]
+    fn successful_publication_replaces_previous_install_directory() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("MultiCore");
+        let staged = temp.path().join("MultiCore.new");
+        let backup = temp.path().join("MultiCore.previous");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&staged).unwrap();
+        fs::write(target.join("old.txt"), b"old").unwrap();
+        fs::write(staged.join("new.txt"), b"new").unwrap();
+        transactional_swap_with(&target, &staged, &backup, |from, to| fs::rename(from, to))
+            .unwrap();
+        assert_eq!(fs::read(target.join("new.txt")).unwrap(), b"new");
+        assert!(!target.join("old.txt").exists());
+        assert!(backup.join("old.txt").is_file());
+        assert!(!staged.exists());
     }
 }

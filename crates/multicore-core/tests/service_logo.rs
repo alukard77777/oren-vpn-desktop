@@ -231,6 +231,45 @@ impl HttpClient for LogoHttp {
     }
 }
 
+#[derive(Clone)]
+struct VendorLogoHttp {
+    calls: Arc<Mutex<Vec<(String, &'static str)>>>,
+}
+
+impl HttpClient for VendorLogoHttp {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        user_agent: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_owned(), user_agent));
+            if user_agent == UA_NATIVE {
+                Ok(HttpResponse::new(
+                    200,
+                    bundle(),
+                    [
+                        ("ajsdjddj-servicelogo", "https://logos.example/vendor.png"),
+                        (
+                            "ajsdjddj-background",
+                            "https://logos.example/must-ignore.png",
+                        ),
+                    ],
+                ))
+            } else {
+                Ok(HttpResponse::new(
+                    200,
+                    encoded(ImageFormat::Png),
+                    [] as [(&str, &str); 0],
+                ))
+            }
+        })
+    }
+}
+
 fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "multicore-service-logo-{name}-{}-{}",
@@ -272,18 +311,96 @@ async fn valid_native_bundle_is_terminal_and_fetches_logo_once_after_parsing() {
             ("https://logos.example/logo.any".to_owned(), UA_SERVICE_LOGO),
         ]
     );
-    let path = snapshot.service_logo_path().unwrap();
-    assert_eq!(path.file_name().unwrap(), "service-logo.png");
-    assert_canonical_png(&std::fs::read(path).unwrap());
+    let path = snapshot.service_logo_path().unwrap().to_owned();
+    let expected_logo = std::fs::read(&path).unwrap();
+    assert_canonical_png(&expected_logo);
     let persisted =
         std::fs::read_to_string(root.join("snapshot-00000000000000000001/subscription.json"))
             .unwrap();
     assert!(!persisted.contains("logos.example"));
 
+    drop(snapshot);
     drop(store);
     let reopened = PersistentSnapshotStore::open(&root).unwrap();
-    assert_eq!(reopened.current().unwrap().service_logo_path(), Some(path));
+    let reopened_snapshot = reopened.current().unwrap();
+    assert_eq!(
+        std::fs::read(reopened_snapshot.service_logo_path().unwrap()).unwrap(),
+        expected_logo
+    );
+    drop(reopened_snapshot);
+    drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn arbitrary_vendor_prefix_is_accepted_only_for_safe_service_logo_suffix() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let root = temp_root("vendor-prefix");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    let snapshot = SubscriptionFetcher::new(VendorLogoHttp {
+        calls: calls.clone(),
+    })
+    .refresh("https://subscription.example/private", &store)
+    .await
+    .unwrap();
+
+    assert!(snapshot.service_logo_path().is_some());
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[
+            ("https://subscription.example/private".to_owned(), UA_NATIVE),
+            (
+                "https://logos.example/vendor.png".to_owned(),
+                UA_SERVICE_LOGO
+            ),
+        ]
+    );
+
+    drop(snapshot);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn exposed_logo_path_remains_bound_to_original_after_root_replacement() {
+    let root = temp_root("root-replacement");
+    let original = root.with_extension("original");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    let snapshot = SubscriptionFetcher::new(LogoHttp {
+        calls: Arc::default(),
+        logo: Ok(HttpResponse::new(
+            200,
+            encoded(ImageFormat::Png),
+            [] as [(&str, &str); 0],
+        )),
+    })
+    .refresh("https://subscription.example/private", &store)
+    .await
+    .unwrap();
+    let exposed = snapshot.service_logo_path().unwrap().to_owned();
+    let trusted = std::fs::read(&exposed).unwrap();
+
+    std::fs::rename(&root, &original).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let replacement_generation = root.join("snapshot-00000000000000000001");
+    std::fs::create_dir(&replacement_generation).unwrap();
+    std::fs::write(
+        replacement_generation.join("service-logo.png"),
+        b"attacker replacement bytes",
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(&exposed).unwrap(), trusted);
+    assert_ne!(
+        std::fs::read(replacement_generation.join("service-logo.png")).unwrap(),
+        trusted
+    );
+
+    drop(snapshot);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(original).unwrap();
 }
 
 #[tokio::test]
@@ -307,6 +424,8 @@ async fn logo_failure_is_nonfatal_and_persists_no_logo() {
         .await
         .unwrap();
         assert!(snapshot.service_logo_path().is_none());
+        drop(snapshot);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -338,21 +457,20 @@ async fn failed_logo_generation_staging_keeps_the_last_good_logo_path() {
         std::process::id()
     )))
     .unwrap();
-    assert_eq!(
+    assert!(matches!(
         SubscriptionFetcher::new(http)
             .refresh("https://subscription.example/private", &store)
             .await,
         Err(FetchError::Persistence)
-    );
+    ));
     assert_eq!(
         store.current().unwrap().service_logo_path(),
         Some(last_good.as_path())
     );
     drop(store);
     let reopened = PersistentSnapshotStore::open(&root).unwrap();
-    assert_eq!(
-        reopened.current().unwrap().service_logo_path(),
-        Some(last_good.as_path())
+    assert_canonical_png(
+        &std::fs::read(reopened.current().unwrap().service_logo_path().unwrap()).unwrap(),
     );
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
@@ -374,6 +492,7 @@ fn invalid_persisted_optional_logo_is_ignored_without_losing_config() {
     let reopened = PersistentSnapshotStore::open(&root).unwrap();
     assert!(reopened.current().is_some());
     assert!(reopened.current().unwrap().service_logo_path().is_none());
+    drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -428,7 +547,7 @@ async fn invalid_config_never_triggers_a_logo_request() {
             &multicore_core::AtomicSnapshot::default(),
         )
         .await;
-    assert_eq!(result, Err(FetchError::InvalidBundle));
+    assert!(matches!(result, Err(FetchError::InvalidBundle)));
     assert_eq!(*calls.lock().unwrap(), [UA_NATIVE]);
 }
 
@@ -487,5 +606,6 @@ async fn fallback_uses_mihomo_logo_precedence_and_fetches_only_that_url_once() {
     assert_eq!(logo_calls.len(), 1);
     assert_eq!(logo_calls[0].0, "https://mihomo.example/logo");
     drop(calls);
+    drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }

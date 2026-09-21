@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -15,8 +16,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use multicore_core::{
-    Engine, FetchError, HttpClient, HttpResponse, PersistentSnapshotStore, ProcessController,
-    Snapshot, SubscriptionFetcher,
+    Engine, FetchError, HttpClient, HttpResponse, ProcessController, ProfileStore, Snapshot,
+    SubscriptionFetcher,
 };
 use multicore_daemon::{
     Backend, BackendError, CoreBackend, MihomoHttpSelector, MihomoSelector, SelectionRequest,
@@ -83,12 +84,34 @@ impl ProcessController for NoopController {
 #[derive(Default)]
 struct RecordingSelector {
     calls: Mutex<Vec<(String, String)>>,
-    fail: bool,
+    fail: AtomicBool,
 }
 
 struct BlockingSelector {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+}
+
+struct SequencedSelector {
+    calls: Mutex<Vec<(String, String)>>,
+    call_count: std::sync::atomic::AtomicUsize,
+    fail_on_call: usize,
+}
+
+#[async_trait]
+impl MihomoSelector for SequencedSelector {
+    async fn select(&self, group: &str, node: &str) -> Result<(), SelectorError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((group.to_owned(), node.to_owned()));
+        let call = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_call {
+            Err(SelectorError::new())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[async_trait]
@@ -107,7 +130,7 @@ impl MihomoSelector for RecordingSelector {
             .lock()
             .unwrap()
             .push((group.to_owned(), node.to_owned()));
-        if self.fail {
+        if self.fail.load(Ordering::SeqCst) {
             Err(SelectorError::new())
         } else {
             Ok(())
@@ -134,9 +157,11 @@ fn backend_with_mihomo(
     impl Fn(&Snapshot) -> Result<Arc<NoopController>, BackendError> + use<>,
 > {
     let root = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(root.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(root.path().join("profiles"), None).unwrap();
     store
-        .commit(Snapshot::parse(mihomo.as_bytes(), br#"{ "xray": "exact" }"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(mihomo.as_bytes(), br#"{ "xray": "exact" }"#).unwrap(),
+        ))
         .unwrap();
     CoreBackend::new_with_selector(
         store,
@@ -145,6 +170,106 @@ fn backend_with_mihomo(
         selector,
     )
     .unwrap()
+}
+
+fn persisted_backend(
+    root: &std::path::Path,
+    selector: Arc<RecordingSelector>,
+) -> CoreBackend<
+    NeverHttp,
+    NoopController,
+    impl Fn(&Snapshot) -> Result<Arc<NoopController>, BackendError> + use<>,
+> {
+    CoreBackend::new_with_selector(
+        ProfileStore::open(root, None).unwrap(),
+        SubscriptionFetcher::new(NeverHttp),
+        |_snapshot| Ok(Arc::new(NoopController)),
+        selector,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn selections_are_profile_scoped_survive_restart_and_failed_live_choice_is_not_persisted() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let snapshot = Arc::new(Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap());
+    let first = store.create_profile(snapshot.clone()).unwrap();
+    let second = store.create_profile(snapshot).unwrap();
+    store.activate(&first).unwrap();
+    drop(store);
+
+    let backend = persisted_backend(root.path(), Arc::new(RecordingSelector::default()));
+    let first_catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: first_catalog.revision,
+            group_id: first_catalog.groups[0].id.clone(),
+            node_id: first_catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    backend.activate_subscription(&second).await.unwrap();
+    let second_catalog = backend.catalog().await.unwrap();
+    assert!(second_catalog.groups[0].nodes[0].selected);
+    backend.activate_subscription(&first).await.unwrap();
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[1].selected);
+    drop(backend);
+
+    let failing = Arc::new(RecordingSelector {
+        calls: Mutex::new(Vec::new()),
+        fail: AtomicBool::new(false),
+    });
+    let backend = persisted_backend(root.path(), failing.clone());
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[1].selected);
+    backend.connect().await.unwrap();
+    failing.fail.store(true, Ordering::SeqCst);
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(
+        backend
+            .select(SelectionRequest {
+                revision: catalog.revision,
+                group_id: catalog.groups[0].id.clone(),
+                node_id: catalog.groups[0].nodes[0].id.clone(),
+            })
+            .await,
+        Err(multicore_daemon::SelectionError::SelectorFailed)
+    );
+    drop(backend);
+
+    let restarted = persisted_backend(root.path(), Arc::new(RecordingSelector::default()));
+    assert!(restarted.catalog().await.unwrap().groups[0].nodes[1].selected);
+    restarted.activate_subscription(&second).await.unwrap();
+    assert!(restarted.catalog().await.unwrap().groups[0].nodes[0].selected);
+}
+
+#[tokio::test]
+async fn restored_partial_multi_group_selection_keeps_defaults_for_unsaved_groups() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(MULTI_GROUP_MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    drop(store);
+    let backend = persisted_backend(root.path(), Arc::new(RecordingSelector::default()));
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[1].id.clone(),
+            node_id: catalog.groups[1].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    drop(backend);
+
+    let restarted = persisted_backend(root.path(), Arc::new(RecordingSelector::default()));
+    let catalog = restarted.catalog().await.unwrap();
+    assert!(catalog.groups[0].nodes[0].selected);
+    assert!(catalog.groups[1].nodes[1].selected);
+    assert!(catalog.groups[2].nodes[0].selected);
 }
 
 #[tokio::test]
@@ -165,9 +290,11 @@ proxy-groups:
 #[tokio::test]
 async fn select_and_import_are_serialized_by_the_shared_operation_mutex() {
     let root = tempfile::tempdir().unwrap();
-    let store = PersistentSnapshotStore::open(root.path().join("snapshots")).unwrap();
+    let store = ProfileStore::open(root.path().join("profiles"), None).unwrap();
     store
-        .commit(Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap())
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
         .unwrap();
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -232,7 +359,7 @@ async fn json_body(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
-async fn selection_requires_auth_connection_and_current_opaque_ids() {
+async fn selection_requires_auth_and_ready_state_accepts_a_queued_choice() {
     let selector = Arc::new(RecordingSelector::default());
     let backend = backend(selector);
     let catalog = backend.catalog().await.unwrap();
@@ -254,7 +381,7 @@ async fn selection_requires_auth_connection_and_current_opaque_ids() {
     let unauthorized_body = json_body(unauthorized).await.to_string();
     assert!(!unauthorized_body.contains(TOKEN));
     assert!(!unauthorized_body.contains("submitted-private-node"));
-    let disconnected = app
+    let ready = app
         .clone()
         .oneshot(request(
             &format!("/v1/selections/{}", group.id),
@@ -263,8 +390,57 @@ async fn selection_requires_auth_connection_and_current_opaque_ids() {
         ))
         .await
         .unwrap();
-    assert_eq!(disconnected.status(), StatusCode::CONFLICT);
-    assert_eq!(json_body(disconnected).await["code"], "not_connected");
+    assert_eq!(ready.status(), StatusCode::OK);
+    let ready = json_body(ready).await;
+    assert_eq!(ready["groups"][0]["nodes"][1]["selected"], true);
+}
+
+#[tokio::test]
+async fn connect_replays_and_confirms_the_ready_state_choice_before_connected() {
+    let selector = Arc::new(RecordingSelector::default());
+    let backend = backend(selector.clone());
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[0].id.clone(),
+            node_id: catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(selector.calls.lock().unwrap().is_empty());
+
+    backend.connect().await.unwrap();
+    assert_eq!(
+        selector.calls.lock().unwrap().as_slice(),
+        &[("group / ? # %".into(), "second".into())]
+    );
+    assert_eq!(
+        backend.status().await.unwrap().state,
+        multicore_daemon::ConnectionState::Connected
+    );
+}
+
+#[tokio::test]
+async fn failed_startup_selection_replay_rolls_cores_back_to_ready() {
+    let selector = Arc::new(RecordingSelector {
+        calls: Mutex::new(Vec::new()),
+        fail: AtomicBool::new(true),
+    });
+    let backend = backend(selector);
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[0].id.clone(),
+            node_id: catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(backend.connect().await.is_err());
+    let status = backend.status().await.unwrap();
+    assert_eq!(status.state, multicore_daemon::ConnectionState::Ready);
+    assert!(!status.degraded);
 }
 
 #[tokio::test]
@@ -272,6 +448,7 @@ async fn successful_selection_uses_raw_names_and_updates_only_selected_flags() {
     let selector = Arc::new(RecordingSelector::default());
     let backend = backend(selector.clone());
     backend.connect().await.unwrap();
+    selector.calls.lock().unwrap().clear();
     let before = backend.catalog().await.unwrap();
     let group = &before.groups[0];
     let target = &group.nodes[1];
@@ -295,10 +472,128 @@ async fn successful_selection_uses_raw_names_and_updates_only_selected_flags() {
 }
 
 #[tokio::test]
+async fn live_selection_storage_failure_compensates_to_the_previous_confirmed_choice() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let id = store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let selector = Arc::new(RecordingSelector::default());
+    let backend = CoreBackend::new_with_selector(
+        store,
+        SubscriptionFetcher::new(NeverHttp),
+        |_snapshot| Ok(Arc::new(NoopController)),
+        selector.clone(),
+    )
+    .unwrap();
+    backend.connect().await.unwrap();
+    selector.calls.lock().unwrap().clear();
+    std::fs::create_dir(root.path().join(id.as_str()).join("selections.json.tmp")).unwrap();
+    let before = backend.catalog().await.unwrap();
+    let error = backend
+        .select(SelectionRequest {
+            revision: before.revision,
+            group_id: before.groups[0].id.clone(),
+            node_id: before.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, multicore_daemon::SelectionError::StorageFailed);
+    assert_eq!(backend.catalog().await.unwrap(), before);
+    assert!(!backend.status().await.unwrap().degraded);
+    assert_eq!(
+        selector.calls.lock().unwrap().as_slice(),
+        &[
+            ("group / ? # %".into(), "second".into()),
+            ("group / ? # %".into(), "node / ? # %".into()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn live_selection_storage_failure_has_a_distinct_safe_http_error() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let id = store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let backend = CoreBackend::new_with_selector(
+        store,
+        SubscriptionFetcher::new(NeverHttp),
+        |_snapshot| Ok(Arc::new(NoopController)),
+        Arc::new(RecordingSelector::default()),
+    )
+    .unwrap();
+    backend.connect().await.unwrap();
+    std::fs::create_dir(root.path().join(id.as_str()).join("selections.json.tmp")).unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let group = &catalog.groups[0];
+    let response = router(backend, TOKEN)
+        .oneshot(request(
+            &format!("/v1/selections/{}", group.id),
+            json!({"revision": catalog.revision, "node_id": group.nodes[1].id}),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(response).await;
+    assert_eq!(body["code"], "selection_storage_failed");
+    assert!(!body.to_string().contains("group / ? # %"));
+    assert!(!body.to_string().contains("node / ? # %"));
+    assert!(!body.to_string().contains(TOKEN));
+}
+
+#[tokio::test]
+async fn failed_live_selection_compensation_marks_runtime_degraded() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let id = store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let selector = Arc::new(SequencedSelector {
+        calls: Mutex::new(Vec::new()),
+        call_count: std::sync::atomic::AtomicUsize::new(0),
+        fail_on_call: 2,
+    });
+    let backend = CoreBackend::new_with_selector(
+        store,
+        SubscriptionFetcher::new(NeverHttp),
+        |_snapshot| Ok(Arc::new(NoopController)),
+        selector,
+    )
+    .unwrap();
+    backend.connect().await.unwrap();
+    std::fs::create_dir(root.path().join(id.as_str()).join("selections.json.tmp")).unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(
+        backend
+            .select(SelectionRequest {
+                revision: catalog.revision,
+                group_id: catalog.groups[0].id.clone(),
+                node_id: catalog.groups[0].nodes[1].id.clone(),
+            })
+            .await,
+        Err(multicore_daemon::SelectionError::StorageFailed)
+    );
+    let status = backend.status().await.unwrap();
+    assert!(status.degraded);
+    assert_eq!(status.state, multicore_daemon::ConnectionState::Error);
+}
+
+#[tokio::test]
 async fn distinct_selector_groups_keep_independent_selected_nodes() {
     let selector = Arc::new(RecordingSelector::default());
     let backend = backend_with_mihomo(selector.clone(), MULTI_GROUP_MIHOMO);
     backend.connect().await.unwrap();
+    selector.calls.lock().unwrap().clear();
 
     for group_index in 0..3 {
         let catalog = backend.catalog().await.unwrap();
@@ -344,6 +639,7 @@ async fn selection_endpoint_returns_the_updated_safe_catalog() {
     let selector = Arc::new(RecordingSelector::default());
     let backend = backend(selector.clone());
     backend.connect().await.unwrap();
+    selector.calls.lock().unwrap().clear();
     let before = backend.catalog().await.unwrap();
     let group_id = before.groups[0].id.clone();
     let node_id = before.groups[0].nodes[1].id.clone();
@@ -373,10 +669,12 @@ async fn selection_endpoint_returns_the_updated_safe_catalog() {
 async fn stale_unknown_and_selector_failure_are_stable_and_rollback_selection() {
     let selector = Arc::new(RecordingSelector {
         calls: Mutex::new(Vec::new()),
-        fail: true,
+        fail: AtomicBool::new(false),
     });
-    let backend = backend(selector);
+    let backend = backend(selector.clone());
     backend.connect().await.unwrap();
+    selector.calls.lock().unwrap().clear();
+    selector.fail.store(true, Ordering::SeqCst);
     let before = backend.catalog().await.unwrap();
 
     let stale = backend
@@ -422,10 +720,12 @@ async fn stale_unknown_and_selector_failure_are_stable_and_rollback_selection() 
 async fn selection_http_errors_have_stable_status_and_safe_codes() {
     let selector = Arc::new(RecordingSelector {
         calls: Mutex::new(Vec::new()),
-        fail: true,
+        fail: AtomicBool::new(false),
     });
-    let backend = backend(selector);
+    let backend = backend(selector.clone());
     backend.connect().await.unwrap();
+    selector.calls.lock().unwrap().clear();
+    selector.fail.store(true, Ordering::SeqCst);
     let catalog = backend.catalog().await.unwrap();
     let group = &catalog.groups[0];
     let node = &group.nodes[1];

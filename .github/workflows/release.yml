@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -19,13 +19,24 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-msvc
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
 
     steps:
       - name: Checkout tagged source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      - name: Enforce privileged broker release gate
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady
+
+      - name: Require dedicated release credential
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw 'RELEASES_TOKEN is required to publish into fatyzzz/multicore-releases'
+          }
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -54,6 +65,7 @@ jobs:
           cargo test --workspace --all-targets --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
 
@@ -62,10 +74,18 @@ jobs:
         run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
             -DestinationPath dist/release/multicore-windows-x64 `
-            -UpdateRepository fatyzzz/multicore `
+            -UpdateRepository fatyzzz/multicore-releases `
             -ReleaseAssetPath dist/release/multicore-windows-x64.zip
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
-            -ExecutablePath dist/release/multicore-windows-x64/MultiCore.exe
+            -DesktopExecutablePath dist/release/multicore-windows-x64/MultiCore.exe `
+            -DaemonExecutablePath dist/release/multicore-windows-x64/runtime/multicore-daemon.exe `
+            -UpdaterExecutablePath dist/release/multicore-windows-x64/runtime/multicore-updater.exe `
+            -CoreHostExecutablePath dist/release/multicore-windows-x64/runtime/multicore-core-host.exe
+          $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x64.zip').Path
+          cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-one-click.ps1 `
+            -PackagePath dist/release/multicore-windows-x64 `
+            -Background
 
       - name: Install pinned Inno Setup
         shell: pwsh
@@ -134,15 +154,17 @@ jobs:
           @"
           MultiCore $env:APP_VERSION for Windows x64.
 
+          Source commit: $env:GITHUB_SHA (private source repository).
+
           - `MultiCore-Setup-x64.exe` — per-user installer.
           - `multicore-windows-x64.zip` — verified portable bundle and updater asset.
-          - Normal launch triggers the standard Windows UAC prompt required by Mihomo TUN; manual "Run as administrator" is not needed.
+          - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
           - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
 
-          The binaries are not Authenticode-signed yet, so Windows SmartScreen may show a warning.
+          UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn. Keep this release as a draft until a signed-production review explicitly approves publication.
           "@ | Set-Content -LiteralPath dist/release/RELEASE_NOTES.md -Encoding utf8
 
-      - name: Publish draft release atomically
+      - name: Create unsigned preview as draft
         shell: pwsh
         run: |
           $assets = @(
@@ -153,8 +175,8 @@ jobs:
             'dist/release/RELEASE-SHA256SUMS.txt'
           )
           gh release create $env:GITHUB_REF_NAME @assets `
-            --verify-tag `
+            --repo fatyzzz/multicore-releases `
+            --target main `
             --draft `
             --title "MultiCore $env:APP_VERSION" `
             --notes-file dist/release/RELEASE_NOTES.md
-          gh release edit $env:GITHUB_REF_NAME --draft=false

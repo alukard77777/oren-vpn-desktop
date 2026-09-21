@@ -1,99 +1,156 @@
 # MultiCore
 
-Нативный Windows-клиент на Rust без WebView. Внутри работают два независимых ядра:
+MultiCore is a native Windows x64 client written in Rust with a Slint UI. It runs
+two independent cores: Mihomo owns TUN, DNS, rules, process routing, groups, and
+selectors; Xray provides the configured Shadowsocks and FinalMask outbound
+transports through local SOCKS inbounds. No WebView is used.
 
-- Mihomo владеет TUN, DNS, sniffing, правилами по процессам, группами и селекторами;
-- Xray обслуживает готовые Shadowsocks + FinalMask outbounds через локальные SOCKS inbounds;
-- Rust daemon атомарно обновляет конфигурации и запускает Xray перед Mihomo;
-- Slint desktop оставляет пользователю один основной сценарий: добавить подписку, подключиться, выбрать маршрут и отключиться.
+The desktop and its private daemon run as the current user. Windows UAC is
+requested only when **Connect** launches `multicore-core-host.exe`. That elevated
+host is reused across Connect operations for the daemon lifetime and owns Xray
+and Mihomo in a kill-on-close Job Object. Disconnect stops both cores; closing
+the authenticated named pipe stops the cores and exits the host. Normal launch,
+subscription refresh, settings, autostart, and update checks do not require
+elevation.
 
-## Запуск готового клиента
+> **Preview status:** this feature branch is a preview until it is merged and a
+> signed production release is published. Current binaries are not
+> Authenticode-signed. The elevated host and cores also live in a user-writable
+> portable/per-user installation, so this layout is not a hardened privilege
+> boundary.
 
-Откройте:
+## Install or run
 
-```text
-dist\multicore-windows-x64\MultiCore.exe
-```
+- Portable: keep the generated directory intact and run `MultiCore.exe`.
+- Installer: run `MultiCore-Setup-x64.exe`. It installs to
+  `%LOCALAPPDATA%\Programs\MultiCore\current` and can add an HKCU autostart entry.
+- Source checkout: build with the commands below, then use the packaging script;
+  a bare Cargo executable is not a complete runtime package.
 
-Это единственный пользовательский `.exe`. Он сам:
+The portable package contains `MultiCore.exe`, the private daemon, updater and
+core host under `runtime\`, pinned Xray and Mihomo binaries under `cores\`, and
+the package manifest, notices, licenses, and checksums. Runtime never downloads
+the cores independently.
 
-1. запрашивает стандартное подтверждение Windows UAC, затем проверяет комплектность `runtime\multicore-daemon.exe` и обоих ядер;
-2. создаёт случайный локальный токен;
-3. без консоли запускает daemon на свободном loopback-порту;
-4. проверяет авторизованный `/v1/status`;
-5. при закрытии уничтожает принадлежащее ему дерево процессов через Windows Job Object.
+## Subscription profiles
 
-Никакие переменные окружения и второе окно PowerShell для обычного запуска не нужны. Пользовательские данные хранятся в `%LOCALAPPDATA%\MultiCore`.
+MultiCore stores up to 16 independent profiles. Exactly one profile is active;
+profiles are never merged. Route selections are persisted per profile. Existing
+single-subscription data under the legacy snapshot directory is migrated locally
+and offline on first profile-store startup. Activating or deleting a profile is
+blocked while connected.
 
-В portable preview зафиксированы проверенные upstream-сборки на 15 сентября 2026 года:
+The subscription strip on the Home screen is a compact active-profile selector
+only. Adding, refreshing, inspecting, and deleting profiles lives under
+the top-level **Subscriptions** page, so routine switching stays separate from
+profile management. Expanded rows keep metadata and actions compact; saved
+subscription URLs are not displayed back in the profile list.
 
-- Xray-core `v26.9.9`, commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`;
-- Mihomo `v1.19.30`, commit `ac017cdd246ce8bd547653d927e7bf77d7ee73d5`.
+The tray icon uses exact mouse behavior: left click restores the main window;
+right click toggles MultiCore's own compact control popup with connection,
+group, node, open, and exit actions. The Home page's ambient signal waves are
+bounded behind content and stop while hidden, minimized, or when Windows asks
+applications to reduce motion.
 
-Точные upstream URL и SHA-256 архивов/исполняемых файлов записаны в `versions.json`, итоговые хеши пакета — в `SHA256SUMS.txt`.
+The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
+daemon. Requests use a random per-launch bearer token, bounded bodies, no proxy,
+and no redirects.
 
-## Формат подписки
+## Provider HTTP contract
 
-Клиент использует один URL и три фиксированных User-Agent:
+The subscription URL supports three fixed configuration User-Agent values:
 
-- `multicore-json-massive` — JSON tuple `["<Mihomo YAML>", {<Xray JSON>}]`;
-- `multicore-mihomo` — полный сырой Mihomo YAML;
-- `multicore-xray` — один готовый Xray JSON object.
+| User-Agent | Response |
+| --- | --- |
+| `multicore-json-massive` | `["<Mihomo YAML>", {<Xray JSON>}]` JSON tuple |
+| `multicore-mihomo` | complete Mihomo YAML |
+| `multicore-xray` | one Xray JSON object |
 
-Сначала выполняется один запрос combined tuple. При успешном HTTP-ответе другие запросы не выполняются; битый tuple возвращает ошибку. Только если massive-вариант недоступен или не поддерживается сервером, две части загружаются отдельно. Только Mihomo YAML разбирается для групп и UI. Полученный Xray JSON проверяется на UTF-8/JSON object и хранится byte-exact. Непосредственно перед Connect клиент заново определяет активный Windows default interface, локально разрешает только домены Xray-серверов и создаёт отдельную ephemeral runtime-копию: merge `dns.hosts`, `sockopt.domainStrategy: ForceIP` и `sockopt.interface`. FinalMask и все остальные серверные поля сохраняются.
+Configuration requests include `x-hwid`, `x-device-os`, `x-ver-os`, and
+`x-device-model`. Provider metadata may supply a separate optional logo URL in
+any response header matching `<vendor>-servicelogo` (case-insensitive), for
+example `flclashx-servicelogo` or `ajsdjddj-servicelogo`. The vendor prefix must
+be non-empty; it is not a fixed allowlist. The value must be an HTTPS URL with a
+host and without embedded credentials. MultiCore fetches that URL with
+`multicore-service-logo` and deliberately omits the configuration identity
+headers. A
+successful HTTP response to `multicore-json-massive` is authoritative: parsing
+failure is reported and does not fall back. Only an unavailable or explicitly
+unsupported massive response triggers the atomic Mihomo + Xray fallback pair.
 
-Контракт для backend: [docs/contracts/multicore-subscription-backend-prompt.md](docs/contracts/multicore-subscription-backend-prompt.md).
+The Xray JSON is retained byte-for-byte in the saved snapshot. At Connect time,
+an ephemeral runtime copy receives only the client-local DNS/interface overlay
+needed to bootstrap before TUN. See the complete
+[subscription HTTP contract](docs/subscription-http-contract.md) and the
+[provider implementation contract](docs/contracts/multicore-subscription-backend-prompt.md).
 
-Полный HTTP-контракт User-Agent, identity- и metadata-заголовков:
-[docs/subscription-http-contract.md](docs/subscription-http-contract.md).
+While the active profile is disconnected and ready, MultiCore refreshes it
+automatically using `profile-update-interval`; when the provider omits that
+header, the safe default is six hours. Provider values remain clamped from 15
+minutes through 30 days, and failed automatic attempts back off for 15 minutes.
+The Home subscription strip shows the active snapshot date in a compact gray
+`DD.MM.YYYY` form. Its clock indicator changes to warning state only after the
+effective refresh interval has elapsed.
 
-## Сборка из исходников
+The configuration provider sees the usual HTTP request data, the subscription
+URL, the four configuration identity headers, and the selected configuration
+User-Agent. A metadata-provided logo endpoint sees its logo URL and the
+`multicore-service-logo` User-Agent, but not those identity headers. MultiCore
+does not operate analytics, telemetry, crash-reporting, account, or subscription
+services. See [PRIVACY.md](PRIVACY.md).
 
-Нужны Rust/Cargo ровно 1.98.1 и MSVC Build Tools:
+## Data, runtime, and updates
+
+- User data: `%LOCALAPPDATA%\MultiCore`
+- Profiles: `%LOCALAPPDATA%\MultiCore\profiles`
+- Generated connect-time configs: `%LOCALAPPDATA%\MultiCore\runtime`
+- Update downloads/helper state: `%LOCALAPPDATA%\MultiCore\updates`
+- Per-user installation: `%LOCALAPPDATA%\Programs\MultiCore\current`
+
+Core diagnostics are bounded and redacted before they are exposed through the
+authenticated local API and UI. The current elevated-host path retains them in
+memory; it does not promise a persistent `latest-core.log`.
+
+Updater builds are pinned to the public release-only repository
+`fatyzzz/multicore-releases`. The
+client reads the latest non-draft `vX.Y.Z` GitHub Release anonymously and expects
+`multicore-windows-x64.zip` with GitHub's SHA-256 asset digest. It then verifies
+the archive's internal `SHA256SUMS.txt`, stages a sibling directory, swaps the
+complete bundle transactionally, and relaunches the client. Updates are blocked
+while connected. A private repository or private release is incompatible with
+anonymous update checks, so source remains private while release assets remain
+public. The private source workflow needs a dedicated least-privilege
+`RELEASES_TOKEN` Actions secret with permission to create releases in the public
+release repository; the token is never embedded in the client.
+
+## Build, verify, and package
+
+Requirements: Windows x64, MSVC Build Tools, PowerShell, Rust 1.98.1, and Inno
+Setup 6 for installer creation.
 
 ```powershell
 $env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-msvc'
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" build --workspace --release --locked
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" test --workspace --all-targets
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-package-windows-release.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-smoke-test-one-click-contract.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-windows-installer-contract.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-release-workflow-contract.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-windows-elevation-manifest-contract.ps1
 ```
 
-Собрать portable preview с pinned-ядрами:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
-  -DestinationPath dist\multicore-windows-x64
-```
-
-Сборка с закреплённым GitHub Releases-каналом и готовым asset для автообновления:
+Create the verified portable bundle and updater asset:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -DestinationPath dist\multicore-windows-x64 `
-  -UpdateRepository owner/repository `
+  -UpdateRepository fatyzzz/multicore-releases `
   -ReleaseAssetPath dist\release\multicore-windows-x64.zip
 ```
 
-Репозиторий вшивается при сборке и не меняется из UI. Клиент проверяет только
-последний стабильный GitHub Release с тегом `vX.Y.Z` и asset
-`multicore-windows-x64.zip`. Перед заменой всего portable-пакета проверяются
-размер, GitHub SHA-256 digest, безопасные пути архива и внутренний
-`SHA256SUMS.txt`; установка заблокирована, пока VPN подключён. Старый каталог
-сохраняется рядом для отката. Канал пока не Authenticode/offline-key signed:
-перед публичной раздачей подпись и защита release-аккаунта остаются обязательны.
-
-Production-упаковщик сам собирает оба Rust-бинарника, проверяет версии Cargo/rustc 1.98.1, удаляет приватные пути сборщика и не принимает готовые `.exe`. Он принимает online только committed manifest `packaging\windows-x64\versions.json`, проверяет точные официальные URL, SHA-256, ZIP entry и PE32+ AMD64. Существующий destination он не перезаписывает.
-
-Проверки упаковки и запуска:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-package-windows-release.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-windows-installer-contract.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-release-workflow-contract.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-test-one-click.ps1
-```
-
-Собрать per-user установщик из уже проверенного portable-каталога:
+Create the per-user installer from that bundle:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
@@ -102,16 +159,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-in
   -AppVersion 0.1.2
 ```
 
-Установщик кладёт клиент в `%LOCALAPPDATA%\Programs\MultiCore`, добавляет ярлык,
-опциональный фоновый автозапуск и регистрирует `multicore://install-sub?url=…`.
-Тег `vX.Y.Z`, совпадающий с версией desktop crate, запускает Windows release
-workflow: он повторно проверяет код, собирает portable ZIP и installer, прикладывает
-точные upstream source archives и только затем публикует GitHub Release.
-
-## Ограничения релиза
-
-Бинарники пока не имеют Authenticode-подписи, поэтому Windows SmartScreen может
-показать предупреждение. TUN elevation остаётся runtime-задачей; установщик намеренно
-per-user и не маскирует её. Точные лицензии и notices находятся в
-`THIRD_PARTY_NOTICES.md` внутри пакета, а release workflow сохраняет immutable
-corresponding source для зафиксированных версий ядер.
+The tag workflow builds and verifies artifacts but leaves the GitHub Release as
+a draft. Do not publish an unsigned draft as a stable update. Public production
+release requires Authenticode signing, protected release credentials, a public
+anonymous asset, immutable corresponding source for the bundled cores, and a
+complete Rust dependency/license inventory. The current third-party notice is
+explicitly incomplete for the Rust dependency graph.

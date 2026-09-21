@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $Packager = Join-Path $PSScriptRoot 'package-windows-release.ps1'
+$PackagerSource = Get-Content -Raw -LiteralPath $Packager
 $MetadataRoot = Join-Path $RepositoryRoot 'packaging\windows-x64'
 
 function Assert-True {
@@ -118,8 +119,9 @@ function Write-TestManifest {
     if (-not $MihomoArchiveHash) { $MihomoArchiveHash = Get-Sha256 (Join-Path $InputDirectory 'mihomo-fixture.zip') }
     $manifest = [ordered]@{
         schemaVersion = 1
+        fixtureContract = 'multicore-package-test-v1'
         platform = 'windows-x64'
-        build = [ordered]@{ rustToolchain = '1.98.1'; desktopPackage = 'multicore-desktop'; daemonPackage = 'multicore-daemon'; updaterPackage = 'multicore-updater' }
+        build = [ordered]@{ rustToolchain = '1.98.1'; desktopPackage = 'multicore-desktop'; daemonPackage = 'multicore-daemon'; updaterPackage = 'multicore-updater'; coreHostPackage = 'multicore-core-host' }
         components = [ordered]@{
             xray = [ordered]@{
                 project = 'XTLS/Xray-core'; version = 'fixture'; commit = ('1' * 40); license = 'MPL-2.0'
@@ -139,14 +141,16 @@ function Write-TestManifest {
 }
 
 function Invoke-Package {
-    param([string]$Destination, [string]$InputDirectory, [string]$Manifest, [string]$Desktop, [string]$Daemon, [string]$ReleaseAsset)
+    param([string]$Destination, [string]$InputDirectory, [string]$Manifest, [string]$Desktop, [string]$Daemon, [string]$CoreHost, [string]$ReleaseAsset)
     $parameters = @{
         DestinationPath = $Destination
         OfflineSourceDirectory = $InputDirectory
         ManifestPath = $Manifest
         DesktopExecutablePath = $Desktop
         DaemonExecutablePath = $Daemon
+        CoreHostExecutablePath = $CoreHost
         UpdaterExecutablePath = $Updater
+        FixtureContractMode = $true
     }
     if ($ReleaseAsset) { $parameters.ReleaseAssetPath = $ReleaseAsset }
     & $Packager @parameters
@@ -162,13 +166,17 @@ function Assert-PackageFailure {
     & $Arrange $input $manifest
     $destination = Join-Path $caseRoot 'output'
     $failed = $false
-    try { Invoke-Package $destination $input $manifest $Desktop $Daemon | Out-Null } catch { $failed = $true }
+    try { Invoke-Package $destination $input $manifest $Desktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
     Assert-True $failed "$Name must fail"
     Assert-True (-not (Test-Path -LiteralPath $destination)) "$Name must not publish a partial destination"
     Assert-NoStageResidue $caseRoot $Name
 }
 
 Assert-True (Test-Path -LiteralPath $Packager) 'packager script must exist'
+Assert-True ($PackagerSource.Contains('$PrivilegedBrokerReleaseReady = $true')) 'production release gate marker must be true after broker Tasks 2-4 are complete'
+Assert-True ($PackagerSource.Contains('$AssertReleaseReady')) 'packager must expose the explicit CI readiness check'
+Assert-True ($PackagerSource.Contains("fixtureContract -ceq 'multicore-package-test-v1'")) 'fixture authorization must require the synthetic manifest marker'
+Assert-True ($PackagerSource.IndexOf('$PrivilegedBrokerReleaseReady = $true', [StringComparison]::Ordinal) -lt $PackagerSource.IndexOf('function Invoke-PinnedRustBuild', [StringComparison]::Ordinal)) 'release gate must be evaluated before Rust builds or downloads'
 foreach ($required in @('README.md', 'THIRD_PARTY_NOTICES.md', 'licenses\Xray-core-MPL-2.0.txt', 'licenses\mihomo-GPL-3.0.txt')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $MetadataRoot $required)) "metadata file $required must exist"
 }
@@ -178,6 +186,7 @@ New-Item -ItemType Directory -Path $TestRoot | Out-Null
 try {
     $Desktop = Join-Path $TestRoot 'multicore-desktop.exe'; New-TestPe $Desktop
     $Daemon = Join-Path $TestRoot 'multicore-daemon.exe'; New-TestPe $Daemon
+    $CoreHost = Join-Path $TestRoot 'multicore-core-host.exe'; New-TestPe $CoreHost
     $Updater = Join-Path $TestRoot 'multicore-apply.exe'; New-TestPe $Updater
     $xray = Join-Path $TestRoot 'xray.exe'; New-TestPe $xray
     $mihomo = Join-Path $TestRoot 'mihomo.exe'; New-TestPe $mihomo
@@ -191,22 +200,22 @@ try {
     $manifest = Join-Path $TestRoot 'versions.json'
     Write-TestManifest $manifest $BaseInput $xrayHash $mihomoHash
 
-    $productionProbe = Join-Path $TestRoot 'production-pin-probe'
-    $productionProbeError = $null
+    $releaseReadyOutput = (& $Packager -AssertReleaseReady | Out-String).Trim()
+    Assert-True ($releaseReadyOutput -ceq 'PASS: privileged broker release gate is open') 'production release gate must report ready after broker Tasks 2-4 are complete'
+
+    $productionOfflineProbeError = $null
     try {
-        & $Packager -DestinationPath $productionProbe -DesktopExecutablePath $Desktop -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater | Out-Null
+        & $Packager -DestinationPath (Join-Path $TestRoot 'production-offline-probe') -OfflineSourceDirectory $BaseInput -DesktopExecutablePath $Desktop -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater | Out-Null
     } catch {
-        $productionProbeError = $_.Exception.Message
+        $productionOfflineProbeError = $_.Exception.Message
     }
-    Assert-True ($productionProbeError -ceq 'Production packaging builds all Rust executables internally; executable overrides are fixture-only') 'production manifest must match the built-in immutable pin tuple'
-    Assert-True (-not (Test-Path -LiteralPath $productionProbe)) 'production pin probe must not publish'
-    Assert-NoStageResidue $TestRoot 'production pin probe'
+    Assert-True ($productionOfflineProbeError -ceq 'Production packaging builds all Rust executables internally; executable overrides are fixture-only') 'offline inputs must not allow executable overrides with the production manifest'
 
     $out1 = Join-Path $TestRoot 'package-one'; $out2 = Join-Path $TestRoot 'package-two'
     $releaseAsset = Join-Path $TestRoot 'multicore-windows-x64.zip'
-    Invoke-Package $out1 $BaseInput $manifest $Desktop $Daemon $releaseAsset | Out-Null
-    Invoke-Package $out2 $BaseInput $manifest $Desktop $Daemon | Out-Null
-    [string[]]$expected = @('MultiCore.exe', 'README.md', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.md', 'cores/mihomo.exe', 'cores/xray.exe', 'licenses/Xray-core-MPL-2.0.txt', 'licenses/mihomo-GPL-3.0.txt', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
+    Invoke-Package $out1 $BaseInput $manifest $Desktop $Daemon $CoreHost $releaseAsset | Out-Null
+    Invoke-Package $out2 $BaseInput $manifest $Desktop $Daemon $CoreHost | Out-Null
+    [string[]]$expected = @('MultiCore.exe', 'README.md', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.md', 'cores/mihomo.exe', 'cores/xray.exe', 'licenses/Xray-core-MPL-2.0.txt', 'licenses/mihomo-GPL-3.0.txt', 'runtime/multicore-core-host.exe', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
     $actualItems = @(Get-ChildItem -LiteralPath $out1 -Force -Recurse)
     foreach ($item in $actualItems) { Assert-True (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "published inventory must not contain reparse entries: $($item.FullName)" }
     [string[]]$actual = @($actualItems | Where-Object { -not $_.PSIsContainer } | ForEach-Object { $_.FullName.Substring($out1.Length + 1).Replace('\', '/') })
@@ -219,6 +228,7 @@ try {
     Assert-True ((Get-Sha256 (Join-Path $out1 'MultiCore.exe')) -eq (Get-Sha256 $Desktop)) 'desktop executable must be renamed without modification'
     Assert-True ((Get-Sha256 (Join-Path $out1 'runtime\multicore-daemon.exe')) -eq (Get-Sha256 $Daemon)) 'daemon hash must match'
     Assert-True ((Get-Sha256 (Join-Path $out1 'runtime\multicore-updater.exe')) -eq (Get-Sha256 $Updater)) 'updater hash must match'
+    Assert-True ((Get-Sha256 (Join-Path $out1 'runtime\multicore-core-host.exe')) -eq (Get-Sha256 $CoreHost)) 'core-host hash must match'
     Assert-True ((Get-Sha256 (Join-Path $out1 'cores\xray.exe')) -eq $xrayHash) 'Xray hash must match'
     Assert-True ((Get-Sha256 (Join-Path $out1 'cores\mihomo.exe')) -eq $mihomoHash) 'Mihomo hash must match'
     foreach ($relative in $expected) {
@@ -226,7 +236,7 @@ try {
     }
     $sumLines = Get-Content -LiteralPath (Join-Path $out1 'SHA256SUMS.txt')
     Assert-True (-not ($sumLines -match 'SHA256SUMS.txt')) 'SHA256SUMS must exclude itself'
-    Assert-True ($sumLines.Count -eq 10) 'SHA256SUMS must cover every other file'
+    Assert-True ($sumLines.Count -eq 11) 'SHA256SUMS must cover every other file'
     Assert-True (-not ($sumLines -match [regex]::Escape($TestRoot))) 'SHA256SUMS must not contain host paths'
     $sumPaths = New-Object System.Collections.Generic.List[string]
     foreach ($line in $sumLines) {
@@ -235,7 +245,7 @@ try {
         $sumPaths.Add($relative)
         Assert-True ((Get-Sha256 (Join-Path $out1 $relative)) -ceq $Matches[1]) "SHA256SUMS digest mismatch: $relative"
     }
-    [string[]]$expectedSumPaths = @('MultiCore.exe', 'README.md', 'THIRD_PARTY_NOTICES.md', 'cores/mihomo.exe', 'cores/xray.exe', 'licenses/Xray-core-MPL-2.0.txt', 'licenses/mihomo-GPL-3.0.txt', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
+    [string[]]$expectedSumPaths = @('MultiCore.exe', 'README.md', 'THIRD_PARTY_NOTICES.md', 'cores/mihomo.exe', 'cores/xray.exe', 'licenses/Xray-core-MPL-2.0.txt', 'licenses/mihomo-GPL-3.0.txt', 'runtime/multicore-core-host.exe', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
     Assert-True (($sumPaths -join '|') -ceq ($expectedSumPaths -join '|')) 'SHA256SUMS paths must be complete and ordered'
 
     Assert-True (Test-Path -LiteralPath $releaseAsset -PathType Leaf) 'release ZIP asset must be created when requested'
@@ -256,7 +266,7 @@ try {
 
     $customOnlineDestination = Join-Path $TestRoot 'custom-online-output'
     $failed = $false
-    try { & $Packager -DestinationPath $customOnlineDestination -ManifestPath $manifest -DesktopExecutablePath $Desktop -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater | Out-Null } catch { $failed = $true }
+    try { & $Packager -DestinationPath $customOnlineDestination -ManifestPath $manifest -DesktopExecutablePath $Desktop -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater -CoreHostExecutablePath $CoreHost | Out-Null } catch { $failed = $true }
     Assert-True $failed 'online mode must reject every custom manifest before network access'
     Assert-True (-not (Test-Path -LiteralPath $customOnlineDestination)) 'custom online manifest rejection must not publish'
     Assert-NoStageResidue $TestRoot 'custom online manifest rejection'
@@ -264,7 +274,7 @@ try {
     $malformedDesktop = Join-Path $TestRoot 'malformed-desktop.exe'; New-TestPe $malformedDesktop -Malformed
     $malformedDesktopDestination = Join-Path $TestRoot 'malformed-desktop-output'
     $failed = $false
-    try { Invoke-Package $malformedDesktopDestination $BaseInput $manifest $malformedDesktop $Daemon | Out-Null } catch { $failed = $true }
+    try { Invoke-Package $malformedDesktopDestination $BaseInput $manifest $malformedDesktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
     Assert-True $failed 'malformed staged desktop executable must be rejected'
     Assert-True (-not (Test-Path -LiteralPath $malformedDesktopDestination)) 'malformed staged desktop failure must not publish'
     Assert-NoStageResidue $TestRoot 'malformed staged desktop rejection'
@@ -347,7 +357,7 @@ try {
     $existing = Join-Path $TestRoot 'existing-output'; New-Item -ItemType Directory -Path $existing | Out-Null
     Set-Content -LiteralPath (Join-Path $existing 'keep.txt') -Value 'untouched' -NoNewline
     $failed = $false
-    try { Invoke-Package $existing $BaseInput $manifest $Desktop $Daemon | Out-Null } catch { $failed = $true }
+    try { Invoke-Package $existing $BaseInput $manifest $Desktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
     Assert-True $failed 'existing destination must be rejected'
     Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $existing 'keep.txt')) -ceq 'untouched') 'existing destination must be untouched'
     Assert-NoStageResidue $TestRoot 'existing destination rejection'
@@ -358,7 +368,7 @@ try {
     Assert-True (Test-Path -LiteralPath $junction) 'junction fixture must be created'
     $junctionDestination = Join-Path $junction 'output'
     $failed = $false
-    try { Invoke-Package $junctionDestination $BaseInput $manifest $Desktop $Daemon | Out-Null } catch { $failed = $true }
+    try { Invoke-Package $junctionDestination $BaseInput $manifest $Desktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
     Assert-True $failed 'reparse-point destination ancestor must be rejected'
     Assert-True (-not (Test-Path -LiteralPath $junctionDestination)) 'reparse ancestor failure must not publish'
     Assert-NoStageResidue $junctionTarget 'destination reparse ancestor rejection'
@@ -370,7 +380,7 @@ try {
     Assert-True (Test-Path -LiteralPath $inputJunction) 'input junction fixture must be created'
     $inputJunctionDestination = Join-Path $TestRoot 'input-junction-output'
     $failed = $false
-    try { & $Packager -DestinationPath $inputJunctionDestination -OfflineSourceDirectory $BaseInput -ManifestPath $manifest -DesktopExecutablePath (Join-Path $inputJunction 'desktop.exe') -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater | Out-Null } catch { $failed = $true }
+    try { & $Packager -DestinationPath $inputJunctionDestination -OfflineSourceDirectory $BaseInput -ManifestPath $manifest -DesktopExecutablePath (Join-Path $inputJunction 'desktop.exe') -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater -CoreHostExecutablePath $CoreHost -FixtureContractMode | Out-Null } catch { $failed = $true }
     Assert-True $failed 'reparse-point input ancestor must be rejected'
     Assert-True (-not (Test-Path -LiteralPath $inputJunctionDestination)) 'input reparse ancestor failure must not publish'
     Assert-NoStageResidue $TestRoot 'input reparse ancestor rejection'

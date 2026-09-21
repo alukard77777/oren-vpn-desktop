@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -8,8 +9,12 @@ use regex::Regex;
 
 use crate::daemon::{
     DaemonCatalog, DaemonClient, DaemonDiagnostics, DaemonEvent, DaemonEventBatch, DaemonLatencies,
-    DaemonStatus, DaemonSubscriptionInfo,
+    DaemonStatus, DaemonSubscriptionInfo, DaemonSubscriptionList, DaemonSubscriptionProfile,
 };
+
+#[allow(dead_code)] // Wired into the Slint shell in Task 6.
+const MAX_SUBSCRIPTION_PROFILES: usize = 16;
+const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiState {
@@ -84,6 +89,7 @@ enum MutationKind {
 struct ActiveMutation {
     token: MutationToken,
     kind: MutationKind,
+    profile_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +176,7 @@ pub(crate) struct CatalogGroupPresentation {
     pub(crate) id: String,
     pub(crate) label: String,
     pub(crate) selected: bool,
+    pub(crate) selected_node_label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,12 +208,58 @@ pub(crate) struct SubscriptionPresentation {
     pub(crate) display_name: String,
     pub(crate) usage: String,
     pub(crate) expiry: String,
+    pub(crate) updated: String,
+    pub(crate) updated_stale: bool,
     pub(crate) announcement_text: String,
     pub(crate) announcement_tone: String,
     pub(crate) service_logo_path: Option<String>,
     pub(crate) refresh_available: bool,
     pub(crate) refresh_pending: bool,
     pub(crate) error: Option<String>,
+}
+
+#[allow(dead_code)] // Wired into the Slint shell in Task 6.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubscriptionProfilePresentation {
+    pub(crate) id: String,
+    pub(crate) active: bool,
+    pub(crate) available: bool,
+    pub(crate) title: String,
+    pub(crate) usage: String,
+    pub(crate) expiry: String,
+    pub(crate) service_logo_path: Option<String>,
+}
+
+#[allow(dead_code)] // Wired into the Slint shell in Task 6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriptionProfileOperation {
+    List,
+    Activate,
+    Refresh,
+    Edit,
+    Delete,
+}
+
+#[allow(dead_code)] // Wired into the Slint shell in Task 6.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SubscriptionProfilesPresentation {
+    pub(crate) active_id: Option<String>,
+    pub(crate) profiles: Vec<SubscriptionProfilePresentation>,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) pending_operation: Option<SubscriptionProfileOperation>,
+    pub(crate) pending_id: Option<String>,
+}
+
+#[allow(dead_code)] // Wired into the Slint shell in Task 6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProfileRequestToken(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveProfileRequest {
+    token: ProfileRequestToken,
+    operation: SubscriptionProfileOperation,
+    profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -509,6 +562,22 @@ pub struct DesktopViewModel {
     connection_notice: Option<String>,
     subscription: Option<DaemonSubscriptionInfo>,
     subscription_refresh_error: Option<String>,
+    active_profile_id: Option<String>,
+    subscription_profiles: Vec<SubscriptionProfilePresentation>,
+    profile_error: Option<String>,
+    profile_status_reload_needed: bool,
+    profile_reload_needed: bool,
+    profile_catalog_reload_needed: bool,
+    profile_status_reconciliation_pending: bool,
+    profile_list_reconciliation_pending: bool,
+    profile_catalog_reconciliation_pending: bool,
+    #[allow(dead_code)] // Consumed by the profile menu in Task 6.
+    profile_close_intent: bool,
+    profile_epoch: u64,
+    next_profile_list_generation: u64,
+    profile_list_request_pending: Option<ProfileRequestToken>,
+    next_profile_mutation_generation: u64,
+    active_profile_mutation: Option<ActiveProfileRequest>,
     next_mutation_generation: u64,
     active_mutation: Option<ActiveMutation>,
     event_epoch: Option<String>,
@@ -525,6 +594,8 @@ pub struct DesktopViewModel {
     catalog_revision: Option<u64>,
     catalog_groups: Vec<CatalogGroup>,
     selected_catalog_group: Option<String>,
+    restored_route_group: Option<String>,
+    restored_route_nodes: BTreeMap<String, String>,
     catalog_error: Option<String>,
     next_catalog_generation: u64,
     catalog_request_pending: Option<CatalogRequestToken>,
@@ -556,6 +627,21 @@ impl DesktopViewModel {
             connection_notice: None,
             subscription: None,
             subscription_refresh_error: None,
+            active_profile_id: None,
+            subscription_profiles: Vec::new(),
+            profile_error: None,
+            profile_status_reload_needed: false,
+            profile_reload_needed: false,
+            profile_catalog_reload_needed: false,
+            profile_status_reconciliation_pending: false,
+            profile_list_reconciliation_pending: false,
+            profile_catalog_reconciliation_pending: false,
+            profile_close_intent: false,
+            profile_epoch: 0,
+            next_profile_list_generation: 0,
+            profile_list_request_pending: None,
+            next_profile_mutation_generation: 0,
+            active_profile_mutation: None,
             next_mutation_generation: 0,
             active_mutation: None,
             event_epoch: None,
@@ -572,6 +658,8 @@ impl DesktopViewModel {
             catalog_revision: None,
             catalog_groups: Vec::new(),
             selected_catalog_group: None,
+            restored_route_group: None,
+            restored_route_nodes: BTreeMap::new(),
             catalog_error: None,
             next_catalog_generation: 0,
             catalog_request_pending: None,
@@ -610,6 +698,8 @@ impl DesktopViewModel {
         }
         if self.active_mutation.is_some()
             || self.import_pending
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
         {
@@ -635,10 +725,552 @@ impl DesktopViewModel {
     }
 
     fn apply_daemon_status(&mut self, status: DaemonStatus) -> UiState {
+        self.set_authoritative_active_profile(status.active_profile_id.clone());
+        self.subscription = status.subscription.clone();
+        state_from_status(status)
+    }
+}
+
+#[allow(dead_code)] // Profile operations are wired to background workers in Task 6.
+impl DesktopViewModel {
+    pub(crate) fn profile_presentation(&self) -> SubscriptionProfilesPresentation {
+        SubscriptionProfilesPresentation {
+            active_id: self.active_profile_id.clone(),
+            profiles: self.subscription_profiles.clone(),
+            loading: self.profile_list_request_pending.is_some(),
+            error: self.profile_error.clone(),
+            pending_operation: self
+                .active_profile_mutation
+                .as_ref()
+                .map(|request| request.operation)
+                .or_else(|| {
+                    self.profile_list_request_pending
+                        .map(|_| SubscriptionProfileOperation::List)
+                }),
+            pending_id: self
+                .active_profile_mutation
+                .as_ref()
+                .and_then(|request| request.profile_id.clone()),
+        }
+    }
+
+    pub(crate) fn begin_profile_list(&mut self) -> Option<ProfileRequestToken> {
+        self.profile_error = None;
+        self.profile_reload_needed = false;
+        self.next_profile_list_generation = self.next_profile_list_generation.wrapping_add(1);
+        let token = ProfileRequestToken(self.next_profile_list_generation);
+        self.profile_list_request_pending = Some(token);
+        Some(token)
+    }
+
+    pub(crate) fn finish_profile_list(
+        &mut self,
+        token: ProfileRequestToken,
+        result: Result<DaemonSubscriptionList, crate::daemon::DaemonError>,
+    ) -> bool {
+        if self.profile_list_request_pending != Some(token) {
+            return false;
+        }
+        self.profile_list_request_pending = None;
+        match result {
+            Ok(list) => {
+                self.replace_profile_list(list);
+                self.profile_error = None;
+                self.profile_list_reconciliation_pending = false;
+                self.arm_profile_catalog_reconciliation();
+            }
+            Err(_) => {
+                self.profile_error =
+                    Some("Не удалось загрузить подписки. Повторите попытку.".into());
+                if self.profile_list_reconciliation_pending {
+                    self.profile_reload_needed = true;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn begin_profile_activation(
+        &mut self,
+        profile_id: &str,
+    ) -> Option<ProfileRequestToken> {
+        if !self.profile_mutation_preflight(profile_id, false) {
+            return None;
+        }
+        if self.active_profile_id.as_deref() == Some(profile_id) {
+            return None;
+        }
+        Some(self.next_profile_mutation(
+            SubscriptionProfileOperation::Activate,
+            Some(profile_id.to_owned()),
+        ))
+    }
+
+    pub(crate) fn finish_profile_activation(
+        &mut self,
+        token: ProfileRequestToken,
+        result: Result<DaemonStatus, crate::daemon::DaemonError>,
+    ) -> bool {
+        if !self.is_current_profile_mutation(token, SubscriptionProfileOperation::Activate) {
+            if profile_result_may_have_committed(&result) {
+                self.require_full_profile_reconciliation();
+            }
+            return false;
+        }
+        self.active_profile_mutation = None;
+        match result {
+            Ok(status) => {
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                self.state = self.apply_profile_changing_status(status);
+                self.profile_error = None;
+                self.profile_reload_needed = true;
+                self.profile_catalog_reload_needed = true;
+                self.profile_list_reconciliation_pending = true;
+                self.profile_catalog_reconciliation_pending = true;
+                true
+            }
+            Err(error) => {
+                self.profile_error = Some(profile_mutation_error(&error, "активировать"));
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn begin_profile_target_refresh(
+        &mut self,
+        profile_id: &str,
+    ) -> Option<ProfileRequestToken> {
+        if !self.profile_mutation_preflight(profile_id, true) {
+            return None;
+        }
+        Some(self.next_profile_mutation(
+            SubscriptionProfileOperation::Refresh,
+            Some(profile_id.to_owned()),
+        ))
+    }
+
+    pub(crate) fn finish_profile_target_refresh(
+        &mut self,
+        token: ProfileRequestToken,
+        result: Result<DaemonSubscriptionList, crate::daemon::DaemonError>,
+    ) -> bool {
+        let Some(request) =
+            self.take_current_profile_mutation(token, SubscriptionProfileOperation::Refresh)
+        else {
+            if profile_result_may_have_committed(&result) {
+                self.require_full_profile_reconciliation();
+            }
+            return false;
+        };
+        let Some(profile_id) = request.profile_id else {
+            return false;
+        };
+        let refreshes_active_profile = self.active_profile_id.as_deref() == Some(&profile_id);
+        match result {
+            Ok(list) => {
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                if let Some(profile) = list
+                    .profiles
+                    .into_iter()
+                    .find(|profile| profile.id == profile_id)
+                    .and_then(present_subscription_profile)
+                    && let Some(existing) = self
+                        .subscription_profiles
+                        .iter_mut()
+                        .find(|profile| profile.id == profile_id)
+                {
+                    // A targeted refresh is not authoritative for ordering, other rows, or the
+                    // active ID. It changes only the requested row until the follow-up list.
+                    let mut profile = profile;
+                    profile.active = existing.active;
+                    *existing = profile;
+                }
+                if refreshes_active_profile {
+                    self.invalidate_profile_runtime();
+                    self.require_profile_reconciliation(true, true, true);
+                } else {
+                    self.profile_reload_needed = true;
+                    self.profile_list_reconciliation_pending = true;
+                }
+                self.profile_error = None;
+                true
+            }
+            Err(error) => {
+                self.profile_error = Some(profile_mutation_error(&error, "обновить"));
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn begin_profile_source_edit(
+        &mut self,
+        profile_id: &str,
+        url: &str,
+    ) -> Option<ProfileRequestToken> {
+        let valid = reqwest::Url::parse(url.trim())
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+        if !valid {
+            self.profile_error = Some("Введите корректный HTTP(S) URL.".into());
+            return None;
+        }
+        if !self.profile_mutation_preflight(profile_id, false) {
+            return None;
+        }
+        Some(self.next_profile_mutation(
+            SubscriptionProfileOperation::Edit,
+            Some(profile_id.to_owned()),
+        ))
+    }
+
+    pub(crate) fn finish_profile_source_edit(
+        &mut self,
+        token: ProfileRequestToken,
+        result: Result<DaemonSubscriptionList, crate::daemon::DaemonError>,
+    ) -> bool {
+        let Some(request) =
+            self.take_current_profile_mutation(token, SubscriptionProfileOperation::Edit)
+        else {
+            if profile_result_may_have_committed(&result) {
+                self.require_full_profile_reconciliation();
+            }
+            return false;
+        };
+        let Some(profile_id) = request.profile_id else {
+            return false;
+        };
+        let edits_active_profile = self.active_profile_id.as_deref() == Some(&profile_id);
+        match result {
+            Ok(list) => {
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                if let Some(profile) = list
+                    .profiles
+                    .into_iter()
+                    .find(|profile| profile.id == profile_id)
+                    .and_then(present_subscription_profile)
+                    && let Some(existing) = self
+                        .subscription_profiles
+                        .iter_mut()
+                        .find(|profile| profile.id == profile_id)
+                {
+                    let mut profile = profile;
+                    profile.active = existing.active;
+                    *existing = profile;
+                }
+                if edits_active_profile {
+                    self.invalidate_profile_runtime();
+                    self.require_profile_reconciliation(true, true, true);
+                } else {
+                    self.profile_reload_needed = true;
+                    self.profile_list_reconciliation_pending = true;
+                }
+                self.profile_error = None;
+                true
+            }
+            Err(error) => {
+                self.profile_error = Some(profile_mutation_error(&error, "изменить ссылку"));
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn begin_profile_delete(&mut self, profile_id: &str) -> Option<ProfileRequestToken> {
+        if !self.profile_mutation_preflight(profile_id, false) {
+            return None;
+        }
+        Some(self.next_profile_mutation(
+            SubscriptionProfileOperation::Delete,
+            Some(profile_id.to_owned()),
+        ))
+    }
+
+    pub(crate) fn finish_profile_delete(
+        &mut self,
+        token: ProfileRequestToken,
+        result: Result<DaemonStatus, crate::daemon::DaemonError>,
+    ) -> bool {
+        let Some(request) =
+            self.take_current_profile_mutation(token, SubscriptionProfileOperation::Delete)
+        else {
+            if profile_result_may_have_committed(&result) {
+                self.require_full_profile_reconciliation();
+            }
+            return false;
+        };
+        let Some(profile_id) = request.profile_id else {
+            return false;
+        };
+        match result {
+            Ok(status) => {
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                let previous_active = self.active_profile_id.clone();
+                self.subscription_profiles
+                    .retain(|profile| profile.id != profile_id);
+                self.state = self.apply_daemon_status(status);
+                if self.active_profile_id != previous_active {
+                    self.profile_catalog_reload_needed = true;
+                    self.profile_catalog_reconciliation_pending = true;
+                }
+                self.profile_close_intent = self.subscription_profiles.is_empty();
+                self.profile_error = None;
+                self.profile_reload_needed = true;
+                self.profile_list_reconciliation_pending = true;
+                true
+            }
+            Err(error) => {
+                self.profile_error = Some(profile_mutation_error(&error, "удалить"));
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn take_profile_list_reload_needed(&mut self) -> bool {
+        std::mem::take(&mut self.profile_reload_needed)
+    }
+
+    pub(crate) fn take_profile_close_intent(&mut self) -> bool {
+        std::mem::take(&mut self.profile_close_intent)
+    }
+
+    pub(crate) fn take_profile_catalog_reload_needed(&mut self) -> bool {
+        std::mem::take(&mut self.profile_catalog_reload_needed)
+    }
+
+    pub(crate) fn take_profile_status_reload_needed(&mut self) -> bool {
+        std::mem::take(&mut self.profile_status_reload_needed)
+    }
+
+    fn next_profile_mutation(
+        &mut self,
+        operation: SubscriptionProfileOperation,
+        profile_id: Option<String>,
+    ) -> ProfileRequestToken {
+        self.invalidate_profile_list_request();
+        self.next_profile_mutation_generation =
+            self.next_profile_mutation_generation.wrapping_add(1);
+        let token = ProfileRequestToken(self.next_profile_mutation_generation);
+        self.active_profile_mutation = Some(ActiveProfileRequest {
+            token,
+            operation,
+            profile_id,
+        });
+        token
+    }
+
+    fn is_current_profile_mutation(
+        &self,
+        token: ProfileRequestToken,
+        operation: SubscriptionProfileOperation,
+    ) -> bool {
+        self.active_profile_mutation
+            .as_ref()
+            .is_some_and(|request| request.token == token && request.operation == operation)
+    }
+
+    fn take_current_profile_mutation(
+        &mut self,
+        token: ProfileRequestToken,
+        operation: SubscriptionProfileOperation,
+    ) -> Option<ActiveProfileRequest> {
+        self.is_current_profile_mutation(token, operation)
+            .then(|| self.active_profile_mutation.take())
+            .flatten()
+    }
+
+    fn profile_mutation_preflight(&mut self, profile_id: &str, requires_available: bool) -> bool {
+        if matches!(
+            self.state,
+            UiState::Connected { .. } | UiState::Connecting { .. }
+        ) {
+            self.profile_error = Some("Отключитесь перед изменением подписки.".into());
+            return false;
+        }
+        if matches!(self.state, UiState::DaemonDegraded { .. }) {
+            self.profile_error = Some("Дождитесь восстановления фонового сервиса.".into());
+            return false;
+        }
+        if self.active_profile_mutation.is_some()
+            || self
+                .active_mutation
+                .is_some_and(|active| active.kind != MutationKind::Refresh)
+            || self.import_pending
+            || self.active_selection.is_some()
+            || self.catalog_reconciliation_required
+            || self.profile_reconciliation_required()
+            || self.state.presentation().is_busy
+        {
+            self.profile_error = Some("Дождитесь завершения текущей операции.".into());
+            return false;
+        }
+        let Some(profile) = self
+            .subscription_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.profile_error = Some("Подписка больше недоступна. Обновите список.".into());
+            return false;
+        };
+        if requires_available && !profile.available {
+            self.profile_error = Some("Эту подписку сейчас нельзя обновить.".into());
+            return false;
+        }
+        self.profile_error = None;
+        true
+    }
+
+    fn profile_mutation_pending(&self) -> bool {
+        self.active_profile_mutation.is_some()
+    }
+
+    fn profile_reconciliation_required(&self) -> bool {
+        self.profile_status_reconciliation_pending
+            || self.profile_list_reconciliation_pending
+            || self.profile_catalog_reconciliation_pending
+    }
+
+    fn invalidate_profile_list_request(&mut self) {
+        self.next_profile_list_generation = self.next_profile_list_generation.wrapping_add(1);
+        self.profile_list_request_pending = None;
+    }
+
+    fn advance_profile_epoch(&mut self) {
+        self.profile_epoch = self.profile_epoch.wrapping_add(1);
+        if self
+            .active_mutation
+            .is_some_and(|mutation| mutation.kind == MutationKind::Refresh)
+        {
+            self.active_mutation = None;
+        }
+    }
+
+    fn require_profile_reconciliation(&mut self, status: bool, list: bool, catalog: bool) {
+        self.profile_status_reconciliation_pending |= status;
+        self.profile_list_reconciliation_pending |= list;
+        self.profile_catalog_reconciliation_pending |= catalog;
+        self.profile_status_reload_needed |= status;
+        self.profile_reload_needed |= list;
+        self.profile_catalog_reload_needed |= catalog;
+        self.arm_profile_catalog_reconciliation();
+    }
+
+    fn arm_profile_catalog_reconciliation(&mut self) {
+        if self.profile_catalog_reconciliation_pending
+            && !self.profile_status_reconciliation_pending
+            && !self.profile_list_reconciliation_pending
+        {
+            self.profile_catalog_reload_needed = true;
+        }
+    }
+
+    fn require_full_profile_reconciliation(&mut self) {
+        self.active_profile_mutation = None;
+        self.invalidate_profile_list_request();
+        self.advance_profile_epoch();
+        self.invalidate_profile_runtime();
+        self.active_profile_id = None;
+        self.sync_profile_active_flags();
+        self.state = UiState::DaemonDegraded {
+            message: "Проверяем состояние подписок…".into(),
+        };
+        if self.profile_error.is_none() {
+            self.profile_error =
+                Some("Не удалось подтвердить изменение. Обновляем состояние подписок.".into());
+        }
+        self.require_profile_reconciliation(true, true, true);
+    }
+
+    fn replace_profile_list(&mut self, list: DaemonSubscriptionList) {
+        self.set_authoritative_active_profile(
+            list.active_profile_id.as_deref().and_then(safe_profile_id),
+        );
+        self.subscription_profiles = list
+            .profiles
+            .into_iter()
+            .take(MAX_SUBSCRIPTION_PROFILES)
+            .filter_map(present_subscription_profile)
+            .map(|mut profile| {
+                profile.active = self.active_profile_id.as_deref() == Some(profile.id.as_str());
+                profile
+            })
+            .collect();
+    }
+
+    fn set_authoritative_active_profile(&mut self, profile_id: Option<String>) {
+        let profile_id = profile_id.as_deref().and_then(safe_profile_id);
+        if self.active_profile_id != profile_id {
+            self.invalidate_profile_runtime();
+            self.active_profile_id = profile_id;
+            self.sync_profile_active_flags();
+            self.arm_profile_catalog_reconciliation();
+        }
+    }
+
+    fn apply_profile_changing_status(&mut self, status: DaemonStatus) -> UiState {
+        self.invalidate_profile_runtime();
+        self.active_profile_id = status
+            .active_profile_id
+            .as_deref()
+            .and_then(safe_profile_id);
+        self.sync_profile_active_flags();
         self.subscription = status.subscription.clone();
         state_from_status(status)
     }
 
+    fn sync_profile_active_flags(&mut self) {
+        for profile in &mut self.subscription_profiles {
+            profile.active = self.active_profile_id.as_deref() == Some(profile.id.as_str());
+        }
+    }
+
+    fn invalidate_profile_runtime(&mut self) {
+        self.subscription = None;
+        self.subscription_refresh_error = None;
+
+        self.invalidate_catalog_runtime();
+    }
+
+    fn invalidate_catalog_runtime(&mut self) {
+        self.next_catalog_generation = self.next_catalog_generation.wrapping_add(1);
+        self.catalog_request_pending = None;
+        self.catalog_request_deferred = false;
+        self.catalog_revision = None;
+        self.catalog_groups.clear();
+        self.selected_catalog_group = None;
+        self.restored_route_group = None;
+        self.restored_route_nodes.clear();
+        self.catalog_error = None;
+        self.catalog_reconciliation_required = false;
+        self.catalog_notice_after_refresh = None;
+
+        self.next_selection_generation = self.next_selection_generation.wrapping_add(1);
+        self.active_selection = None;
+        self.queued_selections.clear();
+
+        self.next_latency_generation = self.next_latency_generation.wrapping_add(1);
+        self.latency_request_pending = None;
+        self.latency_request_revision = None;
+        self.latency_request_group_ids.clear();
+        self.latency_queued = false;
+        self.latency_error = None;
+    }
+}
+
+impl DesktopViewModel {
     pub(crate) fn subscription_presentation(&self) -> SubscriptionPresentation {
         self.subscription_presentation_at(current_unix_time())
     }
@@ -649,6 +1281,8 @@ impl DesktopViewModel {
                 display_name: "Подписка".into(),
                 usage: "Нет данных".into(),
                 expiry: "Добавьте ссылку".into(),
+                updated: "Не обновлялась".into(),
+                updated_stale: false,
                 announcement_text: String::new(),
                 announcement_tone: "info".into(),
                 service_logo_path: None,
@@ -682,6 +1316,12 @@ impl DesktopViewModel {
                 }
             },
         );
+        let updated = format_update_date(info.updated_at_unix);
+        let updated_stale = info.updated_at_unix != 0
+            && now_unix
+                >= info
+                    .updated_at_unix
+                    .saturating_add(subscription_refresh_interval(info));
         let display_name = bounded_plain_text(&info.display_name, 128)
             .filter(|name| !name.is_empty())
             .or_else(|| bounded_plain_text(&info.source_name, 128))
@@ -701,6 +1341,8 @@ impl DesktopViewModel {
             display_name,
             usage,
             expiry,
+            updated,
+            updated_stale,
             announcement_text,
             announcement_tone: announcement_tone.into(),
             service_logo_path: info.service_logo_path.as_deref().and_then(local_logo_path),
@@ -712,9 +1354,24 @@ impl DesktopViewModel {
         }
     }
 
+    pub(crate) fn automatic_subscription_refresh_due_at(&self, now_unix: u64) -> bool {
+        let Some(info) = self.subscription.as_ref() else {
+            return false;
+        };
+        if !matches!(self.state, UiState::Ready { .. }) || !info.refresh_available {
+            return false;
+        }
+        now_unix
+            >= info
+                .updated_at_unix
+                .saturating_add(subscription_refresh_interval(info))
+    }
+
     pub(crate) fn begin_subscription_refresh(&mut self) -> Option<MutationToken> {
         if self.active_mutation.is_some()
             || self.import_pending
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
             || matches!(
@@ -749,9 +1406,12 @@ impl DesktopViewModel {
                 self.queued_selections.clear();
                 self.latency_queued = true;
             }
-            Err(_) => {
+            Err(error) => {
                 self.subscription_refresh_error =
                     Some("Не удалось обновить. Рабочий профиль сохранён.".into());
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
             }
         }
         self.active_mutation = None;
@@ -761,16 +1421,30 @@ impl DesktopViewModel {
     fn next_mutation(&mut self, kind: MutationKind) -> MutationToken {
         self.next_mutation_generation = self.next_mutation_generation.wrapping_add(1);
         let token = MutationToken(self.next_mutation_generation);
-        self.active_mutation = Some(ActiveMutation { token, kind });
+        if kind == MutationKind::Refresh && self.profile_mutation_pending() {
+            return token;
+        }
+        self.active_mutation = Some(ActiveMutation {
+            token,
+            kind,
+            profile_epoch: self.profile_epoch,
+        });
         token
     }
 
     fn is_current_mutation(&self, token: MutationToken, kind: MutationKind) -> bool {
-        self.active_mutation == Some(ActiveMutation { token, kind })
+        self.active_mutation.is_some_and(|active| {
+            active.token == token
+                && active.kind == kind
+                && active.profile_epoch == self.profile_epoch
+        })
     }
 
     pub(crate) fn begin_refresh(&mut self) -> MutationToken {
         self.connection_notice = None;
+        if self.profile_status_reconciliation_pending {
+            self.profile_status_reload_needed = false;
+        }
         self.next_mutation(MutationKind::Refresh)
     }
 
@@ -793,6 +1467,8 @@ impl DesktopViewModel {
     pub fn begin_primary_action(&mut self) -> Option<(PrimaryAction, MutationToken)> {
         if self.active_mutation.is_some()
             || self.import_pending
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
         {
@@ -829,6 +1505,8 @@ impl DesktopViewModel {
 
     pub fn begin_import(&mut self, url: &str) -> Option<MutationToken> {
         if self.import_pending
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
         {
@@ -861,11 +1539,25 @@ impl DesktopViewModel {
         if !self.is_current_mutation(token, MutationKind::Refresh) {
             return;
         }
+        if self.profile_mutation_pending() {
+            self.active_mutation = None;
+            return;
+        }
         self.state = match result {
-            Ok(status) => self.apply_daemon_status(status),
-            Err(error) => UiState::Error {
-                message: error.to_string(),
-            },
+            Ok(status) => {
+                self.profile_status_reconciliation_pending = false;
+                let state = self.apply_daemon_status(status);
+                self.arm_profile_catalog_reconciliation();
+                state
+            }
+            Err(error) => {
+                if self.profile_status_reconciliation_pending {
+                    self.profile_status_reload_needed = true;
+                }
+                UiState::Error {
+                    message: error.to_string(),
+                }
+            }
         };
         self.active_mutation = None;
     }
@@ -884,14 +1576,22 @@ impl DesktopViewModel {
             .unwrap_or_else(|| self.state.clone());
         match result {
             Ok(status) => {
-                self.state = self.apply_daemon_status(status);
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                self.subscription_profiles.clear();
+                self.profile_error = None;
+                self.profile_reload_needed = true;
+                self.profile_catalog_reload_needed = true;
+                self.state = self.apply_profile_changing_status(status);
                 self.import_error = None;
-                self.catalog_revision = None;
             }
-            Err(_) => {
+            Err(error) => {
                 self.state = previous_state;
                 self.import_error =
                     Some("Не удалось добавить подписку. Проверьте URL и повторите попытку.".into());
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
             }
         }
         self.import_pending = false;
@@ -1124,7 +1824,12 @@ impl DesktopViewModel {
     }
 
     pub(crate) fn begin_catalog_request(&mut self) -> Option<CatalogRequest> {
-        if self.catalog_request_pending.is_some() {
+        if self.catalog_request_pending.is_some()
+            || self.profile_mutation_pending()
+            || (self.profile_catalog_reconciliation_pending
+                && (self.profile_status_reconciliation_pending
+                    || self.profile_list_reconciliation_pending))
+        {
             return None;
         }
         if self.active_selection.is_some() {
@@ -1132,6 +1837,9 @@ impl DesktopViewModel {
             return None;
         }
         self.catalog_request_deferred = false;
+        if self.profile_catalog_reconciliation_pending {
+            self.profile_catalog_reload_needed = false;
+        }
         self.next_catalog_generation = self.next_catalog_generation.wrapping_add(1);
         let token = CatalogRequestToken(self.next_catalog_generation);
         self.catalog_request_pending = Some(token);
@@ -1154,7 +1862,10 @@ impl DesktopViewModel {
 
     pub(crate) fn begin_latency_request(&mut self) -> Option<LatencyRequest> {
         self.latency_error = None;
-        if self.latency_request_pending.is_some() {
+        if self.latency_request_pending.is_some()
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
+        {
             self.latency_queued = true;
             return None;
         }
@@ -1259,11 +1970,15 @@ impl DesktopViewModel {
                     self.sync_connected_route_from_catalog();
                 }
                 self.catalog_reconciliation_required = false;
+                self.profile_catalog_reconciliation_pending = false;
                 self.catalog_error = self.catalog_notice_after_refresh.take();
             }
             Err(_) => {
                 self.catalog_revision = None;
                 self.catalog_reconciliation_required = false;
+                if self.profile_catalog_reconciliation_pending {
+                    self.profile_catalog_reload_needed = true;
+                }
                 self.catalog_error = self
                     .catalog_notice_after_refresh
                     .take()
@@ -1284,9 +1999,50 @@ impl DesktopViewModel {
         true
     }
 
+    /// Supplies the route choices loaded from preferences before the first catalog refresh.
+    /// IDs are opaque daemon values; unknown IDs are ignored when the catalog arrives.
+    pub(crate) fn restore_route_preferences(
+        &mut self,
+        group_id: Option<&str>,
+        selections: &BTreeMap<String, String>,
+    ) {
+        self.restored_route_group = group_id.map(str::to_owned);
+        self.restored_route_nodes = selections.clone();
+        if !self.catalog_groups.is_empty() {
+            self.apply_restored_route_preferences();
+        }
+    }
+
+    /// Returns the currently selected route IDs in the shape persisted by the desktop shell.
+    pub(crate) fn route_preferences(
+        &self,
+    ) -> Option<(String, Option<String>, BTreeMap<String, String>)> {
+        if self.catalog_groups.is_empty() {
+            return None;
+        }
+        let selections = self
+            .catalog_groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .nodes
+                    .iter()
+                    .find(|node| node.selected)
+                    .map(|node| (group.id.clone(), node.id.clone()))
+            })
+            .collect();
+        Some((
+            self.active_profile_id.clone()?,
+            self.selected_catalog_group.clone(),
+            selections,
+        ))
+    }
+
     pub(crate) fn begin_node_selection(&mut self, node_id: &str) -> Option<NodeSelectionRequest> {
         if self.active_selection.is_some()
             || self.catalog_request_pending.is_some()
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
             || self.active_mutation.is_some()
             || self.import_pending
             || self.catalog_reconciliation_required
@@ -1470,6 +2226,12 @@ impl DesktopViewModel {
                 id: group.id.clone(),
                 label: group.label.clone(),
                 selected: selected == Some(group.id.as_str()),
+                selected_node_label: group
+                    .nodes
+                    .iter()
+                    .find(|node| node.selected)
+                    .map(|node| node.label.clone())
+                    .unwrap_or_else(|| "Не выбран".into()),
             })
             .collect();
         let nodes = selected
@@ -1573,6 +2335,7 @@ impl DesktopViewModel {
         if !self.catalog_groups.is_empty() {
             self.latency_queued = true;
         }
+        self.apply_restored_route_preferences();
         if preserve_queued {
             for queued in &self.queued_selections {
                 if let Some(group) = self
@@ -1596,6 +2359,38 @@ impl DesktopViewModel {
                 }
             }
         }
+    }
+
+    fn apply_restored_route_preferences(&mut self) {
+        if self.catalog_groups.is_empty() {
+            return;
+        }
+        if let Some(group_id) = self.restored_route_group.take()
+            && self.catalog_groups.iter().any(|group| group.id == group_id)
+        {
+            self.selected_catalog_group = Some(group_id);
+        }
+        if self.restored_route_nodes.is_empty() {
+            return;
+        }
+        for group in &mut self.catalog_groups {
+            let Some(node_id) = self.restored_route_nodes.get(&group.id) else {
+                continue;
+            };
+            let Some(target_index) = group.nodes.iter().position(|node| node.id == *node_id) else {
+                continue;
+            };
+            for node in &mut group.nodes {
+                node.selected = false;
+            }
+            group.nodes[target_index].selected = true;
+            if group.is_primary
+                && let UiState::Ready { node, .. } = &mut self.state
+            {
+                *node = group.nodes[target_index].label.clone();
+            }
+        }
+        self.restored_route_nodes.clear();
     }
 
     fn restore_selection(&mut self, active: &ActiveSelection) {
@@ -1732,8 +2527,111 @@ fn current_unix_time() -> u64 {
         .as_secs()
 }
 
+const MIN_AUTO_REFRESH_SECS: u64 = 15 * 60;
+const DEFAULT_AUTO_REFRESH_SECS: u64 = 6 * 60 * 60;
+const MAX_AUTO_REFRESH_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn subscription_refresh_interval(info: &DaemonSubscriptionInfo) -> u64 {
+    info.refresh_interval_secs
+        .unwrap_or(DEFAULT_AUTO_REFRESH_SECS)
+        .clamp(MIN_AUTO_REFRESH_SECS, MAX_AUTO_REFRESH_SECS)
+}
+
+fn format_update_date(updated_at_unix: u64) -> String {
+    if updated_at_unix == 0 {
+        return "Не обновлялась".into();
+    }
+
+    // Convert whole UTC days since the Unix epoch to a Gregorian date without
+    // pulling a date-time dependency into the desktop shell.
+    let days = (updated_at_unix / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{day:02}.{month:02}.{year:04}")
+}
+
 fn format_gib(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1024_f64.powi(3))
+}
+
+#[allow(dead_code)] // Used by profile presentation methods wired in Task 6.
+fn present_subscription_profile(
+    profile: DaemonSubscriptionProfile,
+) -> Option<SubscriptionProfilePresentation> {
+    let id = safe_profile_id(&profile.id)?;
+    let redacted_title = redact_event_text(&profile.display_name);
+    let title = bounded_plain_text(&redacted_title, 128).unwrap_or_else(|| "Подписка".into());
+    let usage = match (profile.used_bytes, profile.total_bytes) {
+        (Some(used), Some(total)) => format!("{} / {}", format_gib(used), format_gib(total)),
+        (Some(used), None) => format_gib(used),
+        (None, Some(total)) => format!("— / {}", format_gib(total)),
+        (None, None) => "Нет данных".into(),
+    };
+    let expiry = profile.expires_at_unix.map_or_else(
+        || "Срок неизвестен".into(),
+        |expires| {
+            let now = current_unix_time();
+            if expires <= now {
+                "Срок истёк".into()
+            } else {
+                let days = (expires - now).div_ceil(86_400);
+                format!("Осталось {days} {}", russian_days(days))
+            }
+        },
+    );
+    Some(SubscriptionProfilePresentation {
+        id,
+        active: profile.active,
+        available: profile.available,
+        title,
+        usage,
+        expiry,
+        service_logo_path: profile
+            .service_logo_path
+            .as_deref()
+            .and_then(local_logo_path),
+    })
+}
+
+fn safe_profile_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 128
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')))
+    .then(|| value.to_owned())
+}
+
+#[allow(dead_code)] // Used by profile presentation methods wired in Task 6.
+fn profile_mutation_error(error: &crate::daemon::DaemonError, action: &str) -> String {
+    if error.is_profile_conflict() {
+        return "Отключитесь перед изменением подписки.".into();
+    }
+    if error.is_profile_not_found() {
+        return "Подписка больше недоступна. Обновите список.".into();
+    }
+    let action = bounded_plain_text(action, 32).unwrap_or_else(|| "изменить".into());
+    format!("Не удалось {action} подписку. Повторите попытку.")
+}
+
+fn profile_result_may_have_committed<T>(result: &Result<T, crate::daemon::DaemonError>) -> bool {
+    result
+        .as_ref()
+        .map(|_| true)
+        .unwrap_or_else(|error| error.requires_reconciliation())
 }
 
 fn bounded_plain_text(value: &str, max_chars: usize) -> Option<String> {
@@ -1771,7 +2669,8 @@ fn local_logo_path(value: &str) -> Option<String> {
     use std::path::{Component, Prefix};
 
     let value = value.trim();
-    if value.is_empty() || is_non_file_reference(value) {
+    if value.is_empty() || value.len() > MAX_SERVICE_LOGO_PATH_BYTES || is_non_file_reference(value)
+    {
         return None;
     }
     let path = Path::new(value);
@@ -1785,7 +2684,8 @@ fn local_logo_path(value: &str) -> Option<String> {
 #[cfg(not(windows))]
 fn local_logo_path(value: &str) -> Option<String> {
     let value = value.trim();
-    if value.is_empty() || is_non_file_reference(value) {
+    if value.is_empty() || value.len() > MAX_SERVICE_LOGO_PATH_BYTES || is_non_file_reference(value)
+    {
         return None;
     }
     Path::new(value).is_absolute().then(|| value.to_owned())
@@ -1906,6 +2806,743 @@ mod tests {
         DaemonLatencies, DaemonLatencyEntry, DaemonProxyMapping, DaemonSubscriptionInfo,
         test_support::MockDaemonClient,
     };
+
+    fn profile(id: &str, active: bool, title: &str) -> DaemonSubscriptionProfile {
+        DaemonSubscriptionProfile {
+            id: id.into(),
+            active,
+            available: true,
+            display_name: title.into(),
+            used_bytes: Some(1024),
+            total_bytes: Some(2048),
+            expires_at_unix: None,
+            service_logo_path: None,
+        }
+    }
+
+    fn profile_list(
+        active_profile_id: Option<&str>,
+        profiles: Vec<DaemonSubscriptionProfile>,
+    ) -> DaemonSubscriptionList {
+        DaemonSubscriptionList {
+            active_profile_id: active_profile_id.map(str::to_owned),
+            profiles,
+        }
+    }
+
+    fn model_with_profiles() -> DesktopViewModel {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Visible title must not be a key".into()),
+                current_node: Some("Auto".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        let list = model.begin_profile_list().expect("profile list");
+        assert!(model.finish_profile_list(
+            list,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![
+                    profile("profile-a", true, "Alpha"),
+                    profile("profile-b", false, "Beta"),
+                ],
+            )),
+        ));
+        model
+    }
+
+    #[test]
+    fn profile_list_generation_suppresses_only_older_list_responses() {
+        let mut model = model_with_profiles();
+        let old = model.begin_profile_list().expect("older profile list");
+        let newer = model.begin_profile_list().expect("newer profile list");
+
+        assert!(!model.finish_profile_list(
+            old,
+            Ok(profile_list(
+                Some("profile-b"),
+                vec![profile("profile-b", true, "Stale Beta")],
+            )),
+        ));
+        assert!(model.finish_profile_list(
+            newer,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![
+                    profile("profile-a", true, "Alpha newest"),
+                    profile("profile-b", false, "Beta"),
+                ],
+            )),
+        ));
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.active_id.as_deref(), Some("profile-a"));
+        assert_eq!(presentation.profiles[0].title, "Alpha newest");
+    }
+
+    #[test]
+    fn list_during_activation_never_discards_or_overwrites_the_committing_mutation() {
+        let mut model = model_with_profiles();
+        let activation = model
+            .begin_profile_activation("profile-b")
+            .expect("activation");
+        let precommit_list = model.begin_profile_list().expect("parallel profile list");
+        assert!(model.finish_profile_list(
+            precommit_list,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![
+                    profile("profile-a", true, "Alpha before commit"),
+                    profile("profile-b", false, "Beta before commit"),
+                ],
+            )),
+        ));
+
+        assert!(model.finish_profile_activation(
+            activation,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                profile: Some("Beta".into()),
+                ..DaemonStatus::default()
+            }),
+        ));
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.active_id.as_deref(), Some("profile-b"));
+        assert!(!presentation.profiles[0].active);
+        assert!(presentation.profiles[1].active);
+        assert!(model.take_profile_list_reload_needed());
+
+        let mut late_list_model = model_with_profiles();
+        let activation = late_list_model
+            .begin_profile_activation("profile-b")
+            .expect("activation");
+        let stale_list = late_list_model
+            .begin_profile_list()
+            .expect("precommit list");
+        assert!(late_list_model.finish_profile_activation(
+            activation,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                ..DaemonStatus::default()
+            }),
+        ));
+        assert!(!late_list_model.finish_profile_list(
+            stale_list,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![profile("profile-a", true, "Stale Alpha")],
+            )),
+        ));
+        assert_eq!(
+            late_list_model.profile_presentation().active_id.as_deref(),
+            Some("profile-b")
+        );
+    }
+
+    #[test]
+    fn status_captured_before_activation_cannot_restore_the_old_active_profile() {
+        let mut model = model_with_profiles();
+        let old_status = model.begin_refresh();
+        let activation = model
+            .begin_profile_activation("profile-b")
+            .expect("activation supersedes status polling");
+
+        model.finish_refresh(
+            old_status,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-c".into()),
+                profile: Some("Captured stale profile".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert_eq!(
+            model.profile_presentation().active_id.as_deref(),
+            Some("profile-a")
+        );
+        assert_ne!(model.presentation().profile, "Captured stale profile");
+        assert!(model.finish_profile_activation(
+            activation,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                profile: Some("Beta".into()),
+                ..DaemonStatus::default()
+            }),
+        ));
+        model.finish_refresh(
+            old_status,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Old Alpha".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert_eq!(
+            model.profile_presentation().active_id.as_deref(),
+            Some("profile-b")
+        );
+        assert_eq!(model.presentation().profile, "Beta");
+    }
+
+    #[test]
+    fn activation_invalidates_old_catalog_latency_selection_and_worker_tokens() {
+        let mut model = model_with_profiles();
+        let old_catalog = model.begin_catalog_request().expect("old catalog request");
+        let activation = model
+            .begin_profile_activation("profile-b")
+            .expect("activation");
+        assert!(model.finish_profile_activation(
+            activation,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                profile: Some("Beta".into()),
+                ..DaemonStatus::default()
+            }),
+        ));
+
+        assert!(
+            model
+                .finish_catalog(old_catalog.token, Ok(catalog_fixture()))
+                .is_none()
+        );
+        assert!(model.catalog_presentation().groups.is_empty());
+        assert!(model.take_profile_list_reload_needed());
+        assert_eq!(
+            model.profile_presentation().active_id.as_deref(),
+            Some("profile-b")
+        );
+        let rows = model.profile_presentation().profiles;
+        assert!(!rows[0].active);
+        assert!(rows[1].active);
+
+        let failed_reload = model.begin_profile_list().expect("failed list reload");
+        assert!(model.finish_profile_list(
+            failed_reload,
+            Err(crate::daemon::DaemonError::new("unsafe list details")),
+        ));
+        let rows_after_failure = model.profile_presentation().profiles;
+        assert!(!rows_after_failure[0].active);
+        assert!(rows_after_failure[1].active);
+    }
+
+    #[test]
+    fn active_delete_immediately_reconciles_cached_row_flags() {
+        let mut model = model_with_profiles();
+        let deletion = model
+            .begin_profile_delete("profile-a")
+            .expect("delete active profile");
+
+        assert!(model.finish_profile_delete(
+            deletion,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                profile: Some("Beta".into()),
+                ..DaemonStatus::default()
+            }),
+        ));
+
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.active_id.as_deref(), Some("profile-b"));
+        assert_eq!(presentation.profiles.len(), 1);
+        assert_eq!(presentation.profiles[0].id, "profile-b");
+        assert!(presentation.profiles[0].active);
+    }
+
+    #[test]
+    fn route_preferences_are_keyed_by_authoritative_opaque_profile_id() {
+        let mut model = model_with_profiles();
+        let catalog = model.begin_catalog_request().expect("catalog request");
+        model.finish_catalog(catalog.token, Ok(catalog_fixture()));
+
+        let (profile_key, _, _) = model.route_preferences().expect("route preferences");
+
+        assert_eq!(profile_key, "profile-a");
+        assert_ne!(profile_key, model.presentation().profile);
+    }
+
+    #[test]
+    fn deleting_last_profile_yields_empty_rows_and_close_intent() {
+        let mut model = model_with_profiles();
+        let list = model.begin_profile_list().expect("single profile list");
+        model.finish_profile_list(
+            list,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![profile("profile-a", true, "Alpha")],
+            )),
+        );
+        let deletion = model
+            .begin_profile_delete("profile-a")
+            .expect("delete last profile");
+
+        assert!(model.finish_profile_delete(
+            deletion,
+            Ok(DaemonStatus {
+                state: "empty".into(),
+                active_profile_id: None,
+                ..DaemonStatus::default()
+            }),
+        ));
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.active_id, None);
+        assert!(presentation.profiles.is_empty());
+        assert!(model.take_profile_close_intent());
+        assert!(!model.take_profile_close_intent());
+    }
+
+    #[test]
+    fn inactive_targeted_refresh_updates_only_matching_metadata_until_list_reload() {
+        let mut model = model_with_profiles();
+        let refresh = model
+            .begin_profile_target_refresh("profile-b")
+            .expect("targeted refresh");
+
+        assert!(model.finish_profile_target_refresh(
+            refresh,
+            Ok(profile_list(
+                Some("profile-b"),
+                vec![
+                    profile("profile-a", false, "Wrong speculative update"),
+                    profile("profile-b", true, "Beta updated"),
+                ],
+            )),
+        ));
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.active_id.as_deref(), Some("profile-a"));
+        assert_eq!(presentation.profiles[0].title, "Alpha");
+        assert!(presentation.profiles[0].active);
+        assert_eq!(presentation.profiles[1].title, "Beta updated");
+        assert!(!presentation.profiles[1].active);
+        assert!(model.take_profile_list_reload_needed());
+        assert!(!model.take_profile_catalog_reload_needed());
+    }
+
+    #[test]
+    fn profile_source_edit_validates_url_and_reconciles_the_target_profile() {
+        let mut model = model_with_profiles();
+        assert!(
+            model
+                .begin_profile_source_edit("profile-a", "not a URL")
+                .is_none()
+        );
+        assert_eq!(
+            model.profile_presentation().error.as_deref(),
+            Some("Введите корректный HTTP(S) URL.")
+        );
+
+        let edit = model
+            .begin_profile_source_edit("profile-a", "https://replacement.invalid/sub?token=secret")
+            .expect("start source edit");
+        let pending = model.profile_presentation();
+        assert_eq!(
+            pending.pending_operation,
+            Some(SubscriptionProfileOperation::Edit)
+        );
+        assert_eq!(pending.pending_id.as_deref(), Some("profile-a"));
+
+        assert!(model.finish_profile_source_edit(
+            edit,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![
+                    profile("profile-a", true, "Alpha replaced"),
+                    profile("profile-b", false, "Beta"),
+                ],
+            )),
+        ));
+        assert_eq!(
+            model.profile_presentation().profiles[0].title,
+            "Alpha replaced"
+        );
+        assert!(model.profile_reconciliation_required());
+    }
+
+    #[test]
+    fn ambiguous_profile_source_edit_forces_full_authoritative_reconciliation() {
+        let mut model = model_with_profiles();
+        let edit = model
+            .begin_profile_source_edit("profile-b", "https://replacement.invalid/sub")
+            .expect("start source edit");
+
+        assert!(!model.finish_profile_source_edit(
+            edit,
+            Err(DaemonError::ambiguous("private committed marker")),
+        ));
+
+        assert!(model.profile_reconciliation_required());
+        assert!(model.take_profile_status_reload_needed());
+        assert!(model.take_profile_list_reload_needed());
+        assert!(model.take_profile_catalog_reload_needed());
+        assert!(
+            !format!("{:?}", model.profile_presentation()).contains("private committed marker")
+        );
+    }
+
+    #[test]
+    fn active_targeted_refresh_invalidates_old_catalog_and_latency_workers() {
+        let mut catalog_model = model_with_profiles();
+        catalog_model.subscription = Some(DaemonSubscriptionInfo {
+            display_name: "Stale active shelf".into(),
+            total_bytes: Some(42),
+            ..DaemonSubscriptionInfo::default()
+        });
+        let old_catalog = catalog_model
+            .begin_catalog_request()
+            .expect("in-flight old catalog");
+        let refresh = catalog_model
+            .begin_profile_target_refresh("profile-a")
+            .expect("active targeted refresh");
+        assert!(catalog_model.finish_profile_target_refresh(
+            refresh,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![profile("profile-a", true, "Alpha refreshed")],
+            )),
+        ));
+        assert!(
+            catalog_model
+                .finish_catalog(old_catalog.token, Ok(catalog_fixture()))
+                .is_none()
+        );
+        assert!(catalog_model.catalog_presentation().groups.is_empty());
+        assert!(catalog_model.subscription.is_none());
+        assert!(catalog_model.take_profile_status_reload_needed());
+        assert!(catalog_model.take_profile_list_reload_needed());
+        assert!(catalog_model.take_profile_catalog_reload_needed());
+
+        let mut latency_model = model_with_profiles();
+        let catalog = latency_model
+            .begin_catalog_request()
+            .expect("catalog before latency");
+        latency_model.finish_catalog(catalog.token, Ok(catalog_fixture()));
+        latency_model.state = UiState::Connected {
+            profile: "Alpha".into(),
+            node: "Auto".into(),
+        };
+        let old_latency = latency_model
+            .begin_latency_request()
+            .expect("in-flight old latency");
+        latency_model.state = UiState::Ready {
+            profile: "Alpha".into(),
+            node: "Auto".into(),
+        };
+        let refresh = latency_model
+            .begin_profile_target_refresh("profile-a")
+            .expect("active refresh after disconnect");
+        assert!(latency_model.finish_profile_target_refresh(
+            refresh,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![profile("profile-a", true, "Alpha refreshed")],
+            )),
+        ));
+        assert!(
+            latency_model
+                .finish_latencies(old_latency.token, Ok(DaemonLatencies::default()))
+                .is_none()
+        );
+        assert!(latency_model.catalog_presentation().groups.is_empty());
+        assert!(latency_model.take_profile_catalog_reload_needed());
+    }
+
+    #[test]
+    fn profile_presentation_debug_never_contains_provider_urls() {
+        let mut model = model_with_profiles();
+        let list = model.begin_profile_list().expect("unsafe profile list");
+        let mut unsafe_profile = profile("profile-a", true, "https://private.invalid/?token=x");
+        unsafe_profile.service_logo_path = Some("https://private.invalid/logo.png".into());
+        model.finish_profile_list(
+            list,
+            Ok(profile_list(Some("profile-a"), vec![unsafe_profile])),
+        );
+
+        let debug = format!("{:?}", model.profile_presentation());
+        assert!(!debug.contains("https://"));
+        assert!(!debug.contains("private.invalid"));
+        assert!(!debug.contains("token=x"));
+    }
+
+    #[test]
+    fn profile_rows_and_provider_titles_are_bounded_and_remote_logos_are_rejected() {
+        let mut model = model_with_profiles();
+        let list = model.begin_profile_list().expect("bounded profile list");
+        let profiles = (0..32)
+            .map(|index| {
+                let mut item = profile(&format!("profile-{index}"), index == 0, &"x".repeat(512));
+                item.service_logo_path = Some(if index == 1 {
+                    format!(
+                        r"C:\cache\{}\logo.png",
+                        "x".repeat(MAX_SERVICE_LOGO_PATH_BYTES)
+                    )
+                } else {
+                    "https://private.invalid/logo.png".into()
+                });
+                item
+            })
+            .collect();
+        model.finish_profile_list(list, Ok(profile_list(Some("profile-0"), profiles)));
+
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.profiles.len(), MAX_SUBSCRIPTION_PROFILES);
+        assert!(
+            presentation
+                .profiles
+                .iter()
+                .all(|profile| profile.title.chars().count() <= 128)
+        );
+        assert!(
+            presentation
+                .profiles
+                .iter()
+                .all(|profile| profile.service_logo_path.is_none())
+        );
+    }
+
+    #[test]
+    fn import_success_exposes_reload_intents_without_gating_the_current_shell() {
+        let mut model = model_with_profiles();
+        let old_catalog = model.begin_catalog_request().expect("old catalog request");
+        let import = model
+            .begin_import("https://subscription.invalid/new")
+            .expect("import");
+
+        model.finish_import(
+            import,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-new".into()),
+                profile: Some("New".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+
+        assert!(
+            model
+                .finish_catalog(old_catalog.token, Ok(catalog_fixture()))
+                .is_none()
+        );
+        assert!(model.catalog_presentation().groups.is_empty());
+        assert!(model.profile_presentation().profiles.is_empty());
+        assert_eq!(
+            model.profile_presentation().active_id.as_deref(),
+            Some("profile-new")
+        );
+        assert!(model.take_profile_list_reload_needed());
+        assert!(model.take_profile_catalog_reload_needed());
+        assert!(!model.profile_reconciliation_required());
+        assert!(model.presentation().primary_enabled);
+        assert!(model.begin_primary_action().is_some());
+
+        let main = include_str!("main.rs");
+        let import_worker = main
+            .split("fn run_import(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_connect(").next())
+            .expect("run_import source");
+        assert!(import_worker.contains("model.finish_import(mutation, result)"));
+        assert!(!import_worker.contains("begin_profile_list"));
+    }
+
+    #[test]
+    fn connected_profile_mutations_are_rejected_before_a_request_token_exists() {
+        let mut model = model_with_profiles();
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Alpha".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+
+        assert!(model.begin_profile_activation("profile-b").is_none());
+        assert!(model.begin_profile_delete("profile-b").is_none());
+        assert!(model.begin_profile_target_refresh("profile-b").is_none());
+        let error = model.profile_presentation().error.expect("inline error");
+        assert!(error.chars().count() < 128);
+        assert!(!error.contains("profile-b"));
+    }
+
+    #[test]
+    fn degraded_profile_mutations_are_rejected_without_issuing_tokens() {
+        let mut model = model_with_profiles();
+        model.state = UiState::DaemonDegraded {
+            message: "unsafe https://private.invalid token=secret".into(),
+        };
+
+        assert!(model.begin_profile_activation("profile-b").is_none());
+        assert!(model.begin_profile_delete("profile-b").is_none());
+        assert!(model.begin_profile_target_refresh("profile-b").is_none());
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.pending_operation, None);
+        let error = presentation.error.expect("bounded degraded error");
+        assert!(error.chars().count() < 128);
+        assert!(!error.contains("private.invalid"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("profile-b"));
+    }
+
+    fn assert_full_profile_reconciliation_required(model: &mut DesktopViewModel) {
+        assert_eq!(model.profile_presentation().active_id, None);
+        assert!(model.subscription.is_none());
+        assert!(model.catalog_presentation().groups.is_empty());
+        assert!(model.take_profile_status_reload_needed());
+        assert!(model.take_profile_list_reload_needed());
+        assert!(model.take_profile_catalog_reload_needed());
+        assert!(model.begin_catalog_request().is_none());
+        assert!(model.profile_reconciliation_required());
+        assert!(model.begin_primary_action().is_none());
+        assert!(model.begin_profile_activation("profile-b").is_none());
+    }
+
+    #[test]
+    fn ambiguous_profile_mutations_clear_runtime_and_require_full_reconciliation() {
+        let mut activation = model_with_profiles();
+        let catalog = activation
+            .begin_catalog_request()
+            .expect("activation catalog");
+        activation.finish_catalog(catalog.token, Ok(catalog_fixture()));
+        activation.subscription = Some(DaemonSubscriptionInfo {
+            display_name: "Unsafe old shelf".into(),
+            ..DaemonSubscriptionInfo::default()
+        });
+        let token = activation
+            .begin_profile_activation("profile-b")
+            .expect("activation");
+        assert!(!activation.finish_profile_activation(
+            token,
+            Err(DaemonError::ambiguous(
+                "unsafe activation transport details"
+            )),
+        ));
+        assert_full_profile_reconciliation_required(&mut activation);
+
+        let status = activation.begin_refresh();
+        activation.finish_refresh(
+            status,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some("profile-b".into()),
+                profile: Some("Beta".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        let list = activation
+            .begin_profile_list()
+            .expect("reconciliation list");
+        activation.finish_profile_list(
+            list,
+            Ok(profile_list(
+                Some("profile-b"),
+                vec![profile("profile-b", true, "Beta")],
+            )),
+        );
+        let catalog = activation
+            .begin_catalog_request()
+            .expect("reconciliation catalog");
+        activation.finish_catalog(catalog.token, Ok(catalog_fixture()));
+        assert!(!activation.profile_reconciliation_required());
+        assert!(activation.presentation().primary_enabled);
+
+        let mut refresh = model_with_profiles();
+        let token = refresh
+            .begin_profile_target_refresh("profile-a")
+            .expect("target refresh");
+        assert!(!refresh.finish_profile_target_refresh(
+            token,
+            Err(DaemonError::ambiguous("unsafe refresh transport details")),
+        ));
+        assert_full_profile_reconciliation_required(&mut refresh);
+
+        let mut deletion = model_with_profiles();
+        let token = deletion.begin_profile_delete("profile-b").expect("delete");
+        assert!(!deletion.finish_profile_delete(
+            token,
+            Err(DaemonError::ambiguous("unsafe delete transport details")),
+        ));
+        assert_full_profile_reconciliation_required(&mut deletion);
+    }
+
+    #[test]
+    fn ambiguous_profile_reconciliation_sequences_catalog_after_status_and_list_in_every_order() {
+        const ORDERS: [[&str; 3]; 6] = [
+            ["status", "list", "catalog"],
+            ["status", "catalog", "list"],
+            ["list", "status", "catalog"],
+            ["list", "catalog", "status"],
+            ["catalog", "status", "list"],
+            ["catalog", "list", "status"],
+        ];
+
+        for order in ORDERS {
+            let mut model = model_with_profiles();
+            let mutation = model
+                .begin_profile_activation("profile-b")
+                .expect("activation");
+            assert!(!model.finish_profile_activation(
+                mutation,
+                Err(DaemonError::ambiguous("unsafe transport details")),
+            ));
+            assert!(model.take_profile_catalog_reload_needed());
+
+            let status = model.begin_refresh();
+            let list = model.begin_profile_list().expect("profile list");
+            let mut catalog_finished = false;
+            for phase in order {
+                match phase {
+                    "status" => model.finish_refresh(
+                        status,
+                        Ok(DaemonStatus {
+                            state: "ready".into(),
+                            active_profile_id: Some("profile-b".into()),
+                            profile: Some("Beta".into()),
+                            ..DaemonStatus::default()
+                        }),
+                    ),
+                    "list" => {
+                        assert!(model.finish_profile_list(
+                            list,
+                            Ok(profile_list(
+                                Some("profile-b"),
+                                vec![profile("profile-b", true, "Beta")],
+                            )),
+                        ));
+                    }
+                    "catalog" => {
+                        if let Some(request) = model.begin_catalog_request() {
+                            model.finish_catalog(request.token, Ok(catalog_fixture()));
+                            catalog_finished = true;
+                        }
+                    }
+                    _ => unreachable!("fixed reconciliation phase"),
+                }
+            }
+
+            if !catalog_finished {
+                assert!(model.take_profile_catalog_reload_needed());
+                let request = model
+                    .begin_catalog_request()
+                    .expect("catalog is armed after status and list");
+                model.finish_catalog(request.token, Ok(catalog_fixture()));
+            }
+            assert!(!model.catalog_presentation().groups.is_empty(), "{order:?}");
+            assert!(!model.profile_reconciliation_required(), "{order:?}");
+            assert!(model.presentation().primary_enabled, "{order:?}");
+        }
+    }
 
     #[test]
     fn latency_check_queues_while_disconnected_and_allows_only_one_request_when_connected() {
@@ -2471,8 +4108,49 @@ mod tests {
         assert_eq!(subscription.display_name, "Provider One");
         assert_eq!(subscription.usage, "17179869184.0 GB");
         assert_eq!(subscription.expiry, "Осталось 40 дней");
+        assert_eq!(subscription.updated, "14.09.2026");
+        assert!(!subscription.updated_stale);
         assert!(subscription.refresh_available);
         assert!(!format!("{subscription:?}").contains("https://"));
+
+        let stale = view_model.subscription_presentation_at(1_789_405_200 + 6 * 60 * 60);
+        assert_eq!(stale.updated, "14.09.2026");
+        assert!(stale.updated_stale);
+    }
+
+    #[test]
+    fn subscription_update_date_is_compact_and_explicit() {
+        assert_eq!(format_update_date(0), "Не обновлялась");
+        assert_eq!(format_update_date(1), "01.01.1970");
+        assert_eq!(format_update_date(1_789_405_200), "14.09.2026");
+    }
+
+    #[test]
+    fn automatic_subscription_refresh_uses_provider_interval_or_safe_default() {
+        let mut client = MockDaemonClient::ready();
+        client.status.subscription = Some(DaemonSubscriptionInfo {
+            updated_at_unix: 10_000,
+            refresh_interval_secs: Some(3_600),
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+        let mut model = DesktopViewModel::new(Arc::new(client));
+        let refresh = model.begin_refresh();
+        let status = model.daemon_client().status().expect("status");
+        model.finish_refresh(refresh, Ok(status));
+
+        assert!(!model.automatic_subscription_refresh_due_at(13_599));
+        assert!(model.automatic_subscription_refresh_due_at(13_600));
+
+        model.subscription.as_mut().unwrap().refresh_interval_secs = None;
+        assert!(!model.automatic_subscription_refresh_due_at(10_000 + 6 * 60 * 60 - 1));
+        assert!(model.automatic_subscription_refresh_due_at(10_000 + 6 * 60 * 60));
+
+        model.state = UiState::Connected {
+            profile: "Основной".into(),
+            node: "Auto".into(),
+        };
+        assert!(!model.automatic_subscription_refresh_due_at(u64::MAX));
     }
 
     #[test]
@@ -2617,6 +4295,37 @@ mod tests {
             Some("Не удалось обновить. Рабочий профиль сохранён.")
         );
         assert!(!format!("{subscription:?}").contains("private.invalid"));
+    }
+
+    #[test]
+    fn ambiguous_subscription_refresh_forces_full_authoritative_reconciliation() {
+        let mut client = MockDaemonClient::ready();
+        client.status.subscription = Some(DaemonSubscriptionInfo {
+            source_name: "subscription.example".into(),
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+        let mut view_model = DesktopViewModel::new(Arc::new(client));
+        let startup = view_model.begin_refresh();
+        let status = view_model.daemon_client().status().expect("status");
+        view_model.finish_refresh(startup, Ok(status));
+
+        let refresh = view_model
+            .begin_subscription_refresh()
+            .expect("refresh from ready state");
+        assert!(!view_model.finish_subscription_refresh(
+            refresh,
+            Err(DaemonError::ambiguous("private committed marker")),
+        ));
+
+        assert!(matches!(view_model.state, UiState::DaemonDegraded { .. }));
+        assert!(view_model.profile_status_reconciliation_pending);
+        assert!(view_model.profile_list_reconciliation_pending);
+        assert!(view_model.profile_catalog_reconciliation_pending);
+        assert!(view_model.profile_status_reload_needed);
+        assert!(view_model.profile_reload_needed);
+        assert!(view_model.profile_catalog_reload_needed);
+        assert!(!format!("{:?}", view_model.subscription_presentation()).contains("private"));
     }
 
     struct DelayedDaemonClient {
@@ -3032,6 +4741,14 @@ mod tests {
         assert!(!view_model.presentation().primary_enabled);
         assert_eq!(view_model.begin_primary_action(), None);
         view_model.finish_import(import, Ok(MockDaemonClient::ready().status));
+        let list = view_model
+            .begin_profile_list()
+            .expect("post-import profile list");
+        view_model.finish_profile_list(list, Ok(profile_list(None, Vec::new())));
+        let catalog = view_model
+            .begin_catalog_request()
+            .expect("post-import catalog");
+        view_model.finish_catalog(catalog.token, Ok(catalog_fixture()));
 
         let (action, mutation) = view_model
             .begin_primary_action()
@@ -3227,6 +4944,36 @@ mod tests {
         assert_eq!(catalog.nodes[0].delay_ms, Some(37));
         assert!(!catalog.groups[0].label.contains("private.invalid"));
         assert!(catalog.error.is_none());
+    }
+
+    #[test]
+    fn restored_route_preferences_are_applied_once_when_catalog_arrives() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        view_model.active_profile_id = Some("profile-a".into());
+        let mut selections = BTreeMap::new();
+        selections.insert("opaque:selected".into(), "opaque:node-c".into());
+        view_model.restore_route_preferences(Some("opaque:selected"), &selections);
+
+        let request = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(request.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+
+        let presentation = view_model.catalog_presentation();
+        assert_eq!(
+            presentation.selected_group_id.as_deref(),
+            Some("opaque:selected")
+        );
+        let selected = presentation
+            .nodes
+            .iter()
+            .find(|node| node.selected)
+            .expect("restored selected node");
+        assert_eq!(selected.id, "opaque:node-c");
+        assert_eq!(
+            view_model.route_preferences().expect("route preferences").2,
+            selections
+        );
     }
 
     #[test]
@@ -3725,6 +5472,145 @@ mod tests {
         assert!(main.contains("ui.set_state_busy(presentation.is_busy);"));
         assert!(main.contains("if refresh_catalog && current.presentation.has_profile"));
         assert!(main.contains("load_catalog(weak, model);"));
+    }
+
+    #[test]
+    fn home_background_is_bounded_pausable_and_non_interactive() {
+        let source = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
+
+        for required in [
+            "in-out property <bool> ambient-background-enabled",
+            "in-out property <bool> shell-active",
+            "in property <bool> reduced-motion",
+            "wave-timer := Timer",
+            "wave-kickoff := Timer",
+            "private property <bool> ambient-wave-started: false",
+            "running: root.ambient-motion-active && !root.ambient-wave-started",
+            "interval: 80ms",
+            "root.ambient-wave-started = true",
+            "root.ambient-wave-phase = !root.ambient-wave-phase",
+            "private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == \"home\"",
+            "interval: 12s",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing ambient contract: {required}"
+            );
+        }
+
+        assert_eq!(source.matches("ambient-wave-a := Path").count(), 1);
+        assert_eq!(source.matches("ambient-wave-b := Path").count(), 1);
+        assert!(!source.to_ascii_lowercase().contains("scanline"));
+        assert!(!source.to_ascii_lowercase().contains("particle"));
+
+        let first_wave = source
+            .find("ambient-wave-a :=")
+            .expect("first ambient wave marker");
+        let home_content = source[first_wave..]
+            .find("VerticalLayout {")
+            .map(|offset| first_wave + offset)
+            .expect("home content follows ambient waves");
+        let wave_layer = &source[first_wave..home_content];
+        let home_layer = source
+            .split("if root.visible-page == \"home\": Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("VerticalLayout {").next())
+            .expect("home ambient layer");
+        assert!(home_layer.contains("clip: true"));
+        assert!(!wave_layer.contains("TouchArea"));
+        assert!(!wave_layer.contains("blur"));
+
+        let wave_a = source
+            .split("ambient-wave-a := Path {")
+            .nth(1)
+            .and_then(|source| source.split("ambient-wave-b := Path {").next())
+            .expect("wave A block");
+        for required in [
+            "x: root.ambient-wave-phase ? -12px : -48px;",
+            "y: root.ambient-wave-phase ? 48px : 76px;",
+            "opacity: 0.026;",
+            "animate x { duration: 12000ms; easing: ease-in-out; }",
+            "animate y { duration: 12000ms; easing: ease-in-out; }",
+        ] {
+            assert!(wave_a.contains(required), "wave A missing: {required}");
+        }
+        let wave_b = source
+            .split("ambient-wave-b := Path {")
+            .nth(1)
+            .and_then(|source| source.split("VerticalLayout {").next())
+            .expect("wave B block");
+        for required in [
+            "x: root.ambient-wave-phase ? -58px : -22px;",
+            "y: root.ambient-wave-phase ? 288px : 254px;",
+            "opacity: 0.018;",
+            "animate x { duration: 12000ms; easing: ease-in-out; }",
+            "animate y { duration: 12000ms; easing: ease-in-out; }",
+        ] {
+            assert!(wave_b.contains(required), "wave B missing: {required}");
+        }
+        assert!(source.contains("background: root.status-tone == \"success\" ? #101a16 : root.status-tone == \"danger\" ? #1a1215 : #101721;"));
+        assert!(components.contains("background: root.selected ? #172433 : Theme.surface;"));
+        assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
+        assert!(home_layer.contains("ambient-touch.mouse-x"));
+        assert!(home_layer.contains("ambient-touch.mouse-y"));
+        for cursor in ["ns-resize", "ew-resize", "nwse-resize", "nesw-resize"] {
+            assert!(source.contains(&format!("mouse-cursor: {cursor};")));
+        }
+    }
+
+    #[test]
+    fn status_and_settings_keep_stable_bottom_rhythm_and_build_identity() {
+        let source = include_str!("../ui/app.slint");
+        let status = source
+            .split("if root.visible-page == \"status\": Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("if root.visible-page == \"settings\"").next())
+            .expect("status page block");
+        for padding in [
+            "padding-left: 28px;",
+            "padding-right: 28px;",
+            "padding-top: 28px;",
+            "padding-bottom: 40px;",
+        ] {
+            assert!(status.contains(padding), "status missing {padding}");
+        }
+
+        assert_eq!(
+            source
+                .matches("MultiCore · Mihomo 1.19.30 · Xray 26.9.9")
+                .count(),
+            1
+        );
+        assert!(source.contains(
+            "if root.visible-page == \"settings\": Text { height: 24px; text: \"MultiCore · Mihomo 1.19.30 · Xray 26.9.9\";"
+        ));
+    }
+
+    #[test]
+    fn settings_page_scrolls_at_minimum_height_without_flattening_hierarchy() {
+        let source = include_str!("../ui/app.slint");
+        let settings = source
+            .split(
+                "if root.visible-page == \"settings\" || root.visible-page == \"subscriptions\": Rectangle {",
+            )
+            .nth(1)
+            .and_then(|source| source.split("changed minimized =>").next())
+            .expect("settings page block");
+
+        assert!(settings.contains("settings-scroll := ScrollView"));
+        assert!(settings.contains("settings-content := VerticalLayout"));
+        assert!(settings.contains("vertical-stretch: 1;"));
+        assert!(settings.contains("width: settings-scroll.visible-width;"));
+        assert!(settings.contains("min-height: settings-scroll.visible-height;"));
+        assert!(settings.contains("padding: 28px;"));
+        assert!(settings.contains("// Historical minimum-height contract used spacing: 18px;."));
+        assert!(settings.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(settings.matches("ToggleRow {").count() >= 2);
+        assert!(
+            settings.find("settings-scroll := ScrollView").unwrap()
+                < settings.find("settings-content := VerticalLayout").unwrap()
+        );
     }
 
     #[test]

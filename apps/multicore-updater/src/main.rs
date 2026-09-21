@@ -120,18 +120,23 @@ fn apply_update(request: &ApplyRequest) -> Result<(), Box<dyn std::error::Error>
     extract_verified_bundle(&request.archive, &staged)?;
     transactional_swap(&target, &staged, &backup)?;
 
-    let executable = target.join("MultiCore.exe");
-    if let Err(launch_error) = Command::new(&executable).current_dir(&target).spawn() {
-        rollback_after_launch_failure(&target, &backup)?;
-        return Err(format!("new client could not start: {launch_error}").into());
-    }
-
-    if let Err(error) = discard_backup(&backup) {
-        write_log(
-            request,
-            &format!("installed; previous version cleanup deferred: {error}"),
-        );
-    }
+    launch_and_finalize(
+        &target,
+        &backup,
+        |executable| {
+            Command::new(executable)
+                .current_dir(&target)
+                .spawn()
+                .map(|_| ())
+        },
+        |error| {
+            write_log(
+                request,
+                &format!("installed; previous version cleanup deferred: {error}"),
+            )
+        },
+    )
+    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     write_log(request, "installed and launched");
     write_result(request, true, "Обновление установлено");
@@ -150,6 +155,25 @@ fn discard_backup(backup: &Path) -> io::Result<()> {
         ));
     }
     fs::remove_dir_all(backup)
+}
+
+fn launch_and_finalize(
+    target: &Path,
+    backup: &Path,
+    launch: impl FnOnce(&Path) -> io::Result<()>,
+    on_cleanup_error: impl FnOnce(io::Error),
+) -> Result<(), String> {
+    let executable = target.join("MultiCore.exe");
+    if let Err(launch_error) = launch(&executable) {
+        rollback_after_launch_failure(target, backup).map_err(|rollback_error| {
+            format!("new client could not start: {launch_error}; rollback failed: {rollback_error}")
+        })?;
+        return Err(format!("new client could not start: {launch_error}"));
+    }
+    if let Err(error) = discard_backup(backup) {
+        on_cleanup_error(error);
+    }
+    Ok(())
 }
 
 fn relaunch_current_client(request: &ApplyRequest) -> io::Result<()> {
@@ -269,7 +293,7 @@ fn write_log(request: &ApplyRequest, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{discard_backup, parse_args};
+    use super::{discard_backup, launch_and_finalize, parse_args};
 
     #[test]
     fn parses_exact_apply_request() {
@@ -330,5 +354,31 @@ mod tests {
         assert!(!backup.exists());
         assert_eq!(std::fs::read(installer_metadata).unwrap(), b"keep");
         assert!(discard_backup(temp.path()).is_err());
+    }
+
+    #[test]
+    fn successful_launch_discards_backup_but_failed_launch_restores_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("MultiCore");
+        let backup = temp.path().join(".multicore-previous-0.2.0-42");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(target.join("new.exe"), b"new").unwrap();
+        std::fs::write(backup.join("old.exe"), b"old").unwrap();
+        launch_and_finalize(&target, &backup, |_| Ok(()), |_| {}).unwrap();
+        assert!(!backup.exists());
+
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("old.exe"), b"old").unwrap();
+        let error = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Err(std::io::Error::other("fixture launch failure")),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("could not start"));
+        assert_eq!(std::fs::read(target.join("old.exe")).unwrap(), b"old");
+        assert!(!backup.exists());
     }
 }

@@ -121,6 +121,12 @@ async fn title_decodes_plain_standard_and_urlsafe_base64_with_service_name_fallb
         fallback.subscription_info().unwrap().display_name,
         "Fallback ISP"
     );
+
+    let vendor_neutral = native_info([("ajsdjddj-servicename", "Vendor-neutral ISP")]).await;
+    assert_eq!(
+        vendor_neutral.subscription_info().unwrap().display_name,
+        "Vendor-neutral ISP"
+    );
 }
 
 #[tokio::test]

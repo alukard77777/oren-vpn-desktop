@@ -135,6 +135,7 @@ export component QuietChip inherits Rectangle {
     in property <string> state-label:
         root.label + (root.selected ? ", " + root.selected-state-label : "");
     in property <bool> enabled: true;
+    in property <bool> modal-enabled: true;
     in property <bool> selected: false;
     in property <bool> focus-on-init: false;
     in property <int> focus-epoch: 0;
@@ -157,17 +158,17 @@ export component QuietChip inherits Rectangle {
     min-height: Theme.interactive-min;
     preferred-width: chip-label.preferred-width + Theme.space-3 * 2 + (root.icon == "" ? 0px : 22px);
     preferred-height: Theme.interactive-min;
-    background: root.selected ? #4c9dff1f : #ffffff08;
+    background: root.selected ? #172433 : Theme.surface;
     border-color: chip-focus.has-focus ? Theme.focus : root.selected ? #4c9dff66 : #ffffff12;
     border-width: chip-focus.has-focus ? Theme.focus-width : 1px;
     border-radius: 14px;
     clip: true;
-    opacity: root.enabled ? 1 : 0.5;
+    opacity: root.enabled && root.modal-enabled ? 1 : 0.5;
     accessible-role: button;
     accessible-label: root.state-label;
-    accessible-enabled: root.enabled;
+    accessible-enabled: root.enabled && root.modal-enabled;
     accessible-action-default => {
-        if (root.enabled) {
+        if (root.enabled && root.modal-enabled) {
             root.activated();
         }
     }
@@ -214,7 +215,7 @@ export component QuietChip inherits Rectangle {
     }
 
     chip-focus := FocusScope {
-        enabled: root.enabled;
+        enabled: root.enabled && root.modal-enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
         key-pressed(event) => {
@@ -226,7 +227,7 @@ export component QuietChip inherits Rectangle {
         }
 
         chip-touch := TouchArea {
-            enabled: root.enabled;
+            enabled: root.enabled && root.modal-enabled;
             clicked => { root.activated(); }
         }
     }
@@ -256,7 +257,7 @@ export component RouteNodeRow inherits Rectangle {
     min-height: Theme.interactive-min;
     preferred-height: 46px;
     max-height: 46px;
-    background: root.selected ? #4c9dff17 : #ffffff06;
+    background: root.selected ? #172433 : Theme.surface;
     border-color: row-focus.has-focus ? Theme.focus : root.selected ? #4c9dff59 : #ffffff12;
     border-width: row-focus.has-focus ? Theme.focus-width : 1px;
     border-radius: 14px;

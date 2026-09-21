@@ -4,6 +4,7 @@ members = [
     "crates/multicore-daemon",
     "crates/multicore-update",
     "apps/multicore-desktop",
+    "apps/multicore-core-host",
     "apps/multicore-updater",
 ]
 resolver = "2"
@@ -27,3 +28,4 @@ sha2 = "0.10.9"
 thiserror = "2"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync"] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
+zeroize = { version = "1.9", features = ["derive"] }

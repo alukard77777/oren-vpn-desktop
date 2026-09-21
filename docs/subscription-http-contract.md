@@ -77,18 +77,23 @@ Metadata may be returned on the successful combined response. In fallback mode, 
 
 | Purpose | Accepted response headers | Format and behavior |
 | --- | --- | --- |
-| Display title | `profile-title`, then `flclashx-servicename`, then `Content-Disposition: ...; filename=...` | Plain UTF-8 or `base64:` for the first two. Standard/URL-safe Base64 with optional padding. Sanitized, maximum 128 characters; credential-like values are rejected. Source host is the final fallback. |
+| Display title | `profile-title`, then any non-empty vendor-prefixed `*-servicename`, then `Content-Disposition: ...; filename=...` | Plain UTF-8 or `base64:` for the first two. Standard/URL-safe Base64 with optional padding. Sanitized, maximum 128 characters; credential-like values are rejected. Source host is the final fallback. |
 | Usage and expiry | `subscription-userinfo` or any name ending in `-subscription-userinfo` | Semicolon fields `upload=<u64>; download=<u64>; total=<u64>; expire=<u64>`. Byte counters use bytes; `expire` is Unix seconds. `total=0` or `expire=0` means unspecified/unlimited. |
-| Refresh interval | `profile-update-interval` | Integer hours. Converted to seconds and clamped from 15 minutes through 30 days. Metadata only; it does not enable background refresh by itself. |
+| Refresh interval | `profile-update-interval` | Integer hours. Converted to seconds and clamped from 15 minutes through 30 days. While the active profile is disconnected and ready, the desktop uses this interval for automatic refresh. If omitted, the client uses six hours. Failed automatic attempts back off for 15 minutes. |
 | Provider page | `profile-web-page-url` | `http` or `https`, maximum 2048 characters, host required, embedded credentials rejected. |
 | Support | `support-url` | `http`, `https`, or `tg`; same bounds and credential rejection. |
-| Service logo | `flclashx-servicelogo` | HTTPS URL only; host required; no embedded credentials. Logo failure does not fail the subscription. |
+| Service logo | Any header matching `<vendor>-servicelogo`, where `<vendor>` is non-empty. Examples: `flclashx-servicelogo`, `rabbit-servicelogo`, `ajsdjddj-servicelogo`. | Header matching is case-insensitive and the vendor prefix is not allowlisted. HTTPS URL only; host required; no embedded credentials. The first valid matching value wins. Logo failure does not fail the subscription. |
 | Announcement text | `announce`, then `sub-info-text`, then `banner-text` | Plain UTF-8 or `base64:`, sanitized and capped at 512 characters. Value `0` suppresses the announcement. Markup is not interpreted. |
 | Announcement target | `announce-url`, then `sub-info-button-link`, then `banner-button-url` | `http`, `https`, or `tg`; bounded, with no embedded credentials. |
 | Announcement label | `sub-info-button-text`, then `banner-button-text` | Sanitized plain text, maximum 32 characters. |
 | Announcement tone | `sub-info-color` | Only `blue`, `green`, or `red`, mapped to semantic info/success/danger styling. |
 
-Unknown metadata headers are ignored. Remote styling/behavior headers such as `flclashx-background`, widgets, settings, or routing overrides are intentionally not supported.
+Unknown metadata headers are ignored. Generalized vendor prefixes apply only to
+`servicename`, `servicelogo`, and the already supported `subscription-userinfo`
+suffix. A bare `servicelogo` header is not accepted: the name must contain a
+non-empty vendor prefix followed by `-servicelogo`. Remote styling/behavior
+headers such as `flclashx-background`, `ajsdjddj-background`, widgets, settings,
+or routing overrides are intentionally not supported.
 
 ## Metadata limits and safety
 
@@ -121,7 +126,7 @@ Content-Type: application/vnd.multicore.bundle+json; charset=utf-8
 Profile-Title: base64:TXVsdGlDb3JlIFByZW1pdW0=
 Subscription-Userinfo: upload=1024; download=2048; total=107374182400; expire=1798761600
 Profile-Update-Interval: 6
-FlClashX-ServiceLogo: https://cdn.example.com/logo.png
+MyProvider-ServiceLogo: https://cdn.example.com/logo.png
 Announce: Плановое обслуживание 20 сентября
 Sub-Info-Color: blue
 X-Multicore-Revision: revision-42

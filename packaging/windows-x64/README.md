@@ -1,44 +1,51 @@
 # MultiCore Windows x64 portable preview
 
-Next to `MultiCore.exe`, this file describes the generated portable payload; in
-the source tree it also serves as input to `scripts/package-windows-release.ps1`.
-The portable folder starts with `MultiCore.exe` and contains only the
-desktop, its private daemon and update helper, the two pinned upstream cores,
-notices, licenses, the version manifest, and checksums.
+This file is copied into packages by `scripts/package-windows-release.ps1`.
+Keep the generated directory intact and start `MultiCore.exe`.
 
-This packaging flow supports local previews and can emit the full-bundle ZIP
-consumed by the client updater. It is not an installer, a cryptographically
-signed release channel, or a complete public redistribution workflow. Before distributing
-a package publicly, preserve immutable corresponding-source artifacts for every
-copyleft component, verify their hashes independently, satisfy the MPL-2.0 and
-GPL-3.0 obligations, and obtain appropriate legal review.
+The package contains exactly:
 
-The pinned core release assets are downloaded only by the developer packaging
-script. Runtime updates replace the complete verified portable package; neither
-core is independently updated. Content staging is
-deterministic while each pinned upstream asset remains available; this is not a
-claim that the upstream executables are reproducible compiler outputs.
+- `MultiCore.exe`;
+- `runtime/multicore-daemon.exe`, `multicore-updater.exe`, and
+  `multicore-core-host.exe`;
+- pinned `cores/xray.exe` and `cores/mihomo.exe`;
+- `versions.json`, `THIRD_PARTY_NOTICES.md`, two upstream core license texts,
+  this README, and `SHA256SUMS.txt`.
 
-For a local preview, keep the generated tree intact and double-click
-`MultiCore.exe`. Runtime state is stored separately under `%LOCALAPPDATA%\MultiCore`.
-The latest daemon session's redacted core output is retained at
-`%LOCALAPPDATA%\MultiCore\logs\latest-core.log` and capped at 1 MiB.
-Verify `SHA256SUMS.txt` before use; it covers every package file except itself.
+`SHA256SUMS.txt` covers every package file except itself. The packaging script
+pins official upstream URLs and archive/executable hashes, validates PE32+ AMD64
+files, and builds Rust executables with toolchain 1.98.1. This is deterministic
+staging, not a claim that upstream binaries are reproducible compiler outputs.
 
-## GitHub Releases update asset
+The desktop and daemon run as the current user. Connect requests UAC for the
+packaged core host, which owns both cores and their Job Object/pipe cleanup. Core
+diagnostics are bounded, redacted, and currently retained in memory rather than
+written to a promised persistent log.
 
-Build the desktop with a compile-time-pinned repository and emit the exact asset
-name expected by the updater:
+Runtime data lives under `%LOCALAPPDATA%\MultiCore`; update downloads are under
+`%LOCALAPPDATA%\MultiCore\updates`. The optional per-user installer installs this
+bundle beneath `%LOCALAPPDATA%\Programs\MultiCore\current`.
+
+Build the updater asset for the official anonymous channel with:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -DestinationPath dist\multicore-windows-x64 `
-  -UpdateRepository owner/repository `
+  -UpdateRepository fatyzzz/multicore-releases `
   -ReleaseAssetPath dist\release\multicore-windows-x64.zip
 ```
 
-Publish `multicore-windows-x64.zip` on a stable GitHub Release tagged
-`v<major>.<minor>.<patch>`. The updater requires GitHub's `sha256:` asset digest,
-then verifies the archive's internal `SHA256SUMS.txt` before directory replacement.
-Do not enable a public update channel until release publishing credentials,
-corresponding-source obligations, and signing policy are ready.
+The updater accepts the latest public, non-draft `vX.Y.Z` GitHub Release, requires
+the asset name `multicore-windows-x64.zip` and GitHub `sha256:` digest, then also
+verifies this package's internal checksums before replacing the full bundle.
+The application source repository is private; the public release-only repository
+contains binary releases so installed clients can update anonymously without an
+embedded GitHub credential.
+
+This preview is not Authenticode-signed, and its elevated binaries are stored in
+a user-writable directory. Do not publish it as a stable production update.
+Public distribution also requires protected signing/release procedures,
+immutable corresponding-source artifacts for the bundled cores, fulfillment of
+MPL-2.0/GPL-3.0 obligations, and a complete Rust dependency/license inventory.
+`THIRD_PARTY_NOTICES.md` documents the included core artifacts and selected Rust
+libraries but explicitly does not claim that the Rust inventory is complete.

@@ -1,12 +1,14 @@
+pub mod elevated_controller;
+
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fmt, io,
     marker::PhantomData,
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -19,13 +21,14 @@ use axum::{
     http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState as CoreConnectionState, DiagnosticStream, Event,
-    HttpClient, PersistentSnapshotStore, ProcessController, ProcessDiagnostics, RuntimeCheckState,
-    Severity, Snapshot, StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
+    HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError, ProfileId,
+    ProfileStore, ProfileSummary, RuntimeCheckState, ServiceLogoLease, Severity, Snapshot,
+    StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -74,6 +77,8 @@ pub enum ConnectionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StatusDto {
     pub state: ConnectionState,
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
     pub profile: Option<String>,
     pub current_node: Option<String>,
     pub message: Option<String>,
@@ -111,6 +116,24 @@ pub struct SubscriptionInfoDto {
     #[serde(default)]
     pub service_logo_path: Option<String>,
     pub refresh_available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionListDto {
+    pub active_profile_id: Option<String>,
+    pub profiles: Vec<SubscriptionProfileDto>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionProfileDto {
+    pub id: String,
+    pub active: bool,
+    pub available: bool,
+    pub display_name: String,
+    pub used_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub expires_at_unix: Option<u64>,
+    pub service_logo_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -242,13 +265,27 @@ pub struct ApiErrorBody {
 
 #[derive(Clone, Debug)]
 pub struct BackendError {
-    _private: (),
+    profile_mutation: Option<ProfileMutationError>,
 }
 
 impl BackendError {
     #[must_use]
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {
+            profile_mutation: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_profile_mutation(error: ProfileMutationError) -> Self {
+        Self {
+            profile_mutation: Some(error),
+        }
+    }
+
+    #[must_use]
+    pub const fn profile_mutation(&self) -> Option<ProfileMutationError> {
+        self.profile_mutation
     }
 }
 
@@ -273,7 +310,25 @@ pub enum SelectionError {
     UnknownGroup,
     UnknownNode,
     SelectorFailed,
+    StorageFailed,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProfileMutationError {
+    NotFound,
+    Connected,
+    LimitReached,
+    Storage,
+    Committed,
+}
+
+impl fmt::Display for ProfileMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("profile mutation was not completed")
+    }
+}
+
+impl std::error::Error for ProfileMutationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LatencyError {
@@ -542,6 +597,28 @@ pub trait Backend: Send + Sync + 'static {
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
         Err(BackendError::new())
     }
+    async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn activate_subscription(&self, _id: ProfileId) -> Result<StatusDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn refresh_subscription_profile(
+        &self,
+        _id: ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn replace_subscription_source(
+        &self,
+        _id: ProfileId,
+        _request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::new())
+    }
+    async fn delete_subscription(&self, _id: ProfileId) -> Result<StatusDto, BackendError> {
+        Err(BackendError::new())
+    }
     async fn connect(&self) -> Result<StatusDto, BackendError>;
     async fn disconnect(&self) -> Result<StatusDto, BackendError>;
     async fn select(&self, _request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
@@ -618,8 +695,22 @@ where
         .route("/catalog", get(catalog))
         .route("/latencies", post(latencies))
         .route("/selections/{group_id}", put(select_node))
+        .route("/subscriptions", get(list_subscriptions))
         .route("/subscriptions/import", post(import_subscription))
         .route("/subscriptions/refresh", post(refresh_subscription))
+        .route(
+            "/subscriptions/{profile_id}/activate",
+            put(activate_subscription),
+        )
+        .route(
+            "/subscriptions/{profile_id}/refresh",
+            post(refresh_subscription_profile),
+        )
+        .route(
+            "/subscriptions/{profile_id}/source",
+            put(replace_subscription_source),
+        )
+        .route("/subscriptions/{profile_id}", delete(delete_subscription))
         .route("/connect", post(connect))
         .route("/disconnect", post(disconnect))
         .route("/events", get(events))
@@ -843,7 +934,136 @@ async fn select_node(
                 "selector_failed",
                 "Mihomo не применил выбор маршрута. Повторите попытку.",
             ),
+            SelectionError::StorageFailed => ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "selection_storage_failed",
+                "Не удалось сохранить выбор маршрута. Повторите попытку.",
+            ),
         })
+}
+
+async fn list_subscriptions(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SubscriptionListDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    state
+        .backend
+        .list_subscriptions()
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось получить список подписок."))
+}
+
+async fn activate_subscription(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<StatusDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let profile_id = parse_profile_id(&profile_id)?;
+    state
+        .backend
+        .activate_subscription(profile_id)
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось активировать профиль."))
+}
+
+async fn refresh_subscription_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<SubscriptionListDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let profile_id = parse_profile_id(&profile_id)?;
+    state
+        .backend
+        .refresh_subscription_profile(profile_id)
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось обновить профиль."))
+}
+
+async fn replace_subscription_source(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    payload: Result<Json<ImportSubscriptionRequest>, JsonRejection>,
+) -> Result<Json<SubscriptionListDto>, ApiError> {
+    let profile_id = parse_profile_id(&profile_id)?;
+    let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
+    let Some(url) = valid_subscription_source_url(&request.url) else {
+        return Err(ApiError::bad_request(
+            "Укажите корректный HTTP(S) URL подписки.",
+        ));
+    };
+    state
+        .backend
+        .replace_subscription_source(profile_id, ImportSubscriptionRequest { url })
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось изменить ссылку подписки."))
+}
+
+async fn delete_subscription(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<StatusDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let profile_id = parse_profile_id(&profile_id)?;
+    state
+        .backend
+        .delete_subscription(profile_id)
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось удалить профиль."))
+}
+
+fn parse_profile_id(value: &str) -> Result<ProfileId, ApiError> {
+    ProfileId::parse(value).map_err(|_| profile_not_found())
+}
+
+fn valid_subscription_source_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 8 * 1024 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn profile_api_error(error: BackendError, internal_message: &str) -> ApiError {
+    match error.profile_mutation() {
+        Some(ProfileMutationError::NotFound) => profile_not_found(),
+        Some(ProfileMutationError::Connected) => ApiError::new(
+            StatusCode::CONFLICT,
+            "profile_busy",
+            "Отключитесь перед изменением профиля.",
+        ),
+        Some(ProfileMutationError::LimitReached) => ApiError::new(
+            StatusCode::CONFLICT,
+            "profile_limit",
+            "Достигнут предел количества профилей.",
+        ),
+        Some(ProfileMutationError::Committed) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "profile_mutation_ambiguous",
+            "Изменение могло сохраниться. Обновите состояние подписок.",
+        ),
+        Some(ProfileMutationError::Storage) | None => ApiError::backend(internal_message),
+    }
+}
+
+fn profile_not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "profile_not_found",
+        "Профиль не найден. Обновите список подписок.",
+    )
 }
 
 async fn import_subscription(
@@ -861,8 +1081,9 @@ async fn import_subscription(
         .import_subscription(request)
         .await
         .map(Json)
-        .map_err(|_| {
-            ApiError::backend(
+        .map_err(|error| {
+            profile_api_error(
+                error,
                 "Не удалось импортировать подписку. Проверьте ссылку и повторите попытку.",
             )
         })
@@ -878,8 +1099,9 @@ async fn refresh_subscription(
         .refresh_subscription()
         .await
         .map(Json)
-        .map_err(|_| {
-            ApiError::backend(
+        .map_err(|error| {
+            profile_api_error(
+                error,
                 "Не удалось обновить подписку. Если профиль старый, укажите ссылку ещё раз.",
             )
         })
@@ -1102,22 +1324,36 @@ pub fn transactional_controller_factory<F>(factory: F) -> TransactionalControlle
 type PreparedFactory<P> =
     dyn Fn(&Snapshot) -> Result<PreparedController<P>, BackendError> + Send + Sync;
 
+struct ProfileLogoLease {
+    physical_generation: u64,
+    lease: Option<ServiceLogoLease>,
+}
+
+struct ListLogoPublishHook {
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
 pub struct CoreBackend<C, P, F>
 where
     C: HttpClient,
     P: ProcessController,
 {
-    store: PersistentSnapshotStore,
+    store: ProfileStore,
     fetcher: SubscriptionFetcher<C>,
     controller_factory: Arc<PreparedFactory<P>>,
     factory_type: PhantomData<fn() -> F>,
     selector: Arc<dyn MihomoSelector>,
     latency_permits: Arc<tokio::sync::Semaphore>,
     operation: tokio::sync::Mutex<()>,
+    post_commit_load_fault: AtomicBool,
+    list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
+    profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
     inner: RwLock<CoreRuntime<P>>,
 }
 
 struct CoreRuntime<P: ProcessController> {
+    active_profile_id: Option<ProfileId>,
     state: StateMachine,
     controller: Option<Arc<P>>,
     snapshot: Option<Arc<Snapshot>>,
@@ -1125,6 +1361,7 @@ struct CoreRuntime<P: ProcessController> {
     profile: Option<String>,
     current_node: Option<String>,
     selected_nodes: Vec<Option<String>>,
+    explicit_selected_nodes: Vec<Option<String>>,
     message: Option<String>,
     degraded: bool,
     events: EventBuffer<Event>,
@@ -1133,6 +1370,7 @@ struct CoreRuntime<P: ProcessController> {
 impl<P: ProcessController> CoreRuntime<P> {
     fn empty() -> Self {
         Self {
+            active_profile_id: None,
             state: StateMachine::default(),
             controller: None,
             snapshot: None,
@@ -1143,6 +1381,7 @@ impl<P: ProcessController> CoreRuntime<P> {
             profile: None,
             current_node: None,
             selected_nodes: Vec::new(),
+            explicit_selected_nodes: Vec::new(),
             message: None,
             degraded: false,
             events: EventBuffer::default(),
@@ -1175,6 +1414,10 @@ impl<P: ProcessController> CoreRuntime<P> {
             });
         StatusDto {
             state: map_core_state(self.state.current()),
+            active_profile_id: self
+                .active_profile_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
             profile,
             current_node,
             message: self.message.clone(),
@@ -1215,17 +1458,40 @@ impl<P: ProcessController> CoreRuntime<P> {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: Arc<Snapshot>, controller: Arc<P>, revision: u64) {
+    fn apply_snapshot(
+        &mut self,
+        id: ProfileId,
+        snapshot: Arc<Snapshot>,
+        controller: Arc<P>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
+    ) {
+        self.active_profile_id = Some(id);
         self.controller = Some(controller);
-        self.apply_snapshot_metadata(snapshot, revision);
+        self.apply_snapshot_metadata(snapshot, revision, selected_nodes, explicit_selected_nodes);
     }
 
-    fn apply_snapshot_without_controller(&mut self, snapshot: Arc<Snapshot>, revision: u64) {
+    fn apply_snapshot_without_controller(
+        &mut self,
+        id: ProfileId,
+        snapshot: Arc<Snapshot>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
+    ) {
+        self.active_profile_id = Some(id);
         self.controller = None;
-        self.apply_snapshot_metadata(snapshot, revision);
+        self.apply_snapshot_metadata(snapshot, revision, selected_nodes, explicit_selected_nodes);
     }
 
-    fn apply_snapshot_metadata(&mut self, snapshot: Arc<Snapshot>, revision: u64) {
+    fn apply_snapshot_metadata(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
+    ) {
         if matches!(
             self.state.current(),
             CoreConnectionState::Empty | CoreConnectionState::Error
@@ -1234,10 +1500,8 @@ impl<P: ProcessController> CoreRuntime<P> {
         }
         let selectable = selectable_groups(&snapshot);
         self.profile = selectable.first().map(|group| group.name.to_owned());
-        self.selected_nodes = selectable
-            .iter()
-            .map(|group| group.nodes.first().map(|node| (*node).to_owned()))
-            .collect();
+        self.selected_nodes = selected_nodes;
+        self.explicit_selected_nodes = explicit_selected_nodes;
         self.current_node = self.selected_nodes.first().cloned().flatten();
         self.catalog = build_catalog(
             &snapshot,
@@ -1246,6 +1510,23 @@ impl<P: ProcessController> CoreRuntime<P> {
             &self.selected_nodes,
         );
         self.snapshot = Some(snapshot);
+        self.message = None;
+        self.degraded = false;
+    }
+
+    fn clear_for_active(&mut self, active_profile_id: Option<ProfileId>) {
+        self.active_profile_id = active_profile_id;
+        self.state = StateMachine::default();
+        self.controller = None;
+        self.snapshot = None;
+        self.catalog = CatalogDto {
+            revision: 0,
+            groups: Vec::new(),
+        };
+        self.profile = None;
+        self.current_node = None;
+        self.selected_nodes.clear();
+        self.explicit_selected_nodes.clear();
         self.message = None;
         self.degraded = false;
     }
@@ -1289,7 +1570,7 @@ where
     F: Fn(&Snapshot) -> Result<Arc<P>, BackendError> + Send + Sync + 'static,
 {
     pub fn new(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: F,
     ) -> Result<Self, BackendError> {
@@ -1302,7 +1583,7 @@ where
     }
 
     pub fn new_with_selector(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: F,
         selector: Arc<dyn MihomoSelector>,
@@ -1321,7 +1602,7 @@ where
     F: Fn(&Snapshot) -> Result<PreparedController<P>, BackendError> + Send + Sync + 'static,
 {
     pub fn new_transactional(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: TransactionalControllerFactory<F>,
     ) -> Result<Self, BackendError> {
@@ -1334,7 +1615,7 @@ where
     }
 
     pub fn new_transactional_with_selector(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: TransactionalControllerFactory<F>,
         selector: Arc<dyn MihomoSelector>,
@@ -1352,14 +1633,33 @@ where
     P: ProcessController,
 {
     fn from_prepared_factory(
-        store: PersistentSnapshotStore,
+        store: ProfileStore,
         fetcher: SubscriptionFetcher<C>,
         controller_factory: Arc<PreparedFactory<P>>,
         selector: Arc<dyn MihomoSelector>,
     ) -> Result<Self, BackendError> {
         let mut inner = CoreRuntime::empty();
-        if let Some((revision, snapshot)) = store.current_with_generation() {
-            inner.apply_snapshot_without_controller(snapshot, revision);
+        let mut profile_logo_leases = HashMap::new();
+        inner.active_profile_id = store.active_id();
+        if let Ok(Some((id, revision, physical_generation, snapshot))) =
+            store.active_snapshot_generation()
+        {
+            profile_logo_leases.insert(
+                id.clone(),
+                ProfileLogoLease {
+                    physical_generation,
+                    lease: snapshot.service_logo_lease(),
+                },
+            );
+            let (selections, explicit_selections) =
+                initial_and_explicit_selections(&store, &id, revision, &snapshot);
+            inner.apply_snapshot_without_controller(
+                id,
+                snapshot,
+                revision,
+                selections,
+                explicit_selections,
+            );
         }
         Ok(Self {
             store,
@@ -1369,9 +1669,645 @@ where
             selector,
             latency_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES)),
             operation: tokio::sync::Mutex::new(()),
+            post_commit_load_fault: AtomicBool::new(false),
+            list_logo_publish_hook: std::sync::Mutex::new(None),
+            profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
             inner: RwLock::new(inner),
         })
     }
+
+    pub fn list_subscriptions(&self) -> Result<Vec<ProfileSummary>, ProfileMutationError> {
+        self.store.list().map_err(map_profile_error)
+    }
+
+    #[doc(hidden)]
+    pub fn inject_post_commit_load_fault_for_testing(&self) {
+        self.post_commit_load_fault.store(true, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn inject_list_logo_publish_hook_for_testing(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (reached, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume, resume_rx) = std::sync::mpsc::sync_channel(0);
+        *self
+            .list_logo_publish_hook
+            .lock()
+            .expect("list logo publish hook lock poisoned") = Some(ListLogoPublishHook {
+            reached,
+            resume: resume_rx,
+        });
+        (reached_rx, resume)
+    }
+
+    #[doc(hidden)]
+    pub fn retained_profile_logo_path_for_testing(
+        &self,
+        id: &ProfileId,
+    ) -> Option<std::path::PathBuf> {
+        self.profile_logo_leases
+            .lock()
+            .expect("profile logo lease lock poisoned")
+            .get(id)
+            .and_then(|entry| entry.lease.as_ref())
+            .and_then(ServiceLogoLease::path)
+            .map(std::path::Path::to_owned)
+    }
+
+    fn subscription_list_dto(&self) -> Result<SubscriptionListDto, ProfileMutationError> {
+        let mut active_profile_id = None;
+        let mut index = 0;
+        let profiles = self
+            .store
+            .map_loaded(|loaded| {
+                let profile_index = index;
+                index += 1;
+                if loaded.summary.active {
+                    active_profile_id = Some(loaded.summary.id.as_str().to_owned());
+                }
+                let info = loaded
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.subscription_info());
+                let display_name = info.map_or_else(
+                    || format!("Профиль {}", profile_index + 1),
+                    |info| safe_catalog_label(&info.display_name, "Профиль", profile_index),
+                );
+                let service_logo_path = loaded.snapshot.as_ref().and_then(|snapshot| {
+                    loaded.physical_generation.and_then(|physical_generation| {
+                        self.wait_for_list_logo_publish_hook();
+                        self.retain_profile_logo(&loaded.summary.id, physical_generation, snapshot)
+                    })
+                });
+                SubscriptionProfileDto {
+                    id: loaded.summary.id.as_str().to_owned(),
+                    active: loaded.summary.active,
+                    available: loaded.summary.available,
+                    display_name,
+                    used_bytes: info.and_then(|info| info.used_bytes()),
+                    total_bytes: info.and_then(|info| info.total_bytes),
+                    expires_at_unix: info.and_then(|info| info.expires_at_unix),
+                    service_logo_path,
+                }
+            })
+            .map_err(map_profile_error)?;
+        Ok(SubscriptionListDto {
+            active_profile_id,
+            profiles,
+        })
+    }
+
+    fn require_profile(&self, id: &ProfileId) -> Result<(), ProfileMutationError> {
+        if self.store.contains(id) {
+            Ok(())
+        } else {
+            Err(ProfileMutationError::NotFound)
+        }
+    }
+
+    fn retain_profile_logo(
+        &self,
+        id: &ProfileId,
+        physical_generation: u64,
+        snapshot: &Snapshot,
+    ) -> Option<String> {
+        let candidate = snapshot
+            .service_logo_lease()
+            .filter(|lease| lease.path().is_some_and(|path| path.is_file()));
+        let mut leases = self
+            .profile_logo_leases
+            .lock()
+            .expect("profile logo lease lock poisoned");
+        if let Some(current) = leases.get(id)
+            && current.physical_generation > physical_generation
+        {
+            return current
+                .lease
+                .as_ref()
+                .and_then(ServiceLogoLease::path)
+                .and_then(std::path::Path::to_str)
+                .map(ToOwned::to_owned);
+        }
+        let path = candidate
+            .as_ref()
+            .and_then(ServiceLogoLease::path)
+            .and_then(std::path::Path::to_str)
+            .map(ToOwned::to_owned);
+        leases.insert(
+            id.clone(),
+            ProfileLogoLease {
+                physical_generation,
+                lease: candidate,
+            },
+        );
+        path
+    }
+
+    fn wait_for_list_logo_publish_hook(&self) {
+        let hook = self
+            .list_logo_publish_hook
+            .lock()
+            .expect("list logo publish hook lock poisoned")
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(());
+            let _ = hook.resume.recv();
+        }
+    }
+
+    fn remove_profile_logo(&self, id: &ProfileId) {
+        self.profile_logo_leases
+            .lock()
+            .expect("profile logo lease lock poisoned")
+            .remove(id);
+    }
+
+    pub async fn activate_subscription(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError> {
+        self.require_disconnected_mutation().await?;
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        let (mut revision, physical_generation, mut snapshot) = self
+            .store
+            .profile_snapshot_generation(id)
+            .map_err(map_profile_error)?;
+        self.retain_profile_logo(id, physical_generation, &snapshot);
+        let prepared =
+            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+        let maintenance_debt = match self.store.activate(id) {
+            Ok(_) => false,
+            Err(error) if error.mutation_committed() => {
+                let (active_id, active_revision, _, active_snapshot) =
+                    match self.store.active_snapshot_generation() {
+                        Ok(Some(loaded)) => loaded,
+                        Ok(None) | Err(_) => {
+                            self.reconcile_authoritative().await;
+                            return Err(ProfileMutationError::Storage);
+                        }
+                    };
+                if active_id != *id {
+                    self.reconcile_authoritative().await;
+                    return Err(ProfileMutationError::Storage);
+                }
+                revision = active_revision;
+                snapshot = active_snapshot;
+                true
+            }
+            Err(error) => return Err(map_profile_error(error)),
+        };
+        let (selections, explicit_selections) =
+            initial_and_explicit_selections(&self.store, id, revision, &snapshot);
+        let controller = prepared.controller();
+        {
+            let mut state = self.inner.write().await;
+            state.clear_for_active(Some(id.clone()));
+            state.apply_snapshot(
+                id.clone(),
+                snapshot,
+                controller,
+                revision,
+                selections,
+                explicit_selections,
+            );
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Core,
+                    "profile_maintenance",
+                    "Profile activation committed with maintenance debt.",
+                );
+            }
+        }
+        if prepared.activate().is_err() {
+            self.reconcile_authoritative().await;
+            return Err(ProfileMutationError::Storage);
+        }
+        Ok(self.current_status().await)
+    }
+
+    pub async fn refresh_subscription_profile(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        self.refresh_profile_locked(id).await
+    }
+
+    pub async fn replace_subscription_source_profile(
+        &self,
+        id: &ProfileId,
+        request: ImportSubscriptionRequest,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        self.replace_profile_source_locked(id, &request.url).await
+    }
+
+    pub async fn import_subscription_profile(
+        &self,
+        request: ImportSubscriptionRequest,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let _operation = self.operation.lock().await;
+        self.import_profile_locked(&request.url).await
+    }
+
+    pub async fn delete_subscription(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError> {
+        self.require_disconnected_mutation().await?;
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        let was_active = self.store.active_id().as_ref() == Some(id);
+        let maintenance_debt = match self.store.delete(id) {
+            Ok(_) => false,
+            Err(error) if error.mutation_committed() => true,
+            Err(error) => return Err(map_profile_error(error)),
+        };
+        self.remove_profile_logo(id);
+        if was_active {
+            self.reconcile_authoritative().await;
+        }
+        if maintenance_debt {
+            let _ = self.store.cleanup_unindexed_profile(id);
+        }
+        if maintenance_debt {
+            self.record_maintenance_debt("profile_delete").await;
+        }
+        Ok(self.current_status().await)
+    }
+
+    async fn require_disconnected_mutation(&self) -> Result<(), ProfileMutationError> {
+        let state = self.inner.read().await;
+        if state.degraded
+            || matches!(
+                state.state.current(),
+                CoreConnectionState::Connecting | CoreConnectionState::Connected
+            )
+        {
+            Err(ProfileMutationError::Connected)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn reconcile_authoritative(&self) {
+        let authoritative_id = self.store.active_id();
+        let loaded = self.store.active_snapshot_generation().ok().flatten();
+        match (&authoritative_id, &loaded) {
+            (_, Some((id, _, physical_generation, snapshot))) => {
+                self.retain_profile_logo(id, *physical_generation, snapshot);
+            }
+            (Some(id), None) => self.remove_profile_logo(id),
+            (None, None) => {}
+        }
+        let mut state = self.inner.write().await;
+        state.clear_for_active(authoritative_id);
+        if let Some((id, revision, _, snapshot)) = loaded {
+            let (selections, explicit_selections) =
+                initial_and_explicit_selections(&self.store, &id, revision, &snapshot);
+            state.apply_snapshot_without_controller(
+                id,
+                snapshot,
+                revision,
+                selections,
+                explicit_selections,
+            );
+        }
+    }
+
+    async fn reconcile_authoritative_unreadable(&self) {
+        let authoritative_id = self.store.active_id();
+        if let Some(id) = &authoritative_id {
+            self.remove_profile_logo(id);
+        }
+        self.inner.write().await.clear_for_active(authoritative_id);
+    }
+
+    async fn current_status(&self) -> StatusDto {
+        let mut status = self.inner.read().await.status();
+        status.active_profile_id = self.store.active_id().map(|id| id.as_str().to_owned());
+        status
+    }
+
+    async fn record_maintenance_debt(&self, phase: &str) {
+        self.inner.write().await.push_event(
+            Severity::Warning,
+            Component::Core,
+            phase,
+            "Profile mutation committed with maintenance debt.",
+        );
+    }
+
+    async fn profile_snapshot_after_commit(
+        &self,
+        id: &ProfileId,
+    ) -> Result<(u64, u64, Arc<Snapshot>), ProfileMutationError> {
+        if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
+            self.remove_profile_logo(id);
+            self.reconcile_authoritative_unreadable().await;
+            return Err(ProfileMutationError::Committed);
+        }
+        match self.store.profile_snapshot_generation(id) {
+            Ok(loaded) => Ok(loaded),
+            Err(_) => {
+                self.remove_profile_logo(id);
+                self.reconcile_authoritative().await;
+                Err(ProfileMutationError::Committed)
+            }
+        }
+    }
+
+    async fn refresh_profile_locked(
+        &self,
+        id: &ProfileId,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let (_, previous) = self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let source_url = previous
+            .subscription_source_url()
+            .ok_or(ProfileMutationError::Storage)?
+            .to_owned();
+        self.replace_profile_source_locked(id, &source_url).await
+    }
+
+    async fn replace_profile_source_locked(
+        &self,
+        id: &ProfileId,
+        source_url: &str,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let source_url = source_url.trim();
+        if source_url.is_empty() {
+            return Err(ProfileMutationError::Storage);
+        }
+        let staging = AtomicSnapshot::default();
+        let fetched = self
+            .fetcher
+            .refresh(source_url, &staging)
+            .await
+            .map_err(|_| ProfileMutationError::Storage)?;
+        let (snapshot, _) = fetched.into_parts();
+        let active = self.store.active_id().as_ref() == Some(id);
+        let prepared = if active {
+            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?)
+        } else {
+            None
+        };
+        let (revision, physical_generation, persisted, maintenance_debt) =
+            match self.store.replace_profile_loaded(id, snapshot.clone()) {
+                Ok((revision, physical_generation, persisted)) => {
+                    (revision, physical_generation, persisted, false)
+                }
+                Err(error) if error.mutation_committed() => {
+                    let (revision, physical_generation, persisted) =
+                        self.profile_snapshot_after_commit(id).await?;
+                    (revision, physical_generation, persisted, true)
+                }
+                Err(error) => return Err(map_profile_error(error)),
+            };
+        if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
+            self.remove_profile_logo(id);
+            self.reconcile_authoritative_unreadable().await;
+            return Err(ProfileMutationError::Committed);
+        }
+        self.retain_profile_logo(id, physical_generation, &persisted);
+        if !active {
+            if maintenance_debt {
+                self.record_maintenance_debt("profile_refresh").await;
+            }
+            return Ok(self.current_status().await);
+        }
+        let prepared = prepared.expect("active refresh prepares a controller");
+        let (selections, explicit_selections) =
+            initial_and_explicit_selections(&self.store, id, revision, &persisted);
+        let controller = prepared.controller();
+        {
+            let mut state = self.inner.write().await;
+            state.clear_for_active(Some(id.clone()));
+            state.apply_snapshot(
+                id.clone(),
+                persisted,
+                controller,
+                revision,
+                selections,
+                explicit_selections,
+            );
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "profile_refresh",
+                    "Profile refresh committed with maintenance debt.",
+                );
+            }
+        }
+        if prepared.activate().is_err() {
+            self.reconcile_authoritative().await;
+            return Err(ProfileMutationError::Committed);
+        }
+        Ok(self.current_status().await)
+    }
+
+    async fn import_profile_locked(&self, url: &str) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        self.require_disconnected_mutation().await?;
+        let trimmed_url = url.trim();
+        if trimmed_url.is_empty() {
+            return Err(ProfileMutationError::Storage);
+        }
+        let staging = AtomicSnapshot::default();
+        let fetched = self
+            .fetcher
+            .refresh(trimmed_url, &staging)
+            .await
+            .map_err(|_| ProfileMutationError::Storage)?;
+        let (snapshot, _) = fetched.into_parts();
+        let prepared =
+            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+        let existing = self
+            .store
+            .find_exact_source(trimmed_url)
+            .map_err(map_profile_error)?;
+        let (id, maintenance_debt) = if let Some(id) = existing {
+            let replace_debt = match self.store.replace_profile_loaded(&id, snapshot.clone()) {
+                Ok(_) => false,
+                Err(error) if error.mutation_committed() => {
+                    self.profile_snapshot_after_commit(&id).await?;
+                    true
+                }
+                Err(error) => return Err(map_profile_error(error)),
+            };
+            let activate_debt = match self.store.activate(&id) {
+                Ok(_) => false,
+                Err(error) if error.mutation_committed() => true,
+                Err(error) => {
+                    self.reconcile_authoritative().await;
+                    return Err(map_profile_error(error));
+                }
+            };
+            (id, replace_debt || activate_debt)
+        } else {
+            match self.store.create_profile(snapshot.clone()) {
+                Ok(id) => (id, false),
+                Err(error) if error.mutation_committed() => {
+                    let Some(id) = self.store.active_id() else {
+                        self.reconcile_authoritative().await;
+                        return Err(ProfileMutationError::Storage);
+                    };
+                    (id, true)
+                }
+                Err(error) => return Err(map_profile_error(error)),
+            }
+        };
+        let (revision, physical_generation, persisted) =
+            self.profile_snapshot_after_commit(&id).await?;
+        self.retain_profile_logo(&id, physical_generation, &persisted);
+        let (selections, explicit_selections) =
+            initial_and_explicit_selections(&self.store, &id, revision, &persisted);
+        let controller = prepared.controller();
+        {
+            let mut state = self.inner.write().await;
+            state.clear_for_active(Some(id.clone()));
+            state.apply_snapshot(
+                id,
+                persisted,
+                controller,
+                revision,
+                selections,
+                explicit_selections,
+            );
+            state.push_event(
+                Severity::Info,
+                Component::Subscription,
+                "import",
+                "Subscription imported.",
+            );
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "profile_import",
+                    "Profile import committed with maintenance debt.",
+                );
+            }
+        }
+        if prepared.activate().is_err() {
+            self.reconcile_authoritative().await;
+            return Err(ProfileMutationError::Storage);
+        }
+        Ok(self.current_status().await)
+    }
+}
+
+fn map_profile_error(error: ProfileError) -> ProfileMutationError {
+    match error {
+        ProfileError::NotFound(_) => ProfileMutationError::NotFound,
+        ProfileError::LimitReached => ProfileMutationError::LimitReached,
+        _ => ProfileMutationError::Storage,
+    }
+}
+
+fn default_selections(snapshot: &Snapshot) -> Vec<Option<String>> {
+    selectable_groups(snapshot)
+        .iter()
+        .map(|group| group.nodes.first().map(|node| (*node).to_owned()))
+        .collect()
+}
+
+fn restored_selections(
+    store: &ProfileStore,
+    id: &ProfileId,
+    revision: u64,
+    snapshot: &Snapshot,
+) -> Vec<Option<String>> {
+    let groups = selectable_groups(snapshot);
+    let catalog_ids: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            (
+                catalog_group_id(revision, group_index),
+                group
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(node_index, _)| catalog_node_id(revision, group_index, node_index))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let catalog: Vec<_> = catalog_ids
+        .iter()
+        .map(|(group, nodes)| {
+            (
+                group.as_str(),
+                nodes.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let catalog: Vec<_> = catalog
+        .iter()
+        .map(|(group, nodes)| (*group, nodes.as_slice()))
+        .collect();
+    let saved = store
+        .valid_selections(id, revision, &catalog)
+        .unwrap_or_default();
+    groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            let group_id = catalog_group_id(revision, group_index);
+            saved.get(&group_id).and_then(|node_id| {
+                group
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(node_index, node)| {
+                        (catalog_node_id(revision, group_index, node_index) == *node_id)
+                            .then(|| (*node).to_owned())
+                    })
+            })
+        })
+        .collect()
+}
+
+fn initial_and_explicit_selections(
+    store: &ProfileStore,
+    id: &ProfileId,
+    revision: u64,
+    snapshot: &Snapshot,
+) -> (Vec<Option<String>>, Vec<Option<String>>) {
+    let explicit = restored_selections(store, id, revision, snapshot);
+    let mut selections = default_selections(snapshot);
+    for (selected, restored) in selections.iter_mut().zip(&explicit) {
+        if restored.is_some() {
+            selected.clone_from(restored);
+        }
+    }
+    (selections, explicit)
 }
 
 #[async_trait]
@@ -1382,7 +2318,7 @@ where
     F: 'static,
 {
     async fn status(&self) -> Result<StatusDto, BackendError> {
-        Ok(self.inner.read().await.status())
+        Ok(self.current_status().await)
     }
 
     async fn catalog(&self) -> Result<CatalogDto, BackendError> {
@@ -1395,141 +2331,84 @@ where
         request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
-        {
-            let state = self.inner.read().await;
-            if matches!(
-                state.state.current(),
-                CoreConnectionState::Connecting | CoreConnectionState::Connected
-            ) || state.degraded
-            {
-                return Err(BackendError::new());
-            }
-        }
-
-        let staging = AtomicSnapshot::default();
-        let snapshot = match self.fetcher.refresh(&request.url, &staging).await {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                let mut state = self.inner.write().await;
-                state.mark_error(
-                    "Импорт не выполнен. Проверьте ссылку и доступ к сети.",
-                    false,
-                );
-                state.push_event(
-                    Severity::Error,
-                    Component::Subscription,
-                    "import",
-                    "Импорт подписки завершился ошибкой.",
-                );
-                return Err(BackendError::new());
-            }
-        };
-        let prepared = match (self.controller_factory)(&snapshot) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let mut state = self.inner.write().await;
-                state.mark_error(
-                    "Не удалось подготовить конфигурацию запуска. Повторите импорт.",
-                    false,
-                );
-                state.push_event(
-                    Severity::Error,
-                    Component::Core,
-                    "runtime_publish",
-                    "Подготовка конфигурации запуска завершилась ошибкой.",
-                );
-                return Err(error);
-            }
-        };
-
-        let (revision, snapshot) = match self.store.commit_with_generation((*snapshot).clone()) {
-            Ok(persisted) => persisted,
-            Err(_) => {
-                drop(prepared);
-                let mut state = self.inner.write().await;
-                if state.snapshot.is_some() {
-                    if state.state.current() != CoreConnectionState::Ready {
-                        let _ = state.state.transition(CoreConnectionState::Ready);
-                    }
-                    state.message = Some(
-                        "Не удалось сохранить новый профиль. Предыдущий профиль сохранён."
-                            .to_owned(),
-                    );
-                    state.degraded = false;
-                } else {
-                    state.mark_error(
-                        "Не удалось сохранить профиль. Освободите место и повторите импорт.",
-                        false,
-                    );
-                }
-                state.push_event(
-                    Severity::Error,
-                    Component::Core,
-                    "snapshot_commit",
-                    "Сохранение профиля завершилось ошибкой.",
-                );
-                return Err(BackendError::new());
-            }
-        };
-
-        let mut state = self.inner.write().await;
-        let controller = prepared.controller();
-        state.apply_snapshot(snapshot, controller, revision);
-        state.push_event(
-            Severity::Info,
-            Component::Subscription,
-            "import",
-            "Подписка импортирована.",
-        );
-        let status = state.status();
-        drop(state);
-        prepared.activate()?;
-        Ok(status)
+        self.import_profile_locked(&request.url)
+            .await
+            .map_err(BackendError::from_profile_mutation)
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
-        let source_url = {
-            let state = self.inner.read().await;
-            if matches!(
-                state.state.current(),
-                CoreConnectionState::Connecting | CoreConnectionState::Connected
-            ) || state.degraded
-            {
-                return Err(BackendError::new());
-            }
-            state
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.subscription_source_url())
-                .map(ToOwned::to_owned)
-                .ok_or_else(BackendError::new)?
-        };
-        let result = self
-            .import_subscription(ImportSubscriptionRequest { url: source_url })
-            .await;
-        if result.is_err() {
-            let mut state = self.inner.write().await;
-            if state.snapshot.is_some() {
-                if state.state.current() != CoreConnectionState::Ready {
-                    let _ = state.state.transition(CoreConnectionState::Ready);
-                }
-                state.message =
-                    Some("Не удалось обновить подписку. Предыдущий профиль сохранён.".to_owned());
-                state.degraded = false;
-                state.push_event(
-                    Severity::Warning,
-                    Component::Subscription,
-                    "refresh",
-                    "Обновление подписки не выполнено; предыдущий профиль сохранён.",
-                );
-            }
-        }
-        result
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        let id = self
+            .store
+            .active_id()
+            .ok_or_else(|| BackendError::from_profile_mutation(ProfileMutationError::NotFound))?;
+        self.refresh_profile_locked(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
+        self.subscription_list_dto()
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn activate_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        self.activate_subscription(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn refresh_subscription_profile(
+        &self,
+        id: ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.refresh_profile_locked(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.subscription_list_dto()
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn replace_subscription_source(
+        &self,
+        id: ProfileId,
+        request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.replace_profile_source_locked(&id, &request.url)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.subscription_list_dto()
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn delete_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        self.delete_subscription(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)
     }
 
     async fn connect(&self) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
-        let snapshot = {
+        let (snapshot, queued_selections) = {
             let state = self.inner.read().await;
             if state.degraded {
                 return Err(BackendError::new());
@@ -1537,7 +2416,16 @@ where
             if state.state.current() != CoreConnectionState::Ready {
                 return Err(BackendError::new());
             }
-            state.snapshot.clone().ok_or_else(BackendError::new)?
+            let snapshot = state.snapshot.clone().ok_or_else(BackendError::new)?;
+            let queued_selections = selectable_groups(&snapshot)
+                .iter()
+                .zip(&state.explicit_selected_nodes)
+                .filter_map(|(group, node)| {
+                    node.as_ref()
+                        .map(|node| (group.name.to_owned(), node.clone()))
+                })
+                .collect::<Vec<_>>();
+            (snapshot, queued_selections)
         };
         let prepared = match (self.controller_factory)(&snapshot) {
             Ok(prepared) => prepared,
@@ -1582,7 +2470,38 @@ where
             );
         }
 
-        let result = Supervisor::new(controller).connect().await;
+        let result = Supervisor::new(controller.clone()).connect().await;
+        if result.is_ok() {
+            for (group, node) in queued_selections {
+                if self.selector.select(&group, &node).await.is_err() {
+                    let rollback = Supervisor::new(controller.clone()).disconnect().await;
+                    let mut state = self.inner.write().await;
+                    if rollback.is_ok() {
+                        state
+                            .state
+                            .transition(CoreConnectionState::Ready)
+                            .map_err(|_| BackendError::new())?;
+                        state.message = Some(
+                            "Mihomo did not apply the queued route selection; connection was rolled back."
+                                .to_owned(),
+                        );
+                        state.degraded = false;
+                    } else {
+                        state.mark_error(
+                            "Mihomo route selection failed and core rollback was incomplete.",
+                            true,
+                        );
+                    }
+                    state.push_event(
+                        Severity::Error,
+                        Component::Mihomo,
+                        "selection_replay",
+                        "Queued Mihomo selection replay failed during connection startup.",
+                    );
+                    return Err(BackendError::new());
+                }
+            }
+        }
         let mut state = self.inner.write().await;
         match result {
             Ok(()) => {
@@ -1691,15 +2610,32 @@ where
 
     async fn select(&self, request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
         let _operation = self.operation.lock().await;
-        let (snapshot, group_index, raw_group, raw_node) = {
+        let (
+            snapshot,
+            active_profile_id,
+            connected,
+            group_index,
+            raw_group,
+            raw_node,
+            previous_raw_node,
+        ) = {
             let state = self.inner.read().await;
-            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+            if !matches!(
+                state.state.current(),
+                CoreConnectionState::Ready | CoreConnectionState::Connected
+            ) || state.degraded
+            {
                 return Err(SelectionError::NotConnected);
             }
             if request.revision != state.catalog.revision {
                 return Err(SelectionError::StaleRevision);
             }
             let snapshot = state.snapshot.clone().ok_or(SelectionError::UnknownGroup)?;
+            let active_profile_id = state
+                .active_profile_id
+                .clone()
+                .ok_or(SelectionError::UnknownGroup)?;
+            let connected = state.state.current() == CoreConnectionState::Connected;
             let groups = selectable_groups(&snapshot);
             let group_index = groups
                 .iter()
@@ -1720,13 +2656,57 @@ where
                 .ok_or(SelectionError::UnknownNode)?;
             let raw_group = group.name.to_owned();
             let raw_node = group.nodes[node_index].to_owned();
-            (snapshot, group_index, raw_group, raw_node)
+            let previous_raw_node = state.selected_nodes[group_index].clone();
+            (
+                snapshot,
+                active_profile_id,
+                connected,
+                group_index,
+                raw_group,
+                raw_node,
+                previous_raw_node,
+            )
         };
 
-        self.selector
-            .select(&raw_group, &raw_node)
-            .await
-            .map_err(|_| SelectionError::SelectorFailed)?;
+        if connected {
+            self.selector
+                .select(&raw_group, &raw_node)
+                .await
+                .map_err(|_| SelectionError::SelectorFailed)?;
+        }
+
+        let maintenance_debt = match self.store.save_selection(
+            &active_profile_id,
+            request.revision,
+            &request.group_id,
+            &request.node_id,
+        ) {
+            Ok(()) => false,
+            Err(error) if error.mutation_committed() => true,
+            Err(_) => {
+                if connected
+                    && let Some(previous_raw_node) = previous_raw_node
+                    && self
+                        .selector
+                        .select(&raw_group, &previous_raw_node)
+                        .await
+                        .is_err()
+                {
+                    let mut state = self.inner.write().await;
+                    state.mark_error(
+                        "Mihomo selection changed but persistence and live compensation failed.",
+                        true,
+                    );
+                    state.push_event(
+                        Severity::Error,
+                        Component::Mihomo,
+                        "selection_compensation",
+                        "Mihomo selection compensation failed after a storage error.",
+                    );
+                }
+                return Err(SelectionError::StorageFailed);
+            }
+        };
 
         let mut state = self.inner.write().await;
         // All state-changing operations share `operation`, so this revision cannot change while
@@ -1734,9 +2714,22 @@ where
         if state.catalog.revision != request.revision {
             return Err(SelectionError::StaleRevision);
         }
-        state.selected_nodes[group_index] = Some(raw_node.clone());
-        if group_index == 0 {
-            state.current_node = Some(raw_node);
+        if maintenance_debt {
+            let (selected_nodes, explicit_selected_nodes) = initial_and_explicit_selections(
+                &self.store,
+                &active_profile_id,
+                request.revision,
+                &snapshot,
+            );
+            state.selected_nodes = selected_nodes;
+            state.explicit_selected_nodes = explicit_selected_nodes;
+            state.current_node = state.selected_nodes.first().cloned().flatten();
+        } else {
+            state.selected_nodes[group_index] = Some(raw_node.clone());
+            state.explicit_selected_nodes[group_index] = Some(raw_node.clone());
+            if group_index == 0 {
+                state.current_node = Some(raw_node);
+            }
         }
         state.catalog = build_catalog(
             &snapshot,
@@ -1750,6 +2743,14 @@ where
             "selection",
             "Маршрут Mihomo изменён.",
         );
+        if maintenance_debt {
+            state.push_event(
+                Severity::Warning,
+                Component::Core,
+                "selection_maintenance",
+                "Selection committed with maintenance debt.",
+            );
+        }
         Ok(state.catalog.clone())
     }
 
@@ -2366,23 +3367,83 @@ pub struct MemoryBackend {
     inner: RwLock<MemoryState>,
 }
 
-#[derive(Default)]
 struct MemoryState {
     connection: ConnectionState,
-    subscriptions: u64,
+    profiles: Vec<MemoryProfile>,
+    active_profile_id: Option<ProfileId>,
+    next_profile_id: u64,
     events: EventBuffer<EventDto>,
+}
+
+impl Default for MemoryState {
+    fn default() -> Self {
+        Self {
+            connection: ConnectionState::Empty,
+            profiles: Vec::new(),
+            active_profile_id: None,
+            next_profile_id: 1,
+            events: EventBuffer::default(),
+        }
+    }
+}
+
+struct MemoryProfile {
+    id: ProfileId,
+    source_url: String,
+    display_name: String,
 }
 
 impl MemoryState {
     fn status(&self) -> StatusDto {
-        let has_profile = self.subscriptions > 0;
+        let active = self.active_profile_id.as_ref().and_then(|active_id| {
+            self.profiles
+                .iter()
+                .find(|profile| &profile.id == active_id)
+        });
         StatusDto {
             state: self.connection,
-            profile: has_profile.then(|| "Основной профиль".to_owned()),
-            current_node: has_profile.then(|| "Авто".to_owned()),
+            active_profile_id: active.map(|profile| profile.id.as_str().to_owned()),
+            profile: active.map(|profile| profile.display_name.clone()),
+            current_node: active.map(|_| "Авто".to_owned()),
             message: None,
             degraded: false,
             subscription: None,
+        }
+    }
+
+    fn subscriptions(&self) -> SubscriptionListDto {
+        SubscriptionListDto {
+            active_profile_id: self
+                .active_profile_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            profiles: self
+                .profiles
+                .iter()
+                .map(|profile| SubscriptionProfileDto {
+                    id: profile.id.as_str().to_owned(),
+                    active: self.active_profile_id.as_ref() == Some(&profile.id),
+                    available: true,
+                    display_name: profile.display_name.clone(),
+                    used_bytes: None,
+                    total_bytes: None,
+                    expires_at_unix: None,
+                    service_logo_path: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn require_mutable(&self) -> Result<(), BackendError> {
+        if matches!(
+            self.connection,
+            ConnectionState::Connecting | ConnectionState::Connected
+        ) {
+            Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Connected,
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -2411,12 +3472,123 @@ impl Backend for MemoryBackend {
 
     async fn import_subscription(
         &self,
-        _request: ImportSubscriptionRequest,
+        request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
         let mut state = self.inner.write().await;
-        state.subscriptions += 1;
+        state.require_mutable()?;
+        let source_url = request.url.trim();
+        if let Some(existing_id) = state
+            .profiles
+            .iter()
+            .find(|profile| profile.source_url == source_url)
+            .map(|profile| profile.id.clone())
+        {
+            state.active_profile_id = Some(existing_id);
+        } else {
+            if state.profiles.len() >= MAX_PROFILES {
+                return Err(BackendError::from_profile_mutation(
+                    ProfileMutationError::LimitReached,
+                ));
+            }
+            let id = ProfileId::parse(&format!(
+                "00000000-0000-4000-8000-{:012x}",
+                state.next_profile_id
+            ))
+            .map_err(|_| BackendError::new())?;
+            state.next_profile_id = state.next_profile_id.saturating_add(1);
+            let display_name = format!("Профиль {}", state.profiles.len() + 1);
+            state.profiles.push(MemoryProfile {
+                id: id.clone(),
+                source_url: source_url.to_owned(),
+                display_name,
+            });
+            state.active_profile_id = Some(id);
+        }
         state.connection = ConnectionState::Ready;
         state.push_event("info", "Подписка импортирована.");
+        Ok(state.status())
+    }
+
+    async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
+        let state = self.inner.read().await;
+        state.require_mutable()?;
+        if state.active_profile_id.is_none() {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        }
+        Ok(state.status())
+    }
+
+    async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
+        Ok(self.inner.read().await.subscriptions())
+    }
+
+    async fn activate_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        let mut state = self.inner.write().await;
+        if !state.profiles.iter().any(|profile| profile.id == id) {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        }
+        state.require_mutable()?;
+        state.active_profile_id = Some(id);
+        state.connection = ConnectionState::Ready;
+        Ok(state.status())
+    }
+
+    async fn refresh_subscription_profile(
+        &self,
+        id: ProfileId,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        let state = self.inner.read().await;
+        if !state.profiles.iter().any(|profile| profile.id == id) {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        }
+        state.require_mutable()?;
+        Ok(state.subscriptions())
+    }
+
+    async fn replace_subscription_source(
+        &self,
+        id: ProfileId,
+        request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        let mut state = self.inner.write().await;
+        let Some(position) = state.profiles.iter().position(|profile| profile.id == id) else {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        };
+        state.require_mutable()?;
+        state.profiles[position].source_url = request.url.trim().to_owned();
+        Ok(state.subscriptions())
+    }
+
+    async fn delete_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
+        let mut state = self.inner.write().await;
+        let Some(position) = state.profiles.iter().position(|profile| profile.id == id) else {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        };
+        state.require_mutable()?;
+        let was_active = state.active_profile_id.as_ref() == Some(&id);
+        state.profiles.remove(position);
+        if was_active {
+            state.active_profile_id = state
+                .profiles
+                .get(position)
+                .or_else(|| state.profiles.last())
+                .map(|profile| profile.id.clone());
+        }
+        state.connection = if state.profiles.is_empty() {
+            ConnectionState::Empty
+        } else {
+            ConnectionState::Ready
+        };
         Ok(state.status())
     }
 
@@ -2429,10 +3601,10 @@ impl Backend for MemoryBackend {
 
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
         let mut state = self.inner.write().await;
-        state.connection = if state.subscriptions > 0 {
-            ConnectionState::Ready
-        } else {
+        state.connection = if state.profiles.is_empty() {
             ConnectionState::Empty
+        } else {
+            ConnectionState::Ready
         };
         state.push_event("info", "Подключение остановлено.");
         Ok(state.status())

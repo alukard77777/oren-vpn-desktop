@@ -46,6 +46,8 @@ export component ComponentCheck inherits Window {{
     println!("cargo:rerun-if-changed=assets/diagnostics.svg");
     println!("cargo:rerun-if-changed=assets/app-icon.svg");
     println!("cargo:rerun-if-changed=assets/close.svg");
+    println!("cargo:rerun-if-changed=assets/refresh.svg");
+    println!("cargo:rerun-if-changed=assets/trash.svg");
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=app-debug.manifest");
 

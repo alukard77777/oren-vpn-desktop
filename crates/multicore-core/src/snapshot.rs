@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
     net::{IpAddr, SocketAddr},
@@ -15,10 +16,11 @@ use serde_yaml_ng::Value as YamlValue;
 use thiserror::Error;
 
 use crate::{
-    ConfigError, MihomoConfig, XrayConfig,
+    ConfigError, MAX_CONFIG_BYTES, MihomoConfig, XrayConfig,
     fetch::SubscriptionMetadataHeaders,
     parse_mihomo, parse_xray,
     service_logo::{MAX_SERVICE_LOGO_OUTPUT_BYTES, is_canonical_service_logo},
+    store_root::{CapabilityFile, DirectoryCapability},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +30,22 @@ pub struct Snapshot {
     subscription: Option<SubscriptionRecord>,
     service_logo_png: Option<Vec<u8>>,
     service_logo_path: Option<PathBuf>,
+    service_logo_file: Option<CapabilityFile>,
+}
+
+/// A lightweight lease that keeps a validated, app-owned service-logo file addressable.
+///
+/// On Linux the exposed path names the retained file descriptor. On Windows the retained handle
+/// prevents the validated file from being replaced while another process reads it.
+#[derive(Clone, Debug)]
+pub struct ServiceLogoLease {
+    retained: CapabilityFile,
+}
+
+impl ServiceLogoLease {
+    pub fn path(&self) -> Option<&Path> {
+        self.retained.path()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +142,7 @@ impl Snapshot {
             subscription: None,
             service_logo_png: None,
             service_logo_path: None,
+            service_logo_file: None,
         })
     }
 
@@ -242,10 +261,18 @@ impl Snapshot {
     pub(crate) fn set_service_logo_png(&mut self, png: Vec<u8>) {
         self.service_logo_png = Some(png);
         self.service_logo_path = None;
+        self.service_logo_file = None;
     }
 
     pub fn service_logo_path(&self) -> Option<&Path> {
         self.service_logo_path.as_deref()
+    }
+
+    pub fn service_logo_lease(&self) -> Option<ServiceLogoLease> {
+        self.service_logo_file
+            .as_ref()
+            .cloned()
+            .map(|retained| ServiceLogoLease { retained })
     }
 }
 
@@ -295,7 +322,7 @@ impl ParsedSubscriptionMetadata {
     fn parse(headers: &SubscriptionMetadataHeaders) -> Self {
         let mut metadata = Self {
             title: first_decoded_text(headers, "profile-title", 128, true)
-                .or_else(|| first_decoded_text(headers, "flclashx-servicename", 128, true))
+                .or_else(|| first_vendor_decoded_text(headers, "servicename", 128, true))
                 .or_else(|| content_disposition_title(headers)),
             ..Self::default()
         };
@@ -324,7 +351,7 @@ impl ParsedSubscriptionMetadata {
             true,
             false,
         );
-        metadata.targets.logo_url = first_url(headers, &["flclashx-servicelogo"], false, true);
+        metadata.targets.logo_url = first_vendor_url(headers, "servicelogo", false, true);
         metadata
     }
 
@@ -395,6 +422,22 @@ fn first_decoded_text(
     reject_credential_like: bool,
 ) -> Option<String> {
     headers.values(name).find_map(|value| {
+        let decoded = decode_text(value)?;
+        if reject_credential_like {
+            sanitize_title_candidate(&decoded, limit)
+        } else {
+            sanitize_text(&decoded, limit)
+        }
+    })
+}
+
+fn first_vendor_decoded_text(
+    headers: &SubscriptionMetadataHeaders,
+    suffix: &str,
+    limit: usize,
+    reject_credential_like: bool,
+) -> Option<String> {
+    headers.vendor_suffix_values(suffix).find_map(|value| {
         let decoded = decode_text(value)?;
         if reject_credential_like {
             sanitize_title_candidate(&decoded, limit)
@@ -543,6 +586,17 @@ fn first_url(
     })
 }
 
+fn first_vendor_url(
+    headers: &SubscriptionMetadataHeaders,
+    suffix: &str,
+    allow_tg: bool,
+    https_only: bool,
+) -> Option<String> {
+    headers
+        .vendor_suffix_values(suffix)
+        .find_map(|value| validate_url(value, allow_tg, https_only))
+}
+
 fn validate_url(value: &str, allow_tg: bool, https_only: bool) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
@@ -582,12 +636,15 @@ impl AtomicSnapshot {
 }
 
 pub trait SnapshotSink: Send + Sync {
-    fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError>;
+    fn save(&self, snapshot: Snapshot) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError>;
 }
 
 impl SnapshotSink for AtomicSnapshot {
-    fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        Ok(self.commit(snapshot))
+    fn save(&self, snapshot: Snapshot) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        Ok(SnapshotCommit {
+            committed: self.commit(snapshot),
+            maintenance_debt: None,
+        })
     }
 }
 
@@ -595,14 +652,50 @@ impl SnapshotSink for AtomicSnapshot {
 pub enum PersistenceError {
     #[error("snapshot persistence operation failed")]
     Io(#[from] io::Error),
+    #[error("snapshot publication committed but directory durability maintenance is required")]
+    MaintenanceDebt(#[source] io::Error),
+}
+
+#[derive(Debug)]
+pub struct SnapshotCommit<T> {
+    committed: T,
+    maintenance_debt: Option<io::Error>,
+}
+
+impl<T> SnapshotCommit<T> {
+    pub fn committed(&self) -> &T {
+        &self.committed
+    }
+
+    pub fn maintenance_debt(&self) -> Option<&io::Error> {
+        self.maintenance_debt.as_ref()
+    }
+
+    pub fn into_parts(self) -> (T, Option<io::Error>) {
+        (self.committed, self.maintenance_debt)
+    }
+
+    pub fn into_committed(self) -> T {
+        self.committed
+    }
+}
+
+impl<T> std::ops::Deref for SnapshotCommit<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.committed
+    }
 }
 
 #[derive(Debug)]
 pub struct PersistentSnapshotStore {
-    root: PathBuf,
+    root: DirectoryCapability,
     current: RwLock<Option<(u64, Arc<Snapshot>)>>,
     next_generation: AtomicU64,
     commit_lock: Mutex<()>,
+    #[cfg(test)]
+    logo_retention_fault: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,28 +840,27 @@ impl PersistentSnapshotStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         secure_directory(&root)?;
+        Self::open_capability(DirectoryCapability::open(&root)?)
+    }
 
+    pub(crate) fn open_capability(root: DirectoryCapability) -> Result<Self, PersistenceError> {
         let mut generations = generation_directories(&root)?;
         for (_, directory) in &generations {
-            secure_directory(directory)?;
             for config in [
                 "mihomo.yaml",
                 "xray.json",
                 "subscription.json",
                 "service-logo.png",
             ] {
-                let path = directory.join(config);
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.file_type().is_file() => secure_file(&path)?,
-                    Ok(_) if config != "service-logo.png" => {
+                match directory.file_metadata(OsStr::new(config))? {
+                    Some((true, _)) => directory.secure_regular_file(OsStr::new(config))?,
+                    Some((false, _)) if config != "service-logo.png" => {
                         return Err(PersistenceError::Io(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "snapshot config is not a regular file",
                         )));
                     }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(PersistenceError::Io(error)),
+                    Some((false, _)) | None => {}
                 }
             }
         }
@@ -787,7 +879,22 @@ impl PersistentSnapshotStore {
             current: RwLock::new(current),
             next_generation: AtomicU64::new(highest_id.saturating_add(1).max(1)),
             commit_lock: Mutex::new(()),
+            #[cfg(test)]
+            logo_retention_fault: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Loads the newest valid generation from an existing legacy root without creating,
+    /// locking, permission-repairing, or otherwise mutating that tree.
+    pub(crate) fn load_latest_readonly(
+        root: &Path,
+    ) -> Result<Option<Arc<Snapshot>>, PersistenceError> {
+        let root = DirectoryCapability::open_readonly(root)?;
+        let mut generations = generation_directories(&root)?;
+        generations.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        Ok(generations
+            .into_iter()
+            .find_map(|(_, directory)| load_generation(&directory).map(Arc::new)))
     }
 
     pub fn current(&self) -> Option<Arc<Snapshot>> {
@@ -810,69 +917,143 @@ impl PersistentSnapshotStore {
             .map(|(generation, _)| *generation)
     }
 
-    pub fn commit(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        self.commit_with_generation(snapshot)
-            .map(|(_, snapshot)| snapshot)
+    pub fn commit(
+        &self,
+        snapshot: Snapshot,
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        self.commit_status(snapshot)
+    }
+
+    pub fn commit_status(
+        &self,
+        snapshot: Snapshot,
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        let outcome = self.commit_with_generation_status(snapshot)?;
+        let ((_, snapshot), maintenance_debt) = outcome.into_parts();
+        Ok(SnapshotCommit {
+            committed: snapshot,
+            maintenance_debt,
+        })
     }
 
     pub fn commit_with_generation(
         &self,
+        snapshot: Snapshot,
+    ) -> Result<SnapshotCommit<(u64, Arc<Snapshot>)>, PersistenceError> {
+        self.commit_with_generation_status(snapshot)
+    }
+
+    pub fn commit_with_generation_status(
+        &self,
         mut snapshot: Snapshot,
-    ) -> Result<(u64, Arc<Snapshot>), PersistenceError> {
+    ) -> Result<SnapshotCommit<(u64, Arc<Snapshot>)>, PersistenceError> {
         let _guard = self
             .commit_lock
             .lock()
             .expect("snapshot commit lock poisoned");
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let published_name = format!("snapshot-{generation:020}");
-        let published = self.root.join(&published_name);
-        let staging = self
-            .root
-            .join(format!(".{published_name}.staging-{}", std::process::id()));
+        let (staging_name, staging) = create_snapshot_staging(&self.root, &published_name)?;
+        snapshot.service_logo_path = None;
+        snapshot.service_logo_file = None;
 
-        let result = (|| {
-            fs::create_dir(&staging)?;
-            secure_directory(&staging)?;
-            write_synced(
-                &staging.join("mihomo.yaml"),
+        let publication = (|| {
+            staging.write_file(
+                OsStr::new("mihomo.yaml"),
                 snapshot.mihomo.raw_yaml().as_bytes(),
             )?;
-            write_synced(&staging.join("xray.json"), snapshot.xray.raw_bytes())?;
+            staging.write_file(OsStr::new("xray.json"), snapshot.xray.raw_bytes())?;
             if let Some(subscription) = &snapshot.subscription {
                 let mut persisted = subscription.clone();
                 persisted.targets.logo_url = None;
                 let encoded = serde_json::to_vec(&persisted).map_err(io::Error::other)?;
-                write_synced(&staging.join("subscription.json"), &encoded)?;
+                staging.write_file(OsStr::new("subscription.json"), &encoded)?;
             }
             if let Some(logo) = &snapshot.service_logo_png {
-                write_synced(&staging.join("service-logo.png"), logo)?;
+                staging.write_file(OsStr::new("service-logo.png"), logo)?;
             }
-            sync_directory(&staging)?;
-            fs::rename(&staging, &published)?;
-            sync_directory(&self.root)?;
-            Ok::<_, io::Error>(())
+            staging.sync()?;
+            self.root
+                .rename_child(&staging, OsStr::new(&published_name))?;
+            Ok::<_, io::Error>(self.root.sync())
         })();
+        drop(staging);
 
-        if let Err(error) = result {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(PersistenceError::Io(error));
+        let directory_sync = match publication {
+            Ok(directory_sync) => directory_sync,
+            Err(error) => {
+                if let Err(cleanup) = self.root.remove_child_tree(&staging_name) {
+                    return Err(PersistenceError::Io(io::Error::new(
+                        cleanup.kind(),
+                        format!(
+                            "snapshot publication failed ({error}); staging cleanup failed: {cleanup}"
+                        ),
+                    )));
+                }
+                return Err(PersistenceError::Io(error));
+            }
+        };
+        let mut maintenance_debt = directory_sync.err();
+        if snapshot.service_logo_png.is_some() {
+            #[cfg(test)]
+            let inject_retention_failure = self
+                .logo_retention_fault
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let inject_retention_failure = false;
+            let retention = if inject_retention_failure {
+                Err(io::Error::other(
+                    "injected post-publication logo retention failure",
+                ))
+            } else {
+                self.root
+                    .open_child(OsStr::new(&published_name))
+                    .and_then(|directory| {
+                        directory
+                            .read_file_retained(
+                                OsStr::new("service-logo.png"),
+                                MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
+                            )
+                            .map(|(_, retained)| retained)
+                    })
+            };
+            match retention {
+                Ok(retained) => {
+                    snapshot.service_logo_path = retained.path().map(Path::to_owned);
+                    snapshot.service_logo_file = Some(retained);
+                }
+                Err(error) => {
+                    maintenance_debt = Some(combine_persistence_debt(maintenance_debt, error));
+                }
+            }
         }
-        snapshot.service_logo_path = snapshot
-            .service_logo_png
-            .as_ref()
-            .map(|_| published.join("service-logo.png"));
         let snapshot = Arc::new(snapshot);
         *self
             .current
             .write()
             .expect("persistent snapshot lock poisoned") = Some((generation, snapshot.clone()));
-        Ok((generation, snapshot))
+        Ok(SnapshotCommit {
+            committed: (generation, snapshot),
+            maintenance_debt,
+        })
     }
 }
 
 impl SnapshotSink for PersistentSnapshotStore {
-    fn save(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, PersistenceError> {
-        self.commit(snapshot)
+    fn save(&self, snapshot: Snapshot) -> Result<SnapshotCommit<Arc<Snapshot>>, PersistenceError> {
+        self.commit_status(snapshot)
+    }
+}
+
+#[cfg(test)]
+impl PersistentSnapshotStore {
+    pub(crate) fn inject_directory_sync_failure(&self) {
+        self.root.inject_sync_failure();
+    }
+
+    fn inject_logo_retention_failure(&self) {
+        self.logo_retention_fault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1149,18 +1330,27 @@ fn stage_runtime_payloads(
     let published = runtime_root.join(&published_name);
     let staging = runtime_root.join(format!(".{published_name}.staging-{}", std::process::id()));
 
-    let result = (|| {
+    let preparation = (|| {
         fs::create_dir(&staging)?;
         secure_directory(&staging)?;
         write_synced(&staging.join("mihomo.yaml"), mihomo)?;
         write_synced(&staging.join("xray.json"), xray)?;
         sync_directory(&staging)?;
-        fs::rename(&staging, &published)?;
-        sync_directory(runtime_root)
+        fs::rename(&staging, &published)
     })();
-    if let Err(error) = result {
-        let _ = fs::remove_dir_all(&staging);
+    if let Err(error) = preparation {
+        if let Err(cleanup) = fs::remove_dir_all(&staging)
+            && cleanup.kind() != io::ErrorKind::NotFound
+        {
+            return Err(PersistenceError::Io(io::Error::new(
+                cleanup.kind(),
+                format!("runtime preparation failed ({error}); staging cleanup failed: {cleanup}"),
+            )));
+        }
         return Err(PersistenceError::Io(error));
+    }
+    if let Err(error) = sync_directory(runtime_root) {
+        return Err(PersistenceError::MaintenanceDebt(error));
     }
 
     Ok(StagedRuntime {
@@ -1195,14 +1385,15 @@ fn remove_staged_runtime(root: &Path, staged: &Path) -> Result<(), PersistenceEr
     Ok(())
 }
 
-fn generation_directories(root: &Path) -> Result<Vec<(u64, PathBuf)>, io::Error> {
+fn generation_directories(
+    root: &DirectoryCapability,
+) -> Result<Vec<(u64, DirectoryCapability)>, io::Error> {
     let mut generations = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+    for entry in root.entries()? {
+        if !entry.is_directory {
             continue;
         }
-        let name = entry.file_name();
+        let name = entry.name;
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -1212,7 +1403,7 @@ fn generation_directories(root: &Path) -> Result<Vec<(u64, PathBuf)>, io::Error>
         else {
             continue;
         };
-        generations.push((id, entry.path()));
+        generations.push((id, root.open_child(OsStr::new(name))?));
     }
     Ok(generations)
 }
@@ -1234,14 +1425,20 @@ fn next_named_generation(root: &Path, prefix: &str) -> Result<u64, io::Error> {
     Ok(highest.saturating_add(1).max(1))
 }
 
-fn load_generation(directory: &Path) -> Option<Snapshot> {
-    let mihomo = fs::read(directory.join("mihomo.yaml")).ok()?;
-    let xray = fs::read(directory.join("xray.json")).ok()?;
+fn load_generation(directory: &DirectoryCapability) -> Option<Snapshot> {
+    let mihomo = directory
+        .read_file(OsStr::new("mihomo.yaml"), MAX_CONFIG_BYTES as u64)
+        .ok()?;
+    let xray = directory
+        .read_file(OsStr::new("xray.json"), MAX_CONFIG_BYTES as u64)
+        .ok()?;
     let mut snapshot = Snapshot::parse(&mihomo, &xray).ok()?;
-    let subscription_path = directory.join("subscription.json");
-    if subscription_path.is_file()
-        && subscription_path.metadata().ok()?.len() <= 16 * 1024
-        && let Ok(bytes) = fs::read(subscription_path)
+    if directory
+        .file_metadata(OsStr::new("subscription.json"))
+        .ok()
+        .flatten()
+        .is_some_and(|(regular, len)| regular && len <= 16 * 1024)
+        && let Ok(bytes) = directory.read_file(OsStr::new("subscription.json"), 16 * 1024)
         && let Ok(mut record) = serde_json::from_slice::<SubscriptionRecord>(&bytes)
         && let Ok(parsed) = reqwest::Url::parse(&record.source_url)
         && record.source_url.len() <= 8192
@@ -1256,16 +1453,43 @@ fn load_generation(directory: &Path) -> Option<Snapshot> {
         }
         snapshot.subscription = Some(record);
     }
-    let logo_path = directory.join("service-logo.png");
-    if logo_path.symlink_metadata().ok().is_some_and(|metadata| {
-        metadata.file_type().is_file() && metadata.len() <= MAX_SERVICE_LOGO_OUTPUT_BYTES as u64
-    }) && let Ok(bytes) = fs::read(&logo_path)
+    if directory
+        .file_metadata(OsStr::new("service-logo.png"))
+        .ok()
+        .flatten()
+        .is_some_and(|(regular, len)| regular && len <= MAX_SERVICE_LOGO_OUTPUT_BYTES as u64)
+        && let Ok((bytes, retained)) = directory.read_file_retained(
+            OsStr::new("service-logo.png"),
+            MAX_SERVICE_LOGO_OUTPUT_BYTES as u64,
+        )
         && is_canonical_service_logo(&bytes)
     {
         snapshot.service_logo_png = Some(bytes);
-        snapshot.service_logo_path = Some(logo_path);
+        snapshot.service_logo_path = retained.path().map(Path::to_owned);
+        snapshot.service_logo_file = Some(retained);
     }
     Some(snapshot)
+}
+
+fn create_snapshot_staging(
+    root: &DirectoryCapability,
+    published_name: &str,
+) -> Result<(OsString, DirectoryCapability), PersistenceError> {
+    let name = OsString::from(format!(".{published_name}.staging-{}", std::process::id()));
+    let child = root.create_child(&name)?;
+    Ok((name, child))
+}
+
+fn combine_persistence_debt(existing: Option<io::Error>, next: io::Error) -> io::Error {
+    match existing {
+        Some(existing) => io::Error::new(
+            next.kind(),
+            format!(
+                "directory sync failed ({existing}); post-publication maintenance failed: {next}"
+            ),
+        ),
+        None => next,
+    }
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
@@ -1444,8 +1668,58 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(windows)]
-pub(crate) fn sync_directory(_path: &Path) -> Result<(), io::Error> {
-    // Stable std cannot open Windows directories with FILE_FLAG_BACKUP_SEMANTICS.
-    // Both payload files are flushed with FlushFileBuffers before the atomic rename.
-    Ok(())
+pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
+    DirectoryCapability::open(path)?.sync()
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn committed_outcome_carries_snapshot_when_post_publication_sync_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        store.inject_directory_sync_failure();
+        let snapshot = Snapshot::parse(
+            b"proxies: []\nproxy-groups: []\nrules: []\n",
+            br#"{"outbounds":[]}"#,
+        )
+        .unwrap();
+
+        let outcome = store.commit_with_generation(snapshot).unwrap();
+        assert!(outcome.maintenance_debt().is_some());
+        let ((generation, committed), debt) = outcome.into_parts();
+        assert_eq!(generation, 1);
+        assert!(debt.is_some());
+        assert!(Arc::ptr_eq(&committed, &store.current().unwrap()));
+    }
+
+    #[test]
+    fn committed_outcome_survives_post_publication_logo_retention_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let mut snapshot = Snapshot::parse(
+            b"proxies: []\nproxy-groups: []\nrules: []\n",
+            br#"{"outbounds":[]}"#,
+        )
+        .unwrap();
+        snapshot.set_service_logo_png(b"persisted logo bytes".to_vec());
+        let first = store.commit(snapshot).unwrap().into_committed();
+        assert!(first.service_logo_path().is_some());
+
+        store.inject_logo_retention_failure();
+        let outcome = store.commit_with_generation((*first).clone()).unwrap();
+        assert!(outcome.maintenance_debt().is_some());
+        let ((generation, committed), debt) = outcome.into_parts();
+        assert_eq!(generation, 2);
+        assert!(debt.is_some());
+        assert!(committed.service_logo_path().is_none());
+        assert!(Arc::ptr_eq(&committed, &store.current().unwrap()));
+        assert!(
+            root.path()
+                .join("snapshot-00000000000000000002/service-logo.png")
+                .is_file()
+        );
+    }
 }

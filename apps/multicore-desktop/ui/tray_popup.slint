@@ -1,0 +1,310 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct TrayMenuRow {
+    id: string,
+    group-id: string,
+    label: string,
+    detail: string,
+    selected: bool,
+    enabled: bool,
+}
+
+component PopupAction inherits Rectangle {
+    in property <string> label;
+    in property <string> marker;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    callback activated();
+
+    height: 38px;
+    border-radius: 7px;
+    background: root.selected ? #4c9dff16 : action-touch.has-hover ? #ffffff0b : transparent;
+    opacity: root.enabled ? 1 : 0.42;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    Text {
+        x: 10px;
+        width: 20px;
+        height: parent.height;
+        text: root.marker;
+        color: root.selected ? Theme.accent-blue : Theme.text-muted;
+        font-family: Theme.emoji-font-family;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: 40px;
+        width: parent.width - 54px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? Theme.text-primary : Theme.text-secondary;
+        font-family: Theme.font-family;
+        font-size: 13px;
+        font-weight: root.selected ? Theme.weight-semibold : Theme.weight-regular;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    action-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: parent.height - 2px;
+            border-radius: 7px;
+            border-width: parent.has-focus ? 1px : 0px;
+            border-color: Theme.focus;
+            background: transparent;
+        }
+        action-touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+component RouteGroupAction inherits Rectangle {
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> expanded: false;
+    in property <bool> enabled: true;
+    callback activated();
+
+    height: 48px;
+    border-radius: 9px;
+    background: root.expanded ? #4c9dff14 : route-group-touch.has-hover ? #ffffff0b : transparent;
+    opacity: root.enabled ? 1 : 0.42;
+    accessible-role: button;
+    accessible-label: root.label + ": " + root.detail;
+    accessible-description: root.expanded ? "Список серверов открыт" : "Открыть список серверов";
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    VerticalLayout {
+        x: 12px;
+        y: 7px;
+        width: parent.width - 42px;
+        height: 34px;
+        spacing: 1px;
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            font-size: 13px;
+            font-weight: Theme.weight-semibold;
+            overflow: elide;
+        }
+        Text {
+            text: root.detail;
+            color: root.expanded ? Theme.accent-blue : Theme.text-muted;
+            font-size: 11px;
+            overflow: elide;
+        }
+    }
+
+    Path {
+        x: parent.width - 24px;
+        y: 20px;
+        width: 10px;
+        height: 7px;
+        viewbox-width: 10;
+        viewbox-height: 7;
+        commands: root.expanded ? "M 1 6 L 5 2 L 9 6" : "M 1 1 L 5 5 L 9 1";
+        stroke: root.expanded ? Theme.accent-blue : Theme.text-muted;
+        stroke-width: 1.5px;
+        fill: transparent;
+    }
+
+    route-group-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: parent.height - 2px;
+            border-radius: 9px;
+            border-width: parent.has-focus ? 1px : 0px;
+            border-color: Theme.focus;
+            background: transparent;
+        }
+        route-group-touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+export component TrayPopup inherits Window {
+    width: 304px;
+    height: 460px;
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    default-font-family: Theme.font-family;
+
+    in property <string> status-text: "Готово";
+    in property <string> connection-label: "Подключиться";
+    in property <bool> connection-enabled: true;
+    in property <[TrayMenuRow]> group-rows;
+    in property <[TrayMenuRow]> node-rows;
+    in-out property <string> expanded-group-id;
+
+    callback toggle-connection();
+    callback select-group(string);
+    callback select-node(string, string);
+    callback open-main();
+    callback exit-app();
+    callback dismiss();
+
+    popup-focus := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.dismiss();
+                return accept;
+            }
+            return reject;
+        }
+
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: parent.height - 2px;
+            background: #15181dfa;
+            border-color: #343a43;
+            border-width: 1px;
+            border-radius: 12px;
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    height: 34px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 7px;
+                        background: #4c9dff18;
+                        Text {
+                            text: "∞";
+                            color: Theme.accent-blue;
+                            font-size: 15px;
+                            font-weight: Theme.weight-semibold;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 1px;
+                        Text { text: "MULTICORE"; color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-bold; letter-spacing: 1px; }
+                        Text { text: root.status-text; color: Theme.text-muted; font-size: 11px; overflow: elide; }
+                    }
+                }
+
+                connect-action := PopupAction {
+                    label: root.connection-label;
+                    marker: "●";
+                    enabled: root.connection-enabled;
+                    selected: root.connection-label == "Отключиться";
+                    activated => { root.toggle-connection(); }
+                }
+
+                Rectangle { height: 1px; vertical-stretch: 0; background: Theme.line; }
+
+                Text {
+                    height: 18px;
+                    vertical-stretch: 0;
+                    text: "МАРШРУТ";
+                    color: Theme.text-muted;
+                    font-size: 10px;
+                    font-weight: Theme.weight-semibold;
+                    letter-spacing: 0.8px;
+                    vertical-alignment: center;
+                }
+
+                route-scroll := ScrollView {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    viewport-width: self.width;
+                    VerticalLayout {
+                        width: route-scroll.viewport-width;
+                        spacing: 2px;
+                        for group in root.group-rows: Rectangle {
+                            height: 48px + (root.expanded-group-id == group.id && group.selected ? root.node-rows.length * 40px + 2px : 0px);
+                            background: transparent;
+                            route-group := RouteGroupAction {
+                                x: 0px;
+                                y: 0px;
+                                width: parent.width;
+                                label: group.label;
+                                detail: group.detail;
+                                expanded: root.expanded-group-id == group.id;
+                                enabled: group.enabled;
+                                activated => {
+                                    if (root.expanded-group-id == group.id) {
+                                        root.expanded-group-id = "";
+                                    } else {
+                                        root.expanded-group-id = group.id;
+                                        if (!group.selected) { root.select-group(group.id); }
+                                    }
+                                }
+                            }
+                            if root.expanded-group-id == group.id && group.selected: VerticalLayout {
+                                x: 12px;
+                                y: 48px;
+                                width: parent.width - 12px;
+                                spacing: 2px;
+                                for node in root.node-rows: PopupAction {
+                                    label: node.label;
+                                    marker: node.selected ? "✓" : "";
+                                    selected: node.selected;
+                                    enabled: node.enabled;
+                                    activated => { root.select-node(node.group-id, node.id); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; vertical-stretch: 0; background: Theme.line; }
+
+                HorizontalLayout {
+                    height: 38px;
+                    vertical-stretch: 0;
+                    spacing: 4px;
+                    PopupAction { horizontal-stretch: 1; label: "Открыть"; marker: "↗"; activated => { root.open-main(); } }
+                    PopupAction { width: 96px; horizontal-stretch: 0; label: "Выйти"; marker: ""; activated => { root.exit-app(); } }
+                }
+            }
+        }
+    }
+}
