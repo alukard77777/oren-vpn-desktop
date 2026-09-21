@@ -24,7 +24,10 @@ pub(crate) struct InstanceGuard {
 }
 
 #[cfg(not(windows))]
-pub(crate) struct InstanceGuard;
+pub(crate) struct InstanceGuard {
+    _lock: std::fs::File,
+    socket: std::path::PathBuf,
+}
 
 pub(crate) fn claim_or_forward(activation: &Activation) -> io::Result<Claim> {
     let preview_scope = cfg!(debug_assertions)
@@ -208,19 +211,128 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{Activation, Claim, InstanceGuard};
-    use std::io;
+    use super::{Activation, Claim, InstanceGuard, MAX_PAYLOAD_LEN, decode_frame, encode_frame};
+    use rustix::fs::{FlockOperation, OFlags, flock};
+    use std::fs::OpenOptions;
+    use std::io::{self, Read, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
     use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const LOCK_NAME: &str = "desktop.lock";
+    const SOCKET_NAME: &str = "desktop.sock";
+    const PREVIEW_LOCK_NAME: &str = "desktop-preview.lock";
+    const PREVIEW_SOCKET_NAME: &str = "desktop-preview.sock";
+    const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+    const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
     pub(super) fn claim_or_forward(
-        _activation: &Activation,
-        _preview_scope: bool,
+        activation: &Activation,
+        preview_scope: bool,
     ) -> io::Result<Claim> {
-        let (_sender, activations) = mpsc::channel();
+        let directory = multicore_platform::dirs::user_runtime_dir()?;
+        claim_or_forward_in(&directory, activation, preview_scope)
+    }
+
+    pub(super) fn claim_or_forward_in(
+        directory: &Path,
+        activation: &Activation,
+        preview_scope: bool,
+    ) -> io::Result<Claim> {
+        let (lock_name, socket_name) = if preview_scope {
+            (PREVIEW_LOCK_NAME, PREVIEW_SOCKET_NAME)
+        } else {
+            (LOCK_NAME, SOCKET_NAME)
+        };
+        let socket = directory.join(socket_name);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+            .open(directory.join(lock_name))?;
+        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                forward(&socket, activation)?;
+                return Ok(Claim::Forwarded);
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        match std::fs::remove_file(&socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let listener = UnixListener::bind(&socket)?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let (sender, activations) = mpsc::channel();
+        thread::Builder::new()
+            .name("multicore-activation-socket".into())
+            .spawn(move || listen(listener, sender))?;
         Ok(Claim::Primary {
-            _guard: InstanceGuard,
+            _guard: InstanceGuard {
+                _lock: lock,
+                socket,
+            },
             activations,
         })
+    }
+
+    fn forward(socket: &Path, activation: &Activation) -> io::Result<()> {
+        let frame = encode_frame(activation).map_err(io::Error::other)?;
+        let started = Instant::now();
+        loop {
+            match UnixStream::connect(socket) {
+                Ok(mut stream) => {
+                    stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
+                    stream.write_all(&frame)?;
+                    stream.flush()?;
+                    return Ok(());
+                }
+                Err(_) if started.elapsed() < FORWARD_TIMEOUT => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn listen(listener: UnixListener, sender: mpsc::Sender<Activation>) {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            if stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).is_err() {
+                continue;
+            }
+            let mut frame = Vec::with_capacity(256);
+            match Read::by_ref(&mut stream)
+                .take((MAX_PAYLOAD_LEN + 5) as u64)
+                .read_to_end(&mut frame)
+            {
+                Ok(_) if frame.len() <= MAX_PAYLOAD_LEN + 4 => {
+                    if let Ok(activation) = decode_frame(&frame)
+                        && sender.send(activation).is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+    }
+
+    impl Drop for InstanceGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
     }
 }
 
@@ -303,5 +415,113 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(payload);
         frame
+    }
+
+    #[cfg(not(windows))]
+    fn primary(claim: std::io::Result<super::Claim>) -> std::sync::mpsc::Receiver<Activation> {
+        match claim.unwrap() {
+            super::Claim::Primary {
+                _guard,
+                activations,
+            } => {
+                std::mem::forget(_guard);
+                activations
+            }
+            super::Claim::Forwarded => panic!("expected the primary instance"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn second_unix_claim_forwards_its_activation_to_the_primary() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let activations = primary(super::platform::claim_or_forward_in(
+            root.path(),
+            &Activation::Show,
+            false,
+        ));
+        let url = Activation::InstallSubscription("https://example.com/sub".into());
+        assert!(matches!(
+            super::platform::claim_or_forward_in(root.path(), &url, false).unwrap(),
+            super::Claim::Forwarded
+        ));
+        assert_eq!(
+            activations.recv_timeout(Duration::from_secs(5)).unwrap(),
+            url
+        );
+
+        let preview = primary(super::platform::claim_or_forward_in(
+            root.path(),
+            &Activation::Show,
+            true,
+        ));
+        assert!(matches!(
+            super::platform::claim_or_forward_in(root.path(), &Activation::Background, true)
+                .unwrap(),
+            super::Claim::Forwarded
+        ));
+        assert_eq!(
+            preview.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Activation::Background
+        );
+        assert!(activations.try_recv().is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stale_unix_socket_without_a_lock_holder_is_replaced() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("desktop.sock"), b"stale").unwrap();
+        let activations = primary(super::platform::claim_or_forward_in(
+            root.path(),
+            &Activation::Show,
+            false,
+        ));
+        assert!(matches!(
+            super::platform::claim_or_forward_in(root.path(), &Activation::Show, false).unwrap(),
+            super::Claim::Forwarded
+        ));
+        assert_eq!(
+            activations.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Activation::Show
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_listener_ignores_invalid_frames_and_keeps_serving() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let activations = primary(super::platform::claim_or_forward_in(
+            root.path(),
+            &Activation::Show,
+            false,
+        ));
+        let socket = root.path().join("desktop.sock");
+        let mut oversized = UnixStream::connect(&socket).unwrap();
+        let _ = oversized.write_all(&vec![0xff; MAX_PAYLOAD_LEN + 64]);
+        drop(oversized);
+        let mut garbage = UnixStream::connect(&socket).unwrap();
+        garbage.write_all(&framed(&[9])).unwrap();
+        drop(garbage);
+        let idle = UnixStream::connect(&socket).unwrap();
+
+        assert!(matches!(
+            super::platform::claim_or_forward_in(root.path(), &Activation::Background, false)
+                .unwrap(),
+            super::Claim::Forwarded
+        ));
+        assert_eq!(
+            activations.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Activation::Background
+        );
+        drop(idle);
     }
 }
