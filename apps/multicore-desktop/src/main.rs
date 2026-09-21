@@ -2929,7 +2929,8 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_has_service_logo(service_logo.is_some());
     ui.set_service_logo(service_logo.unwrap_or_default());
     ui.set_subscription_refresh_available(snapshot.subscription.refresh_available);
-    ui.set_subscription_refresh_enabled(
+    ui.set_subscription_refresh_enabled(presentation.has_profile && !presentation.is_busy);
+    ui.set_subscription_management_enabled(
         presentation.has_profile && !presentation.is_connected && !presentation.is_busy,
     );
     ui.set_subscription_refresh_pending(snapshot.subscription.refresh_pending);
@@ -3313,7 +3314,12 @@ mod window_tests {
             "in property <bool> subscription-updated-stale",
             "updated-meta := Rectangle",
             "text: root.subscription-updated",
+            "subscription-refresh-action := FocusScope",
+            "text: root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
+            "root.refresh-subscription();",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
+            "announcement-strip := Rectangle",
+            "width: Math.min(540px, parent.width - 24px)",
         ] {
             assert!(
                 ui.contains(required),
@@ -3329,6 +3335,8 @@ mod window_tests {
         assert!(!updated_meta.contains("refresh.svg"));
         assert!(!updated_meta.contains("Theme.warning"));
         assert!(!updated_meta.contains("subscription-updated-stale ?"));
+        assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
+        assert!(rust.contains("ui.set_subscription_management_enabled("));
     }
 
     #[test]

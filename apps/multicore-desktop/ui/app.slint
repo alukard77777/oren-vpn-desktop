@@ -406,6 +406,7 @@ export component AppWindow inherits Window {
     in property <string> subscription-announcement-tone: "info";
     in property <bool> subscription-refresh-available: false;
     in property <bool> subscription-refresh-enabled: false;
+    in property <bool> subscription-management-enabled: false;
     in property <bool> subscription-refresh-pending: false;
     in property <string> subscription-refresh-error;
     in property <[UiSubscriptionProfile]> subscription-profiles;
@@ -878,8 +879,6 @@ export component AppWindow inherits Window {
                     }
 
                     subscription-strip := Rectangle {
-                        // Legacy source-contract anchors; profile refresh now lives in
-                        // Settings details: subscription-refresh-action := SmallAction, width: 104px;, padding-right: 5px;, root.refresh-subscription();
                         height: 54px;
                         background: root.profile-menu-open ? Theme.elevated : Theme.surface;
                         border-radius: 16px;
@@ -915,9 +914,9 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 0;
                                 Text {
                                     x: 0px;
-                                    y: 22px;
+                                    y: 25px;
                                     width: parent.width;
-                                    height: 18px;
+                                    height: 16px;
                                     text: root.subscription-updated;
                                     color: Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
@@ -987,48 +986,99 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                        subscription-refresh-action := FocusScope {
+                            x: parent.width - 140px;
+                            y: 5px;
+                            width: 92px;
+                            height: 44px;
+                            enabled: root.subscription-refresh-available
+                                && root.subscription-refresh-enabled
+                                && !root.subscription-refresh-pending;
+                            focus-on-click: true;
+                            focus-on-tab-navigation: true;
+                            accessible-role: button;
+                            accessible-label: root.subscription-refresh-pending ? "Подписка обновляется" : "Обновить подписку";
+                            accessible-enabled: self.enabled;
+                            accessible-action-default => { if (self.enabled) { root.refresh-subscription(); } }
+                            Rectangle {
+                                height: 22px;
+                                border-radius: Theme.radius-small;
+                                background: subscription-refresh-touch.pressed && parent.enabled ? Theme.elevated : subscription-refresh-touch.has-hover && parent.enabled ? #ffffff0d : transparent;
+                                border-color: parent.has-focus ? Theme.focus : Theme.line;
+                                border-width: 1px;
+                                Text {
+                                    text: root.subscription-refresh-pending ? "Обновляем…" : "Обновить";
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.type-metadata-size;
+                                    font-weight: Theme.weight-semibold;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            key-pressed(event) => {
+                                if ((event.text == " " || event.text == "\n") && self.enabled) {
+                                    root.refresh-subscription();
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                            subscription-refresh-touch := TouchArea {
+                                enabled: parent.enabled;
+                                clicked => { root.refresh-subscription(); }
+                            }
+                        }
                     }
 
                     if root.subscription-announcement-text != "": Rectangle {
                         height: 44px;
-                        background: root.subscription-announcement-tone == "danger" ? #211619 : root.subscription-announcement-tone == "success" ? #13231b : #131d29;
-                        border-radius: 12px;
-                        border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
-                        border-width: 1px;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 12px;
-                            padding-top: 7px;
-                            padding-bottom: 7px;
-                            spacing: 10px;
-                            if root.subscription-announcement-tone == "danger": Image {
-                                width: 18px;
-                                height: 18px;
-                                source: @image-url("../assets/announcement-danger.svg");
-                                image-fit: contain;
-                                accessible-role: none;
-                            }
-                            if root.subscription-announcement-tone == "success": Image {
-                                width: 18px;
-                                height: 18px;
-                                source: @image-url("../assets/announcement-success.svg");
-                                image-fit: contain;
-                                accessible-role: none;
-                            }
-                            if root.subscription-announcement-tone != "danger" && root.subscription-announcement-tone != "success": Image {
-                                width: 18px;
-                                height: 18px;
-                                source: @image-url("../assets/announcement-info.svg");
-                                image-fit: contain;
-                                accessible-role: none;
-                            }
-                            Text {
-                                text: root.subscription-announcement-text;
-                                color: Theme.text-secondary;
-                                font-size: Theme.type-metadata-size;
-                                wrap: word-wrap;
-                                overflow: elide;
-                                vertical-alignment: center;
+                        background: transparent;
+                        announcement-strip := Rectangle {
+                            x: Math.max(12px, (parent.width - Math.min(540px, parent.width - 24px)) / 2);
+                            width: Math.min(540px, parent.width - 24px);
+                            height: 44px;
+                            background: root.subscription-announcement-tone == "danger" ? #211619 : root.subscription-announcement-tone == "success" ? #13231b : #131d29;
+                            border-radius: 12px;
+                            border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
+                            border-width: 1px;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                padding-top: 7px;
+                                padding-bottom: 7px;
+                                spacing: 8px;
+                                announcement-icon := Rectangle {
+                                    width: 18px;
+                                    height: 30px;
+                                    background: transparent;
+                                    if root.subscription-announcement-tone == "danger": Image {
+                                        x: 0px; y: 6px; width: 18px; height: 18px;
+                                        source: @image-url("../assets/announcement-danger.svg");
+                                        image-fit: contain;
+                                        accessible-role: none;
+                                    }
+                                    if root.subscription-announcement-tone == "success": Image {
+                                        x: 0px; y: 6px; width: 18px; height: 18px;
+                                        source: @image-url("../assets/announcement-success.svg");
+                                        image-fit: contain;
+                                        accessible-role: none;
+                                    }
+                                    if root.subscription-announcement-tone != "danger" && root.subscription-announcement-tone != "success": Image {
+                                        x: 0px; y: 6px; width: 18px; height: 18px;
+                                        source: @image-url("../assets/announcement-info.svg");
+                                        image-fit: contain;
+                                        accessible-role: none;
+                                    }
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    height: 30px;
+                                    text: root.subscription-announcement-text;
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.type-metadata-size;
+                                    wrap: word-wrap;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
                     }
@@ -1323,7 +1373,7 @@ export component AppWindow inherits Window {
                                         if profile.active: Path { x: parent.width - 172px; y: 29px; width: 16px; height: 12px; viewbox-width: 16; viewbox-height: 12; commands: "M 2 6 L 6 10 L 14 2"; stroke: Theme.accent-blue; stroke-width: 1.8px; fill: transparent; }
                                         if !profile.active: activate-profile-focus := FocusScope {
                                             x: parent.width - 192px; y: 16px; width: 40px; height: 40px;
-                                            enabled: root.subscription-refresh-enabled && root.profile-pending-operation == "none";
+                                            enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Сделать активной " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.activate-profile(profile.id); } }
@@ -1346,7 +1396,7 @@ export component AppWindow inherits Window {
                                         }
                                         edit-profile-focus := FocusScope {
                                             x: parent.width - 96px; y: 16px; width: 40px; height: 40px;
-                                            enabled: root.subscription-refresh-enabled && root.profile-pending-operation == "none";
+                                            enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Изменить URL " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }

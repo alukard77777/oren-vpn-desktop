@@ -609,7 +609,7 @@ async fn unavailable_active_profile_keeps_authoritative_id_and_another_can_be_ac
 }
 
 #[tokio::test]
-async fn connected_profile_mutations_are_rejected_without_hot_swap() {
+async fn connected_refresh_and_delete_are_safe_and_activation_stays_blocked() {
     let root = tempfile::tempdir().unwrap();
     let backend = profile_backend(root.path());
     let first_id = backend
@@ -620,21 +620,49 @@ async fn connected_profile_mutations_are_rejected_without_hot_swap() {
         .unwrap()
         .active_profile_id
         .unwrap();
+    let second_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
     backend.connect().await.unwrap();
     assert_eq!(
         backend.activate_subscription(&profile_id(&first_id)).await,
         Err(ProfileMutationError::Connected)
     );
+
+    let inactive_refresh = backend
+        .refresh_subscription_profile(&profile_id(&first_id))
+        .await
+        .unwrap();
+    assert_eq!(inactive_refresh.state, ConnectionState::Connected);
+    let inactive_delete = backend
+        .delete_subscription(&profile_id(&first_id))
+        .await
+        .unwrap();
+    assert_eq!(inactive_delete.state, ConnectionState::Connected);
     assert_eq!(
-        backend.delete_subscription(&profile_id(&first_id)).await,
-        Err(ProfileMutationError::Connected)
+        inactive_delete.active_profile_id.as_deref(),
+        Some(second_id.as_str())
     );
-    assert_eq!(
-        backend
-            .refresh_subscription_profile(&profile_id(&first_id))
-            .await,
-        Err(ProfileMutationError::Connected)
-    );
+
+    let active_refresh = backend
+        .refresh_subscription_profile(&profile_id(&second_id))
+        .await
+        .unwrap();
+    assert_eq!(active_refresh.state, ConnectionState::Ready);
+    backend.connect().await.unwrap();
+    let home_refresh = Backend::refresh_subscription(&backend).await.unwrap();
+    assert_eq!(home_refresh.state, ConnectionState::Ready);
+    backend.connect().await.unwrap();
+    let active_delete = backend
+        .delete_subscription(&profile_id(&second_id))
+        .await
+        .unwrap();
+    assert_eq!(active_delete.state, ConnectionState::Empty);
 }
 
 #[tokio::test]

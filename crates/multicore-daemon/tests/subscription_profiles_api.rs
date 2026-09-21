@@ -366,7 +366,7 @@ async fn invalid_and_unknown_ids_are_redacted_not_found_even_while_connected() {
 }
 
 #[tokio::test]
-async fn connected_profile_mutations_return_profile_busy() {
+async fn connected_refresh_and_delete_succeed_while_activation_stays_busy() {
     let app = app();
     let id = import(&app, "https://first.invalid/sub")
         .await
@@ -377,23 +377,52 @@ async fn connected_profile_mutations_return_profile_busy() {
         .await
         .unwrap();
 
-    for (method, suffix) in [
-        (Method::PUT, format!("{id}/activate")),
-        (Method::POST, format!("{id}/refresh")),
-        (Method::DELETE, id.clone()),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(request(
-                method,
-                &format!("/v1/subscriptions/{suffix}"),
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(json_body(response).await["code"], "profile_busy");
-    }
+    let activation = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            &format!("/v1/subscriptions/{id}/activate"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(activation.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(activation).await["code"], "profile_busy");
+
+    let refresh = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            &format!("/v1/subscriptions/{id}/refresh"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refresh.status(), StatusCode::OK);
+    let status = app
+        .clone()
+        .oneshot(request(Method::GET, "/v1/status", Body::empty()))
+        .await
+        .unwrap();
+    let status: StatusDto = serde_json::from_value(json_body(status).await).unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+
+    app.clone()
+        .oneshot(request(Method::POST, "/v1/connect", Body::empty()))
+        .await
+        .unwrap();
+    let deletion = app
+        .clone()
+        .oneshot(request(
+            Method::DELETE,
+            &format!("/v1/subscriptions/{id}"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deletion.status(), StatusCode::OK);
+    let deleted: StatusDto = serde_json::from_value(json_body(deletion).await).unwrap();
+    assert_eq!(deleted.state, ConnectionState::Empty);
 }
 
 #[tokio::test]

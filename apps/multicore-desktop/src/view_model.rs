@@ -802,7 +802,7 @@ impl DesktopViewModel {
         &mut self,
         profile_id: &str,
     ) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, false) {
+        if !self.profile_mutation_preflight(profile_id, false, false) {
             return None;
         }
         if self.active_profile_id.as_deref() == Some(profile_id) {
@@ -852,7 +852,7 @@ impl DesktopViewModel {
         &mut self,
         profile_id: &str,
     ) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, true) {
+        if !self.profile_mutation_preflight(profile_id, true, true) {
             return None;
         }
         Some(self.next_profile_mutation(
@@ -929,7 +929,7 @@ impl DesktopViewModel {
             self.profile_error = Some("Введите корректный HTTP(S) URL.".into());
             return None;
         }
-        if !self.profile_mutation_preflight(profile_id, false) {
+        if !self.profile_mutation_preflight(profile_id, false, false) {
             return None;
         }
         Some(self.next_profile_mutation(
@@ -994,7 +994,7 @@ impl DesktopViewModel {
     }
 
     pub(crate) fn begin_profile_delete(&mut self, profile_id: &str) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, false) {
+        if !self.profile_mutation_preflight(profile_id, false, true) {
             return None;
         }
         Some(self.next_profile_mutation(
@@ -1100,11 +1100,15 @@ impl DesktopViewModel {
             .flatten()
     }
 
-    fn profile_mutation_preflight(&mut self, profile_id: &str, requires_available: bool) -> bool {
-        if matches!(
-            self.state,
-            UiState::Connected { .. } | UiState::Connecting { .. }
-        ) {
+    fn profile_mutation_preflight(
+        &mut self,
+        profile_id: &str,
+        requires_available: bool,
+        allow_connected: bool,
+    ) -> bool {
+        if matches!(self.state, UiState::Connecting { .. })
+            || (!allow_connected && matches!(self.state, UiState::Connected { .. }))
+        {
             self.profile_error = Some("Отключитесь перед изменением подписки.".into());
             return false;
         }
@@ -1382,10 +1386,7 @@ impl DesktopViewModel {
             || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
-            || matches!(
-                self.state,
-                UiState::Connected { .. } | UiState::Connecting { .. }
-            )
+            || matches!(self.state, UiState::Connecting { .. })
             || !self
                 .subscription
                 .as_ref()
@@ -3395,7 +3396,7 @@ mod tests {
     }
 
     #[test]
-    fn connected_profile_mutations_are_rejected_before_a_request_token_exists() {
+    fn connected_profile_refresh_and_delete_issue_tokens_but_activation_stays_blocked() {
         let mut model = model_with_profiles();
         let refresh = model.begin_refresh();
         model.finish_refresh(
@@ -3409,11 +3410,20 @@ mod tests {
         );
 
         assert!(model.begin_profile_activation("profile-b").is_none());
-        assert!(model.begin_profile_delete("profile-b").is_none());
-        assert!(model.begin_profile_target_refresh("profile-b").is_none());
-        let error = model.profile_presentation().error.expect("inline error");
-        assert!(error.chars().count() < 128);
-        assert!(!error.contains("profile-b"));
+        assert!(model.begin_profile_target_refresh("profile-b").is_some());
+
+        let mut deletion = model_with_profiles();
+        let refresh = deletion.begin_refresh();
+        deletion.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Alpha".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert!(deletion.begin_profile_delete("profile-b").is_some());
     }
 
     #[test]
@@ -3828,6 +3838,33 @@ mod tests {
             })
         ));
         assert!(view_model.latency_presentation().queued);
+    }
+
+    #[test]
+    fn connected_home_subscription_refresh_starts_and_applies_disconnected_status() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        view_model.state = UiState::Connected {
+            profile: "Тестовый".into(),
+            node: "Авто".into(),
+        };
+        view_model.subscription = Some(DaemonSubscriptionInfo {
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+
+        let refresh = view_model
+            .begin_subscription_refresh()
+            .expect("connected refresh");
+        assert!(view_model.finish_subscription_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Авто".into()),
+                ..DaemonStatus::default()
+            })
+        ));
+        assert!(matches!(view_model.state, UiState::Ready { .. }));
     }
 
     #[test]
@@ -5749,8 +5786,7 @@ mod tests {
         assert!(connection_strip.contains("if (root.primary-enabled)"));
         assert!(connection_strip.contains("root.primary-action();"));
         assert!(connection_strip.contains("strip-glow-touch.pressed"));
-        assert!(source.contains("subscription-refresh-action := SmallAction"));
-        assert!(source.contains("width: 104px;"));
+        assert!(source.contains("subscription-refresh-action := FocusScope"));
         let subscription_strip = source
             .split("subscription-strip := Rectangle")
             .nth(1)
@@ -5761,7 +5797,12 @@ mod tests {
             })
             .expect("subscription strip source");
         assert!(subscription_strip.contains("border-radius: 16px;"));
-        assert!(subscription_strip.contains("padding-right: 5px;"));
+        assert!(subscription_strip.contains("x: parent.width - 140px;"));
+        assert!(subscription_strip.contains("width: 92px;"));
+        assert!(subscription_strip.contains("height: 44px;"));
+        assert!(subscription_strip.contains("accessible-label: root.subscription-refresh-pending"));
+        assert!(subscription_strip.contains("root.refresh-subscription();"));
+        assert!(subscription_strip.contains("padding-right: 16px;"));
         assert!(subscription_strip.contains("padding-top: 5px;"));
         assert!(subscription_strip.contains("padding-bottom: 5px;"));
         assert!(subscription_strip.contains("subscription-copy := VerticalLayout"));
