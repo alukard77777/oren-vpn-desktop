@@ -48,9 +48,9 @@ foreach ($token in @(
     'mihomo-source.zip',
     'gh release create',
     '--repo fatyzzz/multicore-releases',
-    '--draft',
-    'Create unsigned preview as draft',
-    'Keep this release as a draft'
+    '--latest',
+    'Publish release to update channel',
+    'PUBLIC UNSIGNED PREVIEW'
 )) {
     Assert-True ($workflow.Contains($token)) "release workflow is missing: $token"
 }
@@ -60,6 +60,7 @@ Assert-True (-not $workflow.Contains('MULTICORE_DAEMON_TOKEN')) 'release workflo
 Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-repository release must not use the source repository token'
 Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must not publish the draft release'
 Assert-True (-not $workflow.Contains('--draft=false')) 'unsigned workflow must not clear draft state'
+Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be public rather than draft'
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'
 
 $packageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x64.zip', [StringComparison]::Ordinal)

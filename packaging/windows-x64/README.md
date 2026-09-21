@@ -38,12 +38,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-
 The updater accepts the latest public, non-draft `vX.Y.Z` GitHub Release, requires
 the asset name `multicore-windows-x64.zip` and GitHub `sha256:` digest, then also
 verifies this package's internal checksums before replacing the full bundle.
-The application source repository is private; the public release-only repository
-contains binary releases so installed clients can update anonymously without an
-embedded GitHub credential.
+The public release-only repository contains binary releases so installed clients
+can update anonymously without an embedded GitHub credential.
 
 This preview is not Authenticode-signed, and its elevated binaries are stored in
-a user-writable directory. Do not publish it as a stable production update.
+a user-writable directory. Public releases must stay clearly labeled as unsigned
+previews until the production signing boundary is complete.
 Public distribution also requires protected signing/release procedures,
 immutable corresponding-source artifacts for the bundled cores, fulfillment of
 MPL-2.0/GPL-3.0 obligations, and a complete Rust dependency/license inventory.

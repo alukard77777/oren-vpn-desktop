@@ -159,12 +159,13 @@ Create the per-user installer from that bundle:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
   -PackagePath dist\multicore-windows-x64 `
   -OutputDirectory dist\release `
-  -AppVersion 0.1.2
+  -AppVersion 0.1.3
 ```
 
-The tag workflow builds and verifies artifacts but leaves the GitHub Release as
-a draft. Do not publish an unsigned draft as a stable update. Public production
-release requires Authenticode signing, protected release credentials, a public
-anonymous asset, immutable corresponding source for the bundled cores, and a
+Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes
+them to `fatyzzz/multicore-releases`; installed clients read that public channel
+anonymously. Current releases are explicitly unsigned previews. A hardened
+production release still requires Authenticode signing, protected release
+credentials, immutable corresponding source for the bundled cores, and a
 complete Rust dependency/license inventory. The current third-party notice is
 explicitly incomplete for the Rust dependency graph.
