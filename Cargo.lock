@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "multicore-desktop"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "embed-resource",
  "getrandom 0.4.3",

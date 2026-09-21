@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PackagePath,
     [string]$OutputDirectory = 'dist\release',
-    [string]$AppVersion = '0.1.4',
+    [string]$AppVersion = '0.1.5',
     [string]$CompilerPath,
     [switch]$ValidateOnly
 )

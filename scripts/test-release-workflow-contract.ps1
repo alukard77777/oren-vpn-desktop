@@ -41,7 +41,6 @@ foreach ($token in @(
     'cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact',
     'smoke-test-one-click.ps1',
     '-PackagePath dist/release/multicore-windows-x64',
-    '-Background',
     'build-windows-installer.ps1',
     'smoke-test-windows-installed-update.ps1',
     'Xray-core-source.zip',
@@ -65,8 +64,9 @@ Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI 
 
 $packageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x64.zip', [StringComparison]::Ordinal)
 $realBundleIndex = $workflow.IndexOf('$env:MULTICORE_RELEASE_BUNDLE', [StringComparison]::Ordinal)
-$backgroundSmokeIndex = $workflow.IndexOf('smoke-test-one-click.ps1', [StringComparison]::Ordinal)
+$portableSmokeIndex = $workflow.IndexOf('smoke-test-one-click.ps1', [StringComparison]::Ordinal)
 Assert-True ($packageIndex -ge 0 -and $realBundleIndex -gt $packageIndex) 'real updater bundle contract must run after release ZIP creation'
-Assert-True ($backgroundSmokeIndex -gt $packageIndex) 'background one-click smoke must run after portable package creation'
+Assert-True ($portableSmokeIndex -gt $packageIndex) 'one-click smoke must run after portable package creation'
+Assert-True (-not $workflow.Contains('-Background')) 'non-interactive release CI must use the foreground one-click smoke; background tray startup is a manual gate'
 
 Write-Output 'PASS: GitHub release workflow contract'

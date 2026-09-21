@@ -84,8 +84,7 @@ jobs:
           $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x64.zip').Path
           cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-one-click.ps1 `
-            -PackagePath dist/release/multicore-windows-x64 `
-            -Background
+            -PackagePath dist/release/multicore-windows-x64
 
       - name: Install pinned Inno Setup
         shell: pwsh
