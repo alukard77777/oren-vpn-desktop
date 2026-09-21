@@ -2,7 +2,9 @@
 
 mod app_icon;
 mod bootstrap;
+mod clipboard_text;
 mod daemon;
+mod logo_cache;
 mod preferences;
 mod single_instance;
 mod tray;
@@ -14,7 +16,6 @@ mod windows_shell;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -498,6 +499,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
 
     let ui = AppWindow::new()?;
+    let _logo_cache_session = logo_cache::LogoCacheSession::install();
     if preference_writer
         .lock()
         .expect("preference writer lock")
@@ -525,6 +527,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
     wire_import(&ui, model.clone(), profile_preferences.clone());
+    wire_clipboard_import(&ui, model.clone());
     wire_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
     let _subscription_refresh_timer =
         wire_automatic_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
@@ -1725,6 +1728,42 @@ fn wire_import(
     });
 }
 
+fn wire_clipboard_import(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    let paste_model = model.clone();
+    ui.on_paste_subscription(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match clipboard_text::read_subscription_text() {
+            Ok(url) => {
+                ui.set_subscription_draft(url.clone().into());
+                ui.invoke_import_url(url.into());
+            }
+            Err(error) => {
+                let current = {
+                    let mut model = paste_model.lock().expect("view model lock");
+                    model.set_import_error_message(error.user_message());
+                    snapshot(&model)
+                };
+                apply_snapshot(&ui, &current);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_dismiss_first_run_import(move || {
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.dismiss_import_error();
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+    });
+}
+
 fn wire_subscription_refresh(
     ui: &AppWindow,
     model: Arc<Mutex<DesktopViewModel>>,
@@ -2921,29 +2960,27 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
     ui.set_subscription_announcement_tone(snapshot.subscription.announcement_tone.clone().into());
-    let service_logo = snapshot
+    let referenced_logo_paths = snapshot
         .subscription
         .service_logo_path
-        .as_deref()
-        .and_then(|path| slint::Image::load_from_path(Path::new(path)).ok());
-    ui.set_has_service_logo(service_logo.is_some());
-    ui.set_service_logo(service_logo.unwrap_or_default());
-    ui.set_subscription_refresh_available(snapshot.subscription.refresh_available);
-    ui.set_subscription_refresh_enabled(presentation.has_profile && !presentation.is_busy);
-    ui.set_subscription_management_enabled(
-        presentation.has_profile && !presentation.is_connected && !presentation.is_busy,
-    );
-    ui.set_subscription_refresh_pending(snapshot.subscription.refresh_pending);
-    ui.set_subscription_refresh_error(
-        snapshot
+        .iter()
+        .map(String::as_str)
+        .chain(
+            snapshot
+                .profiles
+                .profiles
+                .iter()
+                .filter_map(|profile| profile.service_logo_path.as_deref()),
+        )
+        .collect::<Vec<_>>();
+    let (service_logo, subscription_profiles) = logo_cache::with_logo_cache(|cache| {
+        cache.retain_paths(referenced_logo_paths.iter().copied());
+        let service_logo = snapshot
             .subscription
-            .error
-            .clone()
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_subscription_profiles(ModelRc::new(VecModel::from(
-        snapshot
+            .service_logo_path
+            .as_deref()
+            .and_then(|path| cache.image_for_path(path));
+        let profiles = snapshot
             .profiles
             .profiles
             .iter()
@@ -2951,7 +2988,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                 let logo = profile
                     .service_logo_path
                     .as_deref()
-                    .and_then(|path| slint::Image::load_from_path(Path::new(path)).ok());
+                    .and_then(|path| cache.image_for_path(path));
                 UiSubscriptionProfile {
                     id: profile.id.clone().into(),
                     title: profile.title.clone().into(),
@@ -2970,8 +3007,26 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                         .into(),
                 }
             })
-            .collect::<Vec<_>>(),
-    )));
+            .collect::<Vec<_>>();
+        (service_logo, profiles)
+    });
+    ui.set_has_service_logo(service_logo.is_some());
+    ui.set_service_logo(service_logo.unwrap_or_default());
+    ui.set_subscription_refresh_available(snapshot.subscription.refresh_available);
+    ui.set_subscription_refresh_enabled(presentation.has_profile && !presentation.is_busy);
+    ui.set_subscription_management_enabled(
+        presentation.has_profile && !presentation.is_connected && !presentation.is_busy,
+    );
+    ui.set_subscription_refresh_pending(snapshot.subscription.refresh_pending);
+    ui.set_subscription_refresh_error(
+        snapshot
+            .subscription
+            .error
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_subscription_profiles(ModelRc::new(VecModel::from(subscription_profiles)));
     ui.set_profile_menu_loading(snapshot.profiles.loading);
     ui.set_profile_menu_error(snapshot.profiles.error.clone().unwrap_or_default().into());
     ui.set_profile_pending_operation(
@@ -4362,5 +4417,32 @@ mod window_tests {
             secondary.find("model.open_panel(Panel::None)").unwrap()
                 < secondary.find("prefill_subscription(&ui, url)").unwrap()
         );
+    }
+
+    #[test]
+    fn first_run_clipboard_action_reuses_the_import_pipeline() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("wire_clipboard_import(&ui, model.clone());"));
+
+        let wiring = source
+            .split("fn wire_clipboard_import(")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_subscription_refresh(").next())
+            .expect("clipboard import wiring");
+        for required in [
+            "ui.on_paste_subscription",
+            "ui.on_dismiss_first_run_import",
+            "clipboard_text::read_subscription_text()",
+            "ui.set_subscription_draft",
+            "ui.invoke_import_url",
+            "model.set_import_error_message(error.user_message())",
+            "apply_snapshot(&ui, &current)",
+            "model.dismiss_import_error()",
+        ] {
+            assert!(
+                wiring.contains(required),
+                "missing clipboard wiring: {required}"
+            );
+        }
     }
 }

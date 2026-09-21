@@ -447,9 +447,13 @@ export component AppWindow inherits Window {
     private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
     in-out property <bool> replace-editor-open: false;
     in-out property <int> import-success-serial: 0;
+    in-out property <bool> first-run-manual-open: false;
+    private property <int> first-run-input-focus-serial: 0;
+    private property <int> first-run-trigger-focus-serial: 0;
+    private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
     in property <bool> update-runtime-safe: false;
-    in property <string> update-status: "MultiCore 0.1.5";
+    in property <string> update-status: "MultiCore 0.1.6";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
@@ -474,6 +478,8 @@ export component AppWindow inherits Window {
     in-out property <string> subscription-draft;
 
     callback import-url(string);
+    callback paste-subscription();
+    callback dismiss-first-run-import();
     callback refresh-subscription();
     callback open-profile-menu();
     callback close-profile-menu();
@@ -522,7 +528,15 @@ export component AppWindow inherits Window {
     changed import-success-serial => {
         if (root.import-success-serial > 0) {
             root.replace-editor-open = false;
+            root.first-run-manual-open = false;
             root.subscription-draft = "";
+            if (root.has-profile && root.visible-page == "home") {
+                if (root.primary-enabled) {
+                    root.power-action-focus-serial += 1;
+                } else {
+                    root.profile-shelf-focus-serial += 1;
+                }
+            }
         }
     }
 
@@ -546,7 +560,12 @@ export component AppWindow inherits Window {
         height: parent.height - 2 * root.resize-border;
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                if (root.profile-delete-confirm-id != "") {
+                if (!root.has-profile && root.first-run-manual-open) {
+                    root.first-run-manual-open = false;
+                    root.subscription-draft = "";
+                    root.dismiss-first-run-import();
+                    root.first-run-trigger-focus-serial += 1;
+                } else if (root.profile-delete-confirm-id != "") {
                     root.profile-delete-control-focus-id = root.profile-delete-confirm-id;
                     root.profile-delete-confirm-id = "";
                     root.profile-delete-control-focus-serial += 1;
@@ -701,7 +720,11 @@ export component AppWindow inherits Window {
                     spacing: 10px;
 
                     connection-strip := Rectangle {
-                        height: 96px;
+                        height: root.has-profile
+                            ? 96px
+                            : root.first-run-manual-open
+                                ? (root.import-error == "" ? 174px : 200px)
+                                : (root.import-error == "" ? 124px : 150px);
                         background: root.status-tone == "success" ? #101a16 : root.status-tone == "danger" ? #1a1215 : #101721;
                         border-color: root.status-tone == "success" ? #3ccb7f66 : root.status-tone == "danger" ? #f06a6a66 : #4c9dff55;
                         border-width: 1px;
@@ -768,14 +791,15 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        HorizontalLayout {
+                        if root.has-profile: HorizontalLayout {
                             padding-left: 14px;
                             padding-right: 14px;
                             padding-top: 12px;
                             padding-bottom: 12px;
                             spacing: 16px;
                             alignment: start;
-                            if root.has-profile: power-action := FocusScope {
+                            power-action := FocusScope {
+                                property <int> focus-epoch: root.power-action-focus-serial;
                                 width: 72px;
                                 height: 72px;
                                 enabled: root.primary-enabled && !root.profile-menu-open;
@@ -784,6 +808,11 @@ export component AppWindow inherits Window {
                                 accessible-role: button;
                                 accessible-label: root.primary-label;
                                 accessible-enabled: self.enabled;
+                                changed focus-epoch => {
+                                    if (self.focus-epoch > 0 && root.has-profile && root.visible-page == "home" && self.enabled) {
+                                        self.focus();
+                                    }
+                                }
                                 accessible-action-default => {
                                     if (root.primary-enabled) {
                                         root.primary-action();
@@ -848,16 +877,97 @@ export component AppWindow inherits Window {
                                 Text { text: root.headline; color: Theme.text-primary; font-size: 18px; font-weight: Theme.weight-semibold; overflow: elide; }
                                 Text { text: root.node-name + (root.supporting == "" ? "" : " · " + root.supporting); color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
                             }
-                            if !root.has-profile: PrimaryAction {
-                                width: 164px;
-                                label: "Добавить URL";
-                                state-label: "Добавить подписку";
-                                enabled: !root.import-pending && !root.profile-menu-open;
-                                activated => {
-                                    root.local-page = "settings";
-                                    root.replace-editor-open = true;
-                                    root.close-panel();
+                        }
+
+                        if !root.has-profile: first-run-onboarding := VerticalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            padding-top: 12px;
+                            padding-bottom: 12px;
+                            spacing: 8px;
+
+                            onboarding-copy := VerticalLayout {
+                                spacing: 2px;
+                                Text {
+                                    text: "Добавьте подписку";
+                                    color: Theme.text-primary;
+                                    font-size: 18px;
+                                    font-weight: Theme.weight-semibold;
+                                    overflow: elide;
+                                    accessible-role: text;
                                 }
+                                Text {
+                                    text: "Ссылка хранится локально на этом устройстве";
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.type-metadata-size;
+                                    overflow: elide;
+                                    accessible-role: text;
+                                }
+                            }
+
+                            first-run-actions := HorizontalLayout {
+                                spacing: 10px;
+                                PrimaryAction {
+                                    width: 184px;
+                                    label: root.import-pending ? "Добавляем…" : "Вставить из буфера";
+                                    state-label: "Вставить подписку из буфера обмена";
+                                    enabled: !root.import-pending;
+                                    activated => { root.paste-subscription(); }
+                                }
+                                SmallAction {
+                                    width: 136px;
+                                    label: "Ввести вручную";
+                                    selected: root.first-run-manual-open;
+                                    enabled: !root.import-pending;
+                                    focus-epoch: root.first-run-trigger-focus-serial;
+                                    activated => {
+                                        root.first-run-manual-open = true;
+                                        root.first-run-input-focus-serial += 1;
+                                    }
+                                }
+                            }
+
+                            if root.first-run-manual-open: HorizontalLayout {
+                                spacing: 8px;
+                                first-run-url-input := LineEdit {
+                                    horizontal-stretch: 1;
+                                    property <int> focus-serial: root.first-run-input-focus-serial;
+                                    text <=> root.subscription-draft;
+                                    placeholder-text: "https://example.com/subscription";
+                                    enabled: !root.import-pending;
+                                    accessible-label: "URL подписки";
+                                    init => { self.focus(); }
+                                    changed focus-serial => { self.focus(); }
+                                    accepted => {
+                                        if (!root.import-pending && root.subscription-draft != "") {
+                                            root.import-url(root.subscription-draft);
+                                        }
+                                    }
+                                }
+                                SmallAction {
+                                    label: root.import-pending ? "Добавляем…" : "Добавить";
+                                    enabled: !root.import-pending && root.subscription-draft != "";
+                                    activated => { root.import-url(root.subscription-draft); }
+                                }
+                                SmallAction {
+                                    label: "Отмена";
+                                    enabled: !root.import-pending;
+                                    activated => {
+                                        root.first-run-manual-open = false;
+                                        root.subscription-draft = "";
+                                        root.dismiss-first-run-import();
+                                        root.first-run-trigger-focus-serial += 1;
+                                    }
+                                }
+                            }
+
+                            if root.import-error != "": Text {
+                                text: root.import-error;
+                                color: Theme.error;
+                                font-size: Theme.type-metadata-size;
+                                wrap: word-wrap;
+                                accessible-role: text;
+                                accessible-live-region: polite;
                             }
                         }
 

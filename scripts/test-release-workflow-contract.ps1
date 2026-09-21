@@ -33,13 +33,14 @@ foreach ($token in @(
     'MultiCore-Setup-x64.exe',
     'test-windows-installer-contract.ps1',
     'test-smoke-test-one-click-contract.ps1',
+    'test-packaged-daemon-smoke-contract.ps1',
     '-DesktopExecutablePath dist/release/multicore-windows-x64/MultiCore.exe',
     '-DaemonExecutablePath dist/release/multicore-windows-x64/runtime/multicore-daemon.exe',
     '-UpdaterExecutablePath dist/release/multicore-windows-x64/runtime/multicore-updater.exe',
     '-CoreHostExecutablePath dist/release/multicore-windows-x64/runtime/multicore-core-host.exe',
     '$env:MULTICORE_RELEASE_BUNDLE',
     'cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact',
-    'smoke-test-one-click.ps1',
+    'smoke-test-packaged-daemon.ps1',
     '-PackagePath dist/release/multicore-windows-x64',
     'build-windows-installer.ps1',
     'smoke-test-windows-installed-update.ps1',
@@ -61,12 +62,13 @@ Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must
 Assert-True (-not $workflow.Contains('--draft=false')) 'unsigned workflow must not clear draft state'
 Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be public rather than draft'
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'
+Assert-True ($ci.Contains('test-packaged-daemon-smoke-contract.ps1')) 'normal CI must run the packaged daemon smoke contract'
 
 $packageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x64.zip', [StringComparison]::Ordinal)
 $realBundleIndex = $workflow.IndexOf('$env:MULTICORE_RELEASE_BUNDLE', [StringComparison]::Ordinal)
-$portableSmokeIndex = $workflow.IndexOf('smoke-test-one-click.ps1', [StringComparison]::Ordinal)
+$daemonSmokeIndex = $workflow.IndexOf('smoke-test-packaged-daemon.ps1', [StringComparison]::Ordinal)
 Assert-True ($packageIndex -ge 0 -and $realBundleIndex -gt $packageIndex) 'real updater bundle contract must run after release ZIP creation'
-Assert-True ($portableSmokeIndex -gt $packageIndex) 'one-click smoke must run after portable package creation'
-Assert-True (-not $workflow.Contains('-Background')) 'non-interactive release CI must use the foreground one-click smoke; background tray startup is a manual gate'
+Assert-True ($daemonSmokeIndex -gt $packageIndex) 'headless daemon smoke must run after portable package creation'
+Assert-True (-not $workflow.Contains('-File scripts/smoke-test-one-click.ps1')) 'hosted release CI must not require a GUI session'
 
 Write-Output 'PASS: GitHub release workflow contract'

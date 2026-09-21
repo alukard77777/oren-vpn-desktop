@@ -14,6 +14,7 @@ use crate::daemon::{
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
 const MAX_SUBSCRIPTION_PROFILES: usize = 16;
+pub(crate) const MAX_SUBSCRIPTION_URL_BYTES: usize = 8_192;
 const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -728,6 +729,14 @@ impl DesktopViewModel {
         self.import_error.as_deref()
     }
 
+    pub(crate) fn set_import_error_message(&mut self, message: &'static str) {
+        self.import_error = Some(message.to_owned());
+    }
+
+    pub(crate) fn dismiss_import_error(&mut self) {
+        self.import_error = None;
+    }
+
     pub(crate) fn daemon_client(&self) -> Arc<dyn DaemonClient> {
         self.client.clone()
     }
@@ -923,9 +932,7 @@ impl DesktopViewModel {
         profile_id: &str,
         url: &str,
     ) -> Option<ProfileRequestToken> {
-        let valid = reqwest::Url::parse(url.trim())
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
-        if !valid {
+        if !valid_subscription_url(url) {
             self.profile_error = Some("Введите корректный HTTP(S) URL.".into());
             return None;
         }
@@ -1528,9 +1535,7 @@ impl DesktopViewModel {
             self.import_error = Some("Дождитесь завершения операции подключения.".into());
             return None;
         }
-        let valid = reqwest::Url::parse(url.trim())
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
-        if !valid {
+        if !valid_subscription_url(url) {
             self.import_error = Some("Введите корректный HTTP(S) URL.".into());
             return None;
         }
@@ -2654,6 +2659,13 @@ fn safe_profile_id(value: &str) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')))
     .then(|| value.to_owned())
+}
+
+fn valid_subscription_url(value: &str) -> bool {
+    let value = value.trim();
+    value.len() <= MAX_SUBSCRIPTION_URL_BYTES
+        && reqwest::Url::parse(value)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 #[allow(dead_code)] // Used by profile presentation methods wired in Task 6.
@@ -5710,10 +5722,143 @@ mod tests {
     }
 
     #[test]
+    fn first_run_home_uses_inline_subscription_onboarding() {
+        let source = include_str!("../ui/app.slint");
+        let onboarding = source
+            .split("first-run-onboarding := VerticalLayout")
+            .nth(1)
+            .and_then(|source| source.split("strip-glow-touch := TouchArea").next())
+            .expect("inline first-run onboarding block");
+
+        for required in [
+            "callback paste-subscription();",
+            "callback dismiss-first-run-import();",
+            "in-out property <bool> first-run-manual-open: false;",
+            "private property <int> first-run-input-focus-serial: 0;",
+            "private property <int> first-run-trigger-focus-serial: 0;",
+            "private property <int> power-action-focus-serial: 0;",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing root contract: {required}"
+            );
+        }
+
+        for required in [
+            "text: \"Добавьте подписку\";",
+            "text: \"Ссылка хранится локально на этом устройстве\";",
+            "onboarding-copy := VerticalLayout",
+            "first-run-actions := HorizontalLayout",
+            "label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";",
+            "root.paste-subscription();",
+            "label: \"Ввести вручную\";",
+            "focus-epoch: root.first-run-trigger-focus-serial;",
+            "first-run-url-input := LineEdit",
+            "accessible-label: \"URL подписки\";",
+            "changed focus-serial => { self.focus(); }",
+            "init => { self.focus(); }",
+            "label: root.import-pending ? \"Добавляем…\" : \"Добавить\";",
+            "root.import-url(root.subscription-draft);",
+            "label: \"Отмена\";",
+            "root.first-run-trigger-focus-serial += 1;",
+            "root.dismiss-first-run-import();",
+            "text: root.import-error;",
+            "accessible-live-region: polite;",
+        ] {
+            assert!(
+                onboarding.contains(required),
+                "missing first-run source contract: {required}"
+            );
+        }
+
+        assert!(onboarding.contains("if root.first-run-manual-open"));
+        let paste_action = onboarding
+            .split("PrimaryAction {")
+            .nth(1)
+            .and_then(|action| action.split("SmallAction {").next())
+            .expect("paste action");
+        assert!(paste_action.contains("enabled: !root.import-pending;"));
+        let manual_trigger = onboarding
+            .split("label: \"Ввести вручную\";")
+            .nth(1)
+            .and_then(|action| action.split("activated =>").next())
+            .expect("manual trigger");
+        assert!(manual_trigger.contains("enabled: !root.import-pending;"));
+        let add_action = onboarding
+            .split("label: root.import-pending ? \"Добавляем…\" : \"Добавить\";")
+            .nth(1)
+            .and_then(|action| action.split("activated =>").next())
+            .expect("manual add action");
+        assert!(
+            add_action
+                .contains("enabled: !root.import-pending && root.subscription-draft != \"\";")
+        );
+        let cancel_action = onboarding
+            .split("label: \"Отмена\";")
+            .nth(1)
+            .and_then(|action| action.split("activated =>").next())
+            .expect("manual cancel action");
+        assert!(cancel_action.contains("enabled: !root.import-pending;"));
+        assert!(
+            onboarding.contains("if (!root.import-pending && root.subscription-draft != \"\")")
+        );
+        assert!(!onboarding.contains("root.local-page ="));
+        assert!(!onboarding.contains("root.settings-section ="));
+        assert!(!onboarding.contains("root.add-subscription();"));
+        assert!(!onboarding.contains("root.open-panel("));
+
+        let escape_handler = source
+            .split("key-pressed(event) =>")
+            .find(|handler| handler.contains("event.text == Key.Escape"))
+            .and_then(|handler| handler.split("return reject;").next())
+            .expect("root Escape handler");
+        assert!(escape_handler.contains("if (!root.has-profile && root.first-run-manual-open)"));
+        assert!(escape_handler.contains("root.dismiss-first-run-import();"));
+        assert!(
+            escape_handler.find("root.first-run-manual-open").unwrap()
+                < escape_handler
+                    .find("root.profile-delete-confirm-id")
+                    .unwrap()
+        );
+
+        let success_handler = source
+            .split("changed import-success-serial =>")
+            .nth(1)
+            .and_then(|source| source.split("changed active-panel =>").next())
+            .expect("import success handler");
+        assert!(success_handler.contains("root.subscription-draft = \"\";"));
+        assert!(success_handler.contains("root.first-run-manual-open = false;"));
+        assert!(success_handler.contains("if (root.has-profile && root.visible-page == \"home\")"));
+        assert!(success_handler.contains("root.power-action-focus-serial += 1;"));
+        assert!(success_handler.contains("root.profile-shelf-focus-serial += 1;"));
+
+        let power_action = source
+            .split("power-action := FocusScope")
+            .nth(1)
+            .and_then(|source| source.split("power-button := Rectangle").next())
+            .expect("power action focus scope");
+        assert!(
+            power_action.contains("property <int> focus-epoch: root.power-action-focus-serial;")
+        );
+        assert!(power_action.contains("changed focus-epoch =>"));
+        assert!(power_action.contains("self.focus();"));
+
+        // Subscription management retains its independent add/edit flow.
+        let management = source
+            .split("if root.visible-page == \"subscriptions\": VerticalLayout")
+            .nth(1)
+            .expect("subscription management page");
+        assert!(management.contains("root.add-subscription();"));
+        assert!(management.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(management.contains("root.import-url(root.subscription-draft);"));
+    }
+
+    #[test]
     fn desktop_control_center_source_contract() {
         let source = include_str!("../ui/app.slint");
         let components = include_str!("../ui/components.slint");
         let main = include_str!("main.rs");
+        let logo_cache = include_str!("logo_cache.rs");
 
         let small_action = source
             .split("component SmallAction")
@@ -5728,7 +5873,8 @@ mod tests {
 
         assert!(source.contains("inline-routes := Rectangle"));
         assert!(source.contains("connection-strip := Rectangle"));
-        assert!(source.contains("height: 96px;"));
+        assert!(source.contains("height: root.has-profile"));
+        assert!(source.contains("? 96px"));
         assert!(source.contains("power-action := FocusScope"));
         assert!(source.contains("width: 72px;"));
         assert!(source.contains("height: 72px;"));
@@ -5856,7 +6002,15 @@ mod tests {
         assert!(source.contains("text: root.subscription-title;"));
         assert!(!source.to_ascii_lowercase().contains("text: \"acmevpn\""));
         assert!(!source.to_ascii_lowercase().contains("text: \"work\""));
-        assert!(main.contains("slint::Image::load_from_path(Path::new(path))"));
+        assert!(main.contains("logo_cache::with_logo_cache"));
+        assert!(main.contains("cache.retain_paths"));
+        assert!(main.contains("cache.image_for_path"));
+        assert!(!main.contains("slint::Image::load_from_path"));
+        assert_eq!(
+            logo_cache.matches("slint::Image::load_from_path").count(),
+            1,
+            "PNG decoding must have one cache-owned entry point"
+        );
         assert!(main.contains("ui.set_has_service_logo(service_logo.is_some());"));
         assert!(main.contains("ui.set_service_logo(service_logo.unwrap_or_default());"));
         let snapshot = main
@@ -5920,10 +6074,8 @@ mod tests {
             "root.primary-action();",
             "root.select-catalog-group(group.id);",
             "root.select-catalog-node(node.id);",
-            "if !root.has-profile: PrimaryAction",
-            "label: \"Добавить URL\";",
-            "state-label: \"Добавить подписку\";",
-            "root.replace-editor-open = true;",
+            "first-run-onboarding := VerticalLayout",
+            "callback paste-subscription();",
             "callback update-action();",
             "root.update-action();",
             "Отключитесь, чтобы установить обновление",
@@ -6779,6 +6931,74 @@ mod tests {
                 .unwrap()
                 .contains("token")
         );
+    }
+
+    #[test]
+    fn subscription_url_validation_uses_the_shared_persistence_byte_limit() {
+        let prefix = "https://example.com/";
+        let exact = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_SUBSCRIPTION_URL_BYTES - prefix.len())
+        );
+        let over = format!("{exact}a");
+
+        assert_eq!(exact.len(), MAX_SUBSCRIPTION_URL_BYTES);
+        assert!(valid_subscription_url(&exact));
+        assert!(!valid_subscription_url(&over));
+    }
+
+    #[test]
+    fn dismiss_import_error_clears_validation_and_server_errors_without_changing_state() {
+        let mut validation_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        refresh(&mut validation_model);
+        validation_model.open_panel(Panel::Subscription);
+        assert!(validation_model.begin_import("not a URL").is_none());
+        let validation_state = validation_model.state.clone();
+        let validation_panel = validation_model.panel;
+
+        validation_model.dismiss_import_error();
+
+        assert_eq!(validation_model.import_error, None);
+        assert_eq!(validation_model.state, validation_state);
+        assert_eq!(validation_model.panel, validation_panel);
+        assert!(!validation_model.import_pending);
+
+        let mut client = MockDaemonClient::ready();
+        client.fail_import = true;
+        let mut server_model = DesktopViewModel::new(Arc::new(client));
+        refresh(&mut server_model);
+        import_subscription(
+            &mut server_model,
+            "https://subscription.invalid/server-error",
+        );
+        assert!(server_model.import_error.is_some());
+        let server_state = server_model.state.clone();
+        let server_panel = server_model.panel;
+
+        server_model.dismiss_import_error();
+
+        assert_eq!(server_model.import_error, None);
+        assert_eq!(server_model.state, server_state);
+        assert_eq!(server_model.panel, server_panel);
+        assert!(!server_model.import_pending);
+    }
+
+    #[test]
+    fn external_import_error_survives_unrelated_presentation_until_dismissed() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let state = model.state.clone();
+
+        model.set_import_error_message("Не удалось прочитать буфер обмена");
+        let _ = model.presentation();
+
+        assert_eq!(
+            model.import_error(),
+            Some("Не удалось прочитать буфер обмена")
+        );
+        assert_eq!(model.state, state);
+
+        model.dismiss_import_error();
+        assert_eq!(model.import_error(), None);
     }
 
     #[test]
