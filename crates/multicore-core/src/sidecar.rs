@@ -701,8 +701,10 @@ fn adapter_is_ready(alias: &str, operational_up: bool) -> bool {
 }
 
 #[cfg(not(windows))]
-async fn tun_device_is_up(_device: &str) -> bool {
-    true
+async fn tun_device_is_up(device: &str) -> bool {
+    device == "MultiCore"
+        && crate::network::read_linux_interface(device)
+            .is_some_and(|interface| crate::network::interface_is_up(interface.flags))
 }
 
 pub struct SidecarProcessController<L: ProcessLauncher = TokioProcessLauncher> {
