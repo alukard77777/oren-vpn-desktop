@@ -52,6 +52,14 @@ impl Backend for MutationErrorBackend {
         Err(BackendError::from_profile_mutation(self.0))
     }
 
+    async fn replace_subscription_source(
+        &self,
+        _id: multicore_core::ProfileId,
+        _request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::from_profile_mutation(self.0))
+    }
+
     async fn connect(&self) -> Result<StatusDto, BackendError> {
         self.status().await
     }
@@ -115,6 +123,7 @@ async fn every_profile_route_requires_authentication() {
         (Method::GET, "/v1/subscriptions".to_owned()),
         (Method::PUT, format!("/v1/subscriptions/{id}/activate")),
         (Method::POST, format!("/v1/subscriptions/{id}/refresh")),
+        (Method::PUT, format!("/v1/subscriptions/{id}/source")),
         (Method::DELETE, format!("/v1/subscriptions/{id}")),
     ];
     for (method, uri) in routes {
@@ -230,6 +239,102 @@ async fn inactive_refresh_keeps_active_and_activation_and_delete_update_status()
     assert_eq!(listed.profiles.len(), 1);
     assert_eq!(listed.profiles[0].id, second_id);
     assert!(listed.profiles[0].active);
+}
+
+#[tokio::test]
+async fn source_replacement_targets_one_profile_and_never_echoes_the_url() {
+    let app = app();
+    let first_id = import(&app, "https://first.invalid/sub")
+        .await
+        .active_profile_id
+        .unwrap();
+    let second_id = import(&app, "https://second.invalid/sub")
+        .await
+        .active_profile_id
+        .unwrap();
+    let secret = "replacement-secret-canary";
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::PUT,
+            &format!("/v1/subscriptions/{first_id}/source"),
+            Body::from(
+                json!({ "url": format!("https://replacement.invalid/sub?token={secret}") })
+                    .to_string(),
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json_body(response).await;
+    let listed: SubscriptionListDto = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        listed.active_profile_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    assert_eq!(listed.profiles.len(), 2);
+    assert_eq!(listed.profiles[0].id.as_str(), first_id.as_str());
+    assert!(!value.to_string().contains(secret));
+    assert!(!value.to_string().contains("https://"));
+}
+
+#[tokio::test]
+async fn source_replacement_rejects_invalid_non_http_urls_before_backend_work() {
+    let app = app();
+    let id = import(&app, "https://first.invalid/sub")
+        .await
+        .active_profile_id
+        .unwrap();
+
+    for invalid in ["", "not a URL", "ftp://provider.invalid/sub", "https://"] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::PUT,
+                &format!("/v1/subscriptions/{id}/source"),
+                Body::from(json!({ "url": invalid }).to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "accepted {invalid}"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "invalid_request");
+        if !invalid.is_empty() {
+            assert!(!body.to_string().contains(invalid), "reflected {invalid}");
+        }
+    }
+
+    assert_eq!(list(&app).await.profiles.len(), 1);
+}
+
+#[tokio::test]
+async fn committed_source_replacement_failure_is_explicitly_ambiguous() {
+    let id = "00000000-0000-4000-8000-000000000001";
+    let app = router_with_event_epoch(
+        MutationErrorBackend(ProfileMutationError::Committed),
+        TOKEN,
+        "profiles-test",
+    );
+    let response = app
+        .oneshot(request(
+            Method::PUT,
+            &format!("/v1/subscriptions/{id}/source"),
+            Body::from(json!({ "url": "https://replacement.invalid/sub" }).to_string()),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        json_body(response).await["code"],
+        "profile_mutation_ambiguous"
+    );
 }
 
 #[tokio::test]

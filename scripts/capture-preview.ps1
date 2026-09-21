@@ -8,7 +8,7 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Height,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-edit-large")]
     [string]$ExpectedState,
     [switch]$HoverConnection,
     [switch]$SelectSecondRoute,
@@ -17,7 +17,7 @@ param(
     [switch]$OpenUpdates,
     [switch]$OpenProfiles,
     [switch]$OpenSubscriptionSettings,
-    [switch]$ExpandProfile,
+    [switch]$EditProfile,
     [switch]$ConfirmProfileDelete,
     [switch]$RefreshProfile
 )
@@ -226,7 +226,7 @@ function Test-PreviewFrame([System.Drawing.Bitmap]$Bitmap, [ref]$Failure) {
         }
         $settingsProfileState = $ExpectedState -like "profiles-empty-*" -or
             $ExpectedState -like "profiles-settings-*" -or
-            $ExpectedState -eq "profiles-expanded-large" -or
+            $ExpectedState -eq "profiles-edit-large" -or
             $ExpectedState -in @("profiles-delete-small", "profiles-pending-small")
         if ($settingsProfileState) {
             $settingsText = Get-BrightPixelCount $Bitmap 205 66 ($Bitmap.Width - 20) ($Bitmap.Height - 24)
@@ -437,14 +437,14 @@ try {
     if ($OpenSubscriptionSettings) {
         Click-Preview $handle 88 174
     }
-    if ($ExpandProfile) {
-        Click-Preview $handle ([Math]::Max(430, $Width - 210)) 260
+    if ($EditProfile) {
+        Click-Preview $handle ($Width - 92) 224
     }
     if ($ConfirmProfileDelete) {
-        Click-Preview $handle 426 404
+        Click-Preview $handle ($Width - 44) 224
     }
     if ($RefreshProfile) {
-        Click-Preview $handle 374 404
+        Click-Preview $handle ($Width - 140) 224
     }
     Save-Preview $handle
 } finally {

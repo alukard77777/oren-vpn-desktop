@@ -2,7 +2,7 @@ param(
     [string]$OutputDirectory = "artifacts/screenshots",
     [int]$Port = 18787,
     [string]$DesktopExecutablePath,
-    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-expanded-large")]
+    [ValidateSet("empty", "ready", "connected", "glow-hover", "populated-catalog", "announcement", "error", "selection-pending", "diagnostics", "settings", "settings-updates", "profiles-empty-small", "profiles-one-small", "profiles-many-small", "profiles-loading-small", "profiles-error-small", "profiles-empty-large", "profiles-one-large", "profiles-many-large", "profiles-loading-large", "profiles-error-large", "profiles-delete-small", "profiles-pending-small", "profiles-settings-many-small", "profiles-settings-many-large", "profiles-edit-large")]
     [string[]]$OnlyScenario
 )
 
@@ -76,11 +76,11 @@ $scenarios = @(
     @{ Name = "profiles-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
     @{ Name = "profiles-loading-large"; State = "ready"; ProfileState = "loading"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
     @{ Name = "profiles-error-large"; State = "ready"; ProfileState = "error"; Width = 840; Height = 720; SelectionDelay = 0; OpenProfiles = $true },
-    @{ Name = "profiles-delete-small"; State = "ready"; ProfileState = "one"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true; ConfirmProfileDelete = $true },
-    @{ Name = "profiles-pending-small"; State = "ready"; ProfileState = "one"; ProfileDelay = 5000; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true; RefreshProfile = $true },
+    @{ Name = "profiles-delete-small"; State = "ready"; ProfileState = "one"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; ConfirmProfileDelete = $true },
+    @{ Name = "profiles-pending-small"; State = "ready"; ProfileState = "one"; ProfileDelay = 5000; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true; RefreshProfile = $true },
     @{ Name = "profiles-settings-many-small"; State = "ready"; ProfileState = "many"; Width = 700; Height = 620; SelectionDelay = 0; OpenSubscriptionSettings = $true },
     @{ Name = "profiles-settings-many-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true },
-    @{ Name = "profiles-expanded-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true; ExpandProfile = $true }
+    @{ Name = "profiles-edit-large"; State = "ready"; ProfileState = "many"; Width = 840; Height = 720; SelectionDelay = 0; OpenSubscriptionSettings = $true; EditProfile = $true }
 )
 if ($OnlyScenario.Count -gt 0) {
     $scenarios = @($scenarios | Where-Object { $_.Name -in $OnlyScenario })
@@ -139,7 +139,7 @@ foreach ($scenario in $scenarios) {
         if ($scenario.ContainsKey("OpenUpdates") -and $scenario.OpenUpdates) { $captureArgs += "-OpenUpdates" }
         if ($scenario.ContainsKey("OpenProfiles") -and $scenario.OpenProfiles) { $captureArgs += "-OpenProfiles" }
         if ($scenario.ContainsKey("OpenSubscriptionSettings") -and $scenario.OpenSubscriptionSettings) { $captureArgs += "-OpenSubscriptionSettings" }
-        if ($scenario.ContainsKey("ExpandProfile") -and $scenario.ExpandProfile) { $captureArgs += "-ExpandProfile" }
+        if ($scenario.ContainsKey("EditProfile") -and $scenario.EditProfile) { $captureArgs += "-EditProfile" }
         if ($scenario.ContainsKey("ConfirmProfileDelete") -and $scenario.ConfirmProfileDelete) { $captureArgs += "-ConfirmProfileDelete" }
         if ($scenario.ContainsKey("RefreshProfile") -and $scenario.RefreshProfile) { $captureArgs += "-RefreshProfile" }
         & powershell.exe @captureArgs

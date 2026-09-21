@@ -333,6 +333,17 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Subscription refresh is unavailable."))
     }
 
+    /// PUT /v1/subscriptions/{profile_id}/source.
+    fn replace_subscription_source(
+        &self,
+        _profile_id: &str,
+        _url: &str,
+    ) -> Result<DaemonSubscriptionList, DaemonError> {
+        Err(DaemonError::new(
+            "Subscription source editing is unavailable.",
+        ))
+    }
+
     /// DELETE /v1/subscriptions/{profile_id}.
     #[allow(dead_code)] // Wired into the desktop event loop in Task 6.
     fn delete_subscription(&self, _profile_id: &str) -> Result<DaemonStatus, DaemonError> {
@@ -519,10 +530,21 @@ impl HttpDaemonClient {
                 DaemonErrorKind::ProfileConflict,
                 "Subscription profile cannot be changed right now.",
             )),
-            status if status.is_server_error() => Err(DaemonError::profile_http(
-                DaemonErrorKind::ProfileServer,
-                "Background service could not change the subscription profile.",
-            )),
+            status if status.is_server_error() => {
+                let committed =
+                    decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
+                        .is_ok_and(|body| body.code == "profile_mutation_ambiguous");
+                Err(if committed {
+                    DaemonError::ambiguous(
+                        "Изменение могло сохраниться. Обновляем состояние подписок.",
+                    )
+                } else {
+                    DaemonError::profile_http(
+                        DaemonErrorKind::ProfileServer,
+                        "Background service could not change the subscription profile.",
+                    )
+                })
+            }
             status if !status.is_success() => Err(DaemonError::definitive_http(
                 "Background service rejected the subscription profile request.",
             )),
@@ -647,7 +669,10 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn refresh_subscription(&self) -> Result<DaemonStatus, DaemonError> {
-        self.parse_status(self.http.post(self.endpoint("/v1/subscriptions/refresh")))
+        self.send_profile_json(
+            self.http.post(self.endpoint("/v1/subscriptions/refresh")),
+            STATUS_RESPONSE_LIMIT_BYTES,
+        )
     }
 
     fn subscriptions(&self) -> Result<DaemonSubscriptionList, DaemonError> {
@@ -670,6 +695,19 @@ impl DaemonClient for HttpDaemonClient {
         let endpoint =
             self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("refresh"))?;
         self.send_profile_json(self.http.post(endpoint), SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES)
+    }
+
+    fn replace_subscription_source(
+        &self,
+        profile_id: &str,
+        url: &str,
+    ) -> Result<DaemonSubscriptionList, DaemonError> {
+        let endpoint =
+            self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("source"))?;
+        self.send_profile_json(
+            self.http.put(endpoint).json(&ImportRequest { url }),
+            SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES,
+        )
     }
 
     fn delete_subscription(&self, profile_id: &str) -> Result<DaemonStatus, DaemonError> {
@@ -1733,6 +1771,26 @@ mod http_tests {
             "profile-token",
         );
 
+        let (base_url, server) = start_selection_server("200 OK", list_body);
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("edit client");
+        client
+            .replace_subscription_source(id, "https://replacement.invalid/sub?token=secret")
+            .expect("replace subscription source");
+        let request = server.join().expect("edit server");
+        let (headers, body) = request.split_once("\r\n\r\n").expect("HTTP request");
+        assert!(headers.starts_with(&format!(
+            "PUT /v1/subscriptions/{encoded}/source HTTP/1.1\r\n"
+        )));
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer profile-token\r\n")
+        );
+        assert_eq!(
+            body,
+            r#"{"url":"https://replacement.invalid/sub?token=secret"}"#
+        );
+
         let (base_url, server) = start_selection_server("200 OK", status_body);
         let client = HttpDaemonClient::new(base_url, "profile-token").expect("delete client");
         client.delete_subscription(id).expect("delete profile");
@@ -1783,6 +1841,42 @@ mod http_tests {
             assert!(!text.contains(sensitive_token));
             assert!(!text.contains("https://"));
         }
+    }
+
+    #[test]
+    fn committed_profile_mutation_error_requires_authoritative_reconciliation() {
+        let (base_url, server) = start_selection_server(
+            "500 Internal Server Error",
+            r#"{"code":"profile_mutation_ambiguous","message":"private committed marker"}"#,
+        );
+        let client = HttpDaemonClient::new(base_url, "profile-token").expect("profile client");
+
+        let error = client
+            .replace_subscription_source("profile-a", "https://replacement.invalid/private")
+            .expect_err("committed mutation response must not be accepted as success");
+        server.join().expect("profile error server");
+
+        assert!(error.requires_reconciliation());
+        assert!(!error.to_string().contains("private committed marker"));
+        assert!(!error.to_string().contains("replacement.invalid"));
+    }
+
+    #[test]
+    fn committed_active_refresh_error_requires_authoritative_reconciliation() {
+        let (base_url, server) = start_selection_server(
+            "500 Internal Server Error",
+            r#"{"code":"profile_mutation_ambiguous","message":"private committed marker"}"#,
+        );
+        let client = HttpDaemonClient::new(base_url, "refresh-token").expect("refresh client");
+
+        let error = client
+            .refresh_subscription()
+            .expect_err("committed refresh response must not be accepted as success");
+        let request = server.join().expect("refresh error server");
+
+        assert_profile_request(&request, "POST /v1/subscriptions/refresh", "refresh-token");
+        assert!(error.requires_reconciliation());
+        assert!(!error.to_string().contains("private committed marker"));
     }
 
     #[test]

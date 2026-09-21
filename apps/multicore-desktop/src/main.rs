@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use daemon::{DaemonClient, DaemonError, UnavailableDaemonClient};
 use preferences::{AppPreferences, PreferenceStore, VisiblePage, WindowBounds};
@@ -522,7 +522,9 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
     wire_import(&ui, model.clone(), profile_preferences.clone());
-    wire_subscription_refresh(&ui, model.clone());
+    wire_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
+    let _subscription_refresh_timer =
+        wire_automatic_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
     wire_profile_switcher(&ui, model.clone(), profile_preferences.clone());
     wire_primary_action(&ui, model.clone(), profile_preferences.clone());
     wire_panels(&ui, model.clone());
@@ -542,7 +544,8 @@ fn main() -> Result<(), slint::PlatformError> {
         preference_tracker.clone(),
         tray_popup_open.clone(),
     );
-    let _tray_popup_focus_timer = wire_tray_popup_focus_loss(&tray_popup, tray_popup_open.clone());
+    let _tray_popup_focus_timer =
+        wire_tray_popup_focus_loss(&tray_popup, tray_popup_open.clone(), model.clone());
     let tray_model = tray_menu_model(&model.lock().expect("view model lock"));
     let tray_model_source = model.clone();
     let tray_action_ui = ui.as_weak();
@@ -1269,6 +1272,7 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                 id: group_id.clone().into(),
                 group_id: "".into(),
                 label: entry.label.clone().into(),
+                detail: entry.detail.clone().into(),
                 selected: entry.checked,
                 enabled: entry.enabled,
             }),
@@ -1284,6 +1288,7 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                 id: node_id.clone().into(),
                 group_id: group_id.clone().into(),
                 label: entry.label.clone().into(),
+                detail: "".into(),
                 selected: entry.checked,
                 enabled: entry.enabled,
             }),
@@ -1359,6 +1364,23 @@ fn dispatch_tray_popup_command(
     handle_tray_command(ui, model, command, preference_writer, preference_tracker);
 }
 
+fn dispatch_tray_popup_selection(
+    popup: &slint::Weak<TrayPopup>,
+    ui: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    command: TrayCommand,
+    preference_writer: &Arc<Mutex<PreferenceWriter>>,
+    preference_tracker: &Arc<Mutex<PersistenceTracker>>,
+) {
+    handle_tray_command(ui, model, command, preference_writer, preference_tracker);
+    if let Some(popup) = popup.upgrade() {
+        apply_tray_popup_model(
+            &popup,
+            tray_menu_model(&model.lock().expect("view model lock")),
+        );
+    }
+}
+
 fn wire_tray_popup_actions(
     popup: &TrayPopup,
     ui: slint::Weak<AppWindow>,
@@ -1396,15 +1418,13 @@ fn wire_tray_popup_actions(
     popup.on_exit_app(wire_command(TrayCommand::Exit));
 
     let group_popup = popup_weak.clone();
-    let group_open = open.clone();
     let group_ui = ui.clone();
     let group_model = model.clone();
     let group_writer = preference_writer.clone();
     let group_tracker = preference_tracker.clone();
     popup.on_select_group(move |group_id| {
-        dispatch_tray_popup_command(
+        dispatch_tray_popup_selection(
             &group_popup,
-            &group_open,
             &group_ui,
             &group_model,
             TrayCommand::SelectGroup {
@@ -1416,11 +1436,9 @@ fn wire_tray_popup_actions(
     });
 
     let node_popup = popup_weak;
-    let node_open = open;
     popup.on_select_node(move |group_id, node_id| {
-        dispatch_tray_popup_command(
+        dispatch_tray_popup_selection(
             &node_popup,
-            &node_open,
             &ui,
             &model,
             TrayCommand::SelectNode {
@@ -1433,7 +1451,11 @@ fn wire_tray_popup_actions(
     });
 }
 
-fn wire_tray_popup_focus_loss(popup: &TrayPopup, open: Rc<Cell<bool>>) -> Timer {
+fn wire_tray_popup_focus_loss(
+    popup: &TrayPopup,
+    open: Rc<Cell<bool>>,
+    model: Arc<Mutex<DesktopViewModel>>,
+) -> Timer {
     let timer = Timer::default();
     let weak = popup.as_weak();
     let grace_ticks = Rc::new(Cell::new(0_u8));
@@ -1450,6 +1472,10 @@ fn wire_tray_popup_focus_loss(popup: &TrayPopup, open: Rc<Cell<bool>>) -> Timer 
         let Some(popup) = weak.upgrade() else {
             return;
         };
+        apply_tray_popup_model(
+            &popup,
+            tray_menu_model(&model.lock().expect("view model lock")),
+        );
         let focused = popup
             .window()
             .with_winit_window(|window| window.has_focus())
@@ -1482,6 +1508,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                 id: group.id,
                 label: group.label,
                 selected: group.selected,
+                selected_node_label: group.selected_node_label,
             })
             .collect(),
         selected_group_id: catalog.selected_group_id,
@@ -1610,7 +1637,11 @@ fn wire_import(
     });
 }
 
-fn wire_subscription_refresh(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+fn wire_subscription_refresh(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
     let weak = ui.as_weak();
     ui.on_refresh_subscription(move || {
         let (mutation, client, current, needs_url) = {
@@ -1633,8 +1664,53 @@ fn wire_subscription_refresh(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>
         let Some(mutation) = mutation else {
             return;
         };
-        run_subscription_refresh(weak.clone(), model.clone(), client, mutation);
+        run_subscription_refresh(
+            weak.clone(),
+            model.clone(),
+            client,
+            mutation,
+            profile_preferences.clone(),
+        );
     });
+}
+
+fn wire_automatic_subscription_refresh(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+) -> Timer {
+    const RETRY_BACKOFF_SECS: u64 = 15 * 60;
+
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    let retry_after = Rc::new(Cell::new(0_u64));
+    timer.start(TimerMode::Repeated, Duration::from_secs(60), move || {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (mutation, client, current) = {
+            let mut model = model.lock().expect("view model lock");
+            let due = now_unix >= retry_after.get()
+                && model.automatic_subscription_refresh_due_at(now_unix);
+            let mutation = due.then(|| model.begin_subscription_refresh()).flatten();
+            (mutation, model.daemon_client(), snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if let Some(mutation) = mutation {
+            retry_after.set(now_unix.saturating_add(RETRY_BACKOFF_SECS));
+            run_subscription_refresh(
+                weak.clone(),
+                model.clone(),
+                client,
+                mutation,
+                profile_preferences.clone(),
+            );
+        }
+    });
+    timer
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1700,7 +1776,8 @@ fn delete_focus_plan(
 fn apply_delete_focus_completion(ui: &AppWindow, completion: DeleteFocusTarget) {
     match completion {
         DeleteFocusTarget::ManagementProfile(profile_id) => {
-            ui.set_expanded_profile_id("".into());
+            ui.set_profile_edit_id("".into());
+            ui.set_profile_edit_draft("".into());
             ui.set_profile_delete_confirm_id("".into());
             ui.set_profile_management_focus_id(profile_id.into());
             ui.set_profile_management_focus_serial(
@@ -1708,7 +1785,8 @@ fn apply_delete_focus_completion(ui: &AppWindow, completion: DeleteFocusTarget) 
             );
         }
         DeleteFocusTarget::AddSubscription => {
-            ui.set_expanded_profile_id("".into());
+            ui.set_profile_edit_id("".into());
+            ui.set_profile_edit_draft("".into());
             ui.set_profile_delete_confirm_id("".into());
             ui.set_profile_management_focus_id("".into());
             ui.set_profile_management_focus_serial(
@@ -1844,6 +1922,31 @@ fn wire_profile_switcher(
                 client,
                 token,
                 profile_id.to_string(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let edit_model = model.clone();
+    let edit_preferences = profile_preferences.clone();
+    ui.on_replace_profile_source(move |profile_id, url| {
+        let (token, client, current) = {
+            let mut model = edit_model.lock().expect("view model lock");
+            let token = model.begin_profile_source_edit(profile_id.as_str(), url.as_str());
+            (token, model.daemon_client(), snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if let Some(token) = token {
+            run_profile_source_edit(
+                weak.clone(),
+                edit_model.clone(),
+                edit_preferences.clone(),
+                client,
+                token,
+                profile_id.to_string(),
+                url.to_string(),
             );
         }
     });
@@ -2234,6 +2337,35 @@ fn run_profile_target_refresh(
     });
 }
 
+fn run_profile_source_edit(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    client: Arc<dyn DaemonClient>,
+    token: ProfileRequestToken,
+    profile_id: String,
+    url: String,
+) {
+    thread::spawn(move || {
+        let result = client.replace_subscription_source(&profile_id, &url);
+        let (current, succeeded) = {
+            let mut model = model.lock().expect("view model lock");
+            let succeeded = model.finish_profile_source_edit(token, result);
+            (snapshot(&model), succeeded)
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+                if succeeded {
+                    ui.set_profile_edit_id("".into());
+                    ui.set_profile_edit_draft("".into());
+                }
+            }
+            advance_profile_reconciliation(weak, model, profile_preferences, false);
+        });
+    });
+}
+
 fn run_profile_delete(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
@@ -2274,6 +2406,7 @@ fn load_profile_list(
             Some(
                 SubscriptionProfileOperation::Activate
                     | SubscriptionProfileOperation::Refresh
+                    | SubscriptionProfileOperation::Edit
                     | SubscriptionProfileOperation::Delete
             )
         ) {
@@ -2381,6 +2514,7 @@ fn run_subscription_refresh(
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
+    profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
 ) {
     thread::spawn(move || {
         let result = client.refresh_subscription();
@@ -2389,7 +2523,15 @@ fn run_subscription_refresh(
             let succeeded = model.finish_subscription_refresh(mutation, result);
             (snapshot(&model), succeeded)
         };
-        apply_snapshot_from_worker(weak, current.0, model, current.1, false);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current.0);
+            }
+            if current.1 && current.0.presentation.has_profile {
+                load_catalog(weak.clone(), model.clone());
+            }
+            advance_profile_reconciliation(weak, model, profile_preferences, false);
+        });
     });
 }
 
@@ -2687,6 +2829,8 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_title(snapshot.subscription.display_name.clone().into());
     ui.set_subscription_usage(snapshot.subscription.usage.clone().into());
     ui.set_subscription_expiry(snapshot.subscription.expiry.clone().into());
+    ui.set_subscription_updated(snapshot.subscription.updated.clone().into());
+    ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
     ui.set_subscription_announcement_tone(snapshot.subscription.announcement_tone.clone().into());
     let service_logo = snapshot
@@ -2746,6 +2890,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
             Some(SubscriptionProfileOperation::List) => "list",
             Some(SubscriptionProfileOperation::Activate) => "activate",
             Some(SubscriptionProfileOperation::Refresh) => "refresh",
+            Some(SubscriptionProfileOperation::Edit) => "edit",
             Some(SubscriptionProfileOperation::Delete) => "delete",
             None => "none",
         }
@@ -2895,6 +3040,10 @@ mod window_tests {
             "export component TrayPopup inherits Window",
             "no-frame: true;",
             "always-on-top: true;",
+            "detail: string,",
+            "in-out property <string> expanded-group-id;",
+            "detail: group.detail;",
+            "root.expanded-group-id == group.id",
             "TrayInteraction::ShowMenu",
             "place_tray_popup(",
             ".take(12)",
@@ -2905,10 +3054,11 @@ mod window_tests {
                 "missing branded tray popup contract: {required}"
             );
         }
+        assert!(!popup.contains("text: \"УЗЕЛ\";"));
     }
 
     #[test]
-    fn tray_popup_lifecycle_contract_closes_before_dispatch_and_on_focus_loss() {
+    fn tray_popup_lifecycle_keeps_route_accordion_open_but_closes_terminal_actions() {
         let popup = include_str!("../ui/tray_popup.slint");
         let rust = include_str!("main.rs");
 
@@ -2923,6 +3073,18 @@ mod window_tests {
             dispatch.find("hide_tray_popup").unwrap()
                 < dispatch.find("handle_tray_command").unwrap()
         );
+        let selection_dispatch = rust
+            .split("fn dispatch_tray_popup_selection(")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_tray_popup_actions(").next())
+            .expect("tray popup selection dispatcher");
+        assert!(!selection_dispatch.contains("hide_tray_popup"));
+        assert!(selection_dispatch.contains("handle_tray_command"));
+        assert!(selection_dispatch.contains("apply_tray_popup_model"));
+        let compact_rust = rust.split_whitespace().collect::<String>();
+        assert!(compact_rust.contains(
+            "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone())"
+        ));
         assert!(rust.contains("if open.get() {\n        hide_tray_popup"));
         assert!(rust.contains("with_winit_window(|window| window.has_focus())"));
         assert!(rust.contains("let _ = tray_popup.hide();"));
@@ -2961,6 +3123,39 @@ mod window_tests {
         assert!(source.contains("ui.set_shell_active(starts_visible)"));
         assert!(source.matches("ui.set_shell_active(false)").count() >= 2);
         assert!(source.matches("ui.set_shell_active(true)").count() >= 2);
+    }
+
+    #[test]
+    fn automatic_subscription_refresh_and_home_timestamp_are_wired() {
+        let rust = include_str!("main.rs");
+        let ui = include_str!("../ui/app.slint");
+
+        for required in [
+            "fn wire_automatic_subscription_refresh(",
+            "profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>",
+            "automatic_subscription_refresh_due_at(now_unix)",
+            "Duration::from_secs(60)",
+            "set_subscription_updated",
+            "set_subscription_updated_stale",
+            "advance_profile_reconciliation(weak, model, profile_preferences, false)",
+        ] {
+            assert!(
+                rust.contains(required),
+                "missing auto-refresh contract: {required}"
+            );
+        }
+        for required in [
+            "in property <string> subscription-updated",
+            "in property <bool> subscription-updated-stale",
+            "text: root.subscription-updated",
+            "clock-face := Rectangle",
+            "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
+        ] {
+            assert!(
+                ui.contains(required),
+                "missing updated-at UI contract: {required}"
+            );
+        }
     }
 
     #[test]
@@ -3153,7 +3348,7 @@ mod window_tests {
     }
 
     #[test]
-    fn settings_delete_confirmation_consumes_escape_before_panel_close() {
+    fn settings_inline_profile_tasks_consume_escape_before_panel_close() {
         let source = include_str!("../ui/app.slint");
         let escape_handler = source
             .split("visual-frame := FocusScope {")
@@ -3162,6 +3357,9 @@ mod window_tests {
             .expect("visual frame Escape handler");
         assert!(escape_handler.contains("if (root.profile-delete-confirm-id != \"\")"));
         assert!(escape_handler.contains("root.profile-delete-confirm-id = \"\";"));
+        assert!(escape_handler.contains("else if (root.profile-edit-id != \"\")"));
+        assert!(escape_handler.contains("root.profile-edit-id = \"\";"));
+        assert!(escape_handler.contains("root.profile-edit-draft = \"\";"));
         assert!(escape_handler.contains("else { root.escape-pressed(); }"));
     }
 
@@ -3290,6 +3488,7 @@ mod window_tests {
             "root.active-panel == \"subscription\"",
             "callback activate-profile(string);",
             "callback refresh-profile(string);",
+            "callback replace-profile-source(string, string);",
             "callback delete-profile(string);",
             "callback add-subscription();",
             "callback retry-profile-menu();",
@@ -3298,7 +3497,7 @@ mod window_tests {
             "Подписок пока нет",
             "Удалить подписку?",
             "До 16 подписок · активна только одна",
-            "Локальный источник",
+            "Изменить URL",
             "root.settings-section == \"updates\"",
             "profile-menu-keyboard-open",
             "parent.has-focus && root.profile-menu-keyboard-open",
@@ -3332,11 +3531,15 @@ mod window_tests {
             "GET\" -and $path -eq \"/v1/subscriptions",
             "PUT\" -and $path -match '^/v1/subscriptions/([^/]+)/activate$'",
             "POST\" -and $path -match '^/v1/subscriptions/([^/]+)/refresh$'",
+            "PUT\" -and $path -match '^/v1/subscriptions/([^/]+)/source$'",
             "DELETE\" -and $path -match '^/v1/subscriptions/([^/]+)$'",
         ] {
             assert!(fixture.contains(route), "missing fixture route: {route}");
         }
         assert!(capture.contains("Click-Preview $handle 276 203"));
+        assert!(capture.contains("if ($EditProfile)"));
+        assert!(capture.contains("($Width - 92) 224"));
+        assert!(!capture.contains("if ($ExpandProfile)"));
         assert!(capture.contains("profile flow replaced the navigation rail"));
     }
 
@@ -3465,24 +3668,16 @@ mod window_tests {
     }
 
     #[test]
-    fn expanded_subscription_details_stay_compact_and_aligned() {
+    fn subscription_rows_expose_metadata_and_actions_without_generic_expansion() {
         let ui = include_str!("../ui/app.slint");
-        let details = ui
-            .split("if root.expanded-profile-id == profile.id: Rectangle {")
-            .nth(1)
-            .and_then(|source| {
-                source
-                    .split("Rectangle { x: 12px; y: parent.height - 1px;")
-                    .next()
-            })
-            .expect("expanded subscription details");
 
-        assert!(ui.contains("height: root.expanded-profile-id == profile.id ? 140px : 64px;"));
-        assert!(ui.contains("(root.expanded-profile-id == \"\" ? 0px : 76px)"));
-        assert!(details.contains("x: 56px; y: 64px;"));
-        assert!(details.contains("width: parent.width - 68px; height: 75px;"));
-        assert!(details.contains("profile.usage + \" · \" + profile.expiry"));
-        assert!(!details.contains("y: 82px"));
+        assert!(ui.contains("in-out property <string> profile-edit-id;"));
+        assert!(ui.contains("in-out property <string> profile-edit-draft;"));
+        assert!(ui.contains("root.replace-profile-source(profile.id, root.profile-edit-draft);"));
+        assert!(ui.contains("profile.usage + \" · \" + profile.expiry"));
+        assert!(ui.contains("accessible-label: \"Изменить URL \" + profile.title"));
+        assert!(!ui.contains("expanded-profile-id"));
+        assert!(!ui.contains("Локальный источник"));
     }
 
     #[test]

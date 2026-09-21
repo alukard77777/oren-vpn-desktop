@@ -319,6 +319,7 @@ pub enum ProfileMutationError {
     Connected,
     LimitReached,
     Storage,
+    Committed,
 }
 
 impl fmt::Display for ProfileMutationError {
@@ -608,6 +609,13 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<SubscriptionListDto, BackendError> {
         Err(BackendError::new())
     }
+    async fn replace_subscription_source(
+        &self,
+        _id: ProfileId,
+        _request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        Err(BackendError::new())
+    }
     async fn delete_subscription(&self, _id: ProfileId) -> Result<StatusDto, BackendError> {
         Err(BackendError::new())
     }
@@ -697,6 +705,10 @@ where
         .route(
             "/subscriptions/{profile_id}/refresh",
             post(refresh_subscription_profile),
+        )
+        .route(
+            "/subscriptions/{profile_id}/source",
+            put(replace_subscription_source),
         )
         .route("/subscriptions/{profile_id}", delete(delete_subscription))
         .route("/connect", post(connect))
@@ -973,6 +985,26 @@ async fn refresh_subscription_profile(
         .map_err(|error| profile_api_error(error, "Не удалось обновить профиль."))
 }
 
+async fn replace_subscription_source(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    payload: Result<Json<ImportSubscriptionRequest>, JsonRejection>,
+) -> Result<Json<SubscriptionListDto>, ApiError> {
+    let profile_id = parse_profile_id(&profile_id)?;
+    let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
+    let Some(url) = valid_subscription_source_url(&request.url) else {
+        return Err(ApiError::bad_request(
+            "Укажите корректный HTTP(S) URL подписки.",
+        ));
+    };
+    state
+        .backend
+        .replace_subscription_source(profile_id, ImportSubscriptionRequest { url })
+        .await
+        .map(Json)
+        .map_err(|error| profile_api_error(error, "Не удалось изменить ссылку подписки."))
+}
+
 async fn delete_subscription(
     State(state): State<AppState>,
     Path(profile_id): Path<String>,
@@ -992,6 +1024,18 @@ fn parse_profile_id(value: &str) -> Result<ProfileId, ApiError> {
     ProfileId::parse(value).map_err(|_| profile_not_found())
 }
 
+fn valid_subscription_source_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 8 * 1024 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn profile_api_error(error: BackendError, internal_message: &str) -> ApiError {
     match error.profile_mutation() {
         Some(ProfileMutationError::NotFound) => profile_not_found(),
@@ -1004,6 +1048,11 @@ fn profile_api_error(error: BackendError, internal_message: &str) -> ApiError {
             StatusCode::CONFLICT,
             "profile_limit",
             "Достигнут предел количества профилей.",
+        ),
+        Some(ProfileMutationError::Committed) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "profile_mutation_ambiguous",
+            "Изменение могло сохраниться. Обновите состояние подписок.",
         ),
         Some(ProfileMutationError::Storage) | None => ApiError::backend(internal_message),
     }
@@ -1854,6 +1903,19 @@ where
         self.refresh_profile_locked(id).await
     }
 
+    pub async fn replace_subscription_source_profile(
+        &self,
+        id: &ProfileId,
+        request: ImportSubscriptionRequest,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation().await?;
+        self.replace_profile_source_locked(id, &request.url).await
+    }
+
     pub async fn import_subscription_profile(
         &self,
         request: ImportSubscriptionRequest,
@@ -1960,14 +2022,14 @@ where
         if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
             self.remove_profile_logo(id);
             self.reconcile_authoritative_unreadable().await;
-            return Err(ProfileMutationError::Storage);
+            return Err(ProfileMutationError::Committed);
         }
         match self.store.profile_snapshot_generation(id) {
             Ok(loaded) => Ok(loaded),
-            Err(error) => {
+            Err(_) => {
                 self.remove_profile_logo(id);
                 self.reconcile_authoritative().await;
-                Err(map_profile_error(error))
+                Err(ProfileMutationError::Committed)
             }
         }
     }
@@ -1984,10 +2046,25 @@ where
             .subscription_source_url()
             .ok_or(ProfileMutationError::Storage)?
             .to_owned();
+        self.replace_profile_source_locked(id, &source_url).await
+    }
+
+    async fn replace_profile_source_locked(
+        &self,
+        id: &ProfileId,
+        source_url: &str,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let source_url = source_url.trim();
+        if source_url.is_empty() {
+            return Err(ProfileMutationError::Storage);
+        }
         let staging = AtomicSnapshot::default();
         let fetched = self
             .fetcher
-            .refresh(&source_url, &staging)
+            .refresh(source_url, &staging)
             .await
             .map_err(|_| ProfileMutationError::Storage)?;
         let (snapshot, _) = fetched.into_parts();
@@ -2012,7 +2089,7 @@ where
         if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
             self.remove_profile_logo(id);
             self.reconcile_authoritative_unreadable().await;
-            return Err(ProfileMutationError::Storage);
+            return Err(ProfileMutationError::Committed);
         }
         self.retain_profile_logo(id, physical_generation, &persisted);
         if !active {
@@ -2047,7 +2124,7 @@ where
         }
         if prepared.activate().is_err() {
             self.reconcile_authoritative().await;
-            return Err(ProfileMutationError::Storage);
+            return Err(ProfileMutationError::Committed);
         }
         Ok(self.current_status().await)
     }
@@ -2297,6 +2374,24 @@ where
             .await
             .map_err(BackendError::from_profile_mutation)?;
         self.refresh_profile_locked(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.subscription_list_dto()
+            .map_err(BackendError::from_profile_mutation)
+    }
+
+    async fn replace_subscription_source(
+        &self,
+        id: ProfileId,
+        request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        self.require_profile(&id)
+            .map_err(BackendError::from_profile_mutation)?;
+        let _operation = self.operation.lock().await;
+        self.require_disconnected_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
+        self.replace_profile_source_locked(&id, &request.url)
             .await
             .map_err(BackendError::from_profile_mutation)?;
         self.subscription_list_dto()
@@ -3453,6 +3548,22 @@ impl Backend for MemoryBackend {
             ));
         }
         state.require_mutable()?;
+        Ok(state.subscriptions())
+    }
+
+    async fn replace_subscription_source(
+        &self,
+        id: ProfileId,
+        request: ImportSubscriptionRequest,
+    ) -> Result<SubscriptionListDto, BackendError> {
+        let mut state = self.inner.write().await;
+        let Some(position) = state.profiles.iter().position(|profile| profile.id == id) else {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::NotFound,
+            ));
+        };
+        state.require_mutable()?;
+        state.profiles[position].source_url = request.url.trim().to_owned();
         Ok(state.subscriptions())
     }
 

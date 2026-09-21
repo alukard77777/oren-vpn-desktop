@@ -443,6 +443,89 @@ async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_n
 }
 
 #[tokio::test]
+async fn source_replacement_preserves_profile_identity_and_active_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let first_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    let second_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+
+    let profiles = backend
+        .replace_subscription_source(
+            profile_id(&first_id),
+            ImportSubscriptionRequest {
+                url: "  https://replacement.invalid/sub?token=secret  ".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        profiles.active_profile_id.as_deref(),
+        Some(second_id.as_str())
+    );
+    assert_eq!(profiles.profiles[0].id, first_id);
+    assert_eq!(profiles.profiles[0].display_name, "replacement.invalid");
+    drop(backend);
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let (_, snapshot) = store.profile_snapshot(&profile_id(&first_id)).unwrap();
+    assert_eq!(
+        snapshot.subscription_source_url(),
+        Some("https://replacement.invalid/sub?token=secret")
+    );
+}
+
+#[tokio::test]
+async fn committed_source_replacement_fault_is_reported_as_ambiguous_and_persists_new_source() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    backend.inject_post_commit_load_fault_for_testing();
+
+    let error = backend
+        .replace_subscription_source(
+            profile_id(&id),
+            ImportSubscriptionRequest {
+                url: "https://replacement.invalid/sub".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.profile_mutation(),
+        Some(ProfileMutationError::Committed)
+    );
+    drop(backend);
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let (_, snapshot) = store.profile_snapshot(&profile_id(&id)).unwrap();
+    assert_eq!(
+        snapshot.subscription_source_url(),
+        Some("https://replacement.invalid/sub")
+    );
+}
+
+#[tokio::test]
 async fn active_deletion_selects_next_then_empty_and_active_id_survives_restart() {
     let root = tempfile::tempdir().unwrap();
     let backend = profile_backend(root.path());
@@ -947,7 +1030,7 @@ async fn committed_refresh_load_failure_clears_stale_runtime_and_keeps_authorita
 
     assert_eq!(
         error.profile_mutation(),
-        Some(ProfileMutationError::Storage)
+        Some(ProfileMutationError::Committed)
     );
     let status = backend.status().await.unwrap();
     assert_eq!(status.active_profile_id.as_deref(), Some(id.as_str()));
@@ -973,7 +1056,7 @@ async fn committed_import_load_failure_clears_runtime_and_keeps_new_authoritativ
 
     assert_eq!(
         error.profile_mutation(),
-        Some(ProfileMutationError::Storage)
+        Some(ProfileMutationError::Committed)
     );
     let status = backend.status().await.unwrap();
     let authoritative = status

@@ -12,6 +12,7 @@ pub(crate) struct TrayGroup {
     pub(crate) id: String,
     pub(crate) label: String,
     pub(crate) selected: bool,
+    pub(crate) selected_node_label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub(crate) struct TrayInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrayMenuEntry {
     pub(crate) label: String,
+    pub(crate) detail: String,
     pub(crate) checked: bool,
     pub(crate) enabled: bool,
     pub(crate) command: TrayCommand,
@@ -48,6 +50,7 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
         .into_iter()
         .map(|group| TrayMenuEntry {
             label: group.label,
+            detail: group.selected_node_label,
             checked: group.selected,
             enabled: input.route_selection_enabled,
             command: TrayCommand::SelectGroup { group_id: group.id },
@@ -61,6 +64,7 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
                 .into_iter()
                 .map(|(node_id, label, selected)| TrayMenuEntry {
                     label,
+                    detail: String::new(),
                     checked: selected,
                     enabled: input.route_selection_enabled,
                     command: TrayCommand::SelectNode {
@@ -235,11 +239,13 @@ mod tests {
                     id: "server:opaque".into(),
                     label: "Сервер".into(),
                     selected: true,
+                    selected_node_label: "Швеция".into(),
                 },
                 TrayGroup {
                     id: "games:opaque".into(),
                     label: "Игры".into(),
                     selected: false,
+                    selected_node_label: "Direct".into(),
                 },
             ],
             selected_group_id: Some("server:opaque".into()),
@@ -251,6 +257,8 @@ mod tests {
         assert_eq!(model.status, "В сети");
         assert_eq!(model.connection_label, "Отключиться");
         assert_eq!(model.groups.len(), 2);
+        assert_eq!(model.groups[0].detail, "Швеция");
+        assert_eq!(model.groups[1].detail, "Direct");
         assert_eq!(model.nodes.len(), 1);
         assert_eq!(
             model.nodes[0].command,

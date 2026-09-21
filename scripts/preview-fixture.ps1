@@ -249,6 +249,14 @@ try {
                 } else {
                     Send-JsonResponse $stream 200 (Get-Subscriptions)
                 }
+            } elseif ($method -eq "PUT" -and $path -match '^/v1/subscriptions/([^/]+)/source$') {
+                if ($ProfileDelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $ProfileDelayMilliseconds }
+                $targetId = [System.Uri]::UnescapeDataString($Matches[1])
+                if (@($profileRows | Where-Object { $_.id -eq $targetId }).Count -eq 0) {
+                    Send-JsonResponse $stream 404 @{ code = "profile_not_found"; message = "Not found"; correlation_id = "preview" }
+                } else {
+                    Send-JsonResponse $stream 200 (Get-Subscriptions)
+                }
             } elseif ($method -eq "DELETE" -and $path -match '^/v1/subscriptions/([^/]+)$') {
                 if ($ProfileDelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $ProfileDelayMilliseconds }
                 $targetId = [System.Uri]::UnescapeDataString($Matches[1])

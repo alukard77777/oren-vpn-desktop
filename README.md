@@ -67,9 +67,13 @@ The subscription URL supports three fixed configuration User-Agent values:
 | `multicore-xray` | one Xray JSON object |
 
 Configuration requests include `x-hwid`, `x-device-os`, `x-ver-os`, and
-`x-device-model`. Provider metadata may supply a separate optional logo URL;
-MultiCore fetches that URL with `multicore-service-logo` and deliberately omits
-the configuration identity headers. A
+`x-device-model`. Provider metadata may supply a separate optional logo URL in
+any response header matching `<vendor>-servicelogo` (case-insensitive), for
+example `flclashx-servicelogo` or `ajsdjddj-servicelogo`. The vendor prefix must
+be non-empty; it is not a fixed allowlist. The value must be an HTTPS URL with a
+host and without embedded credentials. MultiCore fetches that URL with
+`multicore-service-logo` and deliberately omits the configuration identity
+headers. A
 successful HTTP response to `multicore-json-massive` is authoritative: parsing
 failure is reported and does not fall back. Only an unavailable or explicitly
 unsupported massive response triggers the atomic Mihomo + Xray fallback pair.
@@ -79,6 +83,14 @@ an ephemeral runtime copy receives only the client-local DNS/interface overlay
 needed to bootstrap before TUN. See the complete
 [subscription HTTP contract](docs/subscription-http-contract.md) and the
 [provider implementation contract](docs/contracts/multicore-subscription-backend-prompt.md).
+
+While the active profile is disconnected and ready, MultiCore refreshes it
+automatically using `profile-update-interval`; when the provider omits that
+header, the safe default is six hours. Provider values remain clamped from 15
+minutes through 30 days, and failed automatic attempts back off for 15 minutes.
+The Home subscription strip shows the active snapshot date in a compact gray
+`DD.MM.YYYY` form. Its clock indicator changes to warning state only after the
+effective refresh interval has elapsed.
 
 The configuration provider sees the usual HTTP request data, the subscription
 URL, the four configuration identity headers, and the selected configuration

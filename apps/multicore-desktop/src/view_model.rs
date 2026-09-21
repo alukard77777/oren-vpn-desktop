@@ -176,6 +176,7 @@ pub(crate) struct CatalogGroupPresentation {
     pub(crate) id: String,
     pub(crate) label: String,
     pub(crate) selected: bool,
+    pub(crate) selected_node_label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +208,8 @@ pub(crate) struct SubscriptionPresentation {
     pub(crate) display_name: String,
     pub(crate) usage: String,
     pub(crate) expiry: String,
+    pub(crate) updated: String,
+    pub(crate) updated_stale: bool,
     pub(crate) announcement_text: String,
     pub(crate) announcement_tone: String,
     pub(crate) service_logo_path: Option<String>,
@@ -233,6 +236,7 @@ pub(crate) enum SubscriptionProfileOperation {
     List,
     Activate,
     Refresh,
+    Edit,
     Delete,
 }
 
@@ -906,6 +910,81 @@ impl DesktopViewModel {
         }
     }
 
+    pub(crate) fn begin_profile_source_edit(
+        &mut self,
+        profile_id: &str,
+        url: &str,
+    ) -> Option<ProfileRequestToken> {
+        let valid = reqwest::Url::parse(url.trim())
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+        if !valid {
+            self.profile_error = Some("Введите корректный HTTP(S) URL.".into());
+            return None;
+        }
+        if !self.profile_mutation_preflight(profile_id, false) {
+            return None;
+        }
+        Some(self.next_profile_mutation(
+            SubscriptionProfileOperation::Edit,
+            Some(profile_id.to_owned()),
+        ))
+    }
+
+    pub(crate) fn finish_profile_source_edit(
+        &mut self,
+        token: ProfileRequestToken,
+        result: Result<DaemonSubscriptionList, crate::daemon::DaemonError>,
+    ) -> bool {
+        let Some(request) =
+            self.take_current_profile_mutation(token, SubscriptionProfileOperation::Edit)
+        else {
+            if profile_result_may_have_committed(&result) {
+                self.require_full_profile_reconciliation();
+            }
+            return false;
+        };
+        let Some(profile_id) = request.profile_id else {
+            return false;
+        };
+        let edits_active_profile = self.active_profile_id.as_deref() == Some(&profile_id);
+        match result {
+            Ok(list) => {
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                if let Some(profile) = list
+                    .profiles
+                    .into_iter()
+                    .find(|profile| profile.id == profile_id)
+                    .and_then(present_subscription_profile)
+                    && let Some(existing) = self
+                        .subscription_profiles
+                        .iter_mut()
+                        .find(|profile| profile.id == profile_id)
+                {
+                    let mut profile = profile;
+                    profile.active = existing.active;
+                    *existing = profile;
+                }
+                if edits_active_profile {
+                    self.invalidate_profile_runtime();
+                    self.require_profile_reconciliation(true, true, true);
+                } else {
+                    self.profile_reload_needed = true;
+                    self.profile_list_reconciliation_pending = true;
+                }
+                self.profile_error = None;
+                true
+            }
+            Err(error) => {
+                self.profile_error = Some(profile_mutation_error(&error, "изменить ссылку"));
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
+                false
+            }
+        }
+    }
+
     pub(crate) fn begin_profile_delete(&mut self, profile_id: &str) -> Option<ProfileRequestToken> {
         if !self.profile_mutation_preflight(profile_id, false) {
             return None;
@@ -1202,6 +1281,8 @@ impl DesktopViewModel {
                 display_name: "Подписка".into(),
                 usage: "Нет данных".into(),
                 expiry: "Добавьте ссылку".into(),
+                updated: "Не обновлялась".into(),
+                updated_stale: false,
                 announcement_text: String::new(),
                 announcement_tone: "info".into(),
                 service_logo_path: None,
@@ -1235,6 +1316,12 @@ impl DesktopViewModel {
                 }
             },
         );
+        let updated = format_update_date(info.updated_at_unix);
+        let updated_stale = info.updated_at_unix != 0
+            && now_unix
+                >= info
+                    .updated_at_unix
+                    .saturating_add(subscription_refresh_interval(info));
         let display_name = bounded_plain_text(&info.display_name, 128)
             .filter(|name| !name.is_empty())
             .or_else(|| bounded_plain_text(&info.source_name, 128))
@@ -1254,6 +1341,8 @@ impl DesktopViewModel {
             display_name,
             usage,
             expiry,
+            updated,
+            updated_stale,
             announcement_text,
             announcement_tone: announcement_tone.into(),
             service_logo_path: info.service_logo_path.as_deref().and_then(local_logo_path),
@@ -1263,6 +1352,19 @@ impl DesktopViewModel {
                 .is_some_and(|active| active.kind == MutationKind::SubscriptionRefresh),
             error: self.subscription_refresh_error.clone(),
         }
+    }
+
+    pub(crate) fn automatic_subscription_refresh_due_at(&self, now_unix: u64) -> bool {
+        let Some(info) = self.subscription.as_ref() else {
+            return false;
+        };
+        if !matches!(self.state, UiState::Ready { .. }) || !info.refresh_available {
+            return false;
+        }
+        now_unix
+            >= info
+                .updated_at_unix
+                .saturating_add(subscription_refresh_interval(info))
     }
 
     pub(crate) fn begin_subscription_refresh(&mut self) -> Option<MutationToken> {
@@ -1304,9 +1406,12 @@ impl DesktopViewModel {
                 self.queued_selections.clear();
                 self.latency_queued = true;
             }
-            Err(_) => {
+            Err(error) => {
                 self.subscription_refresh_error =
                     Some("Не удалось обновить. Рабочий профиль сохранён.".into());
+                if error.requires_reconciliation() {
+                    self.require_full_profile_reconciliation();
+                }
             }
         }
         self.active_mutation = None;
@@ -2121,6 +2226,12 @@ impl DesktopViewModel {
                 id: group.id.clone(),
                 label: group.label.clone(),
                 selected: selected == Some(group.id.as_str()),
+                selected_node_label: group
+                    .nodes
+                    .iter()
+                    .find(|node| node.selected)
+                    .map(|node| node.label.clone())
+                    .unwrap_or_else(|| "Не выбран".into()),
             })
             .collect();
         let nodes = selected
@@ -2414,6 +2525,40 @@ fn current_unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+const MIN_AUTO_REFRESH_SECS: u64 = 15 * 60;
+const DEFAULT_AUTO_REFRESH_SECS: u64 = 6 * 60 * 60;
+const MAX_AUTO_REFRESH_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn subscription_refresh_interval(info: &DaemonSubscriptionInfo) -> u64 {
+    info.refresh_interval_secs
+        .unwrap_or(DEFAULT_AUTO_REFRESH_SECS)
+        .clamp(MIN_AUTO_REFRESH_SECS, MAX_AUTO_REFRESH_SECS)
+}
+
+fn format_update_date(updated_at_unix: u64) -> String {
+    if updated_at_unix == 0 {
+        return "Не обновлялась".into();
+    }
+
+    // Convert whole UTC days since the Unix epoch to a Gregorian date without
+    // pulling a date-time dependency into the desktop shell.
+    let days = (updated_at_unix / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{day:02}.{month:02}.{year:04}")
 }
 
 fn format_gib(bytes: u64) -> String {
@@ -2981,6 +3126,67 @@ mod tests {
         assert!(!presentation.profiles[1].active);
         assert!(model.take_profile_list_reload_needed());
         assert!(!model.take_profile_catalog_reload_needed());
+    }
+
+    #[test]
+    fn profile_source_edit_validates_url_and_reconciles_the_target_profile() {
+        let mut model = model_with_profiles();
+        assert!(
+            model
+                .begin_profile_source_edit("profile-a", "not a URL")
+                .is_none()
+        );
+        assert_eq!(
+            model.profile_presentation().error.as_deref(),
+            Some("Введите корректный HTTP(S) URL.")
+        );
+
+        let edit = model
+            .begin_profile_source_edit("profile-a", "https://replacement.invalid/sub?token=secret")
+            .expect("start source edit");
+        let pending = model.profile_presentation();
+        assert_eq!(
+            pending.pending_operation,
+            Some(SubscriptionProfileOperation::Edit)
+        );
+        assert_eq!(pending.pending_id.as_deref(), Some("profile-a"));
+
+        assert!(model.finish_profile_source_edit(
+            edit,
+            Ok(profile_list(
+                Some("profile-a"),
+                vec![
+                    profile("profile-a", true, "Alpha replaced"),
+                    profile("profile-b", false, "Beta"),
+                ],
+            )),
+        ));
+        assert_eq!(
+            model.profile_presentation().profiles[0].title,
+            "Alpha replaced"
+        );
+        assert!(model.profile_reconciliation_required());
+    }
+
+    #[test]
+    fn ambiguous_profile_source_edit_forces_full_authoritative_reconciliation() {
+        let mut model = model_with_profiles();
+        let edit = model
+            .begin_profile_source_edit("profile-b", "https://replacement.invalid/sub")
+            .expect("start source edit");
+
+        assert!(!model.finish_profile_source_edit(
+            edit,
+            Err(DaemonError::ambiguous("private committed marker")),
+        ));
+
+        assert!(model.profile_reconciliation_required());
+        assert!(model.take_profile_status_reload_needed());
+        assert!(model.take_profile_list_reload_needed());
+        assert!(model.take_profile_catalog_reload_needed());
+        assert!(
+            !format!("{:?}", model.profile_presentation()).contains("private committed marker")
+        );
     }
 
     #[test]
@@ -3902,8 +4108,49 @@ mod tests {
         assert_eq!(subscription.display_name, "Provider One");
         assert_eq!(subscription.usage, "17179869184.0 GB");
         assert_eq!(subscription.expiry, "Осталось 40 дней");
+        assert_eq!(subscription.updated, "14.09.2026");
+        assert!(!subscription.updated_stale);
         assert!(subscription.refresh_available);
         assert!(!format!("{subscription:?}").contains("https://"));
+
+        let stale = view_model.subscription_presentation_at(1_789_405_200 + 6 * 60 * 60);
+        assert_eq!(stale.updated, "14.09.2026");
+        assert!(stale.updated_stale);
+    }
+
+    #[test]
+    fn subscription_update_date_is_compact_and_explicit() {
+        assert_eq!(format_update_date(0), "Не обновлялась");
+        assert_eq!(format_update_date(1), "01.01.1970");
+        assert_eq!(format_update_date(1_789_405_200), "14.09.2026");
+    }
+
+    #[test]
+    fn automatic_subscription_refresh_uses_provider_interval_or_safe_default() {
+        let mut client = MockDaemonClient::ready();
+        client.status.subscription = Some(DaemonSubscriptionInfo {
+            updated_at_unix: 10_000,
+            refresh_interval_secs: Some(3_600),
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+        let mut model = DesktopViewModel::new(Arc::new(client));
+        let refresh = model.begin_refresh();
+        let status = model.daemon_client().status().expect("status");
+        model.finish_refresh(refresh, Ok(status));
+
+        assert!(!model.automatic_subscription_refresh_due_at(13_599));
+        assert!(model.automatic_subscription_refresh_due_at(13_600));
+
+        model.subscription.as_mut().unwrap().refresh_interval_secs = None;
+        assert!(!model.automatic_subscription_refresh_due_at(10_000 + 6 * 60 * 60 - 1));
+        assert!(model.automatic_subscription_refresh_due_at(10_000 + 6 * 60 * 60));
+
+        model.state = UiState::Connected {
+            profile: "Основной".into(),
+            node: "Auto".into(),
+        };
+        assert!(!model.automatic_subscription_refresh_due_at(u64::MAX));
     }
 
     #[test]
@@ -4048,6 +4295,37 @@ mod tests {
             Some("Не удалось обновить. Рабочий профиль сохранён.")
         );
         assert!(!format!("{subscription:?}").contains("private.invalid"));
+    }
+
+    #[test]
+    fn ambiguous_subscription_refresh_forces_full_authoritative_reconciliation() {
+        let mut client = MockDaemonClient::ready();
+        client.status.subscription = Some(DaemonSubscriptionInfo {
+            source_name: "subscription.example".into(),
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+        let mut view_model = DesktopViewModel::new(Arc::new(client));
+        let startup = view_model.begin_refresh();
+        let status = view_model.daemon_client().status().expect("status");
+        view_model.finish_refresh(startup, Ok(status));
+
+        let refresh = view_model
+            .begin_subscription_refresh()
+            .expect("refresh from ready state");
+        assert!(!view_model.finish_subscription_refresh(
+            refresh,
+            Err(DaemonError::ambiguous("private committed marker")),
+        ));
+
+        assert!(matches!(view_model.state, UiState::DaemonDegraded { .. }));
+        assert!(view_model.profile_status_reconciliation_pending);
+        assert!(view_model.profile_list_reconciliation_pending);
+        assert!(view_model.profile_catalog_reconciliation_pending);
+        assert!(view_model.profile_status_reload_needed);
+        assert!(view_model.profile_reload_needed);
+        assert!(view_model.profile_catalog_reload_needed);
+        assert!(!format!("{:?}", view_model.subscription_presentation()).contains("private"));
     }
 
     struct DelayedDaemonClient {
