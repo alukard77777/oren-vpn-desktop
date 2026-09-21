@@ -1,11 +1,12 @@
 [package]
 name = "multicore-desktop"
-version = "0.1.2"
+version = "0.1.7"
 edition = "2024"
 license.workspace = true
 publish = false
 
 [dependencies]
+copypasta = "0.10.2"
 getrandom = "0.4"
 image.workspace = true
 multicore-platform = { path = "../../crates/multicore-platform" }

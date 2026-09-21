@@ -66,6 +66,7 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-packaged-daemon-smoke-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
 
@@ -83,9 +84,8 @@ jobs:
             -CoreHostExecutablePath dist/release/multicore-windows-x64/runtime/multicore-core-host.exe
           $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x64.zip').Path
           cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-one-click.ps1 `
-            -PackagePath dist/release/multicore-windows-x64 `
-            -Background
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-packaged-daemon.ps1 `
+            -PackagePath dist/release/multicore-windows-x64
 
       - name: Install pinned Inno Setup
         shell: pwsh
@@ -154,17 +154,17 @@ jobs:
           @"
           MultiCore $env:APP_VERSION for Windows x64.
 
-          Source commit: $env:GITHUB_SHA (private source repository).
+          Source commit: https://github.com/fatyzzz/multicore/commit/$env:GITHUB_SHA
 
           - `MultiCore-Setup-x64.exe` — per-user installer.
           - `multicore-windows-x64.zip` — verified portable bundle and updater asset.
           - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
           - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
 
-          UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn. Keep this release as a draft until a signed-production review explicitly approves publication.
+          PUBLIC UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn.
           "@ | Set-Content -LiteralPath dist/release/RELEASE_NOTES.md -Encoding utf8
 
-      - name: Create unsigned preview as draft
+      - name: Publish release to update channel
         shell: pwsh
         run: |
           $assets = @(
@@ -177,6 +177,6 @@ jobs:
           gh release create $env:GITHUB_REF_NAME @assets `
             --repo fatyzzz/multicore-releases `
             --target main `
-            --draft `
+            --latest `
             --title "MultiCore $env:APP_VERSION" `
             --notes-file dist/release/RELEASE_NOTES.md

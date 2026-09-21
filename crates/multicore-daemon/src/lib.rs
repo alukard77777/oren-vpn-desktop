@@ -1904,8 +1904,9 @@ where
     where
         C: 'static,
     {
+        self.require_refresh_delete_mutation().await?;
         let _operation = self.operation.lock().await;
-        self.require_disconnected_mutation().await?;
+        self.require_refresh_delete_mutation().await?;
         self.refresh_profile_locked(id).await
     }
 
@@ -1937,14 +1938,25 @@ where
         &self,
         id: &ProfileId,
     ) -> Result<StatusDto, ProfileMutationError> {
-        self.require_disconnected_mutation().await?;
+        self.require_refresh_delete_mutation().await?;
         let _operation = self.operation.lock().await;
-        self.require_disconnected_mutation().await?;
+        self.require_refresh_delete_mutation().await?;
         let was_active = self.store.active_id().as_ref() == Some(id);
+        let stopped_connection = if was_active {
+            self.stop_connection_for_profile_mutation().await?
+        } else {
+            false
+        };
         let maintenance_debt = match self.store.delete(id) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => true,
-            Err(error) => return Err(map_profile_error(error)),
+            Err(error) => {
+                return Err(if stopped_connection {
+                    ProfileMutationError::Committed
+                } else {
+                    map_profile_error(error)
+                });
+            }
         };
         self.remove_profile_logo(id);
         if was_active {
@@ -1970,6 +1982,64 @@ where
             Err(ProfileMutationError::Connected)
         } else {
             Ok(())
+        }
+    }
+
+    async fn require_refresh_delete_mutation(&self) -> Result<(), ProfileMutationError> {
+        let state = self.inner.read().await;
+        if state.degraded || state.state.current() == CoreConnectionState::Connecting {
+            Err(ProfileMutationError::Connected)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn stop_connection_for_profile_mutation(&self) -> Result<bool, ProfileMutationError> {
+        let controller = {
+            let state = self.inner.read().await;
+            match state.state.current() {
+                CoreConnectionState::Connected => state
+                    .controller
+                    .clone()
+                    .ok_or(ProfileMutationError::Committed)?,
+                CoreConnectionState::Connecting => return Err(ProfileMutationError::Connected),
+                CoreConnectionState::Empty
+                | CoreConnectionState::Ready
+                | CoreConnectionState::Error => return Ok(false),
+            }
+        };
+
+        let result = Supervisor::new(controller).disconnect().await;
+        let mut state = self.inner.write().await;
+        match result {
+            Ok(()) => {
+                state
+                    .state
+                    .transition(CoreConnectionState::Ready)
+                    .map_err(|_| ProfileMutationError::Committed)?;
+                state.message = None;
+                state.degraded = false;
+                state.push_event(
+                    Severity::Info,
+                    Component::Core,
+                    "profile_mutation_disconnect",
+                    "Connection stopped before changing the active subscription.",
+                );
+                Ok(true)
+            }
+            Err(_) => {
+                state.mark_error(
+                    "Could not safely stop the cores before changing the active subscription.",
+                    true,
+                );
+                state.push_event(
+                    Severity::Error,
+                    Component::Core,
+                    "profile_mutation_disconnect",
+                    "Core shutdown failed before an active subscription mutation.",
+                );
+                Err(ProfileMutationError::Committed)
+            }
         }
     }
 
@@ -2080,6 +2150,11 @@ where
         } else {
             None
         };
+        let stopped_connection = if active {
+            self.stop_connection_for_profile_mutation().await?
+        } else {
+            false
+        };
         let (revision, physical_generation, persisted, maintenance_debt) =
             match self.store.replace_profile_loaded(id, snapshot.clone()) {
                 Ok((revision, physical_generation, persisted)) => {
@@ -2090,7 +2165,13 @@ where
                         self.profile_snapshot_after_commit(id).await?;
                     (revision, physical_generation, persisted, true)
                 }
-                Err(error) => return Err(map_profile_error(error)),
+                Err(error) => {
+                    return Err(if stopped_connection {
+                        ProfileMutationError::Committed
+                    } else {
+                        map_profile_error(error)
+                    });
+                }
             };
         if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
             self.remove_profile_logo(id);
@@ -2343,8 +2424,11 @@ where
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
+        self.require_refresh_delete_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
         let _operation = self.operation.lock().await;
-        self.require_disconnected_mutation()
+        self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
         let id = self
@@ -2375,8 +2459,11 @@ where
     ) -> Result<SubscriptionListDto, BackendError> {
         self.require_profile(&id)
             .map_err(BackendError::from_profile_mutation)?;
+        self.require_refresh_delete_mutation()
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
         let _operation = self.operation.lock().await;
-        self.require_disconnected_mutation()
+        self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
         self.refresh_profile_locked(&id)
@@ -3516,12 +3603,19 @@ impl Backend for MemoryBackend {
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
-        let state = self.inner.read().await;
-        state.require_mutable()?;
+        let mut state = self.inner.write().await;
         if state.active_profile_id.is_none() {
             return Err(BackendError::from_profile_mutation(
                 ProfileMutationError::NotFound,
             ));
+        }
+        if state.connection == ConnectionState::Connecting {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Connected,
+            ));
+        }
+        if state.connection == ConnectionState::Connected {
+            state.connection = ConnectionState::Ready;
         }
         Ok(state.status())
     }
@@ -3547,13 +3641,22 @@ impl Backend for MemoryBackend {
         &self,
         id: ProfileId,
     ) -> Result<SubscriptionListDto, BackendError> {
-        let state = self.inner.read().await;
+        let mut state = self.inner.write().await;
         if !state.profiles.iter().any(|profile| profile.id == id) {
             return Err(BackendError::from_profile_mutation(
                 ProfileMutationError::NotFound,
             ));
         }
-        state.require_mutable()?;
+        if state.connection == ConnectionState::Connecting {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Connected,
+            ));
+        }
+        if state.active_profile_id.as_ref() == Some(&id)
+            && state.connection == ConnectionState::Connected
+        {
+            state.connection = ConnectionState::Ready;
+        }
         Ok(state.subscriptions())
     }
 
@@ -3580,7 +3683,11 @@ impl Backend for MemoryBackend {
                 ProfileMutationError::NotFound,
             ));
         };
-        state.require_mutable()?;
+        if state.connection == ConnectionState::Connecting {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Connected,
+            ));
+        }
         let was_active = state.active_profile_id.as_ref() == Some(&id);
         state.profiles.remove(position);
         if was_active {
@@ -3590,11 +3697,13 @@ impl Backend for MemoryBackend {
                 .or_else(|| state.profiles.last())
                 .map(|profile| profile.id.clone());
         }
-        state.connection = if state.profiles.is_empty() {
-            ConnectionState::Empty
-        } else {
-            ConnectionState::Ready
-        };
+        if was_active {
+            state.connection = if state.profiles.is_empty() {
+                ConnectionState::Empty
+            } else {
+                ConnectionState::Ready
+            };
+        }
         Ok(state.status())
     }
 

@@ -37,14 +37,18 @@ the cores independently.
 MultiCore stores up to 16 independent profiles. Exactly one profile is active;
 profiles are never merged. Route selections are persisted per profile. Existing
 single-subscription data under the legacy snapshot directory is migrated locally
-and offline on first profile-store startup. Activating or deleting a profile is
-blocked while connected.
+and offline on first profile-store startup. Activating another profile or editing
+its source URL is blocked while connected. Refresh and delete stay available: an
+inactive profile is changed without touching the tunnel, while changing the
+active profile first stops both cores safely and leaves MultiCore ready to
+reconnect.
 
 The subscription strip on the Home screen is a compact active-profile selector
-only. Adding, refreshing, inspecting, and deleting profiles lives under
-the top-level **Subscriptions** page, so routine switching stays separate from
-profile management. Expanded rows keep metadata and actions compact; saved
-subscription URLs are not displayed back in the profile list.
+with a small refresh action above the last-updated date. Adding, inspecting, and
+managing every profile also lives under the top-level **Subscriptions** page, so
+routine switching stays separate from profile management. Rows keep metadata
+and actions compact; saved subscription URLs are not displayed back in the
+profile list.
 
 The tray icon uses exact mouse behavior: left click restores the main window;
 right click toggles MultiCore's own compact control popup with connection,
@@ -117,11 +121,10 @@ client reads the latest non-draft `vX.Y.Z` GitHub Release anonymously and expect
 `multicore-windows-x64.zip` with GitHub's SHA-256 asset digest. It then verifies
 the archive's internal `SHA256SUMS.txt`, stages a sibling directory, swaps the
 complete bundle transactionally, and relaunches the client. Updates are blocked
-while connected. A private repository or private release is incompatible with
-anonymous update checks, so source remains private while release assets remain
-public. The private source workflow needs a dedicated least-privilege
-`RELEASES_TOKEN` Actions secret with permission to create releases in the public
-release repository; the token is never embedded in the client.
+while connected. Release assets must remain public for anonymous update checks.
+The source workflow uses a dedicated least-privilege `RELEASES_TOKEN` Actions
+secret with permission to create releases in the separate public release
+repository; the token is never embedded in the client.
 
 ## Build, verify, and package
 
@@ -156,12 +159,13 @@ Create the per-user installer from that bundle:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
   -PackagePath dist\multicore-windows-x64 `
   -OutputDirectory dist\release `
-  -AppVersion 0.1.2
+  -AppVersion 0.1.7
 ```
 
-The tag workflow builds and verifies artifacts but leaves the GitHub Release as
-a draft. Do not publish an unsigned draft as a stable update. Public production
-release requires Authenticode signing, protected release credentials, a public
-anonymous asset, immutable corresponding source for the bundled cores, and a
+Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes
+them to `fatyzzz/multicore-releases`; installed clients read that public channel
+anonymously. Current releases are explicitly unsigned previews. A hardened
+production release still requires Authenticode signing, protected release
+credentials, immutable corresponding source for the bundled cores, and a
 complete Rust dependency/license inventory. The current third-party notice is
 explicitly incomplete for the Rust dependency graph.

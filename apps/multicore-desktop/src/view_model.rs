@@ -14,6 +14,7 @@ use crate::daemon::{
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
 const MAX_SUBSCRIPTION_PROFILES: usize = 16;
+pub(crate) const MAX_SUBSCRIPTION_URL_BYTES: usize = 8_192;
 const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -728,6 +729,14 @@ impl DesktopViewModel {
         self.import_error.as_deref()
     }
 
+    pub(crate) fn set_import_error_message(&mut self, message: &'static str) {
+        self.import_error = Some(message.to_owned());
+    }
+
+    pub(crate) fn dismiss_import_error(&mut self) {
+        self.import_error = None;
+    }
+
     pub(crate) fn daemon_client(&self) -> Arc<dyn DaemonClient> {
         self.client.clone()
     }
@@ -802,7 +811,7 @@ impl DesktopViewModel {
         &mut self,
         profile_id: &str,
     ) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, false) {
+        if !self.profile_mutation_preflight(profile_id, false, false) {
             return None;
         }
         if self.active_profile_id.as_deref() == Some(profile_id) {
@@ -852,7 +861,7 @@ impl DesktopViewModel {
         &mut self,
         profile_id: &str,
     ) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, true) {
+        if !self.profile_mutation_preflight(profile_id, true, true) {
             return None;
         }
         Some(self.next_profile_mutation(
@@ -923,13 +932,11 @@ impl DesktopViewModel {
         profile_id: &str,
         url: &str,
     ) -> Option<ProfileRequestToken> {
-        let valid = reqwest::Url::parse(url.trim())
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
-        if !valid {
+        if !valid_subscription_url(url) {
             self.profile_error = Some("Введите корректный HTTP(S) URL.".into());
             return None;
         }
-        if !self.profile_mutation_preflight(profile_id, false) {
+        if !self.profile_mutation_preflight(profile_id, false, false) {
             return None;
         }
         Some(self.next_profile_mutation(
@@ -994,7 +1001,7 @@ impl DesktopViewModel {
     }
 
     pub(crate) fn begin_profile_delete(&mut self, profile_id: &str) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, false) {
+        if !self.profile_mutation_preflight(profile_id, false, true) {
             return None;
         }
         Some(self.next_profile_mutation(
@@ -1100,11 +1107,15 @@ impl DesktopViewModel {
             .flatten()
     }
 
-    fn profile_mutation_preflight(&mut self, profile_id: &str, requires_available: bool) -> bool {
-        if matches!(
-            self.state,
-            UiState::Connected { .. } | UiState::Connecting { .. }
-        ) {
+    fn profile_mutation_preflight(
+        &mut self,
+        profile_id: &str,
+        requires_available: bool,
+        allow_connected: bool,
+    ) -> bool {
+        if matches!(self.state, UiState::Connecting { .. })
+            || (!allow_connected && matches!(self.state, UiState::Connected { .. }))
+        {
             self.profile_error = Some("Отключитесь перед изменением подписки.".into());
             return false;
         }
@@ -1382,10 +1393,7 @@ impl DesktopViewModel {
             || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
-            || matches!(
-                self.state,
-                UiState::Connected { .. } | UiState::Connecting { .. }
-            )
+            || matches!(self.state, UiState::Connecting { .. })
             || !self
                 .subscription
                 .as_ref()
@@ -1527,9 +1535,7 @@ impl DesktopViewModel {
             self.import_error = Some("Дождитесь завершения операции подключения.".into());
             return None;
         }
-        let valid = reqwest::Url::parse(url.trim())
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
-        if !valid {
+        if !valid_subscription_url(url) {
             self.import_error = Some("Введите корректный HTTP(S) URL.".into());
             return None;
         }
@@ -2655,6 +2661,13 @@ fn safe_profile_id(value: &str) -> Option<String> {
     .then(|| value.to_owned())
 }
 
+fn valid_subscription_url(value: &str) -> bool {
+    let value = value.trim();
+    value.len() <= MAX_SUBSCRIPTION_URL_BYTES
+        && reqwest::Url::parse(value)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
 #[allow(dead_code)] // Used by profile presentation methods wired in Task 6.
 fn profile_mutation_error(error: &crate::daemon::DaemonError, action: &str) -> String {
     if error.is_profile_conflict() {
@@ -3395,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    fn connected_profile_mutations_are_rejected_before_a_request_token_exists() {
+    fn connected_profile_refresh_and_delete_issue_tokens_but_activation_stays_blocked() {
         let mut model = model_with_profiles();
         let refresh = model.begin_refresh();
         model.finish_refresh(
@@ -3409,11 +3422,20 @@ mod tests {
         );
 
         assert!(model.begin_profile_activation("profile-b").is_none());
-        assert!(model.begin_profile_delete("profile-b").is_none());
-        assert!(model.begin_profile_target_refresh("profile-b").is_none());
-        let error = model.profile_presentation().error.expect("inline error");
-        assert!(error.chars().count() < 128);
-        assert!(!error.contains("profile-b"));
+        assert!(model.begin_profile_target_refresh("profile-b").is_some());
+
+        let mut deletion = model_with_profiles();
+        let refresh = deletion.begin_refresh();
+        deletion.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Alpha".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert!(deletion.begin_profile_delete("profile-b").is_some());
     }
 
     #[test]
@@ -3831,6 +3853,33 @@ mod tests {
     }
 
     #[test]
+    fn connected_home_subscription_refresh_starts_and_applies_disconnected_status() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        view_model.state = UiState::Connected {
+            profile: "Тестовый".into(),
+            node: "Авто".into(),
+        };
+        view_model.subscription = Some(DaemonSubscriptionInfo {
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+
+        let refresh = view_model
+            .begin_subscription_refresh()
+            .expect("connected refresh");
+        assert!(view_model.finish_subscription_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Авто".into()),
+                ..DaemonStatus::default()
+            })
+        ));
+        assert!(matches!(view_model.state, UiState::Ready { .. }));
+    }
+
+    #[test]
     fn latency_results_are_compact_safe_and_stale_completions_are_ignored() {
         let mut view_model = connected_view_model_with_catalog();
         let first = view_model.begin_latency_request().expect("first request");
@@ -3997,7 +4046,11 @@ mod tests {
         let main = include_str!("main.rs");
         assert!(!app.contains("callback check-latencies();"));
         assert!(!app.contains("latency-check-enabled"));
-        assert!(app.contains("Задержка обновляется автоматически"));
+        assert!(!app.contains("Задержка обновляется автоматически"));
+        assert!(app.contains("routes-heading := HorizontalLayout"));
+        assert!(app.contains("route-updated-meta := Text"));
+        assert!(app.contains("text: root.subscription-updated;"));
+        assert!(app.contains("horizontal-alignment: right;"));
         assert!(app.contains("trailing-text: node.latency-text;"));
         assert!(!main.contains("ui.on_check_latencies"));
         assert!(main.contains("TimerMode::Repeated"));
@@ -5673,10 +5726,143 @@ mod tests {
     }
 
     #[test]
+    fn first_run_home_uses_inline_subscription_onboarding() {
+        let source = include_str!("../ui/app.slint");
+        let onboarding = source
+            .split("first-run-onboarding := VerticalLayout")
+            .nth(1)
+            .and_then(|source| source.split("strip-glow-touch := TouchArea").next())
+            .expect("inline first-run onboarding block");
+
+        for required in [
+            "callback paste-subscription();",
+            "callback dismiss-first-run-import();",
+            "in-out property <bool> first-run-manual-open: false;",
+            "private property <int> first-run-input-focus-serial: 0;",
+            "private property <int> first-run-trigger-focus-serial: 0;",
+            "private property <int> power-action-focus-serial: 0;",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing root contract: {required}"
+            );
+        }
+
+        for required in [
+            "text: \"Добавьте подписку\";",
+            "text: \"Ссылка хранится локально на этом устройстве\";",
+            "onboarding-copy := VerticalLayout",
+            "first-run-actions := HorizontalLayout",
+            "label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";",
+            "root.paste-subscription();",
+            "label: \"Ввести вручную\";",
+            "focus-epoch: root.first-run-trigger-focus-serial;",
+            "first-run-url-input := LineEdit",
+            "accessible-label: \"URL подписки\";",
+            "changed focus-serial => { self.focus(); }",
+            "init => { self.focus(); }",
+            "label: root.import-pending ? \"Добавляем…\" : \"Добавить\";",
+            "root.import-url(root.subscription-draft);",
+            "label: \"Отмена\";",
+            "root.first-run-trigger-focus-serial += 1;",
+            "root.dismiss-first-run-import();",
+            "text: root.import-error;",
+            "accessible-live-region: polite;",
+        ] {
+            assert!(
+                onboarding.contains(required),
+                "missing first-run source contract: {required}"
+            );
+        }
+
+        assert!(onboarding.contains("if root.first-run-manual-open"));
+        let paste_action = onboarding
+            .split("PrimaryAction {")
+            .nth(1)
+            .and_then(|action| action.split("SmallAction {").next())
+            .expect("paste action");
+        assert!(paste_action.contains("enabled: !root.import-pending;"));
+        let manual_trigger = onboarding
+            .split("label: \"Ввести вручную\";")
+            .nth(1)
+            .and_then(|action| action.split("activated =>").next())
+            .expect("manual trigger");
+        assert!(manual_trigger.contains("enabled: !root.import-pending;"));
+        let add_action = onboarding
+            .split("label: root.import-pending ? \"Добавляем…\" : \"Добавить\";")
+            .nth(1)
+            .and_then(|action| action.split("activated =>").next())
+            .expect("manual add action");
+        assert!(
+            add_action
+                .contains("enabled: !root.import-pending && root.subscription-draft != \"\";")
+        );
+        let cancel_action = onboarding
+            .split("label: \"Отмена\";")
+            .nth(1)
+            .and_then(|action| action.split("activated =>").next())
+            .expect("manual cancel action");
+        assert!(cancel_action.contains("enabled: !root.import-pending;"));
+        assert!(
+            onboarding.contains("if (!root.import-pending && root.subscription-draft != \"\")")
+        );
+        assert!(!onboarding.contains("root.local-page ="));
+        assert!(!onboarding.contains("root.settings-section ="));
+        assert!(!onboarding.contains("root.add-subscription();"));
+        assert!(!onboarding.contains("root.open-panel("));
+
+        let escape_handler = source
+            .split("key-pressed(event) =>")
+            .find(|handler| handler.contains("event.text == Key.Escape"))
+            .and_then(|handler| handler.split("return reject;").next())
+            .expect("root Escape handler");
+        assert!(escape_handler.contains("if (!root.has-profile && root.first-run-manual-open)"));
+        assert!(escape_handler.contains("root.dismiss-first-run-import();"));
+        assert!(
+            escape_handler.find("root.first-run-manual-open").unwrap()
+                < escape_handler
+                    .find("root.profile-delete-confirm-id")
+                    .unwrap()
+        );
+
+        let success_handler = source
+            .split("changed import-success-serial =>")
+            .nth(1)
+            .and_then(|source| source.split("changed active-panel =>").next())
+            .expect("import success handler");
+        assert!(success_handler.contains("root.subscription-draft = \"\";"));
+        assert!(success_handler.contains("root.first-run-manual-open = false;"));
+        assert!(success_handler.contains("if (root.has-profile && root.visible-page == \"home\")"));
+        assert!(success_handler.contains("root.power-action-focus-serial += 1;"));
+        assert!(success_handler.contains("root.profile-shelf-focus-serial += 1;"));
+
+        let power_action = source
+            .split("power-action := FocusScope")
+            .nth(1)
+            .and_then(|source| source.split("power-button := Rectangle").next())
+            .expect("power action focus scope");
+        assert!(
+            power_action.contains("property <int> focus-epoch: root.power-action-focus-serial;")
+        );
+        assert!(power_action.contains("changed focus-epoch =>"));
+        assert!(power_action.contains("self.focus();"));
+
+        // Subscription management retains its independent add/edit flow.
+        let management = source
+            .split("if root.visible-page == \"subscriptions\": VerticalLayout")
+            .nth(1)
+            .expect("subscription management page");
+        assert!(management.contains("root.add-subscription();"));
+        assert!(management.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(management.contains("root.import-url(root.subscription-draft);"));
+    }
+
+    #[test]
     fn desktop_control_center_source_contract() {
         let source = include_str!("../ui/app.slint");
         let components = include_str!("../ui/components.slint");
         let main = include_str!("main.rs");
+        let logo_cache = include_str!("logo_cache.rs");
 
         let small_action = source
             .split("component SmallAction")
@@ -5691,7 +5877,8 @@ mod tests {
 
         assert!(source.contains("inline-routes := Rectangle"));
         assert!(source.contains("connection-strip := Rectangle"));
-        assert!(source.contains("height: 96px;"));
+        assert!(source.contains("height: root.has-profile"));
+        assert!(source.contains("? 96px"));
         assert!(source.contains("power-action := FocusScope"));
         assert!(source.contains("width: 72px;"));
         assert!(source.contains("height: 72px;"));
@@ -5749,8 +5936,7 @@ mod tests {
         assert!(connection_strip.contains("if (root.primary-enabled)"));
         assert!(connection_strip.contains("root.primary-action();"));
         assert!(connection_strip.contains("strip-glow-touch.pressed"));
-        assert!(source.contains("subscription-refresh-action := SmallAction"));
-        assert!(source.contains("width: 104px;"));
+        assert!(source.contains("subscription-refresh-action := FocusScope"));
         let subscription_strip = source
             .split("subscription-strip := Rectangle")
             .nth(1)
@@ -5761,7 +5947,12 @@ mod tests {
             })
             .expect("subscription strip source");
         assert!(subscription_strip.contains("border-radius: 16px;"));
-        assert!(subscription_strip.contains("padding-right: 5px;"));
+        assert!(subscription_strip.contains("x: parent.width - 140px;"));
+        assert!(subscription_strip.contains("width: 92px;"));
+        assert!(subscription_strip.contains("height: 44px;"));
+        assert!(subscription_strip.contains("accessible-label: root.subscription-refresh-pending"));
+        assert!(subscription_strip.contains("root.refresh-subscription();"));
+        assert!(subscription_strip.contains("padding-right: 16px;"));
         assert!(subscription_strip.contains("padding-top: 5px;"));
         assert!(subscription_strip.contains("padding-bottom: 5px;"));
         assert!(subscription_strip.contains("subscription-copy := VerticalLayout"));
@@ -5815,7 +6006,16 @@ mod tests {
         assert!(source.contains("text: root.subscription-title;"));
         assert!(!source.to_ascii_lowercase().contains("text: \"acmevpn\""));
         assert!(!source.to_ascii_lowercase().contains("text: \"work\""));
-        assert!(main.contains("service_logo::load(Path::new(path))"));
+        assert!(main.contains("logo_cache::with_logo_cache"));
+        assert!(main.contains("cache.retain_paths"));
+        assert!(main.contains("cache.image_for_path"));
+        assert!(!main.contains("slint::Image::load_from_path"));
+        assert!(!logo_cache.contains("slint::Image::load_from_path"));
+        assert_eq!(
+            logo_cache.matches("crate::service_logo::load").count(),
+            1,
+            "PNG decoding must have one cache-owned entry point"
+        );
         assert!(main.contains("ui.set_has_service_logo(service_logo.is_some());"));
         assert!(main.contains("ui.set_service_logo(service_logo.unwrap_or_default());"));
         let snapshot = main
@@ -5872,17 +6072,16 @@ mod tests {
             "label: \"Состояние\";",
             "label: \"Настройки\";",
             "text: \"Маршруты\";",
-            "root.latency-check-queued",
-            "\"Проверим автоматически\"",
+            "routes-heading := HorizontalLayout",
+            "route-updated-meta := Text",
+            "text: root.subscription-updated;",
             "root.open-panel(\"events\")",
             "root.refresh-subscription();",
             "root.primary-action();",
             "root.select-catalog-group(group.id);",
             "root.select-catalog-node(node.id);",
-            "if !root.has-profile: PrimaryAction",
-            "label: \"Добавить URL\";",
-            "state-label: \"Добавить подписку\";",
-            "activated => { root.add-subscription(); }",
+            "first-run-onboarding := VerticalLayout",
+            "callback paste-subscription();",
             "callback update-action();",
             "root.update-action();",
             "Отключитесь, чтобы установить обновление",
@@ -6738,6 +6937,74 @@ mod tests {
                 .unwrap()
                 .contains("token")
         );
+    }
+
+    #[test]
+    fn subscription_url_validation_uses_the_shared_persistence_byte_limit() {
+        let prefix = "https://example.com/";
+        let exact = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_SUBSCRIPTION_URL_BYTES - prefix.len())
+        );
+        let over = format!("{exact}a");
+
+        assert_eq!(exact.len(), MAX_SUBSCRIPTION_URL_BYTES);
+        assert!(valid_subscription_url(&exact));
+        assert!(!valid_subscription_url(&over));
+    }
+
+    #[test]
+    fn dismiss_import_error_clears_validation_and_server_errors_without_changing_state() {
+        let mut validation_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        refresh(&mut validation_model);
+        validation_model.open_panel(Panel::Subscription);
+        assert!(validation_model.begin_import("not a URL").is_none());
+        let validation_state = validation_model.state.clone();
+        let validation_panel = validation_model.panel;
+
+        validation_model.dismiss_import_error();
+
+        assert_eq!(validation_model.import_error, None);
+        assert_eq!(validation_model.state, validation_state);
+        assert_eq!(validation_model.panel, validation_panel);
+        assert!(!validation_model.import_pending);
+
+        let mut client = MockDaemonClient::ready();
+        client.fail_import = true;
+        let mut server_model = DesktopViewModel::new(Arc::new(client));
+        refresh(&mut server_model);
+        import_subscription(
+            &mut server_model,
+            "https://subscription.invalid/server-error",
+        );
+        assert!(server_model.import_error.is_some());
+        let server_state = server_model.state.clone();
+        let server_panel = server_model.panel;
+
+        server_model.dismiss_import_error();
+
+        assert_eq!(server_model.import_error, None);
+        assert_eq!(server_model.state, server_state);
+        assert_eq!(server_model.panel, server_panel);
+        assert!(!server_model.import_pending);
+    }
+
+    #[test]
+    fn external_import_error_survives_unrelated_presentation_until_dismissed() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let state = model.state.clone();
+
+        model.set_import_error_message("Не удалось прочитать буфер обмена");
+        let _ = model.presentation();
+
+        assert_eq!(
+            model.import_error(),
+            Some("Не удалось прочитать буфер обмена")
+        );
+        assert_eq!(model.state, state);
+
+        model.dismiss_import_error();
+        assert_eq!(model.import_error(), None);
     }
 
     #[test]

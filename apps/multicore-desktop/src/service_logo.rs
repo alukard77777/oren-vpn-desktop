@@ -1,33 +1,10 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 
 const MAX_LOGO_BYTES: u64 = 512 * 1024;
-const MAX_CACHED_LOGOS: usize = 32;
-
-thread_local! {
-    static DECODED: RefCell<HashMap<u64, Option<slint::Image>>> = RefCell::new(HashMap::new());
-}
 
 pub(crate) fn load(path: &Path) -> Option<slint::Image> {
-    let bytes = read_bounded(path)?;
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let key = hasher.finish();
-    DECODED.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(image) = cache.get(&key) {
-            return image.clone();
-        }
-        if cache.len() >= MAX_CACHED_LOGOS {
-            cache.clear();
-        }
-        let image = decode_png(&bytes);
-        cache.insert(key, image.clone());
-        image
-    })
+    decode_png(&read_bounded(path)?)
 }
 
 fn read_bounded(path: &Path) -> Option<Vec<u8>> {
@@ -72,16 +49,6 @@ mod tests {
         std::fs::write(&path, png(3, 2)).unwrap();
         let image = load(&path).unwrap();
         assert_eq!((image.size().width, image.size().height), (3, 2));
-    }
-
-    #[test]
-    fn replaced_content_at_the_same_path_is_not_served_from_cache() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("16");
-        std::fs::write(&path, png(4, 4)).unwrap();
-        assert_eq!(load(&path).unwrap().size().width, 4);
-        std::fs::write(&path, png(6, 5)).unwrap();
-        assert_eq!(load(&path).unwrap().size().width, 6);
     }
 
     #[test]

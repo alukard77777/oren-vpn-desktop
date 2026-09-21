@@ -2,9 +2,11 @@
 
 mod app_icon;
 mod bootstrap;
+mod clipboard_text;
 mod daemon;
 #[cfg(target_os = "linux")]
 mod linux_display;
+mod logo_cache;
 mod preferences;
 mod service_logo;
 mod single_instance;
@@ -17,7 +19,7 @@ mod windows_shell;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::io;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -344,6 +346,10 @@ fn retry_delay_after_failure(attempt: usize) -> Option<Duration> {
         .and_then(|index| PREFERENCE_RETRY_DELAYS.get(index).copied())
 }
 
+fn preference_failure_is_terminal(attempt: usize, stop_after_write: bool) -> bool {
+    stop_after_write || retry_delay_after_failure(attempt).is_none()
+}
+
 enum WriterCommand {
     Write(AppPreferences),
     Stop,
@@ -351,7 +357,14 @@ enum WriterCommand {
 
 enum WriterResult {
     Saved(AppPreferences),
-    Failed,
+    Failed(PreferenceWriteFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreferenceWriteFailure {
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    attempts: usize,
 }
 
 struct PreferenceWriter {
@@ -418,22 +431,36 @@ fn preference_writer_loop(
         let mut attempt = 0_usize;
         loop {
             attempt += 1;
-            let saved = store
-                .as_ref()
-                .is_some_and(|store| store.save(&preferences).is_ok());
-            if saved {
+            let save_result = store.as_ref().map_or_else(
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "preference store unavailable",
+                    ))
+                },
+                |store| store.save(&preferences),
+            );
+            if save_result.is_ok() {
                 let _ = results.send(WriterResult::Saved(preferences));
                 if stop_after_write {
                     return;
                 }
                 break;
             }
-            let _ = results.send(WriterResult::Failed);
-            if stop_after_write {
-                return;
+            if preference_failure_is_terminal(attempt, stop_after_write) {
+                let error = save_result.expect_err("failed preference write has an error");
+                let _ = results.send(WriterResult::Failed(PreferenceWriteFailure {
+                    kind: error.kind(),
+                    raw_os_error: error.raw_os_error(),
+                    attempts: attempt,
+                }));
+                if stop_after_write {
+                    return;
+                }
+                break;
             }
             let Some(retry_delay) = retry_delay_after_failure(attempt) else {
-                break;
+                unreachable!("a non-terminal preference failure always has a retry delay");
             };
             match commands.recv_timeout(retry_delay) {
                 Ok(WriterCommand::Write(replacement)) => {
@@ -538,6 +565,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
+    let _logo_cache_session = logo_cache::LogoCacheSession::install();
     if preference_writer
         .lock()
         .expect("preference writer lock")
@@ -565,6 +593,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
     wire_import(&ui, model.clone(), profile_preferences.clone());
+    wire_clipboard_import(&ui, model.clone());
     wire_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
     let _subscription_refresh_timer =
         wire_automatic_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
@@ -1051,8 +1080,11 @@ fn process_writer_results(
                     .expect("preference tracker lock")
                     .mark_persisted(preferences);
             }
-            WriterResult::Failed => {
-                eprintln!("preferences save failed");
+            WriterResult::Failed(failure) => {
+                eprintln!(
+                    "preferences save failed after {} attempts: kind={:?}, os={:?}",
+                    failure.attempts, failure.kind, failure.raw_os_error
+                );
             }
         }
     }
@@ -1061,7 +1093,7 @@ fn process_writer_results(
 fn preference_error_for_result(result: &WriterResult) -> &'static str {
     match result {
         WriterResult::Saved(_) => "",
-        WriterResult::Failed => PREFERENCE_SAVE_ERROR_RU,
+        WriterResult::Failed(_) => PREFERENCE_SAVE_ERROR_RU,
     }
 }
 
@@ -1410,7 +1442,7 @@ fn toggle_tray_popup(
         .with_winit_window(|window| window.outer_size())
         .map(|size| (size.width, size.height))
         .unwrap_or((304, 460));
-    if let Some(position) = place_tray_popup(anchor, popup_size, &monitors) {
+    if let Some(position) = place_tray_popup(anchor, popup_size, &monitors, None) {
         let _ = popup.window().with_winit_window(|window| {
             use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
             use slint::winit_030::winit::window::WindowLevel;
@@ -1759,6 +1791,42 @@ fn wire_import(
             url,
             profile_preferences.clone(),
         );
+    });
+}
+
+fn wire_clipboard_import(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    let paste_model = model.clone();
+    ui.on_paste_subscription(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        match clipboard_text::read_subscription_text() {
+            Ok(url) => {
+                ui.set_subscription_draft(url.clone().into());
+                ui.invoke_import_url(url.into());
+            }
+            Err(error) => {
+                let current = {
+                    let mut model = paste_model.lock().expect("view model lock");
+                    model.set_import_error_message(error.user_message());
+                    snapshot(&model)
+                };
+                apply_snapshot(&ui, &current);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_dismiss_first_run_import(move || {
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.dismiss_import_error();
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
     });
 }
 
@@ -2958,28 +3026,27 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
     ui.set_subscription_announcement_tone(snapshot.subscription.announcement_tone.clone().into());
-    let service_logo = snapshot
+    let referenced_logo_paths = snapshot
         .subscription
         .service_logo_path
-        .as_deref()
-        .and_then(|path| service_logo::load(Path::new(path)));
-    ui.set_has_service_logo(service_logo.is_some());
-    ui.set_service_logo(service_logo.unwrap_or_default());
-    ui.set_subscription_refresh_available(snapshot.subscription.refresh_available);
-    ui.set_subscription_refresh_enabled(
-        presentation.has_profile && !presentation.is_connected && !presentation.is_busy,
-    );
-    ui.set_subscription_refresh_pending(snapshot.subscription.refresh_pending);
-    ui.set_subscription_refresh_error(
-        snapshot
+        .iter()
+        .map(String::as_str)
+        .chain(
+            snapshot
+                .profiles
+                .profiles
+                .iter()
+                .filter_map(|profile| profile.service_logo_path.as_deref()),
+        )
+        .collect::<Vec<_>>();
+    let (service_logo, subscription_profiles) = logo_cache::with_logo_cache(|cache| {
+        cache.retain_paths(referenced_logo_paths.iter().copied());
+        let service_logo = snapshot
             .subscription
-            .error
-            .clone()
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_subscription_profiles(ModelRc::new(VecModel::from(
-        snapshot
+            .service_logo_path
+            .as_deref()
+            .and_then(|path| cache.image_for_path(path));
+        let profiles = snapshot
             .profiles
             .profiles
             .iter()
@@ -2987,7 +3054,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                 let logo = profile
                     .service_logo_path
                     .as_deref()
-                    .and_then(|path| service_logo::load(Path::new(path)));
+                    .and_then(|path| cache.image_for_path(path));
                 UiSubscriptionProfile {
                     id: profile.id.clone().into(),
                     title: profile.title.clone().into(),
@@ -3006,8 +3073,26 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                         .into(),
                 }
             })
-            .collect::<Vec<_>>(),
-    )));
+            .collect::<Vec<_>>();
+        (service_logo, profiles)
+    });
+    ui.set_has_service_logo(service_logo.is_some());
+    ui.set_service_logo(service_logo.unwrap_or_default());
+    ui.set_subscription_refresh_available(snapshot.subscription.refresh_available);
+    ui.set_subscription_refresh_enabled(presentation.has_profile && !presentation.is_busy);
+    ui.set_subscription_management_enabled(
+        presentation.has_profile && !presentation.is_connected && !presentation.is_busy,
+    );
+    ui.set_subscription_refresh_pending(snapshot.subscription.refresh_pending);
+    ui.set_subscription_refresh_error(
+        snapshot
+            .subscription
+            .error
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_subscription_profiles(ModelRc::new(VecModel::from(subscription_profiles)));
     ui.set_profile_menu_loading(snapshot.profiles.loading);
     ui.set_profile_menu_error(snapshot.profiles.error.clone().unwrap_or_default().into());
     ui.set_profile_pending_operation(
@@ -3105,13 +3190,14 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
-        PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriter,
+        PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
         ProfilePreferenceReconciler, WindowObservation, WriterCommand, WriterResult,
         activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
         drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
-        preference_error_for_result, reduced_motion_from_client_area_animation,
-        retry_delay_after_failure, route_hints_apply_to, runtime_allows_update, scale_factor_milli,
-        shell_active_after_native_minimize_change, visible_page_from_name, visible_page_name,
+        preference_error_for_result, preference_failure_is_terminal,
+        reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
+        runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
+        visible_page_from_name, visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -3348,24 +3434,68 @@ mod window_tests {
         for required in [
             "in property <string> subscription-updated",
             "in property <bool> subscription-updated-stale",
-            "updated-meta := Rectangle",
-            "text: root.subscription-updated",
+            "refresh-action-reserve := Rectangle",
+            "subscription-refresh-action := FocusScope",
+            "text: root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
+            "root.refresh-subscription();",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
+            "announcement-strip := Rectangle",
+            "announcement-copy := Text",
+            "routes-heading := HorizontalLayout",
+            "route-updated-meta := Text",
         ] {
             assert!(
                 ui.contains(required),
                 "missing updated-at UI contract: {required}"
             );
         }
-        let updated_meta = ui
-            .split("updated-meta := Rectangle")
+        let refresh_action = ui
+            .split("subscription-refresh-action := FocusScope")
             .nth(1)
-            .and_then(|source| source.split("shelf-chevron := Rectangle").next())
-            .expect("updated-at metadata source");
-        assert!(!updated_meta.contains("text: \"Обновлено\""));
-        assert!(!updated_meta.contains("refresh.svg"));
-        assert!(!updated_meta.contains("Theme.warning"));
-        assert!(!updated_meta.contains("subscription-updated-stale ?"));
+            .and_then(|source| {
+                source
+                    .split("if root.subscription-announcement-text")
+                    .next()
+            })
+            .expect("subscription refresh action source");
+        for unchanged in [
+            "x: parent.width - 140px;",
+            "y: 5px;",
+            "width: 92px;",
+            "height: 44px;",
+        ] {
+            assert!(
+                refresh_action.contains(unchanged),
+                "refresh action moved: {unchanged}"
+            );
+        }
+
+        let announcement = ui
+            .split("announcement-strip := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("inline-routes := Rectangle").next())
+            .expect("announcement source");
+        assert!(announcement.contains("x: 0px;"));
+        assert!(announcement.contains("width: parent.width;"));
+        assert!(announcement.contains("height: 36px;"));
+        assert!(announcement.contains("horizontal-alignment: center;"));
+
+        let routes_header = ui
+            .split("inline-routes := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("ScrollView {").next())
+            .expect("routes header source");
+        assert!(routes_header.contains("text: root.subscription-updated;"));
+        assert!(routes_header.contains("horizontal-alignment: right;"));
+        assert!(
+            routes_header.contains("Rectangle { horizontal-stretch: 1; background: transparent; }")
+        );
+        assert!(!routes_header.contains("route-updated-divider := Rectangle"));
+        assert!(!routes_header.contains("commands: \"M 7 1.5"));
+        assert!(!routes_header.contains("latency-check-loading"));
+        assert!(!routes_header.contains("catalog-selection-queued"));
+        assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
+        assert!(rust.contains("ui.set_subscription_management_enabled("));
     }
 
     #[test]
@@ -3696,6 +3826,7 @@ mod window_tests {
         for required in [
             "export struct UiSubscriptionProfile",
             "root.active-panel == \"subscription\"",
+            "profile-menu-reserve := Rectangle",
             "callback activate-profile(string);",
             "callback refresh-profile(string);",
             "callback replace-profile-source(string, string);",
@@ -3723,10 +3854,46 @@ mod window_tests {
             );
         }
         assert!(!ui.contains("label: \"Профили\";"));
+
+        let switcher = ui
+            .split("subscription-strip := Rectangle")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.subscription-announcement-text")
+                    .next()
+            })
+            .expect("home subscription switcher source");
+        assert!(switcher.contains("background: Theme.surface;"));
+        assert!(
+            !switcher
+                .contains("background: root.profile-menu-open ? Theme.elevated : Theme.surface;")
+        );
+
+        let popover = ui
+            .split("profile-menu := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("// A taskbar restore").next())
+            .expect("animated profile popover source");
+        for required in [
+            "width: parent.width - 40px;",
+            "opacity: root.profile-menu-open ? 1 : 0;",
+            "y: root.profile-menu-open ? 188px : 180px;",
+            "animate opacity { duration: 160ms; easing: ease-out; }",
+            "animate y { duration: 160ms; easing: ease-out; }",
+        ] {
+            assert!(
+                popover.contains(required),
+                "missing polished popover contract: {required}"
+            );
+        }
+        assert!(!ui.contains("profile-menu-shadow := Rectangle"));
+        assert!(!popover.contains("profile.active ? #4c9dff0c"));
+        assert!(!ui.contains("if root.profile-menu-open: profile-menu := Rectangle"));
         assert!(!ui.contains("drop-shadow-blur: 18px"));
         assert!(!ui.contains("text: \"Обн.\""));
         assert!(!ui.contains("text: \"×\""));
-        assert!(ui.contains("width: Math.min(320px, parent.width - 40px);"));
+        assert!(ui.contains("width: parent.width - 40px;"));
         assert!(ui.contains("Math.min(288px, 16px + root.subscription-profiles.length * 54px)"));
         assert!(!ui.contains("text: \"Профили\""));
         assert!(main.contains("model.finish_profile_list(token, result)"));
@@ -3975,6 +4142,14 @@ mod window_tests {
     }
 
     #[test]
+    fn transient_preference_failures_stay_silent_until_retries_are_exhausted() {
+        assert!(!preference_failure_is_terminal(1, false));
+        assert!(!preference_failure_is_terminal(2, false));
+        assert!(preference_failure_is_terminal(3, false));
+        assert!(preference_failure_is_terminal(1, true));
+    }
+
+    #[test]
     fn queued_restored_bounds_survive_maximize_before_ack_and_exit_flush() {
         let bounds_a = WindowBounds {
             x: 10,
@@ -4086,8 +4261,13 @@ mod window_tests {
 
     #[test]
     fn writer_results_expose_only_bounded_safe_russian_error_and_success_clears_it() {
+        let failure = PreferenceWriteFailure {
+            kind: std::io::ErrorKind::PermissionDenied,
+            raw_os_error: Some(5),
+            attempts: PREFERENCE_RETRY_DELAYS.len() + 1,
+        };
         assert_eq!(
-            preference_error_for_result(&WriterResult::Failed),
+            preference_error_for_result(&WriterResult::Failed(failure)),
             PREFERENCE_SAVE_ERROR_RU
         );
         assert_eq!(
@@ -4391,5 +4571,32 @@ mod window_tests {
             secondary.find("model.open_panel(Panel::None)").unwrap()
                 < secondary.find("prefill_subscription(&ui, url)").unwrap()
         );
+    }
+
+    #[test]
+    fn first_run_clipboard_action_reuses_the_import_pipeline() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("wire_clipboard_import(&ui, model.clone());"));
+
+        let wiring = source
+            .split("fn wire_clipboard_import(")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_subscription_refresh(").next())
+            .expect("clipboard import wiring");
+        for required in [
+            "ui.on_paste_subscription",
+            "ui.on_dismiss_first_run_import",
+            "clipboard_text::read_subscription_text()",
+            "ui.set_subscription_draft",
+            "ui.invoke_import_url",
+            "model.set_import_error_message(error.user_message())",
+            "apply_snapshot(&ui, &current)",
+            "model.dismiss_import_error()",
+        ] {
+            assert!(
+                wiring.contains(required),
+                "missing clipboard wiring: {required}"
+            );
+        }
     }
 }

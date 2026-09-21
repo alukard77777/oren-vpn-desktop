@@ -104,12 +104,29 @@ pub struct LogicalSize {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayTaskbarEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
 pub fn place_tray_popup(
     anchor: PhysicalPosition,
     popup_size: (u32, u32),
     monitors: &[MonitorRect],
+    edge_hint: Option<TrayTaskbarEdge>,
 ) -> Option<PhysicalPosition> {
-    let monitor = monitors
+    let monitor = select_tray_monitor(anchor, monitors)?;
+    let edge = edge_hint.unwrap_or_else(|| infer_taskbar_edge(anchor, monitor));
+    Some(place_tray_popup_on_monitor(
+        anchor, popup_size, monitor, edge,
+    ))
+}
+
+fn select_tray_monitor(anchor: PhysicalPosition, monitors: &[MonitorRect]) -> Option<&MonitorRect> {
+    monitors
         .iter()
         .filter(|monitor| valid_monitor(monitor))
         .min_by_key(|monitor| {
@@ -132,7 +149,51 @@ pub fn place_tray_popup(
                 0
             };
             dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
-        })?;
+        })
+}
+
+fn infer_taskbar_edge(anchor: PhysicalPosition, monitor: &MonitorRect) -> TrayTaskbarEdge {
+    let x = i64::from(anchor.x);
+    let y = i64::from(anchor.y);
+    let left = i64::from(monitor.x);
+    let top = i64::from(monitor.y);
+    let right = left + i64::from(monitor.width);
+    let bottom = top + i64::from(monitor.height);
+
+    [
+        (top.saturating_sub(y), TrayTaskbarEdge::Top),
+        (x.saturating_sub(right), TrayTaskbarEdge::Right),
+        (y.saturating_sub(bottom), TrayTaskbarEdge::Bottom),
+        (left.saturating_sub(x), TrayTaskbarEdge::Left),
+    ]
+    .into_iter()
+    .filter(|(outside, _)| *outside > 0)
+    .max_by_key(|(outside, _)| *outside)
+    .map(|(_, edge)| edge)
+    .unwrap_or_else(|| inside_anchor_edge(y, top, bottom))
+}
+
+#[cfg(windows)]
+fn inside_anchor_edge(_y: i64, _top: i64, _bottom: i64) -> TrayTaskbarEdge {
+    TrayTaskbarEdge::Bottom
+}
+
+#[cfg(not(windows))]
+fn inside_anchor_edge(y: i64, top: i64, bottom: i64) -> TrayTaskbarEdge {
+    if y - top < bottom - y {
+        TrayTaskbarEdge::Top
+    } else {
+        TrayTaskbarEdge::Bottom
+    }
+}
+
+fn place_tray_popup_on_monitor(
+    anchor: PhysicalPosition,
+    popup_size: (u32, u32),
+    monitor: &MonitorRect,
+    edge: TrayTaskbarEdge,
+) -> PhysicalPosition {
+    const ANCHOR_GAP: i64 = 10;
 
     let width = i64::from(popup_size.0.min(monitor.width));
     let height = i64::from(popup_size.1.min(monitor.height));
@@ -140,18 +201,35 @@ pub fn place_tray_popup(
     let min_y = i64::from(monitor.y);
     let max_x = min_x + i64::from(monitor.width) - width;
     let max_y = min_y + i64::from(monitor.height) - height;
-    let desired_x = i64::from(anchor.x) - width;
-    let anchor_in_top_half = i64::from(anchor.y) < min_y + i64::from(monitor.height) / 2;
-    let desired_y = if anchor_in_top_half {
-        i64::from(anchor.y) + 10
-    } else {
-        i64::from(anchor.y) - height - 10
+    let work_right = min_x + i64::from(monitor.width);
+    let work_bottom = min_y + i64::from(monitor.height);
+    let anchor_x = i64::from(anchor.x);
+    let anchor_y = i64::from(anchor.y);
+    let (desired_x, desired_y) = match edge {
+        TrayTaskbarEdge::Top => (anchor_x - width, anchor_y + ANCHOR_GAP),
+        TrayTaskbarEdge::Right => (
+            anchor_x - width - ANCHOR_GAP,
+            anchor_y - height - ANCHOR_GAP,
+        ),
+        TrayTaskbarEdge::Bottom => (anchor_x - width, anchor_y - height - ANCHOR_GAP),
+        TrayTaskbarEdge::Left => (anchor_x + ANCHOR_GAP, anchor_y - height - ANCHOR_GAP),
     };
 
-    Some(PhysicalPosition {
+    let desired_x = match edge {
+        TrayTaskbarEdge::Left if anchor_x < min_x => min_x,
+        TrayTaskbarEdge::Right if anchor_x > work_right => max_x,
+        _ => desired_x,
+    };
+    let desired_y = match edge {
+        TrayTaskbarEdge::Top if anchor_y < min_y => min_y,
+        TrayTaskbarEdge::Bottom if anchor_y > work_bottom => max_y,
+        _ => desired_y,
+    };
+
+    PhysicalPosition {
         x: desired_x.clamp(min_x, max_x) as i32,
         y: desired_y.clamp(min_y, max_y) as i32,
-    })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,9 +564,9 @@ impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
 mod tests {
     use super::{
         CloseDisposition, DEFAULT_HEIGHT, DEFAULT_WIDTH, MinimizeDisposition, MonitorRect,
-        MonitorSignature, PhysicalPosition, ResizeEdge, ResizeHitLayout, close_disposition,
-        minimize_disposition, monitor_cap_changed, next_maximized, parse_resize_edge,
-        place_tray_popup, restore_bounds, restore_placement,
+        MonitorSignature, PhysicalPosition, ResizeEdge, ResizeHitLayout, TrayTaskbarEdge,
+        close_disposition, minimize_disposition, monitor_cap_changed, next_maximized,
+        parse_resize_edge, place_tray_popup, restore_bounds, restore_placement,
     };
     use crate::preferences::WindowBounds;
 
@@ -510,20 +588,33 @@ mod tests {
                 PhysicalPosition { x: 1_910, y: 1_070 },
                 (304, 460),
                 &[monitor(0, 0, 1_920, 1_040, true)],
+                None,
             ),
             Some(PhysicalPosition { x: 1_606, y: 580 })
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn tray_popup_opens_below_an_anchor_in_the_top_half() {
+    fn tray_popup_anchor_inside_the_monitor_opens_away_from_the_nearer_vertical_edge() {
+        let monitors = [monitor(0, 0, 1_920, 1_080, true)];
         assert_eq!(
             place_tray_popup(
                 PhysicalPosition { x: 1_900, y: 24 },
                 (304, 460),
-                &[monitor(0, 0, 1_920, 1_080, true)],
+                &monitors,
+                None,
             ),
             Some(PhysicalPosition { x: 1_596, y: 34 })
+        );
+        assert_eq!(
+            place_tray_popup(
+                PhysicalPosition { x: 1_900, y: 1_050 },
+                (304, 460),
+                &monitors,
+                None,
+            ),
+            Some(PhysicalPosition { x: 1_596, y: 580 })
         );
     }
 
@@ -537,8 +628,54 @@ mod tests {
                     monitor(-1_280, 0, 1_280, 984, false),
                     monitor(0, 0, 1_920, 1_040, true),
                 ],
+                None,
             ),
             Some(PhysicalPosition { x: -314, y: 430 })
+        );
+    }
+
+    #[test]
+    fn tray_popup_opens_below_a_top_taskbar() {
+        let anchor = PhysicalPosition { x: 1_910, y: 20 };
+        let monitors = [monitor(0, 40, 1_920, 1_040, true)];
+        let expected = Some(PhysicalPosition { x: 1_606, y: 40 });
+        assert_eq!(
+            place_tray_popup(anchor, (304, 460), &monitors, Some(TrayTaskbarEdge::Top)),
+            expected
+        );
+        assert_eq!(
+            place_tray_popup(anchor, (304, 460), &monitors, None),
+            expected
+        );
+    }
+
+    #[test]
+    fn tray_popup_opens_right_of_a_left_taskbar() {
+        let anchor = PhysicalPosition { x: 20, y: 1_070 };
+        let monitors = [monitor(40, 0, 1_880, 1_080, true)];
+        let expected = Some(PhysicalPosition { x: 40, y: 600 });
+        assert_eq!(
+            place_tray_popup(anchor, (304, 460), &monitors, Some(TrayTaskbarEdge::Left)),
+            expected
+        );
+        assert_eq!(
+            place_tray_popup(anchor, (304, 460), &monitors, None),
+            expected
+        );
+    }
+
+    #[test]
+    fn tray_popup_opens_left_of_a_right_taskbar() {
+        let anchor = PhysicalPosition { x: 1_900, y: 1_070 };
+        let monitors = [monitor(0, 0, 1_880, 1_080, true)];
+        let expected = Some(PhysicalPosition { x: 1_576, y: 600 });
+        assert_eq!(
+            place_tray_popup(anchor, (304, 460), &monitors, Some(TrayTaskbarEdge::Right)),
+            expected
+        );
+        assert_eq!(
+            place_tray_popup(anchor, (304, 460), &monitors, None),
+            expected
         );
     }
 
