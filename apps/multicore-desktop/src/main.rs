@@ -498,6 +498,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
 
     let ui = AppWindow::new()?;
+    #[cfg(not(windows))]
+    ui.set_system_name("Linux".into());
     if preference_writer
         .lock()
         .expect("preference writer lock")

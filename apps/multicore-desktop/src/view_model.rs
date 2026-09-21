@@ -5882,7 +5882,7 @@ mod tests {
             "if !root.has-profile: PrimaryAction",
             "label: \"Добавить URL\";",
             "state-label: \"Добавить подписку\";",
-            "root.replace-editor-open = true;",
+            "activated => { root.add-subscription(); }",
             "callback update-action();",
             "root.update-action();",
             "Отключитесь, чтобы установить обновление",
