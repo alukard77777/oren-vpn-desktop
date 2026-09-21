@@ -767,6 +767,12 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
     assert!(info.support_available);
     assert!(info.announcement_action_available);
     let first_logo = info.service_logo_path.as_deref().unwrap();
+    assert!(
+        std::fs::read(first_logo)
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+    );
+    #[cfg(windows)]
     assert!(first_logo.ends_with("service-logo.png"));
     assert!(std::path::Path::new(first_logo).is_file());
     assert!(info.refresh_available);
@@ -881,6 +887,7 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
         .await
         .unwrap();
     let refreshed_logo = refreshed.profiles[0].service_logo_path.as_ref().unwrap();
+    #[cfg(windows)]
     assert_ne!(refreshed_logo, &inactive_logo);
     assert_eq!(std::fs::read(refreshed_logo).unwrap(), expected_logo);
     assert_eq!(
@@ -895,6 +902,7 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
         backend.retained_profile_logo_path_for_testing(&first_id),
         None
     );
+    #[cfg(windows)]
     assert!(!std::path::Path::new(refreshed_logo).exists());
     let after_delete = Backend::list_subscriptions(&backend).await.unwrap();
     assert!(
@@ -937,6 +945,7 @@ async fn deleting_active_logo_drops_all_leases_before_cleanup_and_recovers_capac
     backend.delete_subscription(&id).await.unwrap();
 
     assert!(!profile_directory.exists());
+    #[cfg(windows)]
     assert!(!std::path::Path::new(&logo_path).exists());
     for index in 0..MAX_PROFILES {
         backend
@@ -1110,6 +1119,7 @@ fn subscription_dto_deserializes_legacy_payloads_with_safe_defaults() {
 
 fn assert_safe_subscription_metadata_eq(
     expected: &multicore_daemon::SubscriptionInfoDto,
+    expected_logo: Option<&[u8]>,
     actual: &multicore_daemon::SubscriptionInfoDto,
 ) {
     assert_eq!(actual.source_name, expected.source_name);
@@ -1133,6 +1143,14 @@ fn assert_safe_subscription_metadata_eq(
         actual.announcement_action_available,
         expected.announcement_action_available
     );
+    assert_eq!(
+        actual
+            .service_logo_path
+            .as_ref()
+            .map(|path| std::fs::read(path).unwrap()),
+        expected_logo.map(<[u8]>::to_vec)
+    );
+    #[cfg(windows)]
     assert_eq!(actual.service_logo_path, expected.service_logo_path);
     assert_eq!(actual.refresh_available, expected.refresh_available);
 }
@@ -1153,6 +1171,10 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
         .await
         .unwrap();
     let expected = imported.subscription.as_ref().unwrap().clone();
+    let expected_logo = expected
+        .service_logo_path
+        .as_ref()
+        .map(|path| std::fs::read(path).unwrap());
     assert!(expected.home_available);
     assert!(expected.support_available);
     assert!(expected.announcement_action_available);
@@ -1172,14 +1194,22 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
     })
     .unwrap();
     let before_failure = backend.status().await.unwrap();
-    assert_safe_subscription_metadata_eq(&expected, before_failure.subscription.as_ref().unwrap());
+    assert_safe_subscription_metadata_eq(
+        &expected,
+        expected_logo.as_deref(),
+        before_failure.subscription.as_ref().unwrap(),
+    );
     assert_eq!(before_failure.profile, imported.profile);
     assert_eq!(before_failure.current_node, imported.current_node);
 
     assert!(backend.refresh_subscription().await.is_err());
     let after_failure = backend.status().await.unwrap();
     assert_eq!(after_failure.state, ConnectionState::Ready);
-    assert_safe_subscription_metadata_eq(&expected, after_failure.subscription.as_ref().unwrap());
+    assert_safe_subscription_metadata_eq(
+        &expected,
+        expected_logo.as_deref(),
+        after_failure.subscription.as_ref().unwrap(),
+    );
     assert_eq!(after_failure.profile, imported.profile);
     assert_eq!(after_failure.current_node, imported.current_node);
     assert!(!format!("{after_failure:?}").contains("source-password"));
@@ -1191,7 +1221,11 @@ async fn failed_refresh_keeps_last_good_profile_ready_and_safe_metadata_visible(
     })
     .unwrap();
     let after_restart = restarted.status().await.unwrap();
-    assert_safe_subscription_metadata_eq(&expected, after_restart.subscription.as_ref().unwrap());
+    assert_safe_subscription_metadata_eq(
+        &expected,
+        expected_logo.as_deref(),
+        after_restart.subscription.as_ref().unwrap(),
+    );
     assert_eq!(after_restart.profile, imported.profile);
     assert_eq!(after_restart.current_node, imported.current_node);
 }

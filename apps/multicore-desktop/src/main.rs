@@ -4,6 +4,7 @@ mod app_icon;
 mod bootstrap;
 mod daemon;
 mod preferences;
+mod service_logo;
 mod single_instance;
 mod tray;
 mod updater;
@@ -2927,7 +2928,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
         .subscription
         .service_logo_path
         .as_deref()
-        .and_then(|path| slint::Image::load_from_path(Path::new(path)).ok());
+        .and_then(|path| service_logo::load(Path::new(path)));
     ui.set_has_service_logo(service_logo.is_some());
     ui.set_service_logo(service_logo.unwrap_or_default());
     ui.set_subscription_refresh_available(snapshot.subscription.refresh_available);
@@ -2952,7 +2953,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                 let logo = profile
                     .service_logo_path
                     .as_deref()
-                    .and_then(|path| slint::Image::load_from_path(Path::new(path)).ok());
+                    .and_then(|path| service_logo::load(Path::new(path)));
                 UiSubscriptionProfile {
                     id: profile.id.clone().into(),
                     title: profile.title.clone().into(),

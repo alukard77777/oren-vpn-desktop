@@ -5815,7 +5815,7 @@ mod tests {
         assert!(source.contains("text: root.subscription-title;"));
         assert!(!source.to_ascii_lowercase().contains("text: \"acmevpn\""));
         assert!(!source.to_ascii_lowercase().contains("text: \"work\""));
-        assert!(main.contains("slint::Image::load_from_path(Path::new(path))"));
+        assert!(main.contains("service_logo::load(Path::new(path))"));
         assert!(main.contains("ui.set_has_service_logo(service_logo.is_some());"));
         assert!(main.contains("ui.set_service_logo(service_logo.unwrap_or_default());"));
         let snapshot = main

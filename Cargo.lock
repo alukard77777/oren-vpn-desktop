@@ -3148,6 +3148,7 @@ dependencies = [
  "embed-resource",
  "getrandom 0.4.3",
  "ico",
+ "image",
  "multicore-platform",
  "multicore-release",
  "regex",
