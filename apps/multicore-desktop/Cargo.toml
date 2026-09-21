@@ -34,6 +34,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+multicore-platform = { path = "../../crates/multicore-platform", features = ["test-support"] }
 tempfile = "3"
 
 [build-dependencies]
