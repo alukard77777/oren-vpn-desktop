@@ -188,7 +188,10 @@ impl ReqwestHttpClient {
             "x-hwid",
             HeaderValue::from_str(identity.hwid()).map_err(|_| FetchError::Network)?,
         );
-        headers.insert("x-device-os", HeaderValue::from_static("windows"));
+        headers.insert(
+            "x-device-os",
+            HeaderValue::from_static(std::env::consts::OS),
+        );
         headers.insert(
             "x-ver-os",
             HeaderValue::from_str(identity.os_version()).map_err(|_| FetchError::Network)?,

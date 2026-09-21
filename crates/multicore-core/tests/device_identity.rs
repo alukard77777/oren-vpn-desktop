@@ -151,7 +151,7 @@ async fn one_real_client_sends_one_identity_with_every_subscription_user_agent()
     assert_eq!(requests.len(), 3);
     for (request, user_agent) in requests.iter().zip([UA_NATIVE, UA_MIHOMO, UA_XRAY]) {
         assert_header(request, "x-hwid", &expected_hwid);
-        assert_header(request, "x-device-os", "windows");
+        assert_header(request, "x-device-os", std::env::consts::OS);
         assert_header(request, "x-ver-os", &expected_version);
         assert_header(request, "x-device-model", &expected_model);
         assert_header(request, "user-agent", user_agent);
