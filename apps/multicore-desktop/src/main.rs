@@ -16,6 +16,7 @@ mod windows_shell;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -342,6 +343,10 @@ fn retry_delay_after_failure(attempt: usize) -> Option<Duration> {
         .and_then(|index| PREFERENCE_RETRY_DELAYS.get(index).copied())
 }
 
+fn preference_failure_is_terminal(attempt: usize, stop_after_write: bool) -> bool {
+    stop_after_write || retry_delay_after_failure(attempt).is_none()
+}
+
 enum WriterCommand {
     Write(AppPreferences),
     Stop,
@@ -349,7 +354,14 @@ enum WriterCommand {
 
 enum WriterResult {
     Saved(AppPreferences),
-    Failed,
+    Failed(PreferenceWriteFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreferenceWriteFailure {
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    attempts: usize,
 }
 
 struct PreferenceWriter {
@@ -416,22 +428,36 @@ fn preference_writer_loop(
         let mut attempt = 0_usize;
         loop {
             attempt += 1;
-            let saved = store
-                .as_ref()
-                .is_some_and(|store| store.save(&preferences).is_ok());
-            if saved {
+            let save_result = store.as_ref().map_or_else(
+                || {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "preference store unavailable",
+                    ))
+                },
+                |store| store.save(&preferences),
+            );
+            if save_result.is_ok() {
                 let _ = results.send(WriterResult::Saved(preferences));
                 if stop_after_write {
                     return;
                 }
                 break;
             }
-            let _ = results.send(WriterResult::Failed);
-            if stop_after_write {
-                return;
+            if preference_failure_is_terminal(attempt, stop_after_write) {
+                let error = save_result.expect_err("failed preference write has an error");
+                let _ = results.send(WriterResult::Failed(PreferenceWriteFailure {
+                    kind: error.kind(),
+                    raw_os_error: error.raw_os_error(),
+                    attempts: attempt,
+                }));
+                if stop_after_write {
+                    return;
+                }
+                break;
             }
             let Some(retry_delay) = retry_delay_after_failure(attempt) else {
-                break;
+                unreachable!("a non-terminal preference failure always has a retry delay");
             };
             match commands.recv_timeout(retry_delay) {
                 Ok(WriterCommand::Write(replacement)) => {
@@ -1014,8 +1040,11 @@ fn process_writer_results(
                     .expect("preference tracker lock")
                     .mark_persisted(preferences);
             }
-            WriterResult::Failed => {
-                eprintln!("preferences save failed");
+            WriterResult::Failed(failure) => {
+                eprintln!(
+                    "preferences save failed after {} attempts: kind={:?}, os={:?}",
+                    failure.attempts, failure.kind, failure.raw_os_error
+                );
             }
         }
     }
@@ -1024,7 +1053,7 @@ fn process_writer_results(
 fn preference_error_for_result(result: &WriterResult) -> &'static str {
     match result {
         WriterResult::Saved(_) => "",
-        WriterResult::Failed => PREFERENCE_SAVE_ERROR_RU,
+        WriterResult::Failed(_) => PREFERENCE_SAVE_ERROR_RU,
     }
 }
 
@@ -3124,13 +3153,14 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
-        PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriter,
+        PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
         ProfilePreferenceReconciler, WindowObservation, WriterCommand, WriterResult,
         activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
         drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
-        preference_error_for_result, reduced_motion_from_client_area_animation,
-        retry_delay_after_failure, route_hints_apply_to, runtime_allows_update, scale_factor_milli,
-        shell_active_after_native_minimize_change, visible_page_from_name, visible_page_name,
+        preference_error_for_result, preference_failure_is_terminal,
+        reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
+        runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
+        visible_page_from_name, visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -3367,29 +3397,66 @@ mod window_tests {
         for required in [
             "in property <string> subscription-updated",
             "in property <bool> subscription-updated-stale",
-            "updated-meta := Rectangle",
-            "text: root.subscription-updated",
+            "refresh-action-reserve := Rectangle",
             "subscription-refresh-action := FocusScope",
             "text: root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
             "root.refresh-subscription();",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
             "announcement-strip := Rectangle",
-            "width: Math.min(540px, parent.width - 24px)",
+            "announcement-copy := Text",
+            "routes-heading := HorizontalLayout",
+            "route-updated-meta := Text",
         ] {
             assert!(
                 ui.contains(required),
                 "missing updated-at UI contract: {required}"
             );
         }
-        let updated_meta = ui
-            .split("updated-meta := Rectangle")
+        let refresh_action = ui
+            .split("subscription-refresh-action := FocusScope")
             .nth(1)
-            .and_then(|source| source.split("shelf-chevron := Rectangle").next())
-            .expect("updated-at metadata source");
-        assert!(!updated_meta.contains("text: \"Обновлено\""));
-        assert!(!updated_meta.contains("refresh.svg"));
-        assert!(!updated_meta.contains("Theme.warning"));
-        assert!(!updated_meta.contains("subscription-updated-stale ?"));
+            .and_then(|source| {
+                source
+                    .split("if root.subscription-announcement-text")
+                    .next()
+            })
+            .expect("subscription refresh action source");
+        for unchanged in [
+            "x: parent.width - 140px;",
+            "y: 5px;",
+            "width: 92px;",
+            "height: 44px;",
+        ] {
+            assert!(
+                refresh_action.contains(unchanged),
+                "refresh action moved: {unchanged}"
+            );
+        }
+
+        let announcement = ui
+            .split("announcement-strip := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("inline-routes := Rectangle").next())
+            .expect("announcement source");
+        assert!(announcement.contains("x: 0px;"));
+        assert!(announcement.contains("width: parent.width;"));
+        assert!(announcement.contains("height: 36px;"));
+        assert!(announcement.contains("horizontal-alignment: center;"));
+
+        let routes_header = ui
+            .split("inline-routes := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("ScrollView {").next())
+            .expect("routes header source");
+        assert!(routes_header.contains("text: root.subscription-updated;"));
+        assert!(routes_header.contains("horizontal-alignment: right;"));
+        assert!(
+            routes_header.contains("Rectangle { horizontal-stretch: 1; background: transparent; }")
+        );
+        assert!(!routes_header.contains("route-updated-divider := Rectangle"));
+        assert!(!routes_header.contains("commands: \"M 7 1.5"));
+        assert!(!routes_header.contains("latency-check-loading"));
+        assert!(!routes_header.contains("catalog-selection-queued"));
         assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
         assert!(rust.contains("ui.set_subscription_management_enabled("));
     }
@@ -3722,6 +3789,7 @@ mod window_tests {
         for required in [
             "export struct UiSubscriptionProfile",
             "root.active-panel == \"subscription\"",
+            "profile-menu-reserve := Rectangle",
             "callback activate-profile(string);",
             "callback refresh-profile(string);",
             "callback replace-profile-source(string, string);",
@@ -3749,10 +3817,46 @@ mod window_tests {
             );
         }
         assert!(!ui.contains("label: \"Профили\";"));
+
+        let switcher = ui
+            .split("subscription-strip := Rectangle")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.subscription-announcement-text")
+                    .next()
+            })
+            .expect("home subscription switcher source");
+        assert!(switcher.contains("background: Theme.surface;"));
+        assert!(
+            !switcher
+                .contains("background: root.profile-menu-open ? Theme.elevated : Theme.surface;")
+        );
+
+        let popover = ui
+            .split("profile-menu := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("// A taskbar restore").next())
+            .expect("animated profile popover source");
+        for required in [
+            "width: parent.width - 40px;",
+            "opacity: root.profile-menu-open ? 1 : 0;",
+            "y: root.profile-menu-open ? 188px : 180px;",
+            "animate opacity { duration: 160ms; easing: ease-out; }",
+            "animate y { duration: 160ms; easing: ease-out; }",
+        ] {
+            assert!(
+                popover.contains(required),
+                "missing polished popover contract: {required}"
+            );
+        }
+        assert!(!ui.contains("profile-menu-shadow := Rectangle"));
+        assert!(!popover.contains("profile.active ? #4c9dff0c"));
+        assert!(!ui.contains("if root.profile-menu-open: profile-menu := Rectangle"));
         assert!(!ui.contains("drop-shadow-blur: 18px"));
         assert!(!ui.contains("text: \"Обн.\""));
         assert!(!ui.contains("text: \"×\""));
-        assert!(ui.contains("width: Math.min(320px, parent.width - 40px);"));
+        assert!(ui.contains("width: parent.width - 40px;"));
         assert!(ui.contains("Math.min(288px, 16px + root.subscription-profiles.length * 54px)"));
         assert!(!ui.contains("text: \"Профили\""));
         assert!(main.contains("model.finish_profile_list(token, result)"));
@@ -4001,6 +4105,14 @@ mod window_tests {
     }
 
     #[test]
+    fn transient_preference_failures_stay_silent_until_retries_are_exhausted() {
+        assert!(!preference_failure_is_terminal(1, false));
+        assert!(!preference_failure_is_terminal(2, false));
+        assert!(preference_failure_is_terminal(3, false));
+        assert!(preference_failure_is_terminal(1, true));
+    }
+
+    #[test]
     fn queued_restored_bounds_survive_maximize_before_ack_and_exit_flush() {
         let bounds_a = WindowBounds {
             x: 10,
@@ -4112,8 +4224,13 @@ mod window_tests {
 
     #[test]
     fn writer_results_expose_only_bounded_safe_russian_error_and_success_clears_it() {
+        let failure = PreferenceWriteFailure {
+            kind: std::io::ErrorKind::PermissionDenied,
+            raw_os_error: Some(5),
+            attempts: PREFERENCE_RETRY_DELAYS.len() + 1,
+        };
         assert_eq!(
-            preference_error_for_result(&WriterResult::Failed),
+            preference_error_for_result(&WriterResult::Failed(failure)),
             PREFERENCE_SAVE_ERROR_RU
         );
         assert_eq!(

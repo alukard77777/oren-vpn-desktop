@@ -4046,7 +4046,11 @@ mod tests {
         let main = include_str!("main.rs");
         assert!(!app.contains("callback check-latencies();"));
         assert!(!app.contains("latency-check-enabled"));
-        assert!(app.contains("Задержка обновляется автоматически"));
+        assert!(!app.contains("Задержка обновляется автоматически"));
+        assert!(app.contains("routes-heading := HorizontalLayout"));
+        assert!(app.contains("route-updated-meta := Text"));
+        assert!(app.contains("text: root.subscription-updated;"));
+        assert!(app.contains("horizontal-alignment: right;"));
         assert!(app.contains("trailing-text: node.latency-text;"));
         assert!(!main.contains("ui.on_check_latencies"));
         assert!(main.contains("TimerMode::Repeated"));
@@ -6067,8 +6071,9 @@ mod tests {
             "label: \"Состояние\";",
             "label: \"Настройки\";",
             "text: \"Маршруты\";",
-            "root.latency-check-queued",
-            "\"Проверим автоматически\"",
+            "routes-heading := HorizontalLayout",
+            "route-updated-meta := Text",
+            "text: root.subscription-updated;",
             "root.open-panel(\"events\")",
             "root.refresh-subscription();",
             "root.primary-action();",

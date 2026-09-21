@@ -990,7 +990,7 @@ export component AppWindow inherits Window {
 
                     subscription-strip := Rectangle {
                         height: 54px;
-                        background: root.profile-menu-open ? Theme.elevated : Theme.surface;
+                        background: Theme.surface;
                         border-radius: 16px;
                         border-color: shelf-open-focus.has-focus ? Theme.focus : transparent;
                         border-width: shelf-open-focus.has-focus ? 2px : 0px;
@@ -1019,36 +1019,42 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            updated-meta := Rectangle {
+                            refresh-action-reserve := Rectangle {
                                 width: 92px;
                                 horizontal-stretch: 0;
-                                Text {
-                                    x: 0px;
-                                    y: 25px;
-                                    width: parent.width;
-                                    height: 16px;
-                                    text: root.subscription-updated;
-                                    color: Theme.text-muted;
-                                    font-size: Theme.type-metadata-size;
-                                    horizontal-alignment: right;
-                                    vertical-alignment: center;
-                                }
+                                background: transparent;
                             }
                             shelf-chevron := Rectangle {
                                 width: 20px;
-                                background: transparent;
+                                background: root.profile-menu-open ? #ffffff08 : transparent;
                                 border-radius: 11px;
-                                Path {
+                                down-chevron := Path {
                                     x: 4px;
                                     y: 18px;
                                     width: 12px;
                                     height: 8px;
                                     viewbox-width: 12;
                                     viewbox-height: 8;
-                                    commands: root.profile-menu-open ? "M 1 7 L 6 2 L 11 7" : "M 1 1 L 6 6 L 11 1";
+                                    commands: "M 1 1 L 6 6 L 11 1";
                                     stroke: Theme.text-muted;
                                     stroke-width: 1.5px;
                                     fill: transparent;
+                                    opacity: root.profile-menu-open ? 0 : 1;
+                                    animate opacity { duration: 120ms; easing: ease-out; }
+                                }
+                                up-chevron := Path {
+                                    x: 4px;
+                                    y: 18px;
+                                    width: 12px;
+                                    height: 8px;
+                                    viewbox-width: 12;
+                                    viewbox-height: 8;
+                                    commands: "M 1 7 L 6 2 L 11 7";
+                                    stroke: Theme.text-muted;
+                                    stroke-width: 1.5px;
+                                    fill: transparent;
+                                    opacity: root.profile-menu-open ? 1 : 0;
+                                    animate opacity { duration: 120ms; easing: ease-out; }
                                 }
                             }
                         }
@@ -1058,7 +1064,7 @@ export component AppWindow inherits Window {
                             y: 0;
                             width: parent.width;
                             height: parent.height;
-                            enabled: !root.profile-menu-open;
+                            enabled: true;
                             focus-on-click: true;
                             focus-on-tab-navigation: true;
                             accessible-role: button;
@@ -1139,56 +1145,60 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    if root.profile-menu-open: profile-menu-reserve := Rectangle {
+                        height: root.profile-menu-error != "" ? 104px
+                            : root.profile-menu-loading ? 144px
+                            : Math.min(288px, 16px + root.subscription-profiles.length * 54px);
+                        background: transparent;
+                    }
+
                     if root.subscription-announcement-text != "": Rectangle {
-                        height: 44px;
+                        height: 36px;
                         background: transparent;
                         announcement-strip := Rectangle {
-                            x: Math.max(12px, (parent.width - Math.min(540px, parent.width - 24px)) / 2);
-                            width: Math.min(540px, parent.width - 24px);
-                            height: 44px;
+                            x: 0px;
+                            width: parent.width;
+                            height: 36px;
                             background: root.subscription-announcement-tone == "danger" ? #211619 : root.subscription-announcement-tone == "success" ? #13231b : #131d29;
-                            border-radius: 12px;
+                            border-radius: 10px;
                             border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
                             border-width: 1px;
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                padding-top: 7px;
-                                padding-bottom: 7px;
-                                spacing: 8px;
-                                announcement-icon := Rectangle {
-                                    width: 18px;
-                                    height: 30px;
-                                    background: transparent;
-                                    if root.subscription-announcement-tone == "danger": Image {
-                                        x: 0px; y: 6px; width: 18px; height: 18px;
-                                        source: @image-url("../assets/announcement-danger.svg");
-                                        image-fit: contain;
-                                        accessible-role: none;
-                                    }
-                                    if root.subscription-announcement-tone == "success": Image {
-                                        x: 0px; y: 6px; width: 18px; height: 18px;
-                                        source: @image-url("../assets/announcement-success.svg");
-                                        image-fit: contain;
-                                        accessible-role: none;
-                                    }
-                                    if root.subscription-announcement-tone != "danger" && root.subscription-announcement-tone != "success": Image {
-                                        x: 0px; y: 6px; width: 18px; height: 18px;
-                                        source: @image-url("../assets/announcement-info.svg");
-                                        image-fit: contain;
-                                        accessible-role: none;
-                                    }
+                            announcement-icon := Rectangle {
+                                x: 12px;
+                                y: 3px;
+                                width: 18px;
+                                height: 30px;
+                                background: transparent;
+                                if root.subscription-announcement-tone == "danger": Image {
+                                    x: 0px; y: 6px; width: 18px; height: 18px;
+                                    source: @image-url("../assets/announcement-danger.svg");
+                                    image-fit: contain;
+                                    accessible-role: none;
                                 }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    height: 30px;
-                                    text: root.subscription-announcement-text;
-                                    color: Theme.text-secondary;
-                                    font-size: Theme.type-metadata-size;
-                                    wrap: word-wrap;
-                                    overflow: elide;
-                                    vertical-alignment: center;
+                                if root.subscription-announcement-tone == "success": Image {
+                                    x: 0px; y: 6px; width: 18px; height: 18px;
+                                    source: @image-url("../assets/announcement-success.svg");
+                                    image-fit: contain;
+                                    accessible-role: none;
                                 }
+                                if root.subscription-announcement-tone != "danger" && root.subscription-announcement-tone != "success": Image {
+                                    x: 0px; y: 6px; width: 18px; height: 18px;
+                                    source: @image-url("../assets/announcement-info.svg");
+                                    image-fit: contain;
+                                    accessible-role: none;
+                                }
+                            }
+                            announcement-copy := Text {
+                                x: 42px;
+                                y: 3px;
+                                width: parent.width - 84px;
+                                height: 30px;
+                                text: root.subscription-announcement-text;
+                                color: Theme.text-secondary;
+                                font-size: Theme.type-metadata-size;
+                                overflow: elide;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
                         }
                     }
@@ -1199,23 +1209,28 @@ export component AppWindow inherits Window {
                         background: transparent;
                         VerticalLayout {
                             spacing: 8px;
-                            HorizontalLayout {
-                                height: 36px;
+                            routes-heading := HorizontalLayout {
+                                height: 28px;
                                 spacing: 12px;
-                                Text { text: "Маршруты"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; vertical-alignment: center; }
+                                routes-title := Text {
+                                    width: 76px;
+                                    height: 28px;
+                                    horizontal-stretch: 0;
+                                    text: "Маршруты";
+                                    color: Theme.text-primary;
+                                    font-size: Theme.type-label-size;
+                                    font-weight: Theme.weight-semibold;
+                                    vertical-alignment: center;
+                                }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                                Text {
-                                    text: root.catalog-selection-queued
-                                        ? "Применим после подключения"
-                                        : root.catalog-selection-pending
-                                            ? "Применяем маршрут…"
-                                            : root.latency-check-loading
-                                                ? "Проверяем задержку…"
-                                                : root.latency-check-queued
-                                                    ? "Проверим автоматически"
-                                                    : "Задержка обновляется автоматически";
-                                    color: root.catalog-selection-queued || root.catalog-selection-pending ? Theme.warning : Theme.text-muted;
+                                route-updated-meta := Text {
+                                    width: 112px;
+                                    height: 28px;
+                                    horizontal-stretch: 0;
+                                    text: root.subscription-updated;
+                                    color: Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
+                                    horizontal-alignment: right;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
@@ -1560,19 +1575,22 @@ export component AppWindow inherits Window {
                 clicked => { root.close-profile-menu(); }
             }
 
-            if root.profile-menu-open: profile-menu := Rectangle {
+            profile-menu := Rectangle {
                 x: 20px;
-                y: 188px;
-                width: Math.min(320px, parent.width - 40px);
-                height: Math.min(parent.height - self.y - 16px,
+                y: root.profile-menu-open ? 188px : 180px;
+                width: parent.width - 40px;
+                height: Math.min(parent.height - 204px,
                     root.profile-menu-error != "" ? 104px
                     : root.profile-menu-loading ? 144px
                     : Math.min(288px, 16px + root.subscription-profiles.length * 54px));
                 background: Theme.elevated;
                 border-color: Theme.line;
                 border-width: 1px;
-                border-radius: 16px;
+                border-radius: 14px;
                 clip: true;
+                opacity: root.profile-menu-open ? 1 : 0;
+                animate opacity { duration: 160ms; easing: ease-out; }
+                animate y { duration: 160ms; easing: ease-out; }
 
                 VerticalLayout {
                     padding: 8px;
@@ -1594,6 +1612,7 @@ export component AppWindow inherits Window {
                         }
                         retry-profile-focus := FocusScope {
                             x: parent.width - 100px; y: 22px; width: 92px; height: 44px;
+                            enabled: root.profile-menu-open;
                             focus-on-click: true;
                             focus-on-tab-navigation: root.profile-menu-keyboard-open;
                             accessible-role: button;
@@ -1643,7 +1662,7 @@ export component AppWindow inherits Window {
                             spacing: 2px;
                             for profile[index] in root.subscription-profiles: profile-row := Rectangle {
                                 height: 52px;
-                                background: profile.active ? #4c9dff0c : profile-row-touch.has-hover ? #ffffff08 : transparent;
+                                background: profile-row-touch.has-hover ? #ffffff08 : transparent;
                                 border-radius: 14px;
                                 opacity: profile.available || profile.active ? 1 : 0.62;
 
@@ -1672,7 +1691,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 profile-row-focus := FocusScope {
-                                    enabled: profile.available && root.profile-pending-operation == "none";
+                                    enabled: root.profile-menu-open && profile.available && root.profile-pending-operation == "none";
                                     focus-on-click: true;
                                     focus-on-tab-navigation: root.profile-menu-keyboard-open;
                                     accessible-role: button;
