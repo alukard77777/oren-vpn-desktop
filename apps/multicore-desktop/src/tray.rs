@@ -992,13 +992,23 @@ mod linux {
 
     fn create_tray(model: &TrayMenuModel, shared: &Arc<Shared>) -> Result<NativeTray, String> {
         gtk::init().map_err(|error| format!("GTK is unavailable: {error}"))?;
-        if xembed_tray_running() {
+        if status_notifier_watcher_running() {
+            return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                create_indicator(model, shared)
+            }))
+            .map_err(|_| "the AppIndicator library is not installed".to_owned())?
+            .map(NativeTray::Indicator);
+        }
+        if gtk_uses_x11() && xembed_tray_running() {
             return Ok(NativeTray::StatusIcon(create_status_icon(model, shared)));
         }
-        if status_notifier_watcher_running() {
-            return create_indicator(model, shared).map(NativeTray::Indicator);
-        }
         Err("no system tray host is running".into())
+    }
+
+    fn gtk_uses_x11() -> bool {
+        use glib::prelude::ObjectExt;
+        gtk::gdk::Display::default()
+            .is_some_and(|display| display.type_().name() == "GdkX11Display")
     }
 
     fn create_status_icon(model: &TrayMenuModel, shared: &Arc<Shared>) -> StatusIcon {
