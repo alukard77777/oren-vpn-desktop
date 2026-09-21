@@ -583,6 +583,32 @@ pub(crate) fn native_menu_commands(
     commands
 }
 
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IconArea {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+}
+
+#[cfg(not(windows))]
+pub(crate) fn status_icon_anchor(
+    icon: IconArea,
+    monitor_top: i32,
+    monitor_height: i32,
+    scale: i32,
+) -> (i32, i32) {
+    let icon_center = icon.y + icon.height / 2;
+    let edge = if icon_center < monitor_top + monitor_height / 2 {
+        icon.y + icon.height
+    } else {
+        icon.y
+    };
+    let scale = scale.max(1);
+    ((icon.x + icon.width) * scale, edge * scale)
+}
+
 #[cfg(all(test, not(windows)))]
 mod native_menu_tests {
     use super::{
@@ -713,6 +739,28 @@ mod native_menu_tests {
     }
 
     #[test]
+    fn status_icon_anchor_uses_the_icon_edge_facing_the_screen_center() {
+        use super::{IconArea, status_icon_anchor};
+
+        let top_bar = IconArea {
+            x: 1_880,
+            y: 2,
+            width: 18,
+            height: 18,
+        };
+        assert_eq!(status_icon_anchor(top_bar, 0, 1_080, 1), (1_898, 20));
+        let bottom_bar = IconArea {
+            x: 1_880,
+            y: 1_050,
+            width: 24,
+            height: 24,
+        };
+        assert_eq!(status_icon_anchor(bottom_bar, 0, 1_080, 1), (1_904, 1_050));
+        assert_eq!(status_icon_anchor(top_bar, 0, 1_080, 2), (3_796, 40));
+        assert_eq!(status_icon_anchor(top_bar, 0, 1_080, 0), (1_898, 20));
+    }
+
+    #[test]
     fn plan_without_routes_has_no_route_section_and_bounds_labels() {
         let mut routeless = input(false, true);
         routeless.groups.clear();
@@ -734,6 +782,8 @@ mod linux {
     use std::time::Duration;
 
     use gtk::glib;
+    use gtk::glib::object::ObjectType;
+    use gtk::prelude::{DeviceExt, MonitorExt, SeatExt};
     use slint::{Timer, TimerMode};
     use tray_icon::menu::{
         CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
@@ -741,8 +791,8 @@ mod linux {
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
     use super::{
-        NativeMenuItem, TrayCommand, TrayInteraction, TrayMenuModel, native_menu_commands,
-        native_menu_plan,
+        IconArea, NativeMenuItem, TrayCommand, TrayInteraction, TrayMenuModel,
+        native_menu_commands, native_menu_plan, status_icon_anchor,
     };
 
     const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -750,11 +800,97 @@ mod linux {
     const EVENT_INTERVAL: Duration = Duration::from_millis(180);
     const STATUS_NOTIFIER_WATCHER: &str = "org.kde.StatusNotifierWatcher";
 
+    const STATUS_ICON_SIZE: i32 = 64;
+
     #[derive(Default)]
     struct Shared {
         latest: Mutex<Option<TrayMenuModel>>,
         commands: Mutex<HashMap<String, TrayCommand>>,
+        interactions: Mutex<Vec<TrayInteraction>>,
         stop: AtomicBool,
+    }
+
+    struct StatusIcon(glib::Object);
+
+    impl StatusIcon {
+        fn new(pixbuf: &gtk::gdk_pixbuf::Pixbuf) -> Self {
+            use glib::translate::{FromGlibPtrFull, ToGlibPtr};
+            let raw = unsafe { gtk::ffi::gtk_status_icon_new_from_pixbuf(pixbuf.to_glib_none().0) };
+            Self(unsafe { glib::Object::from_glib_full(raw.cast::<glib::gobject_ffi::GObject>()) })
+        }
+
+        fn raw(&self) -> *mut gtk::ffi::GtkStatusIcon {
+            self.0.as_ptr().cast()
+        }
+
+        fn set_title(&self, title: &str) {
+            if let Ok(title) = std::ffi::CString::new(title) {
+                unsafe { gtk::ffi::gtk_status_icon_set_title(self.raw(), title.as_ptr()) };
+            }
+        }
+
+        fn set_tooltip(&self, text: &str) {
+            if let Ok(text) = std::ffi::CString::new(text) {
+                unsafe { gtk::ffi::gtk_status_icon_set_tooltip_text(self.raw(), text.as_ptr()) };
+            }
+        }
+
+        fn set_visible(&self, visible: bool) {
+            unsafe { gtk::ffi::gtk_status_icon_set_visible(self.raw(), visible.into()) };
+        }
+
+        fn area(&self) -> Option<IconArea> {
+            let mut area = gtk::gdk::ffi::GdkRectangle {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            };
+            let found = unsafe {
+                gtk::ffi::gtk_status_icon_get_geometry(
+                    self.raw(),
+                    std::ptr::null_mut(),
+                    &mut area,
+                    std::ptr::null_mut(),
+                )
+            };
+            (found != 0 && area.width > 0 && area.height > 0).then_some(IconArea {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: area.height,
+            })
+        }
+
+        fn connect_click(&self, signal: &str, shared: Arc<Shared>) {
+            use glib::prelude::ObjectExt;
+            let icon = self.0.downgrade();
+            self.0.connect_local(signal, false, move |_| {
+                if let Some(icon) = icon.upgrade() {
+                    request_popup(&StatusIcon(icon), &shared);
+                }
+                None
+            });
+        }
+    }
+
+    enum NativeTray {
+        StatusIcon(StatusIcon),
+        Indicator(TrayIcon),
+    }
+
+    impl NativeTray {
+        fn sync(&self, model: &TrayMenuModel, shared: &Shared) {
+            match self {
+                Self::StatusIcon(icon) => icon.set_tooltip(&tooltip(model)),
+                Self::Indicator(tray) => {
+                    if let Ok(menu) = build_menu(model, shared) {
+                        tray.set_menu(Some(Box::new(menu)));
+                    }
+                    let _ = tray.set_tooltip(Some(tooltip(model)));
+                }
+            }
+        }
     }
 
     pub(crate) struct TrayRuntime {
@@ -793,6 +929,14 @@ mod linux {
         timer.start(TimerMode::Repeated, EVENT_INTERVAL, move || {
             if let Ok(mut latest) = timer_shared.latest.lock() {
                 *latest = Some(model_provider());
+            }
+            let interactions = timer_shared
+                .interactions
+                .lock()
+                .map(|mut queued| std::mem::take(&mut *queued))
+                .unwrap_or_default();
+            for interaction in interactions {
+                action_handler(interaction);
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let command = timer_shared
@@ -838,10 +982,7 @@ mod linux {
             if let Some(model) = latest
                 && model != current
             {
-                if let Ok(menu) = build_menu(&model, &shared) {
-                    tray.set_menu(Some(Box::new(menu)));
-                }
-                let _ = tray.set_tooltip(Some(tooltip(&model)));
+                tray.sync(&model, &shared);
                 current = model;
             }
             glib::ControlFlow::Continue
@@ -849,11 +990,62 @@ mod linux {
         gtk::main();
     }
 
-    fn create_tray(model: &TrayMenuModel, shared: &Shared) -> Result<TrayIcon, String> {
+    fn create_tray(model: &TrayMenuModel, shared: &Arc<Shared>) -> Result<NativeTray, String> {
         gtk::init().map_err(|error| format!("GTK is unavailable: {error}"))?;
-        if !tray_host_available() {
-            return Err("no system tray host is running".into());
+        if xembed_tray_running() {
+            return Ok(NativeTray::StatusIcon(create_status_icon(model, shared)));
         }
+        if status_notifier_watcher_running() {
+            return create_indicator(model, shared).map(NativeTray::Indicator);
+        }
+        Err("no system tray host is running".into())
+    }
+
+    fn create_status_icon(model: &TrayMenuModel, shared: &Arc<Shared>) -> StatusIcon {
+        let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+            &glib::Bytes::from_owned(crate::app_icon::rgba(STATUS_ICON_SIZE as u32)),
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            STATUS_ICON_SIZE,
+            STATUS_ICON_SIZE,
+            STATUS_ICON_SIZE * 4,
+        );
+        let icon = StatusIcon::new(&pixbuf);
+        icon.set_title("MultiCore");
+        icon.set_tooltip(&tooltip(model));
+        icon.set_visible(true);
+        icon.connect_click("activate", shared.clone());
+        icon.connect_click("popup-menu", shared.clone());
+        icon
+    }
+
+    fn request_popup(icon: &StatusIcon, shared: &Shared) {
+        if let Some((x, y)) = popup_anchor(icon)
+            && let Ok(mut queued) = shared.interactions.lock()
+        {
+            queued.push(TrayInteraction::ShowMenu { x, y });
+        }
+    }
+
+    fn popup_anchor(icon: &StatusIcon) -> Option<(i32, i32)> {
+        let display = gtk::gdk::Display::default()?;
+        if let Some(area) = icon.area()
+            && let Some(monitor) = display.monitor_at_point(area.x, area.y)
+        {
+            let bounds = monitor.geometry();
+            return Some(status_icon_anchor(
+                area,
+                bounds.y(),
+                bounds.height(),
+                monitor.scale_factor(),
+            ));
+        }
+        let (_, x, y) = display.default_seat()?.pointer()?.position();
+        Some((x, y))
+    }
+
+    fn create_indicator(model: &TrayMenuModel, shared: &Shared) -> Result<TrayIcon, String> {
         let icon = Icon::from_rgba(crate::app_icon::rgba(32), 32, 32)
             .map_err(|error| format!("invalid tray icon: {error}"))?;
         TrayIconBuilder::new()
@@ -864,10 +1056,6 @@ mod linux {
             .with_menu(Box::new(build_menu(model, shared)?))
             .build()
             .map_err(|error| format!("failed to create tray icon: {error}"))
-    }
-
-    fn tray_host_available() -> bool {
-        status_notifier_watcher_running() || xembed_tray_running()
     }
 
     fn status_notifier_watcher_running() -> bool {
@@ -971,7 +1159,7 @@ mod linux {
         #[ignore = "requires a desktop session with a system tray host"]
         fn host_session_exposes_a_tray_host() {
             gtk::init().unwrap();
-            assert!(super::tray_host_available());
+            assert!(super::xembed_tray_running() || super::status_notifier_watcher_running());
         }
     }
 }

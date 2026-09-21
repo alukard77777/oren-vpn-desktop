@@ -141,7 +141,12 @@ pub fn place_tray_popup(
     let max_x = min_x + i64::from(monitor.width) - width;
     let max_y = min_y + i64::from(monitor.height) - height;
     let desired_x = i64::from(anchor.x) - width;
-    let desired_y = i64::from(anchor.y) - height - 10;
+    let anchor_in_top_half = i64::from(anchor.y) < min_y + i64::from(monitor.height) / 2;
+    let desired_y = if anchor_in_top_half {
+        i64::from(anchor.y) + 10
+    } else {
+        i64::from(anchor.y) - height - 10
+    };
 
     Some(PhysicalPosition {
         x: desired_x.clamp(min_x, max_x) as i32,
@@ -507,6 +512,18 @@ mod tests {
                 &[monitor(0, 0, 1_920, 1_040, true)],
             ),
             Some(PhysicalPosition { x: 1_606, y: 580 })
+        );
+    }
+
+    #[test]
+    fn tray_popup_opens_below_an_anchor_in_the_top_half() {
+        assert_eq!(
+            place_tray_popup(
+                PhysicalPosition { x: 1_900, y: 24 },
+                (304, 460),
+                &[monitor(0, 0, 1_920, 1_080, true)],
+            ),
+            Some(PhysicalPosition { x: 1_596, y: 34 })
         );
     }
 

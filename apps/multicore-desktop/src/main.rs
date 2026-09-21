@@ -456,6 +456,37 @@ fn drain_latest_write(commands: &Receiver<WriterCommand>, latest: &mut AppPrefer
     }
 }
 
+#[cfg(target_os = "linux")]
+thread_local! {
+    static CREATING_TRAY_POPUP: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(target_os = "linux")]
+fn select_linux_backend() -> Result<(), slint::PlatformError> {
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .with_winit_window_attributes_hook(|attributes| {
+            if CREATING_TRAY_POPUP.with(Cell::get) {
+                use slint::winit_030::winit::platform::x11::{WindowAttributesExtX11, WindowType};
+                attributes.with_x11_window_type(vec![WindowType::PopupMenu])
+            } else {
+                attributes
+            }
+        })
+        .select()
+}
+
+fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
+    #[cfg(target_os = "linux")]
+    CREATING_TRAY_POPUP.with(|creating| creating.set(true));
+    let popup = TrayPopup::new().inspect(|popup| {
+        let _ = popup.window();
+    });
+    #[cfg(target_os = "linux")]
+    CREATING_TRAY_POPUP.with(|creating| creating.set(false));
+    popup
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let launch_arguments =
         parse_launch_arguments(std::env::args_os().skip(1)).unwrap_or_else(|error| {
@@ -498,6 +529,8 @@ fn main() -> Result<(), slint::PlatformError> {
     )));
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
 
+    #[cfg(target_os = "linux")]
+    select_linux_backend()?;
     let ui = AppWindow::new()?;
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
@@ -540,7 +573,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     wire_windows_settings(&ui);
     wire_external_activations(&ui, activations, model.clone());
-    let tray_popup = TrayPopup::new()?;
+    let tray_popup = create_tray_popup()?;
     let tray_popup_open = Rc::new(Cell::new(false));
     let tray_accordion = Rc::new(RefCell::new(TrayAccordionState::default()));
     wire_tray_popup_actions(
