@@ -99,6 +99,8 @@ Assert-True ($ci.Contains('CARGO_PROFILE_DEV_DEBUG: 0')) 'CI must not create mul
 Assert-True ($ci.Contains('CARGO_PROFILE_TEST_DEBUG: 0')) 'CI must not create multi-gigabyte test debug symbols'
 Assert-True ($ci.Contains('CARGO_INCREMENTAL: 0')) 'CI cache must not retain incremental compiler state'
 Assert-True ($workflow.Contains('CARGO_PROFILE_TEST_DEBUG: 0')) 'release verification must use the bounded test profile'
+Assert-True ($ci.Contains('DPkg::Lock::Timeout=180')) 'Linux CI must tolerate concurrent apt jobs on the self-hosted runner'
+Assert-True ($linuxWorkflow.Contains('DPkg::Lock::Timeout=180')) 'Linux packaging must tolerate concurrent apt jobs on the self-hosted runner'
 Assert-True ($linuxWorkflow.Contains('target/linux-release-ubuntu/release/deps')) `
     'Linux packaging must use a dedicated bounded release cache'
 Assert-True ($ci.Contains('zstd')) 'Linux CI must install zstd before restoring or saving the cache'
