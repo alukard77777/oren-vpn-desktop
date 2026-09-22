@@ -10,6 +10,7 @@ $ciPath = Join-Path $root '.github\workflows\ci.yml'
 $linuxWorkflowPath = Join-Path $root '.github\workflows\linux-packages.yml'
 $linuxDockerScriptPath = Join-Path $root 'scripts\package-linux-in-docker.sh'
 $linuxPackageContractPath = Join-Path $root 'scripts\test-linux-package-contract.sh'
+$publishReleaseScriptPath = Join-Path $root 'scripts\publish-github-release.ps1'
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -21,10 +22,12 @@ Assert-True (Test-Path -LiteralPath $ciPath -PathType Leaf) 'CI workflow must ex
 Assert-True (Test-Path -LiteralPath $linuxWorkflowPath -PathType Leaf) 'Linux package workflow must exist'
 Assert-True (Test-Path -LiteralPath $linuxDockerScriptPath -PathType Leaf) 'Linux Docker packager must exist'
 Assert-True (Test-Path -LiteralPath $linuxPackageContractPath -PathType Leaf) 'Linux package artifact contract must exist'
+Assert-True (Test-Path -LiteralPath $publishReleaseScriptPath -PathType Leaf) 'GitHub release publisher must exist'
 $workflow = Get-Content -Raw -LiteralPath $workflowPath
 $ci = Get-Content -Raw -LiteralPath $ciPath
 $linuxWorkflow = Get-Content -Raw -LiteralPath $linuxWorkflowPath
 $linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
+$publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
 $cacheAction = 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
 
 foreach ($token in @(
@@ -55,9 +58,8 @@ foreach ($token in @(
     'smoke-test-windows-installed-update.ps1',
     'Xray-core-source.zip',
     'mihomo-source.zip',
-    'gh release create',
-    '--repo fatyzzz/multicore-releases',
-    '--latest',
+    'publish-github-release.ps1',
+    '-Repository fatyzzz/multicore-releases',
     'Publish release to update channel',
     'PUBLIC UNSIGNED PREVIEW'
 )) {
@@ -69,6 +71,7 @@ Assert-True (-not $workflow.Contains('cargo test --workspace --all-targets --loc
     'Windows release must not try to execute the requireAdministrator core-host binary as a test target'
 Assert-True (-not $workflow.Contains('MULTICORE_DAEMON_TOKEN')) 'release workflow must not embed runtime secrets'
 Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-repository release must not use the source repository token'
+Assert-True (-not $workflow.Contains('gh release create')) 'release publication must not depend on GitHub CLI being installed on the runner'
 Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must not publish the draft release'
 Assert-True (-not $workflow.Contains('--draft=false')) 'unsigned workflow must not clear draft state'
 Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be public rather than draft'
@@ -101,6 +104,15 @@ Assert-True (-not $linuxWorkflow.Contains('./scripts/build-linux-packages.sh --s
     'Linux workflow must not build glibc-bound release binaries directly on the Debian 13 runner'
 Assert-True ($linuxWorkflow.Contains('target/linux-stage-ubuntu')) `
     'Arch packaging must reuse the exact Ubuntu 22.04 release stage'
+foreach ($token in @(
+    'https://api.github.com/repos/$Repository',
+    'https://uploads.github.com/repos/$Repository',
+    "'X-GitHub-Api-Version'",
+    'Invoke-RestMethod -Method Delete',
+    "make_latest      = 'true'"
+)) {
+    Assert-True ($publishReleaseScript.Contains($token)) "release publisher is missing: $token"
+}
 Assert-True ($linuxDockerScript.Contains('-e MULTICORE_UPDATE_REPOSITORY')) `
     'Docker packaging must forward the compiled update repository into the container'
 Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats deb,appimage')) `

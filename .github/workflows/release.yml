@@ -237,9 +237,11 @@ jobs:
             'dist/release/mihomo-source.zip',
             'dist/release/RELEASE-SHA256SUMS.txt'
           )
-          gh release create $env:GITHUB_REF_NAME @assets `
-            --repo fatyzzz/multicore-releases `
-            --target main `
-            --latest `
-            --title "MultiCore $env:APP_VERSION" `
-            --notes-file dist/release/RELEASE_NOTES.md
+          $assets | Set-Content -LiteralPath dist/release/RELEASE-ASSETS.txt -Encoding utf8
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-github-release.ps1 `
+            -Repository fatyzzz/multicore-releases `
+            -Tag $env:GITHUB_REF_NAME `
+            -Target main `
+            -Title "MultiCore $env:APP_VERSION" `
+            -NotesPath dist/release/RELEASE_NOTES.md `
+            -AssetManifest dist/release/RELEASE-ASSETS.txt
