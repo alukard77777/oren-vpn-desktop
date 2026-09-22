@@ -8,6 +8,10 @@ use multicore_release::{GitHubRelease, ReleaseDecision, Repository, Version, ver
 
 const RELEASE_BODY_LIMIT: usize = 512 * 1024;
 const UPDATE_USER_AGENT: &str = concat!("multicore-updater/", env!("CARGO_PKG_VERSION"));
+#[cfg(target_os = "linux")]
+const REPLACEMENT_DETAIL: &str = "Будет заменён файл AppImage";
+#[cfg(not(target_os = "linux"))]
+const REPLACEMENT_DETAIL: &str = "Будет заменён весь portable-пакет";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UpdateAction {
@@ -22,6 +26,8 @@ pub(crate) enum UpdateState {
     Checking,
     Current,
     Available(GitHubRelease),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Managed(GitHubRelease),
     Downloading(GitHubRelease),
     Error(String),
 }
@@ -87,13 +93,22 @@ impl UpdateState {
             Self::Available(release) => UpdatePresentation {
                 status: format!("Доступна версия {}", release.version()),
                 detail: if runtime_idle {
-                    "Будет заменён весь portable-пакет".into()
+                    REPLACEMENT_DETAIL.into()
                 } else {
                     "Отключитесь, чтобы установить обновление".into()
                 },
                 action_label: "Обновить".into(),
                 action: UpdateAction::Install,
                 action_enabled: runtime_idle,
+                available: true,
+                busy: false,
+            },
+            Self::Managed(release) => UpdatePresentation {
+                status: format!("Доступна версия {}", release.version()),
+                detail: "Обновите пакет через менеджер пакетов".into(),
+                action_label: String::new(),
+                action: UpdateAction::None,
+                action_enabled: false,
                 available: true,
                 busy: false,
             },
@@ -180,16 +195,116 @@ pub(crate) fn check_latest() -> Result<UpdateState, String> {
     if body.len() > RELEASE_BODY_LIMIT {
         return Err("Ответ GitHub слишком большой".into());
     }
-    let release = GitHubRelease::parse_for_repository(&repository, &body)
-        .map_err(|_| "Релиз не соответствует контракту MultiCore".to_owned())?;
+    #[cfg(not(target_os = "linux"))]
+    let release = GitHubRelease::parse_for_repository(&repository, &body);
+    #[cfg(target_os = "linux")]
+    let release = GitHubRelease::parse_appimage_for_repository(&repository, &body);
+    let release = release.map_err(|_| "Релиз не соответствует контракту MultiCore".to_owned())?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|_| "Версия клиента собрана неверно".to_owned())?;
     Ok(match release.decision(&current) {
         ReleaseDecision::Current => UpdateState::Current,
-        ReleaseDecision::UpdateAvailable => UpdateState::Available(release),
+        ReleaseDecision::UpdateAvailable => available_state(release),
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn available_state(release: GitHubRelease) -> UpdateState {
+    UpdateState::Available(release)
+}
+
+#[cfg(target_os = "linux")]
+fn available_state(release: GitHubRelease) -> UpdateState {
+    match linux_install() {
+        LinuxInstall::AppImage(_) => UpdateState::Available(release),
+        LinuxInstall::Package => UpdateState::Managed(release),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LinuxInstall {
+    AppImage(PathBuf),
+    Package,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_install_from(appimage: Option<&std::ffi::OsStr>) -> LinuxInstall {
+    appimage
+        .map(PathBuf::from)
+        .filter(|image| image.is_absolute() && image.is_file())
+        .map_or(LinuxInstall::Package, LinuxInstall::AppImage)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_install() -> LinuxInstall {
+    linux_install_from(std::env::var_os("APPIMAGE").as_deref())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_appimage(image: &Path, staged: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(staged, fs::Permissions::from_mode(0o755))?;
+    match fs::remove_file(backup) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    if fs::hard_link(image, backup).is_err() {
+        fs::copy(image, backup)?;
+    }
+    fs::rename(staged, image)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let LinuxInstall::AppImage(image) = linux_install() else {
+        return Err("Обновите MultiCore через менеджер пакетов".into());
+    };
+    let directory = image
+        .parent()
+        .ok_or_else(|| "Некорректный путь AppImage".to_owned())?;
+    let name = image
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Некорректное имя AppImage".to_owned())?;
+    let staged = directory.join(format!(".{name}.update"));
+    let backup = directory.join(format!("{name}.old"));
+    if staged.exists() {
+        fs::remove_file(&staged).map_err(|_| "Не удалось очистить прошлую загрузку".to_owned())?;
+    }
+    download_release(release, &staged)?;
+    if verify_archive_file(
+        &staged,
+        release.asset().size(),
+        release.asset().sha256_hex(),
+    )
+    .is_err()
+    {
+        let _ = fs::remove_file(&staged);
+        return Err("Загруженный AppImage не прошёл SHA-256 проверку".into());
+    }
+    install_appimage(&image, &staged, &backup)
+        .map_err(|_| "Не удалось заменить файл AppImage".to_owned())?;
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"")
+        .arg("multicore-relaunch")
+        .arg(std::process::id().to_string())
+        .arg(&image)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| "Не удалось перезапустить MultiCore".to_owned())?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), String> {
     let update_dir = update_directory()?;
     fs::create_dir_all(&update_dir)
@@ -322,6 +437,7 @@ fn download_release(release: &GitHubRelease, destination: &Path) -> Result<(), S
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn update_directory() -> Result<PathBuf, String> {
     multicore_platform::dirs::user_data_root()
         .map(|root| root.join("updates"))
@@ -390,5 +506,76 @@ mod tests {
             assert!(!error.busy);
             assert_eq!(error.detail, "network unavailable");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::{LinuxInstall, UpdateAction, UpdateState, install_appimage, linux_install_from};
+    use multicore_release::GitHubRelease;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn release() -> GitHubRelease {
+        GitHubRelease::parse_appimage(br#"{
+            "tag_name":"v0.9.0",
+            "html_url":"https://github.com/fatyzzz/multicore-releases/releases/tag/v0.9.0",
+            "assets":[{
+                "name":"MultiCore-0.9.0-x86_64.AppImage",
+                "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v0.9.0/MultiCore-0.9.0-x86_64.AppImage",
+                "size":4,
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn install_kind_is_appimage_only_for_an_existing_absolute_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("MultiCore.AppImage");
+        std::fs::write(&image, b"old").unwrap();
+        assert_eq!(
+            linux_install_from(Some(image.as_os_str())),
+            LinuxInstall::AppImage(image.clone())
+        );
+        assert_eq!(linux_install_from(None), LinuxInstall::Package);
+        assert_eq!(
+            linux_install_from(Some("MultiCore.AppImage".as_ref())),
+            LinuxInstall::Package
+        );
+        assert_eq!(
+            linux_install_from(Some(temp.path().join("missing").as_os_str())),
+            LinuxInstall::Package
+        );
+    }
+
+    #[test]
+    fn package_managed_updates_are_announced_without_an_install_action() {
+        let ui = UpdateState::Managed(release()).presentation(true);
+        assert!(ui.available);
+        assert_eq!(ui.action, UpdateAction::None);
+        assert!(!ui.action_enabled);
+        assert!(ui.status.contains("0.9.0"));
+        assert!(ui.detail.contains("менеджер пакетов"));
+        let appimage = UpdateState::Available(release()).presentation(true);
+        assert_eq!(appimage.action, UpdateAction::Install);
+        assert!(appimage.detail.contains("AppImage"));
+    }
+
+    #[test]
+    fn appimage_is_replaced_atomically_and_the_previous_image_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("MultiCore.AppImage");
+        let staged = temp.path().join(".MultiCore.AppImage.update");
+        let backup = temp.path().join("MultiCore.AppImage.old");
+        std::fs::write(&image, b"old").unwrap();
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::write(&backup, b"older").unwrap();
+
+        install_appimage(&image, &staged, &backup).unwrap();
+        assert_eq!(std::fs::read(&image).unwrap(), b"new");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert!(!staged.exists());
+        let mode = std::fs::metadata(&image).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }

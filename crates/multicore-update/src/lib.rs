@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const WINDOWS_ASSET_NAME: &str = "multicore-windows-x64.zip";
+
+pub fn appimage_asset_name(version: &Version) -> String {
+    format!("MultiCore-{version}-x86_64.AppImage")
+}
 pub const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_ARCHIVE_ENTRIES: usize = 256;
@@ -168,15 +172,27 @@ pub struct GitHubRelease {
 
 impl GitHubRelease {
     pub fn parse(body: &[u8]) -> Result<Self, UpdateError> {
+        Self::parse_named(body, |_| WINDOWS_ASSET_NAME.to_owned())
+    }
+
+    pub fn parse_appimage(body: &[u8]) -> Result<Self, UpdateError> {
+        Self::parse_named(body, appimage_asset_name)
+    }
+
+    fn parse_named(
+        body: &[u8],
+        asset_name: impl FnOnce(&Version) -> String,
+    ) -> Result<Self, UpdateError> {
         let raw: RawRelease = serde_json::from_slice(body)?;
         let version = Version::parse(&raw.tag_name)?;
+        let asset_name = asset_name(&version);
         if !raw.html_url.starts_with("https://github.com/") {
             return Err(UpdateError::InvalidRelease("unexpected release page URL"));
         }
         let mut matching = raw
             .assets
             .into_iter()
-            .filter(|asset| asset.name == WINDOWS_ASSET_NAME);
+            .filter(|asset| asset.name == asset_name);
         let raw_asset = matching
             .next()
             .ok_or(UpdateError::InvalidRelease("release asset is missing"))?;
@@ -191,7 +207,7 @@ impl GitHubRelease {
             .starts_with("https://github.com/")
             || !raw_asset
                 .browser_download_url
-                .ends_with(&format!("/{WINDOWS_ASSET_NAME}"))
+                .ends_with(&format!("/{asset_name}"))
         {
             return Err(UpdateError::InvalidRelease("unexpected asset URL"));
         }
@@ -219,7 +235,17 @@ impl GitHubRelease {
     }
 
     pub fn parse_for_repository(repository: &Repository, body: &[u8]) -> Result<Self, UpdateError> {
-        let release = Self::parse(body)?;
+        Self::pinned_to(repository, Self::parse(body)?)
+    }
+
+    pub fn parse_appimage_for_repository(
+        repository: &Repository,
+        body: &[u8],
+    ) -> Result<Self, UpdateError> {
+        Self::pinned_to(repository, Self::parse_appimage(body)?)
+    }
+
+    fn pinned_to(repository: &Repository, release: Self) -> Result<Self, UpdateError> {
         let base = format!(
             "https://github.com/{}/{}/releases/",
             repository.owner(),
