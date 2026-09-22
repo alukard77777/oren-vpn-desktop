@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, windowsbuild]
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
