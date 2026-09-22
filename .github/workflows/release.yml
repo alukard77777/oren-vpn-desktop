@@ -15,6 +15,8 @@ concurrency:
 jobs:
   linux-packages:
     uses: ./.github/workflows/linux-packages.yml
+    with:
+      update-repository: fatyzzz/multicore-releases
 
   release:
     needs: linux-packages

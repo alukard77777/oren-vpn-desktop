@@ -2,6 +2,11 @@ name: Linux packages
 
 on:
   workflow_call:
+    inputs:
+      update-repository:
+        description: GitHub repository compiled in as the update channel
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -29,7 +34,13 @@ jobs:
           rustup default 1.98.1
           rustc -Vv
       - name: Stage release tree
-        run: ./scripts/package-linux-release.sh --output target/linux-stage
+        env:
+          UPDATE_REPOSITORY: ${{ inputs.update-repository }}
+        run: |
+          if [ -n "$UPDATE_REPOSITORY" ]; then
+            export MULTICORE_UPDATE_REPOSITORY="$UPDATE_REPOSITORY"
+          fi
+          ./scripts/package-linux-release.sh --output target/linux-stage
       - name: Build Debian package and AppImage
         run: ./scripts/build-linux-packages.sh --stage target/linux-stage --output dist/linux --formats deb,appimage
       - name: Archive stage for the Arch package
