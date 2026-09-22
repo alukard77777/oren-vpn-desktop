@@ -90,6 +90,8 @@ Assert-True ($linuxWorkflow.Contains('target/linux-release-ubuntu/release/deps')
     'Linux packaging must use a dedicated bounded release cache'
 Assert-True ($ci.Contains('zstd')) 'Linux CI must install zstd before restoring or saving the cache'
 Assert-True ($linuxWorkflow.Contains('zstd')) 'Linux packaging must install zstd before restoring or saving the cache'
+Assert-True ($linuxWorkflow.Contains('zstd file')) `
+    'Linux packaging must install file before validating ELF package contents'
 foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
     Assert-True ($content.Contains("hashFiles('**/Cargo.lock')")) 'every Cargo cache key must be invalidated by Cargo.lock'
 }
