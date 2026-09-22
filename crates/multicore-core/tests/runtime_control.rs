@@ -1,16 +1,19 @@
 use std::{
     collections::BTreeMap,
     fs,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+};
+#[cfg(windows)]
+use std::{
+    net::ToSocketAddrs,
+    process::{Command, Stdio},
 };
 
 use multicore_core::{
-    MihomoRuntimeControl, PersistentSnapshotStore, Snapshot, default_ipv4_interface,
-    publish_runtime_with_mihomo_control, stage_runtime_with_mihomo_control,
-    xray_outbound_server_domains,
+    MihomoRuntimeControl, PersistentSnapshotStore, Snapshot, publish_runtime_with_mihomo_control,
+    stage_runtime_with_mihomo_control, xray_outbound_server_domains,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml_ng::Value;
@@ -230,7 +233,7 @@ fn pinned_xray_accepts_the_bootstrap_dns_runtime_overlay() {
     }
     let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
         .unwrap()
-        .with_xray_outbound_interface(default_ipv4_interface().unwrap())
+        .with_xray_outbound_interface(multicore_core::default_ipv4_interface().unwrap())
         .unwrap()
         .with_xray_resolved_hosts(hosts)
         .unwrap();

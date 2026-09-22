@@ -1,6 +1,7 @@
 # MultiCore
 
-MultiCore is a native Windows x64 client written in Rust with a Slint UI. It runs
+MultiCore is a native Windows x64 and Linux x86_64 client written in Rust with a
+Slint UI. It runs
 two independent cores: Mihomo owns TUN, DNS, rules, process routing, groups, and
 selectors; Xray provides the configured Shadowsocks and FinalMask outbound
 transports through local SOCKS inbounds. No WebView is used.
@@ -31,6 +32,49 @@ The portable package contains `MultiCore.exe`, the private daemon, updater and
 core host under `runtime\`, pinned Xray and Mihomo binaries under `cores\`, and
 the package manifest, notices, licenses, and checksums. Runtime never downloads
 the cores independently.
+
+## Linux
+
+Linux releases ship three packages built from one staged tree. All of them
+install the same layout under `/usr/lib/multicore` (or inside the AppImage):
+the desktop, `runtime/multicore-daemon`, `runtime/multicore-core-host`, and the
+pinned Xray and Mihomo binaries under `cores/`.
+
+| Package | Install |
+|---|---|
+| Arch Linux `multicore-<v>-1-x86_64.pkg.tar.zst` | `sudo pacman -U multicore-<v>-1-x86_64.pkg.tar.zst` |
+| Debian 12+ / Ubuntu 22.04+ `multicore_<v>_amd64.deb` | `sudo apt install ./multicore_<v>_amd64.deb` |
+| AppImage `MultiCore-<v>-x86_64.AppImage` | `chmod +x` and run; needs GTK 3, polkit, and AppIndicator on the host |
+
+- **Elevation.** The desktop and daemon run as the user. **Connect** starts the
+  core host through `pkexec`; installed packages ship the polkit action
+  `io.github.fatyzzz.multicore.core-host`, so the password prompt names
+  MultiCore. The daemon listens on an owner-only socket in
+  `$XDG_RUNTIME_DIR/multicore`, requires the connected peer to be root with the
+  launched PID, and the host requires the daemon's PID and the invoking user.
+  The host resolves configs and cores only through owner- and permission-checked,
+  symlink-free paths, and keeps Xray and Mihomo in process groups that die with
+  it. An AppImage copies the host and cores to
+  `$XDG_CACHE_HOME/multicore/appimage-<hash>/` before elevating, because root
+  cannot read a user's FUSE mount; like the Windows preview, that copy is
+  user-writable and not a hardened privilege boundary.
+- **Tray.** With a StatusNotifierItem host (KDE Plasma, GNOME with the
+  AppIndicator extension, waybar, XFCE, Cinnamon, MATE) the tray shows a native
+  menu. X11 window managers with an XEmbed tray and no StatusNotifierItem host
+  (i3bar, polybar, awesome) show the branded popup. Without any tray host the
+  window stays visible and closing it exits.
+- **Autostart.** *Launch at sign-in* writes
+  `$XDG_CONFIG_HOME/autostart/multicore.desktop` with `--background`. Window
+  managers such as i3 need `dex --autostart` or an explicit `exec` line to honour
+  XDG autostart.
+- **Display scale.** On X11 without `Xft.dpi` the client renders at scale 1 like
+  other X11 applications; set `Xft.dpi` or `WINIT_X11_SCALE_FACTOR` to change it.
+- **Data.** `$XDG_DATA_HOME/multicore` (default `~/.local/share/multicore`) holds
+  profiles, generated runtime configs, preferences, and the device identity.
+- **Updates.** Arch and Debian packages are updated by the package manager; the
+  client only announces new releases. The AppImage downloads
+  `MultiCore-<v>-x86_64.AppImage` from the release channel, verifies size and
+  SHA-256, keeps the previous image as `<name>.old`, and relaunches.
 
 ## Subscription profiles
 
@@ -134,7 +178,7 @@ Setup 6 for installer creation.
 ```powershell
 $env:RUSTUP_TOOLCHAIN = '1.98.1-x86_64-pc-windows-msvc'
 cargo fmt --all -- --check
-cargo test --workspace --all-targets --locked
+cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-package-windows-release.ps1
@@ -159,8 +203,21 @@ Create the per-user installer from that bundle:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
   -PackagePath dist\multicore-windows-x64 `
   -OutputDirectory dist\release `
-  -AppVersion 0.1.9
+  -AppVersion 0.2.0
 ```
+
+Linux packages build with Rust 1.98.1 and, for the Debian package and AppImage,
+inside the Ubuntu 22.04 image so they run on glibc 2.35 and newer:
+
+```bash
+./scripts/package-linux-release.sh --output target/linux-stage
+./scripts/build-linux-packages.sh --stage target/linux-stage --output dist/linux --formats arch
+./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage
+```
+
+`packaging/linux/versions.json` pins the Linux core archives and executables by
+SHA-256. CI verifies Linux and Windows on every pull request and builds the Linux
+packages as artifacts on pushes to `main`.
 
 Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes
 them to `fatyzzz/multicore-releases`; installed clients read that public channel

@@ -442,6 +442,7 @@ export component AppWindow inherits Window {
     in-out property <bool> ambient-background-enabled: true;
     in-out property <bool> shell-active: true;
     in property <bool> reduced-motion: false;
+    in property <string> system-name: "Windows";
     private property <bool> ambient-wave-phase: false;
     private property <bool> ambient-wave-started: false;
     private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
@@ -452,7 +453,7 @@ export component AppWindow inherits Window {
     private property <int> first-run-trigger-focus-serial: 0;
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
-    in property <string> update-status: "MultiCore 0.1.9";
+    in property <string> update-status: "MultiCore 0.2.0";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
@@ -913,7 +914,7 @@ export component AppWindow inherits Window {
                             first-run-actions := HorizontalLayout {
                                 spacing: 10px;
                                 PrimaryAction {
-                                    width: 184px;
+                                    preferred-width: 184px;
                                     label: root.import-pending ? "Добавляем…" : "Вставить из буфера";
                                     state-label: "Вставить подписку из буфера обмена";
                                     enabled: !root.import-pending;
@@ -1387,9 +1388,9 @@ export component AppWindow inherits Window {
 
                         if root.visible-page == "settings" && root.settings-section == "general": VerticalLayout {
                             spacing: 16px;
-                            Text { height: 24px; text: "Windows"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                            Text { height: 24px; text: root.system-name; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
                             ToggleRow {
-                                label: "Запускать при входе в Windows";
+                                label: "Запускать при входе в " + root.system-name;
                                 description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "Открывать MultiCore после входа в систему";
                                 checked: root.launch-at-sign-in-enabled;
                                 enabled: !root.profile-menu-open;
@@ -1398,7 +1399,7 @@ export component AppWindow inherits Window {
                             if root.launch-at-sign-in-error != "": Text { height: 34px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             ToggleRow {
                                 label: "Живой фон";
-                                description: root.reduced-motion ? "Анимация отключена настройками Windows" : "Спокойные волны на главной";
+                                description: root.reduced-motion ? "Анимация отключена настройками " + root.system-name : "Спокойные волны на главной";
                                 checked: root.ambient-background-enabled;
                                 enabled: !root.profile-menu-open;
                                 toggled(value) => { root.ambient-background-enabled = value; }

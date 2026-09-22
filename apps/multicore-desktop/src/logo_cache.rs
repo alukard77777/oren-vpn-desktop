@@ -58,8 +58,7 @@ impl LogoImageCache {
     /// Returns the decoded image for `path`, loading it only on the first lookup.
     pub fn image_for_path(&mut self, path: impl AsRef<Path>) -> Option<slint::Image> {
         let path = path.as_ref();
-        self.entries
-            .get_or_load(path, |path| slint::Image::load_from_path(path).ok())
+        self.entries.get_or_load(path, crate::service_logo::load)
     }
 
     /// Drops cached images and failures whose paths are no longer referenced.
@@ -72,8 +71,27 @@ impl LogoImageCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CacheKey {
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 struct PathImageCache<T> {
-    entries: HashMap<PathBuf, Option<T>>,
+    entries: HashMap<CacheKey, Option<T>>,
 }
 
 impl<T> Default for PathImageCache<T> {
@@ -86,8 +104,12 @@ impl<T> Default for PathImageCache<T> {
 
 impl<T: Clone> PathImageCache<T> {
     fn get_or_load(&mut self, path: &Path, loader: impl FnOnce(&Path) -> Option<T>) -> Option<T> {
+        let key = CacheKey {
+            path: path.to_path_buf(),
+            identity: file_identity(path),
+        };
         self.entries
-            .entry(path.to_path_buf())
+            .entry(key)
             .or_insert_with(|| loader(path))
             .clone()
     }
@@ -101,7 +123,7 @@ impl<T: Clone> PathImageCache<T> {
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect();
-        self.entries.retain(|path, _| retained.contains(path));
+        self.entries.retain(|key, _| retained.contains(&key.path));
     }
 }
 
@@ -187,6 +209,28 @@ mod tests {
         assert_eq!(cache.get_or_load(Path::new("keep.png"), load), Some(1));
         assert_eq!(cache.get_or_load(Path::new("drop.png"), load), Some(3));
         assert_eq!(calls.get(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_behind_the_same_path_is_loaded_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("13");
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&path, b"first").unwrap();
+        let calls = Cell::new(0);
+        let mut cache = PathImageCache::default();
+        let load = |path: &Path| {
+            calls.set(calls.get() + 1);
+            std::fs::read(path).ok()
+        };
+
+        assert_eq!(cache.get_or_load(&path, load), Some(b"first".to_vec()));
+        assert_eq!(cache.get_or_load(&path, load), Some(b"first".to_vec()));
+        std::fs::write(&replacement, b"second").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(cache.get_or_load(&path, load), Some(b"second".to_vec()));
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

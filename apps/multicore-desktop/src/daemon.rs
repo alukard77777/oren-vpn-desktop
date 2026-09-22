@@ -460,15 +460,28 @@ impl DaemonClient for UnavailableDaemonClient {
     }
 }
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(330);
+
 #[derive(Clone)]
 pub struct HttpDaemonClient {
     base_url: reqwest::Url,
     token: String,
     http: Client,
+    connect_request_timeout: Duration,
 }
 
 impl HttpDaemonClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, DaemonError> {
+        Self::with_timeouts(base_url, token, REQUEST_TIMEOUT, CONNECT_REQUEST_TIMEOUT)
+    }
+
+    fn with_timeouts(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        request_timeout: Duration,
+        connect_request_timeout: Duration,
+    ) -> Result<Self, DaemonError> {
         let token = token.into();
         if token.trim().is_empty() {
             return Err(DaemonError::new("Daemon access token is not configured."));
@@ -478,13 +491,14 @@ impl HttpDaemonClient {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(10))
+            .timeout(request_timeout)
             .build()
             .map_err(map_error)?;
         Ok(Self {
             base_url,
             token,
             http,
+            connect_request_timeout,
         })
     }
 
@@ -716,7 +730,11 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn connect(&self) -> Result<DaemonStatus, DaemonError> {
-        self.parse_status(self.http.post(self.endpoint("/v1/connect")))
+        self.parse_status(
+            self.http
+                .post(self.endpoint("/v1/connect"))
+                .timeout(self.connect_request_timeout),
+        )
     }
 
     fn disconnect(&self) -> Result<DaemonStatus, DaemonError> {
@@ -2000,5 +2018,45 @@ mod http_tests {
             .expect_err("transport failure");
         assert!(transport.requires_reconciliation());
         assert!(!transport.to_string().contains(sensitive));
+    }
+
+    fn start_delayed_status_server(delay: Duration) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed HTTP server");
+        let address = listener.local_addr().expect("delayed server address");
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept delayed request");
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                thread::sleep(delay);
+                let body = r#"{"state":"ready"}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn connect_waits_for_elevation_longer_than_ordinary_requests() {
+        let (url, server) = start_delayed_status_server(Duration::from_millis(600));
+        let client = HttpDaemonClient::with_timeouts(
+            url,
+            "token",
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(client.status().is_err());
+        assert!(client.connect().is_ok());
+        server.join().unwrap();
+        assert!(CONNECT_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
+        assert!(CONNECT_REQUEST_TIMEOUT >= Duration::from_secs(330));
     }
 }

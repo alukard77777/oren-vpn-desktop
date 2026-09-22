@@ -199,3 +199,50 @@ fn broker_secret_is_redacted_and_authentication_is_exact() {
     let decoded = decode_frame(&encode_frame(&proof).unwrap()).unwrap();
     assert!(secret.verifies(&decoded));
 }
+
+#[test]
+fn stream_frames_round_trip_and_reject_bad_lengths_before_reading_payloads() {
+    use multicore_core::elevation_protocol::{
+        ElevationCommand, MAX_ELEVATION_FRAME_BYTES, decode_command, read_stream_frame,
+        write_stream_frame,
+    };
+    use std::io::{Cursor, ErrorKind};
+
+    let mut buffer = Vec::new();
+    write_stream_frame(&mut buffer, &ElevationCommand::Diagnostics).unwrap();
+    write_stream_frame(&mut buffer, &ElevationCommand::Shutdown).unwrap();
+    let mut reader = Cursor::new(buffer);
+    assert_eq!(
+        decode_command(&read_stream_frame(&mut reader).unwrap()).unwrap(),
+        ElevationCommand::Diagnostics
+    );
+    assert_eq!(
+        decode_command(&read_stream_frame(&mut reader).unwrap()).unwrap(),
+        ElevationCommand::Shutdown
+    );
+    assert_eq!(
+        read_stream_frame(&mut reader).unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+
+    let oversized = ((MAX_ELEVATION_FRAME_BYTES - 3) as u32).to_le_bytes();
+    let mut reader = Cursor::new(oversized.to_vec());
+    assert_eq!(
+        read_stream_frame(&mut reader).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(reader.position(), 4);
+    let mut reader = Cursor::new(0_u32.to_le_bytes().to_vec());
+    assert_eq!(
+        read_stream_frame(&mut reader).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    let mut truncated = 10_u32.to_le_bytes().to_vec();
+    truncated.extend_from_slice(b"{}");
+    assert_eq!(
+        read_stream_frame(&mut Cursor::new(truncated))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof
+    );
+}

@@ -7,6 +7,9 @@ Set-StrictMode -Version Latest
 $root = Split-Path -Parent $PSScriptRoot
 $workflowPath = Join-Path $root '.github\workflows\release.yml'
 $ciPath = Join-Path $root '.github\workflows\ci.yml'
+$linuxWorkflowPath = Join-Path $root '.github\workflows\linux-packages.yml'
+$linuxDockerScriptPath = Join-Path $root 'scripts\package-linux-in-docker.sh'
+$linuxPackageContractPath = Join-Path $root 'scripts\test-linux-package-contract.sh'
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -15,16 +18,21 @@ function Assert-True {
 
 Assert-True (Test-Path -LiteralPath $workflowPath -PathType Leaf) 'release workflow must exist'
 Assert-True (Test-Path -LiteralPath $ciPath -PathType Leaf) 'CI workflow must exist'
+Assert-True (Test-Path -LiteralPath $linuxWorkflowPath -PathType Leaf) 'Linux package workflow must exist'
+Assert-True (Test-Path -LiteralPath $linuxDockerScriptPath -PathType Leaf) 'Linux Docker packager must exist'
+Assert-True (Test-Path -LiteralPath $linuxPackageContractPath -PathType Leaf) 'Linux package artifact contract must exist'
 $workflow = Get-Content -Raw -LiteralPath $workflowPath
 $ci = Get-Content -Raw -LiteralPath $ciPath
+$linuxWorkflow = Get-Content -Raw -LiteralPath $linuxWorkflowPath
+$linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
 
 foreach ($token in @(
     'tags:',
     "- 'v*'",
     'permissions:',
     'contents: read',
-    'runs-on: windows-latest',
-    'cargo test --workspace --all-targets --locked',
+    'runs-on: [self-hosted, Windows, X64, windowsbuild]',
+    'cargo test --workspace --locked',
     'cargo clippy --workspace --all-targets --locked -- -D warnings',
     '-AssertReleaseReady',
     'GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}',
@@ -56,6 +64,8 @@ foreach ($token in @(
 }
 
 Assert-True (-not $workflow.Contains('pull_request_target')) 'release workflow must not run in pull_request_target'
+Assert-True (-not $workflow.Contains('cargo test --workspace --all-targets --locked')) `
+    'Windows release must not try to execute the requireAdministrator core-host binary as a test target'
 Assert-True (-not $workflow.Contains('MULTICORE_DAEMON_TOKEN')) 'release workflow must not embed runtime secrets'
 Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-repository release must not use the source repository token'
 Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must not publish the draft release'
@@ -63,6 +73,19 @@ Assert-True (-not $workflow.Contains('--draft=false')) 'unsigned workflow must n
 Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be public rather than draft'
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'
 Assert-True ($ci.Contains('test-packaged-daemon-smoke-contract.ps1')) 'normal CI must run the packaged daemon smoke contract'
+Assert-True ($ci.Contains('cargo test --workspace --locked')) 'normal CI must run workspace tests without elevated binary targets'
+Assert-True ($linuxWorkflow.Contains('./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage')) `
+    'Debian and AppImage packages must be built inside the pinned Ubuntu 22.04 image'
+Assert-True (-not $linuxWorkflow.Contains('./scripts/build-linux-packages.sh --stage target/linux-stage --output dist/linux --formats deb,appimage')) `
+    'Linux workflow must not build glibc-bound release binaries directly on the Debian 13 runner'
+Assert-True ($linuxWorkflow.Contains('target/linux-stage-ubuntu')) `
+    'Arch packaging must reuse the exact Ubuntu 22.04 release stage'
+Assert-True ($linuxDockerScript.Contains('-e MULTICORE_UPDATE_REPOSITORY')) `
+    'Docker packaging must forward the compiled update repository into the container'
+Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats deb,appimage')) `
+    'Debian and AppImage artifacts must be inspected before upload'
+Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats arch')) `
+    'Arch artifacts must be inspected before upload'
 
 $packageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x64.zip', [StringComparison]::Ordinal)
 $realBundleIndex = $workflow.IndexOf('$env:MULTICORE_RELEASE_BUNDLE', [StringComparison]::Ordinal)

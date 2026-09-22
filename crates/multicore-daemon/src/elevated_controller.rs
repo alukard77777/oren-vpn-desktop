@@ -17,10 +17,22 @@ use multicore_core::{
     CoreLogRecord, DiagnosticStream, Engine, ProcessController, ProcessDiagnostics,
     RuntimeCheckState,
 };
+#[cfg(windows)]
 use zeroize::Zeroizing;
 
 pub const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+pub const BROKER_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[cfg(windows)]
+const DAEMON_EXECUTABLE: &str = "multicore-daemon.exe";
+#[cfg(windows)]
+const CORE_HOST_EXECUTABLE: &str = "multicore-core-host.exe";
+#[cfg(not(windows))]
+const DAEMON_EXECUTABLE: &str = "multicore-daemon";
+#[cfg(not(windows))]
+const CORE_HOST_EXECUTABLE: &str = "multicore-core-host";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ElevationError {
@@ -322,14 +334,14 @@ pub fn packaged_core_host_from(daemon_executable: &Path) -> Result<PathBuf, Elev
         std::fs::canonicalize(daemon_executable).map_err(|_| ElevationError::LaunchFailed)?;
     let runtime = daemon.parent().ok_or(ElevationError::LaunchFailed)?;
     if runtime.file_name().and_then(|name| name.to_str()) != Some("runtime")
-        || daemon.file_name().and_then(|name| name.to_str()) != Some("multicore-daemon.exe")
+        || daemon.file_name().and_then(|name| name.to_str()) != Some(DAEMON_EXECUTABLE)
     {
         return Err(ElevationError::LaunchFailed);
     }
-    let host = runtime.join("multicore-core-host.exe");
+    let host = runtime.join(CORE_HOST_EXECUTABLE);
     let host = std::fs::canonicalize(host).map_err(|_| ElevationError::LaunchFailed)?;
     if host.parent() != Some(runtime)
-        || host.file_name().and_then(|name| name.to_str()) != Some("multicore-core-host.exe")
+        || host.file_name().and_then(|name| name.to_str()) != Some(CORE_HOST_EXECUTABLE)
     {
         return Err(ElevationError::LaunchFailed);
     }
@@ -1549,31 +1561,311 @@ pub fn production_factory() -> Result<ProductionElevatedControllerFactory, Eleva
     ))
 }
 
-#[cfg(not(windows))]
-#[derive(Clone, Copy)]
-pub struct UnsupportedConnector;
-#[cfg(not(windows))]
-pub struct UnsupportedTransport;
-#[cfg(not(windows))]
-impl BrokerTransport for UnsupportedTransport {
-    fn request(&self, _: &ElevationCommand) -> Result<ElevationResponse, ElevationError> {
-        Err(ElevationError::LaunchFailed)
+#[cfg(unix)]
+pub mod unix {
+    use super::*;
+    use multicore_core::elevation_protocol::{
+        ELEVATION_PROTOCOL_VERSION, decode_frame, read_stream_frame, write_stream_frame,
+    };
+    use std::{
+        io::ErrorKind,
+        os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+            process::ExitStatusExt,
+        },
+        process::{Child, Command, ExitStatus, Stdio},
+        time::Instant,
+    };
+
+    const PKEXEC: &str = "/usr/bin/pkexec";
+    const APPIMAGE_STAGE_PREFIX: &str = "appimage-";
+    const APPIMAGE_MEMBERS: [(&str, &str); 3] = [
+        ("runtime", CORE_HOST_EXECUTABLE),
+        ("cores", "xray"),
+        ("cores", "mihomo"),
+    ];
+
+    pub fn stage_appimage_host(host: &Path, cache_root: &Path) -> Result<PathBuf, ElevationError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        let package = host
+            .parent()
+            .and_then(Path::parent)
+            .ok_or(ElevationError::LaunchFailed)?;
+        let mut hasher = Sha256::new();
+        let mut members = Vec::with_capacity(APPIMAGE_MEMBERS.len());
+        for (directory, name) in APPIMAGE_MEMBERS {
+            let bytes = std::fs::read(package.join(directory).join(name))
+                .map_err(|_| ElevationError::LaunchFailed)?;
+            hasher.update(name.as_bytes());
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+            members.push((directory, name, bytes));
+        }
+        let digest = hasher.finalize();
+        let stage_name = format!(
+            "{APPIMAGE_STAGE_PREFIX}{}",
+            digest[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let private_directory = |path: &Path| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .map_err(|_| ElevationError::Io)
+        };
+        private_directory(cache_root)?;
+        let target = cache_root.join(&stage_name);
+        let staged_host = target.join("runtime").join(CORE_HOST_EXECUTABLE);
+        if !staged_host.is_file() {
+            let temporary = cache_root.join(format!(".{stage_name}.{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temporary);
+            for (directory, name, bytes) in &members {
+                private_directory(&temporary.join(directory))?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o755)
+                    .open(temporary.join(directory).join(name))
+                    .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
+                    .map_err(|_| ElevationError::Io)?;
+            }
+            if std::fs::rename(&temporary, &target).is_err() {
+                let _ = std::fs::remove_dir_all(&temporary);
+                if !staged_host.is_file() {
+                    return Err(ElevationError::Io);
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(cache_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(APPIMAGE_STAGE_PREFIX) && name != stage_name {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        Ok(staged_host)
+    }
+    const PKEXEC_DISMISSED: i32 = 126;
+    const ACCEPT_POLL: Duration = Duration::from_millis(25);
+
+    pub struct LaunchedHost {
+        pub pid: u32,
+        pub child: Option<Child>,
+    }
+
+    pub struct UnixBrokerTransport {
+        stream: UnixStream,
+        host: Mutex<Option<Child>>,
+    }
+
+    impl BrokerTransport for UnixBrokerTransport {
+        fn request(&self, command: &ElevationCommand) -> Result<ElevationResponse, ElevationError> {
+            let mut stream = &self.stream;
+            write_stream_frame(&mut stream, command).map_err(io_error)?;
+            let frame = read_stream_frame(&mut stream).map_err(io_error)?;
+            let response: ElevationResponse =
+                decode_frame(&frame).map_err(|_| ElevationError::Protocol)?;
+            if !response_matches_command(command, &response) {
+                return Err(ElevationError::Protocol);
+            }
+            Ok(response)
+        }
+    }
+
+    impl Drop for UnixBrokerTransport {
+        fn drop(&mut self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            if let Some(mut child) = self.host.lock().ok().and_then(|mut host| host.take()) {
+                let _ = std::thread::Builder::new()
+                    .name("multicore-core-host-reaper".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct UnixBrokerConnector;
+
+    impl BrokerConnector for UnixBrokerConnector {
+        type Transport = UnixBrokerTransport;
+
+        fn connect(&self, executable: &Path) -> Result<Self::Transport, ElevationError> {
+            let runtime_dir =
+                multicore_platform::dirs::user_runtime_dir().map_err(|_| ElevationError::Io)?;
+            connect_with(
+                &runtime_dir,
+                |socket, server_pid| launch_with_pkexec(executable, socket, server_pid),
+                0,
+                BROKER_AUTHORIZATION_TIMEOUT,
+            )
+        }
+    }
+
+    fn launch_with_pkexec(
+        executable: &Path,
+        socket: &Path,
+        server_pid: u32,
+    ) -> Result<LaunchedHost, ElevationError> {
+        let child = Command::new(PKEXEC)
+            .arg(executable)
+            .arg("--socket")
+            .arg(socket)
+            .arg("--protocol")
+            .arg(ELEVATION_PROTOCOL_VERSION.to_string())
+            .arg("--server-pid")
+            .arg(server_pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ElevationError::LaunchFailed)?;
+        Ok(LaunchedHost {
+            pid: child.id(),
+            child: Some(child),
+        })
+    }
+
+    struct SocketFile(PathBuf);
+
+    impl Drop for SocketFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn io_error(error: std::io::Error) -> ElevationError {
+        match error.kind() {
+            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+                ElevationError::Disconnected
+            }
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => ElevationError::TimedOut,
+            ErrorKind::InvalidData => ElevationError::Protocol,
+            _ => ElevationError::Io,
+        }
+    }
+
+    pub(crate) fn launch_exit_error(status: ExitStatus) -> ElevationError {
+        if status.code() == Some(PKEXEC_DISMISSED) {
+            ElevationError::ElevationCancelled
+        } else if status.signal().is_some() {
+            ElevationError::Cancelled
+        } else {
+            ElevationError::LaunchFailed
+        }
+    }
+
+    fn socket_name() -> Result<String, ElevationError> {
+        let mut bytes = [0_u8; 24];
+        getrandom::fill(&mut bytes).map_err(|_| ElevationError::Io)?;
+        Ok(format!(
+            "broker-{}.sock",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+    }
+
+    pub fn connect_with(
+        runtime_dir: &Path,
+        launch: impl FnOnce(&Path, u32) -> Result<LaunchedHost, ElevationError>,
+        expected_peer_uid: u32,
+        timeout: Duration,
+    ) -> Result<UnixBrokerTransport, ElevationError> {
+        let socket = SocketFile(runtime_dir.join(socket_name()?));
+        let listener = UnixListener::bind(&socket.0).map_err(|_| ElevationError::Io)?;
+        std::fs::set_permissions(&socket.0, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| ElevationError::Io)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| ElevationError::Io)?;
+        let secret = SessionSecret::generate().map_err(|_| ElevationError::Io)?;
+        let mut host = launch(&socket.0, std::process::id())?;
+        let started = Instant::now();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if let Some(child) = host.child.as_mut()
+                        && let Some(status) = child.try_wait().map_err(|_| ElevationError::Io)?
+                    {
+                        return Err(launch_exit_error(status));
+                    }
+                    if started.elapsed() >= timeout {
+                        if let Some(child) = host.child.as_mut()
+                            && child.kill().is_ok()
+                        {
+                            let _ = child.wait();
+                        }
+                        return Err(ElevationError::TimedOut);
+                    }
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(_) => return Err(ElevationError::Io),
+            }
+        };
+        drop(listener);
+        drop(socket);
+        stream
+            .set_nonblocking(false)
+            .map_err(|_| ElevationError::Io)?;
+        stream
+            .set_read_timeout(Some(BROKER_IO_TIMEOUT))
+            .map_err(|_| ElevationError::Io)?;
+        stream
+            .set_write_timeout(Some(BROKER_IO_TIMEOUT))
+            .map_err(|_| ElevationError::Io)?;
+        let peer =
+            rustix::net::sockopt::socket_peercred(&stream).map_err(|_| ElevationError::Io)?;
+        if peer.uid.as_raw() != expected_peer_uid
+            || peer.pid.as_raw_nonzero().get() as u32 != host.pid
+        {
+            return Err(ElevationError::PeerPidMismatch);
+        }
+        let mut writer = &stream;
+        write_stream_frame(&mut writer, &secret.authentication()).map_err(io_error)?;
+        let echoed = read_stream_frame(&mut writer).map_err(io_error)?;
+        let echoed: Authentication =
+            decode_frame(&echoed).map_err(|_| ElevationError::AuthenticationFailed)?;
+        if !secret.verifies(&echoed) {
+            return Err(ElevationError::AuthenticationFailed);
+        }
+        Ok(UnixBrokerTransport {
+            stream,
+            host: Mutex::new(host.child.take()),
+        })
     }
 }
-#[cfg(not(windows))]
-impl BrokerConnector for UnsupportedConnector {
-    type Transport = UnsupportedTransport;
-    fn connect(&self, _: &Path) -> Result<Self::Transport, ElevationError> {
-        Err(ElevationError::LaunchFailed)
-    }
-}
-#[cfg(not(windows))]
-pub type ProductionElevatedControllerFactory = ElevatedControllerFactory<UnsupportedConnector>;
-#[cfg(not(windows))]
+
+#[cfg(unix)]
+pub type ProductionElevatedControllerFactory = ElevatedControllerFactory<unix::UnixBrokerConnector>;
+
+#[cfg(unix)]
 pub fn production_factory() -> Result<ProductionElevatedControllerFactory, ElevationError> {
+    let daemon = std::env::current_exe().map_err(|_| ElevationError::LaunchFailed)?;
+    let mut host = packaged_core_host_from(&daemon)?;
+    if std::env::var_os("APPDIR")
+        .map(PathBuf::from)
+        .is_some_and(|appdir| appdir.is_absolute() && host.starts_with(appdir))
+    {
+        let cache = multicore_platform::dirs::user_cache_root()
+            .map_err(|_| ElevationError::LaunchFailed)?;
+        host = unix::stage_appimage_host(&host, &cache)?;
+    }
     Ok(ElevatedControllerFactory::new(
-        PathBuf::new(),
-        UnsupportedConnector,
+        host,
+        unix::UnixBrokerConnector,
     ))
 }
 
@@ -1743,6 +2035,7 @@ mod tests {
         assert_eq!(state.connects.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(windows)]
     #[test]
     fn runtime_generation_requires_exact_fixed_width_name() {
         assert_eq!(
@@ -1763,8 +2056,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
         std::fs::create_dir(&runtime).unwrap();
-        let daemon = runtime.join("multicore-daemon.exe");
-        let host = runtime.join("multicore-core-host.exe");
+        let daemon = runtime.join(DAEMON_EXECUTABLE);
+        let host = runtime.join(CORE_HOST_EXECUTABLE);
         std::fs::write(&daemon, b"daemon").unwrap();
         std::fs::write(&host, b"host").unwrap();
         assert_eq!(
@@ -1825,5 +2118,267 @@ mod tests {
             ElevationError::ElevationCancelled
         );
         assert_eq!(map_shell_execute_error(5), ElevationError::LaunchFailed);
+    }
+
+    #[cfg(unix)]
+    mod unix_connector {
+        use super::super::unix::{LaunchedHost, connect_with, launch_exit_error};
+        use super::super::*;
+        use multicore_core::elevation_protocol::{
+            ElevatedEngine, decode_frame, read_stream_frame, write_stream_frame,
+        };
+        use std::{
+            os::unix::{net::UnixStream, process::ExitStatusExt},
+            path::PathBuf,
+            process::ExitStatus,
+            sync::mpsc,
+            thread,
+        };
+
+        enum Host {
+            Echo,
+            WrongSecret,
+            Respond(ElevationResponse),
+        }
+
+        fn fake_host(
+            behaviour: Host,
+            reported_pid: u32,
+        ) -> (
+            impl FnOnce(&Path, u32) -> Result<LaunchedHost, ElevationError>,
+            mpsc::Receiver<PathBuf>,
+        ) {
+            let (sockets, observed) = mpsc::channel();
+            let launch = move |socket: &Path, server_pid: u32| {
+                assert_eq!(server_pid, std::process::id());
+                let socket = socket.to_path_buf();
+                let _ = sockets.send(socket.clone());
+                thread::spawn(move || {
+                    let mut stream = UnixStream::connect(&socket).unwrap();
+                    let frame = read_stream_frame(&mut stream).unwrap();
+                    let authentication: Authentication = decode_frame(&frame).unwrap();
+                    match behaviour {
+                        Host::WrongSecret => {
+                            let other = SessionSecret::generate().unwrap();
+                            let _ = write_stream_frame(&mut stream, &other.authentication());
+                        }
+                        Host::Echo | Host::Respond(_) => {
+                            write_stream_frame(&mut stream, &authentication).unwrap();
+                        }
+                    }
+                    if let Host::Respond(response) = behaviour
+                        && read_stream_frame(&mut stream).is_ok()
+                    {
+                        write_stream_frame(&mut stream, &response).unwrap();
+                    }
+                    let _ = read_stream_frame(&mut stream);
+                });
+                Ok(LaunchedHost {
+                    pid: reported_pid,
+                    child: None,
+                })
+            };
+            (launch, observed)
+        }
+
+        fn uid() -> u32 {
+            rustix::process::getuid().as_raw()
+        }
+
+        #[test]
+        fn authenticated_session_serves_matching_responses_and_removes_the_socket() {
+            let runtime = tempfile::tempdir().unwrap();
+            let (launch, sockets) = fake_host(
+                Host::Respond(ElevationResponse::Stopped {
+                    engine: ElevatedEngine::Xray,
+                }),
+                std::process::id(),
+            );
+            let transport =
+                connect_with(runtime.path(), launch, uid(), Duration::from_secs(5)).unwrap();
+            let socket = sockets.recv().unwrap();
+            assert!(socket.starts_with(runtime.path()));
+            let name = socket.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("broker-") && name.ends_with(".sock"));
+            assert_eq!(name.len(), "broker-".len() + 48 + ".sock".len());
+            assert!(!socket.exists());
+            assert_eq!(
+                transport
+                    .request(&ElevationCommand::Stop {
+                        engine: ElevatedEngine::Xray
+                    })
+                    .unwrap(),
+                ElevationResponse::Stopped {
+                    engine: ElevatedEngine::Xray
+                }
+            );
+        }
+
+        #[test]
+        fn mismatched_responses_are_protocol_errors() {
+            let runtime = tempfile::tempdir().unwrap();
+            let (launch, _) = fake_host(
+                Host::Respond(ElevationResponse::ShuttingDown),
+                std::process::id(),
+            );
+            let transport =
+                connect_with(runtime.path(), launch, uid(), Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                transport
+                    .request(&ElevationCommand::Stop {
+                        engine: ElevatedEngine::Mihomo
+                    })
+                    .err(),
+                Some(ElevationError::Protocol)
+            );
+        }
+
+        #[test]
+        fn wrong_secret_uid_or_pid_fail_closed() {
+            let runtime = tempfile::tempdir().unwrap();
+            let (launch, _) = fake_host(Host::WrongSecret, std::process::id());
+            assert_eq!(
+                connect_with(runtime.path(), launch, uid(), Duration::from_secs(5)).err(),
+                Some(ElevationError::AuthenticationFailed)
+            );
+            let (launch, _) = fake_host(Host::Echo, std::process::id());
+            assert_eq!(
+                connect_with(runtime.path(), launch, uid() + 1, Duration::from_secs(5)).err(),
+                Some(ElevationError::PeerPidMismatch)
+            );
+            let (launch, _) = fake_host(Host::Echo, std::process::id() + 1);
+            assert_eq!(
+                connect_with(runtime.path(), launch, uid(), Duration::from_secs(5)).err(),
+                Some(ElevationError::PeerPidMismatch)
+            );
+            assert_eq!(std::fs::read_dir(runtime.path()).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn early_launcher_exit_and_silence_are_reported_without_leaking_sockets() {
+            let runtime = tempfile::tempdir().unwrap();
+            for (code, expected) in [
+                (126, ElevationError::ElevationCancelled),
+                (127, ElevationError::LaunchFailed),
+                (1, ElevationError::LaunchFailed),
+            ] {
+                let result = connect_with(
+                    runtime.path(),
+                    |_, _| {
+                        let child = std::process::Command::new("/bin/sh")
+                            .arg("-c")
+                            .arg(format!("exit {code}"))
+                            .spawn()
+                            .unwrap();
+                        Ok(LaunchedHost {
+                            pid: child.id(),
+                            child: Some(child),
+                        })
+                    },
+                    uid(),
+                    Duration::from_secs(5),
+                );
+                assert_eq!(result.err(), Some(expected), "{code}");
+            }
+            let result = connect_with(
+                runtime.path(),
+                |_, _| {
+                    Ok(LaunchedHost {
+                        pid: std::process::id(),
+                        child: None,
+                    })
+                },
+                uid(),
+                Duration::from_millis(200),
+            );
+            assert_eq!(result.err(), Some(ElevationError::TimedOut));
+            assert_eq!(std::fs::read_dir(runtime.path()).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn authorization_timeout_kills_the_waiting_launcher() {
+            let runtime = tempfile::tempdir().unwrap();
+            let launched = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let recorded = launched.clone();
+            let result = connect_with(
+                runtime.path(),
+                move |_, _| {
+                    let child = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg("exec sleep 60")
+                        .spawn()
+                        .unwrap();
+                    *recorded.lock().unwrap() = Some(child.id());
+                    Ok(LaunchedHost {
+                        pid: child.id(),
+                        child: Some(child),
+                    })
+                },
+                uid(),
+                Duration::from_millis(200),
+            );
+            assert_eq!(result.err(), Some(ElevationError::TimedOut));
+            let pid = launched.lock().unwrap().unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+
+        fn appimage_package(root: &Path, host: &[u8]) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let runtime = root.join("mount").join("usr/lib/multicore/runtime");
+            let cores = root.join("mount").join("usr/lib/multicore/cores");
+            std::fs::create_dir_all(&runtime).unwrap();
+            std::fs::create_dir_all(&cores).unwrap();
+            for (path, bytes) in [
+                (runtime.join("multicore-core-host"), host),
+                (cores.join("xray"), &b"xray"[..]),
+                (cores.join("mihomo"), &b"mihomo"[..]),
+            ] {
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            runtime.join("multicore-core-host")
+        }
+
+        #[test]
+        fn appimage_host_is_staged_once_per_build_outside_the_mount() {
+            use super::super::unix::stage_appimage_host;
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let host = appimage_package(temp.path(), b"host-one");
+            let staged = stage_appimage_host(&host, &cache).unwrap();
+            assert!(staged.starts_with(&cache));
+            assert!(staged.ends_with("runtime/multicore-core-host"));
+            let package = staged.parent().unwrap().parent().unwrap();
+            assert_eq!(std::fs::read(&staged).unwrap(), b"host-one");
+            assert_eq!(std::fs::read(package.join("cores/xray")).unwrap(), b"xray");
+            assert_eq!(
+                std::fs::read(package.join("cores/mihomo")).unwrap(),
+                b"mihomo"
+            );
+            for path in [&staged, &package.join("cores/xray")] {
+                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o755);
+            }
+            let mode = std::fs::metadata(package).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+            assert_eq!(stage_appimage_host(&host, &cache).unwrap(), staged);
+
+            std::fs::write(&host, b"host-two").unwrap();
+            let rebuilt = stage_appimage_host(&host, &cache).unwrap();
+            assert_ne!(rebuilt, staged);
+            assert_eq!(std::fs::read(&rebuilt).unwrap(), b"host-two");
+            assert!(!package.exists());
+            assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn signalled_launcher_is_reported_as_cancelled() {
+            assert_eq!(
+                launch_exit_error(ExitStatus::from_raw(9)),
+                ElevationError::Cancelled
+            );
+        }
     }
 }

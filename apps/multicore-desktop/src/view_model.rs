@@ -4131,9 +4131,8 @@ mod tests {
 
         assert!(refresh_action.contains("width: 92px;"));
         assert!(refresh_action.contains("height: 44px;"));
-        assert!(refresh_action.contains(
-            "Rectangle {\n                                y: 5px;\n                                height: 34px;"
-        ));
+        let compact = refresh_action.split_whitespace().collect::<String>();
+        assert!(compact.contains("Rectangle{y:5px;height:34px;"));
     }
 
     #[test]
@@ -6026,8 +6025,9 @@ mod tests {
         assert!(main.contains("cache.retain_paths"));
         assert!(main.contains("cache.image_for_path"));
         assert!(!main.contains("slint::Image::load_from_path"));
+        assert!(!logo_cache.contains("slint::Image::load_from_path"));
         assert_eq!(
-            logo_cache.matches("slint::Image::load_from_path").count(),
+            logo_cache.matches("crate::service_logo::load").count(),
             1,
             "PNG decoding must have one cache-owned entry point"
         );

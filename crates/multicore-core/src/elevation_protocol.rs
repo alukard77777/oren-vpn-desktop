@@ -227,6 +227,34 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtocolErro
     Ok(envelope.body)
 }
 
+pub fn read_stream_frame(reader: &mut impl std::io::Read) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut header = [0_u8; 4];
+    reader.read_exact(&mut header)?;
+    let length = u32::from_le_bytes(header) as usize;
+    if length == 0 || length > MAX_ELEVATION_FRAME_BYTES - 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            ProtocolError::InvalidLength,
+        ));
+    }
+    let mut frame = Zeroizing::new(vec![0_u8; 4 + length]);
+    frame[..4].copy_from_slice(&header);
+    reader.read_exact(&mut frame[4..])?;
+    Ok(frame)
+}
+
+pub fn write_stream_frame<T: Serialize>(
+    writer: &mut impl std::io::Write,
+    value: &T,
+) -> std::io::Result<()> {
+    let frame = Zeroizing::new(
+        encode_frame(value)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+    );
+    writer.write_all(&frame)?;
+    writer.flush()
+}
+
 pub fn decode_command(frame: &[u8]) -> Result<ElevationCommand, ProtocolError> {
     let command: ElevationCommand = decode_frame(frame)?;
     command.validate()?;

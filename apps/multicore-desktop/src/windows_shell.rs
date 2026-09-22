@@ -170,7 +170,21 @@ fn infer_taskbar_edge(anchor: PhysicalPosition, monitor: &MonitorRect) -> TrayTa
     .filter(|(outside, _)| *outside > 0)
     .max_by_key(|(outside, _)| *outside)
     .map(|(_, edge)| edge)
-    .unwrap_or(TrayTaskbarEdge::Bottom)
+    .unwrap_or_else(|| inside_anchor_edge(y, top, bottom))
+}
+
+#[cfg(windows)]
+fn inside_anchor_edge(_y: i64, _top: i64, _bottom: i64) -> TrayTaskbarEdge {
+    TrayTaskbarEdge::Bottom
+}
+
+#[cfg(not(windows))]
+fn inside_anchor_edge(y: i64, top: i64, bottom: i64) -> TrayTaskbarEdge {
+    if y - top < bottom - y {
+        TrayTaskbarEdge::Top
+    } else {
+        TrayTaskbarEdge::Bottom
+    }
 }
 
 fn place_tray_popup_on_monitor(
@@ -529,7 +543,6 @@ pub fn next_maximized(current: bool) -> bool {
     !current
 }
 
-#[cfg(windows)]
 impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
     fn from(edge: ResizeEdge) -> Self {
         use slint::winit_030::winit::window::ResizeDirection;
@@ -578,6 +591,30 @@ mod tests {
                 None,
             ),
             Some(PhysicalPosition { x: 1_606, y: 580 })
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tray_popup_anchor_inside_the_monitor_opens_away_from_the_nearer_vertical_edge() {
+        let monitors = [monitor(0, 0, 1_920, 1_080, true)];
+        assert_eq!(
+            place_tray_popup(
+                PhysicalPosition { x: 1_900, y: 24 },
+                (304, 460),
+                &monitors,
+                None,
+            ),
+            Some(PhysicalPosition { x: 1_596, y: 34 })
+        );
+        assert_eq!(
+            place_tray_popup(
+                PhysicalPosition { x: 1_900, y: 1_050 },
+                (304, 460),
+                &monitors,
+                None,
+            ),
+            Some(PhysicalPosition { x: 1_596, y: 580 })
         );
     }
 
@@ -883,7 +920,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn maps_all_resize_edges_to_winit_030() {
         use slint::winit_030::winit::window::ResizeDirection;

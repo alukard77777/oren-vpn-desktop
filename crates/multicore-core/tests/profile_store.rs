@@ -117,7 +117,7 @@ fn set_legacy_modes(root: &std::path::Path) {
         } else {
             0o640 + index as u32 % 8
         };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
         if path.is_dir() {
             for (child_index, child) in fs::read_dir(&path)
                 .unwrap()
@@ -434,7 +434,8 @@ fn invalid_existing_index_is_not_replaced_from_legacy() {
         Err(ProfileError::InvalidIndex(_))
     ));
     assert_eq!(fs::read(profiles.join("index.json")).unwrap(), before);
-    assert_eq!(fs::read_dir(&profiles).unwrap().count(), 2);
+    let expected_entries = if cfg!(windows) { 2 } else { 1 };
+    assert_eq!(fs::read_dir(&profiles).unwrap().count(), expected_entries);
 }
 
 #[test]
@@ -637,7 +638,7 @@ fn unreadable_selection_file_is_not_treated_as_corrupt_or_overwritten() {
         .unwrap();
     let path = profiles.join(id.as_str()).join("selections.json");
     let before = fs::read(&path).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
 
     assert!(matches!(
         store.save_selection(&id, revision, "new", "node-new"),

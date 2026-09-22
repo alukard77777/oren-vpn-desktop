@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 const HOST_MAIN: &str = include_str!("../src/main.rs");
 const WINDOWS_PIPE: &str = include_str!("../src/windows_pipe.rs");
 

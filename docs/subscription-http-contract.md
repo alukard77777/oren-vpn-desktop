@@ -17,10 +17,10 @@ Every config request includes these identity headers:
 
 | Header | Value |
 | --- | --- |
-| `x-hwid` | Stable uppercase UUID-shaped installation identifier. Derived through the INCY-compatible scheme when Windows inputs are available; otherwise random and persisted. |
-| `x-device-os` | `windows` |
-| `x-ver-os` | Bounded Windows version string. |
-| `x-device-model` | Bounded device model, with `Windows PC` fallback. |
+| `x-hwid` | Stable uppercase UUID-shaped installation identifier. Derived through the INCY-compatible scheme when platform inputs are available (Windows `MachineGuid`; Linux `/etc/machine-id`), otherwise random, and persisted. |
+| `x-device-os` | `windows` or `linux` |
+| `x-ver-os` | Bounded OS version string: Windows product and release, or Linux `os-release` `PRETTY_NAME`. |
+| `x-device-model` | Bounded device model, with `Windows PC` or `Linux PC` fallback. |
 
 The client never sends raw MachineGuid, hostname, or user name.
 

@@ -16,6 +16,15 @@ const IDENTITY_FILE: &str = "device_id";
 const IDENTITY_LOCK_FILE: &str = ".device_id.lock";
 const MAX_DESCRIPTOR_BYTES: usize = 128;
 
+#[cfg(windows)]
+const OS_VERSION_FALLBACK: &str = "Windows";
+#[cfg(windows)]
+const DEVICE_MODEL_FALLBACK: &str = "Windows PC";
+#[cfg(not(windows))]
+const OS_VERSION_FALLBACK: &str = "Linux";
+#[cfg(not(windows))]
+const DEVICE_MODEL_FALLBACK: &str = "Linux PC";
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct DeviceIdentity {
     hwid: String,
@@ -112,13 +121,13 @@ fn load_or_create_with_sources(
     let os_version = descriptors
         .os_version
         .as_deref()
-        .and_then(|value| bounded_descriptor(value, "Windows"))
-        .unwrap_or_else(|| "Windows".to_owned());
+        .and_then(|value| bounded_descriptor(value, OS_VERSION_FALLBACK))
+        .unwrap_or_else(|| OS_VERSION_FALLBACK.to_owned());
     let device_model = descriptors
         .device_model
         .as_deref()
-        .and_then(|value| bounded_descriptor(value, "Windows PC"))
-        .unwrap_or_else(|| "Windows PC".to_owned());
+        .and_then(|value| bounded_descriptor(value, DEVICE_MODEL_FALLBACK))
+        .unwrap_or_else(|| DEVICE_MODEL_FALLBACK.to_owned());
     Ok(DeviceIdentity {
         hwid,
         os_version,
@@ -606,21 +615,106 @@ fn platform_descriptors() -> DescriptorInputs {
 }
 
 #[cfg(not(windows))]
+const MAX_PLATFORM_FILE_BYTES: u64 = 64 * 1024;
+
+#[cfg(not(windows))]
+fn read_platform_file(path: &str) -> Option<String> {
+    use std::io::Read;
+
+    let mut text = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_PLATFORM_FILE_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+#[cfg(not(windows))]
+fn parse_machine_id(text: &str) -> Option<String> {
+    let value = text.trim();
+    (value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| value.to_owned())
+}
+
+#[cfg(not(windows))]
+fn parse_os_release_pretty_name(text: &str) -> Option<String> {
+    let raw = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("PRETTY_NAME="))?;
+    let value = if let Some(quoted) = raw.strip_prefix('"') {
+        let mut value = String::new();
+        let mut characters = quoted.chars();
+        loop {
+            match characters.next()? {
+                '"' => break,
+                '\\' => value.push(characters.next()?),
+                character => value.push(character),
+            }
+        }
+        value
+    } else if let Some(quoted) = raw.strip_prefix('\'') {
+        quoted.split_once('\'')?.0.to_owned()
+    } else {
+        raw.to_owned()
+    };
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+#[cfg(not(windows))]
+fn passwd_user_name(passwd: &str, uid: u32) -> Option<String> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        let entry_uid = fields.next()?.parse::<u32>().ok()?;
+        (entry_uid == uid && !name.is_empty()).then(|| name.to_owned())
+    })
+}
+
+#[cfg(not(windows))]
 fn platform_hardware_inputs() -> HardwareInputs {
+    let machine_guid = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .into_iter()
+        .find_map(|path| {
+            read_platform_file(path)
+                .as_deref()
+                .and_then(parse_machine_id)
+        });
+    let hostname = read_platform_file("/proc/sys/kernel/hostname")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let uid = rustix::process::geteuid().as_raw();
+    let user = read_platform_file("/etc/passwd")
+        .and_then(|passwd| passwd_user_name(&passwd, uid))
+        .or_else(|| std::env::var("USER").ok().filter(|value| !value.is_empty()));
     HardwareInputs {
-        machine_guid: None,
-        hostname: None,
+        machine_guid,
+        hostname,
         os: Some(std::env::consts::OS.to_owned()),
         arch: Some(std::env::consts::ARCH.to_owned()),
-        user: None,
+        user,
     }
 }
 
 #[cfg(not(windows))]
 fn platform_descriptors() -> DescriptorInputs {
     DescriptorInputs {
-        os_version: None,
-        device_model: None,
+        os_version: ["/etc/os-release", "/usr/lib/os-release"]
+            .into_iter()
+            .find_map(|path| {
+                read_platform_file(path)
+                    .as_deref()
+                    .and_then(parse_os_release_pretty_name)
+            }),
+        device_model: read_platform_file("/sys/class/dmi/id/product_name")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
     }
 }
 
@@ -790,7 +884,7 @@ mod tests {
         let identity = load_or_create_with_inputs(&root.0, complete_inputs()).unwrap();
         assert_eq!(identity.hwid(), "B64CD3CC-5D61-72F2-AE98-7277AF087AAD");
         assert_eq!(identity.os_version(), "V".repeat(128));
-        assert_eq!(identity.device_model(), "Windows PC");
+        assert_eq!(identity.device_model(), super::DEVICE_MODEL_FALLBACK);
         assert!(identity.os_version().is_ascii());
         assert!(identity.device_model().is_ascii());
         assert!(identity.os_version().len() <= 128);
@@ -832,7 +926,7 @@ mod tests {
         let request = server.join().unwrap();
         assert!(request.contains("x-hwid: B64CD3CC-5D61-72F2-AE98-7277AF087AAD"));
         assert!(request.contains(&format!("x-ver-os: {}", "V".repeat(128))));
-        assert!(request.contains("x-device-model: Windows PC"));
+        assert!(request.contains(&format!("x-device-model: {}", super::DEVICE_MODEL_FALLBACK)));
         for raw in raw_inputs {
             assert!(!request.contains(raw));
         }
@@ -893,6 +987,88 @@ mod tests {
         let lock = root.0.join("identity/.device_id.lock");
         if lock.exists() {
             assert_eq!(fs::metadata(lock).unwrap().len(), 0);
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_machine_id_accepts_only_32_lowercase_hex_characters() {
+        use super::parse_machine_id;
+
+        assert_eq!(
+            parse_machine_id("0123456789abcdef0123456789abcdef\n").as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        for invalid in [
+            "",
+            "\n",
+            "uninitialized\n",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert_eq!(parse_machine_id(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_os_release_pretty_name_handles_quotes_escapes_and_comments() {
+        use super::parse_os_release_pretty_name;
+
+        assert_eq!(
+            parse_os_release_pretty_name("NAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux\"\n")
+                .as_deref(),
+            Some("Arch Linux")
+        );
+        assert_eq!(
+            parse_os_release_pretty_name(
+                "# PRETTY_NAME=ignored\nPRETTY_NAME='Debian GNU/Linux 12'"
+            )
+            .as_deref(),
+            Some("Debian GNU/Linux 12")
+        );
+        assert_eq!(
+            parse_os_release_pretty_name("PRETTY_NAME=Plain").as_deref(),
+            Some("Plain")
+        );
+        assert_eq!(
+            parse_os_release_pretty_name("PRETTY_NAME=\"Say \\\"hi\\\" \\\\ \\$HOME\"").as_deref(),
+            Some("Say \"hi\" \\ $HOME")
+        );
+        assert_eq!(parse_os_release_pretty_name("NAME=Arch"), None);
+        assert_eq!(parse_os_release_pretty_name("PRETTY_NAME=\"\""), None);
+        assert_eq!(
+            parse_os_release_pretty_name("PRETTY_NAME=\"unterminated"),
+            None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_passwd_lookup_matches_the_exact_uid() {
+        use super::passwd_user_name;
+
+        let passwd = "root:x:0:0::/root:/bin/bash\nbroken-line\nalice:x:1000:1000:Alice:/home/alice:/bin/zsh\nalice2:x:10000:10000::/home/a2:/bin/sh\n";
+        assert_eq!(passwd_user_name(passwd, 1000).as_deref(), Some("alice"));
+        assert_eq!(passwd_user_name(passwd, 0).as_deref(), Some("root"));
+        assert_eq!(passwd_user_name(passwd, 10000).as_deref(), Some("alice2"));
+        assert_eq!(passwd_user_name(passwd, 42), None);
+        assert_eq!(passwd_user_name(":x:5:5::/:/bin/sh", 5), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_hardware_inputs_use_the_incy_platform_constants() {
+        let inputs = super::platform_hardware_inputs();
+        assert_eq!(inputs.os.as_deref(), Some("linux"));
+        assert_eq!(inputs.arch.as_deref(), Some(std::env::consts::ARCH));
+        if let Some(machine_id) = inputs.machine_guid.as_deref() {
+            assert_eq!(
+                super::parse_machine_id(machine_id).as_deref(),
+                Some(machine_id)
+            );
         }
     }
 }

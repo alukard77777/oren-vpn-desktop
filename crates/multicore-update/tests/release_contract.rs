@@ -72,3 +72,58 @@ fn pinned_repository_rejects_cross_repository_release_urls() {
     }"#;
     assert!(GitHubRelease::parse_for_repository(&repository, body).is_err());
 }
+
+const MIXED_RELEASE: &[u8] = br#"{
+    "tag_name":"v0.3.0",
+    "html_url":"https://github.com/fatyzzz/multicore-releases/releases/tag/v0.3.0",
+    "assets":[
+        {
+            "name":"multicore-windows-x64.zip",
+            "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v0.3.0/multicore-windows-x64.zip",
+            "size":1234,
+            "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+            "name":"MultiCore-0.3.0-x86_64.AppImage",
+            "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v0.3.0/MultiCore-0.3.0-x86_64.AppImage",
+            "size":5678,
+            "digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+    ]
+}"#;
+
+#[test]
+fn appimage_release_selects_the_versioned_linux_asset() {
+    let repository = Repository::parse("fatyzzz/multicore-releases").unwrap();
+    let release = GitHubRelease::parse_appimage_for_repository(&repository, MIXED_RELEASE).unwrap();
+    assert_eq!(release.version().to_string(), "0.3.0");
+    assert_eq!(release.asset().size(), 5678);
+    assert_eq!(release.asset().sha256_hex(), "b".repeat(64));
+    assert!(
+        release
+            .asset()
+            .download_url()
+            .ends_with("/MultiCore-0.3.0-x86_64.AppImage")
+    );
+    assert_eq!(
+        multicore_release::appimage_asset_name(&release.version()),
+        "MultiCore-0.3.0-x86_64.AppImage"
+    );
+
+    let windows = GitHubRelease::parse_for_repository(&repository, MIXED_RELEASE).unwrap();
+    assert_eq!(windows.asset().size(), 1234);
+}
+
+#[test]
+fn appimage_release_rejects_missing_or_foreign_assets() {
+    let repository = Repository::parse("fatyzzz/multicore-releases").unwrap();
+    let windows_only = String::from_utf8(MIXED_RELEASE.to_vec()).unwrap().replace(
+        "MultiCore-0.3.0-x86_64.AppImage",
+        "MultiCore-0.2.9-x86_64.AppImage",
+    );
+    assert!(
+        GitHubRelease::parse_appimage_for_repository(&repository, windows_only.as_bytes()).is_err()
+    );
+    let other = Repository::parse("someone/else").unwrap();
+    assert!(GitHubRelease::parse_appimage_for_repository(&other, MIXED_RELEASE).is_err());
+}

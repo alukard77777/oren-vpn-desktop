@@ -4,8 +4,11 @@ mod app_icon;
 mod bootstrap;
 mod clipboard_text;
 mod daemon;
+#[cfg(target_os = "linux")]
+mod linux_display;
 mod logo_cache;
 mod preferences;
+mod service_logo;
 mod single_instance;
 mod tray;
 mod updater;
@@ -482,7 +485,40 @@ fn drain_latest_write(commands: &Receiver<WriterCommand>, latest: &mut AppPrefer
     }
 }
 
+#[cfg(target_os = "linux")]
+thread_local! {
+    static CREATING_TRAY_POPUP: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(target_os = "linux")]
+fn select_linux_backend() -> Result<(), slint::PlatformError> {
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .with_winit_window_attributes_hook(|attributes| {
+            if CREATING_TRAY_POPUP.with(Cell::get) {
+                use slint::winit_030::winit::platform::x11::{WindowAttributesExtX11, WindowType};
+                attributes.with_x11_window_type(vec![WindowType::PopupMenu])
+            } else {
+                attributes
+            }
+        })
+        .select()
+}
+
+fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
+    #[cfg(target_os = "linux")]
+    CREATING_TRAY_POPUP.with(|creating| creating.set(true));
+    let popup = TrayPopup::new().inspect(|popup| {
+        let _ = popup.window();
+    });
+    #[cfg(target_os = "linux")]
+    CREATING_TRAY_POPUP.with(|creating| creating.set(false));
+    popup
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    #[cfg(target_os = "linux")]
+    linux_display::prefer_desktop_scale();
     let launch_arguments =
         parse_launch_arguments(std::env::args_os().skip(1)).unwrap_or_else(|error| {
             eprintln!("launch arguments rejected: {error}");
@@ -524,7 +560,11 @@ fn main() -> Result<(), slint::PlatformError> {
     )));
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
 
+    #[cfg(target_os = "linux")]
+    select_linux_backend()?;
     let ui = AppWindow::new()?;
+    #[cfg(not(windows))]
+    ui.set_system_name("Linux".into());
     let _logo_cache_session = logo_cache::LogoCacheSession::install();
     if preference_writer
         .lock()
@@ -566,7 +606,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     wire_windows_settings(&ui);
     wire_external_activations(&ui, activations, model.clone());
-    let tray_popup = TrayPopup::new()?;
+    let tray_popup = create_tray_popup()?;
     let tray_popup_open = Rc::new(Cell::new(false));
     let tray_accordion = Rc::new(RefCell::new(TrayAccordionState::default()));
     wire_tray_popup_actions(
@@ -847,7 +887,7 @@ fn apply_update_state(ui: &AppWindow, state: &UpdateState, runtime_idle: bool) {
 }
 
 fn load_preferences() -> (Option<PreferenceStore>, AppPreferences) {
-    let store = match PreferenceStore::from_local_app_data() {
+    let store = match PreferenceStore::from_user_data_root() {
         Ok(store) => store,
         Err(_) => {
             eprintln!("preferences unavailable");
@@ -1306,10 +1346,7 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
         if let Some(ui) = weak.upgrade() {
             let _ = ui.window().with_winit_window(|window| {
                 let _ = set_current_monitor_max_size(window);
-                #[cfg(windows)]
                 let _ = window.drag_resize_window(edge.into());
-                #[cfg(not(windows))]
-                let _ = edge;
             });
         }
     });
@@ -3423,7 +3460,8 @@ mod window_tests {
         assert!(compact_main.contains(
             "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone(),tray_accordion.clone(),)"
         ));
-        assert!(rust.contains("if open.get() {\n        hide_tray_popup"));
+        let compact_rust = rust.split_whitespace().collect::<String>();
+        assert!(compact_rust.contains("ifopen.get(){hide_tray_popup"));
         assert!(rust.contains("with_winit_window(|window| window.has_focus())"));
         assert!(rust.contains("let _ = tray_popup.hide();"));
     }
@@ -4468,7 +4506,7 @@ mod window_tests {
         assert!(rust.contains("ui.on_window_resize"));
         assert!(rust.contains("parse_resize_edge"));
         assert!(rust.contains("drag_resize_window"));
-        assert!(rust.contains("PreferenceStore::from_local_app_data()"));
+        assert!(rust.contains("PreferenceStore::from_user_data_root()"));
         assert!(rust.contains("TimerMode::Repeated, Duration::from_millis(500)"));
         assert!(rust.contains("stop_and_flush"));
         let exit_branch = rust

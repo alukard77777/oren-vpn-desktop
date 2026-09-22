@@ -1,0 +1,75 @@
+name: Linux packages
+
+on:
+  workflow_call:
+    inputs:
+      update-repository:
+        description: GitHub repository compiled in as the update channel
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  debian-appimage:
+    runs-on: [self-hosted, Linux, X64, debian13]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build Debian package and AppImage in Ubuntu 22.04
+        env:
+          UPDATE_REPOSITORY: ${{ inputs.update-repository }}
+        run: |
+          if [ -n "$UPDATE_REPOSITORY" ]; then
+            export MULTICORE_UPDATE_REPOSITORY="$UPDATE_REPOSITORY"
+          fi
+          ./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage
+      - name: Verify Debian package and AppImage
+        run: ./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats deb,appimage
+      - name: Archive stage for the Arch package
+        run: tar --zstd -C target -cf linux-stage.tar.zst linux-stage-ubuntu
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-packages-debian-appimage
+          path: dist/linux/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-stage
+          path: linux-stage.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+
+  arch:
+    needs: debian-appimage
+    runs-on: [self-hosted, Linux, X64, debian13]
+    timeout-minutes: 30
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-stage
+      - name: Build Arch package
+        run: |
+          pacman -Syu --noconfirm --needed zstd
+          useradd --create-home builder
+          mkdir -p target
+          tar --zstd -xf linux-stage.tar.zst -C target
+          chown -R builder: .
+          su builder -c './scripts/build-linux-packages.sh --stage target/linux-stage-ubuntu --output dist/linux --formats arch'
+      - name: Verify Arch package
+        run: ./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats arch
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-packages-arch
+          path: dist/linux/
+          if-no-files-found: error
