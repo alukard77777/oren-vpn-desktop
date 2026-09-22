@@ -638,7 +638,7 @@ fn unreadable_selection_file_is_not_treated_as_corrupt_or_overwritten() {
         .unwrap();
     let path = profiles.join(id.as_str()).join("selections.json");
     let before = fs::read(&path).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
 
     assert!(matches!(
         store.save_selection(&id, revision, "new", "node-new"),

@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::mpsc,
     thread,
 };
@@ -247,7 +247,7 @@ fn identity_rejects_a_reparse_component_above_the_data_directory() {
 }
 
 #[cfg(windows)]
-fn assert_protected_single_principal_dacl(path: &Path) {
+fn assert_protected_single_principal_dacl(path: &std::path::Path) {
     use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_SUCCESS, LocalFree},

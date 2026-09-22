@@ -375,7 +375,7 @@ fn stable_file_path(
     {
         use std::os::fd::AsRawFd;
         let fd_root = format!("/proc/{}/fd", std::process::id());
-        return Some(PathBuf::from(fd_root).join(file.as_raw_fd().to_string()));
+        Some(PathBuf::from(fd_root).join(file.as_raw_fd().to_string()))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

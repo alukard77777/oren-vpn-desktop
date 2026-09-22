@@ -746,6 +746,7 @@ async fn tun_device_is_up(device: &str) -> bool {
     })
 }
 
+#[cfg(any(windows, test))]
 fn adapter_is_ready(alias: &str, operational_up: bool) -> bool {
     alias == "MultiCore" && operational_up
 }

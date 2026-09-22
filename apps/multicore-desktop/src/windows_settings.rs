@@ -6,6 +6,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const RUN_VALUE_NAME: &str = "MultiCore";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,7 +439,7 @@ mod registry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::{
         LaunchAtSignInState, apply_launch_at_sign_in_change, build_launch_command,

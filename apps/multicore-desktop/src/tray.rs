@@ -422,6 +422,7 @@ mod tests {
     }
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrayPointerButton {
     Left,
@@ -429,6 +430,7 @@ pub(crate) enum TrayPointerButton {
     Middle,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrayPointerState {
     Down,
@@ -441,6 +443,7 @@ pub(crate) enum TrayInteraction {
     ShowMenu { x: i32, y: i32 },
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn pointer_interaction(
     button: TrayPointerButton,
     state: TrayPointerState,
