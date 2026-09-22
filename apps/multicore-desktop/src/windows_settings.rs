@@ -100,11 +100,16 @@ pub fn query_launch_at_sign_in() -> io::Result<LaunchAtSignInState> {
     classify_launch_command(registry::read_run_value()?.as_deref(), &current_executable)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn query_launch_at_sign_in() -> io::Result<LaunchAtSignInState> {
+    autostart::query_in(&autostart::entry_path()?, &autostart::launcher()?)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn query_launch_at_sign_in() -> io::Result<LaunchAtSignInState> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launch at sign-in is only supported on Windows",
+        "launch at sign-in is not supported on this platform",
     ))
 }
 
@@ -120,12 +125,145 @@ pub fn set_launch_at_sign_in(enabled: bool) -> io::Result<LaunchAtSignInState> {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn set_launch_at_sign_in(enabled: bool) -> io::Result<LaunchAtSignInState> {
+    autostart::apply_in(&autostart::entry_path()?, &autostart::launcher()?, enabled)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn set_launch_at_sign_in(_enabled: bool) -> io::Result<LaunchAtSignInState> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launch at sign-in is only supported on Windows",
+        "launch at sign-in is not supported on this platform",
     ))
+}
+
+#[cfg(target_os = "linux")]
+mod autostart {
+    use super::{
+        LaunchAtSignInState, apply_launch_at_sign_in_change, build_launch_command,
+        classify_launch_command,
+    };
+    use std::ffi::OsStr;
+    use std::io::{self, Read};
+    use std::path::{Path, PathBuf};
+
+    const ENTRY_NAME: &str = "multicore.desktop";
+    const MAX_ENTRY_BYTES: u64 = 64 * 1024;
+    const EXEC_RESERVED: [char; 4] = ['`', '$', '\\', '%'];
+
+    pub(super) fn entry_path() -> io::Result<PathBuf> {
+        Ok(multicore_platform::dirs::user_config_root()?
+            .join("autostart")
+            .join(ENTRY_NAME))
+    }
+
+    pub(super) fn launcher() -> io::Result<PathBuf> {
+        Ok(launcher_from(
+            std::env::var_os("APPIMAGE").as_deref(),
+            &std::env::current_exe()?,
+        ))
+    }
+
+    pub(super) fn launcher_from(appimage: Option<&OsStr>, current_exe: &Path) -> PathBuf {
+        appimage
+            .map(Path::new)
+            .filter(|image| image.is_absolute() && image.is_file())
+            .map_or_else(|| current_exe.to_path_buf(), Path::to_path_buf)
+    }
+
+    pub(super) fn desktop_entry(command: &str) -> String {
+        format!(
+            "[Desktop Entry]\nType=Application\nName=MultiCore\nComment=MultiCore network client\nExec={command}\nIcon=multicore\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        )
+    }
+
+    pub(super) fn exec_from_desktop_entry(entry: &str) -> Option<String> {
+        let mut in_main_group = false;
+        let mut exec = None;
+        for line in entry.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_main_group = line == "[Desktop Entry]";
+                continue;
+            }
+            if !in_main_group {
+                continue;
+            }
+            match line
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+            {
+                Some(("Hidden", "true")) | Some(("X-GNOME-Autostart-enabled", "false")) => {
+                    return None;
+                }
+                Some(("Exec", value)) if exec.is_none() => exec = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+        exec
+    }
+
+    fn read_exec(entry: &Path) -> io::Result<Option<String>> {
+        let file = match std::fs::File::open(entry) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut text = String::new();
+        file.take(MAX_ENTRY_BYTES).read_to_string(&mut text)?;
+        Ok(exec_from_desktop_entry(&text))
+    }
+
+    fn write_entry(entry: &Path, command: &str) -> io::Result<()> {
+        let directory = entry
+            .parent()
+            .ok_or_else(|| io::Error::other("autostart entry has no directory"))?;
+        std::fs::create_dir_all(directory)?;
+        let temporary = directory.join(format!(".{ENTRY_NAME}.tmp"));
+        std::fs::write(&temporary, desktop_entry(command))?;
+        std::fs::rename(&temporary, entry).inspect_err(|_| {
+            let _ = std::fs::remove_file(&temporary);
+        })
+    }
+
+    fn delete_entry(entry: &Path) -> io::Result<()> {
+        match std::fs::remove_file(entry) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    fn require_exec_safe(executable: &Path) -> io::Result<()> {
+        let command = build_launch_command(executable)?;
+        if command.contains(EXEC_RESERVED) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launch executable path needs Desktop Entry escaping",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn query_in(entry: &Path, executable: &Path) -> io::Result<LaunchAtSignInState> {
+        classify_launch_command(read_exec(entry)?.as_deref(), executable)
+    }
+
+    pub(super) fn apply_in(
+        entry: &Path,
+        executable: &Path,
+        enabled: bool,
+    ) -> io::Result<LaunchAtSignInState> {
+        if enabled {
+            require_exec_safe(executable)?;
+        }
+        apply_launch_at_sign_in_change(
+            enabled,
+            executable,
+            |command| write_entry(entry, command),
+            || delete_entry(entry),
+            || read_exec(entry),
+        )
+    }
 }
 
 fn apply_launch_at_sign_in_change<Write, Delete, Read>(
@@ -370,5 +508,125 @@ mod tests {
         let ignored_write =
             apply_launch_at_sign_in_change(true, executable, |_| Ok(()), || Ok(()), || Ok(None));
         assert!(ignored_write.is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::LaunchAtSignInState;
+    use super::autostart::{
+        apply_in, desktop_entry, exec_from_desktop_entry, launcher_from, query_in,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn desktop_entry_round_trips_the_exact_background_command() {
+        let command = "\"/usr/lib/multicore/multicore\" --background";
+        let entry = desktop_entry(command);
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("\nType=Application\n"));
+        assert!(entry.contains("\nName=MultiCore\n"));
+        assert_eq!(exec_from_desktop_entry(&entry).as_deref(), Some(command));
+    }
+
+    #[test]
+    fn entries_disabled_by_the_desktop_or_outside_the_main_group_are_ignored() {
+        let base = "[Desktop Entry]\nType=Application\nExec=\"/opt/mc\" --background\n";
+        assert!(exec_from_desktop_entry(base).is_some());
+        assert_eq!(
+            exec_from_desktop_entry(&format!("{base}Hidden=true\n")),
+            None
+        );
+        assert_eq!(
+            exec_from_desktop_entry(&format!("{base}X-GNOME-Autostart-enabled=false\n")),
+            None
+        );
+        assert_eq!(
+            exec_from_desktop_entry("[Desktop Action x]\nExec=\"/opt/mc\" --background\n"),
+            None
+        );
+        assert_eq!(
+            exec_from_desktop_entry("Exec=\"/opt/mc\" --background\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn appimage_path_is_preferred_over_the_mounted_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("MultiCore.AppImage");
+        std::fs::write(&image, b"image").unwrap();
+        let mounted = Path::new("/tmp/.mount_MultiXYZ/usr/lib/multicore/multicore");
+        assert_eq!(launcher_from(Some(image.as_os_str()), mounted), image);
+        assert_eq!(
+            launcher_from(Some("relative.AppImage".as_ref()), mounted),
+            PathBuf::from(mounted)
+        );
+        assert_eq!(launcher_from(None, mounted), PathBuf::from(mounted));
+    }
+
+    #[test]
+    fn enabling_and_disabling_is_written_atomically_and_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("autostart").join("multicore.desktop");
+        let executable = temp.path().join("Multi Core").join("multicore");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"elf").unwrap();
+
+        assert_eq!(
+            query_in(&entry, &executable).unwrap(),
+            LaunchAtSignInState::Disabled
+        );
+        assert_eq!(
+            apply_in(&entry, &executable, true).unwrap(),
+            LaunchAtSignInState::Enabled
+        );
+        assert!(
+            std::fs::read_to_string(&entry)
+                .unwrap()
+                .contains(&format!("Exec=\"{}\" --background", executable.display()))
+        );
+        assert_eq!(
+            query_in(&entry, &executable).unwrap(),
+            LaunchAtSignInState::Enabled
+        );
+        assert!(
+            std::fs::read_dir(entry.parent().unwrap())
+                .unwrap()
+                .all(|file| file.unwrap().file_name() == "multicore.desktop")
+        );
+        assert_eq!(
+            apply_in(&entry, &executable, false).unwrap(),
+            LaunchAtSignInState::Disabled
+        );
+        assert!(!entry.exists());
+        assert_eq!(
+            apply_in(&entry, &executable, false).unwrap(),
+            LaunchAtSignInState::Disabled
+        );
+    }
+
+    #[test]
+    fn a_foreign_command_is_stale_and_unsafe_paths_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("multicore.desktop");
+        let executable = temp.path().join("multicore");
+        std::fs::write(&executable, b"elf").unwrap();
+        std::fs::write(
+            &entry,
+            "[Desktop Entry]\nType=Application\nExec=\"/old/place/multicore\" --background\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            query_in(&entry, &executable).unwrap(),
+            LaunchAtSignInState::Stale { .. }
+        ));
+        for unsafe_name in ["cost$", "tick`", "back\\slash", "field%u"] {
+            let unsafe_executable = temp.path().join(unsafe_name);
+            assert!(
+                apply_in(&entry, &unsafe_executable, true).is_err(),
+                "{unsafe_name}"
+            );
+        }
     }
 }
