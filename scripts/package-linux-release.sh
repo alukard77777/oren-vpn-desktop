@@ -27,7 +27,7 @@ rustc --version | grep -q "^rustc $TOOLCHAIN " || {
 }
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target/linux-release}"
-export RUSTFLAGS="--remap-path-prefix=$ROOT=/build/multicore --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
+export RUSTFLAGS="--remap-path-prefix=$ROOT=/source/multicore --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
 cargo build --release --locked \
     --manifest-path "$ROOT/Cargo.toml" \
     -p multicore-desktop -p multicore-daemon -p multicore-core-host
@@ -85,7 +85,7 @@ install -m 0644 "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/packaging/linu
     "$OUTPUT/usr/share/licenses/multicore/"
 
 for binary in "$PACKAGE_ROOT/multicore" "$PACKAGE_ROOT/runtime/multicore-daemon" "$PACKAGE_ROOT/runtime/multicore-core-host"; do
-    if grep -a -q -F -e "$ROOT" -e "$HOME/" "$binary"; then
+    if grep -a -q -F -e "$ROOT/" -e "$HOME/" "$binary"; then
         echo "private build path found in $binary" >&2
         exit 1
     fi
