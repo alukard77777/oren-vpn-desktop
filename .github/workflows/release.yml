@@ -13,7 +13,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  linux-packages:
+    uses: ./.github/workflows/linux-packages.yml
+
   release:
+    needs: linux-packages
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -133,12 +137,33 @@ jobs:
             }
           }
 
+      - name: Collect Linux packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: linux-packages-*
+          path: dist/release/linux
+          merge-multiple: true
+
+      - name: Verify Linux package set
+        shell: pwsh
+        run: |
+          foreach ($asset in @(
+            "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
+            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
+            "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst"
+          )) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing Linux package $asset" }
+          }
+
       - name: Create release checksums and notes
         shell: pwsh
         run: |
           $assets = @(
             'dist/release/multicore-windows-x64.zip',
             'dist/release/MultiCore-Setup-x64.exe',
+            "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
+            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
+            "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
             'dist/release/Xray-core-source.zip',
             'dist/release/mihomo-source.zip'
           )
@@ -152,12 +177,16 @@ jobs:
             [Text.UTF8Encoding]::new($false)
           )
           @"
-          MultiCore $env:APP_VERSION for Windows x64.
+          MultiCore $env:APP_VERSION for Windows x64 and Linux x86_64.
 
           Source commit: https://github.com/fatyzzz/multicore/commit/$env:GITHUB_SHA
 
           - `MultiCore-Setup-x64.exe` — per-user installer.
           - `multicore-windows-x64.zip` — verified portable bundle and updater asset.
+          - `multicore_$($env:APP_VERSION)_amd64.deb` — Debian and Ubuntu 22.04+ package.
+          - `multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst` — Arch Linux package (`sudo pacman -U`).
+          - `MultiCore-$($env:APP_VERSION)-x86_64.AppImage` — portable Linux build; needs GTK 3 and polkit on the host.
+          - On Linux, Connect asks for the administrator password through polkit to start the core host.
           - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
           - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
 
@@ -170,6 +199,9 @@ jobs:
           $assets = @(
             'dist/release/multicore-windows-x64.zip',
             'dist/release/MultiCore-Setup-x64.exe',
+            "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
+            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
+            "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
             'dist/release/Xray-core-source.zip',
             'dist/release/mihomo-source.zip',
             'dist/release/RELEASE-SHA256SUMS.txt'

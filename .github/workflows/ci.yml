@@ -38,3 +38,35 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-packaged-daemon-smoke-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-3-dev libxkbcommon-dev \
+            libfontconfig-dev libfreetype-dev libwayland-dev libx11-dev libx11-xcb-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libgl-dev libegl-dev
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          rustup default 1.98.1
+      - name: Verify
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          for script in scripts/*.sh; do bash -n "$script"; done
+
+  linux-packages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: linux
+    uses: ./.github/workflows/linux-packages.yml
