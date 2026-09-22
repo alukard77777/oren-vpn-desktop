@@ -909,7 +909,7 @@ export component AppWindow inherits Window {
                             first-run-actions := HorizontalLayout {
                                 spacing: 10px;
                                 PrimaryAction {
-                                    width: 184px;
+                                    preferred-width: 184px;
                                     label: root.import-pending ? "Добавляем…" : "Вставить из буфера";
                                     state-label: "Вставить подписку из буфера обмена";
                                     enabled: !root.import-pending;
