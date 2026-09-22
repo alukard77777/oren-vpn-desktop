@@ -23,7 +23,7 @@ foreach ($token in @(
     "- 'v*'",
     'permissions:',
     'contents: read',
-    'runs-on: windows-latest',
+    'runs-on: [self-hosted, Windows, X64, windowsbuild]',
     'cargo test --workspace --all-targets --locked',
     'cargo clippy --workspace --all-targets --locked -- -D warnings',
     '-AssertReleaseReady',
