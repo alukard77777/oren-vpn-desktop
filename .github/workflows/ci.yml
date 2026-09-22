@@ -40,7 +40,7 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
 
   linux:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, debian13]
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
