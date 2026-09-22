@@ -1,0 +1,18 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl pkg-config python3 unzip file xz-utils zstd dpkg-dev \
+        libgtk-3-dev libxkbcommon-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+        libx11-dev libx11-xcb-dev libxcursor-dev libxrandr-dev libxi-dev libgl-dev libegl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG RUST_TOOLCHAIN=1.98.1
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN" \
+    && rm /tmp/rustup-init.sh \
+    && chmod -R a+rwX "$CARGO_HOME" "$RUSTUP_HOME"
