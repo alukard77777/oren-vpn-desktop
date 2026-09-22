@@ -1579,6 +1579,81 @@ pub mod unix {
     };
 
     const PKEXEC: &str = "/usr/bin/pkexec";
+    const APPIMAGE_STAGE_PREFIX: &str = "appimage-";
+    const APPIMAGE_MEMBERS: [(&str, &str); 3] = [
+        ("runtime", CORE_HOST_EXECUTABLE),
+        ("cores", "xray"),
+        ("cores", "mihomo"),
+    ];
+
+    pub fn stage_appimage_host(host: &Path, cache_root: &Path) -> Result<PathBuf, ElevationError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        let package = host
+            .parent()
+            .and_then(Path::parent)
+            .ok_or(ElevationError::LaunchFailed)?;
+        let mut hasher = Sha256::new();
+        let mut members = Vec::with_capacity(APPIMAGE_MEMBERS.len());
+        for (directory, name) in APPIMAGE_MEMBERS {
+            let bytes = std::fs::read(package.join(directory).join(name))
+                .map_err(|_| ElevationError::LaunchFailed)?;
+            hasher.update(name.as_bytes());
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+            members.push((directory, name, bytes));
+        }
+        let digest = hasher.finalize();
+        let stage_name = format!(
+            "{APPIMAGE_STAGE_PREFIX}{}",
+            digest[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let private_directory = |path: &Path| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path)
+                .map_err(|_| ElevationError::Io)
+        };
+        private_directory(cache_root)?;
+        let target = cache_root.join(&stage_name);
+        let staged_host = target.join("runtime").join(CORE_HOST_EXECUTABLE);
+        if !staged_host.is_file() {
+            let temporary = cache_root.join(format!(".{stage_name}.{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temporary);
+            for (directory, name, bytes) in &members {
+                private_directory(&temporary.join(directory))?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o755)
+                    .open(temporary.join(directory).join(name))
+                    .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
+                    .map_err(|_| ElevationError::Io)?;
+            }
+            if std::fs::rename(&temporary, &target).is_err() {
+                let _ = std::fs::remove_dir_all(&temporary);
+                if !staged_host.is_file() {
+                    return Err(ElevationError::Io);
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(cache_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(APPIMAGE_STAGE_PREFIX) && name != stage_name {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        Ok(staged_host)
+    }
     const PKEXEC_DISMISSED: i32 = 126;
     const ACCEPT_POLL: Duration = Duration::from_millis(25);
 
@@ -1779,7 +1854,15 @@ pub type ProductionElevatedControllerFactory = ElevatedControllerFactory<unix::U
 #[cfg(unix)]
 pub fn production_factory() -> Result<ProductionElevatedControllerFactory, ElevationError> {
     let daemon = std::env::current_exe().map_err(|_| ElevationError::LaunchFailed)?;
-    let host = packaged_core_host_from(&daemon)?;
+    let mut host = packaged_core_host_from(&daemon)?;
+    if std::env::var_os("APPDIR")
+        .map(PathBuf::from)
+        .is_some_and(|appdir| appdir.is_absolute() && host.starts_with(appdir))
+    {
+        let cache = multicore_platform::dirs::user_cache_root()
+            .map_err(|_| ElevationError::LaunchFailed)?;
+        host = unix::stage_appimage_host(&host, &cache)?;
+    }
     Ok(ElevatedControllerFactory::new(
         host,
         unix::UnixBrokerConnector,
@@ -2237,6 +2320,57 @@ mod tests {
             assert_eq!(result.err(), Some(ElevationError::TimedOut));
             let pid = launched.lock().unwrap().unwrap();
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+
+        fn appimage_package(root: &Path, host: &[u8]) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let runtime = root.join("mount").join("usr/lib/multicore/runtime");
+            let cores = root.join("mount").join("usr/lib/multicore/cores");
+            std::fs::create_dir_all(&runtime).unwrap();
+            std::fs::create_dir_all(&cores).unwrap();
+            for (path, bytes) in [
+                (runtime.join("multicore-core-host"), host),
+                (cores.join("xray"), &b"xray"[..]),
+                (cores.join("mihomo"), &b"mihomo"[..]),
+            ] {
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            runtime.join("multicore-core-host")
+        }
+
+        #[test]
+        fn appimage_host_is_staged_once_per_build_outside_the_mount() {
+            use super::super::unix::stage_appimage_host;
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let host = appimage_package(temp.path(), b"host-one");
+            let staged = stage_appimage_host(&host, &cache).unwrap();
+            assert!(staged.starts_with(&cache));
+            assert!(staged.ends_with("runtime/multicore-core-host"));
+            let package = staged.parent().unwrap().parent().unwrap();
+            assert_eq!(std::fs::read(&staged).unwrap(), b"host-one");
+            assert_eq!(std::fs::read(package.join("cores/xray")).unwrap(), b"xray");
+            assert_eq!(
+                std::fs::read(package.join("cores/mihomo")).unwrap(),
+                b"mihomo"
+            );
+            for path in [&staged, &package.join("cores/xray")] {
+                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o755);
+            }
+            let mode = std::fs::metadata(package).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+            assert_eq!(stage_appimage_host(&host, &cache).unwrap(), staged);
+
+            std::fs::write(&host, b"host-two").unwrap();
+            let rebuilt = stage_appimage_host(&host, &cache).unwrap();
+            assert_ne!(rebuilt, staged);
+            assert_eq!(std::fs::read(&rebuilt).unwrap(), b"host-two");
+            assert!(!package.exists());
+            assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         }
 
         #[test]

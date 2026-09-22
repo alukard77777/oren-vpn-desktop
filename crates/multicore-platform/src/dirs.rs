@@ -32,6 +32,14 @@ pub fn user_config_root() -> io::Result<PathBuf> {
 }
 
 #[cfg(unix)]
+pub fn user_cache_root() -> io::Result<PathBuf> {
+    unix_cache_root(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+#[cfg(unix)]
 pub fn user_runtime_dir() -> io::Result<PathBuf> {
     let directory = unix_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?;
     ensure_private_directory(&directory)?;
@@ -79,6 +87,17 @@ fn unix_config_root(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> io
             .ok_or_else(|| unavailable("HOME"))?
             .join(".config")),
     }
+}
+
+#[cfg(unix)]
+fn unix_cache_root(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> io::Result<PathBuf> {
+    let base = match absolute(xdg_cache_home) {
+        Some(base) => base.to_path_buf(),
+        None => absolute(home)
+            .ok_or_else(|| unavailable("HOME"))?
+            .join(".cache"),
+    };
+    Ok(base.join(UNIX_APP_DIRECTORY))
 }
 
 #[cfg(unix)]
@@ -178,6 +197,20 @@ mod tests {
             PathBuf::from("/home/u/.config")
         );
         assert!(unix_config_root(None, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_cache_root_follows_xdg_cache_home_then_home() {
+        assert_eq!(
+            unix_cache_root(Some(OsStr::new("/c")), Some(OsStr::new("/home/u"))).unwrap(),
+            PathBuf::from("/c/multicore")
+        );
+        assert_eq!(
+            unix_cache_root(Some(OsStr::new("c")), Some(OsStr::new("/home/u"))).unwrap(),
+            PathBuf::from("/home/u/.cache/multicore")
+        );
+        assert!(unix_cache_root(None, None).is_err());
     }
 
     #[cfg(unix)]
