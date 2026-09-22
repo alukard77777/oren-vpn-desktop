@@ -78,6 +78,14 @@ Assert-True ($ci.Contains('cargo test --workspace --locked')) 'normal CI must ru
 Assert-True ($ci.Contains($cacheAction)) 'normal CI must restore the Cargo build cache after checkout'
 Assert-True ($workflow.Contains($cacheAction)) 'release workflow must reuse the verified Windows Cargo build cache'
 Assert-True ($linuxWorkflow.Contains($cacheAction)) 'Linux packaging must reuse Cargo artifacts across clean checkouts'
+Assert-True ($ci.Contains('Git\usr\bin')) 'Windows CI must expose gzip before actions/cache saves its archive'
+Assert-True ($workflow.Contains('Git\usr\bin')) 'Windows release must expose gzip before actions/cache saves its archive'
+Assert-True ($ci.Contains('target/debug/deps')) 'CI cache must keep compiled dependencies'
+Assert-True (-not $ci.Contains("            target`n")) 'CI cache must not archive the complete Cargo target tree'
+Assert-True ($linuxWorkflow.Contains('target/linux-release-ubuntu/release/deps')) `
+    'Linux packaging must use a dedicated bounded release cache'
+Assert-True ($ci.Contains('zstd')) 'Linux CI must install zstd before restoring or saving the cache'
+Assert-True ($linuxWorkflow.Contains('zstd')) 'Linux packaging must install zstd before restoring or saving the cache'
 foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
     Assert-True ($content.Contains("hashFiles('**/Cargo.lock')")) 'every Cargo cache key must be invalidated by Cargo.lock'
 }
