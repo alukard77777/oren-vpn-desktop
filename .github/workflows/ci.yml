@@ -17,6 +17,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-msvc
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -39,9 +42,9 @@ jobs:
             target/debug/.fingerprint
             target/debug/build
             target/debug/deps
-          key: cargo-ci-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-ci-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
+            cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
@@ -64,6 +67,9 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -84,9 +90,9 @@ jobs:
             target/debug/.fingerprint
             target/debug/build
             target/debug/deps
-          key: cargo-ci-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-ci-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
+            cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy

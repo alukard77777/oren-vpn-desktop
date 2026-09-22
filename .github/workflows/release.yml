@@ -25,6 +25,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-msvc
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
       GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
 
     steps:
@@ -54,10 +57,10 @@ jobs:
             target/release/.fingerprint
             target/release/build
             target/release/deps
-          key: cargo-release-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
-            cargo-ci-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
+            cargo-release-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
+            cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
 
       - name: Enforce privileged broker release gate
         shell: pwsh

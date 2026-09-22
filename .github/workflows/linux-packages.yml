@@ -33,9 +33,9 @@ jobs:
             target/linux-release-ubuntu/release/.fingerprint
             target/linux-release-ubuntu/release/build
             target/linux-release-ubuntu/release/deps
-          key: cargo-package-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-package-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-package-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
+            cargo-package-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
       - name: Build Debian package and AppImage in Ubuntu 22.04
         env:
           UPDATE_REPOSITORY: ${{ inputs.update-repository }}
