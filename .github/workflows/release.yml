@@ -45,7 +45,9 @@ jobs:
           $tools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Restore Cargo build cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # Release consumes the cache produced by normal CI but never saves another multi-GB
+        # archive during post-job cleanup. A version-only lockfile change must not delay publish.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -254,7 +256,9 @@ jobs:
   publish:
     name: publish
     needs: release
-    runs-on: ubuntu-latest
+    # GitHub-hosted jobs are unavailable when account Actions billing is paused. Publication is
+    # lightweight and uses the already verified artifact, so reuse the trusted Windows runner.
+    runs-on: [self-hosted, Windows, X64, windowsbuild]
     timeout-minutes: 15
     env:
       GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}

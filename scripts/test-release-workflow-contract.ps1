@@ -29,6 +29,7 @@ $linuxWorkflow = Get-Content -Raw -LiteralPath $linuxWorkflowPath
 $linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
 $publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
 $cacheAction = 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+$cacheRestoreAction = 'actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
 
 foreach ($token in @(
     'tags:',
@@ -75,6 +76,9 @@ Assert-True (-not $workflow.Contains('cargo test --workspace --all-targets --loc
     'Windows release must not try to execute the requireAdministrator core-host binary as a test target'
 Assert-True (-not $workflow.Contains('MULTICORE_DAEMON_TOKEN')) 'release workflow must not embed runtime secrets'
 Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-repository release must not use the source repository token'
+$publishJob = ($workflow -split '(?m)^  publish:\s*$', 2)[1]
+Assert-True ($publishJob.Contains('runs-on: [self-hosted, Windows, X64, windowsbuild]')) `
+    'release publication must not depend on GitHub-hosted runner billing'
 Assert-True (-not $workflow.Contains('gh release create')) 'release publication must not depend on GitHub CLI being installed on the runner'
 Assert-True ($publishReleaseScript.Contains('[Text.Encoding]::UTF8.GetBytes')) `
     'release metadata must be encoded as UTF-8 bytes for Windows PowerShell 5.1'
@@ -89,10 +93,13 @@ Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI 
 Assert-True ($ci.Contains('test-packaged-daemon-smoke-contract.ps1')) 'normal CI must run the packaged daemon smoke contract'
 Assert-True ($ci.Contains('cargo test --workspace --locked')) 'normal CI must run workspace tests without elevated binary targets'
 Assert-True ($ci.Contains($cacheAction)) 'normal CI must restore the Cargo build cache after checkout'
-Assert-True ($workflow.Contains($cacheAction)) 'release workflow must reuse the verified Windows Cargo build cache'
+Assert-True ($workflow.Contains($cacheRestoreAction)) `
+    'release workflow must restore the verified Windows Cargo build cache without a post-job save'
+Assert-True (-not $workflow.Contains("uses: $cacheAction")) `
+    'release workflow must not repack the Cargo cache after publishing artifacts'
 Assert-True ($linuxWorkflow.Contains($cacheAction)) 'Linux packaging must reuse Cargo artifacts across clean checkouts'
 Assert-True ($ci.Contains('Git\usr\bin')) 'Windows CI must expose gzip before actions/cache saves its archive'
-Assert-True ($workflow.Contains('Git\usr\bin')) 'Windows release must expose gzip before actions/cache saves its archive'
+Assert-True ($workflow.Contains('Git\usr\bin')) 'Windows release must expose gzip before actions/cache restores its archive'
 Assert-True ($ci.Contains('target/debug/deps')) 'CI cache must keep compiled dependencies'
 Assert-True (-not $ci.Contains("            target`n")) 'CI cache must not archive the complete Cargo target tree'
 Assert-True ($ci.Contains('CARGO_PROFILE_DEV_DEBUG: 0')) 'CI must not create multi-gigabyte development debug symbols'

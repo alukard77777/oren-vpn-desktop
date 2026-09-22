@@ -461,6 +461,10 @@ impl DaemonClient for UnavailableDaemonClient {
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// A refresh can perform a native request, a legacy fallback pair, an optional logo fetch,
+// and a managed core shutdown before the daemon can answer. It must not inherit the short
+// timeout used by local status and selector calls.
+const SUBSCRIPTION_MUTATION_TIMEOUT: Duration = Duration::from_secs(150);
 const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(330);
 
 #[derive(Clone)]
@@ -468,18 +472,26 @@ pub struct HttpDaemonClient {
     base_url: reqwest::Url,
     token: String,
     http: Client,
+    subscription_mutation_timeout: Duration,
     connect_request_timeout: Duration,
 }
 
 impl HttpDaemonClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, DaemonError> {
-        Self::with_timeouts(base_url, token, REQUEST_TIMEOUT, CONNECT_REQUEST_TIMEOUT)
+        Self::with_timeouts(
+            base_url,
+            token,
+            REQUEST_TIMEOUT,
+            SUBSCRIPTION_MUTATION_TIMEOUT,
+            CONNECT_REQUEST_TIMEOUT,
+        )
     }
 
     fn with_timeouts(
         base_url: impl Into<String>,
         token: impl Into<String>,
         request_timeout: Duration,
+        subscription_mutation_timeout: Duration,
         connect_request_timeout: Duration,
     ) -> Result<Self, DaemonError> {
         let token = token.into();
@@ -498,6 +510,7 @@ impl HttpDaemonClient {
             base_url,
             token,
             http,
+            subscription_mutation_timeout,
             connect_request_timeout,
         })
     }
@@ -678,13 +691,16 @@ impl DaemonClient for HttpDaemonClient {
         self.parse_status(
             self.http
                 .post(self.endpoint("/v1/subscriptions/import"))
+                .timeout(self.subscription_mutation_timeout)
                 .json(&ImportRequest { url }),
         )
     }
 
     fn refresh_subscription(&self) -> Result<DaemonStatus, DaemonError> {
         self.send_profile_json(
-            self.http.post(self.endpoint("/v1/subscriptions/refresh")),
+            self.http
+                .post(self.endpoint("/v1/subscriptions/refresh"))
+                .timeout(self.subscription_mutation_timeout),
             STATUS_RESPONSE_LIMIT_BYTES,
         )
     }
@@ -708,7 +724,12 @@ impl DaemonClient for HttpDaemonClient {
     ) -> Result<DaemonSubscriptionList, DaemonError> {
         let endpoint =
             self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("refresh"))?;
-        self.send_profile_json(self.http.post(endpoint), SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES)
+        self.send_profile_json(
+            self.http
+                .post(endpoint)
+                .timeout(self.subscription_mutation_timeout),
+            SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES,
+        )
     }
 
     fn replace_subscription_source(
@@ -719,14 +740,22 @@ impl DaemonClient for HttpDaemonClient {
         let endpoint =
             self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("source"))?;
         self.send_profile_json(
-            self.http.put(endpoint).json(&ImportRequest { url }),
+            self.http
+                .put(endpoint)
+                .timeout(self.subscription_mutation_timeout)
+                .json(&ImportRequest { url }),
             SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES,
         )
     }
 
     fn delete_subscription(&self, profile_id: &str) -> Result<DaemonStatus, DaemonError> {
         let endpoint = self.endpoint_with_segment("/v1/subscriptions/", profile_id, None)?;
-        self.send_profile_json(self.http.delete(endpoint), STATUS_RESPONSE_LIMIT_BYTES)
+        self.send_profile_json(
+            self.http
+                .delete(endpoint)
+                .timeout(self.subscription_mutation_timeout),
+            STATUS_RESPONSE_LIMIT_BYTES,
+        )
     }
 
     fn connect(&self) -> Result<DaemonStatus, DaemonError> {
@@ -2043,12 +2072,43 @@ mod http_tests {
         (format!("http://{address}"), handle)
     }
 
+    fn start_delayed_subscription_server(delay: Duration) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed subscription server");
+        let address = listener.local_addr().expect("delayed server address");
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept delayed request");
+                let mut buffer = [0_u8; 2048];
+                let length = stream.read(&mut buffer).expect("read delayed request");
+                let request = String::from_utf8_lossy(&buffer[..length]);
+                thread::sleep(delay);
+                let body = if request.contains("/v1/subscriptions/profile-a/refresh") {
+                    r#"{"active_profile_id":"profile-a","profiles":[]}"#
+                } else {
+                    r#"{"state":"ready","active_profile_id":"profile-a"}"#
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("write delayed response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
     #[test]
     fn connect_waits_for_elevation_longer_than_ordinary_requests() {
         let (url, server) = start_delayed_status_server(Duration::from_millis(600));
         let client = HttpDaemonClient::with_timeouts(
             url,
             "token",
+            Duration::from_millis(200),
             Duration::from_millis(200),
             Duration::from_secs(5),
         )
@@ -2058,5 +2118,25 @@ mod http_tests {
         server.join().unwrap();
         assert!(CONNECT_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
         assert!(CONNECT_REQUEST_TIMEOUT >= Duration::from_secs(330));
+    }
+
+    #[test]
+    fn subscription_mutations_wait_for_remote_fetch_and_core_shutdown() {
+        let (url, server) = start_delayed_subscription_server(Duration::from_millis(600));
+        let client = HttpDaemonClient::with_timeouts(
+            url,
+            "token",
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(client.refresh_subscription().is_ok());
+        assert!(client.refresh_subscription_by_id("profile-a").is_ok());
+        assert!(client.delete_subscription("profile-a").is_ok());
+        server.join().unwrap();
+        assert!(SUBSCRIPTION_MUTATION_TIMEOUT > REQUEST_TIMEOUT);
+        assert!(SUBSCRIPTION_MUTATION_TIMEOUT >= Duration::from_secs(150));
     }
 }
