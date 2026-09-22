@@ -28,7 +28,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
 
     steps:
       - name: Checkout tagged source
@@ -65,13 +64,6 @@ jobs:
       - name: Enforce privileged broker release gate
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady
-
-      - name: Require dedicated release credential
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-            throw 'RELEASES_TOKEN is required to publish into fatyzzz/multicore-releases'
-          }
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -212,11 +204,11 @@ jobs:
 
           Source commit: https://github.com/fatyzzz/multicore/commit/$env:GITHUB_SHA
 
-          - `MultiCore-Setup-x64.exe` — per-user installer.
-          - `multicore-windows-x64.zip` — verified portable bundle and updater asset.
-          - `multicore_$($env:APP_VERSION)_amd64.deb` — Debian and Ubuntu 22.04+ package.
-          - `multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst` — Arch Linux package (`sudo pacman -U`).
-          - `MultiCore-$($env:APP_VERSION)-x86_64.AppImage` — portable Linux build; needs GTK 3 and polkit on the host.
+          - `MultiCore-Setup-x64.exe` - per-user installer.
+          - `multicore-windows-x64.zip` - verified portable bundle and updater asset.
+          - `multicore_$($env:APP_VERSION)_amd64.deb` - Debian and Ubuntu 22.04+ package.
+          - `multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst` - Arch Linux package (`sudo pacman -U`).
+          - `MultiCore-$($env:APP_VERSION)-x86_64.AppImage` - portable Linux build; needs GTK 3 and polkit on the host.
           - On Linux, Connect asks for the administrator password through polkit to start the core host.
           - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
           - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
@@ -224,9 +216,11 @@ jobs:
           PUBLIC UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn.
           "@ | Set-Content -LiteralPath dist/release/RELEASE_NOTES.md -Encoding utf8
 
-      - name: Publish release to update channel
+      - name: Stage release publication
         shell: pwsh
         run: |
+          $stage = 'dist/release-publication'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
           $assets = @(
             'dist/release/multicore-windows-x64.zip',
             'dist/release/MultiCore-Setup-x64.exe',
@@ -237,11 +231,57 @@ jobs:
             'dist/release/mihomo-source.zip',
             'dist/release/RELEASE-SHA256SUMS.txt'
           )
-          $assets | Set-Content -LiteralPath dist/release/RELEASE-ASSETS.txt -Encoding utf8
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-github-release.ps1 `
+          foreach ($asset in $assets) {
+            Copy-Item -LiteralPath $asset -Destination $stage
+          }
+          Copy-Item -LiteralPath dist/release/RELEASE_NOTES.md -Destination $stage
+          Copy-Item -LiteralPath scripts/publish-github-release.ps1 -Destination $stage
+          $assetNames = $assets | ForEach-Object { [IO.Path]::GetFileName($_) }
+          [IO.File]::WriteAllLines(
+            (Join-Path $stage 'RELEASE-ASSETS.txt'),
+            $assetNames,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Upload verified release publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-publication
+          path: dist/release-publication/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+
+    steps:
+      - name: Require dedicated release credential
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw 'RELEASES_TOKEN is required to publish into fatyzzz/multicore-releases'
+          }
+
+      - name: Download verified release publication
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-publication
+          path: release-publication
+
+      - name: Publish release to update channel
+        shell: pwsh
+        working-directory: release-publication
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          ./publish-github-release.ps1 `
             -Repository fatyzzz/multicore-releases `
             -Tag $env:GITHUB_REF_NAME `
             -Target main `
-            -Title "MultiCore $env:APP_VERSION" `
-            -NotesPath dist/release/RELEASE_NOTES.md `
-            -AssetManifest dist/release/RELEASE-ASSETS.txt
+            -Title "MultiCore $version" `
+            -NotesPath RELEASE_NOTES.md `
+            -AssetManifest RELEASE-ASSETS.txt

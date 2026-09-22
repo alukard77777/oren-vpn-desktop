@@ -60,6 +60,10 @@ foreach ($token in @(
     'mihomo-source.zip',
     'publish-github-release.ps1',
     '-Repository fatyzzz/multicore-releases',
+    'Upload verified release publication',
+    'Download verified release publication',
+    'name: release-publication',
+    'needs: release',
     'Publish release to update channel',
     'PUBLIC UNSIGNED PREVIEW'
 )) {
@@ -74,6 +78,8 @@ Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-re
 Assert-True (-not $workflow.Contains('gh release create')) 'release publication must not depend on GitHub CLI being installed on the runner'
 Assert-True ($publishReleaseScript.Contains('[Text.Encoding]::UTF8.GetBytes')) `
     'release metadata must be encoded as UTF-8 bytes for Windows PowerShell 5.1'
+Assert-True ($publishReleaseScript.Contains('[IO.File]::ReadAllText')) `
+    'release notes must be read as a plain string without PowerShell file metadata'
 Assert-True ($publishReleaseScript.Contains('application/json; charset=utf-8')) `
     'release API requests must declare UTF-8 JSON'
 Assert-True (-not $workflow.Contains('gh release edit')) 'unsigned workflow must not publish the draft release'

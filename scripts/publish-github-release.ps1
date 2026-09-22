@@ -51,7 +51,8 @@ $headers = @{
 }
 $apiRoot = "https://api.github.com/repos/$Repository"
 $escapedTag = [Uri]::EscapeDataString($Tag)
-$notes = Get-Content -LiteralPath $NotesPath -Raw
+$resolvedNotesPath = (Resolve-Path -LiteralPath $NotesPath).Path
+$notes = [IO.File]::ReadAllText($resolvedNotesPath, [Text.Encoding]::UTF8)
 
 try {
     $release = Invoke-RestMethod -Method Get -Uri "$apiRoot/releases/tags/$escapedTag" -Headers $headers
