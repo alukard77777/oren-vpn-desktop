@@ -64,7 +64,7 @@ catch {
     $release = $null
 }
 
-$releaseBody = @{
+$releaseBodyJson = @{
     tag_name         = $Tag
     target_commitish = $Target
     name             = $Title
@@ -72,15 +72,16 @@ $releaseBody = @{
     draft            = $false
     prerelease       = $false
     make_latest      = 'true'
-} | ConvertTo-Json
+} | ConvertTo-Json -Compress
+$releaseBody = [Text.Encoding]::UTF8.GetBytes($releaseBodyJson)
 
 if ($null -eq $release) {
     $release = Invoke-RestMethod -Method Post -Uri "$apiRoot/releases" -Headers $headers `
-        -ContentType 'application/json' -Body $releaseBody
+        -ContentType 'application/json; charset=utf-8' -Body $releaseBody
 }
 else {
     $release = Invoke-RestMethod -Method Patch -Uri "$apiRoot/releases/$($release.id)" -Headers $headers `
-        -ContentType 'application/json' -Body $releaseBody
+        -ContentType 'application/json; charset=utf-8' -Body $releaseBody
 }
 
 $existingAssets = @($release.assets)
