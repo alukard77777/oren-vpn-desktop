@@ -1,5 +1,5 @@
 const APP_ICON_SVG: &[u8] = include_bytes!("assets/app-icon.svg");
-const TRAY_ICON_SIZE: u32 = 32;
+const TRAY_ICON_SIZES: [u32; 2] = [32, 64];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MULTICORE_UPDATE_REPOSITORY");
@@ -10,9 +10,11 @@ fn main() {
         std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
     let icon_tree = resvg::usvg::Tree::from_data(APP_ICON_SVG, &resvg::usvg::Options::default())
         .expect("failed to parse the canonical MultiCore SVG icon");
-    let tray_icon = rasterize_app_icon(&icon_tree, TRAY_ICON_SIZE);
-    std::fs::write(output_dir.join("app-icon-32.rgba"), tray_icon)
-        .expect("failed to write the generated MultiCore tray icon");
+    for size in TRAY_ICON_SIZES {
+        let tray_icon = rasterize_app_icon(&icon_tree, size);
+        std::fs::write(output_dir.join(format!("app-icon-{size}.rgba")), tray_icon)
+            .expect("failed to write the generated MultiCore tray icon");
+    }
 
     let components_path = manifest_dir
         .join("ui/components.slint")
