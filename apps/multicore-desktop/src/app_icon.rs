@@ -1,9 +1,11 @@
+#[cfg(any(windows, test))]
 pub(crate) const TRAY_ICON_SIZE: u32 = 32;
 
 const TRAY_ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon-32.rgba"));
 #[cfg(any(target_os = "linux", test))]
 const STATUS_ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon-64.rgba"));
 
+#[cfg(any(windows, test))]
 pub(crate) fn tray_rgba() -> Vec<u8> {
     TRAY_ICON_RGBA.to_vec()
 }

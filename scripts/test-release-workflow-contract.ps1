@@ -25,6 +25,7 @@ $workflow = Get-Content -Raw -LiteralPath $workflowPath
 $ci = Get-Content -Raw -LiteralPath $ciPath
 $linuxWorkflow = Get-Content -Raw -LiteralPath $linuxWorkflowPath
 $linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
+$cacheAction = 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
 
 foreach ($token in @(
     'tags:',
@@ -74,6 +75,12 @@ Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'
 Assert-True ($ci.Contains('test-packaged-daemon-smoke-contract.ps1')) 'normal CI must run the packaged daemon smoke contract'
 Assert-True ($ci.Contains('cargo test --workspace --locked')) 'normal CI must run workspace tests without elevated binary targets'
+Assert-True ($ci.Contains($cacheAction)) 'normal CI must restore the Cargo build cache after checkout'
+Assert-True ($workflow.Contains($cacheAction)) 'release workflow must reuse the verified Windows Cargo build cache'
+Assert-True ($linuxWorkflow.Contains($cacheAction)) 'Linux packaging must reuse Cargo artifacts across clean checkouts'
+foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
+    Assert-True ($content.Contains("hashFiles('**/Cargo.lock')")) 'every Cargo cache key must be invalidated by Cargo.lock'
+}
 Assert-True ($linuxWorkflow.Contains('./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage')) `
     'Debian and AppImage packages must be built inside the pinned Ubuntu 22.04 image'
 Assert-True (-not $linuxWorkflow.Contains('./scripts/build-linux-packages.sh --stage target/linux-stage --output dist/linux --formats deb,appimage')) `
