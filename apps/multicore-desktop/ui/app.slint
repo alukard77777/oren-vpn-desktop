@@ -622,15 +622,6 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
 
-                    if root.update-available: Rectangle {
-                        x: 151px;
-                        y: 17px;
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: Theme.accent-blue;
-                    }
-
                     drag-touch := TouchArea {
                         moved => { root.window-drag(); }
                         double-clicked => { root.window-toggle-maximize(); }
@@ -696,10 +687,12 @@ export component AppWindow inherits Window {
                     x: root.ambient-wave-phase ? -12px : -48px;
                     y: root.ambient-wave-phase ? 48px : 76px;
                     width: parent.width + 76px;
-                    height: 210px;
+                    // Keep the closing edge of the filled path below the clipped home plane.
+                    // Otherwise it reads as a horizontal divider when it crosses content.
+                    height: parent.height + 80px;
                     viewbox-width: 1000;
-                    viewbox-height: 220;
-                    commands: "M 0 124 C 160 40 340 36 500 112 C 668 192 824 184 1000 82 L 1000 220 L 0 220 Z";
+                    viewbox-height: 800;
+                    commands: "M 0 124 C 160 40 340 36 500 112 C 668 192 824 184 1000 82 L 1000 800 L 0 800 Z";
                     fill: #c8cdd5;
                     opacity: 0.026;
                     animate x { duration: 12000ms; easing: ease-in-out; }
@@ -711,19 +704,28 @@ export component AppWindow inherits Window {
                     x: root.ambient-wave-phase ? -58px : -22px;
                     y: root.ambient-wave-phase ? 288px : 254px;
                     width: parent.width + 76px;
-                    height: 240px;
+                    height: parent.height + 80px;
                     viewbox-width: 1000;
-                    viewbox-height: 240;
-                    commands: "M 0 74 C 190 174 350 184 510 92 C 670 0 824 34 1000 142 L 1000 240 L 0 240 Z";
+                    viewbox-height: 800;
+                    commands: "M 0 74 C 190 174 350 184 510 92 C 670 0 824 34 1000 142 L 1000 800 L 0 800 Z";
                     fill: #aeb5bf;
                     opacity: 0.018;
                     animate x { duration: 12000ms; easing: ease-in-out; }
                     animate y { duration: 12000ms; easing: ease-in-out; }
                 }
 
+                ambient-wave-fade := Rectangle {
+                    x: 0px;
+                    y: 180px;
+                    width: parent.width;
+                    height: parent.height - self.y;
+                    visible: root.ambient-background-enabled;
+                    background: @linear-gradient(180deg, #0d0f1200 0%, Theme.canvas 88%);
+                }
+
                 VerticalLayout {
                     padding: 20px;
-                    spacing: 10px;
+                    spacing: 8px;
 
                     connection-strip := Rectangle {
                         height: root.has-profile

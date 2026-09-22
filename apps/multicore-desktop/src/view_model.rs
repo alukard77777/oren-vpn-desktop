@@ -5647,6 +5647,9 @@ mod tests {
         assert!(home_layer.contains("clip: true"));
         assert!(!wave_layer.contains("TouchArea"));
         assert!(!wave_layer.contains("blur"));
+        assert!(wave_layer.contains("ambient-wave-fade := Rectangle"));
+        assert!(wave_layer.contains("@linear-gradient(180deg"));
+        assert!(wave_layer.contains("Theme.canvas 88%"));
 
         let wave_a = source
             .split("ambient-wave-a := Path {")
@@ -5656,6 +5659,9 @@ mod tests {
         for required in [
             "x: root.ambient-wave-phase ? -12px : -48px;",
             "y: root.ambient-wave-phase ? 48px : 76px;",
+            "height: parent.height + 80px;",
+            "viewbox-height: 800;",
+            "L 1000 800 L 0 800 Z",
             "opacity: 0.026;",
             "animate x { duration: 12000ms; easing: ease-in-out; }",
             "animate y { duration: 12000ms; easing: ease-in-out; }",
@@ -5670,6 +5676,9 @@ mod tests {
         for required in [
             "x: root.ambient-wave-phase ? -58px : -22px;",
             "y: root.ambient-wave-phase ? 288px : 254px;",
+            "height: parent.height + 80px;",
+            "viewbox-height: 800;",
+            "L 1000 800 L 0 800 Z",
             "opacity: 0.018;",
             "animate x { duration: 12000ms; easing: ease-in-out; }",
             "animate y { duration: 12000ms; easing: ease-in-out; }",
@@ -5684,6 +5693,27 @@ mod tests {
         for cursor in ["ns-resize", "ew-resize", "nwse-resize", "nesw-resize"] {
             assert!(source.contains(&format!("mouse-cursor: {cursor};")));
         }
+    }
+
+    #[test]
+    fn home_chrome_has_no_orphan_update_dot_and_uses_system_spacing() {
+        let source = include_str!("../ui/app.slint");
+        let title_bar = source
+            .split("title-bar := Rectangle")
+            .nth(1)
+            .and_then(|source| source.split("HorizontalLayout {").next())
+            .expect("title bar source");
+        assert!(!title_bar.contains("if root.update-available: Rectangle"));
+
+        let home_stack = source
+            .split("if root.visible-page == \"home\": Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("connection-strip := Rectangle").next())
+            .and_then(|source| source.rsplit("VerticalLayout {").next())
+            .expect("home content stack");
+        assert!(home_stack.contains("padding: 20px;"));
+        assert!(home_stack.contains("spacing: 8px;"));
+        assert!(!home_stack.contains("spacing: 10px;"));
     }
 
     #[test]
