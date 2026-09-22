@@ -16,7 +16,7 @@ env:
 
 jobs:
   debian-appimage:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, debian13]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -59,7 +59,7 @@ jobs:
 
   arch:
     needs: debian-appimage
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, debian13]
     timeout-minutes: 30
     container: archlinux:base-devel
     steps:
