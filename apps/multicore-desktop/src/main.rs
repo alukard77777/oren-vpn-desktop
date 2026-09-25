@@ -71,11 +71,79 @@ const DEEP_LINK_WAITING_FOR_DISCONNECT_RU: &str =
     "Отключите VPN: подписка добавится автоматически после отключения.";
 
 #[derive(Default)]
+struct PendingSubscriptionConsents {
+    proposals: VecDeque<SubscriptionProposal>,
+}
+
+struct SubscriptionProposal {
+    url: String,
+    host: String,
+}
+
+impl PendingSubscriptionConsents {
+    fn enqueue(&mut self, url: String) -> bool {
+        if self.proposals.len() >= MAX_PENDING_SUBSCRIPTION_IMPORTS
+            || url.len() > view_model::MAX_SUBSCRIPTION_URL_BYTES
+            || url.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return false;
+        }
+        let Ok(parsed) = reqwest::Url::parse(&url) else {
+            return false;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.fragment().is_some() {
+            return false;
+        }
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        self.proposals.push_back(SubscriptionProposal {
+            url,
+            host: host.to_owned(),
+        });
+        true
+    }
+
+    fn current_host(&self) -> Option<&str> {
+        self.proposals
+            .front()
+            .map(|proposal| proposal.host.as_str())
+    }
+
+    fn approve_next(&mut self, imports: &mut PendingSubscriptionImports) -> bool {
+        let Some(proposal) = self.proposals.front() else {
+            return false;
+        };
+        if !imports.enqueue(proposal.url.clone()) {
+            return false;
+        }
+        self.proposals.pop_front();
+        true
+    }
+
+    fn reject_next(&mut self) -> bool {
+        self.proposals.pop_front().is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.proposals.len()
+    }
+}
+
+#[derive(Default)]
 struct PendingSubscriptionImports {
     urls: VecDeque<String>,
     in_flight: bool,
     attempts: u8,
     retry_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PendingImportOutcome {
+    NotQueued,
+    RetryScheduled,
+    Succeeded,
+    Failed,
 }
 
 impl PendingSubscriptionImports {
@@ -102,18 +170,26 @@ impl PendingSubscriptionImports {
         true
     }
 
-    fn finish_attempt(&mut self, url: &str, succeeded: bool, now: Instant) {
+    fn finish_attempt(&mut self, url: &str, succeeded: bool, now: Instant) -> PendingImportOutcome {
         if self.urls.front().is_none_or(|queued| queued != url) {
-            return;
+            return PendingImportOutcome::NotQueued;
         }
         if succeeded || self.attempts >= 3 {
             self.urls.pop_front();
             self.in_flight = false;
             self.attempts = 0;
             self.retry_at = None;
+            if succeeded {
+                PendingImportOutcome::Succeeded
+            } else {
+                PendingImportOutcome::Failed
+            }
         } else if self.in_flight {
             self.in_flight = false;
             self.retry_at = Some(now + Duration::from_secs(if self.attempts == 1 { 2 } else { 5 }));
+            PendingImportOutcome::RetryScheduled
+        } else {
+            PendingImportOutcome::NotQueued
         }
     }
 
@@ -121,7 +197,11 @@ impl PendingSubscriptionImports {
         self.urls.is_empty()
     }
 
-    #[cfg(test)]
+    fn current_host(&self) -> Option<String> {
+        let url = self.urls.front()?;
+        reqwest::Url::parse(url).ok()?.host_str().map(str::to_owned)
+    }
+
     fn len(&self) -> usize {
         self.urls.len()
     }
@@ -665,10 +745,17 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
     let pending_subscription_imports = Arc::new(Mutex::new(PendingSubscriptionImports::default()));
+    let pending_subscription_consents =
+        Arc::new(Mutex::new(PendingSubscriptionConsents::default()));
     wire_import(
         &ui,
         model.clone(),
         profile_preferences.clone(),
+        pending_subscription_imports.clone(),
+    );
+    wire_deep_link_consent(
+        &ui,
+        pending_subscription_consents.clone(),
         pending_subscription_imports.clone(),
     );
     let _pending_import_timer =
@@ -695,6 +782,7 @@ fn main() -> Result<(), slint::PlatformError> {
         &ui,
         activations,
         model.clone(),
+        pending_subscription_consents.clone(),
         pending_subscription_imports.clone(),
     );
     let tray_popup = create_tray_popup()?;
@@ -781,7 +869,12 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     run_refresh(ui.as_weak(), model.clone(), profile_preferences);
     if let Some(subscription_url) = launch_arguments.subscription_url {
-        queue_subscription_import(&ui, &pending_subscription_imports, subscription_url);
+        queue_subscription_import(
+            &ui,
+            &pending_subscription_consents,
+            &pending_subscription_imports,
+            subscription_url,
+        );
     }
     let _startup_connect_timer = wire_startup_auto_connect(
         &ui,
@@ -817,20 +910,92 @@ fn prefill_subscription(ui: &AppWindow, subscription_url: String) {
     ui.set_replace_editor_open(true);
 }
 
+fn present_pending_consent(ui: &AppWindow, consent: &Arc<Mutex<PendingSubscriptionConsents>>) {
+    let host = consent
+        .lock()
+        .expect("pending subscription consents lock")
+        .current_host()
+        .map(str::to_owned);
+    if let Some(host) = host {
+        ui.set_deep_link_confirm_host(host.into());
+        ui.set_deep_link_confirm_open(true);
+        ui.set_deep_link_focus_serial(ui.get_deep_link_focus_serial().saturating_add(1));
+    } else {
+        ui.set_deep_link_confirm_open(false);
+        ui.set_deep_link_confirm_host("".into());
+    }
+}
+
 fn queue_subscription_import(
     ui: &AppWindow,
+    consent: &Arc<Mutex<PendingSubscriptionConsents>>,
     pending: &Arc<Mutex<PendingSubscriptionImports>>,
     subscription_url: String,
 ) {
-    if pending
+    let approved_count = pending
         .lock()
         .expect("pending subscription imports lock")
-        .enqueue(subscription_url.clone())
+        .len();
+    let mut consent_guard = consent.lock().expect("pending subscription consents lock");
+    let was_empty = consent_guard.current_host().is_none();
+    if approved_count + consent_guard.len() < MAX_PENDING_SUBSCRIPTION_IMPORTS
+        && consent_guard.enqueue(subscription_url)
     {
-        prefill_subscription(ui, subscription_url);
+        drop(consent_guard);
+        if was_empty {
+            present_pending_consent(ui, consent);
+        }
     } else {
-        ui.set_import_error("Слишком много ссылок. Повторите попытку позже.".into());
+        ui.set_local_page("subscriptions".into());
+        ui.set_replace_editor_open(true);
+        ui.set_import_error(
+            "Не удалось открыть ссылку подписки. Проверьте её и повторите попытку.".into(),
+        );
     }
+}
+
+fn wire_deep_link_consent(
+    ui: &AppWindow,
+    consent: Arc<Mutex<PendingSubscriptionConsents>>,
+    pending: Arc<Mutex<PendingSubscriptionImports>>,
+) {
+    let weak = ui.as_weak();
+    let approved_consent = consent.clone();
+    ui.on_confirm_deep_link(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let approved = {
+            let mut consent = approved_consent
+                .lock()
+                .expect("pending subscription consents lock");
+            let mut pending = pending.lock().expect("pending subscription imports lock");
+            consent.approve_next(&mut pending)
+        };
+        if approved {
+            ui.set_local_page("subscriptions".into());
+            ui.set_replace_editor_open(false);
+            let host = pending
+                .lock()
+                .expect("pending subscription imports lock")
+                .current_host()
+                .unwrap_or_default();
+            ui.set_deep_link_import_host(host.into());
+        }
+        present_pending_consent(&ui, &approved_consent);
+    });
+
+    let weak = ui.as_weak();
+    ui.on_cancel_deep_link(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        consent
+            .lock()
+            .expect("pending subscription consents lock")
+            .reject_next();
+        present_pending_consent(&ui, &consent);
+    });
 }
 
 fn wire_pending_subscription_imports(
@@ -872,10 +1037,7 @@ fn wire_pending_subscription_imports(
         pending
             .lock()
             .expect("pending subscription imports lock")
-            .dispatch_next(Instant::now(), |url| {
-                prefill_subscription(&ui, url.to_owned());
-                ui.invoke_import_url(url.into())
-            });
+            .dispatch_next(Instant::now(), |url| ui.invoke_import_url(url.into()));
     });
     timer
 }
@@ -884,6 +1046,7 @@ fn wire_external_activations(
     ui: &AppWindow,
     activations: std::sync::mpsc::Receiver<single_instance::Activation>,
     model: Arc<Mutex<DesktopViewModel>>,
+    consent: Arc<Mutex<PendingSubscriptionConsents>>,
     pending: Arc<Mutex<PendingSubscriptionImports>>,
 ) {
     let weak = ui.as_weak();
@@ -891,6 +1054,7 @@ fn wire_external_activations(
         while let Ok(activation) = activations.recv() {
             let weak = weak.clone();
             let model = model.clone();
+            let consent = consent.clone();
             let pending = pending.clone();
             if slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak.upgrade() else {
@@ -906,7 +1070,7 @@ fn wire_external_activations(
                             snapshot(&model)
                         };
                         apply_snapshot(&ui, &current);
-                        queue_subscription_import(&ui, &pending, url);
+                        queue_subscription_import(&ui, &consent, &pending, url);
                         restore_and_focus(&ui);
                     }
                 }
@@ -2792,13 +2956,24 @@ fn run_import(
             let mut model = model.lock().expect("view model lock");
             model.finish_import(mutation, result);
         }
-        pending
-            .lock()
-            .expect("pending subscription imports lock")
-            .finish_attempt(&url, import_succeeded, Instant::now());
         let _ = slint::invoke_from_event_loop(move || {
+            let (queue_outcome, next_host) = {
+                let mut pending = pending.lock().expect("pending subscription imports lock");
+                let outcome = pending.finish_attempt(&url, import_succeeded, Instant::now());
+                let next_host = pending.current_host();
+                (outcome, next_host)
+            };
             if let Some(ui) = weak.upgrade() {
                 let current = apply_latest_snapshot(&ui, &model);
+                if matches!(queue_outcome, PendingImportOutcome::Failed) {
+                    prefill_subscription(&ui, url);
+                }
+                if matches!(
+                    queue_outcome,
+                    PendingImportOutcome::Succeeded | PendingImportOutcome::Failed
+                ) {
+                    ui.set_deep_link_import_host(next_host.unwrap_or_default().into());
+                }
                 if import_succeeded && !current.import_pending {
                     ui.set_import_success_serial(ui.get_import_success_serial().wrapping_add(1));
                 }
@@ -3626,16 +3801,18 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
-        PREFERENCE_SAVE_ERROR_RU, PendingSubscriptionImports, PersistenceTracker,
-        PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler, UpdateInstallIntent,
-        WindowObservation, WriterCommand, WriterResult, activation_for_launch_arguments,
-        ambient_motion_allowed, delete_focus_plan, drain_latest_write, initial_window_visible,
-        next_maximized, parse_launch_arguments, preference_error_for_result,
-        preference_failure_is_terminal, reduced_motion_from_client_area_animation,
-        retry_delay_after_failure, route_hints_apply_to, runtime_allows_update, scale_factor_milli,
-        shell_active_after_native_minimize_change, startup_should_connect, update_check_due,
-        update_install_intent, visible_page_from_name, visible_page_name,
+        DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode,
+        MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_RETRY_DELAYS, PREFERENCE_SAVE_ERROR_RU,
+        PendingImportOutcome, PendingSubscriptionConsents, PendingSubscriptionImports,
+        PersistenceTracker, PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler,
+        UpdateInstallIntent, WindowObservation, WriterCommand, WriterResult,
+        activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
+        drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
+        preference_error_for_result, preference_failure_is_terminal,
+        reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
+        runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
+        startup_should_connect, update_check_due, update_install_intent, visible_page_from_name,
+        visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -5159,7 +5336,135 @@ mod window_tests {
     }
 
     #[test]
-    fn installer_uri_imports_on_initial_and_secondary_launch() {
+    fn approved_deep_link_failure_exposes_manual_retry_only_after_final_attempt() {
+        let mut pending = PendingSubscriptionImports::default();
+        let now = Instant::now();
+        let url = "https://example.com/sub";
+        assert!(pending.enqueue(url.into()));
+        assert!(pending.dispatch_next(now, |_| true));
+        assert_eq!(
+            pending.finish_attempt(url, false, now),
+            PendingImportOutcome::RetryScheduled
+        );
+        assert!(pending.dispatch_next(now + Duration::from_secs(2), |_| true));
+        assert_eq!(
+            pending.finish_attempt(url, false, now + Duration::from_secs(2)),
+            PendingImportOutcome::RetryScheduled
+        );
+        assert!(pending.dispatch_next(now + Duration::from_secs(7), |_| true));
+        assert_eq!(
+            pending.finish_attempt(url, false, now + Duration::from_secs(7)),
+            PendingImportOutcome::Failed
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn deep_link_consent_never_imports_before_yes_and_decline_discards_only_one() {
+        let mut consent = PendingSubscriptionConsents::default();
+        let mut imports = PendingSubscriptionImports::default();
+        assert!(consent.enqueue("https://user:pass@example.com/private?token=secret".into()));
+        assert!(consent.enqueue("https://second.example/sub".into()));
+        assert_eq!(consent.current_host(), Some("example.com"));
+        assert!(imports.is_empty());
+        assert!(consent.reject_next());
+        assert_eq!(consent.current_host(), Some("second.example"));
+        assert!(imports.is_empty());
+        assert!(consent.approve_next(&mut imports));
+        assert!(consent.current_host().is_none());
+        let mut imported = None;
+        assert!(imports.dispatch_next(Instant::now(), |url| {
+            imported = Some(url.to_owned());
+            true
+        }));
+        assert_eq!(imported.as_deref(), Some("https://second.example/sub"));
+    }
+
+    #[test]
+    fn deep_link_consent_queue_rejects_unparseable_and_oversized_input() {
+        let mut consent = PendingSubscriptionConsents::default();
+        assert!(!consent.enqueue("not a URL".into()));
+        for index in 0..MAX_PENDING_SUBSCRIPTION_IMPORTS {
+            assert!(consent.enqueue(format!("https://host{index}.example/sub")));
+        }
+        assert!(!consent.enqueue("https://overflow.example/sub".into()));
+        assert_eq!(consent.current_host(), Some("host0.example"));
+    }
+
+    #[test]
+    fn deep_link_consent_is_a_domain_only_modal_before_any_import() {
+        let ui = include_str!("../ui/app.slint");
+        assert!(ui.contains("in-out property <bool> deep-link-confirm-open"));
+        assert!(ui.contains("in property <string> deep-link-confirm-host"));
+        assert!(ui.contains("callback confirm-deep-link();"));
+        assert!(ui.contains("callback cancel-deep-link();"));
+        let modal = ui
+            .split("if root.deep-link-confirm-open: Rectangle")
+            .nth(1)
+            .and_then(|block| block.split("// A taskbar restore").next())
+            .expect("deep-link confirmation overlay");
+        assert!(modal.contains("background: #05070bc7;"));
+        assert!(modal.contains("text: root.deep-link-confirm-host;"));
+        assert!(modal.contains("label: \"Нет\";"));
+        assert!(modal.contains("label: \"Да\";"));
+        assert!(!modal.contains("root.subscription-draft"));
+        assert!(modal.contains("key-pressed(event)"));
+        assert!(modal.contains("root.cancel-deep-link();"));
+        assert!(ui.contains("enabled: !root.deep-link-confirm-open;"));
+
+        let rust = include_str!("main.rs");
+        let queue = rust
+            .split("fn queue_subscription_import(")
+            .nth(1)
+            .and_then(|block| block.split("fn wire_pending_subscription_imports(").next())
+            .expect("deep-link queue handler");
+        assert!(queue.contains("consent_guard.enqueue(subscription_url)"));
+        assert!(queue.contains("let was_empty = consent_guard.current_host().is_none()"));
+        assert!(queue.contains("if was_empty {"));
+        assert!(!queue.contains("prefill_subscription("));
+    }
+
+    #[test]
+    fn deep_link_modal_recaptures_keys_after_async_background_focus_restore() {
+        let ui = include_str!("../ui/app.slint");
+        let background = ui
+            .split("visual-frame := FocusScope {")
+            .nth(1)
+            .and_then(|block| block.split("VerticalLayout {").next())
+            .expect("background frame keyboard handlers");
+        assert!(background.contains("capture-key-pressed(event)"));
+        assert!(background.contains("capture-key-released(event)"));
+        assert!(background.contains("if (root.deep-link-confirm-open)"));
+        assert!(background.contains("root.deep-link-focus-serial += 1;"));
+        assert!(
+            background.contains(
+                "if (event.text == Key.Escape) { root.cancel-deep-link(); return accept; }"
+            )
+        );
+        assert!(
+            ui.contains("if root.update-confirm-open && !root.deep-link-confirm-open: Rectangle")
+        );
+
+        let worker = include_str!("main.rs");
+        assert!(worker.contains("apply_delete_focus_completion(&ui"));
+    }
+
+    #[test]
+    fn deep_link_queue_waits_for_ui_completion_before_advancing() {
+        let source = include_str!("main.rs");
+        let worker = source
+            .split("fn run_import(")
+            .nth(1)
+            .and_then(|block| block.split("fn run_connect(").next())
+            .expect("import worker");
+        assert!(
+            worker.find("slint::invoke_from_event_loop").unwrap()
+                < worker.find(".finish_attempt(&url").unwrap()
+        );
+    }
+
+    #[test]
+    fn installer_uri_requests_consent_on_initial_and_secondary_launch() {
         let source = include_str!("main.rs");
         let startup = source
             .split("wire_import(\n        &ui,")
@@ -5170,9 +5475,7 @@ mod window_tests {
                     .next()
             })
             .expect("startup after import callback wiring");
-        assert!(startup.contains(
-            "queue_subscription_import(&ui, &pending_subscription_imports, subscription_url)"
-        ));
+        assert!(startup.contains("&pending_subscription_consents,\n            &pending_subscription_imports,\n            subscription_url"));
 
         let dispatch = source
             .split("fn wire_pending_subscription_imports(")
@@ -5191,7 +5494,7 @@ mod window_tests {
         assert!(
             secondary.find("model.open_panel(Panel::None)").unwrap()
                 < secondary
-                    .find("queue_subscription_import(&ui, &pending, url)")
+                    .find("queue_subscription_import(&ui, &consent, &pending, url)")
                     .unwrap()
         );
 

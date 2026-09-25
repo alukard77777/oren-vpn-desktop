@@ -112,7 +112,11 @@ component SmallAction inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> selected: false;
     in property <int> focus-epoch: 0;
+    out property <bool> action-has-focus: small-focus.has-focus;
     callback activated();
+    callback focus-action();
+
+    focus-action => { small-focus.focus(); }
 
     changed focus-epoch => {
         if (root.focus-epoch > 0) {
@@ -454,13 +458,17 @@ export component AppWindow inherits Window {
     private property <int> first-run-trigger-focus-serial: 0;
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
-    in property <string> update-status: "MultiCore 0.2.7";
+    in property <string> update-status: "MultiCore 0.2.8";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
     in property <bool> update-busy: false;
     in-out property <string> update-banner-dismissed-for;
     in-out property <bool> update-confirm-open: false;
+    in-out property <bool> deep-link-confirm-open: false;
+    in property <string> deep-link-confirm-host;
+    in-out property <string> deep-link-import-host;
+    in-out property <int> deep-link-focus-serial: 0;
 
     in-out property <string> local-page: "home";
     in-out property <string> settings-section: "general";
@@ -508,6 +516,8 @@ export component AppWindow inherits Window {
     callback update-action();
     callback confirm-update-restart();
     callback cancel-update-restart();
+    callback confirm-deep-link();
+    callback cancel-deep-link();
 
     wave-kickoff := Timer {
         interval: 80ms;
@@ -559,13 +569,29 @@ export component AppWindow inherits Window {
     }
 
     visual-frame := FocusScope {
+        enabled: !root.deep-link-confirm-open;
         x: root.resize-border;
         y: root.resize-border;
         width: parent.width - 2 * root.resize-border;
         height: parent.height - 2 * root.resize-border;
+        capture-key-pressed(event) => {
+            if (root.deep-link-confirm-open) {
+                if (event.text == Key.Escape) { root.cancel-deep-link(); return accept; }
+                // Async background work may have restored focus behind the modal.
+                root.deep-link-focus-serial += 1;
+                return accept;
+            }
+            return reject;
+        }
+        capture-key-released(event) => {
+            if (root.deep-link-confirm-open) { return accept; }
+            return reject;
+        }
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                if (root.update-confirm-open) {
+                if (root.deep-link-confirm-open) {
+                    root.cancel-deep-link();
+                } else if (root.update-confirm-open) {
                     root.update-confirm-open = false;
                     root.cancel-update-restart();
                 } else if (!root.has-profile && root.first-run-manual-open) {
@@ -1496,6 +1522,15 @@ export component AppWindow inherits Window {
                                 }
                                 SmallAction { width: 112px; label: "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
                             }
+                            if root.deep-link-import-host != "": Text {
+                                height: 24px;
+                                text: root.import-pending ? "Добавляем подписку с " + root.deep-link-import-host + "…" : "Подписка с " + root.deep-link-import-host + " ожидает добавления…";
+                                color: Theme.text-secondary;
+                                font-size: Theme.type-metadata-size;
+                                overflow: elide;
+                                accessible-role: text;
+                                accessible-live-region: polite;
+                            }
                             if root.replace-editor-open: Rectangle {
                                 height: 116px;
                                 background: Theme.surface;
@@ -1781,7 +1816,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.update-confirm-open: Rectangle {
+    if root.update-confirm-open && !root.deep-link-confirm-open: Rectangle {
         x: root.resize-border;
         y: root.resize-border;
         width: parent.width - 2 * root.resize-border;
@@ -1845,6 +1880,82 @@ export component AppWindow inherits Window {
                         label: "Да";
                         selected: true;
                         activated => { root.confirm-update-restart(); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.deep-link-confirm-open: Rectangle {
+        x: root.resize-border;
+        y: root.resize-border;
+        width: parent.width - 2 * root.resize-border;
+        height: parent.height - 2 * root.resize-border;
+        background: #05070bc7;
+        TouchArea { width: parent.width; height: parent.height; }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: Math.min(420px, parent.width - 48px);
+            height: 232px;
+            background: Theme.elevated;
+            border-color: Theme.line;
+            border-width: 1px;
+            border-radius: 16px;
+
+            deep-link-modal-focus := FocusScope {
+                width: parent.width;
+                height: parent.height;
+                focus-on-tab-navigation: false;
+                capture-key-pressed(event) => {
+                    if (event.text == Key.Tab || event.text == Key.Backtab) {
+                        if (no-action.action-has-focus) { yes-action.focus-action(); }
+                        else { no-action.focus-action(); }
+                        return accept;
+                    }
+                    return reject;
+                }
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.cancel-deep-link();
+                        return accept;
+                    }
+                    return reject;
+                }
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 12px;
+                    Text {
+                        height: 26px;
+                        text: "Добавить подписку?";
+                        color: Theme.text-primary;
+                        font-size: Theme.type-label-size;
+                        font-weight: Theme.weight-semibold;
+                    }
+                    Text {
+                        height: 36px;
+                        text: "Получена ссылка. Загрузить подписку с домена:";
+                        color: Theme.text-secondary;
+                        font-size: Theme.type-metadata-size;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        height: 26px;
+                        text: root.deep-link-confirm-host;
+                        color: Theme.text-primary;
+                        font-size: Theme.type-label-size;
+                        font-weight: Theme.weight-semibold;
+                        overflow: elide;
+                        accessible-role: text;
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    HorizontalLayout {
+                        height: 44px;
+                        alignment: end;
+                        spacing: 8px;
+                        no-action := SmallAction { width: 88px; label: "Нет"; focus-epoch: root.deep-link-focus-serial; activated => { root.cancel-deep-link(); } }
+                        yes-action := SmallAction { width: 88px; label: "Да"; selected: true; activated => { root.confirm-deep-link(); } }
                     }
                 }
             }

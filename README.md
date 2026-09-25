@@ -209,7 +209,7 @@ Create the per-user installer from that bundle:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
   -PackagePath dist\multicore-windows-x64 `
   -OutputDirectory dist\release `
-  -AppVersion 0.2.7
+  -AppVersion 0.2.8
 ```
 
 Linux packages build with Rust 1.98.1 and, for the Debian package and AppImage,

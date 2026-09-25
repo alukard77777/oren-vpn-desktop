@@ -6072,8 +6072,9 @@ mod tests {
         assert!(!onboarding.contains("root.open-panel("));
 
         let escape_handler = source
-            .split("key-pressed(event) =>")
-            .find(|handler| handler.contains("event.text == Key.Escape"))
+            .split("visual-frame := FocusScope {")
+            .nth(1)
+            .and_then(|frame| frame.split("\n        key-pressed(event) =>").nth(1))
             .and_then(|handler| handler.split("return reject;").next())
             .expect("root Escape handler");
         assert!(escape_handler.contains("if (!root.has-profile && root.first-run-manual-open)"));
