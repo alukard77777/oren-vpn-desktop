@@ -44,6 +44,47 @@ pub fn build_launch_command(executable: &Path) -> io::Result<String> {
     Ok(format!("\"{executable}\" --background"))
 }
 
+#[cfg(windows)]
+fn build_protocol_command(executable: &Path) -> io::Result<String> {
+    let launch = build_launch_command(executable)?;
+    let quoted_executable = launch
+        .strip_suffix(" --background")
+        .expect("launch command has its fixed background suffix");
+    Ok(format!("{quoted_executable} \"%1\""))
+}
+
+#[cfg(windows)]
+fn is_installed_executable(executable: &Path) -> bool {
+    let Some(current) = executable.parent() else {
+        return false;
+    };
+    let Some(installation) = current.parent() else {
+        return false;
+    };
+    executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("MultiCore.exe"))
+        && current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("current"))
+        && installation.join("unins000.exe").is_file()
+        && installation.join("unins000.dat").is_file()
+}
+
+/// Repairs registrations lost by an older installation or an in-place updater.
+/// Portable copies never claim the system-wide URL scheme for this user.
+#[cfg(windows)]
+pub fn ensure_url_protocol_registration() -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    if !is_installed_executable(&executable) {
+        return Ok(());
+    }
+    let command = build_protocol_command(&executable)?;
+    registry::write_protocol_registration(&executable, &command)
+}
+
 pub fn classify_launch_command(
     stored_command: Option<&str>,
     current_executable: &Path,
@@ -312,6 +353,7 @@ mod registry {
     };
 
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const PROTOCOL_KEY: &str = "Software\\Classes\\multicore";
     const MAX_VALUE_BYTES: u32 = 64 * 1024;
 
     pub(super) fn read_run_value() -> io::Result<Option<String>> {
@@ -365,7 +407,29 @@ mod registry {
     }
 
     pub(super) fn write_run_value(command: &str) -> io::Result<()> {
-        let subkey = wide(RUN_KEY);
+        write_string_value(RUN_KEY, RUN_VALUE_NAME, command)
+    }
+
+    pub(super) fn write_protocol_registration(
+        executable: &std::path::Path,
+        command: &str,
+    ) -> io::Result<()> {
+        write_string_value(PROTOCOL_KEY, "", "URL:MultiCore Protocol")?;
+        write_string_value(PROTOCOL_KEY, "URL Protocol", "")?;
+        write_string_value(
+            &format!("{PROTOCOL_KEY}\\DefaultIcon"),
+            "",
+            &format!("{},0", executable.display()),
+        )?;
+        write_string_value(
+            &format!("{PROTOCOL_KEY}\\shell\\open\\command"),
+            "",
+            command,
+        )
+    }
+
+    fn write_string_value(subkey: &str, value_name: &str, value: &str) -> io::Result<()> {
+        let subkey = wide(subkey);
         let mut key: HKEY = null_mut();
         let status = unsafe {
             RegCreateKeyExW(
@@ -382,14 +446,14 @@ mod registry {
         };
         win32_result(status)?;
         let key = RegistryKey(key);
-        let value_name = wide(RUN_VALUE_NAME);
-        let command = wide(command);
-        let bytes = command
+        let value_name = wide(value_name);
+        let value = wide(value);
+        let bytes = value
             .len()
             .checked_mul(2)
             .and_then(|size| u32::try_from(size).ok())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "launch command is too large")
+                io::Error::new(io::ErrorKind::InvalidInput, "registry value is too large")
             })?;
         let status = unsafe {
             RegSetValueExW(
@@ -397,7 +461,7 @@ mod registry {
                 value_name.as_ptr(),
                 0,
                 REG_SZ,
-                command.as_ptr().cast::<u8>(),
+                value.as_ptr().cast::<u8>(),
                 bytes,
             )
         };
@@ -443,7 +507,7 @@ mod registry {
 mod tests {
     use super::{
         LaunchAtSignInState, apply_launch_at_sign_in_change, build_launch_command,
-        classify_launch_command,
+        build_protocol_command, classify_launch_command, is_installed_executable,
     };
     use std::cell::RefCell;
     use std::path::Path;
@@ -455,6 +519,24 @@ mod tests {
         assert_eq!(
             build_launch_command(Path::new(r"C:\Program Files\MultiCore\MultiCore.exe")).unwrap(),
             r#""C:\Program Files\MultiCore\MultiCore.exe" --background"#
+        );
+    }
+
+    #[test]
+    fn installed_protocol_command_is_quoted_and_portable_copy_is_not_registered() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        std::fs::create_dir(&current).unwrap();
+        let executable = current.join("MultiCore.exe");
+        std::fs::write(&executable, b"app").unwrap();
+
+        assert!(!is_installed_executable(&executable));
+        std::fs::write(root.path().join("unins000.exe"), b"uninstaller").unwrap();
+        std::fs::write(root.path().join("unins000.dat"), b"metadata").unwrap();
+        assert!(is_installed_executable(&executable));
+        assert_eq!(
+            build_protocol_command(&executable).unwrap(),
+            format!("\"{}\" \"%1\"", executable.display())
         );
     }
 

@@ -534,6 +534,10 @@ fn main() -> Result<(), slint::PlatformError> {
             eprintln!("launch arguments rejected: {error}");
             LaunchArguments::foreground()
         });
+    #[cfg(windows)]
+    if let Err(error) = windows_settings::ensure_url_protocol_registration() {
+        eprintln!("URL protocol registration could not be repaired: {error}");
+    }
     let activation = activation_for_launch_arguments(&launch_arguments);
     let (_instance_guard, activations) = match single_instance::claim_or_forward(&activation) {
         Ok(single_instance::Claim::Primary {
@@ -4920,6 +4924,19 @@ mod window_tests {
             }),
             Activation::InstallSubscription("https://example.com/sub".into())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_windows_protocol_is_repaired_before_single_instance_forwarding() {
+        let source = include_str!("main.rs");
+        let repair = source
+            .find("windows_settings::ensure_url_protocol_registration()")
+            .expect("installed URL protocol repair must run on startup");
+        let forwarding = source
+            .find("single_instance::claim_or_forward(&activation)")
+            .expect("single-instance forwarding");
+        assert!(repair < forwarding);
     }
 
     #[test]

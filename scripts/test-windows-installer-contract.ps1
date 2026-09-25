@@ -7,6 +7,7 @@ Set-StrictMode -Version Latest
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $DefinitionPath = Join-Path $RepositoryRoot 'packaging\windows-x64\installer.iss'
 $BuilderPath = Join-Path $PSScriptRoot 'build-windows-installer.ps1'
+$InstalledUpdateSmokePath = Join-Path $PSScriptRoot 'smoke-test-windows-installed-update.ps1'
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -18,6 +19,14 @@ Assert-True (Test-Path -LiteralPath $BuilderPath -PathType Leaf) 'installer buil
 
 $definition = Get-Content -Raw -LiteralPath $DefinitionPath
 $builder = Get-Content -Raw -LiteralPath $BuilderPath
+$installedUpdateSmoke = Get-Content -Raw -LiteralPath $InstalledUpdateSmokePath
+
+Assert-True ($installedUpdateSmoke.Contains('reg.exe export')) `
+    'installed-update smoke must snapshot an existing URL protocol before testing the installer'
+Assert-True ($installedUpdateSmoke.Contains('reg.exe import')) `
+    'installed-update smoke must restore the previous URL protocol after testing the uninstaller'
+Assert-True ($installedUpdateSmoke.IndexOf('reg.exe export') -lt $installedUpdateSmoke.IndexOf('Start-Process -FilePath $installer')) `
+    'URL protocol snapshot must happen before the temporary installer runs'
 
 Assert-True (-not $definition.Contains('Verb: "runas"')) 'installer must not elevate desktop postinstall launch'
 

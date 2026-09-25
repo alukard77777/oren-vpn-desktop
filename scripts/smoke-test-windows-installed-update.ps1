@@ -208,8 +208,18 @@ $localAppDataSiblingCanary = Join-Path $testRoot 'local-app-data-sibling-canary.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $protocolKey = 'HKCU:\Software\Classes\multicore'
 $foreignAutostart = '"C:\Foreign Tool\agent.exe" --background'
+$protocolBackup = Join-Path $temporaryBase ('multicore-protocol-backup-' + [Guid]::NewGuid().ToString('N') + '.reg')
+$protocolWasPresent = Test-Path -LiteralPath $protocolKey
+if ($protocolWasPresent) {
+    & reg.exe export 'HKCU\Software\Classes\multicore' $protocolBackup /y | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to back up the existing MultiCore URL protocol registration'
+    }
+}
 
+# The outer guard restores the pre-existing handler even if the smoke test or its cleanup fails.
 try {
+    try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $install = Start-Process -FilePath $installer `
         -ArgumentList @(
@@ -655,5 +665,19 @@ $signalTemporary = $SignalPath + '.tmp'
     $currentAutostart = Get-ItemProperty -LiteralPath $runKey -Name 'MultiCore' -ErrorAction SilentlyContinue
     if ($null -ne $currentAutostart -and $currentAutostart.MultiCore -ceq $foreignAutostart) {
         Remove-ItemProperty -LiteralPath $runKey -Name 'MultiCore' -Force
+    }
+    }
+} finally {
+    # The disposable install shares HKCU with the user's real installation. Its uninstaller
+    # removes the global multicore:// handler, so restore exactly what existed beforehand.
+    if (Test-Path -LiteralPath $protocolKey) {
+        Remove-Item -LiteralPath $protocolKey -Recurse -Force
+    }
+    if ($protocolWasPresent) {
+        & reg.exe import $protocolBackup | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to restore MultiCore URL protocol registration; backup: $protocolBackup"
+        }
+        Remove-Item -LiteralPath $protocolBackup -Force
     }
 }
