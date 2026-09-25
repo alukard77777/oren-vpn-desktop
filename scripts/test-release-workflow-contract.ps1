@@ -91,6 +91,8 @@ Assert-True (-not $workflow.Contains('GH_TOKEN: ${{ github.token }}')) 'cross-re
 $publishJob = ($workflow -split '(?m)^  publish:\s*$', 2)[1]
 Assert-True ($publishJob.Contains('runs-on: [self-hosted, Windows, X64, windowsbuild]')) `
     'release publication must not depend on GitHub-hosted runner billing'
+Assert-True ($publishJob -match '(?m)^    timeout-minutes: 90\s*$') `
+    'release publication must allow the complete asset set to upload over a slow connection'
 Assert-True (-not $workflow.Contains('gh release create')) 'release publication must not depend on GitHub CLI being installed on the runner'
 Assert-True ($publishReleaseScript.Contains('[Text.Encoding]::UTF8.GetBytes')) `
     'release metadata must be encoded as UTF-8 bytes for Windows PowerShell 5.1'

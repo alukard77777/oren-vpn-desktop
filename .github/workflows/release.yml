@@ -259,7 +259,7 @@ jobs:
     # GitHub-hosted jobs are unavailable when account Actions billing is paused. Publication is
     # lightweight and uses the already verified artifact, so reuse the trusted Windows runner.
     runs-on: [self-hosted, Windows, X64, windowsbuild]
-    timeout-minutes: 15
+    timeout-minutes: 90
     env:
       GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
 
