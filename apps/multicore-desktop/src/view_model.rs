@@ -1067,12 +1067,20 @@ impl DesktopViewModel {
         std::mem::take(&mut self.profile_reload_needed)
     }
 
+    pub(crate) fn defer_profile_list_reload(&mut self) {
+        self.profile_reload_needed = true;
+    }
+
     pub(crate) fn take_profile_close_intent(&mut self) -> bool {
         std::mem::take(&mut self.profile_close_intent)
     }
 
     pub(crate) fn take_profile_catalog_reload_needed(&mut self) -> bool {
         std::mem::take(&mut self.profile_catalog_reload_needed)
+    }
+
+    pub(crate) fn defer_profile_catalog_reload(&mut self) {
+        self.profile_catalog_reload_needed = true;
     }
 
     pub(crate) fn take_profile_status_reload_needed(&mut self) -> bool {
@@ -1530,6 +1538,21 @@ impl DesktopViewModel {
             };
         }
         Some((action, token))
+    }
+
+    pub(crate) fn can_begin_external_import(&self) -> bool {
+        !self.presentation().is_connected
+            && !self.import_pending
+            && !self.profile_mutation_pending()
+            && !self.profile_reconciliation_required()
+            && !self.profile_status_reload_needed
+            && !self.profile_reload_needed
+            && !self.profile_catalog_reload_needed
+            && self.profile_list_request_pending.is_none()
+            && self.catalog_request_pending.is_none()
+            && self.active_selection.is_none()
+            && !self.catalog_reconciliation_required
+            && self.active_mutation.is_none()
     }
 
     pub fn begin_import(&mut self, url: &str) -> Option<MutationToken> {
@@ -4110,7 +4133,8 @@ mod tests {
         assert!(main.contains("TimerMode::Repeated"));
         assert!(main.contains("Duration::from_secs(60)"));
         assert!(main.contains("ui.window().is_visible()"));
-        assert!(main.contains("if current.latency.queued"));
+        assert!(main.contains("if latency_queued"));
+        assert!(main.contains("apply_latest_snapshot(&ui, &model).latency.queued"));
         assert!(app.contains("trailing-tone: node.latency-tone;"));
         assert!(!app.contains("Local signal grid: structural guides"));
         assert!(app.contains("height: 54px;"));
@@ -4854,6 +4878,98 @@ mod tests {
         );
         assert!(!view_model.presentation().primary_enabled);
         assert_eq!(view_model.begin_primary_action(), None);
+    }
+
+    #[test]
+    fn external_import_waits_for_existing_import_or_connected_tunnel() {
+        let mut disconnected = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        assert!(disconnected.can_begin_external_import());
+        let refresh = disconnected.begin_refresh();
+        assert!(!disconnected.can_begin_external_import());
+        disconnected.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "empty".into(),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert!(disconnected.can_begin_external_import());
+        let import = disconnected
+            .begin_import("https://subscription.invalid/first")
+            .expect("first import starts");
+        assert!(!disconnected.can_begin_external_import());
+        disconnected.finish_import(import, Err(DaemonError::new("offline")));
+        assert!(disconnected.can_begin_external_import());
+
+        let connected = connected_view_model_with_catalog();
+        assert!(!connected.can_begin_external_import());
+    }
+
+    #[test]
+    fn external_import_waits_for_profile_list_and_catalog_after_success() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let import = model
+            .begin_import("https://subscription.invalid/first")
+            .expect("start first import");
+        model.finish_import(
+            import,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                profile: Some("First".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert!(!model.can_begin_external_import());
+
+        let list = model.begin_profile_list().expect("reconcile list");
+        assert!(!model.can_begin_external_import());
+        assert!(model.finish_profile_list(list, Ok(profile_list(None, vec![]))));
+        assert!(!model.can_begin_external_import());
+
+        assert!(model.take_profile_catalog_reload_needed());
+        let catalog = model.begin_catalog_request().expect("reconcile catalog");
+        assert!(!model.can_begin_external_import());
+        assert!(
+            model
+                .finish_catalog(catalog.token, Ok(DaemonCatalog::default()))
+                .is_some()
+        );
+        assert!(model.can_begin_external_import());
+    }
+
+    #[test]
+    fn ambiguous_import_failure_requires_reconciliation_before_next_deep_link() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let import = model
+            .begin_import("https://subscription.invalid/first")
+            .expect("start first import");
+        model.finish_import(import, Err(DaemonError::ambiguous("response lost")));
+        assert!(!model.can_begin_external_import());
+        assert!(model.take_profile_status_reload_needed());
+    }
+
+    #[test]
+    fn failed_deep_link_still_reloads_preexisting_profiles_after_startup_status() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let import = model
+            .begin_import("https://subscription.invalid/failing")
+            .expect("deep-link import starts");
+        model.defer_profile_list_reload();
+        assert!(!model.can_begin_external_import());
+        model.finish_import(import, Err(DaemonError::new("offline")));
+        assert!(model.take_profile_list_reload_needed());
+    }
+
+    #[test]
+    fn failed_deep_link_still_reloads_catalog_after_disconnect() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let import = model
+            .begin_import("https://subscription.invalid/failing")
+            .expect("deep-link import starts");
+        model.defer_profile_catalog_reload();
+        assert!(!model.can_begin_external_import());
+        model.finish_import(import, Err(DaemonError::new("offline")));
+        assert!(model.take_profile_catalog_reload_needed());
     }
 
     #[test]

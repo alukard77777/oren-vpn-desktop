@@ -17,7 +17,7 @@ mod windows_settings;
 mod windows_shell;
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::rc::Rc;
@@ -64,6 +64,45 @@ struct UiSnapshot {
     catalog: CatalogPresentation,
     diagnostics: DiagnosticsPresentation,
     latency: LatencyPresentation,
+}
+
+const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
+const DEEP_LINK_WAITING_FOR_DISCONNECT_RU: &str =
+    "Отключите VPN: подписка добавится автоматически после отключения.";
+
+#[derive(Default)]
+struct PendingSubscriptionImports {
+    urls: VecDeque<String>,
+}
+
+impl PendingSubscriptionImports {
+    fn enqueue(&mut self, url: String) -> bool {
+        if self.urls.len() >= MAX_PENDING_SUBSCRIPTION_IMPORTS {
+            return false;
+        }
+        self.urls.push_back(url);
+        true
+    }
+
+    fn dispatch_next(&mut self, try_import: impl FnOnce(&str) -> bool) -> bool {
+        let Some(url) = self.urls.front() else {
+            return false;
+        };
+        if !try_import(url) {
+            return false;
+        }
+        self.urls.pop_front();
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.urls.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.urls.len()
+    }
 }
 
 struct ProfilePreferenceReconciler {
@@ -596,11 +635,6 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
         client_area_animation_enabled(),
     ));
-    if let Some(subscription_url) = launch_arguments.subscription_url {
-        ui.set_local_page("subscriptions".into());
-        ui.set_subscription_draft(subscription_url.into());
-        ui.set_replace_editor_open(true);
-    }
     apply_update_state(
         &ui,
         &update_state.lock().expect("update state lock"),
@@ -609,6 +643,9 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
     wire_import(&ui, model.clone(), profile_preferences.clone());
+    let pending_subscription_imports = Arc::new(Mutex::new(PendingSubscriptionImports::default()));
+    let _pending_import_timer =
+        wire_pending_subscription_imports(&ui, model.clone(), pending_subscription_imports.clone());
     wire_clipboard_import(&ui, model.clone());
     wire_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
     let _subscription_refresh_timer =
@@ -627,7 +664,12 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_catalog_node(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     wire_windows_settings(&ui);
-    wire_external_activations(&ui, activations, model.clone());
+    wire_external_activations(
+        &ui,
+        activations,
+        model.clone(),
+        pending_subscription_imports.clone(),
+    );
     let tray_popup = create_tray_popup()?;
     let tray_popup_open = Rc::new(Cell::new(false));
     let tray_accordion = Rc::new(RefCell::new(TrayAccordionState::default()));
@@ -711,6 +753,9 @@ fn main() -> Result<(), slint::PlatformError> {
         );
     }
     run_refresh(ui.as_weak(), model.clone(), profile_preferences);
+    if let Some(subscription_url) = launch_arguments.subscription_url {
+        queue_subscription_import(&ui, &pending_subscription_imports, subscription_url);
+    }
     let _startup_connect_timer = wire_startup_auto_connect(
         &ui,
         model.clone(),
@@ -745,16 +790,81 @@ fn prefill_subscription(ui: &AppWindow, subscription_url: String) {
     ui.set_replace_editor_open(true);
 }
 
+fn queue_subscription_import(
+    ui: &AppWindow,
+    pending: &Arc<Mutex<PendingSubscriptionImports>>,
+    subscription_url: String,
+) {
+    if pending
+        .lock()
+        .expect("pending subscription imports lock")
+        .enqueue(subscription_url.clone())
+    {
+        prefill_subscription(ui, subscription_url);
+    } else {
+        ui.set_import_error("Слишком много ссылок. Повторите попытку позже.".into());
+    }
+}
+
+fn wire_pending_subscription_imports(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    pending: Arc<Mutex<PendingSubscriptionImports>>,
+) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if pending
+            .lock()
+            .expect("pending subscription imports lock")
+            .is_empty()
+        {
+            return;
+        }
+        let (ready, connected, notice) = {
+            let mut model = model.lock().expect("view model lock");
+            let connected = model.presentation().is_connected;
+            let notice =
+                if connected && model.import_error() != Some(DEEP_LINK_WAITING_FOR_DISCONNECT_RU) {
+                    model.set_import_error_message(DEEP_LINK_WAITING_FOR_DISCONNECT_RU);
+                    Some(snapshot(&model))
+                } else {
+                    None
+                };
+            (model.can_begin_external_import(), connected, notice)
+        };
+        if let Some(notice) = notice {
+            apply_snapshot(&ui, &notice);
+        }
+        if connected || !ready {
+            return;
+        }
+        pending
+            .lock()
+            .expect("pending subscription imports lock")
+            .dispatch_next(|url| {
+                prefill_subscription(&ui, url.to_owned());
+                ui.invoke_import_url(url.into())
+            });
+    });
+    timer
+}
+
 fn wire_external_activations(
     ui: &AppWindow,
     activations: std::sync::mpsc::Receiver<single_instance::Activation>,
     model: Arc<Mutex<DesktopViewModel>>,
+    pending: Arc<Mutex<PendingSubscriptionImports>>,
 ) {
     let weak = ui.as_weak();
     thread::spawn(move || {
         while let Ok(activation) = activations.recv() {
             let weak = weak.clone();
             let model = model.clone();
+            let pending = pending.clone();
             if slint::invoke_from_event_loop(move || {
                 let Some(ui) = weak.upgrade() else {
                     return;
@@ -769,7 +879,7 @@ fn wire_external_activations(
                             snapshot(&model)
                         };
                         apply_snapshot(&ui, &current);
-                        prefill_subscription(&ui, url);
+                        queue_subscription_import(&ui, &pending, url);
                         restore_and_focus(&ui);
                     }
                 }
@@ -1992,7 +2102,7 @@ fn wire_import(
             apply_snapshot(&ui, &current);
         }
         let Some(mutation) = mutation else {
-            return;
+            return false;
         };
 
         run_import(
@@ -2003,6 +2113,7 @@ fn wire_import(
             url,
             profile_preferences.clone(),
         );
+        true
     });
 }
 
@@ -2614,17 +2725,23 @@ fn run_status(
     thread::spawn(move || {
         let result = client.status();
         let refresh_catalog = result.is_ok();
-        let current = {
-            let mut model = model.lock().expect("view model lock");
-            model.finish_refresh(mutation, result);
-            snapshot(&model)
-        };
+        model
+            .lock()
+            .expect("view model lock")
+            .finish_refresh(mutation, result);
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = weak.upgrade() {
-                apply_snapshot(&ui, &current);
-            }
-            if refresh_catalog {
+            let current = if let Some(ui) = weak.upgrade() {
+                apply_latest_snapshot(&ui, &model)
+            } else {
+                snapshot(&model.lock().expect("view model lock"))
+            };
+            if refresh_catalog && !current.import_pending {
                 load_profile_list(weak, model, profile_preferences, true);
+            } else if refresh_catalog && current.import_pending {
+                model
+                    .lock()
+                    .expect("view model lock")
+                    .defer_profile_list_reload();
             }
         });
     });
@@ -2641,21 +2758,18 @@ fn run_import(
     thread::spawn(move || {
         let result = client.import_subscription(&url);
         let import_succeeded = result.is_ok();
-        let current = {
+        {
             let mut model = model.lock().expect("view model lock");
             model.finish_import(mutation, result);
-            snapshot(&model)
-        };
+        }
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
-                apply_snapshot(&ui, &current);
-                if import_succeeded {
+                let current = apply_latest_snapshot(&ui, &model);
+                if import_succeeded && !current.import_pending {
                     ui.set_import_success_serial(ui.get_import_success_serial().wrapping_add(1));
                 }
             }
-            if import_succeeded {
-                advance_profile_reconciliation(weak, model, profile_preferences, true);
-            }
+            advance_profile_reconciliation(weak, model, profile_preferences, import_succeeded);
         });
     });
 }
@@ -2831,7 +2945,7 @@ fn load_profile_list(
     thread::spawn(move || {
         let result = client.subscriptions();
         let succeeded = result.is_ok();
-        let (accepted, current) = {
+        let accepted = {
             let mut model = model.lock().expect("view model lock");
             let accepted = model.finish_profile_list(token, result);
             if accepted && succeeded {
@@ -2840,11 +2954,11 @@ fn load_profile_list(
                     .expect("profile preference reconciler lock")
                     .reconcile_profile_list(&model);
             }
-            (accepted, snapshot(&model))
+            accepted
         };
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
-                apply_snapshot(&ui, &current);
+                apply_latest_snapshot(&ui, &model);
             }
             if accepted && succeeded {
                 advance_profile_reconciliation(weak, model, profile_preferences, catalog_after);
@@ -2900,14 +3014,13 @@ fn run_profile_status_reconciliation(
     thread::spawn(move || {
         let result = client.status();
         let succeeded = result.is_ok();
-        let current = {
-            let mut model = model.lock().expect("view model lock");
-            model.finish_refresh(mutation, result);
-            snapshot(&model)
-        };
+        model
+            .lock()
+            .expect("view model lock")
+            .finish_refresh(mutation, result);
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
-                apply_snapshot(&ui, &current);
+                apply_latest_snapshot(&ui, &model);
             }
             if succeeded {
                 advance_profile_reconciliation(weak, model, profile_preferences, catalog_after);
@@ -3031,11 +3144,13 @@ fn apply_disconnect_snapshot_from_worker(
     model: Arc<Mutex<DesktopViewModel>>,
     update_state: Option<Arc<Mutex<UpdateState>>>,
 ) {
-    let runtime_idle = runtime_allows_update(&current.presentation);
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = weak.upgrade() {
-            apply_snapshot(&ui, &current);
-        }
+        let current = if let Some(ui) = weak.upgrade() {
+            apply_latest_snapshot(&ui, &model)
+        } else {
+            current
+        };
+        let runtime_idle = runtime_allows_update(&current.presentation);
         if runtime_idle && let Some(update_state) = update_state {
             start_update_install(weak, update_state);
         } else if current.presentation.has_profile {
@@ -3052,14 +3167,22 @@ fn apply_snapshot_from_worker(
     import_succeeded: bool,
 ) {
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(ui) = weak.upgrade() {
-            apply_snapshot(&ui, &current);
-            if import_succeeded {
+        let current = if let Some(ui) = weak.upgrade() {
+            let current = apply_latest_snapshot(&ui, &model);
+            if import_succeeded && !current.import_pending {
                 ui.set_import_success_serial(ui.get_import_success_serial().wrapping_add(1));
             }
-        }
-        if refresh_catalog && current.presentation.has_profile {
+            current
+        } else {
+            current
+        };
+        if refresh_catalog && current.presentation.has_profile && !current.import_pending {
             load_catalog(weak, model);
+        } else if refresh_catalog && current.presentation.has_profile && current.import_pending {
+            model
+                .lock()
+                .expect("view model lock")
+                .defer_profile_catalog_reload();
         }
     });
 }
@@ -3154,26 +3277,28 @@ fn load_catalog_impl(
     thread::spawn(move || {
         let result = request.client.catalog();
         let catalog_succeeded = result.is_ok();
-        let current = {
+        let accepted = {
             let mut model = model.lock().expect("view model lock");
-            model.finish_catalog(request.token, result).map(|_| {
-                if let Some(preferences) = &profile_preferences {
-                    preferences
-                        .lock()
-                        .expect("profile preference reconciler lock")
-                        .apply_ready_hints_after_catalog(&mut model, catalog_succeeded);
-                }
-                snapshot(&model)
-            })
+            model
+                .finish_catalog(request.token, result)
+                .map(|_| {
+                    if let Some(preferences) = &profile_preferences {
+                        preferences
+                            .lock()
+                            .expect("profile preference reconciler lock")
+                            .apply_ready_hints_after_catalog(&mut model, catalog_succeeded);
+                    }
+                })
+                .is_some()
         };
-        let Some(current) = current else {
+        if !accepted {
             return;
-        };
+        }
         let _ = slint::invoke_from_event_loop(move || {
-            if let Some(ui) = weak.upgrade() {
-                apply_snapshot(&ui, &current);
-            }
-            if current.latency.queued {
+            let latency_queued = weak
+                .upgrade()
+                .is_some_and(|ui| apply_latest_snapshot(&ui, &model).latency.queued);
+            if latency_queued {
                 begin_latency_check(weak, model);
             }
         });
@@ -3252,6 +3377,12 @@ fn apply_events(ui: &AppWindow, events: Vec<view_model::PresentedEvent>) {
         })
         .collect::<Vec<_>>();
     ui.set_events(ModelRc::new(VecModel::from(events)));
+}
+
+fn apply_latest_snapshot(ui: &AppWindow, model: &Arc<Mutex<DesktopViewModel>>) -> UiSnapshot {
+    let current = snapshot(&model.lock().expect("view model lock"));
+    apply_snapshot(ui, &current);
+    current
 }
 
 fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
@@ -3462,15 +3593,15 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode, PREFERENCE_RETRY_DELAYS,
-        PREFERENCE_SAVE_ERROR_RU, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
-        ProfilePreferenceReconciler, UpdateInstallIntent, WindowObservation, WriterCommand,
-        WriterResult, activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
-        drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
-        preference_error_for_result, preference_failure_is_terminal,
-        reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
-        runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
-        startup_should_connect, update_check_due, update_install_intent, visible_page_from_name,
-        visible_page_name,
+        PREFERENCE_SAVE_ERROR_RU, PendingSubscriptionImports, PersistenceTracker,
+        PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler, UpdateInstallIntent,
+        WindowObservation, WriterCommand, WriterResult, activation_for_launch_arguments,
+        ambient_motion_allowed, delete_focus_plan, drain_latest_write, initial_window_visible,
+        next_maximized, parse_launch_arguments, preference_error_for_result,
+        preference_failure_is_terminal, reduced_motion_from_client_area_animation,
+        retry_delay_after_failure, route_hints_apply_to, runtime_allows_update, scale_factor_milli,
+        shell_active_after_native_minimize_change, startup_should_connect, update_check_due,
+        update_install_intent, visible_page_from_name, visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -4950,18 +5081,52 @@ mod window_tests {
     }
 
     #[test]
-    fn installer_launch_only_prefills_and_reveals_the_editor() {
+    fn queued_installer_urls_wait_for_import_and_keep_arrival_order() {
+        let mut pending = PendingSubscriptionImports::default();
+        assert!(pending.enqueue("https://example.com/first".into()));
+        assert!(pending.enqueue("https://example.com/second".into()));
+        assert!(!pending.dispatch_next(|_| false));
+        assert_eq!(pending.len(), 2);
+
+        let mut imported = Vec::new();
+        assert!(pending.dispatch_next(|url| {
+            imported.push(url.to_owned());
+            true
+        }));
+        assert!(pending.dispatch_next(|url| {
+            imported.push(url.to_owned());
+            true
+        }));
+        assert_eq!(
+            imported,
+            ["https://example.com/first", "https://example.com/second"]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn installer_uri_imports_on_initial_and_secondary_launch() {
         let source = include_str!("main.rs");
-        let setup = source
-            .split("if let Some(subscription_url) = launch_arguments.subscription_url {")
+        let startup = source
+            .split("wire_import(&ui, model.clone(), profile_preferences.clone());")
             .nth(1)
-            .and_then(|source| source.split("apply_update_state(").next())
-            .expect("installer launch UI setup");
-        assert!(setup.contains("ui.set_local_page(\"subscriptions\".into())"));
-        assert!(setup.contains("ui.set_subscription_draft(subscription_url.into())"));
-        assert!(setup.contains("ui.set_replace_editor_open(true)"));
-        assert!(!setup.contains("invoke_import_url"));
-        assert!(!setup.contains("run_import"));
+            .and_then(|source| {
+                source
+                    .split("let result = slint::run_event_loop_until_quit();")
+                    .next()
+            })
+            .expect("startup after import callback wiring");
+        assert!(startup.contains(
+            "queue_subscription_import(&ui, &pending_subscription_imports, subscription_url)"
+        ));
+
+        let dispatch = source
+            .split("fn wire_pending_subscription_imports(")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_external_activations(").next())
+            .expect("queued installer URL dispatch");
+        assert!(dispatch.contains("ui.invoke_import_url(url.into())"));
+        assert!(dispatch.contains(".dispatch_next(|url|"));
 
         let secondary = source
             .split("single_instance::Activation::InstallSubscription(url) => {")
@@ -4971,8 +5136,61 @@ mod window_tests {
         assert!(secondary.contains("model.open_panel(Panel::None)"));
         assert!(
             secondary.find("model.open_panel(Panel::None)").unwrap()
-                < secondary.find("prefill_subscription(&ui, url)").unwrap()
+                < secondary
+                    .find("queue_subscription_import(&ui, &pending, url)")
+                    .unwrap()
         );
+
+        let import_worker = source
+            .split("fn run_import(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_connect(").next())
+            .expect("import worker");
+        assert!(import_worker.contains(
+            "advance_profile_reconciliation(weak, model, profile_preferences, import_succeeded)"
+        ));
+    }
+
+    #[test]
+    fn import_and_reconciliation_callbacks_use_current_model_state() {
+        let source = include_str!("main.rs");
+        for (start, end) in [
+            ("fn run_status(", "fn run_import("),
+            ("fn run_import(", "fn run_connect("),
+            (
+                "fn run_profile_status_reconciliation(",
+                "fn run_subscription_refresh(",
+            ),
+            (
+                "fn load_profile_list(",
+                "fn advance_profile_reconciliation(",
+            ),
+            ("fn load_catalog_impl(", "fn run_latency_check("),
+            ("fn apply_snapshot_from_worker(", "fn load_events("),
+        ] {
+            let worker = source
+                .split(start)
+                .nth(1)
+                .and_then(|source| source.split(end).next())
+                .expect("reconciliation worker");
+            assert!(
+                worker.contains("apply_latest_snapshot(&ui, &model)"),
+                "{start}"
+            );
+        }
+        let status = source
+            .split("fn run_status(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_import(").next())
+            .expect("startup status worker");
+        assert!(status.contains("if refresh_catalog && !current.import_pending"));
+        assert!(status.contains(".defer_profile_list_reload()"));
+        let disconnect = source
+            .split("fn apply_snapshot_from_worker(")
+            .nth(1)
+            .and_then(|source| source.split("fn load_events(").next())
+            .expect("disconnect and connect UI completion");
+        assert!(disconnect.contains(".defer_profile_catalog_reload()"));
     }
 
     #[test]

@@ -49,6 +49,20 @@ for relative in "${metadata[@]}"; do
   [[ -f "$STAGE/$relative" && -r "$STAGE/$relative" ]] || { echo "Missing metadata: $relative" >&2; exit 1; }
 done
 
+desktop_file="$STAGE/usr/share/applications/multicore.desktop"
+grep -qx 'Exec=multicore %u' "$desktop_file" || {
+  echo 'Linux desktop entry must pass one protocol URL to MultiCore' >&2
+  exit 1
+}
+grep -qx 'MimeType=x-scheme-handler/multicore;' "$desktop_file" || {
+  echo 'Linux desktop entry must advertise the multicore URL scheme' >&2
+  exit 1
+}
+grep -Fxq 'exec "$HERE/usr/lib/multicore/multicore" "$@"' "$ROOT/packaging/linux/appimage/AppRun" || {
+  echo 'AppImage launcher must forward the protocol URL unchanged' >&2
+  exit 1
+}
+
 [[ -L "$STAGE/usr/bin/multicore" ]] || { echo "Missing /usr/bin/multicore symlink" >&2; exit 1; }
 [[ "$(readlink "$STAGE/usr/bin/multicore")" == "../lib/multicore/multicore" ]] || {
   echo "Incorrect /usr/bin/multicore symlink" >&2
