@@ -27,7 +27,8 @@ jobs:
           sudo apt-get update
           sudo apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends zstd file
       - name: Restore Cargo build cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # Release jobs must not wait for an optional cache upload after artifacts are ready.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/linux-release-ubuntu/release/.fingerprint

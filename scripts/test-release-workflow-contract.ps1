@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$ExpectedVersion)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -30,6 +30,18 @@ $linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
 $publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
 $cacheAction = 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
 $cacheRestoreAction = 'actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
+
+if ($ExpectedVersion) {
+    $manifest = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\Cargo.toml')
+    $ui = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\ui\app.slint')
+    $installer = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\build-windows-installer.ps1')
+    $versionPattern = '(?m)^version\s*=\s*"{0}"\s*$' -f [regex]::Escape($ExpectedVersion)
+    Assert-True ([regex]::IsMatch($manifest, $versionPattern)) 'desktop manifest must match expected release version'
+    Assert-True ($ui.Contains(('update-status: "MultiCore {0}";' -f $ExpectedVersion))) `
+        'desktop UI must show the expected release version'
+    Assert-True ($installer.Contains(('[string]$AppVersion = ''{0}''' -f $ExpectedVersion))) `
+        'installer default must match the expected release version'
+}
 
 foreach ($token in @(
     'tags:',
@@ -92,13 +104,17 @@ Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'
 Assert-True ($ci.Contains('test-packaged-daemon-smoke-contract.ps1')) 'normal CI must run the packaged daemon smoke contract'
 Assert-True ($ci.Contains('cargo test --workspace --locked')) 'normal CI must run workspace tests without elevated binary targets'
-Assert-True ($ci.Contains($cacheAction)) 'normal CI must restore the Cargo build cache after checkout'
+Assert-True ($ci.Contains($cacheRestoreAction)) 'normal CI must restore the Cargo build cache without a post-job save'
 Assert-True ($workflow.Contains($cacheRestoreAction)) `
     'release workflow must restore the verified Windows Cargo build cache without a post-job save'
 Assert-True (-not $workflow.Contains("uses: $cacheAction")) `
     'release workflow must not repack the Cargo cache after publishing artifacts'
-Assert-True ($linuxWorkflow.Contains($cacheAction)) 'Linux packaging must reuse Cargo artifacts across clean checkouts'
-Assert-True ($ci.Contains('Git\usr\bin')) 'Windows CI must expose gzip before actions/cache saves its archive'
+Assert-True ($linuxWorkflow.Contains($cacheRestoreAction)) `
+    'Linux packaging must reuse Cargo artifacts without a post-job save'
+Assert-True (-not $ci.Contains("uses: $cacheAction")) 'CI must not repack Cargo caches after verification'
+Assert-True (-not $linuxWorkflow.Contains("uses: $cacheAction")) `
+    'Linux packaging must not repack Cargo caches after publishing artifacts'
+Assert-True ($ci.Contains('Git\usr\bin')) 'Windows CI must expose gzip before actions/cache restores its archive'
 Assert-True ($workflow.Contains('Git\usr\bin')) 'Windows release must expose gzip before actions/cache restores its archive'
 Assert-True ($ci.Contains('target/debug/deps')) 'CI cache must keep compiled dependencies'
 Assert-True (-not $ci.Contains("            target`n")) 'CI cache must not archive the complete Cargo target tree'
