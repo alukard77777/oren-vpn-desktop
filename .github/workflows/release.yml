@@ -35,34 +35,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Expose cache compression tools
-        shell: pwsh
-        run: |
-          $tools = Join-Path $env:ProgramFiles 'Git\usr\bin'
-          if (-not (Test-Path -LiteralPath (Join-Path $tools 'gzip.exe') -PathType Leaf)) {
-            throw 'Git gzip is required by actions/cache on the Windows runner'
-          }
-          $tools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Restore Cargo build cache
-        # Release consumes the cache produced by normal CI but never saves another multi-GB
-        # archive during post-job cleanup. A version-only lockfile change must not delay publish.
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/debug/.fingerprint
-            target/debug/build
-            target/debug/deps
-            target/release/.fingerprint
-            target/release/build
-            target/release/deps
-          key: cargo-release-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-release-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
-            cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
-
       - name: Enforce privileged broker release gate
         shell: pwsh
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady

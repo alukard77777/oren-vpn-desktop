@@ -25,27 +25,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Expose cache compression tools
-        shell: pwsh
-        run: |
-          $tools = Join-Path $env:ProgramFiles 'Git\usr\bin'
-          if (-not (Test-Path -LiteralPath (Join-Path $tools 'gzip.exe') -PathType Leaf)) {
-            throw 'Git gzip is required by actions/cache on the Windows runner'
-          }
-          $tools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Restore Cargo build cache
-        # Keep runner teardown bounded: a lockfile miss must not upload a new ~1 GB archive.
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/debug/.fingerprint
-            target/debug/build
-            target/debug/deps
-          key: cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
@@ -82,19 +61,6 @@ jobs:
           sudo apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends zstd pkg-config libgtk-3-dev libxkbcommon-dev \
             libfontconfig-dev libfreetype-dev libwayland-dev libx11-dev libx11-xcb-dev \
             libxcursor-dev libxrandr-dev libxi-dev libgl-dev libegl-dev
-      - name: Restore Cargo build cache
-        # Keep runner teardown bounded: a lockfile miss must not upload a new ~1 GB archive.
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/debug/.fingerprint
-            target/debug/build
-            target/debug/deps
-          key: cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-ci-nodebug-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy

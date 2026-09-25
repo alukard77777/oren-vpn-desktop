@@ -22,21 +22,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Install cache compression tools
+      - name: Install package verification tools
         run: |
           sudo apt-get update
           sudo apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends zstd file
-      - name: Restore Cargo build cache
-        # Release jobs must not wait for an optional cache upload after artifacts are ready.
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            target/linux-release-ubuntu/release/.fingerprint
-            target/linux-release-ubuntu/release/build
-            target/linux-release-ubuntu/release/deps
-          key: cargo-package-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-package-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-
       - name: Build Debian package and AppImage in Ubuntu 22.04
         env:
           UPDATE_REPOSITORY: ${{ inputs.update-repository }}

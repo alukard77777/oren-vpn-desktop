@@ -28,8 +28,6 @@ $ci = Get-Content -Raw -LiteralPath $ciPath
 $linuxWorkflow = Get-Content -Raw -LiteralPath $linuxWorkflowPath
 $linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
 $publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
-$cacheAction = 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
-$cacheRestoreAction = 'actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9'
 
 if ($ExpectedVersion) {
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\Cargo.toml')
@@ -106,35 +104,22 @@ Assert-True (-not $workflow.Contains('--draft')) 'update channel release must be
 Assert-True ($ci.Contains('test-smoke-test-one-click-contract.ps1')) 'normal CI must run the one-click smoke contract'
 Assert-True ($ci.Contains('test-packaged-daemon-smoke-contract.ps1')) 'normal CI must run the packaged daemon smoke contract'
 Assert-True ($ci.Contains('cargo test --workspace --locked')) 'normal CI must run workspace tests without elevated binary targets'
-Assert-True ($ci.Contains($cacheRestoreAction)) 'normal CI must restore the Cargo build cache without a post-job save'
-Assert-True ($workflow.Contains($cacheRestoreAction)) `
-    'release workflow must restore the verified Windows Cargo build cache without a post-job save'
-Assert-True (-not $workflow.Contains("uses: $cacheAction")) `
-    'release workflow must not repack the Cargo cache after publishing artifacts'
-Assert-True ($linuxWorkflow.Contains($cacheRestoreAction)) `
-    'Linux packaging must reuse Cargo artifacts without a post-job save'
-Assert-True (-not $ci.Contains("uses: $cacheAction")) 'CI must not repack Cargo caches after verification'
-Assert-True (-not $linuxWorkflow.Contains("uses: $cacheAction")) `
-    'Linux packaging must not repack Cargo caches after publishing artifacts'
-Assert-True ($ci.Contains('Git\usr\bin')) 'Windows CI must expose gzip before actions/cache restores its archive'
-Assert-True ($workflow.Contains('Git\usr\bin')) 'Windows release must expose gzip before actions/cache restores its archive'
-Assert-True ($ci.Contains('target/debug/deps')) 'CI cache must keep compiled dependencies'
-Assert-True (-not $ci.Contains("            target`n")) 'CI cache must not archive the complete Cargo target tree'
+foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
+    Assert-True (-not $content.Contains('actions/cache')) `
+        'self-hosted workflows must not transfer oversized Cargo cache archives'
+    Assert-True (-not $content.Contains('Restore Cargo build cache')) `
+        'self-hosted workflows must not stall on Cargo cache restoration'
+}
 Assert-True ($ci.Contains('CARGO_PROFILE_DEV_DEBUG: 0')) 'CI must not create multi-gigabyte development debug symbols'
 Assert-True ($ci.Contains('CARGO_PROFILE_TEST_DEBUG: 0')) 'CI must not create multi-gigabyte test debug symbols'
 Assert-True ($ci.Contains('CARGO_INCREMENTAL: 0')) 'CI cache must not retain incremental compiler state'
 Assert-True ($workflow.Contains('CARGO_PROFILE_TEST_DEBUG: 0')) 'release verification must use the bounded test profile'
 Assert-True ($ci.Contains('DPkg::Lock::Timeout=180')) 'Linux CI must tolerate concurrent apt jobs on the self-hosted runner'
 Assert-True ($linuxWorkflow.Contains('DPkg::Lock::Timeout=180')) 'Linux packaging must tolerate concurrent apt jobs on the self-hosted runner'
-Assert-True ($linuxWorkflow.Contains('target/linux-release-ubuntu/release/deps')) `
-    'Linux packaging must use a dedicated bounded release cache'
-Assert-True ($ci.Contains('zstd')) 'Linux CI must install zstd before restoring or saving the cache'
-Assert-True ($linuxWorkflow.Contains('zstd')) 'Linux packaging must install zstd before restoring or saving the cache'
+Assert-True ($ci.Contains('zstd')) 'Linux CI must install zstd for release-stage verification'
+Assert-True ($linuxWorkflow.Contains('zstd')) 'Linux packaging must install zstd for release-stage verification'
 Assert-True ($linuxWorkflow.Contains('zstd file')) `
     'Linux packaging must install file before validating ELF package contents'
-foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
-    Assert-True ($content.Contains("hashFiles('**/Cargo.lock')")) 'every Cargo cache key must be invalidated by Cargo.lock'
-}
 Assert-True ($linuxWorkflow.Contains('./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage')) `
     'Debian and AppImage packages must be built inside the pinned Ubuntu 22.04 image'
 Assert-True (-not $linuxWorkflow.Contains('./scripts/build-linux-packages.sh --stage target/linux-stage --output dist/linux --formats deb,appimage')) `
