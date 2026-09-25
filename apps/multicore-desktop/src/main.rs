@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemon::{DaemonClient, DaemonError, UnavailableDaemonClient};
 use preferences::{AppPreferences, PreferenceStore, VisiblePage, WindowBounds};
@@ -155,13 +155,19 @@ impl ProfilePreferenceReconciler {
             .cloned()
             .unwrap_or_default();
         let catalog_group = model.catalog_presentation().selected_group_id;
-        model.restore_route_preferences(selected_group.as_deref(), &BTreeMap::new());
-        for (group_id, node_id) in &selections {
-            if model.select_catalog_group(group_id) {
-                let _ = model.begin_node_selection(node_id);
+        let selected_group_id = selected_group
+            .as_deref()
+            .and_then(|key| model.resolve_group_preference_id(key));
+        model.restore_route_preferences(selected_group_id.as_deref(), &BTreeMap::new());
+        for (group_key, node_key) in &selections {
+            if let Some((group_id, node_id)) =
+                model.resolve_route_preference_ids(group_key, node_key)
+                && model.select_catalog_group(&group_id)
+            {
+                let _ = model.begin_node_selection(&node_id);
             }
         }
-        let restored_group = selected_group
+        let restored_group = selected_group_id
             .as_deref()
             .is_some_and(|group_id| model.select_catalog_group(group_id));
         if !restored_group && let Some(group_id) = catalog_group {
@@ -212,6 +218,10 @@ impl PersistenceTracker {
 
     fn set_ambient_background(&mut self, enabled: bool) {
         self.desired.ambient_background = enabled;
+    }
+
+    fn set_auto_connect_on_startup(&mut self, enabled: bool) {
+        self.desired.auto_connect_on_startup = enabled;
     }
 
     fn set_route_preferences(
@@ -559,6 +569,7 @@ fn main() -> Result<(), slint::PlatformError> {
         preference_tracker.clone(),
     )));
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
+    let update_check_started_at = Rc::new(Cell::new(Instant::now()));
 
     #[cfg(target_os = "linux")]
     select_linux_backend()?;
@@ -577,6 +588,7 @@ fn main() -> Result<(), slint::PlatformError> {
     apply_snapshot(&ui, &snapshot(&model.lock().expect("view model lock")));
     ui.set_local_page(visible_page_name(&loaded_preferences.visible_page).into());
     ui.set_ambient_background_enabled(loaded_preferences.ambient_background);
+    ui.set_auto_connect_on_startup(loaded_preferences.auto_connect_on_startup);
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
         client_area_animation_enabled(),
     ));
@@ -598,7 +610,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let _subscription_refresh_timer =
         wire_automatic_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
     wire_profile_switcher(&ui, model.clone(), profile_preferences.clone());
-    wire_primary_action(&ui, model.clone(), profile_preferences.clone());
+    let startup_connect_pending = Rc::new(Cell::new(true));
+    wire_primary_action(
+        &ui,
+        model.clone(),
+        profile_preferences.clone(),
+        startup_connect_pending.clone(),
+    );
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
@@ -668,17 +686,40 @@ fn main() -> Result<(), slint::PlatformError> {
         preference_writer.clone(),
         preference_tracker.clone(),
     );
-    wire_updater(&ui, model.clone(), update_state.clone());
+    wire_updater(
+        &ui,
+        model.clone(),
+        update_state.clone(),
+        update_check_started_at.clone(),
+    );
+    let _update_check_timer = wire_periodic_update_check(
+        &ui,
+        model.clone(),
+        update_state.clone(),
+        update_check_started_at.clone(),
+    );
     if updater::configured_repository().ok().flatten().is_some() {
-        run_update_check(ui.as_weak(), model.clone(), update_state);
+        run_update_check(
+            ui.as_weak(),
+            model.clone(),
+            update_state,
+            update_check_started_at,
+        );
     }
     run_refresh(ui.as_weak(), model.clone(), profile_preferences);
+    let _startup_connect_timer = wire_startup_auto_connect(
+        &ui,
+        model.clone(),
+        launch_mode,
+        loaded_preferences.auto_connect_on_startup,
+        startup_connect_pending,
+    );
     let starts_visible = initial_window_visible(launch_mode, tray_runtime.is_some());
     ui.set_shell_active(starts_visible);
     if starts_visible {
         ui.show()?;
     }
-    let result = slint::run_event_loop();
+    let result = slint::run_event_loop_until_quit();
     flush_preferences(&ui, &model, &preference_writer, &preference_tracker);
     let _ = tray_popup.hide();
     let _ = ui.hide();
@@ -755,6 +796,64 @@ enum LaunchMode {
     Background,
 }
 
+fn startup_should_connect(
+    mode: LaunchMode,
+    enabled: bool,
+    profile_ready: bool,
+    network_ready: bool,
+) -> bool {
+    mode == LaunchMode::Background && enabled && profile_ready && network_ready
+}
+
+fn wire_startup_auto_connect(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    mode: LaunchMode,
+    enabled_at_launch: bool,
+    pending: Rc<Cell<bool>>,
+) -> Timer {
+    let timer = Timer::default();
+    if !startup_should_connect(mode, enabled_at_launch, true, true) {
+        return timer;
+    }
+    let weak = ui.as_weak();
+    timer.start(TimerMode::Repeated, Duration::from_secs(2), move || {
+        if !pending.get() {
+            return;
+        }
+        let Some(ui) = weak.upgrade() else {
+            pending.set(false);
+            return;
+        };
+        if !ui.get_auto_connect_on_startup() {
+            pending.set(false);
+            return;
+        }
+        let profile_ready = {
+            let model = model.lock().expect("view model lock");
+            let presentation = model.presentation();
+            let catalog = model.catalog_presentation();
+            if presentation.is_connected || presentation.is_error {
+                pending.set(false);
+            }
+            presentation.primary_action == PrimaryAction::Connect
+                && presentation.primary_enabled
+                && catalog.revision.is_some()
+                && !catalog.loading
+                && !catalog.groups.is_empty()
+        };
+        if !pending.get() || !profile_ready {
+            return;
+        }
+        let network_ready = multicore_core::default_ipv4_interface().is_ok();
+        if startup_should_connect(mode, enabled_at_launch, profile_ready, network_ready) {
+            pending.set(false);
+            ui.invoke_primary_action();
+        }
+    });
+    timer
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LaunchArguments {
     mode: LaunchMode,
@@ -793,9 +892,17 @@ fn parse_launch_arguments(
                 .strip_prefix(INSTALL_SUBSCRIPTION_PREFIX)
                 .ok_or("unsupported launch argument")?;
             let subscription_url = decode_percent_encoded_url(encoded)?;
+            if subscription_url.len() > view_model::MAX_SUBSCRIPTION_URL_BYTES
+                || subscription_url.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err("subscription URL contains invalid bytes or is too long");
+            }
             let parsed = reqwest::Url::parse(&subscription_url)
                 .map_err(|_| "subscription URL is malformed")?;
-            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || parsed.fragment().is_some()
+            {
                 return Err("subscription URL must use HTTP or HTTPS");
             }
             Ok(LaunchArguments {
@@ -1122,6 +1229,7 @@ fn flush_preferences(
     let preferences = {
         let mut tracker = tracker.lock().expect("preference tracker lock");
         tracker.set_ambient_background(ui.get_ambient_background_enabled());
+        tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
         if let Some((profile, selected_group, selections)) = route_preferences {
             tracker.set_route_preferences(profile, selected_group, selections);
         }
@@ -1174,6 +1282,7 @@ fn wire_preference_persistence(
         let preferences = {
             let mut tracker = tracker.lock().expect("preference tracker lock");
             tracker.set_ambient_background(ui.get_ambient_background_enabled());
+            tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
             }
@@ -1193,6 +1302,7 @@ fn wire_updater(
     ui: &AppWindow,
     model: Arc<Mutex<DesktopViewModel>>,
     state: Arc<Mutex<UpdateState>>,
+    check_started_at: Rc<Cell<Instant>>,
 ) {
     let weak = ui.as_weak();
     let action_model = model.clone();
@@ -1206,9 +1316,12 @@ fn wire_updater(
             .presentation(runtime_idle)
             .action;
         match action {
-            UpdateAction::Check => {
-                run_update_check(weak.clone(), action_model.clone(), action_state.clone())
-            }
+            UpdateAction::Check => run_update_check(
+                weak.clone(),
+                action_model.clone(),
+                action_state.clone(),
+                check_started_at.clone(),
+            ),
             UpdateAction::Install => match update_install_intent(runtime_idle) {
                 UpdateInstallIntent::InstallNow => {
                     start_update_install(weak.clone(), action_state.clone());
@@ -1254,6 +1367,42 @@ fn wire_updater(
     });
 }
 
+fn update_check_due(elapsed: Duration, busy: bool) -> bool {
+    elapsed >= Duration::from_secs(24 * 60 * 60) && !busy
+}
+
+fn wire_periodic_update_check(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    state: Arc<Mutex<UpdateState>>,
+    check_started_at: Rc<Cell<Instant>>,
+) -> Timer {
+    let timer = Timer::default();
+    if updater::configured_repository().ok().flatten().is_none() {
+        return timer;
+    }
+    let weak = ui.as_weak();
+    timer.start(
+        TimerMode::Repeated,
+        Duration::from_secs(60 * 60),
+        move || {
+            let busy = matches!(
+                &*state.lock().expect("update state lock"),
+                UpdateState::Checking | UpdateState::Downloading(_)
+            );
+            if update_check_due(check_started_at.get().elapsed(), busy) {
+                run_update_check(
+                    weak.clone(),
+                    model.clone(),
+                    state.clone(),
+                    check_started_at.clone(),
+                );
+            }
+        },
+    );
+    timer
+}
+
 fn start_update_install(weak: slint::Weak<AppWindow>, state: Arc<Mutex<UpdateState>>) {
     let release = state.lock().expect("update state lock").available_release();
     let Some(release) = release else {
@@ -1290,7 +1439,9 @@ fn run_update_check(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     state: Arc<Mutex<UpdateState>>,
+    check_started_at: Rc<Cell<Instant>>,
 ) {
+    check_started_at.set(Instant::now());
     {
         let mut current = state.lock().expect("update state lock");
         *current = UpdateState::Checking;
@@ -2246,9 +2397,11 @@ fn wire_primary_action(
     ui: &AppWindow,
     model: Arc<Mutex<DesktopViewModel>>,
     profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    startup_connect_pending: Rc<Cell<bool>>,
 ) {
     let weak = ui.as_weak();
     ui.on_primary_action(move || {
+        startup_connect_pending.set(false);
         let (action, client, queued, current) = {
             let mut model = model.lock().expect("view model lock");
             let action = model.begin_primary_action();
@@ -3312,7 +3465,8 @@ mod window_tests {
         preference_error_for_result, preference_failure_is_terminal,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
-        update_install_intent, visible_page_from_name, visible_page_name,
+        startup_should_connect, update_check_due, update_install_intent, visible_page_from_name,
+        visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -3326,6 +3480,7 @@ mod window_tests {
         parse_resize_edge,
     };
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn maximize_toggle_inverts_current_window_state() {
@@ -3796,7 +3951,8 @@ mod window_tests {
         let (_, selected_group, selections) = model
             .route_preferences()
             .expect("restored route preferences");
-        assert_eq!(selected_group.as_deref(), Some("group-a"));
+        let group_key = selected_group.unwrap();
+        assert!(group_key.starts_with("label-sha256:"));
         assert_eq!(
             selections.get("group-a").map(String::as_str),
             Some("node-a-saved")
@@ -4045,7 +4201,7 @@ mod window_tests {
 
         let source = include_str!("main.rs");
         let shutdown = source
-            .split("let result = slint::run_event_loop();")
+            .split("let result = slint::run_event_loop_until_quit();")
             .nth(1)
             .and_then(|source| source.split("fn activation_for_launch_arguments").next())
             .expect("common post-event-loop shutdown");
@@ -4587,9 +4743,14 @@ mod window_tests {
     #[test]
     fn background_launch_and_restore_source_contract() {
         let source = include_str!("main.rs");
+        let launch = source
+            .split("fn main()")
+            .nth(1)
+            .and_then(|source| source.split("fn activation_for_launch_arguments").next())
+            .expect("desktop startup body");
         assert!(source.contains("--background"));
         assert!(source.contains("LaunchMode::Background"));
-        assert!(source.contains("slint::run_event_loop()"));
+        assert!(launch.contains("slint::run_event_loop_until_quit()"));
         assert!(source.contains("initial_window_visible(launch_mode, tray_runtime.is_some())"));
 
         let show_branch = source
@@ -4661,6 +4822,72 @@ mod window_tests {
                 parse_launch_arguments([argument.into()]).is_err(),
                 "{argument}"
             );
+        }
+    }
+
+    #[test]
+    fn startup_auto_connect_requires_background_opt_in_ready_profile_and_network() {
+        assert!(!startup_should_connect(
+            LaunchMode::Foreground,
+            true,
+            true,
+            true
+        ));
+        assert!(!startup_should_connect(
+            LaunchMode::Background,
+            false,
+            true,
+            true
+        ));
+        assert!(!startup_should_connect(
+            LaunchMode::Background,
+            true,
+            false,
+            true
+        ));
+        assert!(!startup_should_connect(
+            LaunchMode::Background,
+            true,
+            true,
+            false
+        ));
+        assert!(startup_should_connect(
+            LaunchMode::Background,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn update_check_is_due_once_per_day_but_not_during_an_update_operation() {
+        assert!(!update_check_due(Duration::from_secs(86_399), false));
+        assert!(!update_check_due(Duration::from_secs(86_400), true));
+        assert!(update_check_due(Duration::from_secs(86_400), false));
+    }
+
+    #[test]
+    fn home_update_banner_only_shows_available_releases_and_has_actions() {
+        let ui = include_str!("../ui/app.slint");
+        assert!(ui.contains(
+            "root.update-available && root.update-status != root.update-banner-dismissed-for"
+        ));
+        assert!(ui.contains("root.update-banner-dismissed-for = root.update-status"));
+        assert!(ui.contains("root.update-action();"));
+    }
+
+    #[test]
+    fn installer_uri_rejects_controls_fragments_and_oversized_subscription_urls() {
+        for argument in [
+            "multicore://install-sub?url=https%3A%2F%2Fexample.com%2Fsub%0Apath".to_owned(),
+            "multicore://install-sub?url=https%3A%2F%2Fexample.com%2Fsub%00path".to_owned(),
+            "multicore://install-sub?url=https%3A%2F%2Fexample.com%2Fsub%23fragment".to_owned(),
+            format!(
+                "multicore://install-sub?url=https%3A%2F%2Fexample.com%2F{}",
+                "a".repeat(crate::view_model::MAX_SUBSCRIPTION_URL_BYTES)
+            ),
+        ] {
+            assert!(parse_launch_arguments([argument.into()]).is_err());
         }
     }
 

@@ -44,6 +44,7 @@ pub struct AppPreferences {
     pub last_group_by_profile: BTreeMap<String, String>,
     pub selections_by_profile: BTreeMap<String, BTreeMap<String, String>>,
     pub ambient_background: bool,
+    pub auto_connect_on_startup: bool,
 }
 
 impl Default for AppPreferences {
@@ -57,6 +58,7 @@ impl Default for AppPreferences {
             last_group_by_profile: BTreeMap::new(),
             selections_by_profile: BTreeMap::new(),
             ambient_background: true,
+            auto_connect_on_startup: false,
         }
     }
 }
@@ -622,6 +624,7 @@ mod tests {
                 BTreeMap::from([("group-b".into(), "node-c".into())]),
             )]),
             ambient_background: true,
+            auto_connect_on_startup: true,
         };
 
         store.save(&expected).unwrap();
@@ -649,8 +652,16 @@ mod tests {
                 last_group_by_profile: BTreeMap::new(),
                 selections_by_profile: BTreeMap::new(),
                 ambient_background: true,
+                auto_connect_on_startup: false,
             }
         );
+    }
+
+    #[test]
+    fn older_preferences_keep_autoconnect_disabled() {
+        let old = br#"{"schema_version":1,"ambient_background":true}"#;
+        let loaded: AppPreferences = serde_json::from_slice(old).unwrap();
+        assert!(!loaded.auto_connect_on_startup);
     }
 
     #[test]

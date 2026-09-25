@@ -202,6 +202,7 @@ impl ReqwestHttpClient {
         );
         let subscription_client = reqwest::Client::builder()
             .default_headers(headers)
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
@@ -450,6 +451,81 @@ impl HttpResponse {
 
     fn status_is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+}
+
+#[cfg(test)]
+mod subscription_transport_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn subscription_request_uses_direct_tun_route_even_with_proxy_environment() {
+        let direct = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_url = format!(
+            "http://127.0.0.1:{}/subscription",
+            direct.local_addr().unwrap().port()
+        );
+        let proxy_url = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+        let direct_server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), direct.accept())
+                .await
+                .expect("direct subscription request")
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let length = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).contains("GET /subscription"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+        let proxy_server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(3), proxy.accept())
+                .await
+                .is_ok()
+        });
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "fetch::subscription_transport_tests::subscription_proxy_environment_child",
+            ])
+            .env("MULTICORE_SUBSCRIPTION_PROXY_TEST_URL", direct_url)
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "subscription proxy child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        direct_server.await.unwrap();
+        assert!(
+            !proxy_server.await.unwrap(),
+            "subscription request used the environment proxy"
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated helper invoked by subscription_request_uses_direct_tun_route_even_with_proxy_environment"]
+    fn subscription_proxy_environment_child() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = DeviceIdentity::load_or_create(root.path()).unwrap();
+        let client = ReqwestHttpClient::new(identity).unwrap();
+        let url = std::env::var("MULTICORE_SUBSCRIPTION_PROXY_TEST_URL").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let response = runtime.block_on(client.get(&url, UA_NATIVE)).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"OK");
     }
 }
 

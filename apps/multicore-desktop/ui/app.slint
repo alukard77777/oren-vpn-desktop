@@ -438,6 +438,7 @@ export component AppWindow inherits Window {
     in property <bool> launch-at-sign-in-enabled: false;
     in property <bool> launch-at-sign-in-stale: false;
     in property <string> launch-at-sign-in-error;
+    in-out property <bool> auto-connect-on-startup: false;
     in property <string> preference-error;
     in-out property <bool> ambient-background-enabled: true;
     in-out property <bool> shell-active: true;
@@ -453,11 +454,12 @@ export component AppWindow inherits Window {
     private property <int> first-run-trigger-focus-serial: 0;
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
-    in property <string> update-status: "MultiCore 0.2.2";
+    in property <string> update-status: "MultiCore 0.2.3";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
     in property <bool> update-busy: false;
+    in-out property <string> update-banner-dismissed-for;
     in-out property <bool> update-confirm-open: false;
 
     in-out property <string> local-page: "home";
@@ -996,6 +998,49 @@ export component AppWindow inherits Window {
 
                     }
 
+                    if root.update-available && root.update-status != root.update-banner-dismissed-for: update-banner := Rectangle {
+                        height: 72px;
+                        background: #101721;
+                        border-color: #4c9dff55;
+                        border-width: 1px;
+                        border-radius: 14px;
+                        clip: true;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 12px;
+                            Rectangle {
+                                width: 32px;
+                                height: 32px;
+                                border-radius: 8px;
+                                background: #4c9dff18;
+                                Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 2px;
+                                Text { text: "Доступно обновление"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                                Text { text: root.update-status; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                            }
+                            SmallAction {
+                                min-width: 96px;
+                                label: root.update-action-label != "" ? root.update-action-label : "Подробнее";
+                                selected: true;
+                                enabled: !root.update-busy && !root.profile-menu-open && !root.update-confirm-open;
+                                activated => {
+                                    if (root.update-action-label != "") { root.update-action(); }
+                                    else { root.local-page = "settings"; root.settings-section = "updates"; }
+                                }
+                            }
+                            SmallAction {
+                                label: "Позже";
+                                enabled: !root.profile-menu-open;
+                                activated => { root.update-banner-dismissed-for = root.update-status; }
+                            }
+                        }
+                    }
+
                     subscription-strip := Rectangle {
                         height: 54px;
                         background: Theme.surface;
@@ -1399,6 +1444,13 @@ export component AppWindow inherits Window {
                                 toggled(value) => { root.set-launch-at-sign-in(value); }
                             }
                             if root.launch-at-sign-in-error != "": Text { height: 34px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            ToggleRow {
+                                label: "Подключаться при запуске";
+                                description: root.launch-at-sign-in-enabled ? "После входа в систему и появления сети" : "Сначала включите автозапуск";
+                                checked: root.auto-connect-on-startup;
+                                enabled: root.launch-at-sign-in-enabled && !root.profile-menu-open;
+                                toggled(value) => { root.auto-connect-on-startup = value; }
+                            }
                             ToggleRow {
                                 label: "Живой фон";
                                 description: root.reduced-motion ? "Анимация отключена настройками " + root.system-name : "Спокойные волны на главной";

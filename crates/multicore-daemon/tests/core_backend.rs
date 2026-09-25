@@ -27,6 +27,14 @@ proxy-groups:
     proxies: [Test Node]
 "#;
 
+const REFRESH_SELECTION_MIHOMO: &str = r#"
+proxies:
+  - {name: First, type: socks5}
+  - {name: Second, type: socks5}
+proxy-groups:
+  - {name: Main, type: select, proxies: [First, Second]}
+"#;
+
 struct ConfirmingSelector;
 
 #[async_trait]
@@ -409,7 +417,7 @@ async fn profiles_stay_isolated_duplicate_urls_reuse_and_inactive_refresh_does_n
         duplicate.active_profile_id.as_deref(),
         Some(first_id.as_str())
     );
-    assert_eq!(duplicate.current_node.as_deref(), Some("One Node"));
+    assert_eq!(duplicate.current_node.as_deref(), Some("One Alt"));
     let first_revision = backend.catalog().await.unwrap().revision;
     assert_eq!(backend.list_subscriptions().unwrap().len(), 1);
 
@@ -653,11 +661,9 @@ async fn connected_refresh_and_delete_are_safe_and_activation_stays_blocked() {
         .refresh_subscription_profile(&profile_id(&second_id))
         .await
         .unwrap();
-    assert_eq!(active_refresh.state, ConnectionState::Ready);
-    backend.connect().await.unwrap();
+    assert_eq!(active_refresh.state, ConnectionState::Connected);
     let home_refresh = Backend::refresh_subscription(&backend).await.unwrap();
-    assert_eq!(home_refresh.state, ConnectionState::Ready);
-    backend.connect().await.unwrap();
+    assert_eq!(home_refresh.state, ConnectionState::Connected);
     let active_delete = backend
         .delete_subscription(&profile_id(&second_id))
         .await
@@ -844,6 +850,137 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
         [UA_NATIVE, UA_SERVICE_LOGO, UA_NATIVE, UA_SERVICE_LOGO]
     );
     assert!(!format!("{refreshed:?}").contains("source-password"));
+}
+
+#[tokio::test]
+async fn connected_refresh_keeps_tunnel_up_and_restores_selected_node_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    let source = "https://subscription.example/config";
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(REFRESH_SELECTION_MIHOMO.as_bytes(), br#"{}"#)
+                .unwrap()
+                .with_subscription_source(source, None, 1)
+                .unwrap(),
+        ))
+        .unwrap();
+    let controller = Arc::new(RecordingController::default());
+    let backend = CoreBackend::new_with_selector(
+        store,
+        SubscriptionFetcher::new(FixtureHttp::with_mihomo(REFRESH_SELECTION_MIHOMO)),
+        {
+            let controller = controller.clone();
+            move |_snapshot| Ok(controller.clone())
+        },
+        Arc::new(ConfirmingSelector),
+    )
+    .unwrap();
+
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[0].id.clone(),
+            node_id: catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    backend.connect().await.unwrap();
+    let refreshed = backend.refresh_subscription().await.unwrap();
+    assert_eq!(refreshed.state, ConnectionState::Connected);
+    assert!(refreshed.subscription.unwrap().updated_at_unix > 1);
+    assert_eq!(controller.calls.lock().unwrap().len(), 2);
+    backend.disconnect().await.unwrap();
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[1].selected);
+    drop(backend);
+
+    let restarted = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(OfflineHttp),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    assert!(restarted.catalog().await.unwrap().groups[0].nodes[1].selected);
+}
+
+#[tokio::test]
+async fn selection_after_connected_refresh_is_saved_for_the_new_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(REFRESH_SELECTION_MIHOMO.as_bytes(), br#"{}"#)
+                .unwrap()
+                .with_subscription_source("https://subscription.example/config", None, 1)
+                .unwrap(),
+        ))
+        .unwrap();
+    let backend = test_backend(
+        store,
+        SubscriptionFetcher::new(FixtureHttp::with_mihomo(REFRESH_SELECTION_MIHOMO)),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    let before = backend.catalog().await.unwrap();
+    backend.connect().await.unwrap();
+    backend.refresh_subscription().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: before.revision,
+            group_id: before.groups[0].id.clone(),
+            node_id: before.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    backend.disconnect().await.unwrap();
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[1].selected);
+    drop(backend);
+    let restarted = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(OfflineHttp),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    assert!(restarted.catalog().await.unwrap().groups[0].nodes[1].selected);
+}
+
+#[tokio::test]
+async fn importing_an_existing_subscription_preserves_its_selected_node() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(FixtureHttp::with_mihomo(REFRESH_SELECTION_MIHOMO)),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    let source = "https://subscription.example/config";
+    backend
+        .import_subscription(ImportSubscriptionRequest { url: source.into() })
+        .await
+        .unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            group_id: catalog.groups[0].id.clone(),
+            node_id: catalog.groups[0].nodes[1].id.clone(),
+        })
+        .await
+        .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest { url: source.into() })
+        .await
+        .unwrap();
+    assert!(backend.catalog().await.unwrap().groups[0].nodes[1].selected);
+    drop(backend);
+    let restarted = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(OfflineHttp),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    assert!(restarted.catalog().await.unwrap().groups[0].nodes[1].selected);
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "multicore-desktop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license.workspace = true
 publish = false
@@ -10,11 +10,13 @@ copypasta = "0.10.2"
 getrandom = "0.4"
 image.workspace = true
 multicore-platform = { path = "../../crates/multicore-platform" }
+multicore-core = { path = "../../crates/multicore-core" }
 multicore-release = { path = "../../crates/multicore-update" }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2.workspace = true
 slint = { version = "=1.17.0", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "compat-1-2", "unstable-winit-030"] }
 
 [target.'cfg(unix)'.dependencies]

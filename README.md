@@ -83,9 +83,9 @@ profiles are never merged. Route selections are persisted per profile. Existing
 single-subscription data under the legacy snapshot directory is migrated locally
 and offline on first profile-store startup. Activating another profile or editing
 its source URL is blocked while connected. Refresh and delete stay available: an
-inactive profile is changed without touching the tunnel, while changing the
-active profile first stops both cores safely and leaves MultiCore ready to
-reconnect.
+inactive profile is changed without touching the tunnel. Refreshing the active
+profile also keeps the current tunnel up and saves the new configuration for
+the next reconnect; deleting the active profile stops both cores safely.
 
 The subscription strip on the Home screen is a compact active-profile selector
 with a small refresh action above the last-updated date. Adding, inspecting, and
@@ -99,6 +99,12 @@ right click toggles MultiCore's own compact control popup with connection,
 group, node, open, and exit actions. The Home page's ambient signal waves are
 bounded behind content and stop while hidden, minimized, or when Windows asks
 applications to reduce motion.
+
+Settings offers separate launch-at-sign-in and auto-connect switches. Auto-connect
+defaults off; when enabled, a background sign-in launch waits for a ready profile
+and network route, then makes one connection attempt. Home shows a dismissible
+update banner only when a newer release is found. MultiCore checks for releases
+at startup and every 24 hours while it remains open.
 
 The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
 daemon. Requests use a random per-launch bearer token, bounded bodies, no proxy,
@@ -203,7 +209,7 @@ Create the per-user installer from that bundle:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-installer.ps1 `
   -PackagePath dist\multicore-windows-x64 `
   -OutputDirectory dist\release `
-  -AppVersion 0.2.2
+  -AppVersion 0.2.3
 ```
 
 Linux packages build with Rust 1.98.1 and, for the Debian package and AppImage,

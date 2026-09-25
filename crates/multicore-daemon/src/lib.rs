@@ -1363,6 +1363,7 @@ struct CoreRuntime<P: ProcessController> {
     state: StateMachine,
     controller: Option<Arc<P>>,
     snapshot: Option<Arc<Snapshot>>,
+    pending_snapshot: Option<(u64, Arc<Snapshot>)>,
     catalog: CatalogDto,
     profile: Option<String>,
     current_node: Option<String>,
@@ -1380,6 +1381,7 @@ impl<P: ProcessController> CoreRuntime<P> {
             state: StateMachine::default(),
             controller: None,
             snapshot: None,
+            pending_snapshot: None,
             catalog: CatalogDto {
                 revision: 0,
                 groups: Vec::new(),
@@ -1428,39 +1430,44 @@ impl<P: ProcessController> CoreRuntime<P> {
             current_node,
             message: self.message.clone(),
             degraded: self.degraded,
-            subscription: self.snapshot.as_ref().and_then(|snapshot| {
-                snapshot
-                    .subscription_info()
-                    .map(|info| SubscriptionInfoDto {
-                        source_name: info.source_host.clone(),
-                        display_name: info.display_name.clone(),
-                        uploaded_bytes: info.uploaded_bytes,
-                        downloaded_bytes: info.downloaded_bytes,
-                        used_bytes: info.used_bytes(),
-                        total_bytes: info.total_bytes,
-                        expires_at_unix: info.expires_at_unix,
-                        updated_at_unix: info.updated_at_unix,
-                        refresh_interval_secs: info.refresh_interval_secs,
-                        announcement_text: info
-                            .announcement_text
-                            .as_deref()
-                            .map(|text| text.chars().take(512).collect()),
-                        announcement_action_label: info.announcement_action_label.clone(),
-                        announcement_tone: info
-                            .announcement_tone
-                            .map(|tone| tone.as_str().to_owned()),
-                        home_available: snapshot.subscription_home_url().is_some(),
-                        support_available: snapshot.subscription_support_url().is_some(),
-                        announcement_action_available: snapshot
-                            .subscription_announcement_url()
-                            .is_some(),
-                        service_logo_path: snapshot
-                            .service_logo_path()
-                            .and_then(std::path::Path::to_str)
-                            .map(ToOwned::to_owned),
-                        refresh_available: snapshot.subscription_source_url().is_some(),
-                    })
-            }),
+            subscription: self
+                .pending_snapshot
+                .as_ref()
+                .map(|(_, snapshot)| snapshot)
+                .or(self.snapshot.as_ref())
+                .and_then(|snapshot| {
+                    snapshot
+                        .subscription_info()
+                        .map(|info| SubscriptionInfoDto {
+                            source_name: info.source_host.clone(),
+                            display_name: info.display_name.clone(),
+                            uploaded_bytes: info.uploaded_bytes,
+                            downloaded_bytes: info.downloaded_bytes,
+                            used_bytes: info.used_bytes(),
+                            total_bytes: info.total_bytes,
+                            expires_at_unix: info.expires_at_unix,
+                            updated_at_unix: info.updated_at_unix,
+                            refresh_interval_secs: info.refresh_interval_secs,
+                            announcement_text: info
+                                .announcement_text
+                                .as_deref()
+                                .map(|text| text.chars().take(512).collect()),
+                            announcement_action_label: info.announcement_action_label.clone(),
+                            announcement_tone: info
+                                .announcement_tone
+                                .map(|tone| tone.as_str().to_owned()),
+                            home_available: snapshot.subscription_home_url().is_some(),
+                            support_available: snapshot.subscription_support_url().is_some(),
+                            announcement_action_available: snapshot
+                                .subscription_announcement_url()
+                                .is_some(),
+                            service_logo_path: snapshot
+                                .service_logo_path()
+                                .and_then(std::path::Path::to_str)
+                                .map(ToOwned::to_owned),
+                            refresh_available: snapshot.subscription_source_url().is_some(),
+                        })
+                }),
         }
     }
 
@@ -1516,6 +1523,7 @@ impl<P: ProcessController> CoreRuntime<P> {
             &self.selected_nodes,
         );
         self.snapshot = Some(snapshot);
+        self.pending_snapshot = None;
         self.message = None;
         self.degraded = false;
     }
@@ -1525,6 +1533,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         self.state = StateMachine::default();
         self.controller = None;
         self.snapshot = None;
+        self.pending_snapshot = None;
         self.catalog = CatalogDto {
             revision: 0,
             groups: Vec::new(),
@@ -2137,6 +2146,11 @@ where
         if source_url.is_empty() {
             return Err(ProfileMutationError::Storage);
         }
+        let (previous_revision, previous) =
+            self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let active = self.store.active_id().as_ref() == Some(id);
+        let connected =
+            active && self.inner.read().await.state.current() == CoreConnectionState::Connected;
         let staging = AtomicSnapshot::default();
         let fetched = self
             .fetcher
@@ -2144,13 +2158,12 @@ where
             .await
             .map_err(|_| ProfileMutationError::Storage)?;
         let (snapshot, _) = fetched.into_parts();
-        let active = self.store.active_id().as_ref() == Some(id);
-        let prepared = if active {
+        let prepared = if active && !connected {
             Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?)
         } else {
             None
         };
-        let stopped_connection = if active {
+        let stopped_connection = if active && !connected {
             self.stop_connection_for_profile_mutation().await?
         } else {
             false
@@ -2161,8 +2174,13 @@ where
                     (revision, physical_generation, persisted, false)
                 }
                 Err(error) if error.mutation_committed() => {
-                    let (revision, physical_generation, persisted) =
-                        self.profile_snapshot_after_commit(id).await?;
+                    let (revision, physical_generation, persisted) = if connected {
+                        self.store
+                            .profile_snapshot_generation(id)
+                            .map_err(|_| ProfileMutationError::Committed)?
+                    } else {
+                        self.profile_snapshot_after_commit(id).await?
+                    };
                     (revision, physical_generation, persisted, true)
                 }
                 Err(error) => {
@@ -2173,7 +2191,19 @@ where
                     });
                 }
             };
+        carry_forward_selections(
+            &self.store,
+            id,
+            previous_revision,
+            &previous,
+            revision,
+            &persisted,
+        )
+        .map_err(|_| ProfileMutationError::Committed)?;
         if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
+            if connected {
+                return Err(ProfileMutationError::Committed);
+            }
             self.remove_profile_logo(id);
             self.reconcile_authoritative_unreadable().await;
             return Err(ProfileMutationError::Committed);
@@ -2184,6 +2214,19 @@ where
                 self.record_maintenance_debt("profile_refresh").await;
             }
             return Ok(self.current_status().await);
+        }
+        if connected {
+            let mut state = self.inner.write().await;
+            state.pending_snapshot = Some((revision, persisted));
+            if maintenance_debt {
+                state.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "profile_refresh",
+                    "Profile refresh committed with maintenance debt.",
+                );
+            }
+            return Ok(state.status());
         }
         let prepared = prepared.expect("active refresh prepares a controller");
         let (selections, explicit_selections) =
@@ -2238,7 +2281,11 @@ where
             .store
             .find_exact_source(trimmed_url)
             .map_err(map_profile_error)?;
-        let (id, maintenance_debt) = if let Some(id) = existing {
+        let (id, maintenance_debt, previous) = if let Some(id) = existing {
+            let previous = self
+                .store
+                .profile_snapshot(&id)
+                .map_err(map_profile_error)?;
             let replace_debt = match self.store.replace_profile_loaded(&id, snapshot.clone()) {
                 Ok(_) => false,
                 Err(error) if error.mutation_committed() => {
@@ -2255,22 +2302,33 @@ where
                     return Err(map_profile_error(error));
                 }
             };
-            (id, replace_debt || activate_debt)
+            (id, replace_debt || activate_debt, Some(previous))
         } else {
             match self.store.create_profile(snapshot.clone()) {
-                Ok(id) => (id, false),
+                Ok(id) => (id, false, None),
                 Err(error) if error.mutation_committed() => {
                     let Some(id) = self.store.active_id() else {
                         self.reconcile_authoritative().await;
                         return Err(ProfileMutationError::Storage);
                     };
-                    (id, true)
+                    (id, true, None)
                 }
                 Err(error) => return Err(map_profile_error(error)),
             }
         };
         let (revision, physical_generation, persisted) =
             self.profile_snapshot_after_commit(&id).await?;
+        if let Some((previous_revision, previous)) = previous {
+            carry_forward_selections(
+                &self.store,
+                &id,
+                previous_revision,
+                &previous,
+                revision,
+                &persisted,
+            )
+            .map_err(|_| ProfileMutationError::Committed)?;
+        }
         self.retain_profile_logo(&id, physical_generation, &persisted);
         let (selections, explicit_selections) =
             initial_and_explicit_selections(&self.store, &id, revision, &persisted);
@@ -2395,6 +2453,60 @@ fn initial_and_explicit_selections(
         }
     }
     (selections, explicit)
+}
+
+fn carry_forward_selections(
+    store: &ProfileStore,
+    id: &ProfileId,
+    previous_revision: u64,
+    previous: &Snapshot,
+    next_revision: u64,
+    next: &Snapshot,
+) -> Result<(), ProfileError> {
+    let previous_groups = selectable_groups(previous);
+    let saved_nodes = restored_selections(store, id, previous_revision, previous);
+    for (previous_group, saved_node) in previous_groups.iter().zip(saved_nodes) {
+        let Some(saved_node) = saved_node else {
+            continue;
+        };
+        let Some((group_id, node_id)) =
+            selection_ids_for_names(next_revision, next, previous_group.name, &saved_node)
+        else {
+            continue;
+        };
+        store.save_selection(id, next_revision, &group_id, &node_id)?;
+    }
+    Ok(())
+}
+
+fn selection_ids_for_names(
+    revision: u64,
+    snapshot: &Snapshot,
+    group_name: &str,
+    node_name: &str,
+) -> Option<(String, String)> {
+    let groups = selectable_groups(snapshot);
+    let mut matching_groups = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| group.name == group_name);
+    let (group_index, group) = matching_groups.next()?;
+    if matching_groups.next().is_some() {
+        return None;
+    }
+    let mut matching_nodes = group
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| **node == node_name);
+    let (node_index, _) = matching_nodes.next()?;
+    if matching_nodes.next().is_some() {
+        return None;
+    }
+    Some((
+        catalog_group_id(revision, group_index),
+        catalog_node_id(revision, group_index, node_index),
+    ))
 }
 
 #[async_trait]
@@ -2683,7 +2795,9 @@ where
                     "disconnect",
                     "Подключение остановлено.",
                 );
-                Ok(state.status())
+                drop(state);
+                self.reconcile_authoritative().await;
+                Ok(self.current_status().await)
             }
             Err(_) => {
                 state.mark_error(
@@ -2711,6 +2825,7 @@ where
             raw_group,
             raw_node,
             previous_raw_node,
+            pending_snapshot,
         ) = {
             let state = self.inner.read().await;
             if !matches!(
@@ -2758,6 +2873,7 @@ where
                 raw_group,
                 raw_node,
                 previous_raw_node,
+                state.pending_snapshot.clone(),
             )
         };
 
@@ -2768,12 +2884,23 @@ where
                 .map_err(|_| SelectionError::SelectorFailed)?;
         }
 
-        let maintenance_debt = match self.store.save_selection(
-            &active_profile_id,
-            request.revision,
-            &request.group_id,
-            &request.node_id,
-        ) {
+        let save_target = if let Some((pending_revision, pending)) = &pending_snapshot {
+            selection_ids_for_names(*pending_revision, pending, &raw_group, &raw_node)
+                .map(|(group_id, node_id)| (*pending_revision, group_id, node_id))
+        } else {
+            Some((
+                request.revision,
+                request.group_id.clone(),
+                request.node_id.clone(),
+            ))
+        };
+        let save_result = save_target
+            .as_ref()
+            .map_or(Ok(()), |(revision, group_id, node_id)| {
+                self.store
+                    .save_selection(&active_profile_id, *revision, group_id, node_id)
+            });
+        let maintenance_debt = match save_result {
             Ok(()) => false,
             Err(error) if error.mutation_committed() => true,
             Err(_) => {
@@ -2807,7 +2934,7 @@ where
         if state.catalog.revision != request.revision {
             return Err(SelectionError::StaleRevision);
         }
-        if maintenance_debt {
+        if maintenance_debt && pending_snapshot.is_none() {
             let (selected_nodes, explicit_selected_nodes) = initial_and_explicit_selections(
                 &self.store,
                 &active_profile_id,

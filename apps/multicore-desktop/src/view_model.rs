@@ -6,6 +6,7 @@ use std::{
 };
 
 use regex::Regex;
+use sha2::{Digest, Sha256};
 
 use crate::daemon::{
     DaemonCatalog, DaemonClient, DaemonDiagnostics, DaemonEvent, DaemonEventBatch, DaemonLatencies,
@@ -16,6 +17,14 @@ use crate::daemon::{
 const MAX_SUBSCRIPTION_PROFILES: usize = 16;
 pub(crate) const MAX_SUBSCRIPTION_URL_BYTES: usize = 8_192;
 const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
+const STABLE_ROUTE_KEY_PREFIX: &str = "label-sha256:";
+
+fn stable_route_key(label: &str) -> String {
+    format!(
+        "{STABLE_ROUTE_KEY_PREFIX}{:x}",
+        Sha256::digest(label.as_bytes())
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiState {
@@ -1377,7 +1386,11 @@ impl DesktopViewModel {
         let Some(info) = self.subscription.as_ref() else {
             return false;
         };
-        if !matches!(self.state, UiState::Ready { .. }) || !info.refresh_available {
+        if !matches!(
+            self.state,
+            UiState::Ready { .. } | UiState::Connected { .. }
+        ) || !info.refresh_available
+        {
             return false;
         }
         now_unix
@@ -2014,7 +2027,7 @@ impl DesktopViewModel {
     }
 
     /// Supplies the route choices loaded from preferences before the first catalog refresh.
-    /// IDs are opaque daemon values; unknown IDs are ignored when the catalog arrives.
+    /// Legacy opaque IDs and stable unique labels are both accepted.
     pub(crate) fn restore_route_preferences(
         &mut self,
         group_id: Option<&str>,
@@ -2027,7 +2040,7 @@ impl DesktopViewModel {
         }
     }
 
-    /// Returns the currently selected route IDs in the shape persisted by the desktop shell.
+    /// Keeps daemon node IDs opaque; only the locally viewed group gets a stable label hash.
     pub(crate) fn route_preferences(
         &self,
     ) -> Option<(String, Option<String>, BTreeMap<String, String>)> {
@@ -2045,11 +2058,47 @@ impl DesktopViewModel {
                     .map(|node| (group.id.clone(), node.id.clone()))
             })
             .collect();
-        Some((
-            self.active_profile_id.clone()?,
-            self.selected_catalog_group.clone(),
-            selections,
-        ))
+        let selected_group = self
+            .selected_catalog_group
+            .as_ref()
+            .and_then(|id| self.catalog_groups.iter().find(|group| &group.id == id))
+            .and_then(|group| {
+                let key = stable_route_key(&group.label);
+                (self.resolve_group_preference_id(&key).as_deref() == Some(group.id.as_str()))
+                    .then_some(key)
+            });
+        Some((self.active_profile_id.clone()?, selected_group, selections))
+    }
+
+    pub(crate) fn resolve_group_preference_id(&self, key: &str) -> Option<String> {
+        if key.starts_with(STABLE_ROUTE_KEY_PREFIX) {
+            let mut matching = self
+                .catalog_groups
+                .iter()
+                .filter(|group| stable_route_key(&group.label) == key);
+            let group = matching.next()?;
+            return matching.next().is_none().then(|| group.id.clone());
+        }
+        if let Some(group) = self.catalog_groups.iter().find(|group| group.id == key) {
+            return Some(group.id.clone());
+        }
+        None
+    }
+
+    pub(crate) fn resolve_route_preference_ids(
+        &self,
+        group_key: &str,
+        node_key: &str,
+    ) -> Option<(String, String)> {
+        let group_id = self.resolve_group_preference_id(group_key)?;
+        let group = self
+            .catalog_groups
+            .iter()
+            .find(|group| group.id == group_id)?;
+        if let Some(node) = group.nodes.iter().find(|node| node.id == node_key) {
+            return Some((group_id, node.id.clone()));
+        }
+        None
     }
 
     pub(crate) fn begin_node_selection(&mut self, node_id: &str) -> Option<NodeSelectionRequest> {
@@ -2411,16 +2460,21 @@ impl DesktopViewModel {
         if self.catalog_groups.is_empty() {
             return;
         }
-        if let Some(group_id) = self.restored_route_group.take()
-            && self.catalog_groups.iter().any(|group| group.id == group_id)
+        if let Some(group_key) = self.restored_route_group.take()
+            && let Some(group_id) = self.resolve_group_preference_id(&group_key)
         {
             self.selected_catalog_group = Some(group_id);
         }
         if self.restored_route_nodes.is_empty() {
             return;
         }
+        let resolved: BTreeMap<_, _> = self
+            .restored_route_nodes
+            .iter()
+            .filter_map(|(group, node)| self.resolve_route_preference_ids(group, node))
+            .collect();
         for group in &mut self.catalog_groups {
-            let Some(node_id) = self.restored_route_nodes.get(&group.id) else {
+            let Some(node_id) = resolved.get(&group.id) else {
                 continue;
             };
             let Some(target_index) = group.nodes.iter().position(|node| node.id == *node_id) else {
@@ -4258,7 +4312,8 @@ mod tests {
             profile: "Основной".into(),
             node: "Auto".into(),
         };
-        assert!(!model.automatic_subscription_refresh_due_at(u64::MAX));
+        assert!(model.automatic_subscription_refresh_due_at(u64::MAX));
+        assert!(model.begin_subscription_refresh().is_some());
     }
 
     #[test]
@@ -5097,10 +5152,46 @@ mod tests {
             .find(|node| node.selected)
             .expect("restored selected node");
         assert_eq!(selected.id, "opaque:node-c");
+        let saved = view_model.route_preferences().expect("route preferences").2;
+        assert_eq!(saved, selections);
+    }
+
+    #[test]
+    fn viewed_group_survives_revision_without_replaying_stale_node_ids() {
+        let old = catalog_fixture();
+        let mut original = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        original.active_profile_id = Some("profile-a".into());
+        let request = original.begin_catalog_request().unwrap();
+        original
+            .finish_catalog(request.token, Ok(old.clone()))
+            .unwrap();
+        let (_, selected_group, selections) = original.route_preferences().unwrap();
+        let group_key = selected_group.as_deref().unwrap();
+        assert!(group_key.starts_with("label-sha256:"));
+        assert!(!group_key.contains(&old.groups[1].label));
         assert_eq!(
-            view_model.route_preferences().expect("route preferences").2,
-            selections
+            selections.get("opaque:selected").map(String::as_str),
+            Some("opaque:node-b")
         );
+
+        let mut revised = old;
+        revised.revision += 1;
+        for (group_index, group) in revised.groups.iter_mut().enumerate() {
+            group.id = format!("new-group-{group_index}");
+            group.selected = false;
+            for (node_index, node) in group.nodes.iter_mut().enumerate() {
+                node.id = format!("new-node-{group_index}-{node_index}");
+                node.selected = false;
+            }
+        }
+        let mut restored = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        restored.active_profile_id = Some("profile-a".into());
+        restored.restore_route_preferences(selected_group.as_deref(), &selections);
+        let request = restored.begin_catalog_request().unwrap();
+        restored.finish_catalog(request.token, Ok(revised)).unwrap();
+        let catalog = restored.catalog_presentation();
+        assert_eq!(catalog.selected_group_id.as_deref(), Some("new-group-1"));
+        assert!(catalog.nodes.iter().all(|node| !node.selected));
     }
 
     #[test]
@@ -5942,7 +6033,7 @@ mod tests {
         let connection_strip = source
             .split("connection-strip := Rectangle")
             .nth(1)
-            .and_then(|source| source.split("height: 54px;").next())
+            .and_then(|source| source.split("update-banner := Rectangle").next())
             .expect("connection strip source");
         assert!(connection_strip.contains("alignment: start;"));
         assert!(!connection_strip.contains("alignment: center;"));
