@@ -5968,6 +5968,14 @@ mod tests {
         assert!(settings.contains("width: settings-scroll.visible-width;"));
         assert!(settings.contains("min-height: settings-scroll.visible-height;"));
         assert!(settings.contains("padding: 28px;"));
+        assert!(settings.contains("? settings-scroll.visible-width - 56px"));
+        let subscription_header = settings
+            .split("if root.visible-page == \"subscriptions\": VerticalLayout")
+            .nth(1)
+            .and_then(|source| source.split("if root.replace-editor-open").next())
+            .expect("subscription header");
+        assert!(subscription_header.contains("width: parent.width - 128px;"));
+        assert!(subscription_header.contains("overflow: elide;"));
         assert!(settings.contains("// Historical minimum-height contract used spacing: 18px;."));
         assert!(settings.contains("LineEdit { text <=> root.subscription-draft;"));
         assert!(settings.matches("ToggleRow {").count() >= 2);

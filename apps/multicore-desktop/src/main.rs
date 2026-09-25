@@ -73,6 +73,9 @@ const DEEP_LINK_WAITING_FOR_DISCONNECT_RU: &str =
 #[derive(Default)]
 struct PendingSubscriptionImports {
     urls: VecDeque<String>,
+    in_flight: bool,
+    attempts: u8,
+    retry_at: Option<Instant>,
 }
 
 impl PendingSubscriptionImports {
@@ -84,15 +87,34 @@ impl PendingSubscriptionImports {
         true
     }
 
-    fn dispatch_next(&mut self, try_import: impl FnOnce(&str) -> bool) -> bool {
+    fn dispatch_next(&mut self, now: Instant, try_import: impl FnOnce(&str) -> bool) -> bool {
+        if self.in_flight || self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return false;
+        }
         let Some(url) = self.urls.front() else {
             return false;
         };
         if !try_import(url) {
             return false;
         }
-        self.urls.pop_front();
+        self.in_flight = true;
+        self.attempts += 1;
         true
+    }
+
+    fn finish_attempt(&mut self, url: &str, succeeded: bool, now: Instant) {
+        if self.urls.front().is_none_or(|queued| queued != url) {
+            return;
+        }
+        if succeeded || self.attempts >= 3 {
+            self.urls.pop_front();
+            self.in_flight = false;
+            self.attempts = 0;
+            self.retry_at = None;
+        } else if self.in_flight {
+            self.in_flight = false;
+            self.retry_at = Some(now + Duration::from_secs(if self.attempts == 1 { 2 } else { 5 }));
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -642,8 +664,13 @@ fn main() -> Result<(), slint::PlatformError> {
     );
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
-    wire_import(&ui, model.clone(), profile_preferences.clone());
     let pending_subscription_imports = Arc::new(Mutex::new(PendingSubscriptionImports::default()));
+    wire_import(
+        &ui,
+        model.clone(),
+        profile_preferences.clone(),
+        pending_subscription_imports.clone(),
+    );
     let _pending_import_timer =
         wire_pending_subscription_imports(&ui, model.clone(), pending_subscription_imports.clone());
     wire_clipboard_import(&ui, model.clone());
@@ -845,7 +872,7 @@ fn wire_pending_subscription_imports(
         pending
             .lock()
             .expect("pending subscription imports lock")
-            .dispatch_next(|url| {
+            .dispatch_next(Instant::now(), |url| {
                 prefill_subscription(&ui, url.to_owned());
                 ui.invoke_import_url(url.into())
             });
@@ -2084,6 +2111,7 @@ fn wire_import(
     ui: &AppWindow,
     model: Arc<Mutex<DesktopViewModel>>,
     profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    pending: Arc<Mutex<PendingSubscriptionImports>>,
 ) {
     let weak = ui.as_weak();
     ui.on_import_url(move |url| {
@@ -2112,6 +2140,7 @@ fn wire_import(
             mutation,
             url,
             profile_preferences.clone(),
+            pending.clone(),
         );
         true
     });
@@ -2754,6 +2783,7 @@ fn run_import(
     mutation: MutationToken,
     url: String,
     profile_preferences: Arc<Mutex<ProfilePreferenceReconciler>>,
+    pending: Arc<Mutex<PendingSubscriptionImports>>,
 ) {
     thread::spawn(move || {
         let result = client.import_subscription(&url);
@@ -2762,6 +2792,10 @@ fn run_import(
             let mut model = model.lock().expect("view model lock");
             model.finish_import(mutation, result);
         }
+        pending
+            .lock()
+            .expect("pending subscription imports lock")
+            .finish_attempt(&url, import_succeeded, Instant::now());
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
                 let current = apply_latest_snapshot(&ui, &model);
@@ -3615,7 +3649,7 @@ mod window_tests {
         parse_resize_edge,
     };
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn maximize_toggle_inverts_current_window_state() {
@@ -5083,20 +5117,25 @@ mod window_tests {
     #[test]
     fn queued_installer_urls_wait_for_import_and_keep_arrival_order() {
         let mut pending = PendingSubscriptionImports::default();
+        let now = Instant::now();
         assert!(pending.enqueue("https://example.com/first".into()));
         assert!(pending.enqueue("https://example.com/second".into()));
-        assert!(!pending.dispatch_next(|_| false));
+        assert!(!pending.dispatch_next(now, |_| false));
         assert_eq!(pending.len(), 2);
 
         let mut imported = Vec::new();
-        assert!(pending.dispatch_next(|url| {
+        assert!(pending.dispatch_next(now, |url| {
             imported.push(url.to_owned());
             true
         }));
-        assert!(pending.dispatch_next(|url| {
+        assert!(!pending.dispatch_next(now, |_| true));
+        assert_eq!(pending.len(), 2);
+        pending.finish_attempt("https://example.com/first", true, now);
+        assert!(pending.dispatch_next(now, |url| {
             imported.push(url.to_owned());
             true
         }));
+        pending.finish_attempt("https://example.com/second", true, now);
         assert_eq!(
             imported,
             ["https://example.com/first", "https://example.com/second"]
@@ -5105,10 +5144,25 @@ mod window_tests {
     }
 
     #[test]
+    fn failed_installer_import_retries_without_losing_the_url() {
+        let mut pending = PendingSubscriptionImports::default();
+        let now = Instant::now();
+        let url = "https://example.com/sub";
+        assert!(pending.enqueue(url.into()));
+        assert!(pending.dispatch_next(now, |_| true));
+        pending.finish_attempt(url, false, now);
+        assert_eq!(pending.len(), 1);
+        assert!(!pending.dispatch_next(now, |_| true));
+        assert!(pending.dispatch_next(now + Duration::from_secs(2), |_| true));
+        pending.finish_attempt(url, true, now + Duration::from_secs(2));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn installer_uri_imports_on_initial_and_secondary_launch() {
         let source = include_str!("main.rs");
         let startup = source
-            .split("wire_import(&ui, model.clone(), profile_preferences.clone());")
+            .split("wire_import(\n        &ui,")
             .nth(1)
             .and_then(|source| {
                 source
@@ -5126,7 +5180,7 @@ mod window_tests {
             .and_then(|source| source.split("fn wire_external_activations(").next())
             .expect("queued installer URL dispatch");
         assert!(dispatch.contains("ui.invoke_import_url(url.into())"));
-        assert!(dispatch.contains(".dispatch_next(|url|"));
+        assert!(dispatch.contains(".dispatch_next(Instant::now(), |url|"));
 
         let secondary = source
             .split("single_instance::Activation::InstallSubscription(url) => {")

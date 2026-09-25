@@ -454,7 +454,7 @@ export component AppWindow inherits Window {
     private property <int> first-run-trigger-focus-serial: 0;
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
-    in property <string> update-status: "MultiCore 0.2.6";
+    in property <string> update-status: "MultiCore 0.2.7";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
@@ -1429,7 +1429,7 @@ export component AppWindow inherits Window {
                                 Rectangle { vertical-stretch: 1; background: transparent; }
                             }
                             settings-section-body := VerticalLayout {
-                                width: root.visible-page == "subscriptions" ? root.width - 232px : root.width >= 800px ? root.width - 380px : root.width - 356px;
+                                width: root.visible-page == "subscriptions" ? settings-scroll.visible-width - 56px : root.width >= 800px ? settings-scroll.visible-width - 204px : settings-scroll.visible-width - 180px;
                                 horizontal-stretch: 1;
                                 spacing: 16px;
 
@@ -1489,9 +1489,10 @@ export component AppWindow inherits Window {
                                 height: 52px;
                                 spacing: 16px;
                                 VerticalLayout {
+                                    width: parent.width - 128px;
                                     spacing: 2px;
-                                    Text { text: "До 16 подписок · активна только одна"; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
-                                    Text { text: "Ссылки хранятся локально и не показываются в интерфейсе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                                    Text { width: parent.width; text: "До 16 подписок · активна только одна"; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                                    Text { width: parent.width; text: "Ссылки хранятся локально и не показываются в интерфейсе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
                                 }
                                 SmallAction { width: 112px; label: "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
                             }
