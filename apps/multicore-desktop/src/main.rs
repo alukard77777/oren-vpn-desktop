@@ -1862,9 +1862,27 @@ fn close_window(weak: &slint::Weak<AppWindow>, tray_available: bool) {
 /// Preserve the native-only hide path on Windows.
 fn hide_window_to_tray(ui: &AppWindow) {
     #[cfg(target_os = "linux")]
-    if let Err(error) = ui.hide() {
-        ui.set_shell_active(true);
-        eprintln!("failed to hide window to tray: {error}");
+    {
+        let window = ui.window();
+        let size = window.size().to_logical(window.scale_factor());
+        let maximized = window.is_maximized();
+        match ui.hide() {
+            Ok(()) if !window.has_winit_window() => {
+                // Slint 1.17 recreates Wayland windows from default attributes.
+                // An explicit size avoids its first-show preferred-size reset.
+                window.set_size(size);
+                if maximized {
+                    // Refresh the attributes even if Slint's cached state is true.
+                    window.set_maximized(false);
+                    window.set_maximized(true);
+                }
+            }
+            Ok(()) => {}
+            Err(error) => {
+                ui.set_shell_active(true);
+                eprintln!("failed to hide window to tray: {error}");
+            }
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {

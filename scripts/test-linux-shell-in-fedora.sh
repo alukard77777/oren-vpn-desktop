@@ -23,7 +23,7 @@ docker run --rm --init \
   --env MULTICORE_SHELL_EVIDENCE=/evidence \
   --env "MULTICORE_SHELL_UID=$test_uid" \
   fedora:44 bash -euo pipefail -c '
-    timeout 600s dnf install -y weston dbus-daemon gtk3 libX11 libXcursor libXi libXrandr \
+    timeout 600s dnf install -y weston xorg-x11-server-Xvfb dbus-daemon gtk3 libX11 libXcursor libXi libXrandr \
       libxkbcommon-x11 libappindicator-gtk3 mesa-dri-drivers mesa-libEGL \
       mesa-libGL dejavu-sans-fonts python3-gobject-base shadow-utils util-linux
     useradd --create-home --uid "$MULTICORE_SHELL_UID" shelltest

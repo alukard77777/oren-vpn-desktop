@@ -4,12 +4,17 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ $# == 2 && "$1" == --test-binary && -x "$2" ]] || { echo 'Usage: test-linux-shell.sh --test-binary /absolute/test-executable' >&2; exit 1; }
 test_binary="$2"
-for command in weston dbus-run-session timeout python3; do command -v "$command" >/dev/null; done
+for command in weston Xvfb dbus-run-session timeout python3; do command -v "$command" >/dev/null; done
 evidence="${MULTICORE_SHELL_EVIDENCE:?private evidence directory required}"
 mkdir -p "$evidence"
 runtime="$(mktemp -d -t multicore-wayland.XXXXXXXX)"
 compositor_pid=''
+x11_pid=''
 cleanup() {
+  if [[ -n "$x11_pid" ]]; then
+    kill "$x11_pid" 2>/dev/null || true
+    wait "$x11_pid" 2>/dev/null || true
+  fi
   if [[ -n "$compositor_pid" ]]; then
     kill "$compositor_pid" 2>/dev/null || true
     wait "$compositor_pid" 2>/dev/null || true
@@ -60,4 +65,20 @@ if ! timeout 30s dbus-run-session -- python3 scripts/fixtures/status_notifier_ho
   result=1
 fi
 check_test_count "$evidence/tray-menu.log"
+Xvfb -displayfd 3 -screen 0 1280x900x24 -nolisten tcp -ac \
+  3> "$runtime/x11-display" > "$evidence/xvfb.log" 2>&1 &
+x11_pid=$!
+for ((attempt=0; attempt<100; attempt++)); do
+  [[ -s "$runtime/x11-display" ]] && break
+  kill -0 "$x11_pid" 2>/dev/null || { cat "$evidence/xvfb.log"; exit 1; }
+  sleep 0.1
+done
+read -r x11_display < "$runtime/x11-display"
+[[ "$x11_display" =~ ^[0-9]+$ ]] || { cat "$evidence/xvfb.log"; exit 1; }
+if ! DISPLAY=":$x11_display" GDK_BACKEND=x11 timeout 30s dbus-run-session -- "$test_binary" \
+  linux_shell_tests::x11_title_buttons_still_hide_and_restore \
+  --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/x11-title-buttons.log"; then
+  result=1
+fi
+check_test_count "$evidence/x11-title-buttons.log"
 exit "$result"
