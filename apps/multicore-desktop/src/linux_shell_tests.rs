@@ -84,6 +84,38 @@ fn wayland_title_buttons_hide_and_restore_without_exiting() {
 
 #[test]
 #[ignore = "requires the isolated native Wayland compositor in test-linux-shell.sh"]
+fn wayland_minimize_without_tray_keeps_recoverable_window() {
+    let ui = wayland_window(false);
+    let weak = ui.as_weak();
+    let phase = Rc::new(Cell::new(0));
+    let progress = phase.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        let ui = weak.upgrade().unwrap();
+        match progress.get() {
+            0 => {
+                click_title_button(&ui, 110.0);
+                assert!(ui.window().is_minimized());
+                assert!(ui.window().has_winit_window());
+            }
+            1 => {
+                // Native minimize must not tear down the recovery surface when no tray exists.
+                assert!(ui.window().is_visible());
+                restore_and_focus(&ui);
+                assert!(!ui.window().is_minimized());
+            }
+            2 => click_title_button(&ui, 22.0),
+            _ => panic!("close after native minimize did not exit"),
+        }
+        progress.set(progress.get() + 1);
+    });
+    slint::run_event_loop_until_quit().unwrap();
+    assert_eq!(phase.get(), 3);
+    ui.hide().unwrap();
+}
+
+#[test]
+#[ignore = "requires the isolated native Wayland compositor in test-linux-shell.sh"]
 fn wayland_close_without_tray_exits() {
     let ui = wayland_window(false);
     let weak = ui.as_weak();

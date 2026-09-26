@@ -108,6 +108,7 @@ jobs:
           python3 -B scripts/fixtures/test_runner_workspace_recovery.py
 
       - name: Test native Wayland window lifecycle
+        if: ${{ !cancelled() }}
         run: bash scripts/test-linux-shell-in-fedora.sh
       - name: Retain native Wayland evidence
         if: always()

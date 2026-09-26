@@ -886,6 +886,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn exclusive_lock_is_close_on_exec() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = DirectoryCapability::open(temp.path()).unwrap();
+        let lock = directory.lock_exclusive().unwrap();
+
+        let flags = rustix::io::fcntl_getfd(&lock._file).unwrap();
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "a spawned child must not inherit the store lock"
+        );
+    }
+
+    #[test]
     fn opening_existing_regular_file_restores_owner_only_mode() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config");
