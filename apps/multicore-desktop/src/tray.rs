@@ -1083,19 +1083,20 @@ mod linux {
         };
         connection
             .call_sync(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-                "NameHasOwner",
-                Some(&(STATUS_NOTIFIER_WATCHER,).into()),
-                Some(glib::VariantTy::new("(b)").expect("static variant type")),
-                gtk::gio::DBusCallFlags::NONE,
+                Some(STATUS_NOTIFIER_WATCHER),
+                "/StatusNotifierWatcher",
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                Some(&(STATUS_NOTIFIER_WATCHER, "IsStatusNotifierHostRegistered").into()),
+                Some(glib::VariantTy::new("(v)").expect("static variant type")),
+                gtk::gio::DBusCallFlags::NO_AUTO_START,
                 1000,
                 None::<&gtk::gio::Cancellable>,
             )
             .ok()
-            .and_then(|reply| reply.get::<(bool,)>())
-            .is_some_and(|(owned,)| owned)
+            .and_then(|reply| reply.get::<(glib::Variant,)>())
+            .and_then(|(host_registered,)| host_registered.get::<bool>())
+            .unwrap_or(false)
     }
 
     fn xembed_tray_running() -> bool {

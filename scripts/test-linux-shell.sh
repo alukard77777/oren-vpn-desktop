@@ -36,14 +36,14 @@ result=0
 check_test_count() {
   grep -Fqx 'running 1 test' "$1" || { echo "Expected exactly one native test in $1" >&2; result=1; }
 }
-for test in wayland_title_buttons_hide_and_restore_without_exiting wayland_close_without_tray_exits wayland_minimize_without_tray_keeps_recoverable_window; do
+for test in wayland_title_buttons_hide_and_restore_without_exiting wayland_close_without_tray_exits wayland_minimize_without_tray_keeps_recoverable_window wayland_hide_restore_preserves_user_geometry; do
   if ! WAYLAND_DEBUG=client timeout 30s dbus-run-session -- "$test_binary" \
     "linux_shell_tests::$test" --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/$test.log"; then
     result=1
   fi
   check_test_count "$evidence/$test.log"
 done
-grep -Eq 'xdg_toplevel@[0-9]+\.set_minimized\(' "$evidence/wayland_minimize_without_tray_keeps_recoverable_window.log" || {
+grep -Eq 'xdg_toplevel[@#][0-9]+\.set_minimized\(' "$evidence/wayland_minimize_without_tray_keeps_recoverable_window.log" || {
   echo 'The compositor did not receive a native minimize request' >&2; result=1;
 }
 for host in absent false true; do

@@ -64,9 +64,11 @@ fn wayland_title_buttons_hide_and_restore_without_exiting() {
                 assert!(!ui.window().is_visible());
                 restore_and_focus(&ui);
                 assert!(ui.window().is_visible());
-                assert!(ui.window().has_winit_window());
             }
             2 | 6 | 10 => {
+                // Slint creates the replacement native window at about_to_wait,
+                // after show() returns. Inspect it on a later event-loop turn.
+                assert!(ui.window().has_winit_window());
                 click_title_button(&ui, 22.0); // Actual Slint close hit target.
                 assert!(!ui.window().is_visible(), "close must hide on Wayland");
                 assert!(!ui.window().has_winit_window());
@@ -79,6 +81,69 @@ fn wayland_title_buttons_hide_and_restore_without_exiting() {
     });
     slint::run_event_loop_until_quit().unwrap();
     assert_eq!(phase.get(), 12, "event loop exited while hidden");
+    ui.hide().unwrap();
+}
+
+#[test]
+#[ignore = "requires the isolated native Wayland compositor in test-linux-shell.sh"]
+fn wayland_hide_restore_preserves_user_geometry() {
+    let ui = wayland_window(true);
+    let weak = ui.as_weak();
+    let phase = Rc::new(Cell::new(0));
+    let progress = phase.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+        let ui = weak.upgrade().unwrap();
+        match progress.get() {
+            0 => {
+                ui.window()
+                    .with_winit_window(|window| {
+                        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(980, 780));
+                    })
+                    .unwrap();
+            }
+            1 => {
+                assert_eq!(
+                    ui.window().size().to_logical(ui.window().scale_factor()),
+                    slint::LogicalSize::new(980.0, 780.0)
+                );
+                click_title_button(&ui, 110.0);
+                assert!(!ui.window().is_visible());
+            }
+            2 => restore_and_focus(&ui),
+            3 => {
+                assert_eq!(
+                    ui.window().size().to_logical(ui.window().scale_factor()),
+                    slint::LogicalSize::new(980.0, 780.0),
+                    "restore lost user size"
+                );
+                ui.window().set_maximized(true);
+            }
+            4 => {
+                assert_eq!(
+                    ui.window()
+                        .with_winit_window(|window| window.is_maximized()),
+                    Some(true)
+                );
+                ui.invoke_window_close();
+                assert!(!ui.window().is_visible());
+            }
+            5 => restore_and_focus(&ui),
+            6 => {
+                assert_eq!(
+                    ui.window()
+                        .with_winit_window(|window| window.is_maximized()),
+                    Some(true),
+                    "restore lost maximized state"
+                );
+                slint::quit_event_loop().unwrap();
+            }
+            _ => panic!("unexpected timer tick"),
+        }
+        progress.set(progress.get() + 1);
+    });
+    slint::run_event_loop_until_quit().unwrap();
+    assert_eq!(phase.get(), 7);
     ui.hide().unwrap();
 }
 
@@ -183,7 +248,7 @@ fn wayland_native_tray_menu_restores_and_exits() {
                 std::fs::write(&marker, "restore-one").unwrap();
                 progress.set(1);
             }
-            1 if seen_actions.get() == 1 => {
+            1 if seen_actions.get() == 1 && ui.window().has_winit_window() => {
                 assert!(ui.window().is_visible());
                 assert!(ui.window().has_winit_window());
                 click_title_button(&ui, 22.0);
@@ -191,7 +256,7 @@ fn wayland_native_tray_menu_restores_and_exits() {
                 std::fs::write(&marker, "restore-two").unwrap();
                 progress.set(2);
             }
-            2 if seen_actions.get() == 2 => {
+            2 if seen_actions.get() == 2 && ui.window().has_winit_window() => {
                 assert!(ui.window().is_visible());
                 assert!(ui.window().has_winit_window());
                 std::fs::write(&marker, "exit").unwrap();

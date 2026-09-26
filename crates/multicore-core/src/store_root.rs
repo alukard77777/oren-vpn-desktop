@@ -69,7 +69,8 @@ impl DirectoryCapability {
             #[cfg(target_os = "solaris")]
             let file = open_unix_lock_file(self, OsStr::new(".index.lock"))?;
             #[cfg(not(target_os = "solaris"))]
-            let file = fd_into_file(rustix::io::dup(&self.fd)?);
+            // Set CLOEXEC atomically so spawned children cannot retain the store lock.
+            let file = fd_into_file(rustix::io::fcntl_dupfd_cloexec(&self.fd, 0)?);
             fs2::FileExt::try_lock_exclusive(&file)?;
             Ok(StoreLock { _file: file })
         }

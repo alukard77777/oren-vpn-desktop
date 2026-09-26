@@ -1856,17 +1856,22 @@ fn close_window(weak: &slint::Weak<AppWindow>, tray_available: bool) {
     }
 }
 
-/// Hide the native surface without deregistering the Slint window.
-///
-/// `slint::Window::hide()` releases the framework keep-alive for the window.
-/// When the tray is the only remaining recovery surface that lets the event
-/// loop terminate as soon as the title bar is closed/minimized. Keep the
-/// component registered and only hide its Winit window instead; tray events
-/// and timers can then continue to run until the explicit tray Exit action.
+/// Wayland cannot hide a native Winit window: Slint must destroy its surface
+/// and recreate it on show(). The explicit run_event_loop_until_quit() keeps
+/// tray events and timers alive while there are no visible windows.
+/// Preserve the native-only hide path on Windows.
 fn hide_window_to_tray(ui: &AppWindow) {
-    let _ = ui.window().with_winit_window(|window| {
-        window.set_visible(false);
-    });
+    #[cfg(target_os = "linux")]
+    if let Err(error) = ui.hide() {
+        ui.set_shell_active(true);
+        eprintln!("failed to hide window to tray: {error}");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ui.window().with_winit_window(|window| {
+            window.set_visible(false);
+        });
+    }
 }
 
 fn apply_tray_popup_model(
@@ -4677,6 +4682,10 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("fn apply_tray_popup_model").next())
             .expect("tray hide helper");
+        let helper = helper
+            .split("#[cfg(not(target_os = \"linux\"))]")
+            .nth(1)
+            .expect("native-only hide branch");
         assert!(helper.contains("with_winit_window"));
         assert!(helper.contains("window.set_visible(false)"));
         assert!(!helper.contains("ui.hide()"));
