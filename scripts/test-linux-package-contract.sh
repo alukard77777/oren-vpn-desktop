@@ -96,7 +96,7 @@ check_rpm() (
   local requires dependency
   requires="$(rpm -qp --requires "$package")"
   for dependency in 'gtk3(x86-64)' 'libayatana-appindicator-gtk3(x86-64)' \
-      polkit iproute 'libxkbcommon(x86-64)' 'fontconfig(x86-64)' \
+      polkit iproute 'libxkbcommon(x86-64)' 'libxkbcommon-x11(x86-64)' 'fontconfig(x86-64)' \
       'libglvnd-glx(x86-64)' 'libglvnd-egl(x86-64)' hicolor-icon-theme \
       'libc.so.6()(64bit)'; do
     grep -Fxq "$dependency" <<<"$requires" || {

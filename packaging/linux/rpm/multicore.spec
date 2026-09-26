@@ -25,6 +25,8 @@ Requires:       libayatana-appindicator-gtk3%{?_isa}
 Requires:       polkit
 Requires:       iproute
 Requires:       libxkbcommon%{?_isa}
+# winit loads the X11 extension separately through xkbcommon-dl.
+Requires:       libxkbcommon-x11%{?_isa}
 Requires:       fontconfig%{?_isa}
 Requires:       libglvnd-glx%{?_isa}
 Requires:       libglvnd-egl%{?_isa}

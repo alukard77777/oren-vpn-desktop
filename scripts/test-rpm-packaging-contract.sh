@@ -36,6 +36,10 @@ spec="$ROOT/packaging/linux/rpm/multicore.spec"
 grep -Eq '^Release:[[:space:]]+1$' "$spec"
 grep -Eq '^BuildArch:[[:space:]]+x86_64$' "$spec"
 grep -Fxq '/usr/lib/multicore/runtime/multicore-core-host' "$spec"
+grep -Eq '^Requires:[[:space:]]+libxkbcommon-x11%\{\?_isa\}$' "$spec" || {
+    echo 'FAIL: RPM must require the X11 XKB library loaded dynamically by the desktop backend' >&2
+    exit 1
+}
 for macro in debug_package __brp_strip __brp_strip_static_archive __brp_strip_comment_note __brp_strip_lto __brp_llvm_compile_lto_elf; do
     grep -Eq "^%global $macro[[:space:]]+%\{nil\}$" "$spec"
 done
