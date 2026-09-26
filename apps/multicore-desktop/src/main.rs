@@ -1174,7 +1174,7 @@ impl LaunchArguments {
     }
 }
 
-const INSTALL_SUBSCRIPTION_PREFIX: &str = "multicore://install-sub?url=";
+const INSTALL_SUBSCRIPTION_ROUTE: &str = "multicore://install-sub";
 
 fn parse_launch_arguments(
     args: impl IntoIterator<Item = OsString>,
@@ -1193,9 +1193,21 @@ fn parse_launch_arguments(
             let argument = argument
                 .to_str()
                 .ok_or("launch argument must be valid Unicode")?;
-            let encoded = argument
-                .strip_prefix(INSTALL_SUBSCRIPTION_PREFIX)
+            let (route, query) = argument
+                .split_once('?')
                 .ok_or("unsupported launch argument")?;
+            // Windows ShellExecute canonicalizes an empty authority path to `/`.
+            // Scheme and host are case-insensitive; only an empty or root path is valid.
+            if !route
+                .strip_suffix('/')
+                .unwrap_or(route)
+                .eq_ignore_ascii_case(INSTALL_SUBSCRIPTION_ROUTE)
+            {
+                return Err("unsupported installer URI route");
+            }
+            let encoded = query
+                .strip_prefix("url=")
+                .ok_or("installer URI must contain one subscription URL")?;
             let subscription_url = decode_percent_encoded_url(encoded)?;
             if subscription_url.len() > view_model::MAX_SUBSCRIPTION_URL_BYTES
                 || subscription_url.bytes().any(|byte| byte.is_ascii_control())
@@ -5152,6 +5164,81 @@ mod window_tests {
                 subscription_url: Some("https://example.com/sub?token=a%2Fb".into()),
             }
         );
+    }
+
+    #[test]
+    fn installer_uri_accepts_windows_shell_root_path_and_scheme_host_case() {
+        for route in [
+            "multicore://install-sub",
+            "multicore://install-sub/",
+            "MULTICORE://INSTALL-SUB/",
+        ] {
+            let uri =
+                format!("{route}?url=https%3A%2F%2Fexample.com%2Fsub%3Ftoken%3Da%252Fb%26next%3D1");
+            let parsed = parse_launch_arguments([uri.into()]).unwrap();
+            assert_eq!(parsed.mode, LaunchMode::Foreground);
+            assert_eq!(
+                parsed.subscription_url.as_deref(),
+                Some("https://example.com/sub?token=a%2Fb&next=1"),
+                "{route}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_uri_received_from_real_windows_shell_preserves_subscription() {
+        use std::os::windows::process::CommandExt;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/fixtures/capture-windows-shell-uri.ps1");
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(fixture)
+            .creation_flags(0x08000000)
+            .output()
+            .expect("run Windows ShellExecute fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        // The fixture owns a unique scheme so concurrent tests never replace the user's handler.
+        // Only its scheme name differs from the production ShellExecute invocation.
+        let received = receipt["received"].as_str().unwrap();
+        let scheme = receipt["scheme"].as_str().unwrap();
+        let suffix = received.strip_prefix(scheme).unwrap();
+        let parsed = parse_launch_arguments([format!("multicore{suffix}").into()])
+            .expect("the URI actually delivered by Windows must be accepted");
+        assert_eq!(
+            parsed.subscription_url.as_deref(),
+            Some("https://example.com/sub?token=a%2Fb&next=1")
+        );
+    }
+
+    #[test]
+    fn installer_uri_rejects_extra_route_components_in_shell_form() {
+        for argument in [
+            "multicore://install-sub//?url=https%3A%2F%2Fexample.com",
+            "multicore://install-sub/other?url=https%3A%2F%2Fexample.com",
+            "multicore://user@install-sub/?url=https%3A%2F%2Fexample.com",
+            "multicore://install-sub:80/?url=https%3A%2F%2Fexample.com",
+            "multicore://install-sub/?url=https%3A%2F%2Fexample.com#fragment",
+            "multicore://install-sub/?url=https%3A%2F%2Fexample.com&url=https%3A%2F%2Fother.example",
+            "multicore://install-sub/?url=https://example.com/sub",
+        ] {
+            assert!(
+                parse_launch_arguments([argument.into()]).is_err(),
+                "{argument}"
+            );
+        }
     }
 
     #[test]
