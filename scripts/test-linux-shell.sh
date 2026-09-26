@@ -2,8 +2,10 @@
 # A private Wayland compositor and session bus; never attaches to the user's desktop.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-for command in weston dbus-run-session cargo timeout; do command -v "$command" >/dev/null; done
-evidence="$PWD/artifacts/linux-shell"
+[[ $# == 2 && "$1" == --test-binary && -x "$2" ]] || { echo 'Usage: test-linux-shell.sh --test-binary /absolute/test-executable' >&2; exit 1; }
+test_binary="$2"
+for command in weston dbus-run-session timeout python3; do command -v "$command" >/dev/null; done
+evidence="${MULTICORE_SHELL_EVIDENCE:?private evidence directory required}"
 mkdir -p "$evidence"
 runtime="$(mktemp -d -t multicore-wayland.XXXXXXXX)"
 compositor_pid=''
@@ -30,7 +32,18 @@ for ((attempt=0; attempt<100; attempt++)); do
   sleep 0.1
 done
 [[ -S "$runtime/$WAYLAND_DISPLAY" ]] || { cat "$evidence/weston.log"; exit 1; }
+result=0
 for test in wayland_title_buttons_hide_and_restore_without_exiting wayland_close_without_tray_exits; do
-  timeout 90s dbus-run-session -- cargo test -p multicore-desktop --locked \
-    "linux_shell_tests::$test" -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/$test.log"
+  if ! timeout 30s dbus-run-session -- "$test_binary" \
+    "linux_shell_tests::$test" --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/$test.log"; then
+    result=1
+  fi
 done
+for host in absent false true; do
+  if ! timeout 30s dbus-run-session -- python3 scripts/fixtures/status_notifier_host.py --host "$host" -- \
+    "$test_binary" tray::linux::tests::notifier_availability_matches_registered_host \
+    --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/tray-host-$host.log"; then
+    result=1
+  fi
+done
+exit "$result"

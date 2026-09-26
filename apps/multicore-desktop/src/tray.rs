@@ -1173,6 +1173,17 @@ mod linux {
     #[cfg(test)]
     mod tests {
         #[test]
+        #[ignore = "requires isolated D-Bus fixtures from test-linux-shell.sh"]
+        fn notifier_availability_matches_registered_host() {
+            assert_eq!(
+                std::env::var("MULTICORE_ISOLATED_SHELL_TEST").as_deref(),
+                Ok("1")
+            );
+            let expected = std::env::var("MULTICORE_TEST_HOST_PRESENT").unwrap() == "true";
+            assert_eq!(super::status_notifier_watcher_running(), expected);
+        }
+
+        #[test]
         #[ignore = "requires a desktop session with a system tray host"]
         fn host_session_exposes_a_tray_host() {
             gtk::init().unwrap();
