@@ -230,8 +230,8 @@ SHA-256. CI verifies Linux and Windows on every pull request and builds the Linu
 packages as artifacts on pushes to `main` and `feature/**`. The same RPM is installed
 and smoke-tested in clean Fedora 43 and 44 containers before a tagged release can
 publish. See [Fedora RPM verification](docs/fedora-rpm-verification.md) for the build
-commands and the boundaries of the container checks. RPM support is added by this
-change; already-published releases are not rewritten.
+commands and the boundaries of the container checks. The verified RPM is also
+added to the existing v0.3.0 release; its other binary assets are not replaced.
 
 Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes
 them to `fatyzzz/multicore-releases`; installed clients read that public channel

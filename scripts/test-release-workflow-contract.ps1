@@ -48,9 +48,13 @@ $rpmName = 'multicore-$($env:APP_VERSION)-1.x86_64.rpm'
 Assert-True ([regex]::Matches($workflow, [regex]::Escape($rpmName)).Count -eq 4) `
     'RPM must appear in the required Linux set, checksums, release notes, and publication stage'
 Assert-True ($workflow.Contains('needs: linux-packages')) 'release must wait for Fedora RPM smoke jobs'
+Assert-True ($linuxWorkflow -match '(?m)^          test "\$#" -eq 1\r?$') `
+    'RPM smoke must reject multiple artifacts with a standalone fail-fast test'
 $linuxCiJob = [regex]::Match($ci, '(?ms)^  linux-packages:\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)').Groups['body'].Value
 Assert-True ($linuxCiJob -match "(?m)^    if: github\.event_name == 'push'\r?`$") `
     'Linux packaging must run on every configured push branch, without a main-only restriction'
+Assert-True ($linuxCiJob -match '(?m)^      update-repository: fatyzzz/multicore-releases\r?$') `
+    'Linux CI artifacts must use the public update channel before publication'
 
 if ($ExpectedVersion) {
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\Cargo.toml')

@@ -93,9 +93,15 @@ jobs:
       - name: Install RPM build and verification tools
         run: dnf install -y rpm-build redhat-rpm-config zstd tar gzip cpio file desktop-file-utils diffutils binutils python3 findutils coreutils
       - name: Build and verify Fedora RPM
+        env:
+          UPDATE_REPOSITORY: ${{ inputs.update-repository }}
         run: |
           mkdir -p target
           tar --zstd -xf linux-stage.tar.zst -C target
+          if [ -n "$UPDATE_REPOSITORY" ]; then
+            LC_ALL=C grep -aFq -- "$UPDATE_REPOSITORY" target/linux-stage-ubuntu/usr/lib/multicore/multicore
+            echo "Verified compiled update repository: $UPDATE_REPOSITORY"
+          fi
           ./scripts/test-rpm-packaging-contract.sh
           ./scripts/build-linux-packages.sh --stage target/linux-stage-ubuntu --output dist/linux --formats rpm
           ./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats rpm
@@ -134,7 +140,8 @@ jobs:
           MULTICORE_DISPOSABLE_RPM_TEST: 1
         run: |
           set -- dist/linux/*.rpm
-          test "$#" -eq 1 && test -f "$1"
+          test "$#" -eq 1
+          test -f "$1"
           ./scripts/test-fedora-rpm.sh --package "$1"
       - name: Retain bounded synthetic smoke evidence
         if: always()
