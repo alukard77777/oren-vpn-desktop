@@ -101,6 +101,11 @@ fn wayland_hide_restore_preserves_user_geometry() {
                         let _ = window.request_inner_size(winit::dpi::LogicalSize::new(980, 780));
                     })
                     .unwrap();
+                // Winit returns the new size synchronously for an application
+                // resize; deliver the same Slint event as a compositor resize.
+                ui.window().dispatch_event(WindowEvent::Resized {
+                    size: slint::LogicalSize::new(980.0, 780.0),
+                });
             }
             1 => {
                 assert_eq!(
@@ -117,9 +122,30 @@ fn wayland_hide_restore_preserves_user_geometry() {
                     slint::LogicalSize::new(980.0, 780.0),
                     "restore lost user size"
                 );
-                ui.window().set_maximized(true);
+                slint::quit_event_loop().unwrap();
             }
-            4 => {
+            _ => panic!("unexpected timer tick"),
+        }
+        progress.set(progress.get() + 1);
+    });
+    slint::run_event_loop_until_quit().unwrap();
+    assert_eq!(phase.get(), 4);
+    ui.hide().unwrap();
+}
+
+#[test]
+#[ignore = "requires the isolated native Wayland compositor in test-linux-shell.sh"]
+fn wayland_hide_restore_preserves_maximized_state() {
+    let ui = wayland_window(true);
+    let weak = ui.as_weak();
+    let phase = Rc::new(Cell::new(0));
+    let progress = phase.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+        let ui = weak.upgrade().unwrap();
+        match progress.get() {
+            0 => ui.window().set_maximized(true),
+            1 => {
                 assert_eq!(
                     ui.window()
                         .with_winit_window(|window| window.is_maximized()),
@@ -128,8 +154,8 @@ fn wayland_hide_restore_preserves_user_geometry() {
                 ui.invoke_window_close();
                 assert!(!ui.window().is_visible());
             }
-            5 => restore_and_focus(&ui),
-            6 => {
+            2 => restore_and_focus(&ui),
+            3 => {
                 assert_eq!(
                     ui.window()
                         .with_winit_window(|window| window.is_maximized()),
@@ -143,7 +169,7 @@ fn wayland_hide_restore_preserves_user_geometry() {
         progress.set(progress.get() + 1);
     });
     slint::run_event_loop_until_quit().unwrap();
-    assert_eq!(phase.get(), 7);
+    assert_eq!(phase.get(), 4);
     ui.hide().unwrap();
 }
 

@@ -36,7 +36,7 @@ result=0
 check_test_count() {
   grep -Fqx 'running 1 test' "$1" || { echo "Expected exactly one native test in $1" >&2; result=1; }
 }
-for test in wayland_title_buttons_hide_and_restore_without_exiting wayland_close_without_tray_exits wayland_minimize_without_tray_keeps_recoverable_window wayland_hide_restore_preserves_user_geometry; do
+for test in wayland_title_buttons_hide_and_restore_without_exiting wayland_close_without_tray_exits wayland_minimize_without_tray_keeps_recoverable_window wayland_hide_restore_preserves_user_geometry wayland_hide_restore_preserves_maximized_state; do
   if ! WAYLAND_DEBUG=client timeout 30s dbus-run-session -- "$test_binary" \
     "linux_shell_tests::$test" --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/$test.log"; then
     result=1
