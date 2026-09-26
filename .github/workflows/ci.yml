@@ -62,13 +62,36 @@ jobs:
       CARGO_INCREMENTAL: 0
 
     steps:
+      - name: Recover host workspace ownership
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          runner_work="$(realpath -e -- "$(dirname -- "${RUNNER_TEMP:?}")")"
+          expected="$runner_work/multicore/multicore"
+          workspace="$(realpath -e -- "${GITHUB_WORKSPACE:?}")"
+          [[ "$runner_work" != / && "$workspace" == "$expected" && -d "$workspace" ]] || {
+            echo "Refusing ownership recovery outside the expected repository workspace" >&2
+            exit 1
+          }
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          [[ "$runner_uid" =~ ^[0-9]+$ && "$runner_uid" != 0 && "$runner_gid" =~ ^[0-9]+$ ]] || {
+            echo "Ownership recovery requires a non-root host runner user" >&2
+            exit 1
+          }
+          stat -c 'Workspace owner before recovery: %u:%g %n' -- "$expected"
+          find "$expected" -maxdepth 2 -uid 0 -printf 'Root-owned entry before recovery: %U:%G %p\n' || true
+          sudo chown -hR -P -- "$runner_uid:$runner_gid" "$expected"
+          stat -c 'Workspace owner after recovery: %u:%g %n' -- "$expected"
+          find "$expected" -maxdepth 2 -uid 0 -printf 'Root-owned entry after recovery: %U:%G %p\n'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends zstd pkg-config libgtk-3-dev libxkbcommon-dev \
+          sudo apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends zstd python3 pkg-config libgtk-3-dev libxkbcommon-dev \
             libfontconfig-dev libfreetype-dev libwayland-dev libx11-dev libx11-xcb-dev \
             libxcursor-dev libxrandr-dev libxi-dev libgl-dev libegl-dev
       - name: Install pinned Rust toolchain
@@ -81,6 +104,7 @@ jobs:
           cargo test --workspace --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
           for script in scripts/*.sh; do bash -n "$script"; done
+          python3 -B scripts/fixtures/test_runner_workspace_recovery.py
 
   linux-packages:
     if: github.event_name == 'push'

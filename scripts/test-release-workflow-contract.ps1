@@ -31,6 +31,45 @@ $publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
 
 & (Join-Path $PSScriptRoot 'test-windows-workflow-fail-fast.ps1')
 
+foreach ($hostJob in @(
+    @{ Text = $ci; Name = 'linux' },
+    @{ Text = $linuxWorkflow; Name = 'debian-appimage' }
+)) {
+    $pattern = '(?ms)^  ' + [regex]::Escape($hostJob.Name) + ':\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)'
+    $body = [regex]::Match($hostJob.Text, $pattern).Groups['body'].Value
+    $guardIndex = $body.IndexOf('name: Recover host workspace ownership', [StringComparison]::Ordinal)
+    $checkoutIndex = $body.IndexOf('actions/checkout@', [StringComparison]::Ordinal)
+    Assert-True ($guardIndex -ge 0 -and $guardIndex -lt $checkoutIndex) `
+        "$($hostJob.Name) must recover host workspace ownership before checkout"
+    Assert-True (-not $body.Contains('    container:')) 'ownership recovery must only run on the Linux host'
+    foreach ($token in @(
+        'working-directory: ${{ runner.temp }}',
+        'runner_work="$(realpath -e -- "$(dirname -- "${RUNNER_TEMP:?}")")"',
+        'expected="$runner_work/multicore/multicore"',
+        'workspace="$(realpath -e -- "${GITHUB_WORKSPACE:?}")"',
+        '"$workspace" == "$expected"',
+        '"$runner_uid" != 0',
+        'sudo chown -hR -P -- "$runner_uid:$runner_gid" "$expected"'
+    )) {
+        Assert-True ($body.Contains($token)) "host recovery guard is missing: $token"
+    }
+}
+foreach ($fedoraJob in @(
+    @{ Name = 'rpm'; Tools = 'Install RPM build and verification tools' },
+    @{ Name = 'rpm-smoke'; Tools = 'Install isolated Fedora smoke tools' }
+)) {
+    $pattern = '(?ms)^  ' + [regex]::Escape($fedoraJob.Name) + ':\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)'
+    $body = [regex]::Match($linuxWorkflow, $pattern).Groups['body'].Value
+    $toolsIndex = $body.IndexOf($fedoraJob.Tools, [StringComparison]::Ordinal)
+    $checkoutIndex = $body.IndexOf('actions/checkout@', [StringComparison]::Ordinal)
+    Assert-True ($toolsIndex -ge 0 -and $toolsIndex -lt $checkoutIndex) `
+        "$($fedoraJob.Name) must install tools before checkout"
+    Assert-True ($body.Substring(0, $checkoutIndex).Contains('dnf install -y git ')) `
+        "$($fedoraJob.Name) must install Git before checkout to avoid the REST fallback"
+}
+Assert-True ($ci.Contains('python3 -B scripts/fixtures/test_runner_workspace_recovery.py')) `
+    'Linux CI must exercise the actual workspace recovery guards'
+
 foreach ($token in @(
     '  rpm:',
     'container: fedora:43',

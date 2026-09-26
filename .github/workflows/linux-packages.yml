@@ -19,6 +19,29 @@ jobs:
     runs-on: [self-hosted, Linux, X64, debian13]
     timeout-minutes: 90
     steps:
+      - name: Recover host workspace ownership
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          runner_work="$(realpath -e -- "$(dirname -- "${RUNNER_TEMP:?}")")"
+          expected="$runner_work/multicore/multicore"
+          workspace="$(realpath -e -- "${GITHUB_WORKSPACE:?}")"
+          [[ "$runner_work" != / && "$workspace" == "$expected" && -d "$workspace" ]] || {
+            echo "Refusing ownership recovery outside the expected repository workspace" >&2
+            exit 1
+          }
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          [[ "$runner_uid" =~ ^[0-9]+$ && "$runner_uid" != 0 && "$runner_gid" =~ ^[0-9]+$ ]] || {
+            echo "Ownership recovery requires a non-root host runner user" >&2
+            exit 1
+          }
+          stat -c 'Workspace owner before recovery: %u:%g %n' -- "$expected"
+          find "$expected" -maxdepth 2 -uid 0 -printf 'Root-owned entry before recovery: %U:%G %p\n' || true
+          sudo chown -hR -P -- "$runner_uid:$runner_gid" "$expected"
+          stat -c 'Workspace owner after recovery: %u:%g %n' -- "$expected"
+          find "$expected" -maxdepth 2 -uid 0 -printf 'Root-owned entry after recovery: %U:%G %p\n'
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -84,14 +107,16 @@ jobs:
     timeout-minutes: 30
     container: fedora:43
     steps:
+      - name: Install RPM build and verification tools
+        run: |
+          dnf install -y git rpm-build redhat-rpm-config zstd tar gzip cpio file desktop-file-utils diffutils binutils python3 findutils coreutils
+          git --version
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-stage
-      - name: Install RPM build and verification tools
-        run: dnf install -y rpm-build redhat-rpm-config zstd tar gzip cpio file desktop-file-utils diffutils binutils python3 findutils coreutils
       - name: Build and verify Fedora RPM
         env:
           UPDATE_REPOSITORY: ${{ inputs.update-repository }}
@@ -122,6 +147,10 @@ jobs:
         fedora: ['43', '44']
     container: fedora:${{ matrix.fedora }}
     steps:
+      - name: Install isolated Fedora smoke tools
+        run: |
+          dnf install -y git python3 xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon dbus-tools xdotool desktop-file-utils glib2 file binutils libcap shadow-utils util-linux xdg-utils mesa-dri-drivers mesa-libGL mesa-libEGL dejavu-sans-fonts procps-ng diffutils
+          git --version
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -129,8 +158,6 @@ jobs:
         with:
           name: linux-packages-rpm
           path: dist/linux
-      - name: Install isolated Fedora smoke tools
-        run: dnf install -y python3 xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon dbus-tools xdotool desktop-file-utils glib2 file binutils libcap shadow-utils util-linux xdg-utils mesa-dri-drivers mesa-libGL mesa-libEGL dejavu-sans-fonts procps-ng diffutils
       - name: Verify disposable smoke safety guards
         run: |
           ./scripts/test-fedora-rpm-contract.sh
