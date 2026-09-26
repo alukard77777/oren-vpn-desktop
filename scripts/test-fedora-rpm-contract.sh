@@ -33,3 +33,17 @@ for argument in --unknown --package; do
 done
 
 echo 'PASS: Fedora smoke opt-in and argument guards refuse before mutation'
+
+# A cold Fedora desktop dependency transaction can exceed five minutes while
+# mirrors retry downloads. Keep its larger budget finite, with shorter bounds
+# for local reinstall and removal; inspect only, never invoke package operations.
+for operation in install reinstall remove; do
+  operation_line="$(grep -E "^timeout .* dnf .* ${operation} " "$SMOKE")"
+  expected_budget=300s
+  if [[ "$operation" == install ]]; then expected_budget=900s; fi
+  [[ "$operation_line" == "timeout --kill-after=15s $expected_budget dnf "* ]] || {
+    echo "FAIL: dnf $operation must have a bounded $expected_budget budget and 15s kill grace" >&2
+    exit 1
+  }
+done
+echo 'PASS: Fedora cold install allows 900s; reinstall/removal remain bounded at 300s'

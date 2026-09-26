@@ -71,6 +71,26 @@ Assert-True ($ci.Contains('python3 -B scripts/fixtures/test_runner_workspace_rec
     'Linux CI must exercise the actual workspace recovery guards'
 
 foreach ($token in @(
+    '  workflow_dispatch:',
+    '      rpm-run-id:',
+    '      rpm-sha256:',
+    "if: github.event_name != 'workflow_dispatch'",
+    'if: ${{ !cancelled() && (needs.rpm.result == ''success'' || github.event_name == ''workflow_dispatch'') }}',
+    '    timeout-minutes: 45',
+    'name: Verify selected RPM digest',
+    'SOURCE_RUN_ID: ${{ inputs.rpm-run-id }}',
+    'EXPECTED_SHA256: ${{ inputs.rpm-sha256 }}',
+    'run-id: ${{ inputs.rpm-run-id }}',
+    'github-token: ${{ github.token }}',
+    'sha256sum --check --strict -'
+)) {
+    Assert-True ($linuxWorkflow.Contains($token)) "Immutable RPM smoke rerun is missing: $token"
+}
+foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
+    Assert-True ($content.Contains('  actions: read')) 'RPM artifact reuse requires read-only Actions permissions in each caller'
+}
+
+foreach ($token in @(
     '  rpm:',
     'container: fedora:43',
     '--formats rpm',

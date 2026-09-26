@@ -67,7 +67,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "Installing $IDENTITY on Fedora $VERSION_ID with dependency resolution"
-timeout --kill-after=15s 300s dnf -y --setopt=localpkg_gpgcheck=False install "$PACKAGE" >"$OUTPUT/install.log" 2>&1
+# Cold Fedora desktop dependencies can involve hundreds of packages and mirror
+# retries. Allow 15 minutes for this first download; keep local maintenance shorter.
+timeout --kill-after=15s 900s dnf -y --setopt=localpkg_gpgcheck=False install "$PACKAGE" >"$OUTPUT/install.log" 2>&1
 [[ "$(rpm -q --queryformat '%{NAME} %{VERSION} %{RELEASE} %{ARCH}' multicore)" == "$IDENTITY" ]] || fail 'Installed RPM identity differs'
 rpm -V multicore >"$OUTPUT/rpm-verify-install.log" 2>&1
 python3 "$FIXTURE" --verify-install
