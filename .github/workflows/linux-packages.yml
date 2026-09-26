@@ -36,7 +36,7 @@ jobs:
           ./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage
       - name: Verify Debian package and AppImage
         run: ./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats deb,appimage
-      - name: Archive stage for the Arch package
+      - name: Archive stage for Arch and RPM packages
         run: tar --zstd -C target -cf linux-stage.tar.zst linux-stage-ubuntu
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -77,3 +77,73 @@ jobs:
           name: linux-packages-arch
           path: dist/linux/
           if-no-files-found: error
+
+  rpm:
+    needs: debian-appimage
+    runs-on: [self-hosted, Linux, X64, debian13]
+    timeout-minutes: 30
+    container: fedora:43
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-stage
+      - name: Install RPM build and verification tools
+        run: dnf install -y rpm-build redhat-rpm-config zstd tar gzip cpio file desktop-file-utils diffutils binutils python3 findutils coreutils
+      - name: Build and verify Fedora RPM
+        run: |
+          mkdir -p target
+          tar --zstd -xf linux-stage.tar.zst -C target
+          ./scripts/test-rpm-packaging-contract.sh
+          ./scripts/build-linux-packages.sh --stage target/linux-stage-ubuntu --output dist/linux --formats rpm
+          ./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats rpm
+          sha256sum dist/linux/*.rpm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-packages-rpm
+          path: dist/linux/*.rpm
+          if-no-files-found: error
+
+  rpm-smoke:
+    needs: rpm
+    runs-on: [self-hosted, Linux, X64, debian13]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: ['43', '44']
+    container: fedora:${{ matrix.fedora }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-packages-rpm
+          path: dist/linux
+      - name: Install isolated Fedora smoke tools
+        run: dnf install -y python3 xorg-x11-server-Xvfb xorg-x11-xauth dbus-daemon dbus-tools xdotool desktop-file-utils glib2 file binutils libcap shadow-utils util-linux xdg-utils mesa-dri-drivers mesa-libGL mesa-libEGL dejavu-sans-fonts procps-ng diffutils
+      - name: Verify disposable smoke safety guards
+        run: |
+          ./scripts/test-fedora-rpm-contract.sh
+          python3 -B scripts/fixtures/test_fedora_rpm_smoke.py
+      - name: Test installed RPM in disposable Fedora
+        env:
+          MULTICORE_DISPOSABLE_RPM_TEST: 1
+        run: |
+          set -- dist/linux/*.rpm
+          test "$#" -eq 1 && test -f "$1"
+          ./scripts/test-fedora-rpm.sh --package "$1"
+      - name: Retain bounded synthetic smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fedora-${{ matrix.fedora }}-rpm-smoke
+          path: |
+            artifacts/fedora-rpm-smoke/*.log
+            artifacts/fedora-rpm-smoke/*.json
+            artifacts/fedora-rpm-smoke/*.ppm
+          retention-days: 7
+          if-no-files-found: warn

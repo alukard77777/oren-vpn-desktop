@@ -31,6 +31,27 @@ $publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
 
 & (Join-Path $PSScriptRoot 'test-windows-workflow-fail-fast.ps1')
 
+foreach ($token in @(
+    '  rpm:',
+    'container: fedora:43',
+    '--formats rpm',
+    'name: linux-packages-rpm',
+    '  rpm-smoke:',
+    "fedora: ['43', '44']",
+    'container: fedora:${{ matrix.fedora }}',
+    'MULTICORE_DISPOSABLE_RPM_TEST: 1',
+    'test-fedora-rpm.sh'
+)) {
+    Assert-True ($linuxWorkflow.Contains($token)) "Fedora RPM workflow is missing: $token"
+}
+$rpmName = 'multicore-$($env:APP_VERSION)-1.x86_64.rpm'
+Assert-True ([regex]::Matches($workflow, [regex]::Escape($rpmName)).Count -eq 4) `
+    'RPM must appear in the required Linux set, checksums, release notes, and publication stage'
+Assert-True ($workflow.Contains('needs: linux-packages')) 'release must wait for Fedora RPM smoke jobs'
+$linuxCiJob = [regex]::Match($ci, '(?ms)^  linux-packages:\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)').Groups['body'].Value
+Assert-True ($linuxCiJob -match "(?m)^    if: github\.event_name == 'push'\r?`$") `
+    'Linux packaging must run on every configured push branch, without a main-only restriction'
+
 if ($ExpectedVersion) {
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\Cargo.toml')
     $ui = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\ui\app.slint')

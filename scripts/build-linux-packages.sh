@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --stage <stage-dir> --output <dir> --formats <arch,deb,appimage>" >&2
+    echo "usage: $0 --stage <stage-dir> --output <dir> --formats <arch,deb,appimage,rpm>" >&2
     exit 2
 }
 
@@ -51,6 +51,18 @@ build_deb() {
     dpkg-deb --root-owner-group -Zxz --build "$work" "$OUTPUT/multicore_${VERSION}_amd64.deb"
 }
 
+build_rpm() {
+    local work="$WORK/rpm"
+    mkdir -p "$work"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+    # Repackage the shared Ubuntu 22.04 stage; do not compile or strip it here.
+    tar -C "$STAGE" --owner=0 --group=0 --numeric-owner \
+        -czf "$work/SOURCES/multicore-$VERSION-stage.tar.gz" .
+    sed -e "s/@VERSION@/$VERSION/" "$ROOT/packaging/linux/rpm/multicore.spec" > "$work/SPECS/multicore.spec"
+    rpmbuild -bb --target x86_64 --define "_topdir $work" "$work/SPECS/multicore.spec"
+    install -m 0644 "$work/RPMS/x86_64/multicore-$VERSION-1.x86_64.rpm" \
+        "$OUTPUT/multicore-$VERSION-1.x86_64.rpm"
+}
+
 build_appimage() {
     local tool="$WORK/appimagetool"
     curl -fsSL --proto '=https' --tlsv1.2 -o "$tool" "$APPIMAGETOOL_URL"
@@ -72,6 +84,7 @@ for format in "${requested[@]}"; do
     case "$format" in
         arch) build_arch ;;
         deb) build_deb ;;
+        rpm) build_rpm ;;
         appimage) build_appimage ;;
         *) echo "unknown format $format" >&2; exit 2 ;;
     esac

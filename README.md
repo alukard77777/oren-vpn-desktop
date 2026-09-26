@@ -35,7 +35,7 @@ the cores independently.
 
 ## Linux
 
-Linux releases ship three packages built from one staged tree. All of them
+Linux packaging supports four formats built from one staged tree. All of them
 install the same layout under `/usr/lib/multicore` (or inside the AppImage):
 the desktop, `runtime/multicore-daemon`, `runtime/multicore-core-host`, and the
 pinned Xray and Mihomo binaries under `cores/`.
@@ -44,6 +44,7 @@ pinned Xray and Mihomo binaries under `cores/`.
 |---|---|
 | Arch Linux `multicore-<v>-1-x86_64.pkg.tar.zst` | `sudo pacman -U multicore-<v>-1-x86_64.pkg.tar.zst` |
 | Debian 12+ / Ubuntu 22.04+ `multicore_<v>_amd64.deb` | `sudo apt install ./multicore_<v>_amd64.deb` |
+| Fedora 43/44 x86_64 `multicore-<v>-1.x86_64.rpm` | `sudo dnf install ./multicore-<v>-1.x86_64.rpm` |
 | AppImage `MultiCore-<v>-x86_64.AppImage` | `chmod +x` and run; needs GTK 3, polkit, and AppIndicator on the host |
 
 - **Elevation.** The desktop and daemon run as the user. **Connect** starts the
@@ -71,7 +72,7 @@ pinned Xray and Mihomo binaries under `cores/`.
   other X11 applications; set `Xft.dpi` or `WINIT_X11_SCALE_FACTOR` to change it.
 - **Data.** `$XDG_DATA_HOME/multicore` (default `~/.local/share/multicore`) holds
   profiles, generated runtime configs, preferences, and the device identity.
-- **Updates.** Arch and Debian packages are updated by the package manager; the
+- **Updates.** Arch, Debian, and Fedora packages are updated by the package manager; the
   client only announces new releases. The AppImage downloads
   `MultiCore-<v>-x86_64.AppImage` from the release channel, verifies size and
   SHA-256, keeps the previous image as `<name>.old`, and relaunches.
@@ -219,11 +220,18 @@ inside the Ubuntu 22.04 image so they run on glibc 2.35 and newer:
 ./scripts/package-linux-release.sh --output target/linux-stage
 ./scripts/build-linux-packages.sh --stage target/linux-stage --output dist/linux --formats arch
 ./scripts/package-linux-in-docker.sh --output dist/linux --formats deb,appimage
+# In a Fedora build environment, reuse the Ubuntu stage for the RPM:
+./scripts/build-linux-packages.sh --stage target/linux-stage-ubuntu --output dist/linux --formats rpm
+./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats rpm
 ```
 
 `packaging/linux/versions.json` pins the Linux core archives and executables by
 SHA-256. CI verifies Linux and Windows on every pull request and builds the Linux
-packages as artifacts on pushes to `main`.
+packages as artifacts on pushes to `main` and `feature/**`. The same RPM is installed
+and smoke-tested in clean Fedora 43 and 44 containers before a tagged release can
+publish. See [Fedora RPM verification](docs/fedora-rpm-verification.md) for the build
+commands and the boundaries of the container checks. RPM support is added by this
+change; already-published releases are not rewritten.
 
 Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes
 them to `fatyzzz/multicore-releases`; installed clients read that public channel

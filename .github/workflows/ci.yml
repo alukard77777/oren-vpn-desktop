@@ -83,6 +83,6 @@ jobs:
           for script in scripts/*.sh; do bash -n "$script"; done
 
   linux-packages:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     needs: linux
     uses: ./.github/workflows/linux-packages.yml
