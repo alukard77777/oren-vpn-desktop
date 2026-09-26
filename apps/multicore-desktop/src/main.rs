@@ -6,6 +6,8 @@ mod clipboard_text;
 mod daemon;
 #[cfg(target_os = "linux")]
 mod linux_display;
+#[cfg(all(test, target_os = "linux"))]
+mod linux_shell_tests;
 mod logo_cache;
 mod preferences;
 mod service_logo;
@@ -4667,12 +4669,13 @@ mod window_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn tray_hide_keeps_slint_window_registered_for_tray_events() {
         let source = include_str!("main.rs");
         let helper = source
             .split("fn hide_window_to_tray(")
             .nth(1)
-            .and_then(|source| source.split("fn tray_menu_model").next())
+            .and_then(|source| source.split("fn apply_tray_popup_model").next())
             .expect("tray hide helper");
         assert!(helper.contains("with_winit_window"));
         assert!(helper.contains("window.set_visible(false)"));

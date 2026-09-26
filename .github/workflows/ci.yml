@@ -94,7 +94,8 @@ jobs:
           sudo apt-get update
           sudo apt-get -o DPkg::Lock::Timeout=180 install -y --no-install-recommends zstd python3 pkg-config libgtk-3-dev libxkbcommon-dev \
             libfontconfig-dev libfreetype-dev libwayland-dev libx11-dev libx11-xcb-dev \
-            libxcursor-dev libxrandr-dev libxi-dev libgl-dev libegl-dev
+            libxcursor-dev libxrandr-dev libxi-dev libgl-dev libegl-dev \
+            weston dbus-daemon libgl1-mesa-dri libegl-mesa0
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
@@ -106,6 +107,17 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           for script in scripts/*.sh; do bash -n "$script"; done
           python3 -B scripts/fixtures/test_runner_workspace_recovery.py
+
+      - name: Test native Wayland window lifecycle
+        run: bash scripts/test-linux-shell.sh
+      - name: Retain native Wayland evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-shell-smoke
+          path: artifacts/linux-shell/
+          if-no-files-found: warn
+          retention-days: 7
 
   linux-packages:
     if: github.event_name == 'push'
