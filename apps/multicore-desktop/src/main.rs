@@ -5552,47 +5552,51 @@ mod window_tests {
 
     #[test]
     fn installer_uri_requests_consent_on_initial_and_secondary_launch() {
-        let source = include_str!("main.rs");
-        let startup = source
-            .split("wire_import(\n        &ui,")
-            .nth(1)
-            .and_then(|source| {
-                source
-                    .split("let result = slint::run_event_loop_until_quit();")
-                    .next()
-            })
-            .expect("startup after import callback wiring");
-        assert!(startup.contains("&pending_subscription_consents,\n            &pending_subscription_imports,\n            subscription_url"));
+        let lf_source = include_str!("main.rs").replace("\r\n", "\n");
+        for source in [lf_source.clone(), lf_source.replace('\n', "\r\n")] {
+            // include_str! retains Git's checkout line endings on Windows runners.
+            let source = source.replace("\r\n", "\n");
+            let startup = source
+                .split("wire_import(\n        &ui,")
+                .nth(1)
+                .and_then(|source| {
+                    source
+                        .split("let result = slint::run_event_loop_until_quit();")
+                        .next()
+                })
+                .expect("startup after import callback wiring");
+            assert!(startup.contains("&pending_subscription_consents,\n            &pending_subscription_imports,\n            subscription_url"));
 
-        let dispatch = source
-            .split("fn wire_pending_subscription_imports(")
-            .nth(1)
-            .and_then(|source| source.split("fn wire_external_activations(").next())
-            .expect("queued installer URL dispatch");
-        assert!(dispatch.contains("ui.invoke_import_url(url.into())"));
-        assert!(dispatch.contains(".dispatch_next(Instant::now(), |url|"));
+            let dispatch = source
+                .split("fn wire_pending_subscription_imports(")
+                .nth(1)
+                .and_then(|source| source.split("fn wire_external_activations(").next())
+                .expect("queued installer URL dispatch");
+            assert!(dispatch.contains("ui.invoke_import_url(url.into())"));
+            assert!(dispatch.contains(".dispatch_next(Instant::now(), |url|"));
 
-        let secondary = source
-            .split("single_instance::Activation::InstallSubscription(url) => {")
-            .nth(1)
-            .and_then(|source| source.split(".is_err()").next())
-            .expect("secondary installer activation");
-        assert!(secondary.contains("model.open_panel(Panel::None)"));
-        assert!(
-            secondary.find("model.open_panel(Panel::None)").unwrap()
-                < secondary
-                    .find("queue_subscription_import(&ui, &consent, &pending, url)")
-                    .unwrap()
-        );
+            let secondary = source
+                .split("single_instance::Activation::InstallSubscription(url) => {")
+                .nth(1)
+                .and_then(|source| source.split(".is_err()").next())
+                .expect("secondary installer activation");
+            assert!(secondary.contains("model.open_panel(Panel::None)"));
+            assert!(
+                secondary.find("model.open_panel(Panel::None)").unwrap()
+                    < secondary
+                        .find("queue_subscription_import(&ui, &consent, &pending, url)")
+                        .unwrap()
+            );
 
-        let import_worker = source
-            .split("fn run_import(")
-            .nth(1)
-            .and_then(|source| source.split("fn run_connect(").next())
-            .expect("import worker");
-        assert!(import_worker.contains(
-            "advance_profile_reconciliation(weak, model, profile_preferences, import_succeeded)"
-        ));
+            let import_worker = source
+                .split("fn run_import(")
+                .nth(1)
+                .and_then(|source| source.split("fn run_connect(").next())
+                .expect("import worker");
+            assert!(import_worker.contains(
+                "advance_profile_reconciliation(weak, model, profile_preferences, import_succeeded)"
+            ));
+        }
     }
 
     #[test]

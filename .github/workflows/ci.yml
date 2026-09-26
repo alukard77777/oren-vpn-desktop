@@ -29,18 +29,28 @@ jobs:
         shell: pwsh
         run: |
           rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default 1.98.1-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify
         shell: pwsh
         run: |
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-packaged-daemon-smoke-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   linux:
     runs-on: [self-hosted, Linux, X64, debian13]

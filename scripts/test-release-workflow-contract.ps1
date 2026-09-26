@@ -29,6 +29,8 @@ $linuxWorkflow = Get-Content -Raw -LiteralPath $linuxWorkflowPath
 $linuxDockerScript = Get-Content -Raw -LiteralPath $linuxDockerScriptPath
 $publishReleaseScript = Get-Content -Raw -LiteralPath $publishReleaseScriptPath
 
+& (Join-Path $PSScriptRoot 'test-windows-workflow-fail-fast.ps1')
+
 if ($ExpectedVersion) {
     $manifest = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\Cargo.toml')
     $ui = Get-Content -Raw -LiteralPath (Join-Path $root 'apps\multicore-desktop\ui\app.slint')

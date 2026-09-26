@@ -37,15 +37,21 @@ jobs:
 
       - name: Enforce privileged broker release gate
         shell: pwsh
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
           rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default 1.98.1-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc -Vv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo -V
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify tag and package version
         shell: pwsh
@@ -63,13 +69,21 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-packaged-daemon-smoke-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build verified portable bundle
         shell: pwsh
@@ -78,15 +92,19 @@ jobs:
             -DestinationPath dist/release/multicore-windows-x64 `
             -UpdateRepository fatyzzz/multicore-releases `
             -ReleaseAssetPath dist/release/multicore-windows-x64.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
             -DesktopExecutablePath dist/release/multicore-windows-x64/MultiCore.exe `
             -DaemonExecutablePath dist/release/multicore-windows-x64/runtime/multicore-daemon.exe `
             -UpdaterExecutablePath dist/release/multicore-windows-x64/runtime/multicore-updater.exe `
             -CoreHostExecutablePath dist/release/multicore-windows-x64/runtime/multicore-core-host.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x64.zip').Path
           cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-packaged-daemon.ps1 `
             -PackagePath dist/release/multicore-windows-x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install pinned Inno Setup
         shell: pwsh
@@ -109,6 +127,7 @@ jobs:
             -PackagePath dist/release/multicore-windows-x64 `
             -OutputDirectory dist/release `
             -AppVersion $env:APP_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Smoke-test installed update boundary
         shell: pwsh
@@ -116,6 +135,7 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-windows-installed-update.ps1 `
             -InstallerPath dist/release/MultiCore-Setup-x64.exe `
             -PackagePath dist/release/multicore-windows-x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Preserve pinned upstream source
         shell: pwsh
