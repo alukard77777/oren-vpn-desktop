@@ -207,6 +207,14 @@ $payloadSiblingCanary = Join-Path $installRoot 'payload-sibling-canary.bin'
 $localAppDataSiblingCanary = Join-Path $testRoot 'local-app-data-sibling-canary.bin'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $protocolKey = 'HKCU:\Software\Classes\multicore'
+. (Join-Path $PSScriptRoot 'installer-shortcut-state.ps1')
+$startMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'MultiCore.lnk'
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'MultiCore.lnk'
+$shortcutSnapshots = @(Save-InstallerShortcutState @($startMenuShortcut, $desktopShortcut))
+$ownedShortcutTargets = @(
+    (Join-Path $installRoot 'current\MultiCore.exe'),
+    (Join-Path $foreignInstallRoot 'current\MultiCore.exe')
+)
 $foreignAutostart = '"C:\Foreign Tool\agent.exe" --background'
 $protocolBackup = Join-Path $temporaryBase ('multicore-protocol-backup-' + [Guid]::NewGuid().ToString('N') + '.reg')
 $protocolWasPresent = Test-Path -LiteralPath $protocolKey
@@ -229,6 +237,11 @@ try {
     Assert-True ($install.ExitCode -eq 0) "installer exited with $($install.ExitCode)"
 
     $current = Join-Path $installRoot 'current'
+    Assert-True (Test-Path -LiteralPath $startMenuShortcut -PathType Leaf) 'installer must create a Start menu shortcut without an optional task'
+    $shortcutShell = New-Object -ComObject WScript.Shell
+    $installedShortcut = $shortcutShell.CreateShortcut($startMenuShortcut)
+    Assert-True ($installedShortcut.TargetPath -ieq (Join-Path $current 'MultiCore.exe')) 'Start menu shortcut must target the installed current payload'
+    Assert-True ($installedShortcut.WorkingDirectory -ieq $current) 'Start menu shortcut must use the installed working directory'
     $uninstaller = Join-Path $installRoot 'unins000.exe'
     $uninstallerData = Join-Path $installRoot 'unins000.dat'
     Assert-True (Test-Path -LiteralPath (Join-Path $current 'MultiCore.exe') -PathType Leaf) 'installed app must live under current'
@@ -668,6 +681,7 @@ $signalTemporary = $SignalPath + '.tmp'
     }
     }
 } finally {
+    try {
     # The disposable install shares HKCU with the user's real installation. Its uninstaller
     # removes the global multicore:// handler, so restore exactly what existed beforehand.
     if (Test-Path -LiteralPath $protocolKey) {
@@ -679,5 +693,8 @@ $signalTemporary = $SignalPath + '.tmp'
             throw "Failed to restore MultiCore URL protocol registration; backup: $protocolBackup"
         }
         Remove-Item -LiteralPath $protocolBackup -Force
+    }
+    } finally {
+        Restore-InstallerShortcutState $shortcutSnapshots $ownedShortcutTargets
     }
 }

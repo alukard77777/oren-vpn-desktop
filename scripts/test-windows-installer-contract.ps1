@@ -20,6 +20,14 @@ Assert-True (Test-Path -LiteralPath $BuilderPath -PathType Leaf) 'installer buil
 $definition = Get-Content -Raw -LiteralPath $DefinitionPath
 $builder = Get-Content -Raw -LiteralPath $BuilderPath
 $installedUpdateSmoke = Get-Content -Raw -LiteralPath $InstalledUpdateSmokePath
+& (Join-Path $PSScriptRoot 'test-installer-shortcut-state.ps1')
+
+Assert-True ($definition.Contains('Name: "{autoprograms}\MultiCore"; Filename: "{app}\current\MultiCore.exe"; WorkingDir: "{app}\current"')) `
+    'installer must always create a searchable per-user Start menu shortcut'
+Assert-True ($installedUpdateSmoke.Contains('Restore-InstallerShortcutState $shortcutSnapshots $ownedShortcutTargets')) `
+    'installed-update smoke must restore user shortcuts after disposable uninstall'
+Assert-True ($installedUpdateSmoke.IndexOf('Save-InstallerShortcutState') -lt $installedUpdateSmoke.IndexOf('Start-Process -FilePath $installer')) `
+    'user shortcuts must be saved before the disposable installer runs'
 
 Assert-True ($installedUpdateSmoke.Contains('reg.exe export')) `
     'installed-update smoke must snapshot an existing URL protocol before testing the installer'
