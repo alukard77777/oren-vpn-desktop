@@ -22,7 +22,7 @@ cleanup() {
 trap cleanup EXIT
 export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=multicore-test
 export GDK_BACKEND=wayland LIBGL_ALWAYS_SOFTWARE=1 MULTICORE_ISOLATED_SHELL_TEST=1
-unset DISPLAY DBUS_SESSION_BUS_ADDRESS SLINT_BACKEND MULTICORE_SMOKE_CLOSE
+unset DISPLAY DBUS_SESSION_BUS_ADDRESS SLINT_BACKEND MULTICORE_SMOKE_EXIT_ON_CLOSE
 weston --backend=headless-backend.so --renderer=pixman --socket="$WAYLAND_DISPLAY" \
   --width=1280 --height=900 --idle-time=0 --no-config --log="$evidence/weston.log" &
 compositor_pid=$!
@@ -46,4 +46,9 @@ for host in absent false true; do
     result=1
   fi
 done
+if ! timeout 30s dbus-run-session -- python3 scripts/fixtures/status_notifier_host.py --host true --exercise-menu -- \
+  "$test_binary" linux_shell_tests::wayland_native_tray_menu_restores_and_exits \
+  --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/tray-menu.log"; then
+  result=1
+fi
 exit "$result"

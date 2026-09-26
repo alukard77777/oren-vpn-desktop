@@ -2,8 +2,10 @@
 """A private SNI watcher fixture: a bus owner alone is not a visible tray host."""
 import argparse
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 from gi.repository import Gio, GLib
 
@@ -21,6 +23,7 @@ XML = """<node><interface name="org.kde.StatusNotifierWatcher">
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", choices=("absent", "false", "true"), required=True)
+    parser.add_argument("--exercise-menu", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -28,6 +31,7 @@ def main():
         parser.error("Requires an isolated session and a test command")
     connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     registration = None
+    items = []
     if args.host != "absent":
         properties = {
             "IsStatusNotifierHostRegistered": GLib.Variant("b", args.host == "true"),
@@ -35,7 +39,10 @@ def main():
             "ProtocolVersion": GLib.Variant("i", 0),
         }
 
-        def method_call(_connection, _sender, _path, _interface, _method, _parameters, invocation):
+        def method_call(_connection, sender, _path, _interface, method, parameters, invocation):
+            if method == "RegisterStatusNotifierItem":
+                service = parameters.unpack()[0]
+                items.append((sender, service) if service.startswith("/") else (service, "/StatusNotifierItem"))
             invocation.return_value(GLib.Variant("()", ()))
 
         def get_property(_connection, _sender, _path, _interface, name):
@@ -50,11 +57,54 @@ def main():
                                       Gio.DBusCallFlags.NONE, 1000, None)
         if result.unpack() != (1,):
             raise RuntimeError("Private watcher name is already owned")
-    environment = dict(os.environ, MULTICORE_TEST_HOST_PRESENT=str(args.host == "true").lower())
+    temporary = tempfile.TemporaryDirectory(prefix="multicore-menu-", dir=os.environ["XDG_RUNTIME_DIR"])
+    marker = Path(temporary.name) / "phase"
+    environment = dict(os.environ, MULTICORE_TEST_HOST_PRESENT=str(args.host == "true").lower(),
+                       MULTICORE_TEST_MENU_MARKER=str(marker))
     child = subprocess.Popen(command, env=environment)
     loop = GLib.MainLoop()
+    sent = set()
+    failures = []
+
+    def call(service, path, interface, method, parameters=None):
+        return connection.call_sync(service, path, interface, method, parameters, None,
+                                    Gio.DBusCallFlags.NONE, 2000, None)
+
+    def menu_event(label):
+        service, item_path = items[-1]
+        menu_path = call(service, item_path, "org.freedesktop.DBus.Properties", "Get",
+                         GLib.Variant("(ss)", ("org.kde.StatusNotifierItem", "Menu"))).unpack()[0]
+        layout = call(service, menu_path, "com.canonical.dbusmenu", "GetLayout",
+                      GLib.Variant("(iias)", (0, -1, ["label", "enabled"]))).unpack()[1]
+
+        def find(node):
+            item_id, properties, children = node
+            if properties.get("label", "").replace("_", "") == label:
+                if not properties.get("enabled", True):
+                    raise RuntimeError("Tray action unexpectedly disabled")
+                return item_id
+            for nested in children:
+                found = find(nested)
+                if found is not None:
+                    return found
+            return None
+
+        item_id = find(layout)
+        if item_id is None:
+            raise RuntimeError(f"Missing tray action: {label}")
+        call(service, menu_path, "com.canonical.dbusmenu", "Event",
+             GLib.Variant("(isvu)", (item_id, "clicked", GLib.Variant("i", 0), 0)))
 
     def poll():
+        if args.exercise_menu and child.poll() is None and marker.exists() and items:
+            phase = marker.read_text()
+            if phase and phase not in sent:
+                try:
+                    menu_event("Выйти" if phase == "exit" else "Открыть MultiCore")
+                    sent.add(phase)
+                except Exception as error:
+                    failures.append(str(error))
+                    child.kill()
         if child.poll() is None:
             return True
         loop.quit()
@@ -63,6 +113,10 @@ def main():
     GLib.timeout_add(50, poll)
     try:
         loop.run()
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        if args.exercise_menu and child.returncode == 0:
+            assert sent == {"restore-one", "restore-two", "exit"}, sent
         return child.returncode
     finally:
         if child.poll() is None:
@@ -70,6 +124,7 @@ def main():
             child.wait()
         if registration is not None:
             connection.unregister_object(registration)
+        temporary.cleanup()
 
 
 if __name__ == "__main__":

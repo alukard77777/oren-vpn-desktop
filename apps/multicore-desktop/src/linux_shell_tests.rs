@@ -100,3 +100,79 @@ fn wayland_close_without_tray_exits() {
     assert!(clicked.get());
     ui.hide().unwrap();
 }
+
+#[test]
+#[ignore = "requires isolated Wayland and SNI menu host from test-linux-shell.sh"]
+fn wayland_native_tray_menu_restores_and_exits() {
+    let ui = wayland_window(true);
+    let marker = std::path::PathBuf::from(std::env::var_os("MULTICORE_TEST_MENU_MARKER").unwrap());
+    let model = Arc::new(Mutex::new(DesktopViewModel::new(Arc::new(
+        UnavailableDaemonClient::new(DaemonError::new("isolated shell test")),
+    ))));
+    let writer = Arc::new(Mutex::new(PreferenceWriter::start(None)));
+    let tracker = Arc::new(Mutex::new(PersistenceTracker::new(
+        AppPreferences::default(),
+    )));
+    let menu = tray_menu_model(&model.lock().unwrap());
+    let menu_source = menu.clone();
+    let weak = ui.as_weak();
+    let actions = Rc::new(Cell::new(0));
+    let seen_actions = actions.clone();
+    let _tray = tray::start(
+        menu,
+        move || menu_source.clone(),
+        move |interaction| {
+            let TrayInteraction::Command(command) = interaction else {
+                panic!("SNI must use the native menu");
+            };
+            match command {
+                TrayCommand::ShowWindow => seen_actions.set(seen_actions.get() + 1),
+                TrayCommand::Exit => {
+                    assert_eq!(seen_actions.get(), 2);
+                    seen_actions.set(3);
+                }
+                _ => panic!("unexpected command from isolated tray host"),
+            }
+            handle_tray_command(&weak, &model, command, &writer, &tracker);
+        },
+    )
+    .expect("real AppIndicator must initialize with the isolated host");
+    let weak = ui.as_weak();
+    let phase = Rc::new(Cell::new(0));
+    let progress = phase.clone();
+    let seen_actions = actions.clone();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        let ui = weak.upgrade().unwrap();
+        match progress.get() {
+            0 => {
+                click_title_button(&ui, 110.0);
+                assert!(!ui.window().is_visible());
+                std::fs::write(&marker, "restore-one").unwrap();
+                progress.set(1);
+            }
+            1 if seen_actions.get() == 1 => {
+                assert!(ui.window().is_visible());
+                assert!(ui.window().has_winit_window());
+                click_title_button(&ui, 22.0);
+                assert!(!ui.window().is_visible());
+                std::fs::write(&marker, "restore-two").unwrap();
+                progress.set(2);
+            }
+            2 if seen_actions.get() == 2 => {
+                assert!(ui.window().is_visible());
+                assert!(ui.window().has_winit_window());
+                std::fs::write(&marker, "exit").unwrap();
+                progress.set(3);
+            }
+            _ => {}
+        }
+    });
+    Timer::single_shot(Duration::from_secs(15), || {
+        panic!("native tray menu timed out")
+    });
+    slint::run_event_loop_until_quit().unwrap();
+    assert_eq!(phase.get(), 3);
+    assert_eq!(actions.get(), 3, "must exit through the real D-Bus menu");
+    ui.hide().unwrap();
+}
