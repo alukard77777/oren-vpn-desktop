@@ -3,6 +3,7 @@
 mod app_icon;
 mod bootstrap;
 mod clipboard_text;
+mod conflicting_apps;
 mod daemon;
 #[cfg(target_os = "linux")]
 mod linux_display;
@@ -42,11 +43,11 @@ use tray::{
 };
 use updater::{UpdateAction, UpdateState};
 use view_model::{
-    CatalogDisplayKind, CatalogPresentation, DesktopViewModel, DiagnosticsPresentation,
-    LatencyPresentation, LatencyRequest, MutationToken, NodeSelectionRequest, Panel, PrimaryAction,
-    ProfileRequestToken, QueuedNodeSelection, SemanticTone, StatePresentation,
-    SubscriptionPresentation, SubscriptionProfileOperation, SubscriptionProfilesPresentation,
-    derive_catalog_display,
+    CatalogDisplayKind, CatalogPresentation, ConflictingAppsPresentation, DesktopViewModel,
+    DiagnosticsPresentation, LatencyPresentation, LatencyRequest, MutationToken,
+    NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
+    SemanticTone, StatePresentation, SubscriptionPresentation, SubscriptionProfileOperation,
+    SubscriptionProfilesPresentation, derive_catalog_display,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -68,6 +69,7 @@ struct UiSnapshot {
     catalog: CatalogPresentation,
     diagnostics: DiagnosticsPresentation,
     latency: LatencyPresentation,
+    conflicting_apps: ConflictingAppsPresentation,
 }
 
 const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
@@ -782,6 +784,8 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
+    wire_conflicting_apps_banner(&ui, model.clone());
+    let _conflicting_apps_timer = wire_conflicting_apps_scan(&ui, model.clone());
     wire_windows_settings(&ui);
     wire_external_activations(
         &ui,
@@ -2764,6 +2768,10 @@ fn wire_primary_action(
         startup_connect_pending.set(false);
         let (action, client, queued, current) = {
             let mut model = model.lock().expect("view model lock");
+            // Re-scan right at the start of the attempt: warn before a
+            // conflicting app causes a failed Connect, or explain one that
+            // just happened.
+            model.set_conflicting_apps(conflicting_apps::scan_running());
             let action = model.begin_primary_action();
             let client = model.daemon_client();
             let queued = model.queued_node_selections();
@@ -2901,6 +2909,53 @@ fn begin_latency_check(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopVie
     if let Some(request) = request {
         run_latency_check(weak, model, request);
     }
+}
+
+/// Periodically re-scans for other Mihomo/Xray-based VPN client apps known
+/// to conflict with MultiCore's TUN adapter, WinTun driver session, and
+/// local ports, so the banner can warn *before* a Connect attempt fails
+/// because of one. The scan is cheap and local (see `conflicting_apps.rs`);
+/// it only runs while the window is visible and only while not already
+/// connected, since a working tunnel means there is nothing to warn about.
+fn wire_conflicting_apps_scan(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    timer.start(TimerMode::Repeated, Duration::from_secs(7), move || {
+        if !weak.upgrade().is_some_and(|ui| ui.window().is_visible()) {
+            return;
+        }
+        if model
+            .lock()
+            .expect("view model lock")
+            .presentation()
+            .is_connected
+        {
+            return;
+        }
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.set_conflicting_apps(conflicting_apps::scan_running());
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+    });
+    timer
+}
+
+fn wire_conflicting_apps_banner(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    ui.on_dismiss_conflicting_apps_banner(move || {
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.dismiss_conflicting_apps_banner();
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+    });
 }
 
 fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
@@ -3657,6 +3712,7 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         catalog: model.catalog_presentation(),
         diagnostics: model.diagnostics_presentation(),
         latency: model.latency_presentation(),
+        conflicting_apps: model.conflicting_apps_presentation(),
     }
 }
 
@@ -3814,6 +3870,8 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
             })
             .collect::<Vec<_>>(),
     )));
+    ui.set_conflicting_apps_banner_visible(snapshot.conflicting_apps.visible);
+    ui.set_conflicting_apps_message(snapshot.conflicting_apps.message.clone().into());
     apply_catalog(ui, &snapshot.catalog);
     ui.set_active_panel(
         match snapshot.panel {
