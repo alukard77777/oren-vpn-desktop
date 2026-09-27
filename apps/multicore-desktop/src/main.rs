@@ -10,6 +10,8 @@ mod linux_display;
 mod linux_shell_tests;
 mod logo_cache;
 mod preferences;
+#[cfg(all(test, feature = "preview-render"))]
+mod preview_render;
 mod service_logo;
 mod single_instance;
 mod tray;
