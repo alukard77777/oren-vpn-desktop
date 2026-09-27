@@ -2648,16 +2648,9 @@ fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPres
 
 fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
     match (status, latency_ms) {
-        ("ok", Some(value)) => {
-            let tone = if value < 80 {
-                "success"
-            } else if value < 150 {
-                "warning"
-            } else {
-                "danger"
-            };
-            (format!("{value} ms"), tone.into())
-        }
+        // Any answered ping is a working node: the exact millisecond count
+        // isn't a failure signal, so it stays green regardless of value.
+        ("ok", Some(value)) => (format!("{value} ms"), "success".into()),
         ("timeout", _) => ("таймаут".into(), "danger".into()),
         ("error" | "unavailable", _) => ("нет связи".into(), "danger".into()),
         _ => ("нет данных".into(), "neutral".into()),
@@ -3854,23 +3847,13 @@ mod tests {
     }
 
     #[test]
-    fn latency_tone_boundaries_are_stable() {
-        assert_eq!(
-            latency_display("ok", Some(79)),
-            ("79 ms".into(), "success".into())
-        );
-        assert_eq!(
-            latency_display("ok", Some(80)),
-            ("80 ms".into(), "warning".into())
-        );
-        assert_eq!(
-            latency_display("ok", Some(149)),
-            ("149 ms".into(), "warning".into())
-        );
-        assert_eq!(
-            latency_display("ok", Some(150)),
-            ("150 ms".into(), "danger".into())
-        );
+    fn any_answered_ping_is_success_only_timeout_and_errors_are_danger() {
+        for value in [1, 79, 80, 149, 150, 999, 5000] {
+            assert_eq!(
+                latency_display("ok", Some(value)),
+                (format!("{value} ms"), "success".into())
+            );
+        }
         assert_eq!(latency_display("timeout", None).1, "danger");
         assert_eq!(latency_display("unavailable", None).1, "danger");
         assert_eq!(latency_display("unknown", None).1, "neutral");
