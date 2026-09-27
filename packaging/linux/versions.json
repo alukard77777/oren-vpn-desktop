@@ -35,6 +35,17 @@
         "entry": "mihomo",
         "executableSha256": "8ad44e28fe72be4640254b96741b677f4074991b99186cc4486a1c28ded02b1a"
       }
+    },
+    "dashboard": {
+      "project": "Zephyruso/zashboard",
+      "version": "v3.29.1",
+      "license": "GPL-3.0-only",
+      "asset": {
+        "name": "dist-no-fonts.zip",
+        "url": "https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist-no-fonts.zip",
+        "sha256": "21371cd111b6b3d87774f3ea3ddeacdcb0f6aff8690a16d652daa3ea6e3b0145",
+        "note": "dist-no-fonts is used (not dist-cdn-fonts/dist) so the vendored static UI never references a runtime font CDN. Verified empirically against the pinned Mihomo v1.19.30 binary: Mihomo requires an external-ui directory to be a subpath of its own home directory or listed in the SAFE_PATHS environment variable of the process that spawns it, and otherwise attempts a live download of a dashboard from the internet -- this package must always stage this directory and set SAFE_PATHS before launching Mihomo."
+      }
     }
   }
 }
