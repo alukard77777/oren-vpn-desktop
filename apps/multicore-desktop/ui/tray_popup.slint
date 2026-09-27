@@ -282,7 +282,7 @@ component RouteGroupAction inherits Rectangle {
         Text {
             text: root.detail;
             color: root.expanded ? Theme.accent-blue : Theme.text-muted;
-            font-size: 11px;
+            font-size: Theme.type-metadata-size;
             overflow: elide;
         }
     }
@@ -359,6 +359,8 @@ export component TrayPopup inherits Window {
     in property <string> status-text: "Готово";
     in property <string> connection-label: "Подключиться";
     in property <bool> connection-enabled: true;
+    in property <bool> connected: false;
+    in property <bool> has-profile: true;
     in property <[TrayMenuRow]> group-rows;
     in property <[TrayMenuRow]> node-rows;
 
@@ -366,6 +368,7 @@ export component TrayPopup inherits Window {
     callback toggle-group(string);
     callback select-node(string, string);
     callback open-main();
+    callback add-subscription();
     callback exit-app();
     callback dismiss();
 
@@ -415,15 +418,23 @@ export component TrayPopup inherits Window {
                     VerticalLayout {
                         spacing: 1px;
                         Text { text: "MULTICORE"; color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-bold; letter-spacing: 1px; }
-                        Text { text: root.status-text; color: Theme.text-muted; font-size: 11px; overflow: elide; }
+                        Text { text: root.status-text; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
                     }
                 }
 
-                connect-action := TrayConnectAction {
+                if root.has-profile: connect-action := TrayConnectAction {
                     label: root.connection-label;
                     enabled: root.connection-enabled;
-                    connected: root.connection-label == "Отключиться";
+                    connected: root.connected;
                     activated => { root.toggle-connection(); }
+                }
+
+                if !root.has-profile: PopupAction {
+                    height: 44px;
+                    vertical-stretch: 0;
+                    label: "Добавить подписку";
+                    icon-kind: "window";
+                    activated => { root.add-subscription(); }
                 }
 
                 Rectangle { height: 1px; vertical-stretch: 0; background: Theme.line; }
@@ -433,7 +444,7 @@ export component TrayPopup inherits Window {
                     vertical-stretch: 0;
                     text: "Маршруты";
                     color: Theme.text-muted;
-                    font-size: 11px;
+                    font-size: Theme.type-metadata-size;
                     font-weight: Theme.weight-semibold;
                     vertical-alignment: center;
                 }

@@ -50,6 +50,11 @@ pub enum UiState {
     Error {
         message: String,
     },
+    /// The status poll itself failed: the local service did not answer, so the
+    /// tunnel state is unknown rather than a failed connection attempt.
+    ServiceUnreachable {
+        message: String,
+    },
     DaemonDegraded {
         message: String,
     },
@@ -217,6 +222,8 @@ pub(crate) struct CatalogPresentation {
     pub(crate) group_navigation_enabled: bool,
     pub(crate) selection_enabled: bool,
     pub(crate) selection_pending: bool,
+    #[allow(dead_code)]
+    // Queue state is asserted in tests; the UI shows the queued route as selected.
     pub(crate) selection_queued: bool,
     pub(crate) error: Option<String>,
 }
@@ -264,7 +271,13 @@ pub(crate) struct SubscriptionProfilesPresentation {
     pub(crate) active_id: Option<String>,
     pub(crate) profiles: Vec<SubscriptionProfilePresentation>,
     pub(crate) loading: bool,
+    /// The profile list could not be loaded; retrying the list request helps.
     pub(crate) error: Option<String>,
+    /// A profile mutation was rejected or failed. Reloading the list does not
+    /// resolve it, so it is shown without a retry action.
+    pub(crate) mutation_error: Option<String>,
+    /// Switching the active subscription requires a disconnected tunnel.
+    pub(crate) switch_locked: bool,
     pub(crate) pending_operation: Option<SubscriptionProfileOperation>,
     pub(crate) pending_id: Option<String>,
 }
@@ -306,7 +319,6 @@ pub struct StatePresentation {
     pub primary_label: &'static str,
     pub primary_action: PrimaryAction,
     pub primary_enabled: bool,
-    pub pill_label: &'static str,
     pub semantic_tone: SemanticTone,
     pub has_profile: bool,
     pub is_connected: bool,
@@ -327,7 +339,6 @@ impl UiState {
                 primary_label: "Подключиться",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ГОТОВО",
                 semantic_tone: SemanticTone::Neutral,
                 has_profile: false,
                 is_connected: false,
@@ -344,7 +355,6 @@ impl UiState {
                 primary_label: "Добавляем…",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ПОДКЛЮЧЕНИЕ",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: false,
                 is_connected: false,
@@ -361,7 +371,6 @@ impl UiState {
                 primary_label: "Подключиться",
                 primary_action: PrimaryAction::Connect,
                 primary_enabled: true,
-                pill_label: "ГОТОВО",
                 semantic_tone: SemanticTone::Accent,
                 has_profile: true,
                 is_connected: false,
@@ -382,7 +391,6 @@ impl UiState {
                 primary_label: "Подключаем…",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ПОДКЛЮЧЕНИЕ",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: false,
@@ -399,7 +407,6 @@ impl UiState {
                 primary_label: "Отключиться",
                 primary_action: PrimaryAction::Disconnect,
                 primary_enabled: true,
-                pill_label: "В СЕТИ",
                 semantic_tone: SemanticTone::Success,
                 has_profile: true,
                 is_connected: true,
@@ -416,7 +423,6 @@ impl UiState {
                 primary_label: "Отключаем…",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ОТКЛЮЧЕНИЕ",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: true,
@@ -430,10 +436,25 @@ impl UiState {
                 supporting: message.clone(),
                 profile: "—".into(),
                 node: "Авто".into(),
-                primary_label: "Повторить",
+                primary_label: "Проверить снова",
                 primary_action: PrimaryAction::Retry,
                 primary_enabled: true,
-                pill_label: "ОШИБКА",
+                semantic_tone: SemanticTone::Danger,
+                has_profile: true,
+                is_connected: false,
+                is_busy: false,
+                is_error: true,
+                is_degraded: false,
+            },
+            Self::ServiceUnreachable { message } => StatePresentation {
+                eyebrow: "Нет связи с сервисом",
+                headline: "Сервис не отвечает".into(),
+                supporting: message.clone(),
+                profile: "Состояние неизвестно".into(),
+                node: "—".into(),
+                primary_label: "Проверить снова",
+                primary_action: PrimaryAction::Retry,
+                primary_enabled: true,
                 semantic_tone: SemanticTone::Danger,
                 has_profile: true,
                 is_connected: false,
@@ -447,10 +468,9 @@ impl UiState {
                 supporting: message.clone(),
                 profile: "Состояние неизвестно".into(),
                 node: "—".into(),
-                primary_label: "Очистить",
+                primary_label: "Остановить туннель",
                 primary_action: PrimaryAction::Cleanup,
                 primary_enabled: true,
-                pill_label: "СЕРВИС",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: false,
@@ -583,6 +603,7 @@ pub struct DesktopViewModel {
     active_profile_id: Option<String>,
     subscription_profiles: Vec<SubscriptionProfilePresentation>,
     profile_error: Option<String>,
+    profile_list_error: Option<String>,
     profile_status_reload_needed: bool,
     profile_reload_needed: bool,
     profile_catalog_reload_needed: bool,
@@ -648,6 +669,7 @@ impl DesktopViewModel {
             active_profile_id: None,
             subscription_profiles: Vec::new(),
             profile_error: None,
+            profile_list_error: None,
             profile_status_reload_needed: false,
             profile_reload_needed: false,
             profile_catalog_reload_needed: false,
@@ -709,7 +731,6 @@ impl DesktopViewModel {
             presentation.eyebrow = "Проверка";
             presentation.headline = "Проверяем состояние…".into();
             presentation.primary_label = "Проверяем…";
-            presentation.pill_label = "ПРОВЕРКА";
             presentation.semantic_tone = SemanticTone::Warning;
             presentation.is_connected = false;
             presentation.is_busy = true;
@@ -764,7 +785,14 @@ impl DesktopViewModel {
             active_id: self.active_profile_id.clone(),
             profiles: self.subscription_profiles.clone(),
             loading: self.profile_list_request_pending.is_some(),
-            error: self.profile_error.clone(),
+            error: self.profile_list_error.clone(),
+            mutation_error: self.profile_error.clone(),
+            switch_locked: matches!(
+                self.state,
+                UiState::Connected { .. }
+                    | UiState::Connecting { .. }
+                    | UiState::Disconnecting { .. }
+            ),
             pending_operation: self
                 .active_profile_mutation
                 .as_ref()
@@ -782,6 +810,7 @@ impl DesktopViewModel {
 
     pub(crate) fn begin_profile_list(&mut self) -> Option<ProfileRequestToken> {
         self.profile_error = None;
+        self.profile_list_error = None;
         self.profile_reload_needed = false;
         self.next_profile_list_generation = self.next_profile_list_generation.wrapping_add(1);
         let token = ProfileRequestToken(self.next_profile_list_generation);
@@ -802,11 +831,12 @@ impl DesktopViewModel {
             Ok(list) => {
                 self.replace_profile_list(list);
                 self.profile_error = None;
+                self.profile_list_error = None;
                 self.profile_list_reconciliation_pending = false;
                 self.arm_profile_catalog_reconciliation();
             }
             Err(_) => {
-                self.profile_error =
+                self.profile_list_error =
                     Some("Не удалось загрузить подписки. Повторите попытку.".into());
                 if self.profile_list_reconciliation_pending {
                     self.profile_reload_needed = true;
@@ -1604,7 +1634,7 @@ impl DesktopViewModel {
                 if self.profile_status_reconciliation_pending {
                     self.profile_status_reload_needed = true;
                 }
-                UiState::Error {
+                UiState::ServiceUnreachable {
                     message: error.to_string(),
                 }
             }
@@ -3270,9 +3300,10 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            model.profile_presentation().error.as_deref(),
+            model.profile_presentation().mutation_error.as_deref(),
             Some("Введите корректный HTTP(S) URL.")
         );
+        assert_eq!(model.profile_presentation().error, None);
 
         let edit = model
             .begin_profile_source_edit("profile-a", "https://replacement.invalid/sub?token=secret")
@@ -3519,6 +3550,61 @@ mod tests {
     }
 
     #[test]
+    fn connected_state_locks_profile_switching_and_reports_it_as_a_mutation_error() {
+        let mut model = model_with_profiles();
+        assert!(!model.profile_presentation().switch_locked);
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Alpha".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+
+        assert!(model.profile_presentation().switch_locked);
+        assert!(model.begin_profile_activation("profile-b").is_none());
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.error, None);
+        assert_eq!(
+            presentation.mutation_error.as_deref(),
+            Some("Отключитесь перед изменением подписки.")
+        );
+    }
+
+    #[test]
+    fn profile_list_failure_is_retryable_and_cleared_by_the_next_list_request() {
+        let mut model = model_with_profiles();
+        let list = model.begin_profile_list().expect("profile list");
+        assert!(
+            model.finish_profile_list(list, Err(crate::daemon::DaemonError::new("unavailable")),)
+        );
+        let presentation = model.profile_presentation();
+        assert_eq!(
+            presentation.error.as_deref(),
+            Some("Не удалось загрузить подписки. Повторите попытку.")
+        );
+        assert_eq!(presentation.mutation_error, None);
+
+        model.begin_profile_list().expect("retry list");
+        assert_eq!(model.profile_presentation().error, None);
+    }
+
+    #[test]
+    fn failed_status_poll_reports_an_unreachable_service_not_a_failed_connection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Err(crate::daemon::DaemonError::new("unavailable")));
+        let presentation = model.presentation();
+        assert_eq!(presentation.eyebrow, "Нет связи с сервисом");
+        assert_eq!(presentation.primary_label, "Проверить снова");
+        assert_eq!(presentation.primary_action, PrimaryAction::Retry);
+        assert_eq!(presentation.semantic_tone, SemanticTone::Danger);
+    }
+
+    #[test]
     fn degraded_profile_mutations_are_rejected_without_issuing_tokens() {
         let mut model = model_with_profiles();
         model.state = UiState::DaemonDegraded {
@@ -3530,7 +3616,11 @@ mod tests {
         assert!(model.begin_profile_target_refresh("profile-b").is_none());
         let presentation = model.profile_presentation();
         assert_eq!(presentation.pending_operation, None);
-        let error = presentation.error.expect("bounded degraded error");
+        assert_eq!(
+            presentation.error, None,
+            "mutation errors are not list errors"
+        );
+        let error = presentation.mutation_error.expect("bounded degraded error");
         assert!(error.chars().count() < 128);
         assert!(!error.contains("private.invalid"));
         assert!(!error.contains("secret"));
@@ -4129,7 +4219,12 @@ mod tests {
         assert!(!app.contains("Задержка обновляется автоматически"));
         assert!(app.contains("routes-heading := HorizontalLayout"));
         assert!(app.contains("route-updated-meta := Text"));
-        assert!(app.contains("text: root.subscription-updated;"));
+        assert!(app.contains(
+            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated;"
+        ));
+        assert!(app.contains(
+            "color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;"
+        ));
         assert!(app.contains("horizontal-alignment: right;"));
         assert!(app.contains("trailing-text: node.latency-text;"));
         assert!(!main.contains("ui.on_check_latencies"));
@@ -4210,8 +4305,10 @@ mod tests {
             .and_then(|source| source.split("if root.profile-menu-open").next())
             .expect("home subscription refresh action source");
 
-        assert!(refresh_action.contains("width: 92px;"));
+        assert!(refresh_action.contains("width: 116px;"));
         assert!(refresh_action.contains("height: 44px;"));
+        assert!(refresh_action.contains("opacity: parent.enabled ? 1 : 0.45;"));
+        assert!(refresh_action.contains("\"Указать ссылку\""));
         let compact = refresh_action.split_whitespace().collect::<String>();
         assert!(compact.contains("Rectangle{y:5px;height:34px;"));
     }
@@ -5745,7 +5842,6 @@ mod tests {
             "padding: 20px;",
             "preferred-height: 44px;",
             "preferred-height: 92px;",
-            "state-busy",
             "LineEdit",
             "multicore://install-sub?url=…",
             "QuietChip",
@@ -5806,7 +5902,6 @@ mod tests {
             );
         }
         assert!(main.contains("ui.set_has_profile(presentation.has_profile);"));
-        assert!(main.contains("ui.set_state_busy(presentation.is_busy);"));
         assert!(main.contains("if refresh_catalog && current.presentation.has_profile"));
         assert!(main.contains("load_catalog(weak, model);"));
     }
@@ -5943,15 +6038,15 @@ mod tests {
             assert!(status.contains(padding), "status missing {padding}");
         }
 
-        assert_eq!(
-            source
-                .matches("MultiCore · Mihomo 1.19.30 · Xray 26.9.9")
-                .count(),
-            1
-        );
+        assert!(!source.contains("Mihomo 1.19.30"));
         assert!(source.contains(
-            "if root.visible-page == \"settings\": Text { height: 24px; text: \"MultiCore · Mihomo 1.19.30 · Xray 26.9.9\";"
+            "if root.visible-page == \"settings\": Text { height: 24px; text: root.runtime-versions;"
         ));
+        assert!(
+            include_str!("main.rs")
+                .contains("ui.set_runtime_versions(env!(\"MULTICORE_RUNTIME_VERSIONS\").into());")
+        );
+        assert!(include_str!("../build.rs").contains("packaging/windows-x64/versions.json"));
     }
 
     #[test]
@@ -5980,7 +6075,7 @@ mod tests {
         assert!(subscription_header.contains("width: parent.width - 128px;"));
         assert!(subscription_header.contains("overflow: elide;"));
         assert!(settings.contains("// Historical minimum-height contract used spacing: 18px;."));
-        assert!(settings.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(settings.contains("text <=> root.subscription-draft;"));
         assert!(settings.matches("ToggleRow {").count() >= 2);
         assert!(
             settings.find("settings-scroll := ScrollView").unwrap()
@@ -6117,8 +6212,21 @@ mod tests {
             .nth(1)
             .expect("subscription management page");
         assert!(management.contains("root.add-subscription();"));
-        assert!(management.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(management.contains("text <=> root.subscription-draft;"));
+        assert!(management.contains("accessible-label: \"URL подписки\";"));
+        assert!(management.contains("accepted => {"));
+        assert!(management.contains("label: \"Отмена\";"));
+        assert!(management.contains("root.import-pending ? \"Добавляем…\" : \"Добавить\""));
         assert!(management.contains("root.import-url(root.subscription-draft);"));
+        // A failed deep-link import renders on the page even without the editor.
+        assert!(
+            management
+                .contains("if root.import-error != \"\" && !root.replace-editor-open: Text {")
+        );
+
+        // First launch shows only onboarding: no empty shelf or route list noise.
+        assert!(source.contains("if root.has-profile: subscription-strip := Rectangle {"));
+        assert!(source.contains("if root.has-profile: inline-routes := Rectangle {"));
     }
 
     #[test]
@@ -6211,10 +6319,13 @@ mod tests {
             })
             .expect("subscription strip source");
         assert!(subscription_strip.contains("border-radius: 16px;"));
-        assert!(subscription_strip.contains("x: parent.width - 140px;"));
-        assert!(subscription_strip.contains("width: 92px;"));
+        assert!(subscription_strip.contains("x: parent.width - 164px;"));
+        assert!(subscription_strip.contains("width: 116px;"));
         assert!(subscription_strip.contains("height: 44px;"));
-        assert!(subscription_strip.contains("accessible-label: root.subscription-refresh-pending"));
+        assert!(
+            subscription_strip
+                .contains("root.subscription-refresh-pending ? \"Подписка обновляется\"")
+        );
         assert!(subscription_strip.contains("root.refresh-subscription();"));
         assert!(subscription_strip.contains("padding-right: 16px;"));
         assert!(subscription_strip.contains("padding-top: 5px;"));
@@ -6338,7 +6449,7 @@ mod tests {
             "text: \"Маршруты\";",
             "routes-heading := HorizontalLayout",
             "route-updated-meta := Text",
-            "text: root.subscription-updated;",
+            "root.subscription-updated;",
             "root.open-panel(\"events\")",
             "root.refresh-subscription();",
             "root.primary-action();",
@@ -6426,7 +6537,6 @@ mod tests {
         let route = components
             .split("export component RouteNodeRow")
             .nth(1)
-            .and_then(|source| source.split("export component DetailsSurface").next())
             .expect("RouteNodeRow source");
         assert!(route.contains("font-size: Theme.type-metadata-size;"));
         assert!(route.contains("text: root.icon;"));
@@ -6684,13 +6794,11 @@ mod tests {
         assert!(!components.contains("std-widgets.slint"));
         assert!(!components.contains(" Button "));
 
-        for component in [
-            "IconAction",
-            "PrimaryAction",
-            "QuietChip",
-            "RouteNodeRow",
-            "DetailsSurface",
-        ] {
+        for unused in ["IconAction", "DetailsSurface"] {
+            assert!(!components.contains(&format!("export component {unused}")));
+            assert!(!build.contains(unused));
+        }
+        for component in ["PrimaryAction", "QuietChip", "RouteNodeRow"] {
             assert!(
                 components.contains(&format!("export component {component}")),
                 "missing Quiet Signal primitive: {component}"
@@ -6709,15 +6817,10 @@ mod tests {
             next.and_then(|next| source.split(&format!("export component {next}")).next())
                 .unwrap_or(source)
         };
-        let icon_action = component_source("IconAction", Some("PrimaryAction"));
-        assert!(icon_action.contains("preferred-width: Theme.interactive-min;"));
-        assert!(icon_action.contains("preferred-height: Theme.interactive-min;"));
-        assert!(icon_action.contains("accessible-label: root.state-label;"));
-
         for (name, next) in [
             ("PrimaryAction", "QuietChip"),
             ("QuietChip", "RouteNodeRow"),
-            ("RouteNodeRow", "DetailsSurface"),
+            ("RouteNodeRow", "RouteNodeRow-end"),
         ] {
             let source = component_source(name, Some(next));
             assert!(
@@ -6740,7 +6843,7 @@ mod tests {
         );
         assert!(!primary.contains("destructive"));
 
-        let route = component_source("RouteNodeRow", Some("DetailsSurface"));
+        let route = component_source("RouteNodeRow", None);
         assert!(route.contains("pending-state-label"));
         assert!(route.contains("root.pending ?"));
         assert!(route.contains("font-size: Theme.type-metadata-size;"));
@@ -6756,15 +6859,6 @@ mod tests {
         assert!(route.contains("enabled: root.enabled;"));
         assert!(route.contains("clicked => { root.activated(); }"));
         assert!(!route.contains("parent.width - 136px"));
-
-        let details = component_source("DetailsSurface", None);
-        assert!(details.contains("width: Theme.interactive-min;"));
-        assert!(details.contains("height: Theme.interactive-min;"));
-        assert!(details.contains("Theme.focus-width"));
-        assert!(details.contains("event.text == \" \""));
-        assert!(details.contains("event.text == \"\\n\""));
-        assert!(details.contains("dismiss-label"));
-        assert!(!details.contains("\"Close "));
 
         let capture_runner = include_str!("../../../scripts/run-preview-capture.ps1");
         assert!(capture_runner.contains("$captureFileNames = @("));
@@ -7274,19 +7368,19 @@ mod tests {
     #[test]
     fn presentation_exposes_exact_status_tone_and_inline_profile_mode() {
         let cases = [
-            (UiState::Empty, "ГОТОВО", SemanticTone::Neutral, false),
             (
-                UiState::Importing,
-                "ПОДКЛЮЧЕНИЕ",
-                SemanticTone::Warning,
+                UiState::Empty,
+                "Профиль не добавлен",
+                SemanticTone::Neutral,
                 false,
             ),
+            (UiState::Importing, "Импорт", SemanticTone::Warning, false),
             (
                 UiState::Ready {
                     profile: "Работа".into(),
                     node: "Авто".into(),
                 },
-                "ГОТОВО",
+                "Готово",
                 SemanticTone::Accent,
                 true,
             ),
@@ -7296,7 +7390,7 @@ mod tests {
                     node: "Авто".into(),
                     step: "Запуск".into(),
                 },
-                "ПОДКЛЮЧЕНИЕ",
+                "Подключение",
                 SemanticTone::Warning,
                 true,
             ),
@@ -7305,7 +7399,7 @@ mod tests {
                     profile: "Работа".into(),
                     node: "nl-01".into(),
                 },
-                "В СЕТИ",
+                "Подключено",
                 SemanticTone::Success,
                 true,
             ),
@@ -7313,7 +7407,15 @@ mod tests {
                 UiState::Error {
                     message: "Ошибка".into(),
                 },
-                "ОШИБКА",
+                "Не удалось подключиться",
+                SemanticTone::Danger,
+                true,
+            ),
+            (
+                UiState::ServiceUnreachable {
+                    message: "Нет ответа".into(),
+                },
+                "Нет связи с сервисом",
                 SemanticTone::Danger,
                 true,
             ),
@@ -7321,7 +7423,7 @@ mod tests {
                 UiState::DaemonDegraded {
                     message: "Сервис".into(),
                 },
-                "СЕРВИС",
+                "Сервис недоступен",
                 SemanticTone::Warning,
                 true,
             ),
@@ -7329,7 +7431,7 @@ mod tests {
 
         for (state, label, tone, has_profile) in cases {
             let presentation = state.presentation();
-            assert_eq!(presentation.pill_label, label);
+            assert_eq!(presentation.eyebrow, label);
             assert_eq!(presentation.semantic_tone, tone);
             assert_eq!(presentation.has_profile, has_profile);
         }
@@ -7424,7 +7526,15 @@ mod tests {
                 },
                 "Что-то пошло не так",
                 PrimaryAction::Retry,
-                "Повторить",
+                "Проверить снова",
+            ),
+            (
+                UiState::ServiceUnreachable {
+                    message: "Нет ответа".into(),
+                },
+                "Сервис не отвечает",
+                PrimaryAction::Retry,
+                "Проверить снова",
             ),
             (
                 UiState::DaemonDegraded {
@@ -7432,7 +7542,7 @@ mod tests {
                 },
                 "Ограниченный режим",
                 PrimaryAction::Cleanup,
-                "Очистить",
+                "Остановить туннель",
             ),
         ];
 
