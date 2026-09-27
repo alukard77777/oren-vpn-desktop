@@ -205,6 +205,86 @@ fn data_root_follows_the_peer_xdg_data_home_or_the_passwd_home() {
     );
 }
 
+#[test]
+fn dashboard_absent_leaves_dashboard_directory_none() {
+    let fixture = fixture();
+    let resolved = resolve(&fixture).unwrap();
+    assert_eq!(resolved.paths.dashboard_directory, None);
+}
+
+#[test]
+fn resolves_an_optional_dashboard_sibling_of_cores_with_no_windows_style_prefix() {
+    // Mirrors apps/multicore-core-host/src/runtime_paths.rs's Windows dashboard resolution:
+    // `<package>/dashboard`, a sibling of `cores/`, not `<package>/runtime/dashboard` (the host
+    // executable's own directory, one level deeper). Also confirms the reasoning behind not
+    // needing runtime_paths.rs's `strip_verbatim_prefix` here: Linux's `fs::canonicalize` never
+    // adds a `\\?\`-style prefix, so the value this resolver hands back for Mihomo's SAFE_PATHS
+    // already byte-for-byte matches the unprefixed `external-ui` path the daemon writes into the
+    // generated Mihomo config (crates/multicore-daemon/src/main.rs) with no stripping needed.
+    let fixture = fixture();
+    let package = fixture.host.parent().unwrap().parent().unwrap();
+    let dashboard = package.join("dashboard");
+    fs::create_dir_all(&dashboard).unwrap();
+    fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+
+    let resolved = resolve(&fixture).unwrap();
+    let canonical = dashboard.canonicalize().unwrap();
+    assert_eq!(resolved.paths.dashboard_directory, Some(canonical.clone()));
+    assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+}
+
+#[test]
+fn dashboard_replaced_with_a_symlink_is_rejected_not_silently_treated_as_absent() {
+    // Regression for a real bug: `dashboard_present` used to be gated on
+    // `symlink_metadata(&dashboard).is_dir()`, but on Unix `is_dir()` is *always* false for a
+    // symlink (`lstat` reports `S_IFLNK`, never `S_IFDIR`, no matter what the symlink points
+    // to) - unlike Windows, where a directory reparse point keeps `FILE_ATTRIBUTE_DIRECTORY`
+    // set. That made a dashboard directory swapped for a symlink look identical to a genuinely
+    // absent dashboard: presence was false, the guard chain never ran, and resolution quietly
+    // succeeded with `dashboard_directory: None` instead of failing closed the way the Windows
+    // resolver's equivalent check does (`ResolveError::Reparse`, see
+    // apps/multicore-core-host/src/runtime_paths.rs's `rejects_a_dashboard_directory_replaced_
+    // with_a_reparse_point`). The symlink is created directly at the dashboard path (never a
+    // real directory first) so this cannot be satisfied by anything that merely tracks whether
+    // a directory once existed there.
+    let fixture = fixture();
+    let package = fixture.host.parent().unwrap().parent().unwrap();
+    let outside = fixture.data.parent().unwrap().join("outside-dashboard");
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, package.join("dashboard")).unwrap();
+    assert_eq!(resolve(&fixture).err(), Some(ResolveError::Symlink));
+}
+
+#[test]
+fn dashboard_path_occupied_by_a_regular_file_is_rejected_not_silently_treated_as_absent() {
+    let fixture = fixture();
+    let package = fixture.host.parent().unwrap().parent().unwrap();
+    fs::write(package.join("dashboard"), b"not a directory").unwrap();
+    assert_eq!(resolve(&fixture).err(), Some(ResolveError::Layout));
+}
+
+#[test]
+fn dashboard_symlink_and_writable_permission_are_rejected() {
+    let fixture = fixture();
+    let package = fixture.host.parent().unwrap().parent().unwrap();
+    let dashboard = package.join("dashboard");
+    fs::create_dir_all(&dashboard).unwrap();
+    fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+    replace_with_symlink(&dashboard);
+    assert_eq!(resolve(&fixture).err(), Some(ResolveError::Symlink));
+}
+
+#[test]
+fn dashboard_group_or_world_writable_is_rejected() {
+    let fixture = fixture();
+    let package = fixture.host.parent().unwrap().parent().unwrap();
+    let dashboard = package.join("dashboard");
+    fs::create_dir_all(&dashboard).unwrap();
+    fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+    fs::set_permissions(&dashboard, fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(resolve(&fixture).err(), Some(ResolveError::Ownership));
+}
+
 #[path = "../src/unix_socket.rs"]
 #[allow(dead_code)]
 mod unix_socket;

@@ -116,8 +116,23 @@ pub(crate) fn resolve_from(
     // The vendored dashboard is optional: absent in builds without one, present as an exact
     // package-root sibling of `cores` otherwise. Its presence is decided once, up front, so a
     // directory that appears only after that check can never be picked up mid-resolution.
+    //
+    // Presence is "something exists at this path at all" (`is_ok()`), not "is a directory"
+    // (`is_dir()`). On Unix, `symlink_metadata` never reports `is_dir()` true for a symlink -
+    // `lstat`'s mode bits report `S_IFLNK`, never `S_IFDIR`, regardless of what the symlink
+    // points to. Gating presence on `is_dir()` would make a dashboard directory replaced with a
+    // symlink silently look identical to a genuinely absent dashboard: `dashboard_present` would
+    // be `false`, the guard chain below would never run, and resolution would quietly succeed
+    // with `dashboard_directory: None` instead of failing closed. That is a real divergence from
+    // the Windows resolver's equivalent check just below: a Windows directory reparse
+    // point/symlink keeps `FILE_ATTRIBUTE_DIRECTORY` set, so it is still seen as "present" there
+    // and correctly rejected by the guard chain as `ResolveError::Reparse`. Checking `is_ok()`
+    // instead makes a symlinked (or otherwise non-directory) dashboard path reach guard_chain
+    // and its `O_NOFOLLOW` open below, which rejects a symlink as `ResolveError::Symlink` and
+    // anything else as `ResolveError::Layout` - matching the Windows fail-closed behavior instead
+    // of silently disabling the dashboard feature with no signal anything was wrong.
     let dashboard = package.join("dashboard");
-    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok_and(|m| m.file_type().is_dir());
+    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok();
 
     let mut guards = Vec::new();
     for directory in [
