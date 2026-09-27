@@ -296,6 +296,30 @@ function Assert-ExactProductionPin {
     }
 }
 
+function Assert-ExactDashboardPin {
+    param([object]$Component)
+    $expected = @(
+        'Zephyruso/zashboard', 'v3.29.1', '50717b02dac68425cdc5b80cb754bea768ee4fc9', 'MIT',
+        'dist-no-fonts.zip', 'https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist-no-fonts.zip',
+        '21371cd111b6b3d87774f3ea3ddeacdcb0f6aff8690a16d652daa3ea6e3b0145', 'dist/',
+        '70bb3dc4057cbc0feaff524672f2b0fbafa52279b757dbdc8cb8fdc3e6a73510',
+        'zashboard-MIT.txt', 'https://raw.githubusercontent.com/Zephyruso/zashboard/50717b02dac68425cdc5b80cb754bea768ee4fc9/LICENSE',
+        'ffc390eec51f16b58506b1a42c99fe0cd9ffea1e3081aab443100fd8c20182d9',
+        "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+    )
+    $actual = @(
+        [string]$Component.project, [string]$Component.version, [string]$Component.commit, [string]$Component.license,
+        [string]$Component.asset.name, [string]$Component.asset.url, [string]$Component.asset.sha256, [string]$Component.asset.rootPrefix,
+        [string]$Component.asset.indexHtmlSha256,
+        [string]$Component.licenseFile.name, [string]$Component.licenseFile.url, [string]$Component.licenseFile.sha256,
+        [string]$Component.contentSecurityPolicy
+    )
+    if ($actual.Count -ne $expected.Count) { throw 'Incomplete built-in pin tuple for dashboard' }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($actual[$index] -cne $expected[$index]) { throw 'Production manifest does not match the built-in immutable dashboard pin tuple' }
+    }
+}
+
 function Expand-ExactZipEntry {
     param([string]$ArchivePath, [string]$ExpectedEntry, [int64]$MaximumBytes, [string]$Destination)
     Add-Type -AssemblyName System.IO.Compression
@@ -335,6 +359,116 @@ function Expand-ExactZipEntry {
             } finally { $entryStream.Dispose() }
         } finally { $archive.Dispose() }
     } finally { $stream.Dispose() }
+}
+
+function Expand-SafeZipToDirectory {
+    param([string]$ArchivePath, [string]$RootPrefix, [string]$Destination, [int64]$MaximumEntryBytes, [int64]$MaximumExpandedBytes, [int]$MaximumEntryCount)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if ($MaximumEntryBytes -le 0 -or $MaximumEntryBytes -gt 268435456) { throw 'Expanded per-entry bound is invalid' }
+    if ($MaximumExpandedBytes -le 0 -or $MaximumExpandedBytes -gt 1073741824) { throw 'Expanded total-size bound is invalid' }
+    if ($MaximumEntryCount -le 0 -or $MaximumEntryCount -gt 4096) { throw 'Entry-count bound is invalid' }
+    if (-not $RootPrefix -or -not $RootPrefix.EndsWith('/')) { throw 'RootPrefix must be a non-empty path ending with /' }
+    [void](Assert-SafeArchiveName $RootPrefix)
+    $destinationFull = Get-FullPath $Destination
+    if (Test-Path -LiteralPath $destinationFull) { throw "Refusing to extract into an existing directory: $destinationFull" }
+    New-Item -ItemType Directory -Path $destinationFull | Out-Null
+    $stream = [IO.File]::OpenRead((Get-FullPath $ArchivePath))
+    try {
+        $archive = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Read, $false)
+        try {
+            $seen = @{}
+            [int64]$total = 0
+            $count = 0
+            $extractions = New-Object System.Collections.Generic.List[object]
+            foreach ($entry in $archive.Entries) {
+                $normalized = Assert-SafeArchiveName $entry.FullName
+                if ($normalized.EndsWith('/')) { continue }
+                if (-not $normalized.StartsWith($RootPrefix, [StringComparison]::Ordinal)) { throw "ZIP entry is outside the expected root ${RootPrefix}: $($entry.FullName)" }
+                $relative = $normalized.Substring($RootPrefix.Length)
+                if ([string]::IsNullOrEmpty($relative)) { throw 'ZIP contains an entry with an empty relative path' }
+                $key = $relative.ToUpperInvariant()
+                if ($seen.ContainsKey($key)) { throw "ZIP contains duplicate/aliased entries: $($entry.FullName)" }
+                $seen[$key] = $true
+                $attributes = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$entry.ExternalAttributes), 0)
+                $unixType = ($attributes -shr 16) -band 0xf000
+                if ($unixType -eq 0xa000 -or ($attributes -band 0x400) -ne 0) { throw "ZIP contains a link/reparse entry: $($entry.FullName)" }
+                if ($entry.Length -gt $MaximumEntryBytes) { throw "ZIP entry exceeds the configured per-entry size bound: $($entry.FullName)" }
+                $total += $entry.Length
+                if ($total -gt $MaximumExpandedBytes) { throw 'ZIP exceeds the configured total expanded-size bound' }
+                $count += 1
+                if ($count -gt $MaximumEntryCount) { throw 'ZIP exceeds the configured entry-count bound' }
+                $extractions.Add([PSCustomObject]@{ Entry = $entry; Relative = $relative })
+            }
+            if ($extractions.Count -eq 0) { throw "ZIP contains no entries under the expected root: $RootPrefix" }
+            foreach ($item in $extractions) {
+                $target = Join-Path $destinationFull ($item.Relative.Replace('/', '\'))
+                $targetDirectory = Split-Path -Parent $target
+                if (-not (Test-Path -LiteralPath $targetDirectory)) { [IO.Directory]::CreateDirectory($targetDirectory) | Out-Null }
+                $entryStream = $item.Entry.Open()
+                try {
+                    $output = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                    try {
+                        $buffer = New-Object byte[] 65536
+                        [int64]$written = 0
+                        while (($read = $entryStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                            $written += $read
+                            if ($written -gt $MaximumEntryBytes) { throw 'Expanded ZIP entry exceeded its configured bound while streaming' }
+                            $output.Write($buffer, 0, $read)
+                        }
+                    } finally { $output.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+    } finally { $stream.Dispose() }
+    [string[]]$relativeFiles = @($extractions | ForEach-Object { $_.Relative })
+    [Array]::Sort($relativeFiles, [StringComparer]::Ordinal)
+    return , $relativeFiles
+}
+
+function Protect-DashboardIndexHtml {
+    param([string]$IndexHtmlPath, [string]$ExpectedOriginalSha256, [string]$ContentSecurityPolicy)
+    Assert-Hash $IndexHtmlPath $ExpectedOriginalSha256 'dashboard index.html (pre-patch)'
+    $indexFull = Get-FullPath $IndexHtmlPath
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $original = [IO.File]::ReadAllText($indexFull, [Text.Encoding]::UTF8)
+
+    $charsetMarker = "<meta charset=`"UTF-8`" />`n"
+    if (([regex]::Matches($original, [regex]::Escape($charsetMarker))).Count -ne 1) {
+        throw 'Dashboard index.html does not have exactly one expected charset marker; refusing to patch (upstream layout may have changed)'
+    }
+    $cspMetaLine = '    <meta http-equiv="Content-Security-Policy" content="' + $ContentSecurityPolicy + '" />' + "`n"
+    $patched = $original.Replace($charsetMarker, $charsetMarker + $cspMetaLine)
+
+    $scriptStartMarker = "    <script>`n      ;(function () {"
+    $scriptEndMarker = "    </script>`n  </body>"
+    $startIndex = $patched.IndexOf($scriptStartMarker, [StringComparison]::Ordinal)
+    if ($startIndex -lt 0) { throw 'Dashboard index.html does not contain the expected inline theme script; refusing to patch (upstream layout may have changed)' }
+    $endIndex = $patched.IndexOf($scriptEndMarker, $startIndex, [StringComparison]::Ordinal)
+    if ($endIndex -lt 0) { throw 'Dashboard index.html inline theme script is not closed as expected; refusing to patch' }
+    $blockEnd = $endIndex + '    </script>'.Length
+    $inlineOpen = "    <script>`n"
+    $inlineClose = "`n    </script>"
+    $block = $patched.Substring($startIndex, $blockEnd - $startIndex)
+    if (-not $block.StartsWith($inlineOpen, [StringComparison]::Ordinal) -or -not $block.EndsWith($inlineClose, [StringComparison]::Ordinal)) {
+        throw 'Dashboard inline theme script markers are inconsistent; refusing to patch'
+    }
+    $inlineJs = $block.Substring($inlineOpen.Length, $block.Length - $inlineOpen.Length - $inlineClose.Length)
+    $dedented = foreach ($line in ($inlineJs -split "`n")) { if ($line.StartsWith('      ')) { $line.Substring(6) } else { $line } }
+    $externalJs = (($dedented -join "`n").Trim("`n")) + "`n"
+    $themeScriptPath = Join-Path (Split-Path -Parent $indexFull) 'theme-favicon.js'
+    if (Test-Path -LiteralPath $themeScriptPath) { throw "Refusing to overwrite an existing dashboard file: $themeScriptPath" }
+    $jsBytes = $utf8.GetBytes($externalJs)
+    $jsStream = [IO.File]::Open($themeScriptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $jsStream.Write($jsBytes, 0, $jsBytes.Length) } finally { $jsStream.Dispose() }
+
+    $patched = $patched.Substring(0, $startIndex) + '    <script src="./theme-favicon.js"></script>' + $patched.Substring($blockEnd)
+
+    if ($patched.IndexOf($ContentSecurityPolicy, [StringComparison]::Ordinal) -lt 0) { throw 'Patched dashboard index.html unexpectedly does not carry the pinned Content-Security-Policy' }
+    if ($patched.IndexOf('<script>', [StringComparison]::Ordinal) -ge 0) { throw 'Patched dashboard index.html unexpectedly still contains an inline <script> block' }
+
+    $patchedBytes = $utf8.GetBytes($patched)
+    [IO.File]::WriteAllBytes($indexFull, $patchedBytes)
 }
 
 function Read-UInt16 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUInt16($Bytes, $Offset) }
@@ -478,6 +612,31 @@ try {
         }
     }
 
+    # The vendored dashboard is optional so fixture/offline manifests that predate it keep
+    # working unchanged; a real production manifest always carries it (see versions.json).
+    $hasDashboard = $manifest.components.PSObject.Properties.Name -contains 'dashboard'
+    if ($hasDashboard) {
+        $dashboard = $manifest.components.dashboard
+        if ($dashboard.commit -cnotmatch '^[0-9a-f]{40}$') { throw 'dashboard must use a full lowercase commit pin' }
+        foreach ($hash in @($dashboard.asset.sha256, $dashboard.asset.indexHtmlSha256, $dashboard.licenseFile.sha256)) {
+            if ($hash -cnotmatch '^[0-9a-f]{64}$') { throw 'dashboard contains an invalid SHA-256 pin' }
+        }
+        Assert-SafeLeafName $dashboard.asset.name 'dashboard archive name'
+        Assert-SafeLeafName $dashboard.licenseFile.name 'dashboard license name'
+        if ([string]$dashboard.asset.rootPrefix -cnotmatch '^[A-Za-z0-9._-]+/$') { throw 'dashboard archive rootPrefix is invalid' }
+        if ([int64]$dashboard.asset.maximumEntryBytes -le 0 -or [int64]$dashboard.asset.maximumExpandedBytes -le 0 -or [int]$dashboard.asset.maximumEntryCount -le 0) { throw 'dashboard archive bounds are invalid' }
+        $dashboardCsp = [string]$dashboard.contentSecurityPolicy
+        if ([string]::IsNullOrWhiteSpace($dashboardCsp) -or $dashboardCsp -cnotmatch "(?:^|;)\s*default-src 'self'\s*(?:;|$)" -or $dashboardCsp -cnotmatch "(?:^|;)\s*script-src 'self'\s*(?:;|$)") {
+            throw "dashboard contentSecurityPolicy must lock down default-src and script-src to exactly 'self' (no additional sources, no 'unsafe-inline'/'unsafe-eval')"
+        }
+        if (-not $OfflineSourceDirectory) {
+            Assert-ExactDashboardPin $dashboard
+            Assert-PinnedHttpsUrl $dashboard.asset.url
+            Assert-PinnedHttpsUrl $dashboard.licenseFile.url
+            if (-not $dashboard.licenseFile.url.Contains($dashboard.commit)) { throw 'dashboard license URL is not pinned to its full commit' }
+        }
+    }
+
     if ($isProductionManifest) {
         if ($DesktopExecutablePath -or $DaemonExecutablePath -or $UpdaterExecutablePath -or $CoreHostExecutablePath) {
             throw 'Production packaging builds all Rust executables internally; executable overrides are fixture-only'
@@ -530,18 +689,57 @@ try {
         Assert-Hash $licenseTarget $component.licenseFile.sha256 "$componentName license"
     }
 
+    $dashboardRelativeFiles = @()
+    if ($hasDashboard) {
+        $dashboard = $manifest.components.dashboard
+        $dashboardArchive = Join-Path $stage ('.inputs\' + $dashboard.asset.name)
+        Get-InputFile $dashboard.asset.name $dashboard.asset.url $dashboardArchive
+        Assert-Hash $dashboardArchive $dashboard.asset.sha256 'dashboard archive'
+        $dashboardTarget = Join-Path $stage 'dashboard'
+        $dashboardRelativeFiles = Expand-SafeZipToDirectory $dashboardArchive $dashboard.asset.rootPrefix $dashboardTarget ([int64]$dashboard.asset.maximumEntryBytes) ([int64]$dashboard.asset.maximumExpandedBytes) ([int]$dashboard.asset.maximumEntryCount)
+        if (-not ($dashboardRelativeFiles -ccontains 'index.html')) { throw 'Dashboard archive does not contain an index.html at its root' }
+        $dashboardIndex = Join-Path $dashboardTarget 'index.html'
+        Protect-DashboardIndexHtml $dashboardIndex $dashboard.asset.indexHtmlSha256 $dashboard.contentSecurityPolicy
+        $dashboardRelativeFiles = @($dashboardRelativeFiles + @('theme-favicon.js'))
+
+        $dashboardLicenseTarget = Join-Path $stage ('licenses\' + $dashboard.licenseFile.name)
+        Get-InputFile $dashboard.licenseFile.name $dashboard.licenseFile.url $dashboardLicenseTarget
+        Assert-Hash $dashboardLicenseTarget $dashboard.licenseFile.sha256 'dashboard license'
+    }
+
     Copy-CreateNew (Join-Path $MetadataRoot 'README.md') (Join-Path $stage 'README.md')
     Copy-CreateNew (Join-Path $MetadataRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $stage 'THIRD_PARTY_NOTICES.md')
 
     $inputs = Get-FullPath (Join-Path $stage '.inputs')
     if ((Split-Path -Parent $inputs) -cne (Get-FullPath $stage) -or (Split-Path -Leaf $inputs) -cne '.inputs') { throw 'Refusing unsafe staging-input cleanup' }
     Remove-Item -LiteralPath $inputs -Recurse -Force
+    # Dashboard filenames are content-hashed by its upstream build and change on every
+    # re-vendor, so unlike cores/licenses they cannot be hardcoded here; instead they are
+    # derived from the archive Expand-SafeZipToDirectory already extracted, whose bytes were
+    # already verified against the pinned SHA-256 (and, for a real production manifest, against
+    # the immutable dashboard pin tuple) before a single file was written to disk.
+    $dashboardExpectedDirectories = New-Object System.Collections.Generic.List[string]
+    $dashboardExpectedFiles = New-Object System.Collections.Generic.List[string]
+    if ($hasDashboard) {
+        $dashboardExpectedDirectories.Add('dashboard')
+        foreach ($relative in $dashboardRelativeFiles) {
+            $dashboardExpectedFiles.Add("dashboard/$relative")
+            $segments = $relative.Split('/')
+            for ($depth = 1; $depth -lt $segments.Length; $depth++) {
+                $dashboardExpectedDirectories.Add('dashboard/' + (($segments[0..($depth - 1)]) -join '/'))
+            }
+        }
+    }
+
     $inventory = Get-StageInventory $stage
     [string[]]$directories = $inventory.Directories
-    [string[]]$expectedDirectories = @('cores', 'licenses', 'runtime')
+    [string[]]$expectedDirectories = @('cores', 'licenses', 'runtime') + @($dashboardExpectedDirectories | Select-Object -Unique)
+    [Array]::Sort($expectedDirectories, [StringComparer]::Ordinal)
     if (($directories -join '|') -cne ($expectedDirectories -join '|')) { throw "Staged directory inventory is not exact: $($directories -join ', ')" }
     [string[]]$files = $inventory.Files
     [string[]]$expected = @('MultiCore.exe', 'README.md', 'THIRD_PARTY_NOTICES.md', 'cores/mihomo.exe', 'cores/xray.exe', 'licenses/Xray-core-MPL-2.0.txt', 'licenses/mihomo-GPL-3.0.txt', 'runtime/multicore-core-host.exe', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
+    if ($hasDashboard) { $expected = @($expected + @('licenses/' + $dashboard.licenseFile.name) + @($dashboardExpectedFiles)) }
+    [Array]::Sort($expected, [StringComparer]::Ordinal)
     if (($files -join '|') -cne ($expected -join '|')) { throw "Staged file inventory is not exact: $($files -join ', ')" }
     $lines = foreach ($relative in $files) { '{0} *{1}' -f (Get-Sha256 (Join-Path $stage $relative)), $relative }
     $sumPath = Join-Path $stage 'SHA256SUMS.txt'
@@ -551,7 +749,8 @@ try {
 
     $finalInventory = Get-StageInventory $stage
     [string[]]$finalFiles = $finalInventory.Files
-    [string[]]$expectedFinalFiles = @('MultiCore.exe', 'README.md', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.md', 'cores/mihomo.exe', 'cores/xray.exe', 'licenses/Xray-core-MPL-2.0.txt', 'licenses/mihomo-GPL-3.0.txt', 'runtime/multicore-core-host.exe', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
+    [string[]]$expectedFinalFiles = @($expected + @('SHA256SUMS.txt'))
+    [Array]::Sort($expectedFinalFiles, [StringComparer]::Ordinal)
     if (($finalFiles -join '|') -cne ($expectedFinalFiles -join '|')) { throw "Final file inventory is not exact: $($finalFiles -join ', ')" }
     [string[]]$finalDirectories = $finalInventory.Directories
     if (($finalDirectories -join '|') -cne ($expectedDirectories -join '|')) { throw "Final directory inventory is not exact: $($finalDirectories -join ', ')" }
