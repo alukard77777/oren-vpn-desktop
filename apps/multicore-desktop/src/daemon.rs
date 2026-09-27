@@ -465,7 +465,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // and a managed core shutdown before the daemon can answer. It must not inherit the short
 // timeout used by local status and selector calls.
 const SUBSCRIPTION_MUTATION_TIMEOUT: Duration = Duration::from_secs(150);
-const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(330);
+// Linux polkit may wait 300 s for the user, then each core start waits up to 20 s for
+// readiness before queued selections are replayed.
+const CONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(390);
+// Disconnect stops Mihomo and Xray through the elevated host, each with its own 5 s budget,
+// and then reconciles the profile state.
+const DISCONNECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct HttpDaemonClient {
@@ -767,7 +772,11 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn disconnect(&self) -> Result<DaemonStatus, DaemonError> {
-        self.parse_status(self.http.post(self.endpoint("/v1/disconnect")))
+        self.parse_status(
+            self.http
+                .post(self.endpoint("/v1/disconnect"))
+                .timeout(DISCONNECT_REQUEST_TIMEOUT),
+        )
     }
 
     fn events(
@@ -2117,7 +2126,8 @@ mod http_tests {
         assert!(client.connect().is_ok());
         server.join().unwrap();
         assert!(CONNECT_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
-        assert!(CONNECT_REQUEST_TIMEOUT >= Duration::from_secs(330));
+        assert!(CONNECT_REQUEST_TIMEOUT >= Duration::from_secs(300 + 2 * 20 + 30));
+        assert!(DISCONNECT_REQUEST_TIMEOUT >= Duration::from_secs(2 * 5 + 10));
     }
 
     #[test]
