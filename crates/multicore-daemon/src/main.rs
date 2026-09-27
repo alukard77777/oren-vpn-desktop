@@ -13,6 +13,7 @@ use multicore_daemon::elevated_controller::{production_factory, runtime_generati
 use multicore_daemon::{
     BackendError, CoreBackend, MihomoHttpSelector, PreparedController, bind_loopback,
     publish_readiness_if_enabled, transactional_controller_factory, try_router,
+    try_router_with_dashboard_url,
 };
 
 #[tokio::main]
@@ -45,6 +46,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mihomo_controller_address,
         &mihomo_controller_secret,
     )?);
+
+    // The vendored zashboard build ships as a `dashboard/` sibling of this executable in a
+    // packaged release (see packaging/*/versions.json). It is absent in ad hoc dev/test builds,
+    // in which case the dashboard feature is simply unavailable: no runtime download is ever
+    // attempted. `dashboard_url` embeds the per-process controller secret and must never be
+    // logged; it only leaves this process through the authenticated `/v1/dashboard-url` route.
+    let dashboard_directory = env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("dashboard")));
+    let runtime_control = match &dashboard_directory {
+        Some(directory) => runtime_control
+            .clone()
+            .with_external_ui_directory(directory)
+            .unwrap_or(runtime_control),
+        None => runtime_control,
+    };
+    let dashboard_url: Option<Arc<str>> = dashboard_directory
+        .as_deref()
+        .filter(|directory| directory.join("index.html").is_file())
+        .map(|_| {
+            Arc::from(format!(
+                "http://{mihomo_controller_address}/ui/#/setup?hostname={}&port={}&secret={mihomo_controller_secret}",
+                mihomo_controller_address.ip(),
+                mihomo_controller_address.port(),
+            ))
+        });
     drop(mihomo_controller_secret);
 
     let store = ProfileStore::open(
@@ -79,7 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend =
         CoreBackend::new_transactional_with_selector(store, fetcher, controller_factory, selector)?;
 
-    let app = try_router(backend, token)?;
+    let app = match dashboard_url {
+        Some(dashboard_url) => try_router_with_dashboard_url(backend, token, dashboard_url)?,
+        None => try_router(backend, token)?,
+    };
     let listener = bind_loopback(address).await?;
     let resolved_address = listener.local_addr()?;
     {
