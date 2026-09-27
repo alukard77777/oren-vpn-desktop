@@ -88,15 +88,39 @@ pub fn scan_running() -> Vec<&'static str> {
     detect_from_stems(running_process_image_names())
 }
 
-#[cfg(windows)]
+/// Terminates every currently running process whose image stem matches one
+/// of `app_name`'s known aliases (an unrecognized name matches nothing).
+/// Best-effort and never elevated: a process this user's own token cannot
+/// open or terminate (a different user, or one already exiting) is silently
+/// skipped rather than surfaced as an error, matching `scan_running`'s
+/// "never block, never surprise the user with a hard failure" contract.
+/// Returns how many processes were successfully signaled to terminate.
+pub fn close_running(app_name: &str) -> usize {
+    let Some(app) = CONFLICTING_APPS.iter().find(|app| app.name == app_name) else {
+        return 0;
+    };
+    let mut closed = 0;
+    for (pid, image) in running_process_entries() {
+        if app.aliases.iter().any(|alias| *alias == stem_of(&image)) && terminate_pid(pid) {
+            closed += 1;
+        }
+    }
+    closed
+}
+
 fn running_process_image_names() -> impl Iterator<Item = String> {
+    running_process_entries().map(|(_pid, name)| name)
+}
+
+#[cfg(windows)]
+fn running_process_entries() -> impl Iterator<Item = (u32, String)> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
     };
 
-    let mut names = Vec::new();
+    let mut entries = Vec::new();
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot != INVALID_HANDLE_VALUE {
         let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
@@ -109,43 +133,82 @@ fn running_process_image_names() -> impl Iterator<Item = String> {
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
             if len > 0 {
-                names.push(String::from_utf16_lossy(&entry.szExeFile[..len]));
+                entries.push((
+                    entry.th32ProcessID,
+                    String::from_utf16_lossy(&entry.szExeFile[..len]),
+                ));
             }
             more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
         }
         unsafe { CloseHandle(snapshot) };
     }
-    names.into_iter()
+    entries.into_iter()
 }
 
 #[cfg(target_os = "linux")]
-fn running_process_image_names() -> impl Iterator<Item = String> {
-    let mut names = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let is_pid = entry
+fn running_process_entries() -> impl Iterator<Item = (u32, String)> {
+    let mut entries = Vec::new();
+    if let Ok(dir_entries) = std::fs::read_dir("/proc") {
+        for entry in dir_entries.flatten() {
+            let Some(pid) = entry
                 .file_name()
                 .to_str()
-                .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty());
-            if !is_pid {
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
                 continue;
-            }
+            };
             // `comm` is a short (<=15 byte), always-available, non-root-only
             // process name; every alias above fits well within that limit.
             if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
                 let name = comm.trim();
                 if !name.is_empty() {
-                    names.push(name.to_string());
+                    entries.push((pid, name.to_string()));
                 }
             }
         }
     }
-    names.into_iter()
+    entries.into_iter()
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn running_process_image_names() -> impl Iterator<Item = String> {
+fn running_process_entries() -> impl Iterator<Item = (u32, String)> {
     std::iter::empty()
+}
+
+/// Best-effort process termination with this user's own privileges only:
+/// never elevates, and a process it cannot open or signal (wrong user,
+/// already gone) is simply not counted as closed.
+#[cfg(windows)]
+fn terminate_pid(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let ok = unsafe { TerminateProcess(handle, 1) } != 0;
+    unsafe { CloseHandle(handle) };
+    ok
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_pid(pid: u32) -> bool {
+    // No new process-signaling dependency: `kill` is present on every Linux
+    // system this app already targets (see scripts/test-linux-shell.sh and
+    // friends running against real distros), and this stays a plain,
+    // unprivileged SIGTERM - never sudo/pkexec, matching this feature's
+    // "only what the user's own token can already do" contract.
+    std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn terminate_pid(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -257,5 +320,21 @@ mod tests {
         // Smoke test against the real platform enumeration: must complete
         // without panicking regardless of what happens to be running.
         let _ = scan_running();
+    }
+
+    #[test]
+    fn close_running_ignores_an_unrecognized_app_name_without_enumerating() {
+        assert_eq!(close_running("Not A Real App"), 0);
+        assert_eq!(close_running(""), 0);
+    }
+
+    #[test]
+    fn close_running_is_a_harmless_smoke_test_for_every_known_app() {
+        // None of these are expected to be running in a test environment;
+        // this only proves the real enumeration + best-effort terminate path
+        // completes without panicking, never touching an unrelated process.
+        for app in CONFLICTING_APPS {
+            let _ = close_running(app.name);
+        }
     }
 }

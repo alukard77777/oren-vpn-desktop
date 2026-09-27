@@ -2964,15 +2964,52 @@ fn wire_conflicting_apps_scan(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>
 
 fn wire_conflicting_apps_banner(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     let weak = ui.as_weak();
+    let dismiss_model = model.clone();
     ui.on_dismiss_conflicting_apps_banner(move || {
         let current = {
-            let mut model = model.lock().expect("view model lock");
+            let mut model = dismiss_model.lock().expect("view model lock");
             model.dismiss_conflicting_apps_banner();
             snapshot(&model)
         };
         if let Some(ui) = weak.upgrade() {
             apply_snapshot(&ui, &current);
         }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_close_conflicting_apps(move || {
+        let apps = model
+            .lock()
+            .expect("view model lock")
+            .conflicting_apps_presentation()
+            .apps;
+        if apps.is_empty() {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_conflicting_apps_closing(true);
+        }
+        let model = model.clone();
+        let weak = weak.clone();
+        thread::spawn(move || {
+            // User-privilege-only, best-effort: never elevated, and a
+            // process this user's own token cannot terminate is simply not
+            // counted, matching conflicting_apps::close_running's contract.
+            for app in &apps {
+                conflicting_apps::close_running(app);
+            }
+            let current = {
+                let mut model = model.lock().expect("view model lock");
+                model.set_conflicting_apps(conflicting_apps::scan_running());
+                snapshot(&model)
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_conflicting_apps_closing(false);
+                    apply_snapshot(&ui, &current);
+                }
+            });
+        });
     });
 }
 
