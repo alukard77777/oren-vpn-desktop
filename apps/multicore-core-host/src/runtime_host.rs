@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use multicore_core::{
-    CoreLogBuffer, Engine, ProcessController, ProcessDiagnostics, RuntimeCheckState,
+    CoreLogBuffer, Engine, ProcessController, ProcessDiagnostics, ProcessError, RuntimeCheckState,
     SidecarProcessController,
     elevation_protocol::{
         BrokerErrorCode, ElevatedDiagnosticStream, ElevatedEngine, ElevatedLogRecord,
@@ -20,10 +20,11 @@ use multicore_core::UnixGroupLauncher as PlatformLauncher;
 use multicore_core::WindowsJobLauncher as PlatformLauncher;
 
 trait Controller: Send + Sync {
+    /// Starts `engine`, or confirms it is still running. An exited core is started again.
     fn start<'a>(
         &'a self,
         engine: Engine,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), BrokerErrorCode>> + Send + 'a>>;
     fn stop<'a>(
         &'a self,
         engine: Engine,
@@ -39,10 +40,18 @@ impl Controller for ProductionController {
     fn start<'a>(
         &'a self,
         engine: Engine,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), BrokerErrorCode>> + Send + 'a>> {
         Box::pin(async move {
-            self._validated_files.verify_unchanged().map_err(|_| ())?;
-            self.controller.start(engine).await.map_err(|_| ())
+            self._validated_files
+                .verify_unchanged()
+                .map_err(|_| BrokerErrorCode::NotReady)?;
+            self.controller
+                .start(engine)
+                .await
+                .map_err(|error| match error {
+                    ProcessError::ReadinessTimedOut(_) => BrokerErrorCode::TimedOut,
+                    _ => BrokerErrorCode::NotReady,
+                })
         })
     }
     fn stop<'a>(
@@ -129,11 +138,15 @@ impl RuntimeHost {
         if self
             .active
             .as_ref()
-            .is_some_and(|a| a.generation != generation && (a.xray || a.mihomo))
+            .is_some_and(|a| a.generation != generation)
         {
-            return ElevationResponse::Error {
-                code: BrokerErrorCode::GenerationMismatch,
-            };
+            if self.any_core_alive() {
+                return ElevationResponse::Error {
+                    code: BrokerErrorCode::GenerationMismatch,
+                };
+            }
+            // Every core of the previous generation has exited; release it for the new one.
+            self.discard_active();
         }
         if engine == Engine::Mihomo && self.active.is_none() {
             return ElevationResponse::Error {
@@ -159,29 +172,43 @@ impl RuntimeHost {
                 code: BrokerErrorCode::NotReady,
             };
         }
-        let running = match engine {
-            Engine::Xray => active.xray,
-            Engine::Mihomo => active.mihomo,
-        };
-        if !running
-            && self
-                .runtime
-                .block_on(active.controller.start(engine))
-                .is_err()
-        {
-            if !active.xray && !active.mihomo {
-                self.active = None;
-            }
-            return ElevationResponse::Error {
-                code: BrokerErrorCode::NotReady,
-            };
-        }
+        // Always delegate: the controller is idempotent for a live core and restarts one that
+        // exited, so a crashed core never stays reported as running.
+        let result = self.runtime.block_on(active.controller.start(engine));
+        let running = result.is_ok();
         match engine {
-            Engine::Xray => active.xray = true,
-            Engine::Mihomo => active.mihomo = true,
+            Engine::Xray => active.xray = running,
+            Engine::Mihomo => active.mihomo = running,
         }
-        ElevationResponse::Started {
-            engine: from_engine(engine),
+        match result {
+            Ok(()) => ElevationResponse::Started {
+                engine: from_engine(engine),
+            },
+            Err(code) => {
+                if !active.xray && !active.mihomo {
+                    self.active = None;
+                }
+                ElevationResponse::Error { code }
+            }
+        }
+    }
+    fn any_core_alive(&self) -> bool {
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        if !active.xray && !active.mihomo {
+            return false;
+        }
+        let diagnostics = self.runtime.block_on(active.controller.diagnostics());
+        diagnostics.xray != RuntimeCheckState::Stopped
+            || diagnostics.mihomo != RuntimeCheckState::Stopped
+    }
+    fn discard_active(&mut self) {
+        if let Some(active) = self.active.take() {
+            let _ = self
+                .runtime
+                .block_on(active.controller.stop(Engine::Mihomo));
+            let _ = self.runtime.block_on(active.controller.stop(Engine::Xray));
         }
     }
     fn stop(&mut self, engine: Engine) -> bool {
@@ -316,14 +343,37 @@ mod tests {
     struct Fake {
         calls: Mutex<Vec<(bool, Engine)>>,
         diagnostics: Mutex<ProcessDiagnostics>,
+        running: Mutex<Vec<Engine>>,
+        fail_start: Mutex<Option<(Engine, BrokerErrorCode)>>,
+    }
+    impl Fake {
+        fn crash(&self, engine: Engine) {
+            self.running.lock().unwrap().retain(|e| *e != engine);
+        }
+        fn state(&self, engine: Engine) -> RuntimeCheckState {
+            if self.running.lock().unwrap().contains(&engine) {
+                RuntimeCheckState::Ready
+            } else {
+                RuntimeCheckState::Stopped
+            }
+        }
     }
     impl Controller for Arc<Fake> {
         fn start<'a>(
             &'a self,
             e: Engine,
-        ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(), BrokerErrorCode>> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push((true, e));
+                if let Some((engine, code)) = *self.fail_start.lock().unwrap()
+                    && engine == e
+                {
+                    return Err(code);
+                }
+                let mut running = self.running.lock().unwrap();
+                if !running.contains(&e) {
+                    running.push(e);
+                }
                 Ok(())
             })
         }
@@ -333,13 +383,19 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push((false, e));
+                self.crash(e);
                 Ok(())
             })
         }
         fn diagnostics<'a>(
             &'a self,
         ) -> Pin<Box<dyn Future<Output = ProcessDiagnostics> + Send + 'a>> {
-            Box::pin(async { self.diagnostics.lock().unwrap().clone() })
+            Box::pin(async {
+                let mut diagnostics = self.diagnostics.lock().unwrap().clone();
+                diagnostics.xray = self.state(Engine::Xray);
+                diagnostics.mihomo = self.state(Engine::Mihomo);
+                diagnostics
+            })
         }
     }
     struct FakeFactory {
@@ -390,10 +446,57 @@ mod tests {
             }
         ));
         assert_eq!(c.load(Ordering::Relaxed), 1);
+        // A repeated start is delegated; the controller itself is idempotent for a live core.
         assert_eq!(
             f.calls.lock().unwrap().iter().filter(|(s, _)| *s).count(),
-            1
+            2
         );
+        assert_eq!(f.running.lock().unwrap().as_slice(), [Engine::Xray]);
+    }
+    #[test]
+    fn crashed_core_is_restarted_for_the_same_generation() {
+        let (mut h, f, c) = host();
+        h.execute(ElevationCommand::StartXray { generation_id: 1 });
+        h.execute(ElevationCommand::StartMihomo { generation_id: 1 });
+        f.crash(Engine::Mihomo);
+        assert!(matches!(
+            h.execute(ElevationCommand::StartMihomo { generation_id: 1 }),
+            ElevationResponse::Started {
+                engine: ElevatedEngine::Mihomo
+            }
+        ));
+        assert_eq!(f.state(Engine::Mihomo), RuntimeCheckState::Ready);
+        assert_eq!(c.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn exited_generation_does_not_block_a_new_generation() {
+        let (mut h, f, c) = host();
+        h.execute(ElevationCommand::StartXray { generation_id: 1 });
+        h.execute(ElevationCommand::StartMihomo { generation_id: 1 });
+        f.crash(Engine::Mihomo);
+        f.crash(Engine::Xray);
+        assert!(matches!(
+            h.execute(ElevationCommand::StartXray { generation_id: 2 }),
+            ElevationResponse::Started {
+                engine: ElevatedEngine::Xray
+            }
+        ));
+        assert_eq!(c.load(Ordering::Relaxed), 2);
+        assert_eq!(h.active.as_ref().map(|a| a.generation), Some(2));
+    }
+    #[test]
+    fn failed_restart_clears_the_running_flag_and_reports_the_code() {
+        let (mut h, f, _) = host();
+        h.execute(ElevationCommand::StartXray { generation_id: 1 });
+        f.crash(Engine::Xray);
+        *f.fail_start.lock().unwrap() = Some((Engine::Xray, BrokerErrorCode::TimedOut));
+        assert!(matches!(
+            h.execute(ElevationCommand::StartXray { generation_id: 1 }),
+            ElevationResponse::Error {
+                code: BrokerErrorCode::TimedOut
+            }
+        ));
+        assert!(h.active.is_none());
     }
     #[test]
     fn stop_and_shutdown_are_idempotent() {
