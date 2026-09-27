@@ -72,7 +72,15 @@ struct ProductionFactory;
 impl Factory for ProductionFactory {
     fn create(&self, generation: u64) -> Result<Box<dyn Controller>, ()> {
         let resolved = resolve_current(generation).map_err(|_| ())?;
-        let logs = Arc::new(CoreLogBuffer::with_limits(128, 1024));
+        // Best-effort: a file the local debugging/support story can actually
+        // read without the desktop's per-session API token in hand. Every
+        // line is already redacted before it ever reaches the buffer (see
+        // CoreLogBuffer::push), so persisting it carries no new secret-
+        // exposure risk; if the file can't be created for any reason this
+        // silently falls back to memory-only, matching this being
+        // diagnostic-only and never allowed to block a real Connect.
+        let log_path = resolved.data_root.join("logs").join("latest-core.log");
+        let logs = Arc::new(CoreLogBuffer::persistent_or_memory(log_path));
         let launcher = PlatformLauncher::for_runtime(
             resolved.paths.clone(),
             logs,

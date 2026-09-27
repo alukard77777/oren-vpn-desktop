@@ -28,6 +28,11 @@ pub(crate) enum ResolveError {
 
 pub(crate) struct ResolvedRuntime {
     pub paths: RuntimePaths,
+    /// The user's `%LOCALAPPDATA%\MultiCore` directory (already resolved and
+    /// trusted by this same function for `runtime/`) - exposed so callers
+    /// can place their own per-user files (for example a persistent core
+    /// log) alongside `profiles/`, `runtime/`, etc. without a second lookup.
+    pub data_root: PathBuf,
     guards: Vec<GuardedPath>,
 }
 
@@ -188,6 +193,7 @@ pub(crate) fn resolve_from(
         validate_amd64_pe(&mut guard.handle)?;
     }
     Ok(ResolvedRuntime {
+        data_root: canonical_data.clone(),
         paths: RuntimePaths {
             xray_binary: fs::canonicalize(xray).map_err(|_| ResolveError::Missing)?,
             mihomo_binary: fs::canonicalize(mihomo).map_err(|_| ResolveError::Missing)?,
@@ -381,6 +387,10 @@ mod tests {
         let (_r, d, h) = fixture();
         let resolved = resolve_from(&d, &h, 7).unwrap();
         assert_eq!(resolved.paths.dashboard_directory, None);
+        // The exact `%LOCALAPPDATA%\MultiCore` directory this function
+        // already validated for `runtime/`, exposed so callers (the
+        // persistent core log) don't need a second lookup.
+        assert_eq!(resolved.data_root, fs::canonicalize(&d).unwrap());
     }
     #[test]
     fn resolves_an_optional_dashboard_sibling_of_cores() {

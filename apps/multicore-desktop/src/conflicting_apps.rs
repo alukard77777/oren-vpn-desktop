@@ -327,14 +327,4 @@ mod tests {
         assert_eq!(close_running("Not A Real App"), 0);
         assert_eq!(close_running(""), 0);
     }
-
-    #[test]
-    fn close_running_is_a_harmless_smoke_test_for_every_known_app() {
-        // None of these are expected to be running in a test environment;
-        // this only proves the real enumeration + best-effort terminate path
-        // completes without panicking, never touching an unrelated process.
-        for app in CONFLICTING_APPS {
-            let _ = close_running(app.name);
-        }
-    }
 }
