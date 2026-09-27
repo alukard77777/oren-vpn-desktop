@@ -67,7 +67,7 @@ impl Factory for ProductionFactory {
         let launcher = PlatformLauncher::for_runtime(
             resolved.paths.clone(),
             logs,
-            std::time::Duration::from_secs(12),
+            multicore_core::CORE_READINESS_TIMEOUT,
         )
         .map_err(|_| ())?;
         let controller = SidecarProcessController::with_launcher(resolved.paths.clone(), launcher);

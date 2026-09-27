@@ -15,7 +15,7 @@ use std::{
 use multicore_core::{
     CommandSpec, CoreLogBuffer, DiagnosticStream, Engine, ManagedChild, ProcessController,
     ProcessError, ProcessLauncher, RuntimeCheckState, RuntimePaths, SidecarProcessController,
-    TokioProcessLauncher,
+    StartFailureCause, TokioProcessLauncher,
 };
 
 const SIDECAR_SOURCE: &str = include_str!("../src/sidecar.rs");
@@ -170,6 +170,24 @@ async fn a_child_that_exits_during_startup_is_not_reported_ready() {
     let controller = SidecarProcessController::with_launcher(paths(), launcher);
 
     assert!(controller.start(Engine::Xray).await.is_err());
+}
+
+#[test]
+fn sidecar_start_failures_distinguish_readiness_timeout_from_core_failure() {
+    let controller = SidecarProcessController::with_launcher(paths(), FakeLauncher::default());
+    assert_eq!(
+        controller.start_failure_cause(&ProcessError::ReadinessTimedOut(Engine::Mihomo)),
+        StartFailureCause::ReadinessTimedOut
+    );
+    for error in [
+        ProcessError::ReadinessFailed(Engine::Xray),
+        ProcessError::LaunchFailed(Engine::Xray),
+    ] {
+        assert_eq!(
+            controller.start_failure_cause(&error),
+            StartFailureCause::CoreFailed
+        );
+    }
 }
 
 #[tokio::test]
@@ -359,7 +377,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
     let mut child = launcher.launch(command.clone()).await.unwrap();
     assert_eq!(
         launcher.wait_until_ready(&command, &mut child).await,
-        Err(ProcessError::ReadinessFailed(Engine::Xray))
+        Err(ProcessError::ReadinessTimedOut(Engine::Xray))
     );
     child.stop().await.unwrap();
     let _ = std::fs::remove_dir_all(root);

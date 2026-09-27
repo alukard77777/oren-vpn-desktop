@@ -55,7 +55,7 @@ impl UnixGroupLauncher {
             spawner: Arc::new(Mutex::new(sender)),
             logs,
             readiness: None,
-            readiness_timeout: Duration::from_secs(12),
+            readiness_timeout: crate::CORE_READINESS_TIMEOUT,
         })
     }
 

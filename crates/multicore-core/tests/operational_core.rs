@@ -10,8 +10,8 @@ use std::{
 
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState, Engine, Event, FetchError, HttpClient,
-    HttpResponse, ProcessController, Severity, StateError, StateMachine, SubscriptionFetcher,
-    Supervisor, SupervisorError, UA_NATIVE,
+    HttpResponse, ProcessController, Severity, StartFailureCause, StateError, StateMachine,
+    SubscriptionFetcher, Supervisor, SupervisorError, UA_NATIVE,
 };
 use serde_json::json;
 
@@ -216,6 +216,7 @@ fn structured_events_are_redacted_before_they_exist() {
 struct FakeProcesses {
     calls: Mutex<Vec<(String, Engine)>>,
     fail_start: Mutex<Option<Engine>>,
+    cause: Option<StartFailureCause>,
 }
 
 impl ProcessController for FakeProcesses {
@@ -243,6 +244,32 @@ impl ProcessController for FakeProcesses {
             self.calls.lock().unwrap().push(("stop".into(), engine));
             Ok(())
         })
+    }
+
+    fn start_failure_cause(&self, _error: &()) -> StartFailureCause {
+        self.cause.unwrap_or(StartFailureCause::Unknown)
+    }
+}
+
+#[tokio::test]
+async fn supervisor_reports_the_controller_classified_start_cause() {
+    for (engine, cause) in [
+        (Engine::Xray, StartFailureCause::ElevationCancelled),
+        (Engine::Mihomo, StartFailureCause::ReadinessTimedOut),
+    ] {
+        let processes = Arc::new(FakeProcesses {
+            fail_start: Mutex::new(Some(engine)),
+            cause: Some(cause),
+            ..FakeProcesses::default()
+        });
+        assert_eq!(
+            Supervisor::new(processes).connect().await,
+            Err(SupervisorError::StartFailed {
+                engine,
+                rollback_failed: false,
+                cause,
+            })
+        );
     }
 }
 
@@ -274,7 +301,8 @@ async fn supervisor_orders_sidecars_and_rolls_back_partial_start() {
         error,
         SupervisorError::StartFailed {
             engine: Engine::Mihomo,
-            rollback_failed: false
+            rollback_failed: false,
+            cause: StartFailureCause::Unknown,
         }
     );
     assert_eq!(

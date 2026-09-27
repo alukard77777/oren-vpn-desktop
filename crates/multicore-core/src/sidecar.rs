@@ -265,6 +265,12 @@ pub struct CommandSpec {
     pub args: Vec<OsString>,
 }
 
+/// Longest time a launched core may take to report readiness before its start is failed.
+///
+/// Callers that wait on a remote start (the daemon talking to the elevated host) must allow at
+/// least this long plus launch overhead.
+pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ProcessError {
     #[error("failed to launch {0:?}")]
@@ -275,6 +281,8 @@ pub enum ProcessError {
     StopFailed(Engine),
     #[error("{0:?} did not become ready")]
     ReadinessFailed(Engine),
+    #[error("{0:?} did not become ready in time")]
+    ReadinessTimedOut(Engine),
 }
 
 pub trait ManagedChild: Send {
@@ -490,7 +498,7 @@ impl ProcessLauncher for TokioProcessLauncher {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
-                    return Err(ProcessError::ReadinessFailed(command.engine));
+                    return Err(ProcessError::ReadinessTimedOut(command.engine));
                 }
                 sleep(Duration::from_millis(100)).await;
             }
@@ -603,7 +611,7 @@ pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(ProcessError::ReadinessFailed(command.engine));
+            return Err(ProcessError::ReadinessTimedOut(command.engine));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -766,14 +774,14 @@ pub struct SidecarProcessController<L: ProcessLauncher = TokioProcessLauncher> {
 
 impl SidecarProcessController<TokioProcessLauncher> {
     pub fn new(paths: RuntimePaths) -> Self {
-        let launcher = TokioProcessLauncher::for_runtime(paths.clone(), Duration::from_secs(12));
+        let launcher = TokioProcessLauncher::for_runtime(paths.clone(), CORE_READINESS_TIMEOUT);
         Self::with_launcher(paths, launcher)
     }
 
     pub fn new_with_logs(paths: RuntimePaths, logs: Arc<CoreLogBuffer>) -> Self {
         let launcher = TokioProcessLauncher::for_runtime_with_logs(
             paths.clone(),
-            Duration::from_secs(12),
+            CORE_READINESS_TIMEOUT,
             logs,
         );
         Self::with_launcher(paths, launcher)
@@ -818,6 +826,13 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
             children.insert(engine, child);
             Ok(())
         })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> crate::StartFailureCause {
+        match error {
+            ProcessError::ReadinessTimedOut(_) => crate::StartFailureCause::ReadinessTimedOut,
+            _ => crate::StartFailureCause::CoreFailed,
+        }
     }
 
     fn stop<'a>(
