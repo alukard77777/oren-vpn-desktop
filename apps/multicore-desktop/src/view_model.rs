@@ -525,6 +525,27 @@ pub struct ProxyMappingPresentation {
     pub xray_label: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConflictingAppsPresentation {
+    pub visible: bool,
+    pub apps: Vec<String>,
+    pub message: String,
+}
+
+/// Builds the Russian banner copy for one or more detected conflicting apps.
+fn conflicting_apps_message(apps: &[&'static str]) -> String {
+    let names = apps.join(", ");
+    if apps.len() > 1 {
+        format!(
+            "Обнаружены другие VPN-приложения ({names}): они могут конфликтовать с MultiCore. Закройте их перед подключением."
+        )
+    } else {
+        format!(
+            "Обнаружено другое VPN-приложение ({names}): оно может конфликтовать с MultiCore. Закройте его перед подключением."
+        )
+    }
+}
+
 pub fn redact_event_text(input: &str) -> String {
     static AUTHORIZATION: OnceLock<Regex> = OnceLock::new();
     static SENSITIVE_VALUE: OnceLock<Regex> = OnceLock::new();
@@ -650,6 +671,8 @@ pub struct DesktopViewModel {
     latency_request_group_ids: Vec<String>,
     latency_queued: bool,
     latency_error: Option<String>,
+    conflicting_apps: Vec<&'static str>,
+    conflicting_apps_dismissed_key: Option<String>,
 }
 
 impl DesktopViewModel {
@@ -715,6 +738,8 @@ impl DesktopViewModel {
             latency_request_group_ids: Vec::new(),
             latency_queued: false,
             latency_error: None,
+            conflicting_apps: Vec::new(),
+            conflicting_apps_dismissed_key: None,
         }
     }
 
@@ -1940,6 +1965,54 @@ impl DesktopViewModel {
             loading: self.latency_request_pending.is_some(),
             queued: self.latency_queued,
             error: self.latency_error.clone(),
+        }
+    }
+
+    /// Records the currently-detected conflicting VPN client apps (from a
+    /// local process-name scan; see `conflicting_apps.rs`). When the set
+    /// becomes empty — meaning every previously-detected app is no longer
+    /// running — any prior dismissal is cleared too, so the banner reappears
+    /// if the same app is closed and later reopened, rather than staying
+    /// silently dismissed forever.
+    pub(crate) fn set_conflicting_apps(&mut self, mut apps: Vec<&'static str>) {
+        apps.sort_unstable();
+        apps.dedup();
+        if apps.is_empty() {
+            self.conflicting_apps_dismissed_key = None;
+        }
+        self.conflicting_apps = apps;
+    }
+
+    /// Dismisses the banner for exactly the currently-detected set of apps.
+    /// A later detection of a *different* set (a new app appears, or this
+    /// set shrinks/grows) compares unequal and the banner reappears.
+    pub(crate) fn dismiss_conflicting_apps_banner(&mut self) {
+        self.conflicting_apps_dismissed_key = Some(self.conflicting_apps_key());
+    }
+
+    fn conflicting_apps_key(&self) -> String {
+        self.conflicting_apps.join("\u{1f}")
+    }
+
+    pub(crate) fn conflicting_apps_presentation(&self) -> ConflictingAppsPresentation {
+        if self.conflicting_apps.is_empty() {
+            return ConflictingAppsPresentation::default();
+        }
+        // Purely informational: never shown once the tunnel is already
+        // connected and working, only before/while attempting to connect.
+        if matches!(self.state, UiState::Connected { .. }) {
+            return ConflictingAppsPresentation::default();
+        }
+        let visible =
+            self.conflicting_apps_dismissed_key.as_deref() != Some(&self.conflicting_apps_key());
+        ConflictingAppsPresentation {
+            visible,
+            apps: self
+                .conflicting_apps
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            message: conflicting_apps_message(&self.conflicting_apps),
         }
     }
 
@@ -7819,5 +7892,112 @@ mod tests {
         }
         assert!(source.contains("height: 76px"));
         assert!(!source.contains("Диагностика FlClashX"));
+    }
+
+    #[test]
+    fn conflicting_apps_banner_is_hidden_with_no_detections() {
+        let model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let presentation = model.conflicting_apps_presentation();
+        assert!(!presentation.visible);
+        assert!(presentation.apps.is_empty());
+    }
+
+    #[test]
+    fn conflicting_apps_banner_shows_one_detection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        let presentation = model.conflicting_apps_presentation();
+        assert!(presentation.visible);
+        assert_eq!(presentation.apps, vec!["FlClash".to_string()]);
+        assert!(presentation.message.contains("FlClash"));
+        assert!(presentation.message.contains("оно может конфликтовать"));
+    }
+
+    #[test]
+    fn conflicting_apps_banner_lists_multiple_simultaneous_detections() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["Koala Clash", "FlClash", "Incy"]);
+        let presentation = model.conflicting_apps_presentation();
+        assert!(presentation.visible);
+        // Sorted and deduplicated.
+        assert_eq!(
+            presentation.apps,
+            vec![
+                "FlClash".to_string(),
+                "Incy".to_string(),
+                "Koala Clash".to_string(),
+            ]
+        );
+        assert!(presentation.message.contains("они могут конфликтовать"));
+        assert!(presentation.message.contains("FlClash"));
+        assert!(presentation.message.contains("Incy"));
+        assert!(presentation.message.contains("Koala Clash"));
+    }
+
+    #[test]
+    fn conflicting_apps_banner_deduplicates_repeated_detections() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash", "FlClash"]);
+        assert_eq!(
+            model.conflicting_apps_presentation().apps,
+            vec!["FlClash".to_string()]
+        );
+    }
+
+    #[test]
+    fn dismissing_conflicting_apps_banner_hides_it_for_the_same_detection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(model.conflicting_apps_presentation().visible);
+
+        model.dismiss_conflicting_apps_banner();
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // Re-detecting the exact same set on a later scan stays dismissed.
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(!model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn dismissed_banner_reappears_for_a_newly_detected_different_app() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.dismiss_conflicting_apps_banner();
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // A different app joins the detected set: the banner reappears even
+        // though FlClash is still present, because the set changed.
+        model.set_conflicting_apps(vec!["FlClash", "Incy"]);
+        assert!(model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn conflicting_apps_clearing_resets_dismissal_so_a_relaunch_warns_again() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.dismiss_conflicting_apps_banner();
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // The app closes: the scan reports nothing running anymore.
+        model.set_conflicting_apps(vec![]);
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // The same app is reopened later: since the conflict fully cleared,
+        // dismissal was reset and the banner warns again.
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn conflicting_apps_banner_is_never_shown_while_connected() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.state = UiState::Connected {
+            profile: "Profile".into(),
+            node: "Node".into(),
+        };
+        let presentation = model.conflicting_apps_presentation();
+        assert!(!presentation.visible);
+        assert!(presentation.apps.is_empty());
     }
 }
