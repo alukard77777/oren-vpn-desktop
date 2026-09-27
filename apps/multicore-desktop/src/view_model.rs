@@ -307,6 +307,11 @@ enum EventFilter {
     All,
     System,
     Error,
+    /// Just the vendored cores' own startup/runtime log lines (Xray,
+    /// Mihomo), stripped of every other app event - the "first 15 seconds
+    /// of startup" a user chasing a real connect failure actually needs,
+    /// without having to scroll past unrelated events to find them.
+    Cores,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1815,6 +1820,7 @@ impl DesktopViewModel {
         self.event_filter = match level {
             Some(level) if level.eq_ignore_ascii_case("system") => EventFilter::System,
             Some(level) if level.eq_ignore_ascii_case("error") => EventFilter::Error,
+            Some(level) if level.eq_ignore_ascii_case("cores") => EventFilter::Cores,
             _ => EventFilter::All,
         };
         self.filtered_events()
@@ -2738,6 +2744,10 @@ impl DesktopViewModel {
             }
             EventFilter::Error => {
                 events.retain(|event| event.level.eq_ignore_ascii_case("error"));
+            }
+            EventFilter::Cores => {
+                events
+                    .retain(|event| matches!(event.component.as_str(), "xray" | "mihomo" | "core"));
             }
         }
         events
@@ -7919,6 +7929,70 @@ mod tests {
         );
         assert!(retained.iter().any(|event| event.id == 7));
         assert!(!format!("{retained:?}").contains("upstream secret"));
+    }
+
+    #[test]
+    fn cores_filter_isolates_xray_and_mihomo_log_lines_from_other_events() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let request = view_model
+            .begin_diagnostics_request()
+            .expect("start diagnostics request");
+        view_model
+            .finish_diagnostics(
+                request.token,
+                Ok(DaemonDiagnostics {
+                    xray: "ready".into(),
+                    mihomo: "ready".into(),
+                    tun: "ready".into(),
+                    logs: vec![
+                        DaemonDiagnosticLog {
+                            id: 1,
+                            timestamp: "1".into(),
+                            component: "xray".into(),
+                            level: "info".into(),
+                            message: "xray started".into(),
+                        },
+                        DaemonDiagnosticLog {
+                            id: 2,
+                            timestamp: "2".into(),
+                            component: "mihomo".into(),
+                            level: "info".into(),
+                            message: "mihomo started".into(),
+                        },
+                        DaemonDiagnosticLog {
+                            id: 3,
+                            timestamp: "3".into(),
+                            component: "unlabeled".into(),
+                            level: "info".into(),
+                            message: "unlabeled core line".into(),
+                        },
+                    ],
+                    mappings: Vec::new(),
+                }),
+            )
+            .expect("current diagnostics completion");
+
+        let events = view_model.set_event_filter(Some("cores"));
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.component.as_str(), "xray" | "mihomo" | "core"))
+        );
+
+        // An unrelated app-level event must not appear under "Ядра".
+        view_model.event_cache.push(PresentedEvent {
+            id: 99,
+            timestamp: "99".into(),
+            component: "subscription".into(),
+            level: "info".into(),
+            message: "profile imported".into(),
+        });
+        let events = view_model.set_event_filter(Some("cores"));
+        assert!(!events.iter().any(|event| event.id == 99));
     }
 
     #[test]

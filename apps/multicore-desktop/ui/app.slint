@@ -1564,6 +1564,7 @@ export component AppWindow inherits Window {
                         SmallAction { label: "Все"; selected: root.event-filter == "Все"; enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
                         SmallAction { label: "Система"; selected: root.event-filter == "Система"; enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
                         SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
+                        SmallAction { label: "Ядра"; selected: root.event-filter == "Ядра"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         DashboardAction {
                             label: "Открыть дашборд";

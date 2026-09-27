@@ -3023,6 +3023,7 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         let level = match filter.as_str() {
             "Ошибки" => Some("error".to_owned()),
             "Система" => Some("system".to_owned()),
+            "Ядра" => Some("cores".to_owned()),
             _ => None,
         };
         let events = model
@@ -3174,7 +3175,13 @@ fn run_connect(
             }
             snapshot(&model)
         };
-        apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
+        apply_snapshot_from_worker(weak.clone(), current, model.clone(), refresh_catalog, false);
+        // Pull the bounded core log right away, success or failure, so the
+        // first seconds of Xray/Mihomo startup are already cached in the
+        // Events feed (see view_model::filtered_events) instead of only
+        // being fetched if the user happens to open that panel afterward -
+        // by then the window this covers may already be gone.
+        load_diagnostics(weak, model);
     });
 }
 
