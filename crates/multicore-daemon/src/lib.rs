@@ -2674,6 +2674,8 @@ where
                 "Запускается подключение.",
             );
         }
+        // If this future is dropped before the outcome is recorded, leave a cleanable error.
+        let mut abandoned = AbandonedConnectGuard::new(&self.inner);
 
         let result = Supervisor::new(controller.clone()).connect().await;
         if result.is_ok() {
@@ -2681,6 +2683,7 @@ where
                 if self.selector.select(&group, &node).await.is_err() {
                     let rollback = Supervisor::new(controller.clone()).disconnect().await;
                     let mut state = self.inner.write().await;
+                    abandoned.disarm();
                     if rollback.is_ok() {
                         state
                             .state
@@ -2708,6 +2711,7 @@ where
             }
         }
         let mut state = self.inner.write().await;
+        abandoned.disarm();
         match result {
             Ok(()) => {
                 state
@@ -3192,6 +3196,51 @@ fn runtime_check_to_dto(state: RuntimeCheckState) -> RuntimeCheckDto {
         RuntimeCheckState::Ready => RuntimeCheckDto::Ready,
         RuntimeCheckState::Failed => RuntimeCheckDto::Failed,
         RuntimeCheckState::Unsupported => RuntimeCheckDto::Unsupported,
+    }
+}
+
+/// Marks a connect whose future was dropped mid-start as a degraded error, so the state never
+/// stays `Connecting` and the next Disconnect cleans up whatever the start left running.
+struct AbandonedConnectGuard<'a, P: ProcessController> {
+    inner: &'a RwLock<CoreRuntime<P>>,
+    armed: bool,
+}
+
+impl<'a, P: ProcessController> AbandonedConnectGuard<'a, P> {
+    fn new(inner: &'a RwLock<CoreRuntime<P>>) -> Self {
+        Self { inner, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<P: ProcessController> Drop for AbandonedConnectGuard<'_, P> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop cannot await; readers hold this lock only briefly, so retry a bounded number of
+        // times rather than leaving the state stuck.
+        for _ in 0..10_000 {
+            if let Ok(mut state) = self.inner.try_write() {
+                if state.state.current() == CoreConnectionState::Connecting {
+                    state.mark_error(
+                        "Подключение прервано. Выполните отключение для очистки.",
+                        true,
+                    );
+                    state.push_event(
+                        Severity::Error,
+                        Component::Core,
+                        "connect",
+                        "Запуск подключения был прерван.",
+                    );
+                }
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 }
 

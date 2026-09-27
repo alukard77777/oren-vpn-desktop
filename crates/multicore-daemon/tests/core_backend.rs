@@ -722,6 +722,52 @@ async fn connecting_profile_mutations_reject_immediately_without_waiting_for_ope
 }
 
 #[tokio::test]
+async fn abandoned_connect_does_not_leave_the_state_connecting() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_wait = entered.notified();
+    let controller = Arc::new(BlockingStartController {
+        entered: entered.clone(),
+        release: Arc::new(tokio::sync::Notify::new()),
+    });
+    let backend = Arc::new(
+        CoreBackend::new_with_selector(
+            store,
+            SubscriptionFetcher::new(OfflineHttp),
+            move |_snapshot| Ok(controller.clone()),
+            Arc::new(ConfirmingSelector),
+        )
+        .unwrap(),
+    );
+    let connecting = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.connect().await })
+    };
+    entered_wait.await;
+    assert_eq!(
+        backend.status().await.unwrap().state,
+        ConnectionState::Connecting
+    );
+
+    // The HTTP layer drops the handler future when the client goes away.
+    connecting.abort();
+    assert!(connecting.await.unwrap_err().is_cancelled());
+
+    let status = backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Error);
+    assert!(status.degraded);
+    let cleaned = backend.disconnect().await.unwrap();
+    assert_eq!(cleaned.state, ConnectionState::Ready);
+    assert!(!cleaned.degraded);
+}
+
+#[tokio::test]
 async fn profile_limit_is_reported_as_a_typed_mutation_error() {
     let root = tempfile::tempdir().unwrap();
     let store = ProfileStore::open(root.path(), None).unwrap();
