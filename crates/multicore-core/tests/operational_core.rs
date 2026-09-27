@@ -11,7 +11,7 @@ use std::{
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState, Engine, Event, FetchError, HttpClient,
     HttpResponse, ProcessController, Severity, StateError, StateMachine, SubscriptionFetcher,
-    Supervisor, SupervisorError, UA_NATIVE,
+    Supervisor, SupervisorError, UA_MIHOMO, UA_NATIVE, UA_XRAY,
 };
 use serde_json::json;
 
@@ -113,6 +113,102 @@ async fn answered_but_invalid_massive_response_never_triggers_more_requests() {
     assert_eq!(result.unwrap_err(), FetchError::InvalidBundle);
     assert_eq!(*agents.lock().unwrap(), [UA_NATIVE]);
     assert!(store.current().is_none());
+}
+
+fn status(code: u16, body: &str) -> Result<HttpResponse, FetchError> {
+    Ok(HttpResponse::new(
+        code,
+        body.as_bytes().to_vec(),
+        std::iter::empty::<(&str, &str)>(),
+    ))
+}
+
+#[tokio::test]
+async fn unrecognised_client_page_falls_back_to_per_core_requests() {
+    for page in [
+        "<!doctype html><html><body>Subscription page</body></html>",
+        "dmxlc3M6Ly9hYmNkZWZAZXhhbXBsZS5jb206NDQzP3NlY3VyaXR5PXJlYWxpdHk=",
+        "vless://id@example.com:443?security=reality#Node",
+        "proxies: []\nrules: []\n",
+    ] {
+        let http = FakeHttp::new(vec![
+            status(200, page),
+            ok(MIHOMO.as_bytes().to_vec()),
+            ok(XRAY.as_bytes().to_vec()),
+        ]);
+        let agents = http.user_agents.clone();
+        let store = AtomicSnapshot::default();
+
+        SubscriptionFetcher::new(http)
+            .refresh("https://example.invalid/sub", &store)
+            .await
+            .unwrap_or_else(|error| panic!("{page}: {error}"));
+
+        assert_eq!(*agents.lock().unwrap(), [UA_NATIVE, UA_MIHOMO, UA_XRAY]);
+        assert!(store.current().is_some());
+    }
+}
+
+#[tokio::test]
+async fn panel_without_multicore_support_is_reported_as_not_a_subscription() {
+    let http = FakeHttp::new(vec![
+        status(200, "<html>panel</html>"),
+        status(404, "not found"),
+        status(404, "not found"),
+    ]);
+    let result = SubscriptionFetcher::new(http)
+        .refresh("https://example.invalid/sub", &AtomicSnapshot::default())
+        .await;
+    assert_eq!(result.unwrap_err(), FetchError::NotSubscription);
+
+    let http = FakeHttp::new(vec![
+        status(200, "<html>panel</html>"),
+        status(200, "<html>panel</html>"),
+        status(200, "<html>panel</html>"),
+    ]);
+    let result = SubscriptionFetcher::new(http)
+        .refresh("https://example.invalid/sub", &AtomicSnapshot::default())
+        .await;
+    assert_eq!(result.unwrap_err(), FetchError::NotSubscription);
+}
+
+#[tokio::test]
+async fn rejected_request_reports_the_http_status() {
+    let http = FakeHttp::new(vec![
+        status(403, "forbidden"),
+        status(403, "forbidden"),
+        status(403, "forbidden"),
+    ]);
+    let result = SubscriptionFetcher::new(http)
+        .refresh("https://example.invalid/sub", &AtomicSnapshot::default())
+        .await;
+    assert_eq!(result.unwrap_err(), FetchError::HttpStatus(403));
+}
+
+#[tokio::test]
+async fn byte_order_marks_are_accepted_on_every_representation() {
+    let bundle = format!(
+        "\u{feff}[{},{}]",
+        serde_json::to_string(MIHOMO).unwrap(),
+        XRAY
+    );
+    let store = AtomicSnapshot::default();
+    SubscriptionFetcher::new(FakeHttp::new(vec![ok(bundle.into_bytes())]))
+        .refresh("https://example.invalid/native", &store)
+        .await
+        .unwrap();
+    assert_eq!(store.current().unwrap().xray.raw_json(), XRAY.trim_end());
+
+    let store = AtomicSnapshot::default();
+    SubscriptionFetcher::new(FakeHttp::new(vec![
+        Err(FetchError::Network),
+        ok(format!("\u{feff}{MIHOMO}").into_bytes()),
+        ok(format!("\u{feff}{XRAY}").into_bytes()),
+    ]))
+    .refresh("https://example.invalid/sub", &store)
+    .await
+    .unwrap();
+    assert_eq!(store.current().unwrap().xray.raw_json(), XRAY);
 }
 
 #[tokio::test]

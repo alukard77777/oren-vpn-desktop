@@ -41,19 +41,101 @@ fn client() -> ReqwestHttpClient {
     ReqwestHttpClient::new(identity).unwrap()
 }
 
+fn serve_sequence(responses: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..length]).into_owned();
+            requests.push(request.lines().next().unwrap_or_default().to_owned());
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}/subscription"), handle)
+}
+
+fn http_response(status: &str, extra_headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}
+{extra_headers}Content-Length: {}
+Connection: close
+
+{body}",
+        body.len()
+    )
+}
+
 #[tokio::test]
-async fn default_http_client_never_follows_redirects() {
-    let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
-    redirect_target.set_nonblocking(true).unwrap();
-    let target = redirect_target.local_addr().unwrap();
-    let (url, server) = serve_once(format!(
-        "HTTP/1.1 302 Found\r\nLocation: http://{target}/must-not-receive-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    ));
+async fn subscription_client_follows_redirects_like_a_browser() {
+    let (url, server) = serve_sequence(vec![
+        http_response(
+            "301 Moved Permanently",
+            "Location: /subscription/
+",
+            "",
+        ),
+        http_response("200 OK", "", "proxies: []"),
+    ]);
 
     let response = client().get(&url, UA_MIHOMO).await.unwrap();
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"proxies: []");
+    assert_eq!(
+        server.join().unwrap(),
+        ["GET /subscription HTTP/1.1", "GET /subscription/ HTTP/1.1"]
+    );
+}
+
+#[tokio::test]
+async fn subscription_client_stops_redirect_loops() {
+    let redirect = http_response(
+        "302 Found",
+        "Location: /subscription
+",
+        "",
+    );
+    let (url, server) = serve_sequence(vec![redirect; 6]);
+
+    assert_eq!(
+        client().get(&url, UA_MIHOMO).await,
+        Err(FetchError::Redirect)
+    );
+    assert_eq!(server.join().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn subscription_client_retries_rate_limited_requests_once() {
+    let (url, server) = serve_sequence(vec![
+        http_response(
+            "429 Too Many Requests",
+            "Retry-After: 0
+",
+            "",
+        ),
+        http_response("200 OK", "", "proxies: []"),
+    ]);
+
+    let response = client().get(&url, UA_MIHOMO).await.unwrap();
+
+    assert_eq!(response.status, 200);
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn subscription_client_reports_persistent_http_status() {
+    let (url, server) = serve_once(http_response("403 Forbidden", "", "denied"));
+
+    let response = client().get(&url, UA_MIHOMO).await.unwrap();
+
     server.join().unwrap();
-    assert_eq!(response.status, 302);
-    assert!(redirect_target.accept().is_err());
+    assert_eq!(response.status, 403);
 }
 
 #[tokio::test]

@@ -216,6 +216,9 @@ enum DaemonErrorKind {
 pub struct DaemonError {
     message: String,
     kind: DaemonErrorKind,
+    /// The message was chosen locally from an allowlisted daemon error code
+    /// and explains the actual cause, so the UI can show it verbatim.
+    specific: bool,
 }
 
 impl DaemonError {
@@ -223,13 +226,29 @@ impl DaemonError {
         Self {
             message: message.into(),
             kind: DaemonErrorKind::Other,
+            specific: false,
         }
+    }
+
+    /// Whether the message names the concrete cause (for example an HTTP 403
+    /// from the subscription server) rather than a generic failure.
+    pub(crate) fn is_specific(&self) -> bool {
+        self.specific
+    }
+
+    fn with_known_code(mut self, code: &str) -> Self {
+        if let Some(message) = known_error_message(code) {
+            self.message = message.to_owned();
+            self.specific = true;
+        }
+        self
     }
 
     pub(crate) fn stale_revision() -> Self {
         Self {
             message: "Каталог маршрутов изменился.".into(),
             kind: DaemonErrorKind::StaleRevision,
+            specific: false,
         }
     }
 
@@ -258,6 +277,7 @@ impl DaemonError {
         Self {
             message: message.into(),
             kind,
+            specific: false,
         }
     }
 
@@ -265,6 +285,7 @@ impl DaemonError {
         Self {
             message: message.into(),
             kind: DaemonErrorKind::DefinitiveHttp,
+            specific: false,
         }
     }
 
@@ -272,6 +293,7 @@ impl DaemonError {
         Self {
             message: message.into(),
             kind: DaemonErrorKind::Ambiguous,
+            specific: false,
         }
     }
 }
@@ -551,30 +573,37 @@ impl HttpDaemonClient {
         match response.status() {
             reqwest::StatusCode::NOT_FOUND => Err(DaemonError::profile_http(
                 DaemonErrorKind::ProfileNotFound,
-                "Subscription profile was not found.",
+                "Подписка не найдена. Обновите список подписок.",
             )),
-            reqwest::StatusCode::CONFLICT => Err(DaemonError::profile_http(
-                DaemonErrorKind::ProfileConflict,
-                "Subscription profile cannot be changed right now.",
-            )),
+            reqwest::StatusCode::CONFLICT => {
+                let code = error_code(response);
+                Err(DaemonError::profile_http(
+                    DaemonErrorKind::ProfileConflict,
+                    "Сейчас подписку изменить нельзя.",
+                )
+                .with_known_code(&code))
+            }
             status if status.is_server_error() => {
-                let committed =
-                    decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
-                        .is_ok_and(|body| body.code == "profile_mutation_ambiguous");
-                Err(if committed {
+                let code = error_code(response);
+                Err(if code == "profile_mutation_ambiguous" {
                     DaemonError::ambiguous(
                         "Изменение могло сохраниться. Обновляем состояние подписок.",
                     )
                 } else {
                     DaemonError::profile_http(
                         DaemonErrorKind::ProfileServer,
-                        "Background service could not change the subscription profile.",
+                        "Фоновый сервис не смог изменить подписку.",
                     )
+                    .with_known_code(&code)
                 })
             }
-            status if !status.is_success() => Err(DaemonError::definitive_http(
-                "Background service rejected the subscription profile request.",
-            )),
+            status if !status.is_success() => {
+                let code = error_code(response);
+                Err(
+                    DaemonError::definitive_http("Фоновый сервис отклонил запрос подписки.")
+                        .with_known_code(&code),
+                )
+            }
             _ => decode_bounded_json(response, response_limit),
         }
     }
@@ -586,9 +615,11 @@ impl HttpDaemonClient {
     ) -> Result<T, DaemonError> {
         let response = request.bearer_auth(&self.token).send().map_err(map_error)?;
         if !response.status().is_success() {
-            return Err(DaemonError::definitive_http(
-                "Фоновый сервис отклонил запрос.",
-            ));
+            let code = error_code(response);
+            return Err(
+                DaemonError::definitive_http("Фоновый сервис отклонил запрос.")
+                    .with_known_code(&code),
+            );
         }
         decode_bounded_json(response, response_limit)
     }
@@ -680,6 +711,63 @@ struct LatencyRequest<'a> {
 struct ApiErrorBody {
     #[serde(default)]
     code: String,
+}
+
+/// Local texts for daemon error codes. The daemon's own message is never
+/// displayed, so provider URLs or tokens can never be reflected into the UI.
+fn known_error_message(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "import_requires_disconnect" => {
+            "Отключите VPN, чтобы добавить подписку: новая подписка сразу становится активной."
+        }
+        "profile_busy" => "Отключитесь перед изменением подписки.",
+        "profile_limit" => "Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите.",
+        "subscription_unreachable" => {
+            "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
+        }
+        "subscription_timeout" => {
+            "Сервер подписки не ответил вовремя. Повторите попытку чуть позже."
+        }
+        "subscription_tls" => {
+            "Сертификат сервера подписки не принят. Проверьте ссылку или обратитесь к провайдеру."
+        }
+        "subscription_redirect" => {
+            "Сервер подписки перенаправил запрос небезопасно или слишком много раз."
+        }
+        "subscription_forbidden" => {
+            "Сервер подписки отказал в доступе. Проверьте ссылку и срок действия подписки."
+        }
+        "subscription_not_found" => {
+            "Подписка не найдена. Проверьте, что ссылка скопирована полностью."
+        }
+        "subscription_rate_limited" => {
+            "Сервер подписки временно ограничил запросы. Повторите попытку через минуту."
+        }
+        "subscription_server_error" => {
+            "Сервер подписки временно не работает. Повторите попытку позже."
+        }
+        "subscription_http_status" => "Сервер подписки ответил ошибкой.",
+        "subscription_not_multicore" => {
+            "По ссылке пришла веб-страница или список ссылок, а не подписка MultiCore. Скопируйте ссылку подписки для приложения у провайдера."
+        }
+        "subscription_invalid" => {
+            "Провайдер прислал повреждённую или неподдерживаемую конфигурацию."
+        }
+        "subscription_too_large" => "Ответ сервера подписки слишком большой.",
+        "subscription_storage" => {
+            "Не удалось сохранить подписку на диск. Проверьте свободное место."
+        }
+        "subscription_prepare_failed" => {
+            "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение."
+        }
+        _ => return None,
+    })
+}
+
+fn error_code(response: reqwest::blocking::Response) -> String {
+    decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
+        .map(|body| body.code)
+        .unwrap_or_default()
 }
 
 impl DaemonClient for HttpDaemonClient {
@@ -1888,6 +1976,53 @@ mod http_tests {
             assert!(!text.contains(sensitive_token));
             assert!(!text.contains("https://"));
         }
+    }
+
+    #[test]
+    fn import_failures_show_local_text_for_known_codes_without_reflecting_the_body() {
+        for (status, code, expected) in [
+            (
+                "502 Bad Gateway",
+                "subscription_forbidden",
+                "отказал в доступе",
+            ),
+            (
+                "422 Unprocessable Entity",
+                "subscription_not_multicore",
+                "веб-страница",
+            ),
+            (
+                "409 Conflict",
+                "import_requires_disconnect",
+                "Отключите VPN",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"code":"{code}","message":"https://private.invalid/?token=secret-marker"}}"#
+            );
+            let body: &'static str = Box::leak(body.into_boxed_str());
+            let (base_url, server) = start_selection_server(status, body);
+            let client = HttpDaemonClient::new(base_url, "import-token").expect("import client");
+            let error = client
+                .import_subscription("https://private.invalid/?token=secret-marker")
+                .expect_err("import must fail");
+            server.join().expect("import error server");
+
+            assert!(error.is_specific(), "{code}");
+            let text = error.to_string();
+            assert!(text.contains(expected), "{code}: {text}");
+            assert!(!text.contains("secret-marker"));
+            assert!(!text.contains("https://"));
+        }
+
+        let (base_url, server) =
+            start_selection_server("500 Internal Server Error", r#"{"code":"unknown"}"#);
+        let client = HttpDaemonClient::new(base_url, "import-token").expect("import client");
+        let error = client
+            .import_subscription("https://example.invalid/sub")
+            .expect_err("import must fail");
+        server.join().expect("import error server");
+        assert!(!error.is_specific());
     }
 
     #[test]

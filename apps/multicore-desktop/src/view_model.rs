@@ -1637,8 +1637,11 @@ impl DesktopViewModel {
             }
             Err(error) => {
                 self.state = previous_state;
-                self.import_error =
-                    Some("Не удалось добавить подписку. Проверьте URL и повторите попытку.".into());
+                self.import_error = Some(if error.is_specific() {
+                    error.to_string()
+                } else {
+                    "Не удалось добавить подписку. Проверьте URL и повторите попытку.".into()
+                });
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }

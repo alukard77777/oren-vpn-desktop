@@ -26,9 +26,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState as CoreConnectionState, DiagnosticStream, Event,
-    HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError, ProfileId,
-    ProfileStore, ProfileSummary, RuntimeCheckState, ServiceLogoLease, Severity, Snapshot,
-    StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
+    FetchError, HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError,
+    ProfileId, ProfileStore, ProfileSummary, RuntimeCheckState, ServiceLogoLease, Severity,
+    Snapshot, SnapshotCommit, StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -326,6 +326,10 @@ pub enum ProfileMutationError {
     LimitReached,
     Storage,
     Committed,
+    /// The provider could not be reached or answered with something unusable.
+    Fetch(FetchError),
+    /// The subscription was downloaded but its runtime could not be prepared.
+    Prepare,
 }
 
 impl fmt::Display for ProfileMutationError {
@@ -1042,8 +1046,103 @@ fn valid_subscription_source_url(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// Stays below the desktop's 150 s subscription request timeout.
+const SUBSCRIPTION_FETCH_DEADLINE: Duration = Duration::from_secs(120);
+
+fn subscription_fetch_reason(error: FetchError) -> String {
+    match error {
+        FetchError::Network => "network".to_owned(),
+        FetchError::Timeout => "timeout".to_owned(),
+        FetchError::Tls => "tls".to_owned(),
+        FetchError::Redirect => "redirect".to_owned(),
+        FetchError::HttpStatus(status) => format!("http {status}"),
+        FetchError::NotSubscription => "not a subscription".to_owned(),
+        FetchError::InvalidBundle | FetchError::InvalidConfig => "invalid config".to_owned(),
+        FetchError::Persistence => "persistence".to_owned(),
+        FetchError::TooLarge => "too large".to_owned(),
+    }
+}
+
+fn subscription_fetch_api_error(error: FetchError) -> ApiError {
+    let (status, code, message): (StatusCode, &str, String) = match error {
+        FetchError::Network => (
+            StatusCode::BAD_GATEWAY,
+            "subscription_unreachable",
+            "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
+                .to_owned(),
+        ),
+        FetchError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "subscription_timeout",
+            "Сервер подписки не ответил вовремя. Повторите попытку чуть позже.".to_owned(),
+        ),
+        FetchError::Tls => (
+            StatusCode::BAD_GATEWAY,
+            "subscription_tls",
+            "Не удалось установить защищённое соединение с сервером подписки: сертификат не принят. Проверьте ссылку или обратитесь к провайдеру."
+                .to_owned(),
+        ),
+        FetchError::Redirect => (
+            StatusCode::BAD_GATEWAY,
+            "subscription_redirect",
+            "Сервер подписки перенаправил запрос небезопасно или слишком много раз.".to_owned(),
+        ),
+        FetchError::HttpStatus(status) => (
+            StatusCode::BAD_GATEWAY,
+            match status {
+                401 | 403 => "subscription_forbidden",
+                404 | 410 => "subscription_not_found",
+                429 => "subscription_rate_limited",
+                500..=599 => "subscription_server_error",
+                _ => "subscription_http_status",
+            },
+            match status {
+                401 | 403 => format!(
+                    "Сервер подписки отказал в доступе (HTTP {status}). Проверьте ссылку и срок действия подписки."
+                ),
+                404 | 410 => format!(
+                    "Подписка не найдена (HTTP {status}). Проверьте, что ссылка скопирована полностью."
+                ),
+                429 => "Сервер подписки временно ограничил запросы (HTTP 429). Повторите попытку через минуту.".to_owned(),
+                500..=599 => format!(
+                    "Сервер подписки временно не работает (HTTP {status}). Повторите попытку позже."
+                ),
+                _ => format!("Сервер подписки вернул ошибку HTTP {status}."),
+            },
+        ),
+        FetchError::NotSubscription => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_not_multicore",
+            "По ссылке пришла веб-страница или список ссылок, а не подписка MultiCore. Скопируйте ссылку подписки для приложения у провайдера."
+                .to_owned(),
+        ),
+        FetchError::InvalidBundle | FetchError::InvalidConfig => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_invalid",
+            "Провайдер прислал повреждённую или неподдерживаемую конфигурацию.".to_owned(),
+        ),
+        FetchError::TooLarge => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_too_large",
+            "Ответ сервера подписки слишком большой.".to_owned(),
+        ),
+        FetchError::Persistence => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subscription_storage",
+            "Не удалось сохранить подписку на диск. Проверьте свободное место.".to_owned(),
+        ),
+    };
+    ApiError::new(status, code, &message)
+}
+
 fn profile_api_error(error: BackendError, internal_message: &str) -> ApiError {
     match error.profile_mutation() {
+        Some(ProfileMutationError::Fetch(error)) => subscription_fetch_api_error(error),
+        Some(ProfileMutationError::Prepare) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subscription_prepare_failed",
+            "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение и повторите попытку.",
+        ),
         Some(ProfileMutationError::NotFound) => profile_not_found(),
         Some(ProfileMutationError::Connected) => ApiError::new(
             StatusCode::CONFLICT,
@@ -1088,6 +1187,13 @@ async fn import_subscription(
         .await
         .map(Json)
         .map_err(|error| {
+            if error.profile_mutation() == Some(ProfileMutationError::Connected) {
+                return ApiError::new(
+                    StatusCode::CONFLICT,
+                    "import_requires_disconnect",
+                    "Отключите VPN, чтобы добавить подписку: новая подписка сразу становится активной.",
+                );
+            }
             profile_api_error(
                 error,
                 "Не удалось импортировать подписку. Проверьте ссылку и повторите попытку.",
@@ -1980,6 +2086,34 @@ where
         Ok(self.current_status().await)
     }
 
+    /// Downloads a subscription within one overall deadline that stays below
+    /// the desktop's request timeout, and records a URL-free failure reason.
+    async fn fetch_subscription(
+        &self,
+        url: &str,
+        staging: &AtomicSnapshot,
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, ProfileMutationError> {
+        let result = tokio::time::timeout(
+            SUBSCRIPTION_FETCH_DEADLINE,
+            self.fetcher.refresh(url, staging),
+        )
+        .await
+        .unwrap_or(Err(FetchError::Timeout));
+        match result {
+            Ok(commit) => Ok(commit),
+            Err(error) => {
+                let reason = subscription_fetch_reason(error);
+                self.inner.write().await.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "subscription_fetch_failed",
+                    &format!("Subscription download failed: {reason}."),
+                );
+                Err(ProfileMutationError::Fetch(error))
+            }
+        }
+    }
+
     async fn require_disconnected_mutation(&self) -> Result<(), ProfileMutationError> {
         let state = self.inner.read().await;
         if state.degraded
@@ -2152,14 +2286,10 @@ where
         let connected =
             active && self.inner.read().await.state.current() == CoreConnectionState::Connected;
         let staging = AtomicSnapshot::default();
-        let fetched = self
-            .fetcher
-            .refresh(source_url, &staging)
-            .await
-            .map_err(|_| ProfileMutationError::Storage)?;
+        let fetched = self.fetch_subscription(source_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
         let prepared = if active && !connected {
-            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?)
+            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?)
         } else {
             None
         };
@@ -2269,14 +2399,10 @@ where
             return Err(ProfileMutationError::Storage);
         }
         let staging = AtomicSnapshot::default();
-        let fetched = self
-            .fetcher
-            .refresh(trimmed_url, &staging)
-            .await
-            .map_err(|_| ProfileMutationError::Storage)?;
+        let fetched = self.fetch_subscription(trimmed_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
         let prepared =
-            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?;
         let existing = self
             .store
             .find_exact_source(trimmed_url)

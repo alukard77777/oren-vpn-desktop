@@ -20,6 +20,12 @@ pub const UA_MIHOMO: &str = "multicore-mihomo";
 pub const UA_XRAY: &str = "multicore-xray";
 pub const UA_SERVICE_LOGO: &str = "multicore-service-logo";
 const LOGO_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const LOGO_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
+const SUBSCRIPTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SUBSCRIPTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SUBSCRIPTION_REDIRECTS: usize = 5;
+const RETRY_DELAY: Duration = Duration::from_millis(800);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpResponse {
@@ -156,8 +162,16 @@ fn is_metadata_header(name: &str) -> bool {
 pub enum FetchError {
     #[error("subscription request failed")]
     Network,
-    #[error("subscription server returned an unsuccessful status")]
-    HttpStatus,
+    #[error("subscription request timed out")]
+    Timeout,
+    #[error("subscription server TLS certificate or handshake was rejected")]
+    Tls,
+    #[error("subscription server redirected too many times or to an insecure URL")]
+    Redirect,
+    #[error("subscription server returned HTTP status {0}")]
+    HttpStatus(u16),
+    #[error("subscription server answered with something that is not a MultiCore subscription")]
+    NotSubscription,
     #[error("native subscription bundle is invalid")]
     InvalidBundle,
     #[error("subscription configuration is invalid")]
@@ -179,6 +193,11 @@ pub trait HttpClient: Send + Sync {
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
     subscription_client: reqwest::Client,
+    /// Used only for one retry after the direct request could not connect.
+    /// It honours the OS/environment proxy the way a browser does, which
+    /// helps when the provider domain is unreachable directly (DNS or DPI
+    /// blocking) but reachable through the user's configured proxy.
+    system_proxy_client: reqwest::Client,
 }
 
 impl ReqwestHttpClient {
@@ -200,17 +219,85 @@ impl ReqwestHttpClient {
             "x-device-model",
             HeaderValue::from_str(identity.device_model()).map_err(|_| FetchError::Network)?,
         );
-        let subscription_client = reqwest::Client::builder()
-            .default_headers(headers)
+        let builder = || {
+            reqwest::Client::builder()
+                .default_headers(headers.clone())
+                .redirect(subscription_redirect_policy())
+                .connect_timeout(SUBSCRIPTION_CONNECT_TIMEOUT)
+                .timeout(SUBSCRIPTION_REQUEST_TIMEOUT)
+        };
+        let subscription_client = builder()
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|_| FetchError::Network)?;
+        let system_proxy_client = builder().build().map_err(|_| FetchError::Network)?;
         Ok(Self {
             subscription_client,
+            system_proxy_client,
         })
+    }
+
+    async fn get_subscription(
+        &self,
+        url: &str,
+        user_agent: &'static str,
+    ) -> Result<HttpResponse, FetchError> {
+        match perform_get_detailed(&self.subscription_client, url, user_agent).await {
+            Ok(response) => {
+                if let Some(delay) = retry_delay_for_status(&response) {
+                    tokio::time::sleep(delay).await;
+                    return perform_get(&self.subscription_client, url, user_agent).await;
+                }
+                Ok(response.response)
+            }
+            Err(TransportFailure::Connect) => {
+                tokio::time::sleep(RETRY_DELAY).await;
+                perform_get(&self.system_proxy_client, url, user_agent).await
+            }
+            Err(TransportFailure::Other(error)) => Err(error),
+        }
+    }
+}
+
+/// Browsers follow redirects, and panels commonly redirect http to https,
+/// add a trailing slash or sit behind short links. Never downgrade to http.
+fn subscription_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_SUBSCRIPTION_REDIRECTS {
+            attempt.error("too many subscription redirects")
+        } else if redirect_allowed(attempt.previous(), attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("insecure subscription redirect")
+        }
+    })
+}
+
+fn redirect_allowed(previous: &[reqwest::Url], next: &reqwest::Url) -> bool {
+    if !matches!(next.scheme(), "http" | "https") {
+        return false;
+    }
+    let downgrade = next.scheme() != "https" && previous.iter().any(|url| url.scheme() == "https");
+    let origin_is_public = previous
+        .first()
+        .is_none_or(|origin| !host_is_non_global_ip(origin));
+    !downgrade && !(origin_is_public && host_is_non_global_ip(next))
+}
+
+/// A public provider must not bounce the request (with identity headers) to
+/// loopback or private addresses on the user's machine or network.
+fn host_is_non_global_ip(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    match literal.parse::<IpAddr>() {
+        Ok(ip) => !is_global_ip(ip),
+        Err(_) => {
+            let host = host.trim_end_matches('.');
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
     }
 }
 
@@ -222,9 +309,11 @@ impl HttpClient for ReqwestHttpClient {
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
         Box::pin(async move {
             if user_agent == UA_SERVICE_LOGO {
-                self.get_service_logo(url).await
+                tokio::time::timeout(LOGO_TOTAL_TIMEOUT, self.get_service_logo(url))
+                    .await
+                    .map_err(|_| FetchError::Timeout)?
             } else {
-                perform_get(&self.subscription_client, url, user_agent).await
+                self.get_subscription(url, user_agent).await
             }
         })
     }
@@ -241,37 +330,129 @@ impl ReqwestHttpClient {
     }
 }
 
+struct DetailedResponse {
+    response: HttpResponse,
+    retry_after: Option<Duration>,
+}
+
+enum TransportFailure {
+    /// The TCP/TLS connection could not be established at all.
+    Connect,
+    Other(FetchError),
+}
+
 async fn perform_get(
     client: &reqwest::Client,
     url: &str,
     user_agent: &'static str,
 ) -> Result<HttpResponse, FetchError> {
+    match perform_get_detailed(client, url, user_agent).await {
+        Ok(detailed) => Ok(detailed.response),
+        Err(TransportFailure::Connect) => Err(FetchError::Network),
+        Err(TransportFailure::Other(error)) => Err(error),
+    }
+}
+
+async fn perform_get_detailed(
+    client: &reqwest::Client,
+    url: &str,
+    user_agent: &'static str,
+) -> Result<DetailedResponse, TransportFailure> {
     let mut response = request_builder(client, url, user_agent)
         .send()
         .await
-        .map_err(|_| FetchError::Network)?;
+        .map_err(|error| classify_send_error(&error))?;
     let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
     let metadata = SubscriptionMetadataHeaders::from_header_map(response.headers());
     let limit = response_limit(user_agent);
     if response
         .content_length()
         .is_some_and(|size| size > limit as u64)
     {
-        return Err(FetchError::TooLarge);
+        return Err(TransportFailure::Other(FetchError::TooLarge));
     }
     let mut body =
         Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
-    while let Some(chunk) = response.chunk().await.map_err(|_| FetchError::Network)? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| TransportFailure::Other(classify_body_error(&error)))?
+    {
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(FetchError::TooLarge);
+            return Err(TransportFailure::Other(FetchError::TooLarge));
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(HttpResponse {
-        status,
-        body,
-        metadata,
+    Ok(DetailedResponse {
+        response: HttpResponse {
+            status,
+            body,
+            metadata,
+        },
+        retry_after,
     })
+}
+
+fn classify_send_error(error: &reqwest::Error) -> TransportFailure {
+    if error.is_redirect() {
+        return TransportFailure::Other(FetchError::Redirect);
+    }
+    if is_tls_error(error) {
+        return TransportFailure::Other(FetchError::Tls);
+    }
+    if error.is_connect() {
+        return TransportFailure::Connect;
+    }
+    if error.is_timeout() {
+        return TransportFailure::Other(FetchError::Timeout);
+    }
+    TransportFailure::Other(FetchError::Network)
+}
+
+fn classify_body_error(error: &reqwest::Error) -> FetchError {
+    if error.is_timeout() {
+        FetchError::Timeout
+    } else {
+        FetchError::Network
+    }
+}
+
+fn is_tls_error(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        let text = current.to_string().to_ascii_lowercase();
+        if text.contains("certificate")
+            || text.contains("tls handshake")
+            || text.contains("invalid peer")
+            || text.contains("unknownissuer")
+            || text.contains("peer is incompatible")
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// One quick retry for rate limiting and transient upstream errors. Anti-bot
+/// front ends commonly answer the first burst of requests with 429/503.
+fn retry_delay_for_status(response: &DetailedResponse) -> Option<Duration> {
+    let status = response.response.status;
+    if status == 429 || matches!(status, 500 | 502 | 503 | 504) {
+        Some(
+            response
+                .retry_after
+                .map_or(RETRY_DELAY, |delay| delay.min(MAX_RETRY_AFTER)),
+        )
+    } else {
+        None
+    }
 }
 
 fn request_builder(
@@ -392,31 +573,32 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         url: &str,
         store: &S,
     ) -> Result<SnapshotCommit<Arc<Snapshot>>, FetchError> {
-        if let Ok(response) = self.client.get(url, UA_NATIVE).await
-            && response.status_is_success()
-        {
-            let mut snapshot = parse_native(&response.body)?
-                .with_subscription_metadata(url, &response.metadata, current_unix_time())
-                .map_err(|_| FetchError::InvalidBundle)?;
-            self.fetch_optional_logo(&mut snapshot).await;
-            return store.save(snapshot).map_err(|_| FetchError::Persistence);
-        }
+        let native_error = match self.client.get(url, UA_NATIVE).await {
+            Ok(response) if response.status_is_success() => {
+                let body = strip_utf8_bom(&response.body);
+                if looks_like_native_bundle(body) {
+                    // A JSON array means the backend recognised the combined
+                    // MultiCore request, so its answer is final.
+                    let mut snapshot = parse_native(body)?
+                        .with_subscription_metadata(url, &response.metadata, current_unix_time())
+                        .map_err(|_| FetchError::InvalidBundle)?;
+                    self.fetch_optional_logo(&mut snapshot).await;
+                    return store.save(snapshot).map_err(|_| FetchError::Persistence);
+                }
+                // HTML, share links, Base64 or plain YAML: the panel did not
+                // recognise the combined request; try the per-core requests.
+                FetchError::NotSubscription
+            }
+            Ok(response) => FetchError::HttpStatus(response.status),
+            Err(error) => error,
+        };
 
         let (mihomo, xray) = tokio::join!(
             self.client.get(url, UA_MIHOMO),
             self.client.get(url, UA_XRAY)
         );
-        let mihomo = success_response(mihomo?)?;
-        let xray = success_response(xray?)?;
-        let mut snapshot = Snapshot::parse(&mihomo.body, &xray.body)
-            .map_err(|_| FetchError::InvalidConfig)?
-            .with_merged_subscription_metadata(
-                url,
-                &mihomo.metadata,
-                &xray.metadata,
-                current_unix_time(),
-            )
-            .map_err(|_| FetchError::InvalidConfig)?;
+        let mut snapshot = parse_fallback(url, mihomo, xray)
+            .map_err(|error| prefer_informative(native_error, error))?;
         self.fetch_optional_logo(&mut snapshot).await;
         store.save(snapshot).map_err(|_| FetchError::Persistence)
     }
@@ -533,8 +715,84 @@ fn success_response(response: HttpResponse) -> Result<HttpResponse, FetchError> 
     if response.status_is_success() {
         Ok(response)
     } else {
-        Err(FetchError::HttpStatus)
+        Err(FetchError::HttpStatus(response.status))
     }
+}
+
+fn parse_fallback(
+    url: &str,
+    mihomo: Result<HttpResponse, FetchError>,
+    xray: Result<HttpResponse, FetchError>,
+) -> Result<Snapshot, FetchError> {
+    let mihomo = success_response(mihomo?)?;
+    let xray = success_response(xray?)?;
+    Snapshot::parse(strip_utf8_bom(&mihomo.body), strip_utf8_bom(&xray.body))
+        .map_err(|_| {
+            if looks_like_non_config(&mihomo.body) || looks_like_non_config(&xray.body) {
+                FetchError::NotSubscription
+            } else {
+                FetchError::InvalidConfig
+            }
+        })?
+        .with_merged_subscription_metadata(
+            url,
+            &mihomo.metadata,
+            &xray.metadata,
+            current_unix_time(),
+        )
+        .map_err(|_| FetchError::InvalidConfig)
+}
+
+/// When the per-core fallback also fails, report whichever failure tells the
+/// user more. A panel that served HTML to the combined request and then 404 to
+/// the per-core requests simply does not support MultiCore.
+fn prefer_informative(native: FetchError, fallback: FetchError) -> FetchError {
+    match (native, fallback) {
+        (
+            FetchError::NotSubscription,
+            FetchError::HttpStatus(_) | FetchError::InvalidConfig | FetchError::NotSubscription,
+        ) => FetchError::NotSubscription,
+        (FetchError::HttpStatus(status), FetchError::HttpStatus(_)) => {
+            FetchError::HttpStatus(status)
+        }
+        (_, fallback) => fallback,
+    }
+}
+
+fn strip_utf8_bom(body: &[u8]) -> &[u8] {
+    body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body)
+}
+
+fn first_significant_byte(body: &[u8]) -> Option<u8> {
+    strip_utf8_bom(body)
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+}
+
+fn looks_like_native_bundle(body: &[u8]) -> bool {
+    first_significant_byte(body) == Some(b'[')
+}
+
+/// Panels answer unrecognised clients with an HTML page, a list of share
+/// links (`vless://...`) or one Base64 blob. None of these is a config.
+fn looks_like_non_config(body: &[u8]) -> bool {
+    let body = strip_utf8_bom(body);
+    match first_significant_byte(body) {
+        None | Some(b'<') => return true,
+        Some(b'{') => return false,
+        _ => {}
+    }
+    let sample = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+    let first_line = sample.trim().lines().next().unwrap_or_default().trim();
+    let share_link = first_line.split_once("://").is_some_and(|(scheme, _)| {
+        !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric())
+    });
+    let base64_blob = first_line.len() >= 32
+        && first_line.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        });
+    share_link || base64_blob
 }
 
 fn current_unix_time() -> u64 {
@@ -565,6 +823,55 @@ fn response_limit(user_agent: &str) -> usize {
         MAX_SERVICE_LOGO_BYTES
     } else {
         MAX_CONFIG_BYTES
+    }
+}
+
+#[cfg(test)]
+mod redirect_policy_tests {
+    use super::*;
+
+    fn url(value: &str) -> reqwest::Url {
+        reqwest::Url::parse(value).unwrap()
+    }
+
+    #[test]
+    fn follows_upgrades_and_same_scheme_moves() {
+        assert!(redirect_allowed(
+            &[url("http://panel.example/sub")],
+            &url("https://panel.example/sub/")
+        ));
+        assert!(redirect_allowed(
+            &[url("https://short.example/x")],
+            &url("https://panel.example/api/sub/abc")
+        ));
+        assert!(redirect_allowed(
+            &[url("http://127.0.0.1:8080/a")],
+            &url("http://127.0.0.1:8080/b")
+        ));
+    }
+
+    #[test]
+    fn refuses_downgrades_private_targets_and_foreign_schemes() {
+        assert!(!redirect_allowed(
+            &[url("https://panel.example/sub")],
+            &url("http://panel.example/sub")
+        ));
+        for target in [
+            "https://127.0.0.1/x",
+            "https://[::1]/x",
+            "https://192.168.1.1/x",
+            "https://localhost/x",
+            "https://api.localhost./x",
+        ] {
+            assert!(
+                !redirect_allowed(&[url("https://panel.example/sub")], &url(target)),
+                "{target}"
+            );
+        }
+        assert!(!redirect_allowed(
+            &[url("https://panel.example/sub")],
+            &url("file:///etc/passwd")
+        ));
     }
 }
 
