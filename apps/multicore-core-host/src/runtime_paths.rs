@@ -166,7 +166,16 @@ pub(crate) fn resolve_from(
         let canonical_dashboard =
             fs::canonicalize(&dashboard).map_err(|_| ResolveError::Missing)?;
         canonical_contained(&package, &canonical_dashboard)?;
-        Some(canonical_dashboard)
+        // `fs::canonicalize` returns Windows' `\\?\`-prefixed extended-length form. That form is
+        // kept for the containment check above (it defeats reparse-point tricks the way the rest
+        // of this resolver relies on), but Mihomo's own SAFE_PATHS check does a plain string
+        // prefix comparison against the *unprefixed* `external-ui` path the daemon writes into
+        // the generated config (crates/multicore-daemon/src/main.rs), never normalizing away
+        // `\\?\`. Passed through unprefixed, Mihomo rejected every dashboard path as "not a
+        // subpath of home directory or SAFE_PATHS" and refused to start at all - confirmed live
+        // against the pinned Mihomo binary. Strip it only for the value that leaves this
+        // function as SAFE_PATHS.
+        Some(strip_verbatim_prefix(canonical_dashboard))
     } else {
         None
     };
@@ -188,6 +197,23 @@ pub(crate) fn resolve_from(
         },
         guards,
     })
+}
+
+/// Strips Windows' `\\?\` (or `\\?\UNC\`) extended-length prefix that
+/// `fs::canonicalize` adds, without altering anything else about the path.
+/// Only for values that must byte-for-byte string-match a path written
+/// elsewhere by code that never adds this prefix (Mihomo's own SAFE_PATHS
+/// comparison); the security-relevant containment check runs on the
+/// still-fully-canonical path before this ever applies.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
 }
 
 fn canonical_contained(root: &Path, target: &Path) -> Result<(), ResolveError> {
@@ -365,9 +391,30 @@ mod tests {
         fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
 
         let resolved = resolve_from(&d, &h, 7).unwrap();
+        let canonical = fs::canonicalize(&dashboard).unwrap();
+        let stripped = resolved.paths.dashboard_directory.clone().unwrap();
+        // Must resolve to the same real directory as fs::canonicalize (still fully
+        // symlink/reparse-point resistant - see the reparse-point test below) but without the
+        // `\\?\` prefix, which is required to byte-for-byte string-match the unprefixed
+        // `external-ui` path the daemon writes elsewhere for Mihomo's own SAFE_PATHS comparison.
+        assert_eq!(stripped, strip_verbatim_prefix(canonical));
+        assert!(!stripped.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn strips_only_the_windows_verbatim_prefix() {
         assert_eq!(
-            resolved.paths.dashboard_directory,
-            Some(fs::canonicalize(&dashboard).unwrap())
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\Example\dashboard")),
+            PathBuf::from(r"C:\Users\Example\dashboard")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\dashboard")),
+            PathBuf::from(r"\\server\share\dashboard")
+        );
+        // A path without the prefix is returned unchanged.
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\Users\Example\dashboard")),
+            PathBuf::from(r"C:\Users\Example\dashboard")
         );
     }
     #[test]
