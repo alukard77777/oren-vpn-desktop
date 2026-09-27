@@ -2725,7 +2725,9 @@ where
                 Ok(state.status())
             }
             Err(multicore_core::SupervisorError::StartFailed {
-                rollback_failed, ..
+                engine,
+                rollback_failed,
+                cause,
             }) => {
                 if rollback_failed {
                     state.mark_error(
@@ -2737,9 +2739,7 @@ where
                         .state
                         .transition(CoreConnectionState::Ready)
                         .map_err(|_| BackendError::new())?;
-                    state.message = Some(
-                        "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned(),
-                    );
+                    state.message = Some(start_failure_message(engine, cause));
                     state.degraded = false;
                 }
                 state.push_event(
@@ -3192,6 +3192,33 @@ fn runtime_check_to_dto(state: RuntimeCheckState) -> RuntimeCheckDto {
         RuntimeCheckState::Ready => RuntimeCheckDto::Ready,
         RuntimeCheckState::Failed => RuntimeCheckDto::Failed,
         RuntimeCheckState::Unsupported => RuntimeCheckDto::Unsupported,
+    }
+}
+
+fn start_failure_message(
+    engine: multicore_core::Engine,
+    cause: multicore_core::StartFailureCause,
+) -> String {
+    use multicore_core::{Engine, StartFailureCause as Cause};
+    let core = match engine {
+        Engine::Xray => "Xray",
+        Engine::Mihomo => "Mihomo",
+    };
+    match cause {
+        Cause::ElevationCancelled => {
+            "Подключение отменено: не выдано разрешение администратора.".to_owned()
+        }
+        Cause::ElevationFailed => {
+            "Не удалось запустить службу подключения с правами администратора.".to_owned()
+        }
+        Cause::BrokerFailed => "Служба подключения не ответила. Повторите попытку.".to_owned(),
+        Cause::CoreFailed => format!("Не удалось запустить {core}. Проверьте исполняемые файлы."),
+        Cause::ReadinessTimedOut => {
+            format!("{core} не успел запуститься вовремя. Повторите попытку.")
+        }
+        Cause::Unknown => {
+            "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
+        }
     }
 }
 

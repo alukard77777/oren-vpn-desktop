@@ -7,15 +7,14 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use multicore_core::elevation_protocol::BrokerErrorCode;
 use multicore_core::elevation_protocol::{
-    Authentication, ElevatedDiagnosticStream, ElevatedEngine, ElevatedRuntimeState,
-    ElevationCommand, ElevationResponse, SessionSecret, response_matches_command,
+    Authentication, BrokerErrorCode, ElevatedDiagnosticStream, ElevatedEngine,
+    ElevatedRuntimeState, ElevationCommand, ElevationResponse, SessionSecret,
+    response_matches_command,
 };
 use multicore_core::{
     CoreLogRecord, DiagnosticStream, Engine, ProcessController, ProcessDiagnostics,
-    RuntimeCheckState,
+    RuntimeCheckState, StartFailureCause,
 };
 #[cfg(windows)]
 use zeroize::Zeroizing;
@@ -49,6 +48,10 @@ pub enum ElevationError {
     Protocol,
     LaunchFailed,
     Io,
+    /// The host could not launch the core or the core exited during startup.
+    CoreStartFailed,
+    /// The host launched the core but it did not become ready in time.
+    CoreReadinessTimedOut,
 }
 
 impl fmt::Display for ElevationError {
@@ -64,11 +67,32 @@ impl fmt::Display for ElevationError {
             Self::Protocol => "elevation broker protocol failed",
             Self::LaunchFailed => "elevation broker launch failed",
             Self::Io => "elevation broker I/O failed",
+            Self::CoreStartFailed => "elevated core failed to start",
+            Self::CoreReadinessTimedOut => "elevated core did not become ready in time",
         })
     }
 }
 
 impl std::error::Error for ElevationError {}
+
+impl ElevationError {
+    /// The user-facing reason a start that failed with this error could not complete.
+    #[must_use]
+    pub fn start_failure_cause(&self) -> StartFailureCause {
+        match self {
+            Self::ElevationCancelled => StartFailureCause::ElevationCancelled,
+            Self::LaunchFailed
+            | Self::PeerPidMismatch
+            | Self::AuthenticationFailed
+            | Self::AlreadyConnected => StartFailureCause::ElevationFailed,
+            Self::CoreStartFailed => StartFailureCause::CoreFailed,
+            Self::CoreReadinessTimedOut => StartFailureCause::ReadinessTimedOut,
+            Self::TimedOut | Self::Cancelled | Self::Disconnected | Self::Protocol | Self::Io => {
+                StartFailureCause::BrokerFailed
+            }
+        }
+    }
+}
 
 /// How long to wait for the host's response to `command`.
 #[must_use]
@@ -213,9 +237,17 @@ impl<C: BrokerConnector> ProcessController for ElevatedProcessController<C> {
                 {
                     Ok(())
                 }
+                ElevationResponse::Error {
+                    code: BrokerErrorCode::TimedOut,
+                } => Err(ElevationError::CoreReadinessTimedOut),
+                ElevationResponse::Error { .. } => Err(ElevationError::CoreStartFailed),
                 _ => Err(ElevationError::Protocol),
             }
         })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
+        error.start_failure_cause()
     }
 
     fn stop<'a>(
@@ -1903,6 +1935,7 @@ mod tests {
         connects: AtomicUsize,
         fail_next_connect: AtomicBool,
         disconnect_next_request: AtomicBool,
+        start_error: Mutex<Option<BrokerErrorCode>>,
         commands: Mutex<Vec<ElevationCommand>>,
     }
     #[derive(Clone)]
@@ -1928,6 +1961,11 @@ mod tests {
                 return Err(ElevationError::Disconnected);
             }
             self.0.commands.lock().unwrap().push(command.clone());
+            if matches!(command, ElevationCommand::StartMihomo { .. })
+                && let Some(code) = *self.0.start_error.lock().unwrap()
+            {
+                return Ok(ElevationResponse::Error { code });
+            }
             Ok(match command {
                 ElevationCommand::StartXray { .. } => ElevationResponse::Started {
                     engine: ElevatedEngine::Xray,
@@ -2056,6 +2094,50 @@ mod tests {
         );
         assert_eq!(diagnostics.logs[0].message, "ready");
         assert_eq!(state.connects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_failures_carry_the_elevation_or_core_cause() {
+        let cancelled = Arc::new(FakeState::default());
+        cancelled.fail_next_connect.store(true, Ordering::Relaxed);
+        assert_eq!(
+            multicore_core::Supervisor::new(Arc::new(fake_controller(cancelled)))
+                .connect()
+                .await,
+            Err(multicore_core::SupervisorError::StartFailed {
+                engine: Engine::Xray,
+                rollback_failed: false,
+                cause: StartFailureCause::ElevationCancelled,
+            })
+        );
+        for (code, cause) in [
+            (
+                BrokerErrorCode::TimedOut,
+                StartFailureCause::ReadinessTimedOut,
+            ),
+            (BrokerErrorCode::NotReady, StartFailureCause::CoreFailed),
+        ] {
+            let state = Arc::new(FakeState::default());
+            *state.start_error.lock().unwrap() = Some(code);
+            assert_eq!(
+                multicore_core::Supervisor::new(Arc::new(fake_controller(state)))
+                    .connect()
+                    .await,
+                Err(multicore_core::SupervisorError::StartFailed {
+                    engine: Engine::Mihomo,
+                    rollback_failed: false,
+                    cause,
+                })
+            );
+        }
+        assert_eq!(
+            ElevationError::Disconnected.start_failure_cause(),
+            StartFailureCause::BrokerFailed
+        );
+        assert_eq!(
+            ElevationError::LaunchFailed.start_failure_cause(),
+            StartFailureCause::ElevationFailed
+        );
     }
 
     #[test]
