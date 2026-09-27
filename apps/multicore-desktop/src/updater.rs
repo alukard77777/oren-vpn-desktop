@@ -444,6 +444,62 @@ fn update_directory() -> Result<PathBuf, String> {
         .map_err(|_| "Каталог данных MultiCore недоступен".to_owned())
 }
 
+/// Marker the Windows updater waits for before discarding the previous version.
+/// Must match `STARTED_MARKER` in `apps/multicore-updater`.
+#[cfg(not(target_os = "linux"))]
+const STARTED_MARKER: &str = "started-ok";
+#[cfg(not(target_os = "linux"))]
+const BACKUP_PREFIX: &str = ".multicore-previous-";
+
+/// Confirm that this build started successfully (window and daemon are up).
+///
+/// The updater keeps the previous-version backup until this marker names the
+/// new version. If the marker already named this version before (an earlier
+/// confirmed start), leftover backups are stale and are removed.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn confirm_started() {
+    let Ok(update_dir) = update_directory() else {
+        return;
+    };
+    let Some(install_parent) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent()?.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    if let Err(error) = confirm_started_in(&update_dir, &install_parent, env!("CARGO_PKG_VERSION"))
+    {
+        eprintln!("update start confirmation failed: {error}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn confirm_started_in(
+    update_dir: &Path,
+    install_parent: &Path,
+    version: &str,
+) -> std::io::Result<()> {
+    let marker = update_dir.join(STARTED_MARKER);
+    let previously_confirmed =
+        fs::read_to_string(&marker).is_ok_and(|content| content.trim() == version);
+    if previously_confirmed && let Ok(entries) = fs::read_dir(install_parent) {
+        for entry in entries.flatten() {
+            let stale = entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(BACKUP_PREFIX));
+            if stale {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    fs::create_dir_all(update_dir)?;
+    let temporary = update_dir.join(format!("{STARTED_MARKER}.tmp"));
+    fs::write(&temporary, version)?;
+    fs::rename(temporary, marker)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{UpdateAction, UpdateState};
@@ -474,6 +530,31 @@ mod tests {
         assert_eq!(connected.action, UpdateAction::Install);
         assert!(connected.action_enabled);
         assert!(connected.detail.contains("перезапущен"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn start_confirmation_writes_marker_and_cleans_backups_only_once_confirmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let updates = temp.path().join("updates");
+        let install_parent = temp.path().join("Programs");
+        let backup = install_parent.join(".multicore-previous-0.1.0-9");
+        let unrelated = install_parent.join("current");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        // First start after an update: the updater still owns the backup.
+        super::confirm_started_in(&updates, &install_parent, "0.2.0").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(updates.join("started-ok")).unwrap(),
+            "0.2.0"
+        );
+        assert!(backup.is_dir());
+
+        // A later start of the same confirmed version removes the stale backup.
+        super::confirm_started_in(&updates, &install_parent, "0.2.0").unwrap();
+        assert!(!backup.exists());
+        assert!(unrelated.is_dir());
     }
 
     #[test]

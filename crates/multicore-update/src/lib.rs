@@ -5,6 +5,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path};
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -680,8 +681,53 @@ fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
 
 pub fn transactional_swap(target: &Path, staged: &Path, backup: &Path) -> Result<(), UpdateError> {
     validate_swap_paths(target, staged, backup)?;
-    transactional_swap_with(target, staged, backup, |from, to| fs::rename(from, to))?;
+    transactional_swap_with(target, staged, backup, rename_with_retry)?;
     Ok(())
+}
+
+/// Delay between attempts of a directory rename blocked by another process.
+pub const RENAME_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Attempts that together cover roughly ten seconds of retrying.
+pub const RENAME_RETRY_ATTEMPTS: u32 = 40;
+
+/// Rename a directory, retrying for about ten seconds while Windows reports a
+/// sharing violation or access denial (antivirus scans, exiting processes, or
+/// Explorer handles commonly hold the directory briefly).
+pub fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    retry_transient(
+        || fs::rename(from, to),
+        RENAME_RETRY_ATTEMPTS,
+        std::thread::sleep,
+    )
+}
+
+fn is_transient_lock(error: &std::io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        )
+}
+
+fn retry_transient(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+    attempts: u32,
+    mut sleep: impl FnMut(Duration),
+) -> std::io::Result<()> {
+    let mut remaining = attempts.max(1);
+    loop {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) if remaining > 1 && is_transient_lock(&error) => {
+                remaining -= 1;
+                sleep(RENAME_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn validate_swap_paths(target: &Path, staged: &Path, backup: &Path) -> Result<(), UpdateError> {
@@ -729,7 +775,8 @@ fn transactional_swap_with(
     if let Err(publish_error) = rename(staged, target) {
         if let Err(rollback_error) = rename(backup, target) {
             return Err(std::io::Error::other(format!(
-                "publication failed ({publish_error}); rollback failed ({rollback_error})"
+                "publication failed ({publish_error}); rollback failed ({rollback_error});                  previous version preserved at {}",
+                backup.display()
             )));
         }
         return Err(publish_error);
@@ -744,7 +791,9 @@ pub fn archive_entry_unix_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Op
 
 #[cfg(test)]
 mod publication_tests {
-    use super::{MAX_EXPANDED_BYTES, effective_expanded_limit, transactional_swap_with};
+    use super::{
+        MAX_EXPANDED_BYTES, effective_expanded_limit, retry_transient, transactional_swap_with,
+    };
     use std::fs;
     use std::io;
     use tempfile::TempDir;
@@ -781,6 +830,82 @@ mod publication_tests {
         assert_eq!(fs::read(target.join("old.txt")).unwrap(), b"old");
         assert!(!backup.exists());
         assert!(staged.exists());
+    }
+
+    #[test]
+    fn transient_sharing_violations_are_retried_until_success() {
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let result = retry_transient(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            40,
+            |_| sleeps += 1,
+        );
+        result.unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, 2);
+    }
+
+    #[test]
+    fn retry_gives_up_after_its_budget_and_skips_permanent_errors() {
+        let mut calls = 0;
+        let error = retry_transient(
+            || {
+                calls += 1;
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked"))
+            },
+            5,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 5);
+
+        let mut calls = 0;
+        let error = retry_transient(
+            || {
+                calls += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+            },
+            5,
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn failed_rollback_reports_where_the_previous_version_was_kept() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("MultiCore");
+        let staged = temp.path().join("MultiCore.new");
+        let backup = temp.path().join("MultiCore.previous");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&staged).unwrap();
+        fs::write(target.join("old.txt"), b"old").unwrap();
+
+        let mut calls = 0;
+        let error = transactional_swap_with(&target, &staged, &backup, |from, to| {
+            calls += 1;
+            if calls >= 2 {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "fixture"));
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("rollback failed"), "{message}");
+        assert!(message.contains(&backup.display().to_string()), "{message}");
+        assert_eq!(fs::read(backup.join("old.txt")).unwrap(), b"old");
     }
 
     #[test]
