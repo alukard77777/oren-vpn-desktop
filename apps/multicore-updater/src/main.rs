@@ -361,6 +361,7 @@ fn normalized_windows_path(path: &str) -> String {
     path.replace('/', "\\").to_lowercase()
 }
 
+#[cfg(windows)]
 fn image_is_within(image: &str, install: &Path) -> bool {
     let mut root = normalized_windows_path(&install.to_string_lossy());
     if !root.ends_with('\\') {
@@ -793,7 +794,17 @@ mod tests {
             .args(["/D", "/C", "ping -n 30 127.0.0.1 >NUL"])
             .spawn()
             .unwrap();
-        let found = super::processes_under(&temp.path().canonicalize().unwrap());
+        // Toolhelp snapshots and QueryFullProcessImageNameW are point-in-time;
+        // a freshly spawned process is not always visible on the very first
+        // snapshot, especially under security-software hooks on CI. Poll
+        // briefly instead of asserting immediately after spawn().
+        let install = temp.path().canonicalize().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = super::processes_under(&install);
+        while !found.contains(&child.id()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            found = super::processes_under(&install);
+        }
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(found.contains(&child.id()), "{found:?}");

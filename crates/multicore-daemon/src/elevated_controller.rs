@@ -2480,13 +2480,17 @@ mod tests {
             let result = connect_with(
                 runtime.path(),
                 move |socket, server_pid| {
-                    let child = std::process::Command::new("/bin/sh")
+                    let mut child = std::process::Command::new("/bin/sh")
                         .arg("-c")
                         .arg("exec sleep 0.2")
                         .spawn()
                         .unwrap();
                     *recorded.lock().unwrap() = Some(child.id());
-                    connect_from_self(socket, server_pid)?;
+                    if let Err(error) = connect_from_self(socket, server_pid) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
                     Ok(LaunchedHost {
                         pid: child.id(),
                         child: Some(child),
