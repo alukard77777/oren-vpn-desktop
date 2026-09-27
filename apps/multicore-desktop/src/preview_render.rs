@@ -190,6 +190,8 @@ fn ready(ui: &AppWindow) {
     ui.set_subscription_refresh_available(true);
     ui.set_subscription_refresh_enabled(true);
     ui.set_subscription_management_enabled(true);
+    ui.set_active_profile_id(s("p1"));
+    ui.set_runtime_versions(env!("MULTICORE_RUNTIME_VERSIONS").into());
     ui.set_subscription_profiles(profiles(3));
     ui.set_catalog_groups(groups());
     ui.set_catalog_nodes(nodes(false));
@@ -206,6 +208,7 @@ fn connected(ui: &AppWindow) {
     ui.set_primary_label(s("Отключиться"));
     ui.set_status_tone(s("success"));
     ui.set_subscription_management_enabled(false);
+    ui.set_profile_switch_locked(true);
     ui.set_catalog_selection_enabled(true);
 }
 
@@ -306,6 +309,18 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_primary_label(s("Остановить туннель"));
             ui.set_status_tone(s("warning"));
             ui.set_subscription_refresh_available(false);
+        }),
+        ("home-local-profile", 840, 720, |ui| {
+            ready(ui);
+            ui.set_subscription_refresh_available(false);
+            ui.set_subscription_updated_stale(true);
+        }),
+        ("home-menu-mutation-error", 840, 720, |ui| {
+            ready(ui);
+            ui.set_profile_mutation_error(s(
+                "Не удалось активировать подписку. Повторите попытку.",
+            ));
+            ui.set_active_panel(s("subscription"));
         }),
         ("home-update-banner-menu", 840, 720, |ui| {
             ready(ui);
@@ -481,6 +496,7 @@ fn render_ui_previews() {
     let popup = TrayPopup::new().expect("create tray popup");
     popup.set_status_text(s("Подключено · Автовыбор"));
     popup.set_connection_label(s("Отключиться"));
+    popup.set_connected(true);
     popup.set_group_rows(groups.clone());
     popup.set_node_rows(nodes.clone());
     capture(&popup, "tray-connected", 304, 460);
@@ -489,5 +505,6 @@ fn render_ui_previews() {
     popup.set_status_text(s("Профиль не добавлен"));
     popup.set_connection_label(s("Подключиться"));
     popup.set_connection_enabled(false);
+    popup.set_has_profile(false);
     capture(&popup, "tray-no-profile", 304, 460);
 }
