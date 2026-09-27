@@ -22,6 +22,9 @@ use zeroize::Zeroizing;
 
 pub const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A start response arrives only after the host has waited for core readiness.
+pub const BROKER_START_TIMEOUT: Duration =
+    Duration::from_secs(multicore_core::CORE_READINESS_TIMEOUT.as_secs() + 8);
 #[cfg(unix)]
 pub const BROKER_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -66,6 +69,17 @@ impl fmt::Display for ElevationError {
 }
 
 impl std::error::Error for ElevationError {}
+
+/// How long to wait for the host's response to `command`.
+#[must_use]
+pub fn broker_response_timeout(command: &ElevationCommand) -> Duration {
+    match command {
+        ElevationCommand::StartXray { .. } | ElevationCommand::StartMihomo { .. } => {
+            BROKER_START_TIMEOUT
+        }
+        _ => BROKER_IO_TIMEOUT,
+    }
+}
 
 pub trait BrokerTransport: Send {
     fn request(&self, command: &ElevationCommand) -> Result<ElevationResponse, ElevationError>;
@@ -724,7 +738,13 @@ pub mod windows {
                 return Err(ElevationError::Disconnected);
             };
             let result = write_message(pipe.as_raw_handle(), command, BROKER_IO_TIMEOUT, cancelled)
-                .and_then(|()| read_message(pipe.as_raw_handle(), BROKER_IO_TIMEOUT, cancelled))
+                .and_then(|()| {
+                    read_message(
+                        pipe.as_raw_handle(),
+                        broker_response_timeout(command),
+                        cancelled,
+                    )
+                })
                 .and_then(|frame| decode_frame(&frame).map_err(|_| ElevationError::Protocol))
                 .and_then(|response| {
                     if response_matches_command(command, &response) {
@@ -1670,6 +1690,9 @@ pub mod unix {
     impl BrokerTransport for UnixBrokerTransport {
         fn request(&self, command: &ElevationCommand) -> Result<ElevationResponse, ElevationError> {
             let mut stream = &self.stream;
+            self.stream
+                .set_read_timeout(Some(broker_response_timeout(command)))
+                .map_err(io_error)?;
             write_stream_frame(&mut stream, command).map_err(io_error)?;
             let frame = read_stream_frame(&mut stream).map_err(io_error)?;
             let response: ElevationResponse =
@@ -2033,6 +2056,29 @@ mod tests {
         );
         assert_eq!(diagnostics.logs[0].message, "ready");
         assert_eq!(state.connects.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn start_commands_outlast_core_readiness_and_others_stay_short() {
+        let margin = Duration::from_secs(5);
+        for command in [
+            ElevationCommand::StartXray { generation_id: 1 },
+            ElevationCommand::StartMihomo { generation_id: 1 },
+        ] {
+            assert!(
+                broker_response_timeout(&command)
+                    >= multicore_core::CORE_READINESS_TIMEOUT + margin
+            );
+        }
+        for command in [
+            ElevationCommand::Stop {
+                engine: ElevatedEngine::Xray,
+            },
+            ElevationCommand::Diagnostics,
+            ElevationCommand::Shutdown,
+        ] {
+            assert_eq!(broker_response_timeout(&command), BROKER_IO_TIMEOUT);
+        }
     }
 
     #[cfg(windows)]
