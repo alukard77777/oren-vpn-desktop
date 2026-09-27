@@ -13,7 +13,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, SetHandleInformation},
+    Foundation::{HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0},
     Security::SECURITY_ATTRIBUTES,
     System::{
         JobObjects::{
@@ -198,12 +198,21 @@ impl ManagedChild for WindowsJobManagedChild {
             if unsafe { TerminateProcess(self.process.as_raw_handle(), 1) } == 0 {
                 return Err(ProcessError::StopFailed(self.engine));
             }
-            unsafe {
-                WaitForSingleObject(self.process.as_raw_handle(), INFINITE);
+            if !wait_for_termination(self.process.as_raw_handle(), STOP_TIMEOUT) {
+                return Err(ProcessError::StopFailed(self.engine));
             }
             Ok(())
         })
     }
+}
+
+/// Upper bound for a terminated core to be reaped. A process stuck in a
+/// driver call can outlive `TerminateProcess`; the caller must not hang.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn wait_for_termination(process: HANDLE, timeout: Duration) -> bool {
+    let milliseconds = timeout.as_millis().min(u128::from(INFINITE - 1)) as u32;
+    unsafe { WaitForSingleObject(process, milliseconds) == WAIT_OBJECT_0 }
 }
 
 impl ProcessLauncher for WindowsJobLauncher {
@@ -418,6 +427,29 @@ mod tests {
         unsafe { std::env::set_var("MULTICORE_DAEMON_TOKEN", "never-inherit") };
         let block = String::from_utf16_lossy(&sanitized_environment());
         assert!(!block.contains("never-inherit"));
+    }
+    #[test]
+    fn termination_wait_is_bounded() {
+        // The current process never exits during the test, so the wait must
+        // return after its timeout instead of blocking forever.
+        let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let started = std::time::Instant::now();
+        assert!(!wait_for_termination(current, Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    #[tokio::test]
+    async fn stop_terminates_a_running_child_within_the_bound() {
+        let launcher = WindowsJobLauncher::new(Arc::new(CoreLogBuffer::default())).unwrap();
+        let mut child = launcher
+            .launch(CommandSpec {
+                engine: Engine::Xray,
+                program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                args: vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+            })
+            .await
+            .unwrap();
+        child.stop().await.unwrap();
+        assert!(child.has_exited().unwrap());
     }
     #[tokio::test]
     async fn child_is_created_inside_job_and_job_close_reaps_it() {
