@@ -47,14 +47,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mihomo_controller_secret,
     )?);
 
-    // The vendored zashboard build ships as a `dashboard/` sibling of this executable in a
-    // packaged release (see packaging/*/versions.json). It is absent in ad hoc dev/test builds,
-    // in which case the dashboard feature is simply unavailable: no runtime download is ever
-    // attempted. `dashboard_url` embeds the per-process controller secret and must never be
+    // The vendored zashboard build ships as a `dashboard/` sibling of `cores/` and `runtime/` at
+    // the package root in a packaged release (see packaging/*/versions.json and
+    // apps/multicore-core-host/src/runtime_paths.rs, which resolves the same directory the same
+    // way). This executable itself lives one level deeper, inside `runtime/`, so the package
+    // root is its *grandparent*, not its parent. The directory is absent in ad hoc dev/test
+    // builds, in which case the dashboard feature is simply unavailable: no runtime download is
+    // ever attempted. `dashboard_url` embeds the per-process controller secret and must never be
     // logged; it only leaves this process through the authenticated `/v1/dashboard-url` route.
-    let dashboard_directory = env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent().map(|parent| parent.join("dashboard")));
+    let dashboard_directory = env::current_exe().ok().and_then(|executable| {
+        dashboard_directory_for(&executable).map(|package_root| package_root.join("dashboard"))
+    });
     let runtime_control = match &dashboard_directory {
         Some(directory) => runtime_control
             .clone()
@@ -125,6 +128,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The package root (parent of both `runtime/`, which this executable lives
+/// in, and `cores/`), where an optional vendored `dashboard/` directory is
+/// staged as a sibling of `cores/` - not as a sibling of this executable
+/// itself, which is one level deeper. Matches
+/// `apps/multicore-core-host/src/runtime_paths.rs`'s resolution of the same
+/// directory.
+fn dashboard_directory_for(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    executable
+        .parent()
+        .and_then(|runtime_dir| runtime_dir.parent())
+        .map(std::path::Path::to_path_buf)
+}
+
 fn required_env(name: &str) -> io::Result<String> {
     env::var(name)
         .ok()
@@ -139,7 +155,34 @@ fn required_env(name: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::dashboard_directory_for;
+
     const MAIN_SOURCE: &str = include_str!("main.rs");
+
+    #[test]
+    fn dashboard_directory_is_a_sibling_of_cores_not_of_this_executable() {
+        // multicore-daemon.exe lives in `<package>/runtime/`; the vendored
+        // dashboard is staged at `<package>/dashboard/`, the same package
+        // root apps/multicore-core-host/src/runtime_paths.rs resolves `cores/`
+        // from. Regression coverage for a real bug: an earlier version only
+        // went up one `.parent()`, landing on `<package>/runtime/dashboard`,
+        // which never exists, so the dashboard silently never worked despite
+        // package-windows-release.ps1 staging it correctly.
+        #[cfg(windows)]
+        let executable = std::path::Path::new(
+            r"C:\Users\Example\AppData\Local\Programs\MultiCore\current\runtime\multicore-daemon.exe",
+        );
+        #[cfg(not(windows))]
+        let executable = std::path::Path::new("/usr/lib/multicore/runtime/multicore-daemon");
+
+        let package_root = dashboard_directory_for(executable).expect("package root resolves");
+        assert_eq!(package_root, executable.parent().unwrap().parent().unwrap());
+        assert_ne!(
+            package_root.join("dashboard"),
+            executable.parent().unwrap().join("dashboard"),
+            "must not resolve to a sibling of the executable itself"
+        );
+    }
 
     #[test]
     fn live_dns_does_not_resolve_and_pin_endpoint_ips_during_connect() {

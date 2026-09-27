@@ -22,8 +22,16 @@ struct ConflictingApp {
 
 const CONFLICTING_APPS: &[ConflictingApp] = &[
     ConflictingApp {
+        // Confirmed live on real hardware: this project's own subscription
+        // contract already references the "flclashx" vendor prefix
+        // (docs/subscription-http-contract.md), and the actual installed app
+        // in this ecosystem runs as FlClashX.exe / FlClashCore.exe /
+        // FlClashHelperService.exe (a rebranded/white-label FlClash fork),
+        // not bare "FlClash" - its own TUN adapter shows as "FlClashX" /
+        // "Meta Tunnel". Keep the plain alias too in case an unbranded
+        // upstream build is ever encountered.
         name: "FlClash",
-        aliases: &["flclash"],
+        aliases: &["flclash", "flclashx", "flclashcore", "flclashhelperservice"],
     },
     ConflictingApp {
         name: "Happ",
@@ -167,6 +175,20 @@ mod tests {
     fn matches_case_insensitively() {
         let found = detect_from_stems(stems(&["FlClash.EXE"]));
         assert_eq!(found, vec!["FlClash"]);
+    }
+
+    #[test]
+    fn matches_the_real_flclashx_process_family() {
+        // Confirmed on real hardware: the actually-distributed app in this
+        // ecosystem runs as FlClashX.exe with a separate core/helper process,
+        // not bare FlClash.exe.
+        for exe in [
+            "FlClashX.exe",
+            "FlClashCore.exe",
+            "FlClashHelperService.exe",
+        ] {
+            assert_eq!(detect_from_stems(stems(&[exe])), vec!["FlClash"], "{exe}");
+        }
     }
 
     #[test]
