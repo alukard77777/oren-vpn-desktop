@@ -232,6 +232,13 @@ pub struct RuntimePaths {
     pub mihomo_binary: PathBuf,
     pub xray_config: PathBuf,
     pub mihomo_config: PathBuf,
+    /// The vendored, checksum-verified static dashboard directory (see
+    /// `crates/multicore-core/src/snapshot.rs`'s `external-ui` overlay). When set, Mihomo is
+    /// launched with `SAFE_PATHS` naming this exact directory, which is the only way to let
+    /// Mihomo serve an `external-ui` directory that lies outside its own home directory without
+    /// copying the dashboard into the ephemeral runtime tree on every Connect. Absent in builds
+    /// without a vendored dashboard.
+    pub dashboard_directory: Option<PathBuf>,
 }
 
 impl RuntimePaths {
@@ -245,6 +252,7 @@ impl RuntimePaths {
                     OsString::from("-config"),
                     self.xray_config.clone().into_os_string(),
                 ],
+                env: Vec::new(),
             },
             Engine::Mihomo => CommandSpec {
                 engine,
@@ -253,6 +261,16 @@ impl RuntimePaths {
                     OsString::from("-f"),
                     self.mihomo_config.clone().into_os_string(),
                 ],
+                env: self
+                    .dashboard_directory
+                    .iter()
+                    .map(|directory| {
+                        (
+                            OsString::from("SAFE_PATHS"),
+                            directory.clone().into_os_string(),
+                        )
+                    })
+                    .collect(),
             },
         }
     }
@@ -263,6 +281,9 @@ pub struct CommandSpec {
     pub engine: Engine,
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    /// Additional environment variables the launcher must set on top of its own sanitized base
+    /// environment (never used to remove or replace anything already set).
+    pub env: Vec<(OsString, OsString)>,
 }
 
 /// Longest time a launched core may take to report readiness before its start is failed.
