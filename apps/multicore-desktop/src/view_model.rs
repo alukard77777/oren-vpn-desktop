@@ -532,10 +532,11 @@ pub struct ConflictingAppsPresentation {
     pub message: String,
 }
 
-/// Builds the Russian banner copy for one or more detected conflicting apps.
-fn conflicting_apps_message(apps: &[&'static str]) -> String {
+/// Builds the Russian banner copy for one or more detected conflicting apps,
+/// appending a note about any app a close attempt could not fully remove.
+fn conflicting_apps_message(apps: &[&'static str], close_note: &[&'static str]) -> String {
     let names = apps.join(", ");
-    if apps.len() > 1 {
+    let mut message = if apps.len() > 1 {
         format!(
             "Обнаружены другие VPN-приложения ({names}): они могут конфликтовать с MultiCore. Закройте их перед подключением."
         )
@@ -543,7 +544,16 @@ fn conflicting_apps_message(apps: &[&'static str]) -> String {
         format!(
             "Обнаружено другое VPN-приложение ({names}): оно может конфликтовать с MultiCore. Закройте его перед подключением."
         )
+    };
+    if !close_note.is_empty() {
+        let stuck = close_note.join(", ");
+        message.push_str(&format!(
+            " Закрыть удалось не всё: {stuck} запускает свой движок как службу Windows, \
+            которую наша кнопка не трогает без повышения прав. Отключитесь в самом \
+            приложении перед закрытием или остановите его службу в «Службах Windows»."
+        ));
     }
+    message
 }
 
 pub fn redact_event_text(input: &str) -> String {
@@ -673,6 +683,15 @@ pub struct DesktopViewModel {
     latency_error: Option<String>,
     conflicting_apps: Vec<&'static str>,
     conflicting_apps_dismissed_key: Option<String>,
+    /// Apps a close attempt just targeted but could not fully remove (some of
+    /// their processes are still running after `close_running`). Common
+    /// cause: the app's actual engine runs as a Windows service in Session 0
+    /// (a separate, protected security context), while its GUI runs in the
+    /// user's own session - our close button is deliberately unprivileged
+    /// and can only close what the user's own token can, so it closes the
+    /// GUI but the service outlives it. Surfaced so the button closing
+    /// something doesn't silently look like it did nothing.
+    conflicting_apps_close_note: Vec<&'static str>,
 }
 
 impl DesktopViewModel {
@@ -740,6 +759,7 @@ impl DesktopViewModel {
             latency_error: None,
             conflicting_apps: Vec::new(),
             conflicting_apps_dismissed_key: None,
+            conflicting_apps_close_note: Vec::new(),
         }
     }
 
@@ -1980,7 +2000,23 @@ impl DesktopViewModel {
         if apps.is_empty() {
             self.conflicting_apps_dismissed_key = None;
         }
+        // Drop the note for any noted app that isn't detected anymore
+        // (whether or not other apps are still/newly present).
+        self.conflicting_apps_close_note
+            .retain(|noted| apps.contains(noted));
         self.conflicting_apps = apps;
+    }
+
+    /// Called right after a close-app attempt re-scans. Any `targeted` app
+    /// still present afterward gets an explanatory note appended to the
+    /// banner (see `conflicting_apps_close_note`'s doc comment for why this
+    /// happens); a `targeted` app no longer present needs no note.
+    pub(crate) fn record_close_attempt(&mut self, targeted: &[&'static str]) {
+        self.conflicting_apps_close_note = targeted
+            .iter()
+            .filter(|app| self.conflicting_apps.contains(app))
+            .copied()
+            .collect();
     }
 
     /// Dismisses the banner for exactly the currently-detected set of apps.
@@ -1992,6 +2028,14 @@ impl DesktopViewModel {
 
     fn conflicting_apps_key(&self) -> String {
         self.conflicting_apps.join("\u{1f}")
+    }
+
+    /// The currently-detected app names, as the canonical `&'static str`
+    /// values (not the display-only `String`s `conflicting_apps_presentation`
+    /// returns), so callers can round-trip them into `close_running` and
+    /// `record_close_attempt` without re-parsing.
+    pub(crate) fn conflicting_apps(&self) -> Vec<&'static str> {
+        self.conflicting_apps.clone()
     }
 
     pub(crate) fn conflicting_apps_presentation(&self) -> ConflictingAppsPresentation {
@@ -2012,7 +2056,10 @@ impl DesktopViewModel {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            message: conflicting_apps_message(&self.conflicting_apps),
+            message: conflicting_apps_message(
+                &self.conflicting_apps,
+                &self.conflicting_apps_close_note,
+            ),
         }
     }
 
@@ -7942,6 +7989,57 @@ mod tests {
             model.conflicting_apps_presentation().apps,
             vec!["FlClash".to_string()]
         );
+    }
+
+    #[test]
+    fn record_close_attempt_notes_an_app_that_survives_the_close() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(
+            !model
+                .conflicting_apps_presentation()
+                .message
+                .contains("службу Windows")
+        );
+
+        // Closing found nothing this token could terminate (e.g. only a
+        // Session-0 service is left), so the rescan still detects it.
+        model.record_close_attempt(&["FlClash"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.contains("FlClash"));
+        assert!(message.contains("службу Windows"));
+    }
+
+    #[test]
+    fn record_close_attempt_adds_no_note_when_the_app_is_gone() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.record_close_attempt(&["FlClash"]);
+        assert!(
+            model
+                .conflicting_apps_presentation()
+                .message
+                .contains("службу Windows")
+        );
+
+        // The next scan (run before record_close_attempt, matching the real
+        // main.rs call order) no longer detects it at all.
+        model.set_conflicting_apps(vec![]);
+        assert!(!model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn close_note_for_one_app_does_not_leak_onto_a_different_later_detection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.record_close_attempt(&["FlClash"]);
+
+        // FlClash's service finally exits, but a different app now shows up.
+        model.set_conflicting_apps(vec!["Incy"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.contains("Incy"));
+        assert!(!message.contains("FlClash"));
+        assert!(!message.contains("службу Windows"));
     }
 
     #[test]

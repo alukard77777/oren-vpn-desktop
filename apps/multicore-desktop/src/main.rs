@@ -2978,11 +2978,7 @@ fn wire_conflicting_apps_banner(ui: &AppWindow, model: Arc<Mutex<DesktopViewMode
 
     let weak = ui.as_weak();
     ui.on_close_conflicting_apps(move || {
-        let apps = model
-            .lock()
-            .expect("view model lock")
-            .conflicting_apps_presentation()
-            .apps;
+        let apps = model.lock().expect("view model lock").conflicting_apps();
         if apps.is_empty() {
             return;
         }
@@ -2992,15 +2988,19 @@ fn wire_conflicting_apps_banner(ui: &AppWindow, model: Arc<Mutex<DesktopViewMode
         let model = model.clone();
         let weak = weak.clone();
         thread::spawn(move || {
-            // User-privilege-only, best-effort: never elevated, and a
-            // process this user's own token cannot terminate is simply not
-            // counted, matching conflicting_apps::close_running's contract.
+            // User-privilege-only, best-effort: never elevated. A process
+            // this user's own token cannot terminate (most commonly: the
+            // app's real engine runs as a Windows service in Session 0,
+            // separate from its GUI) is simply not counted -
+            // record_close_attempt below turns that into a specific note
+            // instead of the button silently appearing to do nothing.
             for app in &apps {
                 conflicting_apps::close_running(app);
             }
             let current = {
                 let mut model = model.lock().expect("view model lock");
                 model.set_conflicting_apps(conflicting_apps::scan_running());
+                model.record_close_attempt(&apps);
                 snapshot(&model)
             };
             let _ = slint::invoke_from_event_loop(move || {
