@@ -70,9 +70,15 @@ chmod 0755 "%{buildroot}/usr/lib/multicore/multicore" \
 /usr/share/applications/multicore.desktop
 /usr/share/icons/hicolor/scalable/apps/multicore.svg
 /usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy
+# The vendored dashboard (packaging/linux/versions.json "dashboard" component) is a bare
+# directory path (no %dir, no per-file listing): rpmbuild packages it and everything beneath
+# it recursively. Its filenames are content-hashed by the upstream build and change on every
+# re-vendor, so unlike the entries above they cannot be listed individually here.
+/usr/lib/multicore/dashboard
 %dir /usr/share/licenses/multicore
 %license /usr/share/licenses/multicore/LICENSE-MIT
 %license /usr/share/licenses/multicore/LICENSE-APACHE
 %license /usr/share/licenses/multicore/THIRD_PARTY_NOTICES.md
 %license /usr/share/licenses/multicore/Xray-core-MPL-2.0.txt
 %license /usr/share/licenses/multicore/mihomo-GPL-3.0.txt
+%license /usr/share/licenses/multicore/zashboard-MIT.txt
