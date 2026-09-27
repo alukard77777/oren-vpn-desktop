@@ -890,6 +890,12 @@ fn main() -> Result<(), slint::PlatformError> {
     if starts_visible {
         ui.show()?;
     }
+    // Lets the Windows updater discard the previous version only once this
+    // build has its daemon and event loop running.
+    #[cfg(not(target_os = "linux"))]
+    if _bootstrap_guard.is_some() {
+        slint::Timer::single_shot(Duration::from_secs(2), updater::confirm_started);
+    }
     let result = slint::run_event_loop_until_quit();
     flush_preferences(&ui, &model, &preference_writer, &preference_tracker);
     let _ = tray_popup.hide();
