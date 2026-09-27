@@ -112,6 +112,9 @@ jobs:
         run: bash scripts/test-linux-shell-in-fedora.sh
       - name: Retain native Wayland evidence
         if: always()
+        # Best-effort diagnostic evidence only: an account-wide Actions storage
+        # quota outage must not fail an otherwise-green required check.
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-shell-smoke
