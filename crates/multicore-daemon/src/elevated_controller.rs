@@ -7,21 +7,23 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use multicore_core::elevation_protocol::BrokerErrorCode;
 use multicore_core::elevation_protocol::{
-    Authentication, ElevatedDiagnosticStream, ElevatedEngine, ElevatedRuntimeState,
-    ElevationCommand, ElevationResponse, SessionSecret, response_matches_command,
+    Authentication, BrokerErrorCode, ElevatedDiagnosticStream, ElevatedEngine,
+    ElevatedRuntimeState, ElevationCommand, ElevationResponse, SessionSecret,
+    response_matches_command,
 };
 use multicore_core::{
     CoreLogRecord, DiagnosticStream, Engine, ProcessController, ProcessDiagnostics,
-    RuntimeCheckState,
+    RuntimeCheckState, StartFailureCause,
 };
 #[cfg(windows)]
 use zeroize::Zeroizing;
 
 pub const BROKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A start response arrives only after the host has waited for core readiness.
+pub const BROKER_START_TIMEOUT: Duration =
+    Duration::from_secs(multicore_core::CORE_READINESS_TIMEOUT.as_secs() + 8);
 #[cfg(unix)]
 pub const BROKER_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -46,6 +48,10 @@ pub enum ElevationError {
     Protocol,
     LaunchFailed,
     Io,
+    /// The host could not launch the core or the core exited during startup.
+    CoreStartFailed,
+    /// The host launched the core but it did not become ready in time.
+    CoreReadinessTimedOut,
 }
 
 impl fmt::Display for ElevationError {
@@ -61,11 +67,43 @@ impl fmt::Display for ElevationError {
             Self::Protocol => "elevation broker protocol failed",
             Self::LaunchFailed => "elevation broker launch failed",
             Self::Io => "elevation broker I/O failed",
+            Self::CoreStartFailed => "elevated core failed to start",
+            Self::CoreReadinessTimedOut => "elevated core did not become ready in time",
         })
     }
 }
 
 impl std::error::Error for ElevationError {}
+
+impl ElevationError {
+    /// The user-facing reason a start that failed with this error could not complete.
+    #[must_use]
+    pub fn start_failure_cause(&self) -> StartFailureCause {
+        match self {
+            Self::ElevationCancelled => StartFailureCause::ElevationCancelled,
+            Self::LaunchFailed
+            | Self::PeerPidMismatch
+            | Self::AuthenticationFailed
+            | Self::AlreadyConnected => StartFailureCause::ElevationFailed,
+            Self::CoreStartFailed => StartFailureCause::CoreFailed,
+            Self::CoreReadinessTimedOut => StartFailureCause::ReadinessTimedOut,
+            Self::TimedOut | Self::Cancelled | Self::Disconnected | Self::Protocol | Self::Io => {
+                StartFailureCause::BrokerFailed
+            }
+        }
+    }
+}
+
+/// How long to wait for the host's response to `command`.
+#[must_use]
+pub fn broker_response_timeout(command: &ElevationCommand) -> Duration {
+    match command {
+        ElevationCommand::StartXray { .. } | ElevationCommand::StartMihomo { .. } => {
+            BROKER_START_TIMEOUT
+        }
+        _ => BROKER_IO_TIMEOUT,
+    }
+}
 
 pub trait BrokerTransport: Send {
     fn request(&self, command: &ElevationCommand) -> Result<ElevationResponse, ElevationError>;
@@ -199,9 +237,17 @@ impl<C: BrokerConnector> ProcessController for ElevatedProcessController<C> {
                 {
                     Ok(())
                 }
+                ElevationResponse::Error {
+                    code: BrokerErrorCode::TimedOut,
+                } => Err(ElevationError::CoreReadinessTimedOut),
+                ElevationResponse::Error { .. } => Err(ElevationError::CoreStartFailed),
                 _ => Err(ElevationError::Protocol),
             }
         })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
+        error.start_failure_cause()
     }
 
     fn stop<'a>(
@@ -724,7 +770,13 @@ pub mod windows {
                 return Err(ElevationError::Disconnected);
             };
             let result = write_message(pipe.as_raw_handle(), command, BROKER_IO_TIMEOUT, cancelled)
-                .and_then(|()| read_message(pipe.as_raw_handle(), BROKER_IO_TIMEOUT, cancelled))
+                .and_then(|()| {
+                    read_message(
+                        pipe.as_raw_handle(),
+                        broker_response_timeout(command),
+                        cancelled,
+                    )
+                })
                 .and_then(|frame| decode_frame(&frame).map_err(|_| ElevationError::Protocol))
                 .and_then(|response| {
                     if response_matches_command(command, &response) {
@@ -1670,6 +1722,9 @@ pub mod unix {
     impl BrokerTransport for UnixBrokerTransport {
         fn request(&self, command: &ElevationCommand) -> Result<ElevationResponse, ElevationError> {
             let mut stream = &self.stream;
+            self.stream
+                .set_read_timeout(Some(broker_response_timeout(command)))
+                .map_err(io_error)?;
             write_stream_frame(&mut stream, command).map_err(io_error)?;
             let frame = read_stream_frame(&mut stream).map_err(io_error)?;
             let response: ElevationResponse =
@@ -1684,12 +1739,28 @@ pub mod unix {
     impl Drop for UnixBrokerTransport {
         fn drop(&mut self) {
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
-            if let Some(mut child) = self.host.lock().ok().and_then(|mut host| host.take()) {
-                let _ = std::thread::Builder::new()
-                    .name("multicore-core-host-reaper".into())
-                    .spawn(move || {
-                        let _ = child.wait();
-                    });
+            if let Some(child) = self.host.lock().ok().and_then(|mut host| host.take()) {
+                reap_in_background(child);
+            }
+        }
+    }
+
+    /// Waits for an exiting host off-thread so it never lingers as a zombie.
+    fn reap_in_background(mut child: Child) {
+        let _ = std::thread::Builder::new()
+            .name("multicore-core-host-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+
+    /// Owns the launched host until a transport takes it; reaps it on every failed setup path.
+    struct PendingHost(Option<Child>);
+
+    impl Drop for PendingHost {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.take() {
+                reap_in_background(child);
             }
         }
     }
@@ -1792,21 +1863,25 @@ pub mod unix {
             .map_err(|_| ElevationError::Io)?;
         let secret = SessionSecret::generate().map_err(|_| ElevationError::Io)?;
         let mut host = launch(&socket.0, std::process::id())?;
+        let host_pid = host.pid;
+        let mut pending = PendingHost(host.child.take());
         let started = Instant::now();
         let stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if let Some(child) = host.child.as_mut()
+                    if let Some(child) = pending.0.as_mut()
                         && let Some(status) = child.try_wait().map_err(|_| ElevationError::Io)?
                     {
+                        pending.0 = None;
                         return Err(launch_exit_error(status));
                     }
                     if started.elapsed() >= timeout {
-                        if let Some(child) = host.child.as_mut()
+                        if let Some(child) = pending.0.as_mut()
                             && child.kill().is_ok()
                         {
                             let _ = child.wait();
+                            pending.0 = None;
                         }
                         return Err(ElevationError::TimedOut);
                     }
@@ -1829,7 +1904,7 @@ pub mod unix {
         let peer =
             rustix::net::sockopt::socket_peercred(&stream).map_err(|_| ElevationError::Io)?;
         if peer.uid.as_raw() != expected_peer_uid
-            || peer.pid.as_raw_nonzero().get() as u32 != host.pid
+            || peer.pid.as_raw_nonzero().get() as u32 != host_pid
         {
             return Err(ElevationError::PeerPidMismatch);
         }
@@ -1843,7 +1918,7 @@ pub mod unix {
         }
         Ok(UnixBrokerTransport {
             stream,
-            host: Mutex::new(host.child.take()),
+            host: Mutex::new(pending.0.take()),
         })
     }
 }
@@ -1880,6 +1955,7 @@ mod tests {
         connects: AtomicUsize,
         fail_next_connect: AtomicBool,
         disconnect_next_request: AtomicBool,
+        start_error: Mutex<Option<BrokerErrorCode>>,
         commands: Mutex<Vec<ElevationCommand>>,
     }
     #[derive(Clone)]
@@ -1905,6 +1981,11 @@ mod tests {
                 return Err(ElevationError::Disconnected);
             }
             self.0.commands.lock().unwrap().push(command.clone());
+            if matches!(command, ElevationCommand::StartMihomo { .. })
+                && let Some(code) = *self.0.start_error.lock().unwrap()
+            {
+                return Ok(ElevationResponse::Error { code });
+            }
             Ok(match command {
                 ElevationCommand::StartXray { .. } => ElevationResponse::Started {
                     engine: ElevatedEngine::Xray,
@@ -2033,6 +2114,73 @@ mod tests {
         );
         assert_eq!(diagnostics.logs[0].message, "ready");
         assert_eq!(state.connects.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_failures_carry_the_elevation_or_core_cause() {
+        let cancelled = Arc::new(FakeState::default());
+        cancelled.fail_next_connect.store(true, Ordering::Relaxed);
+        assert_eq!(
+            multicore_core::Supervisor::new(Arc::new(fake_controller(cancelled)))
+                .connect()
+                .await,
+            Err(multicore_core::SupervisorError::StartFailed {
+                engine: Engine::Xray,
+                rollback_failed: false,
+                cause: StartFailureCause::ElevationCancelled,
+            })
+        );
+        for (code, cause) in [
+            (
+                BrokerErrorCode::TimedOut,
+                StartFailureCause::ReadinessTimedOut,
+            ),
+            (BrokerErrorCode::NotReady, StartFailureCause::CoreFailed),
+        ] {
+            let state = Arc::new(FakeState::default());
+            *state.start_error.lock().unwrap() = Some(code);
+            assert_eq!(
+                multicore_core::Supervisor::new(Arc::new(fake_controller(state)))
+                    .connect()
+                    .await,
+                Err(multicore_core::SupervisorError::StartFailed {
+                    engine: Engine::Mihomo,
+                    rollback_failed: false,
+                    cause,
+                })
+            );
+        }
+        assert_eq!(
+            ElevationError::Disconnected.start_failure_cause(),
+            StartFailureCause::BrokerFailed
+        );
+        assert_eq!(
+            ElevationError::LaunchFailed.start_failure_cause(),
+            StartFailureCause::ElevationFailed
+        );
+    }
+
+    #[test]
+    fn start_commands_outlast_core_readiness_and_others_stay_short() {
+        let margin = Duration::from_secs(5);
+        for command in [
+            ElevationCommand::StartXray { generation_id: 1 },
+            ElevationCommand::StartMihomo { generation_id: 1 },
+        ] {
+            assert!(
+                broker_response_timeout(&command)
+                    >= multicore_core::CORE_READINESS_TIMEOUT + margin
+            );
+        }
+        for command in [
+            ElevationCommand::Stop {
+                engine: ElevatedEngine::Xray,
+            },
+            ElevationCommand::Diagnostics,
+            ElevationCommand::Shutdown,
+        ] {
+            assert_eq!(broker_response_timeout(&command), BROKER_IO_TIMEOUT);
+        }
     }
 
     #[cfg(windows)]
@@ -2320,6 +2468,41 @@ mod tests {
             assert_eq!(result.err(), Some(ElevationError::TimedOut));
             let pid = launched.lock().unwrap().unwrap();
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+
+        #[test]
+        fn failed_session_setup_reaps_the_launched_host() {
+            let runtime = tempfile::tempdir().unwrap();
+            let launched = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let recorded = launched.clone();
+            // The fake connects from this process, so the launched child's PID never matches.
+            let (connect_from_self, _) = fake_host(Host::Echo, std::process::id());
+            let result = connect_with(
+                runtime.path(),
+                move |socket, server_pid| {
+                    let child = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg("exec sleep 0.2")
+                        .spawn()
+                        .unwrap();
+                    *recorded.lock().unwrap() = Some(child.id());
+                    connect_from_self(socket, server_pid)?;
+                    Ok(LaunchedHost {
+                        pid: child.id(),
+                        child: Some(child),
+                    })
+                },
+                uid(),
+                Duration::from_secs(5),
+            );
+            assert_eq!(result.err(), Some(ElevationError::PeerPidMismatch));
+            let pid = launched.lock().unwrap().unwrap();
+            let entry = PathBuf::from(format!("/proc/{pid}"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while entry.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!entry.exists(), "launched host was left as a zombie");
         }
 
         fn appimage_package(root: &Path, host: &[u8]) -> PathBuf {

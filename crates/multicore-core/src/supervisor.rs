@@ -26,6 +26,28 @@ pub trait ProcessController: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = crate::sidecar::ProcessDiagnostics> + Send + 'a>> {
         Box::pin(async { crate::sidecar::ProcessDiagnostics::default() })
     }
+
+    /// Classifies a failed `start` so callers can explain it without seeing controller internals.
+    fn start_failure_cause(&self, _error: &Self::Error) -> StartFailureCause {
+        StartFailureCause::Unknown
+    }
+}
+
+/// Why a sidecar could not be started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartFailureCause {
+    /// The controller did not classify the failure.
+    Unknown,
+    /// The user declined the administrator prompt (UAC or polkit).
+    ElevationCancelled,
+    /// The privileged host could not be launched or authorized.
+    ElevationFailed,
+    /// The privileged host session failed or stopped responding.
+    BrokerFailed,
+    /// The core process could not be launched or exited during startup.
+    CoreFailed,
+    /// The core stayed alive but did not become ready in time.
+    ReadinessTimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -34,6 +56,7 @@ pub enum SupervisorError {
     StartFailed {
         engine: Engine,
         rollback_failed: bool,
+        cause: StartFailureCause,
     },
     #[error("failed to stop one or more sidecars")]
     StopFailed,
@@ -54,19 +77,21 @@ impl<P: ProcessController + ?Sized> Supervisor<P> {
 
     pub async fn connect(&self) -> Result<(), SupervisorError> {
         let _operation = self.operation.lock().await;
-        self.controller
-            .start(Engine::Xray)
-            .await
-            .map_err(|_| SupervisorError::StartFailed {
+        if let Err(error) = self.controller.start(Engine::Xray).await {
+            return Err(SupervisorError::StartFailed {
                 engine: Engine::Xray,
                 rollback_failed: false,
-            })?;
+                cause: self.controller.start_failure_cause(&error),
+            });
+        }
 
-        if self.controller.start(Engine::Mihomo).await.is_err() {
+        if let Err(error) = self.controller.start(Engine::Mihomo).await {
+            let cause = self.controller.start_failure_cause(&error);
             let rollback_failed = self.controller.stop(Engine::Xray).await.is_err();
             return Err(SupervisorError::StartFailed {
                 engine: Engine::Mihomo,
                 rollback_failed,
+                cause,
             });
         }
         Ok(())

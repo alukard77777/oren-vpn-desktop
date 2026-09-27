@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use multicore_core::{
     CoreLogRecord, DiagnosticStream, Engine, FetchError, HttpClient, HttpResponse, MAX_PROFILES,
     MihomoRuntimeControl, ProcessController, ProcessDiagnostics, ProfileId, ProfileStore,
-    RuntimeCheckState, Snapshot, SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO,
-    UA_XRAY, stage_runtime_with_mihomo_control,
+    RuntimeCheckState, Snapshot, StartFailureCause, SubscriptionFetcher, UA_MIHOMO, UA_NATIVE,
+    UA_SERVICE_LOGO, UA_XRAY, stage_runtime_with_mihomo_control,
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectionState, CoreBackend, ImportSubscriptionRequest,
@@ -719,6 +719,52 @@ async fn connecting_profile_mutations_reject_immediately_without_waiting_for_ope
 
     release.notify_one();
     connecting.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn abandoned_connect_does_not_leave_the_state_connecting() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(root.path(), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_wait = entered.notified();
+    let controller = Arc::new(BlockingStartController {
+        entered: entered.clone(),
+        release: Arc::new(tokio::sync::Notify::new()),
+    });
+    let backend = Arc::new(
+        CoreBackend::new_with_selector(
+            store,
+            SubscriptionFetcher::new(OfflineHttp),
+            move |_snapshot| Ok(controller.clone()),
+            Arc::new(ConfirmingSelector),
+        )
+        .unwrap(),
+    );
+    let connecting = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.connect().await })
+    };
+    entered_wait.await;
+    assert_eq!(
+        backend.status().await.unwrap().state,
+        ConnectionState::Connecting
+    );
+
+    // The HTTP layer drops the handler future when the client goes away.
+    connecting.abort();
+    assert!(connecting.await.unwrap_err().is_cancelled());
+
+    let status = backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Error);
+    assert!(status.degraded);
+    let cleaned = backend.disconnect().await.unwrap();
+    assert_eq!(cleaned.state, ConnectionState::Ready);
+    assert!(!cleaned.degraded);
 }
 
 #[tokio::test]
@@ -1893,6 +1939,82 @@ async fn successful_rollback_returns_to_ready_without_degraded_mode() {
     assert_eq!(status.state, ConnectionState::Ready);
     assert!(!status.degraded);
     assert!(status.message.is_some());
+}
+
+struct CausedFailureController {
+    engine: Engine,
+    cause: StartFailureCause,
+}
+
+impl ProcessController for CausedFailureController {
+    type Error = StartFailureCause;
+
+    fn start<'a>(
+        &'a self,
+        engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if engine == self.engine {
+                Err(self.cause)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
+        *error
+    }
+}
+
+#[tokio::test]
+async fn connect_failure_message_explains_the_classified_cause() {
+    for (engine, cause, expected) in [
+        (
+            Engine::Xray,
+            StartFailureCause::ElevationCancelled,
+            "Подключение отменено: не выдано разрешение администратора.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::CoreFailed,
+            "Не удалось запустить Mihomo. Проверьте исполняемые файлы.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::ReadinessTimedOut,
+            "Mihomo не успел запуститься вовремя. Повторите попытку.",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+        let backend = test_backend(
+            store,
+            SubscriptionFetcher::new(FixtureHttp::default()),
+            move |_snapshot: &Snapshot| -> Result<Arc<CausedFailureController>, BackendError> {
+                Ok(Arc::new(CausedFailureController { engine, cause }))
+            },
+        )
+        .unwrap();
+        backend
+            .import_subscription(ImportSubscriptionRequest {
+                url: "https://example.invalid/sub".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(backend.connect().await.is_err());
+        let status = backend.status().await.unwrap();
+        assert_eq!(status.state, ConnectionState::Ready);
+        assert_eq!(status.message.as_deref(), Some(expected));
+    }
 }
 
 #[tokio::test]

@@ -2800,6 +2800,8 @@ where
                 "Запускается подключение.",
             );
         }
+        // If this future is dropped before the outcome is recorded, leave a cleanable error.
+        let mut abandoned = AbandonedConnectGuard::new(&self.inner);
 
         let result = Supervisor::new(controller.clone()).connect().await;
         if result.is_ok() {
@@ -2807,6 +2809,7 @@ where
                 if self.selector.select(&group, &node).await.is_err() {
                     let rollback = Supervisor::new(controller.clone()).disconnect().await;
                     let mut state = self.inner.write().await;
+                    abandoned.disarm();
                     if rollback.is_ok() {
                         state
                             .state
@@ -2834,6 +2837,7 @@ where
             }
         }
         let mut state = self.inner.write().await;
+        abandoned.disarm();
         match result {
             Ok(()) => {
                 state
@@ -2851,7 +2855,9 @@ where
                 Ok(state.status())
             }
             Err(multicore_core::SupervisorError::StartFailed {
-                rollback_failed, ..
+                engine,
+                rollback_failed,
+                cause,
             }) => {
                 if rollback_failed {
                     state.mark_error(
@@ -2863,9 +2869,7 @@ where
                         .state
                         .transition(CoreConnectionState::Ready)
                         .map_err(|_| BackendError::new())?;
-                    state.message = Some(
-                        "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned(),
-                    );
+                    state.message = Some(start_failure_message(engine, cause));
                     state.degraded = false;
                 }
                 state.push_event(
@@ -3318,6 +3322,78 @@ fn runtime_check_to_dto(state: RuntimeCheckState) -> RuntimeCheckDto {
         RuntimeCheckState::Ready => RuntimeCheckDto::Ready,
         RuntimeCheckState::Failed => RuntimeCheckDto::Failed,
         RuntimeCheckState::Unsupported => RuntimeCheckDto::Unsupported,
+    }
+}
+
+/// Marks a connect whose future was dropped mid-start as a degraded error, so the state never
+/// stays `Connecting` and the next Disconnect cleans up whatever the start left running.
+struct AbandonedConnectGuard<'a, P: ProcessController> {
+    inner: &'a RwLock<CoreRuntime<P>>,
+    armed: bool,
+}
+
+impl<'a, P: ProcessController> AbandonedConnectGuard<'a, P> {
+    fn new(inner: &'a RwLock<CoreRuntime<P>>) -> Self {
+        Self { inner, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<P: ProcessController> Drop for AbandonedConnectGuard<'_, P> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop cannot await; readers hold this lock only briefly, so retry a bounded number of
+        // times rather than leaving the state stuck.
+        for _ in 0..10_000 {
+            if let Ok(mut state) = self.inner.try_write() {
+                if state.state.current() == CoreConnectionState::Connecting {
+                    state.mark_error(
+                        "Подключение прервано. Выполните отключение для очистки.",
+                        true,
+                    );
+                    state.push_event(
+                        Severity::Error,
+                        Component::Core,
+                        "connect",
+                        "Запуск подключения был прерван.",
+                    );
+                }
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn start_failure_message(
+    engine: multicore_core::Engine,
+    cause: multicore_core::StartFailureCause,
+) -> String {
+    use multicore_core::{Engine, StartFailureCause as Cause};
+    let core = match engine {
+        Engine::Xray => "Xray",
+        Engine::Mihomo => "Mihomo",
+    };
+    match cause {
+        Cause::ElevationCancelled => {
+            "Подключение отменено: не выдано разрешение администратора.".to_owned()
+        }
+        Cause::ElevationFailed => {
+            "Не удалось запустить службу подключения с правами администратора.".to_owned()
+        }
+        Cause::BrokerFailed => "Служба подключения не ответила. Повторите попытку.".to_owned(),
+        Cause::CoreFailed => format!("Не удалось запустить {core}. Проверьте исполняемые файлы."),
+        Cause::ReadinessTimedOut => {
+            format!("{core} не успел запуститься вовремя. Повторите попытку.")
+        }
+        Cause::Unknown => {
+            "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
+        }
     }
 }
 
