@@ -1739,12 +1739,28 @@ pub mod unix {
     impl Drop for UnixBrokerTransport {
         fn drop(&mut self) {
             let _ = self.stream.shutdown(std::net::Shutdown::Both);
-            if let Some(mut child) = self.host.lock().ok().and_then(|mut host| host.take()) {
-                let _ = std::thread::Builder::new()
-                    .name("multicore-core-host-reaper".into())
-                    .spawn(move || {
-                        let _ = child.wait();
-                    });
+            if let Some(child) = self.host.lock().ok().and_then(|mut host| host.take()) {
+                reap_in_background(child);
+            }
+        }
+    }
+
+    /// Waits for an exiting host off-thread so it never lingers as a zombie.
+    fn reap_in_background(mut child: Child) {
+        let _ = std::thread::Builder::new()
+            .name("multicore-core-host-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+
+    /// Owns the launched host until a transport takes it; reaps it on every failed setup path.
+    struct PendingHost(Option<Child>);
+
+    impl Drop for PendingHost {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.take() {
+                reap_in_background(child);
             }
         }
     }
@@ -1847,21 +1863,25 @@ pub mod unix {
             .map_err(|_| ElevationError::Io)?;
         let secret = SessionSecret::generate().map_err(|_| ElevationError::Io)?;
         let mut host = launch(&socket.0, std::process::id())?;
+        let host_pid = host.pid;
+        let mut pending = PendingHost(host.child.take());
         let started = Instant::now();
         let stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if let Some(child) = host.child.as_mut()
+                    if let Some(child) = pending.0.as_mut()
                         && let Some(status) = child.try_wait().map_err(|_| ElevationError::Io)?
                     {
+                        pending.0 = None;
                         return Err(launch_exit_error(status));
                     }
                     if started.elapsed() >= timeout {
-                        if let Some(child) = host.child.as_mut()
+                        if let Some(child) = pending.0.as_mut()
                             && child.kill().is_ok()
                         {
                             let _ = child.wait();
+                            pending.0 = None;
                         }
                         return Err(ElevationError::TimedOut);
                     }
@@ -1884,7 +1904,7 @@ pub mod unix {
         let peer =
             rustix::net::sockopt::socket_peercred(&stream).map_err(|_| ElevationError::Io)?;
         if peer.uid.as_raw() != expected_peer_uid
-            || peer.pid.as_raw_nonzero().get() as u32 != host.pid
+            || peer.pid.as_raw_nonzero().get() as u32 != host_pid
         {
             return Err(ElevationError::PeerPidMismatch);
         }
@@ -1898,7 +1918,7 @@ pub mod unix {
         }
         Ok(UnixBrokerTransport {
             stream,
-            host: Mutex::new(host.child.take()),
+            host: Mutex::new(pending.0.take()),
         })
     }
 }
@@ -2448,6 +2468,41 @@ mod tests {
             assert_eq!(result.err(), Some(ElevationError::TimedOut));
             let pid = launched.lock().unwrap().unwrap();
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        }
+
+        #[test]
+        fn failed_session_setup_reaps_the_launched_host() {
+            let runtime = tempfile::tempdir().unwrap();
+            let launched = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let recorded = launched.clone();
+            // The fake connects from this process, so the launched child's PID never matches.
+            let (connect_from_self, _) = fake_host(Host::Echo, std::process::id());
+            let result = connect_with(
+                runtime.path(),
+                move |socket, server_pid| {
+                    let child = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg("exec sleep 0.2")
+                        .spawn()
+                        .unwrap();
+                    *recorded.lock().unwrap() = Some(child.id());
+                    connect_from_self(socket, server_pid)?;
+                    Ok(LaunchedHost {
+                        pid: child.id(),
+                        child: Some(child),
+                    })
+                },
+                uid(),
+                Duration::from_secs(5),
+            );
+            assert_eq!(result.err(), Some(ElevationError::PeerPidMismatch));
+            let pid = launched.lock().unwrap().unwrap();
+            let entry = PathBuf::from(format!("/proc/{pid}"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while entry.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!entry.exists(), "launched host was left as a zombie");
         }
 
         fn appimage_package(root: &Path, host: &[u8]) -> PathBuf {
