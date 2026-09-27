@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -750,7 +750,6 @@ pub struct MihomoRuntimeControl {
     address: SocketAddr,
     secret: String,
     xray_outbound_interface: Option<String>,
-    xray_resolved_hosts: BTreeMap<String, Vec<IpAddr>>,
 }
 
 impl std::fmt::Debug for MihomoRuntimeControl {
@@ -766,7 +765,6 @@ impl std::fmt::Debug for MihomoRuntimeControl {
                     .as_ref()
                     .map(|_| "[CONFIGURED]"),
             )
-            .field("xray_resolved_host_count", &self.xray_resolved_hosts.len())
             .finish()
     }
 }
@@ -790,7 +788,6 @@ impl MihomoRuntimeControl {
             address,
             secret,
             xray_outbound_interface: None,
-            xray_resolved_hosts: BTreeMap::new(),
         })
     }
 
@@ -812,25 +809,6 @@ impl MihomoRuntimeControl {
             ));
         }
         self.xray_outbound_interface = Some(interface.to_owned());
-        Ok(self)
-    }
-
-    pub fn with_xray_resolved_hosts(
-        mut self,
-        hosts: BTreeMap<String, Vec<IpAddr>>,
-    ) -> io::Result<Self> {
-        if hosts.iter().any(|(domain, addresses)| {
-            domain.is_empty()
-                || domain.len() > 253
-                || domain.chars().any(char::is_control)
-                || addresses.is_empty()
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Xray resolved hosts must contain safe domains and at least one IP",
-            ));
-        }
-        self.xray_resolved_hosts = hosts;
         Ok(self)
     }
 }
@@ -1152,18 +1130,13 @@ pub fn stage_runtime_with_mihomo_control(
         );
     let mihomo = serde_yaml_ng::to_string(&document)
         .map_err(|error| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    let xray = xray_runtime_bytes(
-        snapshot,
-        control.xray_outbound_interface.as_deref(),
-        &control.xray_resolved_hosts,
-    )?;
+    let xray = xray_runtime_bytes(snapshot, control.xray_outbound_interface.as_deref())?;
     stage_runtime_payloads(mihomo.as_bytes(), &xray, runtime_root)
 }
 
 fn xray_runtime_bytes(
     snapshot: &Snapshot,
     outbound_interface: Option<&str>,
-    resolved_hosts: &BTreeMap<String, Vec<IpAddr>>,
 ) -> Result<Vec<u8>, PersistenceError> {
     let Some(outbound_interface) = outbound_interface else {
         return Ok(snapshot.xray.raw_bytes().to_vec());
@@ -1172,6 +1145,24 @@ fn xray_runtime_bytes(
         |message: String| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, message));
     let mut document: serde_json::Value = serde_json::from_slice(snapshot.xray.raw_bytes())
         .map_err(|error| invalid(format!("validated Xray document is invalid: {error}")))?;
+    // Xray strips the terminating FQDN dot before DNS matching.
+    let domains: BTreeSet<_> = xray_outbound_server_domains(snapshot)?
+        .into_iter()
+        .map(|domain| {
+            let domain = domain.trim();
+            domain
+                .strip_suffix('.')
+                .unwrap_or(domain)
+                .to_ascii_lowercase()
+        })
+        .collect();
+    if !domains.is_empty()
+        && (contains_endpoint_dns_tag(&document) || selects_endpoint_dns_outbound(&document))
+    {
+        return Err(invalid(
+            "Xray subscription captures a reserved endpoint DNS tag".to_owned(),
+        ));
+    }
     let root = document
         .as_object_mut()
         .ok_or_else(|| invalid("validated Xray document is not an object".to_owned()))?;
@@ -1185,13 +1176,11 @@ fn xray_runtime_bytes(
         ));
     }
 
-    for outbound in outbounds {
+    for outbound in outbounds.iter_mut() {
         let outbound = outbound
             .as_object_mut()
             .ok_or_else(|| invalid("validated Xray outbound is not an object".to_owned()))?;
-        let must_force_resolved_ip = outbound_server_domains(outbound)
-            .iter()
-            .any(|domain| resolved_hosts.contains_key(domain));
+        let must_resolve_endpoint = !outbound_server_domains(outbound).is_empty();
         let stream_settings = outbound
             .entry("streamSettings")
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
@@ -1214,7 +1203,7 @@ fn xray_runtime_bytes(
             "interface".to_owned(),
             serde_json::Value::String(outbound_interface.to_owned()),
         );
-        if must_force_resolved_ip {
+        if must_resolve_endpoint {
             sockopt.insert(
                 "domainStrategy".to_owned(),
                 serde_json::Value::String("ForceIP".to_owned()),
@@ -1222,7 +1211,17 @@ fn xray_runtime_bytes(
         }
     }
 
-    if !resolved_hosts.is_empty() {
+    if !domains.is_empty() {
+        // Append, never replace the provider's first/default outbound. DNS uses
+        // a literal resolver IP, so this dial cannot recurse into endpoint DNS.
+        outbounds.push(serde_json::json!({
+            "tag": ENDPOINT_DNS_OUTBOUND_TAG,
+            "protocol": "freedom",
+            "settings": {"domainStrategy": "AsIs"},
+            "streamSettings": {"sockopt": {
+                "interface": outbound_interface, "domainStrategy": "AsIs"
+            }}
+        }));
         let dns = root
             .entry("dns")
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
@@ -1232,34 +1231,136 @@ fn xray_runtime_bytes(
         let dns = dns
             .as_object_mut()
             .ok_or_else(|| invalid("validated Xray dns section is not an object".to_owned()))?;
-        let hosts = dns
-            .entry("hosts")
-            .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        if hosts.is_null() {
-            *hosts = serde_json::Value::Object(Default::default());
+        let servers = dns.entry("servers").or_insert(serde_json::Value::Null);
+        // Preserve the old system resolver for unrelated Xray DNS consumers.
+        // Endpoint lookups are scoped to the generated final-query entry.
+        if servers.is_null() {
+            *servers = serde_json::json!(["localhost"]);
         }
-        let hosts = hosts.as_object_mut().ok_or_else(|| {
-            invalid("validated Xray dns.hosts section is not an object".to_owned())
+        let servers = servers.as_array_mut().ok_or_else(|| {
+            invalid("validated Xray dns.servers section is not an array".to_owned())
         })?;
-        for (domain, addresses) in resolved_hosts {
-            let mut addresses = addresses.iter().map(ToString::to_string);
-            let first = addresses.next().expect("resolved hosts were validated");
-            let value = match addresses.next() {
-                None => serde_json::Value::String(first),
-                Some(second) => serde_json::Value::Array(
-                    std::iter::once(first)
-                        .chain(std::iter::once(second))
-                        .chain(addresses)
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            };
-            hosts.insert(domain.clone(), value);
+        if servers.is_empty() {
+            servers.push(serde_json::json!("localhost"));
         }
+        // Xray uses clients[0] even when skipFallback/disableFallback leave no
+        // eligible clients. Keep the original resolver in that emergency slot,
+        // with no matches and excluded from the normal fallback list.
+        let mut emergency = match &servers[0] {
+            serde_json::Value::String(address) => serde_json::json!({"address": address}),
+            serde_json::Value::Object(_) => servers[0].clone(),
+            _ => {
+                return Err(invalid(
+                    "validated Xray DNS server is not an object or string".to_owned(),
+                ));
+            }
+        };
+        emergency["domains"] = serde_json::json!([]);
+        emergency["skipFallback"] = serde_json::json!(true);
+        // Xray silently adds local-TLD/dotless rules to every localhost DNS
+        // entry. Those would run before our scoped resolver. Such endpoints
+        // require private DNS and cannot safely use this public-DNS policy.
+        if emergency["address"]
+            .as_str()
+            .is_some_and(|address| address.trim().eq_ignore_ascii_case("localhost"))
+            && domains.iter().any(|domain| local_dns_domain(domain))
+        {
+            return Err(invalid(
+                "Xray public endpoint DNS cannot override local-only domains".to_owned(),
+            ));
+        }
+        servers.insert(0, serde_json::json!({
+            "address": "77.88.8.8",
+            "domains": domains.iter().map(|domain| format!("full:{domain}")).collect::<Vec<_>>(),
+            "skipFallback": true, "finalQuery": true,
+            "disableCache": false, "serveStale": false,
+            "tag": ENDPOINT_DNS_TAG, "timeoutMs": 3000
+        }));
+        servers.insert(0, emergency);
+        let routing = root.entry("routing").or_insert(serde_json::Value::Null);
+        if routing.is_null() {
+            *routing = serde_json::json!({});
+        }
+        let routing = routing
+            .as_object_mut()
+            .ok_or_else(|| invalid("validated Xray routing section is not an object".to_owned()))?;
+        let rules = routing.entry("rules").or_insert(serde_json::Value::Null);
+        if rules.is_null() {
+            *rules = serde_json::json!([]);
+        }
+        let rules = rules.as_array_mut().ok_or_else(|| {
+            invalid("validated Xray routing.rules section is not an array".to_owned())
+        })?;
+        rules.insert(
+            0,
+            serde_json::json!({
+                "type": "field", "inboundTag": [ENDPOINT_DNS_TAG],
+                "outboundTag": ENDPOINT_DNS_OUTBOUND_TAG
+            }),
+        );
     }
 
     serde_json::to_vec(&document)
         .map_err(|error| invalid(format!("Xray runtime serialization failed: {error}")))
+}
+
+const ENDPOINT_DNS_TAG: &str = "multicore-endpoint-dns";
+const ENDPOINT_DNS_OUTBOUND_TAG: &str = "multicore-endpoint-dns-direct";
+
+fn local_dns_domain(domain: &str) -> bool {
+    !domain.contains('.')
+        || [
+            "local",
+            "localdomain",
+            "localhost",
+            "lan",
+            "home.arpa",
+            "example",
+            "invalid",
+            "test",
+        ]
+        .iter()
+        .any(|suffix| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
+}
+
+fn selects_endpoint_dns_outbound(document: &serde_json::Value) -> bool {
+    let matches = |selector: &serde_json::Value| {
+        if let Some(prefixes) = selector.as_str() {
+            // Xray's StringList accepts comma-separated scalar selectors.
+            return prefixes
+                .split(',')
+                .any(|prefix| ENDPOINT_DNS_OUTBOUND_TAG.starts_with(prefix));
+        }
+        selector.as_array().is_some_and(|prefixes| {
+            prefixes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|prefix| ENDPOINT_DNS_OUTBOUND_TAG.starts_with(prefix))
+        })
+    };
+    document
+        .pointer("/routing/balancers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|balancers| {
+            balancers
+                .iter()
+                .any(|balancer| matches(&balancer["selector"]))
+        })
+        || matches(&document["observatory"]["subjectSelector"])
+        || matches(&document["burstObservatory"]["subjectSelector"])
+}
+
+fn contains_endpoint_dns_tag(value: &serde_json::Value) -> bool {
+    // Fail closed even for references to a missing provider tag: injecting an
+    // outbound with that name could otherwise make an unrelated rule direct.
+    match value {
+        serde_json::Value::String(value) => {
+            value == ENDPOINT_DNS_TAG || value == ENDPOINT_DNS_OUTBOUND_TAG
+        }
+        serde_json::Value::Array(values) => values.iter().any(contains_endpoint_dns_tag),
+        serde_json::Value::Object(values) => values.values().any(contains_endpoint_dns_tag),
+        _ => false,
+    }
 }
 
 pub fn xray_outbound_server_domains(snapshot: &Snapshot) -> Result<Vec<String>, PersistenceError> {
@@ -1300,10 +1401,9 @@ fn outbound_server_domains(outbound: &serde_json::Map<String, serde_json::Value>
         return Vec::new();
     };
     let direct = settings.get("address").and_then(serde_json::Value::as_str);
-    let servers = settings
-        .get("servers")
-        .and_then(serde_json::Value::as_array)
+    let servers = ["servers", "vnext"]
         .into_iter()
+        .filter_map(|key| settings.get(key).and_then(serde_json::Value::as_array))
         .flatten()
         .filter_map(serde_json::Value::as_object)
         .filter_map(|server| server.get("address"))
