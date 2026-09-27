@@ -112,6 +112,11 @@ pub(crate) fn resolve_from(
     let mihomo = cores.join("mihomo");
     let xray_config = generation_dir.join("xray.json");
     let mihomo_config = generation_dir.join("mihomo.yaml");
+    // The vendored dashboard is optional: absent in builds without one, present as an exact
+    // package-root sibling of `cores` otherwise. Its presence is decided once, up front, so a
+    // directory that appears only after that check can never be picked up mid-resolution.
+    let dashboard = package.join("dashboard");
+    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok_and(|m| m.file_type().is_dir());
 
     let mut guards = Vec::new();
     for directory in [
@@ -123,6 +128,9 @@ pub(crate) fn resolve_from(
         &cores,
     ] {
         guard_chain(directory, true, owner_uid, &mut guards)?;
+    }
+    if dashboard_present {
+        guard_chain(&dashboard, true, owner_uid, &mut guards)?;
     }
     for file in [
         host_executable,
@@ -150,6 +158,15 @@ pub(crate) fn resolve_from(
             return Err(ResolveError::Escape);
         }
     }
+    let canonical_dashboard = if dashboard_present {
+        let canonical_dashboard = canonical(&dashboard)?;
+        if !canonical_dashboard.starts_with(&canonical_package) {
+            return Err(ResolveError::Escape);
+        }
+        Some(canonical_dashboard)
+    } else {
+        None
+    };
     for binary in [&xray, &mihomo] {
         let guard = guards
             .iter_mut()
@@ -165,6 +182,7 @@ pub(crate) fn resolve_from(
             mihomo_binary: canonical(&mihomo)?,
             xray_config: canonical(&xray_config)?,
             mihomo_config: canonical(&mihomo_config)?,
+            dashboard_directory: canonical_dashboard,
         },
         guards,
     })
