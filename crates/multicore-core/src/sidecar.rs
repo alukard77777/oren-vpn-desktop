@@ -271,6 +271,12 @@ pub struct CommandSpec {
 /// least this long plus launch overhead.
 pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// How often a readiness-wait loop re-checks a launched core.
+///
+/// Small enough that a core becoming ready between checks is reported with only brief latency,
+/// not a busy loop that wastes CPU while a core takes its full startup time.
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ProcessError {
     #[error("failed to launch {0:?}")]
@@ -500,7 +506,7 @@ impl ProcessLauncher for TokioProcessLauncher {
                 if Instant::now() >= deadline {
                     return Err(ProcessError::ReadinessTimedOut(command.engine));
                 }
-                sleep(Duration::from_millis(100)).await;
+                sleep(READINESS_POLL_INTERVAL).await;
             }
         })
     }
@@ -613,7 +619,7 @@ pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
         if tokio::time::Instant::now() >= deadline {
             return Err(ProcessError::ReadinessTimedOut(command.engine));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
 }
 

@@ -389,6 +389,30 @@ fn readiness_process_helper() {
     std::thread::sleep(Duration::from_secs(5));
 }
 
+/// The readiness poll loop's sleep interval directly bounds how much pure waste a Connect can
+/// incur when a core becomes ready just after a check. It must stay small (a real regression to
+/// a coarse ~100ms tick would waste up to 100ms per check) without busy-looping.
+///
+/// This asserts on source text rather than wall-clock timing: real TCP connect latency to a
+/// not-yet-listening loopback port is not reliable to bound tightly across every environment
+/// (sandboxed/monitored networking stacks can hold a pending SYN far longer than a bare OS
+/// would), so a wall-clock assertion here would be flaky. The interval itself is a plain
+/// constant, so asserting its value directly is both exact and deterministic.
+#[test]
+fn readiness_poll_interval_is_tight_but_not_a_busy_loop() {
+    assert!(
+        !SIDECAR_SOURCE.contains("sleep(Duration::from_millis(100))"),
+        "a readiness loop reverted to the old, wasteful 100ms poll tick"
+    );
+    let occurrences = SIDECAR_SOURCE.matches("READINESS_POLL_INTERVAL").count();
+    // One definition plus both readiness loops (`wait_until_ready` and
+    // `wait_for_runtime_readiness`) actually using it.
+    assert!(
+        occurrences >= 3,
+        "expected both readiness poll loops to share one tight interval constant"
+    );
+}
+
 #[tokio::test]
 async fn failed_stop_retains_child_handle_for_retry() {
     let launcher = FakeLauncher::default();
