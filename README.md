@@ -34,12 +34,11 @@ the package manifest, notices, licenses, and checksums. Runtime never downloads
 the cores independently.
 
 While connected, *Открыть дашборд* (Status page) opens the pinned, vendored
-Zashboard static build (`dashboard\`) in the default browser, pointed at
-Mihomo's local controller with that session's one-time secret in the URL. It
-is served by Mihomo itself (`external-ui`), never fetched at runtime, and the
-button is disabled whenever there is no live controller session. (The
-`dashboard\` folder is pinned in `versions.json`; packaging-script staging of
-it is not yet implemented, see `project-map.md`.)
+Zashboard static build (`dashboard\`, staged and CSP-patched by the packaging
+scripts at build time) in the default browser, pointed at Mihomo's local
+controller with that session's one-time secret in the URL. It is served by
+Mihomo itself (`external-ui`), never fetched at runtime, and the button is
+disabled whenever there is no live controller session.
 
 ## Linux
 
