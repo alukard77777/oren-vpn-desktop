@@ -86,6 +86,41 @@ impl Bootstrap {
     }
 }
 
+/// Upper bound for the best-effort disconnect performed before the owned
+/// daemon is terminated on exit.
+const SHUTDOWN_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl Drop for Bootstrap {
+    fn drop(&mut self) {
+        // Runs before `_owned` is dropped, i.e. before the daemon is killed, so
+        // an active tunnel is torn down in order instead of by process death.
+        disconnect_before_shutdown(
+            self._owned.is_some(),
+            Arc::clone(&self.client),
+            SHUTDOWN_DISCONNECT_TIMEOUT,
+        );
+    }
+}
+
+/// Ask an owned daemon to disconnect, waiting at most `timeout`. An external
+/// daemon is not ours to disconnect. Returns whether a disconnect succeeded.
+fn disconnect_before_shutdown(
+    owned: bool,
+    client: Arc<dyn DaemonClient>,
+    timeout: Duration,
+) -> bool {
+    if !owned {
+        return false;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("multicore-shutdown-disconnect".into())
+        .spawn(move || {
+            let _ = sender.send(client.disconnect().is_ok());
+        });
+    spawned.is_ok() && receiver.recv_timeout(timeout).unwrap_or(false)
+}
+
 pub(crate) fn start() -> Result<Bootstrap, BootstrapError> {
     let selection = select_startup(
         std::env::var_os("MULTICORE_DAEMON_URL").as_deref(),
@@ -1258,6 +1293,95 @@ mod unix_bootstrap {
 mod tests {
     use super::*;
     use std::{ffi::OsString, fs, net::SocketAddr, path::Path};
+
+    struct DisconnectProbe {
+        delay: Duration,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DisconnectProbe {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                delay,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn unsupported<T>() -> Result<T, crate::daemon::DaemonError> {
+            Err(crate::daemon::DaemonError::new("unsupported in probe"))
+        }
+    }
+
+    impl DaemonClient for DisconnectProbe {
+        fn status(&self) -> Result<DaemonStatus, crate::daemon::DaemonError> {
+            Self::unsupported()
+        }
+        fn import_subscription(
+            &self,
+            _url: &str,
+        ) -> Result<DaemonStatus, crate::daemon::DaemonError> {
+            Self::unsupported()
+        }
+        fn connect(&self) -> Result<DaemonStatus, crate::daemon::DaemonError> {
+            Self::unsupported()
+        }
+        fn disconnect(&self) -> Result<DaemonStatus, crate::daemon::DaemonError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            // The probe cannot build a status; reaching here is what matters.
+            Self::unsupported()
+        }
+        fn events(
+            &self,
+            _after: u64,
+            _known_epoch: Option<&str>,
+        ) -> Result<crate::daemon::DaemonEventBatch, crate::daemon::DaemonError> {
+            Self::unsupported()
+        }
+        fn catalog(&self) -> Result<crate::daemon::DaemonCatalog, crate::daemon::DaemonError> {
+            Self::unsupported()
+        }
+        fn select_node(
+            &self,
+            _group_id: &str,
+            _revision: u64,
+            _node_id: &str,
+        ) -> Result<crate::daemon::DaemonCatalog, crate::daemon::DaemonError> {
+            Self::unsupported()
+        }
+    }
+
+    #[test]
+    fn exit_disconnects_an_owned_daemon_but_not_an_external_one() {
+        let probe = DisconnectProbe::new(Duration::ZERO);
+        disconnect_before_shutdown(false, probe.clone(), Duration::from_secs(1));
+        assert_eq!(probe.calls(), 0);
+        disconnect_before_shutdown(true, probe.clone(), Duration::from_secs(1));
+        assert_eq!(probe.calls(), 1);
+
+        let external = DisconnectProbe::new(Duration::ZERO);
+        drop(Bootstrap {
+            client: external.clone(),
+            _owned: None,
+        });
+        assert_eq!(external.calls(), 0);
+    }
+
+    #[test]
+    fn exit_disconnect_is_bounded_when_the_daemon_hangs() {
+        let probe = DisconnectProbe::new(Duration::from_secs(10));
+        let started = Instant::now();
+        assert!(!disconnect_before_shutdown(
+            true,
+            probe.clone(),
+            Duration::from_millis(100)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     fn external(
         url: Option<&str>,
