@@ -736,6 +736,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     apply_snapshot(&ui, &snapshot(&model.lock().expect("view model lock")));
     ui.set_local_page(visible_page_name(&loaded_preferences.visible_page).into());
+    ui.set_runtime_versions(env!("MULTICORE_RUNTIME_VERSIONS").into());
     ui.set_ambient_background_enabled(loaded_preferences.ambient_background);
     ui.set_auto_connect_on_startup(loaded_preferences.auto_connect_on_startup);
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
@@ -1953,6 +1954,8 @@ fn apply_tray_popup_model(
     popup.set_status_text(model.status.into());
     popup.set_connection_label(model.connection_label.into());
     popup.set_connection_enabled(model.connection_enabled);
+    popup.set_connected(model.connected);
+    popup.set_has_profile(model.has_profile);
     popup.set_group_rows(ModelRc::new(VecModel::from(groups)));
     popup.set_node_rows(ModelRc::new(VecModel::from(nodes)));
 }
@@ -2105,6 +2108,8 @@ fn wire_tray_popup_actions(
     };
     popup.on_toggle_connection(wire_command(TrayCommand::ToggleConnection));
     popup.on_open_main(wire_command(TrayCommand::ShowWindow));
+    // Without a profile the main window opens on the inline onboarding.
+    popup.on_add_subscription(wire_command(TrayCommand::ShowWindow));
     popup.on_exit_app(wire_command(TrayCommand::Exit));
 
     let group_popup = popup_weak.clone();
@@ -2198,6 +2203,8 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
         connection_label: presentation.primary_label.into(),
         connection_enabled: presentation.primary_enabled
             && presentation.primary_action != PrimaryAction::None,
+        connected: presentation.is_connected,
+        has_profile: presentation.has_profile,
         groups: tray_groups
             .into_iter()
             .map(|group| {
@@ -3654,10 +3661,8 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_supporting(presentation.supporting.clone().into());
     ui.set_node_name(presentation.node.clone().into());
     ui.set_has_profile(presentation.has_profile);
-    ui.set_state_busy(presentation.is_busy);
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
-    ui.set_status_label(SharedString::from(presentation.pill_label));
     ui.set_status_tone(
         match presentation.semantic_tone {
             SemanticTone::Neutral => "neutral",
@@ -3746,6 +3751,23 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_profiles(ModelRc::new(VecModel::from(subscription_profiles)));
     ui.set_profile_menu_loading(snapshot.profiles.loading);
     ui.set_profile_menu_error(snapshot.profiles.error.clone().unwrap_or_default().into());
+    ui.set_profile_mutation_error(
+        snapshot
+            .profiles
+            .mutation_error
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_profile_switch_locked(snapshot.profiles.switch_locked);
+    ui.set_active_profile_id(
+        snapshot
+            .profiles
+            .active_id
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_profile_pending_operation(
         match snapshot.profiles.pending_operation {
             Some(SubscriptionProfileOperation::List) => "list",
@@ -3773,7 +3795,6 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_diagnostics_tun_tone(snapshot.diagnostics.tun.tone.clone().into());
     ui.set_diagnostics_loading(snapshot.diagnostics.loading);
     ui.set_latency_check_loading(snapshot.latency.loading);
-    ui.set_latency_check_queued(snapshot.latency.queued);
     ui.set_latency_check_error(snapshot.latency.error.clone().unwrap_or_default().into());
     ui.set_diagnostic_mappings(ModelRc::new(VecModel::from(
         snapshot
@@ -3833,7 +3854,6 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
     ui.set_catalog_loading(catalog.loading);
     ui.set_catalog_selection_enabled(catalog.selection_enabled);
     ui.set_catalog_selection_pending(catalog.selection_pending);
-    ui.set_catalog_selection_queued(catalog.selection_queued);
     ui.set_catalog_error(catalog.error.clone().unwrap_or_default().into());
 }
 
@@ -4092,7 +4112,7 @@ mod window_tests {
             "in property <bool> subscription-updated-stale",
             "refresh-action-reserve := Rectangle",
             "subscription-refresh-action := FocusScope",
-            "text: root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
+            "root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
             "root.refresh-subscription();",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
             "announcement-strip := Rectangle",
@@ -4115,9 +4135,9 @@ mod window_tests {
             })
             .expect("subscription refresh action source");
         for unchanged in [
-            "x: parent.width - 140px;",
+            "x: parent.width - 164px;",
             "y: 5px;",
-            "width: 92px;",
+            "width: 116px;",
             "height: 44px;",
         ] {
             assert!(
@@ -4133,7 +4153,11 @@ mod window_tests {
             .expect("announcement source");
         assert!(announcement.contains("x: 0px;"));
         assert!(announcement.contains("width: parent.width;"));
-        assert!(announcement.contains("height: 36px;"));
+        assert!(announcement.contains("height: self.two-line ? 52px : 36px;"));
+        assert!(announcement.contains("wrap: word-wrap;"));
+        assert!(
+            announcement.contains("accessible-description: root.subscription-announcement-text;")
+        );
         assert!(announcement.contains("horizontal-alignment: center;"));
 
         let routes_header = ui
@@ -4141,14 +4165,16 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("ScrollView {").next())
             .expect("routes header source");
-        assert!(routes_header.contains("text: root.subscription-updated;"));
+        assert!(routes_header.contains(": root.subscription-updated;"));
+        assert!(routes_header.contains("root.subscription-updated-stale ? Theme.warning"));
         assert!(routes_header.contains("horizontal-alignment: right;"));
         assert!(
             routes_header.contains("Rectangle { horizontal-stretch: 1; background: transparent; }")
         );
         assert!(!routes_header.contains("route-updated-divider := Rectangle"));
         assert!(!routes_header.contains("commands: \"M 7 1.5"));
-        assert!(!routes_header.contains("latency-check-loading"));
+        // Latency progress is shown in place of the timestamp, not as extra chrome.
+        assert!(routes_header.contains("root.latency-check-loading ? \"Замеряем задержку…\""));
         assert!(!routes_header.contains("catalog-selection-queued"));
         assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
         assert!(rust.contains("ui.set_subscription_management_enabled("));
@@ -4535,7 +4561,7 @@ mod window_tests {
         for required in [
             "width: parent.width - 40px;",
             "opacity: root.profile-menu-open ? 1 : 0;",
-            "y: root.profile-menu-open ? 188px : 180px;",
+            "y: (root.profile-menu-open ? 188px : 180px) + root.home-banner-offset;",
             "animate opacity { duration: 160ms; easing: ease-out; }",
             "animate y { duration: 160ms; easing: ease-out; }",
         ] {
@@ -4638,8 +4664,10 @@ mod window_tests {
             "callback confirm-update-restart()",
             "callback cancel-update-restart()",
             "Скачать обновление и перезапустить клиент?",
-            "label: \"Да\"",
-            "label: \"Нет\"",
+            "label: \"Обновить и перезапустить\"",
+            "label: \"Отмена\"",
+            "update-modal-focus := FocusScope",
+            "focus-epoch: root.update-confirm-focus-serial;",
         ] {
             assert!(
                 ui.contains(required),
@@ -5524,12 +5552,12 @@ mod window_tests {
             .expect("deep-link confirmation overlay");
         assert!(modal.contains("background: #05070bc7;"));
         assert!(modal.contains("text: root.deep-link-confirm-host;"));
-        assert!(modal.contains("label: \"Нет\";"));
-        assert!(modal.contains("label: \"Да\";"));
+        assert!(modal.contains("label: \"Отмена\";"));
+        assert!(modal.contains("label: \"Добавить\";"));
         assert!(!modal.contains("root.subscription-draft"));
         assert!(modal.contains("key-pressed(event)"));
         assert!(modal.contains("root.cancel-deep-link();"));
-        assert!(ui.contains("enabled: !root.deep-link-confirm-open;"));
+        assert!(ui.contains("enabled: !root.deep-link-confirm-open && !root.update-confirm-open;"));
 
         let rust = include_str!("main.rs");
         let queue = rust

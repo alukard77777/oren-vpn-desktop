@@ -31,6 +31,8 @@ pub(crate) struct TrayInput {
     pub(crate) status: String,
     pub(crate) connection_label: String,
     pub(crate) connection_enabled: bool,
+    pub(crate) connected: bool,
+    pub(crate) has_profile: bool,
     pub(crate) groups: Vec<TrayGroup>,
     pub(crate) route_selection_enabled: bool,
 }
@@ -50,6 +52,8 @@ pub(crate) struct TrayMenuModel {
     pub(crate) status: String,
     pub(crate) connection_label: String,
     pub(crate) connection_enabled: bool,
+    pub(crate) connected: bool,
+    pub(crate) has_profile: bool,
     pub(crate) groups: Vec<TrayMenuEntry>,
     pub(crate) nodes: Vec<TrayMenuEntry>,
 }
@@ -129,6 +133,8 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
         status: input.status,
         connection_label: input.connection_label,
         connection_enabled: input.connection_enabled,
+        connected: input.connected,
+        has_profile: input.has_profile,
         groups,
         nodes,
     }
@@ -288,6 +294,8 @@ mod tests {
             status: "В сети".into(),
             connection_label: "Отключиться".into(),
             connection_enabled: true,
+            connected: true,
+            has_profile: true,
             groups: vec![
                 TrayGroup {
                     id: "server:opaque".into(),
@@ -348,6 +356,8 @@ mod tests {
             status: "Готово".into(),
             connection_label: "Подключиться".into(),
             connection_enabled: false,
+            connected: false,
+            has_profile: false,
             groups: Vec::new(),
             route_selection_enabled: true,
         });
@@ -379,6 +389,8 @@ mod tests {
             status: "Готово".into(),
             connection_label: "Подключиться".into(),
             connection_enabled: true,
+            connected: false,
+            has_profile: true,
             groups: Vec::new(),
             route_selection_enabled: true,
         });
@@ -638,6 +650,8 @@ mod native_menu_tests {
             }
             .into(),
             connection_enabled: true,
+            connected,
+            has_profile: true,
             groups: vec![
                 TrayGroup {
                     id: "g:server".into(),
