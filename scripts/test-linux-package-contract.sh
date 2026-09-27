@@ -49,6 +49,40 @@ for relative in "${metadata[@]}"; do
   [[ -f "$STAGE/$relative" && -r "$STAGE/$relative" ]] || { echo "Missing metadata: $relative" >&2; exit 1; }
 done
 
+# The vendored dashboard is optional in the manifest (see packaging/linux/versions.json), but
+# a real production manifest always carries it, so a staged tree from an actual release build
+# is expected to have it. Skip these checks only for a stage that genuinely has no dashboard/
+# (e.g. an older or deliberately dashboard-less manifest), rather than requiring it unconditionally.
+dashboard_dir="$STAGE/usr/lib/multicore/dashboard"
+if [[ -d "$dashboard_dir" ]]; then
+  [[ -f "$dashboard_dir/index.html" ]] || { echo "Dashboard is staged but missing index.html" >&2; exit 1; }
+  grep -q 'Content-Security-Policy' "$dashboard_dir/index.html" || {
+    echo 'Staged dashboard index.html must carry a Content-Security-Policy meta tag' >&2
+    exit 1
+  }
+  grep -q "default-src 'self'" "$dashboard_dir/index.html" || {
+    echo "Staged dashboard CSP must lock default-src down to 'self'" >&2
+    exit 1
+  }
+  grep -Fq '<script>' "$dashboard_dir/index.html" && {
+    echo 'Staged dashboard index.html must not retain an inline <script> block' >&2
+    exit 1
+  }
+  [[ -f "$dashboard_dir/theme-favicon.js" ]] || {
+    echo 'Staged dashboard is missing the externalized theme-favicon.js' >&2
+    exit 1
+  }
+  find "$dashboard_dir" -type l | grep -q . && {
+    echo 'Staged dashboard must not contain symlinks' >&2
+    exit 1
+  }
+  license_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["components"]["dashboard"]["licenseFile"]["name"])' "$ROOT/packaging/linux/versions.json")"
+  [[ -f "$STAGE/usr/share/licenses/multicore/$license_name" ]] || {
+    echo "Missing staged dashboard license: usr/share/licenses/multicore/$license_name" >&2
+    exit 1
+  }
+fi
+
 desktop_file="$STAGE/usr/share/applications/multicore.desktop"
 grep -qx 'Exec=multicore %u' "$desktop_file" || {
   echo 'Linux desktop entry must pass one protocol URL to MultiCore' >&2
@@ -122,9 +156,24 @@ check_rpm() (
     usr/lib/multicore/cores
     usr/share/licenses/multicore
   )
+  # Dashboard filenames are content-hashed by its upstream build and are not otherwise pinned
+  # (see the matching comment in package-linux-release.sh), so they are derived here from the
+  # staged tree rather than hardcoded, the same way scripts/package-windows-release.ps1 derives
+  # its own exact dashboard inventory from the archive it just extracted.
+  local dashboard_files=() dashboard_relative
+  if [[ -d "$dashboard_dir" ]]; then
+    directories+=(usr/lib/multicore/dashboard)
+    while IFS= read -r dashboard_relative; do
+      directories+=("usr/lib/multicore/dashboard/$dashboard_relative")
+    done < <(cd "$dashboard_dir" && find . -mindepth 1 -type d -printf '%P\n' | sort)
+    while IFS= read -r dashboard_relative; do
+      dashboard_files+=("usr/lib/multicore/dashboard/$dashboard_relative")
+    done < <(cd "$dashboard_dir" && find . -mindepth 1 -type f -printf '%P\n' | sort)
+    licenses+=("usr/share/licenses/multicore/$license_name")
+  fi
   local expected_inventory inventory relative
   expected_inventory="$(printf '/%s\n' "${executables[@]}" "${metadata[@]}" \
-      "${licenses[@]}" "${directories[@]}" usr/bin/multicore | sort)"
+      "${licenses[@]}" "${directories[@]}" "${dashboard_files[@]}" usr/bin/multicore | sort)"
   inventory="$(rpm -qpl "$package" | sort)"
   if [[ "$inventory" != "$expected_inventory" ]]; then
     diff -u <(printf '%s\n' "$expected_inventory") <(printf '%s\n' "$inventory") >&2 || true
@@ -177,9 +226,9 @@ check_rpm() (
   # Check the payload too, not only the package header. Extra services, autostart
   # entries, lib64 paths, or other unlisted payload files must fail this check.
   inventory="$(cd "$work" && find . -mindepth 1 ! -type d -printf '%P\n' | sort)"
-  expected_inventory="$(printf '%s\n' "${executables[@]}" "${metadata[@]}" "${licenses[@]}" usr/bin/multicore | sort)"
+  expected_inventory="$(printf '%s\n' "${executables[@]}" "${metadata[@]}" "${licenses[@]}" "${dashboard_files[@]}" usr/bin/multicore | sort)"
   [[ "$inventory" == "$expected_inventory" ]] || { echo 'Unexpected extracted RPM payload inventory' >&2; exit 1; }
-  for relative in "${executables[@]}" "${metadata[@]}" "${licenses[@]}"; do
+  for relative in "${executables[@]}" "${metadata[@]}" "${licenses[@]}" "${dashboard_files[@]}"; do
     [[ -f "$work/$relative" && ! -L "$work/$relative" ]] || { echo "Missing regular RPM payload file: $relative" >&2; exit 1; }
     cmp "$STAGE/$relative" "$work/$relative" || { echo "RPM changed staged file: $relative" >&2; exit 1; }
   done

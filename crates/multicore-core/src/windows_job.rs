@@ -132,7 +132,7 @@ impl WindowsJobLauncher {
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
         let application = wide_nul(command.program.as_os_str());
         let mut command_line = wide_nul(&build_command_line(&command.program, &command.args));
-        let environment = sanitized_environment();
+        let environment = sanitized_environment(&command.env);
         let created = unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -375,7 +375,7 @@ fn quote_windows(value: &OsStr) -> OsString {
     OsString::from(out)
 }
 
-fn sanitized_environment() -> Vec<u16> {
+fn sanitized_environment(extra: &[(OsString, OsString)]) -> Vec<u16> {
     const ALLOWED: &[&str] = &[
         "SYSTEMROOT",
         "WINDIR",
@@ -397,6 +397,15 @@ fn sanitized_environment() -> Vec<u16> {
                 .then(|| format!("{}={}", key_text, value.to_string_lossy()))
         })
         .collect::<Vec<_>>();
+    // `extra` (e.g. SAFE_PATHS for the vendored dashboard directory) comes only from this
+    // process's own fixed `CommandSpec` construction, never from the broker's untrusted input.
+    for (key, value) in extra {
+        entries.push(format!(
+            "{}={}",
+            key.to_string_lossy(),
+            value.to_string_lossy()
+        ));
+    }
     entries.sort_by_key(|entry| entry.to_ascii_uppercase());
     let mut block = Vec::new();
     for entry in entries {
@@ -425,8 +434,17 @@ mod tests {
     #[test]
     fn environment_excludes_daemon_credentials() {
         unsafe { std::env::set_var("MULTICORE_DAEMON_TOKEN", "never-inherit") };
-        let block = String::from_utf16_lossy(&sanitized_environment());
+        let block = String::from_utf16_lossy(&sanitized_environment(&[]));
         assert!(!block.contains("never-inherit"));
+    }
+    #[test]
+    fn environment_carries_explicit_extra_entries_such_as_safe_paths() {
+        let extra = [(
+            OsString::from("SAFE_PATHS"),
+            OsString::from(r"C:\Program Files\MultiCore\dashboard"),
+        )];
+        let block = String::from_utf16_lossy(&sanitized_environment(&extra));
+        assert!(block.contains(r"SAFE_PATHS=C:\Program Files\MultiCore\dashboard"));
     }
     #[test]
     fn termination_wait_is_bounded() {
@@ -445,6 +463,7 @@ mod tests {
                 engine: Engine::Xray,
                 program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
                 args: vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+                env: Vec::new(),
             })
             .await
             .unwrap();
@@ -459,6 +478,7 @@ mod tests {
                 engine: Engine::Xray,
                 program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
                 args: vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+                env: Vec::new(),
             })
             .await
             .unwrap();

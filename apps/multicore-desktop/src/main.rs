@@ -779,6 +779,7 @@ fn main() -> Result<(), slint::PlatformError> {
         profile_preferences.clone(),
         startup_connect_pending.clone(),
     );
+    wire_dashboard_action(&ui, model.clone());
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
@@ -2802,6 +2803,23 @@ fn wire_primary_action(
     });
 }
 
+/// Opens the local Mihomo dashboard in the system's default browser. The button that triggers
+/// this is only enabled while `dashboard_available` (a live, authenticated controller session)
+/// is true, but the daemon re-checks that itself: a race between disconnect and a stale click
+/// simply surfaces as a "not connected" error here, discarded like any other transient failure of
+/// an external-browser launch. The URL contains this session's Mihomo controller secret and must
+/// never be logged, so it is deliberately not attached to any error or diagnostic path.
+fn wire_dashboard_action(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    ui.on_open_dashboard(move || {
+        let client = model.lock().expect("view model lock").daemon_client();
+        thread::spawn(move || {
+            if let Ok(url) = client.dashboard_url() {
+                let _ = webbrowser::open(&url);
+            }
+        });
+    });
+}
+
 fn wire_panels(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     let weak = ui.as_weak();
     let open_model = model.clone();
@@ -3725,6 +3743,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_has_profile(presentation.has_profile);
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
+    ui.set_dashboard_available(presentation.is_connected);
     ui.set_status_tone(
         match presentation.semantic_tone {
             SemanticTone::Neutral => "neutral",

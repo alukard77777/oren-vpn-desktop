@@ -114,6 +114,11 @@ pub(crate) fn resolve_from(
     let mihomo = cores.join("mihomo.exe");
     let xray_config = generation_dir.join("xray.json");
     let mihomo_config = generation_dir.join("mihomo.yaml");
+    // The vendored dashboard is optional: absent in builds without one, present as an exact
+    // package-root sibling of `cores` otherwise. Its presence is decided once, up front, so a
+    // directory that appears only after that check can never be picked up mid-resolution.
+    let dashboard = package_lexical.join("dashboard");
+    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok_and(|meta| meta.is_dir());
     let mut guards = Vec::new();
     for directory in [
         data_root,
@@ -124,6 +129,9 @@ pub(crate) fn resolve_from(
         &cores,
     ] {
         guard_lexical_chain(directory, true, &mut guards)?;
+    }
+    if dashboard_present {
+        guard_lexical_chain(&dashboard, true, &mut guards)?;
     }
     for file in [
         host_executable,
@@ -154,6 +162,14 @@ pub(crate) fn resolve_from(
             &fs::canonicalize(config).map_err(|_| ResolveError::Missing)?,
         )?;
     }
+    let dashboard_directory = if dashboard_present {
+        let canonical_dashboard =
+            fs::canonicalize(&dashboard).map_err(|_| ResolveError::Missing)?;
+        canonical_contained(&package, &canonical_dashboard)?;
+        Some(canonical_dashboard)
+    } else {
+        None
+    };
     for binary in [&xray, &mihomo] {
         let guard = guards
             .iter_mut()
@@ -168,6 +184,7 @@ pub(crate) fn resolve_from(
             mihomo_binary: fs::canonicalize(mihomo).map_err(|_| ResolveError::Missing)?,
             xray_config: fs::canonicalize(xray_config).map_err(|_| ResolveError::Missing)?,
             mihomo_config: fs::canonicalize(mihomo_config).map_err(|_| ResolveError::Missing)?,
+            dashboard_directory,
         },
         guards,
     })
@@ -336,7 +353,40 @@ mod tests {
     #[test]
     fn accepts_exact_layout() {
         let (_r, d, h) = fixture();
-        assert!(resolve_from(&d, &h, 7).is_ok());
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        assert_eq!(resolved.paths.dashboard_directory, None);
+    }
+    #[test]
+    fn resolves_an_optional_dashboard_sibling_of_cores() {
+        let (_r, d, h) = fixture();
+        let package = h.parent().unwrap().parent().unwrap().to_path_buf();
+        let dashboard = package.join("dashboard");
+        fs::create_dir_all(&dashboard).unwrap();
+        fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        assert_eq!(
+            resolved.paths.dashboard_directory,
+            Some(fs::canonicalize(&dashboard).unwrap())
+        );
+    }
+    #[test]
+    fn rejects_a_dashboard_directory_replaced_with_a_reparse_point() {
+        let (_r, d, h) = fixture();
+        let package = h.parent().unwrap().parent().unwrap().to_path_buf();
+        let dashboard = package.join("dashboard");
+        let outside = d.parent().unwrap().join("outside-dashboard");
+        fs::create_dir_all(&outside).unwrap();
+        match std::os::windows::fs::symlink_dir(&outside, &dashboard) {
+            Ok(()) => assert!(matches!(
+                resolve_from(&d, &h, 7),
+                Err(ResolveError::Reparse)
+            )),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("could not create dashboard reparse fixture: {error}"),
+        }
     }
     #[test]
     fn rejects_zero_missing_and_wrong_pe() {

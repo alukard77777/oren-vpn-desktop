@@ -718,6 +718,88 @@ fn cleanup_failure_does_not_cancel_committed_runtime_and_is_retried_later() {
 }
 
 #[test]
+fn runtime_publish_injects_configured_external_ui_directory() {
+    let directory = TempDirectory::new();
+    let dashboard = directory.path().join("dashboard");
+    fs::create_dir(&dashboard).unwrap();
+    fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+
+    let snapshot = Snapshot::parse(b"proxies: []\n", br#"{}"#).unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "secret")
+        .unwrap()
+        .with_external_ui_directory(&dashboard)
+        .unwrap();
+
+    let published = publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control)
+        .expect("staging with a valid external-ui directory must succeed");
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let mapping = runtime.as_mapping().unwrap();
+    assert_eq!(
+        mapping
+            .get(Value::String("external-ui".to_owned()))
+            .and_then(Value::as_str),
+        Some(dashboard.to_str().unwrap())
+    );
+    // Never our own external-ui-name/url alongside it: Mihomo's own auto-update fields must
+    // stay absent so it can never attempt a network fetch for the dashboard it already has.
+    for key in ["external-ui-name", "external-ui-url"] {
+        assert!(
+            mapping.get(Value::String(key.to_owned())).is_none(),
+            "unexpected {key} in runtime overlay"
+        );
+    }
+}
+
+#[test]
+fn runtime_publish_omits_external_ui_when_not_configured() {
+    let directory = TempDirectory::new();
+    let snapshot = Snapshot::parse(b"proxies: []\n", br#"{}"#).unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "secret").unwrap();
+
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    assert!(
+        runtime
+            .as_mapping()
+            .unwrap()
+            .get(Value::String("external-ui".to_owned()))
+            .is_none()
+    );
+}
+
+#[test]
+fn external_ui_directory_rejects_relative_missing_and_indexless_paths() {
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "secret").unwrap();
+
+    assert!(
+        control
+            .clone()
+            .with_external_ui_directory("relative/dashboard")
+            .is_err(),
+        "relative path must be rejected"
+    );
+    assert!(
+        control
+            .clone()
+            .with_external_ui_directory(directory.path().join("does-not-exist"))
+            .is_err(),
+        "missing directory must be rejected"
+    );
+    let empty_dashboard = directory.path().join("empty-dashboard");
+    fs::create_dir(&empty_dashboard).unwrap();
+    assert!(
+        control
+            .with_external_ui_directory(&empty_dashboard)
+            .is_err(),
+        "directory without index.html must be rejected"
+    );
+}
+
+#[test]
 fn runtime_control_rejects_non_loopback_controller() {
     assert!(MihomoRuntimeControl::new("192.0.2.1:19090".parse().unwrap(), "secret").is_err());
 }

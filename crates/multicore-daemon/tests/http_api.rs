@@ -6,8 +6,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use multicore_daemon::{
-    ApiErrorBody, ConnectionState, DiagnosticsDto, MemoryBackend, RuntimeCheckDto, StatusDto,
-    router, router_with_event_epoch,
+    ApiErrorBody, ConnectionState, DashboardUrlDto, DiagnosticsDto, MemoryBackend, RuntimeCheckDto,
+    StatusDto, router, router_with_event_epoch, try_router_with_dashboard_url,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -63,6 +63,7 @@ async fn all_v1_routes_require_bearer_authentication() {
         ("POST", "/v1/disconnect", Body::empty()),
         ("GET", "/v1/events?after=0", Body::empty()),
         ("GET", "/v1/diagnostics", Body::empty()),
+        ("GET", "/v1/dashboard-url", Body::empty()),
     ];
 
     for (method, uri, body) in routes {
@@ -96,6 +97,74 @@ async fn diagnostics_route_is_authenticated_and_has_stable_safe_shape() {
     assert_eq!(diagnostics.tun, RuntimeCheckDto::Stopped);
     assert!(diagnostics.logs.is_empty());
     assert!(diagnostics.mappings.is_empty());
+}
+
+#[tokio::test]
+async fn dashboard_url_route_is_absent_without_a_configured_dashboard() {
+    let response = app()
+        .oneshot(request("GET", "/v1/dashboard-url", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: ApiErrorBody = serde_json::from_value(json_body(response).await).unwrap();
+    assert_eq!(error.code, "dashboard_unavailable");
+}
+
+#[tokio::test]
+async fn dashboard_url_requires_authentication_and_a_live_connection() {
+    let secret_url = "http://127.0.0.1:19090/ui/#/setup?hostname=127.0.0.1&port=19090&secret=must-never-leak-when-not-connected";
+    let app = try_router_with_dashboard_url(MemoryBackend::default(), TOKEN, secret_url).unwrap();
+
+    // Unauthenticated callers never see the URL, even as an error body.
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/dashboard-url")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(unauthenticated).await.to_string();
+    assert!(!body.contains("must-never-leak"));
+
+    // Authenticated but not connected: gated off, and the secret URL is still never returned.
+    let not_connected = app
+        .clone()
+        .oneshot(request("GET", "/v1/dashboard-url", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(not_connected.status(), StatusCode::CONFLICT);
+    let error: ApiErrorBody = serde_json::from_value(json_body(not_connected).await).unwrap();
+    assert_eq!(error.code, "not_connected");
+    assert!(!error.message.contains("must-never-leak"));
+
+    app.clone()
+        .oneshot(request(
+            "POST",
+            "/v1/subscriptions/import",
+            Body::from(r#"{"url":"https://example.invalid/sub"}"#),
+        ))
+        .await
+        .unwrap();
+    let connected = app
+        .clone()
+        .oneshot(request("POST", "/v1/connect", Body::empty()))
+        .await
+        .unwrap();
+    let connected: StatusDto = serde_json::from_value(json_body(connected).await).unwrap();
+    assert_eq!(connected.state, ConnectionState::Connected);
+
+    let dashboard = app
+        .oneshot(request("GET", "/v1/dashboard-url", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(dashboard.status(), StatusCode::OK);
+    let dashboard: DashboardUrlDto = serde_json::from_value(json_body(dashboard).await).unwrap();
+    assert_eq!(dashboard.url, secret_url);
 }
 
 #[tokio::test]

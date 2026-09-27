@@ -165,6 +165,55 @@ component SmallAction inherits Rectangle {
     }
 }
 
+component DashboardAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    // Shown to assistive technology (and is the closest equivalent this app has to a
+    // hover tooltip) explaining why the button is disabled, e.g. "Подключитесь, чтобы
+    // открыть панель Mihomo."
+    in property <string> disabled-hint;
+    callback activated();
+
+    min-width: 128px;
+    preferred-width: dashboard-label.preferred-width + 28px;
+    horizontal-stretch: 0;
+    height: 44px;
+    background: root.enabled ? (dashboard-touch.pressed ? Theme.elevated : dashboard-touch.has-hover ? #ffffff0d : transparent) : transparent;
+    border-color: dashboard-focus.has-focus ? Theme.focus : Theme.line;
+    border-width: dashboard-focus.has-focus ? 2px : 1px;
+    border-radius: 8px;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.enabled ? "" : root.disabled-hint;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    dashboard-label := Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-family: Theme.font-family;
+        font-size: Theme.type-metadata-size;
+        font-weight: Theme.weight-semibold;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    dashboard-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        dashboard-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
 component SettingsNavItem inherits Rectangle {
     in property <string> label;
     in property <bool> selected: false;
@@ -394,6 +443,9 @@ export component AppWindow inherits Window {
     in property <bool> has-profile: false;
     in property <string> primary-label: "Подключить";
     in property <bool> primary-enabled: false;
+    // The Mihomo dashboard is only meaningful while a live, authenticated controller
+    // session exists, i.e. while Connected.
+    in property <bool> dashboard-available: false;
     in property <string> status-tone: "neutral";
     in property <bool> import-pending: false;
     in property <string> import-error;
@@ -515,6 +567,7 @@ export component AppWindow inherits Window {
     callback add-subscription();
     callback retry-profile-menu();
     callback primary-action();
+    callback open-dashboard();
     callback open-panel(string);
     callback close-panel();
     callback escape-pressed();
@@ -1503,6 +1556,12 @@ export component AppWindow inherits Window {
                         SmallAction { label: "Система"; selected: root.event-filter == "Система"; enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
                         SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        DashboardAction {
+                            label: "Открыть дашборд";
+                            enabled: root.dashboard-available && !root.profile-menu-open;
+                            disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
+                            activated => { root.open-dashboard(); }
+                        }
                     }
                     ScrollView {
                         vertical-stretch: 1;

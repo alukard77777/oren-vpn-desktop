@@ -17,6 +17,7 @@ const LATENCIES_RESPONSE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 #[allow(dead_code)] // The profile client is wired into the desktop event loop in Task 6.
 const SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const API_ERROR_RESPONSE_LIMIT_BYTES: usize = 16 * 1024;
+const DASHBOARD_URL_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DaemonStatus {
@@ -391,6 +392,13 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Диагностика недоступна."))
     }
 
+    /// GET /v1/dashboard-url. The returned URL embeds the ephemeral Mihomo controller secret for
+    /// this session; callers must open it directly (e.g. in the default browser) and must never
+    /// log it, persist it, or surface it in diagnostics.
+    fn dashboard_url(&self) -> Result<String, DaemonError> {
+        Err(DaemonError::new("Панель Mihomo недоступна."))
+    }
+
     /// GET /v1/catalog. IDs are opaque daemon values; labels are presentation data.
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError>;
 
@@ -718,6 +726,11 @@ struct ApiErrorBody {
     code: String,
 }
 
+#[derive(Deserialize)]
+struct DashboardUrlResponse {
+    url: String,
+}
+
 /// Local texts for daemon error codes. The daemon's own message is never
 /// displayed, so provider URLs or tokens can never be reflected into the UI.
 fn known_error_message(code: &str) -> Option<&'static str> {
@@ -765,6 +778,8 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         "subscription_prepare_failed" => {
             "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение."
         }
+        "not_connected" => "Подключитесь, чтобы открыть панель Mihomo.",
+        "dashboard_unavailable" => "Панель Mihomo недоступна в этой сборке.",
         _ => return None,
     })
 }
@@ -890,6 +905,25 @@ impl DaemonClient for HttpDaemonClient {
         )
     }
 
+    fn dashboard_url(&self) -> Result<String, DaemonError> {
+        let response = self
+            .http
+            .get(self.endpoint("/v1/dashboard-url"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(map_error)?;
+        if !response.status().is_success() {
+            let code = error_code(response);
+            return Err(
+                DaemonError::definitive_http("Панель Mihomo сейчас недоступна.")
+                    .with_known_code(&code),
+            );
+        }
+        let response: DashboardUrlResponse =
+            decode_bounded_json(response, DASHBOARD_URL_RESPONSE_LIMIT_BYTES)?;
+        Ok(response.url)
+    }
+
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError> {
         self.send_json(
             self.http.get(self.endpoint("/v1/catalog")),
@@ -997,6 +1031,7 @@ pub(crate) mod test_support {
         pub fail_latencies: bool,
         #[allow(dead_code)]
         pub subscriptions: DaemonSubscriptionList,
+        pub dashboard_url: Option<String>,
     }
 
     impl MockDaemonClient {
@@ -1018,6 +1053,7 @@ pub(crate) mod test_support {
                 latencies: DaemonLatencies::default(),
                 fail_latencies: false,
                 subscriptions: DaemonSubscriptionList::default(),
+                dashboard_url: None,
             }
         }
 
@@ -1130,6 +1166,13 @@ pub(crate) mod test_support {
         ) -> Result<DaemonCatalog, DaemonError> {
             self.record("PUT /v1/selections/{opaque}");
             Ok(self.catalog.clone())
+        }
+
+        fn dashboard_url(&self) -> Result<String, DaemonError> {
+            self.record("GET /v1/dashboard-url");
+            self.dashboard_url
+                .clone()
+                .ok_or_else(|| DaemonError::new("Подключитесь, чтобы открыть панель Mihomo."))
         }
     }
 }

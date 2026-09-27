@@ -652,6 +652,11 @@ pub trait Backend: Send + Sync + 'static {
 struct AppState {
     backend: Arc<dyn Backend>,
     event_epoch: Arc<str>,
+    /// The fully-formed local dashboard URL, secret included. Never logged or included in any
+    /// other response; only ever handed back to an already-authenticated caller, and only while a
+    /// live controller session exists. `AppState` deliberately has no `Debug` impl so this can
+    /// never be leaked through an accidental `{:?}` format.
+    dashboard_url: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -680,6 +685,27 @@ where
     ))
 }
 
+/// Fallible production constructor that also exposes the authenticated `/v1/dashboard-url`
+/// endpoint, returning `dashboard_url` to the caller only while a live controller session exists
+/// (see [`ConnectionState::Connected`]). `dashboard_url` should be the fully-formed local Mihomo
+/// dashboard URL, including its per-session secret; it is never logged and never returned from any
+/// other endpoint.
+pub fn try_router_with_dashboard_url<B>(
+    backend: B,
+    bearer_token: impl AsRef<str>,
+    dashboard_url: impl Into<Arc<str>>,
+) -> Result<Router, getrandom::Error>
+where
+    B: Backend,
+{
+    Ok(build_router(
+        backend,
+        bearer_token,
+        generate_event_epoch()?,
+        Some(dashboard_url.into()),
+    ))
+}
+
 /// Builds the local daemon HTTP API with an explicit event epoch.
 ///
 /// Production callers should use [`try_router`]. This constructor exists so transport tests can
@@ -692,9 +718,22 @@ pub fn router_with_event_epoch<B>(
 where
     B: Backend,
 {
+    build_router(backend, bearer_token, event_epoch, None)
+}
+
+fn build_router<B>(
+    backend: B,
+    bearer_token: impl AsRef<str>,
+    event_epoch: impl Into<String>,
+    dashboard_url: Option<Arc<str>>,
+) -> Router
+where
+    B: Backend,
+{
     let app_state = AppState {
         backend: Arc::new(backend),
         event_epoch: Arc::from(event_epoch.into()),
+        dashboard_url,
     };
     let auth_state = AuthState {
         token_hash: Sha256::digest(bearer_token.as_ref().as_bytes()).into(),
@@ -725,6 +764,7 @@ where
         .route("/disconnect", post(disconnect))
         .route("/events", get(events))
         .route("/diagnostics", get(diagnostics))
+        .route("/dashboard-url", get(dashboard_url_handler))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1284,6 +1324,44 @@ async fn diagnostics(
         .await
         .map(Json)
         .map_err(|_| ApiError::backend("Не удалось получить диагностику. Повторите попытку."))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DashboardUrlDto {
+    pub url: String,
+}
+
+/// Returns the fully-formed, secret-bearing local Mihomo dashboard URL, but only while a live
+/// controller session exists (`ConnectionState::Connected`). The URL is never included in
+/// `/status`, `/events`, or any diagnostic output, and this handler never logs it: an error path
+/// here must not accidentally embed the URL in any tracing/log output added later.
+async fn dashboard_url_handler(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<DashboardUrlDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let Some(dashboard_url) = state.dashboard_url.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "dashboard_unavailable",
+            "Панель Mihomo недоступна в этой сборке.",
+        ));
+    };
+    let status = state
+        .backend
+        .status()
+        .await
+        .map_err(|_| ApiError::backend("Не удалось получить состояние. Повторите попытку."))?;
+    if status.state != ConnectionState::Connected {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "not_connected",
+            "Подключитесь, чтобы открыть панель Mihomo.",
+        ));
+    }
+    Ok(Json(DashboardUrlDto {
+        url: dashboard_url.to_string(),
+    }))
 }
 
 fn reject_nonempty_body(body: &Bytes) -> Result<(), ApiError> {

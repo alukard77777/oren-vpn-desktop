@@ -750,6 +750,7 @@ pub struct MihomoRuntimeControl {
     address: SocketAddr,
     secret: String,
     xray_outbound_interface: Option<String>,
+    external_ui_directory: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for MihomoRuntimeControl {
@@ -765,6 +766,7 @@ impl std::fmt::Debug for MihomoRuntimeControl {
                     .as_ref()
                     .map(|_| "[CONFIGURED]"),
             )
+            .field("external_ui_directory", &self.external_ui_directory)
             .finish()
     }
 }
@@ -788,6 +790,7 @@ impl MihomoRuntimeControl {
             address,
             secret,
             xray_outbound_interface: None,
+            external_ui_directory: None,
         })
     }
 
@@ -809,6 +812,49 @@ impl MihomoRuntimeControl {
             ));
         }
         self.xray_outbound_interface = Some(interface.to_owned());
+        Ok(self)
+    }
+
+    /// Points Mihomo's `external-ui` at a vendored, already-staged static dashboard directory so
+    /// the runtime overlay serves it itself (see `crates/multicore-core/src/snapshot.rs` docs on
+    /// `stage_runtime_with_mihomo_control`). The directory must be an absolute, existing directory
+    /// containing an `index.html`; this crate never downloads or writes dashboard content, it only
+    /// references a path the caller has already validated (checksum-verified at package time).
+    ///
+    /// Mihomo additionally requires this path to be a subpath of its own home directory, or listed
+    /// in the `SAFE_PATHS` environment variable of the process that spawns it — this crate cannot
+    /// enforce that from here; the caller that launches the Mihomo process is responsible for it.
+    pub fn with_external_ui_directory(mut self, directory: impl Into<PathBuf>) -> io::Result<Self> {
+        let directory = directory.into();
+        if !directory.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must be an absolute path",
+            ));
+        }
+        if directory
+            .as_os_str()
+            .to_str()
+            .is_none_or(|value| value.chars().any(char::is_control))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must be valid, control-character-free Unicode",
+            ));
+        }
+        if !fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must exist",
+            ));
+        }
+        if !fs::metadata(directory.join("index.html")).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must contain index.html",
+            ));
+        }
+        self.external_ui_directory = Some(directory);
         Ok(self)
     }
 }
@@ -1100,6 +1146,18 @@ pub fn stage_runtime_with_mihomo_control(
         YamlValue::String("secret".to_owned()),
         YamlValue::String(control.secret.clone()),
     );
+    if let Some(external_ui_directory) = &control.external_ui_directory {
+        let external_ui_directory = external_ui_directory.to_str().ok_or_else(|| {
+            PersistenceError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mihomo external-ui directory is not valid Unicode",
+            ))
+        })?;
+        mapping.insert(
+            YamlValue::String("external-ui".to_owned()),
+            YamlValue::String(external_ui_directory.to_owned()),
+        );
+    }
     let tun_key = YamlValue::String("tun".to_owned());
     let tun = mapping
         .entry(tun_key)

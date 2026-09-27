@@ -385,6 +385,197 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $inputJunctionDestination)) 'input reparse ancestor failure must not publish'
     Assert-NoStageResidue $TestRoot 'input reparse ancestor rejection'
 
+    # --- Optional vendored dashboard: staging, CSP patch, and failure atomicity ---
+    function New-DashboardFixtureIndexHtml {
+        param([string]$Title = 'fixture')
+        $lines = @(
+            '<!doctype html>',
+            '<html>',
+            '  <head>',
+            '    <meta charset="UTF-8" />',
+            "    <title>$Title</title>",
+            '  </head>',
+            '  <body>',
+            '    <script>',
+            '      ;(function () {',
+            "        console.log('fixture-theme')",
+            '      })()',
+            '    </script>',
+            '  </body>',
+            '</html>'
+        )
+        ($lines -join "`n") + "`n"
+    }
+
+    function Write-DashboardManifest {
+        param(
+            [string]$Path, [string]$InputDirectory, [string]$XrayExecutableHash, [string]$MihomoExecutableHash,
+            [string]$DashboardArchiveName = 'dashboard-fixture.zip', [string]$DashboardArchiveHash, [string]$IndexHtmlSha256,
+            [string]$RootPrefix = 'dist/', [int64]$MaximumEntryBytes = 1048576, [int64]$MaximumExpandedBytes = 4194304, [int]$MaximumEntryCount = 16,
+            [string]$ContentSecurityPolicy = "default-src 'self'; script-src 'self'"
+        )
+        if (-not $DashboardArchiveHash) { $DashboardArchiveHash = Get-Sha256 (Join-Path $InputDirectory $DashboardArchiveName) }
+        $manifest = [ordered]@{
+            schemaVersion = 1
+            fixtureContract = 'multicore-package-test-v1'
+            platform = 'windows-x64'
+            build = [ordered]@{ rustToolchain = '1.98.1'; desktopPackage = 'multicore-desktop'; daemonPackage = 'multicore-daemon'; updaterPackage = 'multicore-updater'; coreHostPackage = 'multicore-core-host' }
+            components = [ordered]@{
+                xray = [ordered]@{
+                    project = 'XTLS/Xray-core'; version = 'fixture'; commit = ('1' * 40); license = 'MPL-2.0'
+                    asset = [ordered]@{ name = 'xray-fixture.zip'; url = 'https://example.invalid/xray-fixture.zip'; sha256 = (Get-Sha256 (Join-Path $InputDirectory 'xray-fixture.zip')); entry = 'xray.exe'; executableSha256 = $XrayExecutableHash; maximumExpandedBytes = 1048576 }
+                    licenseFile = [ordered]@{ name = 'Xray-core-MPL-2.0.txt'; url = 'https://example.invalid/LICENSE'; sha256 = (Get-Sha256 (Join-Path $InputDirectory 'Xray-core-MPL-2.0.txt')) }
+                    source = [ordered]@{ url = 'https://example.invalid/source'; sha256 = ('2' * 64) }
+                }
+                mihomo = [ordered]@{
+                    project = 'MetaCubeX/mihomo'; version = 'fixture'; commit = ('3' * 40); license = 'GPL-3.0-only'
+                    asset = [ordered]@{ name = 'mihomo-fixture.zip'; url = 'https://example.invalid/mihomo-fixture.zip'; sha256 = (Get-Sha256 (Join-Path $InputDirectory 'mihomo-fixture.zip')); entry = 'mihomo.exe'; executableSha256 = $MihomoExecutableHash; maximumExpandedBytes = 1048576 }
+                    licenseFile = [ordered]@{ name = 'mihomo-GPL-3.0.txt'; url = 'https://example.invalid/LICENSE'; sha256 = (Get-Sha256 (Join-Path $InputDirectory 'mihomo-GPL-3.0.txt')) }
+                    source = [ordered]@{ url = 'https://example.invalid/source'; sha256 = ('4' * 64) }
+                }
+                dashboard = [ordered]@{
+                    project = 'example/dashboard-fixture'; version = 'fixture'; commit = ('5' * 40); license = 'MIT'
+                    asset = [ordered]@{
+                        name = $DashboardArchiveName; url = 'https://example.invalid/dashboard-fixture.zip'; sha256 = $DashboardArchiveHash
+                        rootPrefix = $RootPrefix; maximumEntryBytes = $MaximumEntryBytes; maximumExpandedBytes = $MaximumExpandedBytes; maximumEntryCount = $MaximumEntryCount
+                        indexHtmlSha256 = $IndexHtmlSha256
+                    }
+                    licenseFile = [ordered]@{ name = 'dashboard-fixture-LICENSE.txt'; url = 'https://example.invalid/LICENSE'; sha256 = (Get-Sha256 (Join-Path $InputDirectory 'dashboard-fixture-LICENSE.txt')) }
+                    contentSecurityPolicy = $ContentSecurityPolicy
+                }
+            }
+        }
+        $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+    }
+
+    $DashboardBaseInput = Join-Path $TestRoot 'dashboard-base-input'
+    New-Item -ItemType Directory -Path $DashboardBaseInput | Out-Null
+    Get-ChildItem -LiteralPath $BaseInput | Copy-Item -Destination $DashboardBaseInput -Recurse
+    $dashboardIndexHtml = New-DashboardFixtureIndexHtml
+    $dashboardIndexBytes = [Text.Encoding]::UTF8.GetBytes($dashboardIndexHtml)
+    $dashboardIndexSha256 = (Get-FileHash -InputStream (New-Object IO.MemoryStream(, $dashboardIndexBytes)) -Algorithm SHA256).Hash.ToLowerInvariant()
+    New-TestZip (Join-Path $DashboardBaseInput 'dashboard-fixture.zip') @(
+        @{ Name = 'dist/'; Data = [byte[]]@(); Attributes = $null },
+        @{ Name = 'dist/index.html'; Data = $dashboardIndexBytes; Attributes = $null },
+        @{ Name = 'dist/assets/app.js'; Data = [Text.Encoding]::UTF8.GetBytes("console.log('fixture asset')`n"); Attributes = $null }
+    )
+    Set-Content -LiteralPath (Join-Path $DashboardBaseInput 'dashboard-fixture-LICENSE.txt') -Value 'MIT fixture license' -NoNewline
+
+    function Invoke-DashboardPackage {
+        param([string]$Destination, [string]$InputDirectory, [string]$Manifest)
+        & $Packager -DestinationPath $Destination -OfflineSourceDirectory $InputDirectory -ManifestPath $Manifest -DesktopExecutablePath $Desktop -DaemonExecutablePath $Daemon -UpdaterExecutablePath $Updater -CoreHostExecutablePath $CoreHost -FixtureContractMode
+    }
+
+    function Assert-DashboardPackageFailure {
+        param([string]$Name, [scriptblock]$Arrange)
+        $caseRoot = Join-Path $TestRoot $Name
+        New-Item -ItemType Directory -Path $caseRoot | Out-Null
+        $input = Join-Path $caseRoot 'input'; New-Item -ItemType Directory -Path $input | Out-Null
+        Get-ChildItem -LiteralPath $DashboardBaseInput | Copy-Item -Destination $input -Recurse
+        $manifest = Join-Path $caseRoot 'versions.json'
+        & $Arrange $input $manifest
+        $destination = Join-Path $caseRoot 'output'
+        $failed = $false
+        try { Invoke-DashboardPackage $destination $input $manifest | Out-Null } catch { $failed = $true }
+        Assert-True $failed "$Name must fail"
+        Assert-True (-not (Test-Path -LiteralPath $destination)) "$Name must not publish a partial destination"
+        Assert-NoStageResidue $caseRoot $Name
+    }
+
+    $dashboardManifest = Join-Path $TestRoot 'dashboard-versions.json'
+    Write-DashboardManifest $dashboardManifest $DashboardBaseInput $xrayHash $mihomoHash -IndexHtmlSha256 $dashboardIndexSha256
+
+    $dashboardOut1 = Join-Path $TestRoot 'dashboard-package-one'
+    $dashboardOut2 = Join-Path $TestRoot 'dashboard-package-two'
+    Invoke-DashboardPackage $dashboardOut1 $DashboardBaseInput $dashboardManifest | Out-Null
+    Invoke-DashboardPackage $dashboardOut2 $DashboardBaseInput $dashboardManifest | Out-Null
+
+    [string[]]$expectedDashboardFiles = @('MultiCore.exe', 'README.md', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.md',
+        'cores/mihomo.exe', 'cores/xray.exe',
+        'dashboard/assets/app.js', 'dashboard/index.html', 'dashboard/theme-favicon.js',
+        'licenses/Xray-core-MPL-2.0.txt', 'licenses/dashboard-fixture-LICENSE.txt', 'licenses/mihomo-GPL-3.0.txt',
+        'runtime/multicore-core-host.exe', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
+    [Array]::Sort($expectedDashboardFiles, [StringComparer]::Ordinal)
+    $dashboardActualItems = @(Get-ChildItem -LiteralPath $dashboardOut1 -Force -Recurse)
+    foreach ($item in $dashboardActualItems) { Assert-True (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "published dashboard inventory must not contain reparse entries: $($item.FullName)" }
+    [string[]]$dashboardActualFiles = @($dashboardActualItems | Where-Object { -not $_.PSIsContainer } | ForEach-Object { $_.FullName.Substring($dashboardOut1.Length + 1).Replace('\', '/') })
+    [Array]::Sort($dashboardActualFiles, [StringComparer]::Ordinal)
+    Assert-True (($dashboardActualFiles -join '|') -ceq ($expectedDashboardFiles -join '|')) "dashboard-enabled published inventory must be exact: $($dashboardActualFiles -join ', ')"
+    [string[]]$expectedDashboardDirectories = @('cores', 'dashboard', 'dashboard/assets', 'licenses', 'runtime')
+    [Array]::Sort($expectedDashboardDirectories, [StringComparer]::Ordinal)
+    [string[]]$dashboardActualDirectories = @($dashboardActualItems | Where-Object { $_.PSIsContainer } | ForEach-Object { $_.FullName.Substring($dashboardOut1.Length + 1).Replace('\', '/') })
+    [Array]::Sort($dashboardActualDirectories, [StringComparer]::Ordinal)
+    Assert-True (($dashboardActualDirectories -join '|') -ceq ($expectedDashboardDirectories -join '|')) 'dashboard-enabled published directory inventory must be exact'
+
+    $dashboardPatchedIndex = Get-Content -Raw -LiteralPath (Join-Path $dashboardOut1 'dashboard\index.html')
+    Assert-True ($dashboardPatchedIndex.Contains('Content-Security-Policy')) 'staged dashboard index.html must carry a Content-Security-Policy meta tag'
+    Assert-True ($dashboardPatchedIndex.Contains("default-src 'self'; script-src 'self'")) 'staged dashboard index.html must carry the exact pinned CSP'
+    Assert-True (-not $dashboardPatchedIndex.Contains('<script>')) 'staged dashboard index.html must not retain an inline <script> block'
+    Assert-True ($dashboardPatchedIndex.Contains('<script src="./theme-favicon.js"></script>')) 'staged dashboard index.html must reference the externalized theme script'
+    $themeScript = Get-Content -Raw -LiteralPath (Join-Path $dashboardOut1 'dashboard\theme-favicon.js')
+    Assert-True ($themeScript.Contains("console.log('fixture-theme')")) 'externalized theme script must keep the original inline script body'
+
+    Assert-True ((Get-Sha256 (Join-Path $dashboardOut1 'dashboard\index.html')) -eq (Get-Sha256 (Join-Path $dashboardOut2 'dashboard\index.html'))) 'dashboard CSP patch must be byte-deterministic across runs'
+    Assert-True ((Get-Sha256 (Join-Path $dashboardOut1 'dashboard\assets\app.js')) -eq (Get-Sha256 (Join-Path $dashboardOut2 'dashboard\assets\app.js'))) 'unpatched dashboard assets must be staged byte-identical across runs'
+    Assert-True ((Get-Sha256 (Join-Path $dashboardOut1 'licenses\dashboard-fixture-LICENSE.txt')) -eq (Get-Sha256 (Join-Path $DashboardBaseInput 'dashboard-fixture-LICENSE.txt'))) 'dashboard license must be staged unmodified'
+
+    $sumLines = Get-Content -LiteralPath (Join-Path $dashboardOut1 'SHA256SUMS.txt')
+    Assert-True ($sumLines.Count -eq 15) 'SHA256SUMS must cover every staged file when the dashboard is enabled'
+    Assert-True (($sumLines -match [regex]::Escape('dashboard/index.html')).Count -eq 1) 'SHA256SUMS must record the patched dashboard index.html'
+
+    # Negative: archive checksum mismatch.
+    Assert-DashboardPackageFailure 'dashboard-bad-archive-hash' {
+        param($i, $m) Write-DashboardManifest $m $i $xrayHash $mihomoHash -DashboardArchiveHash ('0' * 64) -IndexHtmlSha256 $dashboardIndexSha256
+    }
+
+    # Negative: a future re-vendor changed index.html without anyone re-running this patch --
+    # this is the regression check that a silently-changed upstream index.html fails the build
+    # instead of shipping without the CSP.
+    Assert-DashboardPackageFailure 'dashboard-index-html-changed-upstream' {
+        param($i, $m) Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 ('6' * 64)
+    }
+
+    # Negative: entry escapes the declared archive root (path-traversal style).
+    Assert-DashboardPackageFailure 'dashboard-entry-outside-root' {
+        param($i, $m)
+        Remove-Item -LiteralPath (Join-Path $i 'dashboard-fixture.zip')
+        New-TestZip (Join-Path $i 'dashboard-fixture.zip') @(
+            @{ Name = 'dist/index.html'; Data = $dashboardIndexBytes; Attributes = $null },
+            @{ Name = 'other/escaped.txt'; Data = [byte[]](1); Attributes = $null }
+        )
+        Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 $dashboardIndexSha256
+    }
+
+    # Negative: symlink entry inside the archive.
+    Assert-DashboardPackageFailure 'dashboard-symlink-entry' {
+        param($i, $m)
+        Remove-Item -LiteralPath (Join-Path $i 'dashboard-fixture.zip')
+        New-TestZip (Join-Path $i 'dashboard-fixture.zip') @(
+            @{ Name = 'dist/index.html'; Data = $dashboardIndexBytes; Attributes = $null },
+            @{ Name = 'dist/assets/link'; Data = [byte[]](1); Attributes = ([int64]0xA1FF0000) }
+        )
+        Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 $dashboardIndexSha256
+    }
+
+    # Negative: a single entry exceeds the pinned per-entry size bound.
+    Assert-DashboardPackageFailure 'dashboard-oversized-entry' {
+        param($i, $m) Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 $dashboardIndexSha256 -MaximumEntryBytes 8
+    }
+
+    # Negative: the archive has no index.html at its declared root.
+    Assert-DashboardPackageFailure 'dashboard-missing-index-html' {
+        param($i, $m)
+        Remove-Item -LiteralPath (Join-Path $i 'dashboard-fixture.zip')
+        New-TestZip (Join-Path $i 'dashboard-fixture.zip') @(@{ Name = 'dist/other.txt'; Data = [byte[]](1); Attributes = $null })
+        Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 (Get-FileHash -InputStream (New-Object IO.MemoryStream(, [byte[]](1))) -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+
+    # Negative: a manifest that weakens the pinned CSP (adds 'unsafe-inline' to script-src) must
+    # be rejected before any network access or staging, regardless of OfflineSourceDirectory.
+    Assert-DashboardPackageFailure 'dashboard-weak-csp' {
+        param($i, $m) Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 $dashboardIndexSha256 -ContentSecurityPolicy "default-src 'self'; script-src 'self' 'unsafe-inline'"
+    }
+
     Write-Output 'PASS: Windows release package contract and failure atomicity'
 } finally {
     if (Test-Path -LiteralPath $TestRoot) { Remove-Item -LiteralPath $TestRoot -Recurse -Force }

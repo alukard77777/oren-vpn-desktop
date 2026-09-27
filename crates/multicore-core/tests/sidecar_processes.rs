@@ -105,6 +105,7 @@ fn paths() -> RuntimePaths {
         mihomo_binary: PathBuf::from(r"C:\Program Files\Multi Core\mihomo.exe"),
         xray_config: PathBuf::from(r"C:\Users\Synthetic User\runtime\xray.json"),
         mihomo_config: PathBuf::from(r"C:\Users\Synthetic User\runtime\mihomo.yaml"),
+        dashboard_directory: None,
     }
 }
 
@@ -130,6 +131,26 @@ fn runtime_paths_build_exact_sidecar_commands_without_shell_strings() {
             OsString::from("-f"),
             paths.mihomo_config.clone().into_os_string(),
         ]
+    );
+    assert!(xray.env.is_empty());
+    assert!(mihomo.env.is_empty(), "no dashboard configured yet");
+}
+
+#[test]
+fn mihomo_command_carries_safe_paths_only_when_a_dashboard_is_configured() {
+    let mut paths = paths();
+    paths.dashboard_directory = Some(PathBuf::from(r"C:\Program Files\Multi Core\dashboard"));
+    let mihomo = paths.command(Engine::Mihomo);
+    assert_eq!(
+        mihomo.env,
+        [(
+            OsString::from("SAFE_PATHS"),
+            OsString::from(r"C:\Program Files\Multi Core\dashboard"),
+        )]
+    );
+    assert!(
+        paths.command(Engine::Xray).env.is_empty(),
+        "Xray never needs Mihomo's external-ui allowlist"
     );
 }
 
@@ -307,6 +328,7 @@ async fn tokio_launcher_captures_and_redacts_both_output_streams() {
             OsString::from("--nocapture"),
         ]
         .into(),
+        env: Vec::new(),
     };
     let mut child = launcher.launch(command).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -351,6 +373,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
         mihomo_binary: PathBuf::new(),
         xray_config,
         mihomo_config: root.join("mihomo.yaml"),
+        dashboard_directory: None,
     };
     let launcher = TokioProcessLauncher::for_runtime(runtime_paths, Duration::from_millis(200));
     let command = CommandSpec {
@@ -363,6 +386,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
             OsString::from("--nocapture"),
         ]
         .into(),
+        env: Vec::new(),
     };
     let mut child = launcher.launch(command.clone()).await.unwrap();
     assert!(
@@ -493,6 +517,7 @@ async fn real_core_child_environment_launcher_helper() {
                 OsString::from("--nocapture"),
             ]
             .into(),
+            env: Vec::new(),
         })
         .await;
     let mut child = match launch {

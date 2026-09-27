@@ -65,6 +65,72 @@ install -d -m 0755 "$PACKAGE_ROOT/runtime" "$STAGE_CORES" "$OUTPUT/usr/bin" \
     "$OUTPUT/usr/share/applications" "$OUTPUT/usr/share/icons/hicolor/scalable/apps" \
     "$OUTPUT/usr/share/polkit-1/actions" "$OUTPUT/usr/share/licenses/multicore"
 
+# The vendored dashboard is optional so manifests that predate it keep staging unchanged; a real
+# production manifest always carries it (see packaging/linux/versions.json). Its filenames are
+# content-hashed by the upstream build and are not otherwise pinned here -- the archive's SHA-256
+# already fully determines the set of files it can produce, and dashboard/index.html additionally
+# gets its own pre-patch SHA-256 check before scripts/patch_dashboard_csp.py touches it.
+fetch_dashboard() {
+    local present
+    present="$(python3 -c 'import json,sys; print("yes" if "dashboard" in json.load(open(sys.argv[1]))["components"] else "no")' "$MANIFEST")"
+    [[ "$present" == "yes" ]] || return 0
+
+    local fields
+    fields="$(python3 - "$MANIFEST" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))["components"]["dashboard"]
+print(d["asset"]["url"], d["asset"]["name"], d["asset"]["sha256"], d["asset"]["rootPrefix"],
+      d["asset"]["indexHtmlSha256"], d["licenseFile"]["url"], d["licenseFile"]["name"], d["licenseFile"]["sha256"])
+PY
+)"
+    read -r url file sha root_prefix index_sha license_url license_name license_sha <<<"$fields"
+
+    local archive="$CACHE/$file"
+    if [[ ! -f "$archive" ]] || ! echo "$sha  $archive" | sha256sum -c --status; then
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$archive.part" "$url"
+        mv "$archive.part" "$archive"
+    fi
+    echo "$sha  $archive" | sha256sum -c --quiet
+
+    local extract_tmp
+    extract_tmp="$(mktemp -d "$CACHE/dashboard-extract.XXXXXX")"
+    # unzip refuses absolute paths and ".." traversal by default; the archive's own SHA-256 is
+    # already pinned above, so this is defense in depth, not the primary control.
+    unzip -q "$archive" -d "$extract_tmp"
+    local extracted_root="$extract_tmp/${root_prefix%/}"
+    if [[ ! -d "$extracted_root" ]]; then
+        echo "dashboard archive is missing its expected root: $root_prefix" >&2
+        rm -rf "$extract_tmp"
+        exit 1
+    fi
+    if find "$extracted_root" -type l | grep -q .; then
+        echo "dashboard archive contains a symlink" >&2
+        rm -rf "$extract_tmp"
+        exit 1
+    fi
+    if [[ ! -f "$extracted_root/index.html" ]]; then
+        echo "dashboard archive does not contain an index.html at its root" >&2
+        rm -rf "$extract_tmp"
+        exit 1
+    fi
+
+    local dashboard_dir="$PACKAGE_ROOT/dashboard"
+    mv "$extracted_root" "$dashboard_dir"
+    rm -rf "$extract_tmp"
+
+    python3 "$ROOT/scripts/patch_dashboard_csp.py" "$MANIFEST" "$dashboard_dir/index.html"
+    find "$dashboard_dir" -type d -exec chmod 0755 {} \;
+    find "$dashboard_dir" -type f -exec chmod 0644 {} \;
+
+    local license_archive="$CACHE/$license_name"
+    if [[ ! -f "$license_archive" ]] || ! echo "$license_sha  $license_archive" | sha256sum -c --status; then
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$license_archive.part" "$license_url"
+        mv "$license_archive.part" "$license_archive"
+    fi
+    echo "$license_sha  $license_archive" | sha256sum -c --quiet
+    install -m 0644 "$license_archive" "$OUTPUT/usr/share/licenses/multicore/$license_name"
+}
+
 install -m 0755 "$CARGO_TARGET_DIR/release/multicore-desktop" "$PACKAGE_ROOT/multicore"
 install -m 0755 "$CARGO_TARGET_DIR/release/multicore-daemon" "$PACKAGE_ROOT/runtime/multicore-daemon"
 install -m 0755 "$CARGO_TARGET_DIR/release/multicore-core-host" "$PACKAGE_ROOT/runtime/multicore-core-host"
@@ -72,6 +138,7 @@ strip --strip-all "$PACKAGE_ROOT/multicore" "$PACKAGE_ROOT/runtime/multicore-dae
     "$PACKAGE_ROOT/runtime/multicore-core-host"
 fetch_core xray
 fetch_core mihomo
+fetch_dashboard
 
 ln -s ../lib/multicore/multicore "$OUTPUT/usr/bin/multicore"
 install -m 0644 "$ROOT/packaging/linux/multicore.desktop" "$OUTPUT/usr/share/applications/multicore.desktop"
