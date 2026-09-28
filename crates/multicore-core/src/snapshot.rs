@@ -1056,10 +1056,48 @@ impl PersistentSnapshotStore {
             .current
             .write()
             .expect("persistent snapshot lock poisoned") = Some((generation, snapshot.clone()));
+        prune_superseded_generations(&self.root, generation);
         Ok(SnapshotCommit {
             committed: (generation, snapshot),
             maintenance_debt,
         })
+    }
+}
+
+/// How many of the newest snapshot generations are kept on disk. More than
+/// one, so loading still falls back to an older valid generation if the
+/// newest one is damaged.
+const RETAINED_GENERATIONS: u64 = 3;
+
+/// Every publish used to add a generation directory that was never
+/// removed, so a long-lived profile collected one per refresh - and every
+/// profile list rescans all of them. After a successful publish, removes
+/// generations older than the newest `RETAINED_GENERATIONS`, plus staging
+/// directories a previous process left behind when it died mid-publish.
+/// Best-effort: an entry that is still held open (for example a leased
+/// service logo) is simply retried on the next publish.
+fn prune_superseded_generations(root: &DirectoryCapability, newest: u64) {
+    let Ok(entries) = root.entries() else {
+        return;
+    };
+    let own_staging_suffix = format!(".staging-{}", std::process::id());
+    for entry in entries {
+        if !entry.is_directory {
+            continue;
+        }
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
+        let superseded = name
+            .strip_prefix("snapshot-")
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| id.saturating_add(RETAINED_GENERATIONS) <= newest);
+        let abandoned_staging = name.starts_with(".snapshot-")
+            && name.contains(".staging-")
+            && !name.ends_with(&own_staging_suffix);
+        if superseded || abandoned_staging {
+            let _ = root.remove_child_tree(OsStr::new(name));
+        }
     }
 }
 
@@ -2006,6 +2044,83 @@ pub(crate) fn sync_directory(path: &Path) -> Result<(), io::Error> {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+
+    fn minimal_snapshot() -> Snapshot {
+        Snapshot::parse(
+            b"proxies: []
+proxy-groups: []
+rules: []
+",
+            br#"{"outbounds":[]}"#,
+        )
+        .unwrap()
+    }
+
+    fn generation_names(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("snapshot-") || name.starts_with(".snapshot-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn publishing_keeps_only_the_newest_generations_and_sweeps_abandoned_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        // A staging directory a crashed earlier process left behind.
+        let abandoned = root
+            .path()
+            .join(".snapshot-00000000000000000099.staging-4294967295");
+        fs::create_dir(&abandoned).unwrap();
+        fs::write(abandoned.join("mihomo.yaml"), b"partial").unwrap();
+
+        for _ in 0..5 {
+            store.commit(minimal_snapshot()).unwrap();
+        }
+
+        assert_eq!(
+            generation_names(root.path()),
+            [
+                "snapshot-00000000000000000003",
+                "snapshot-00000000000000000004",
+                "snapshot-00000000000000000005",
+            ]
+        );
+        assert_eq!(store.current_generation(), Some(5));
+        let reopened = PersistentSnapshotStore::open(root.path()).unwrap();
+        assert_eq!(reopened.current_generation(), Some(5));
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_pruned_never_fails_the_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        store.commit(minimal_snapshot()).unwrap();
+        // Hold a file of generation 1 open, the way a leased logo would be.
+        #[cfg(windows)]
+        let _held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1) // FILE_SHARE_READ only: blocks deletion
+                .open(
+                    root.path()
+                        .join("snapshot-00000000000000000001")
+                        .join("mihomo.yaml"),
+                )
+                .unwrap()
+        };
+
+        for _ in 0..3 {
+            store.commit(minimal_snapshot()).unwrap();
+        }
+
+        assert_eq!(store.current_generation(), Some(4));
+    }
 
     #[test]
     fn committed_outcome_carries_snapshot_when_post_publication_sync_fails() {

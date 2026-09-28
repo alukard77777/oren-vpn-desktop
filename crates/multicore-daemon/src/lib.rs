@@ -2294,10 +2294,15 @@ where
         self.require_disconnected_mutation().await?;
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
-        let (mut revision, physical_generation, mut snapshot) = self
-            .store
-            .profile_snapshot_generation(id)
-            .map_err(map_profile_error)?;
+        let (mut revision, physical_generation, mut snapshot) =
+            match self.store.profile_snapshot_generation(id) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return Err(self
+                        .map_profile_error_logged("activate_load_failed", error)
+                        .await);
+                }
+            };
         self.retain_profile_logo(id, physical_generation, &snapshot);
         let prepared =
             (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
@@ -2320,7 +2325,11 @@ where
                 snapshot = active_snapshot;
                 true
             }
-            Err(error) => return Err(map_profile_error(error)),
+            Err(error) => {
+                return Err(self
+                    .map_profile_error_logged("activate_failed", error)
+                    .await);
+            }
         };
         let (selections, explicit_selections) =
             initial_and_explicit_selections(&self.store, id, revision, &snapshot);
@@ -2406,10 +2415,11 @@ where
             Ok(_) => false,
             Err(error) if error.mutation_committed() => true,
             Err(error) => {
+                let mapped = self.map_profile_error_logged("delete_failed", error).await;
                 return Err(if stopped_connection {
                     ProfileMutationError::Committed
                 } else {
-                    map_profile_error(error)
+                    mapped
                 });
             }
         };
@@ -2625,7 +2635,14 @@ where
     where
         C: 'static,
     {
-        let (_, previous) = self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let (_, previous) = match self.store.profile_snapshot(id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Err(self
+                    .map_profile_error_logged("refresh_load_failed", error)
+                    .await);
+            }
+        };
         let source_url = previous
             .subscription_source_url()
             .ok_or(ProfileMutationError::Storage)?
@@ -2645,8 +2662,14 @@ where
         if source_url.is_empty() {
             return Err(ProfileMutationError::Storage);
         }
-        let (previous_revision, previous) =
-            self.store.profile_snapshot(id).map_err(map_profile_error)?;
+        let (previous_revision, previous) = match self.store.profile_snapshot(id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Err(self
+                    .map_profile_error_logged("replace_load_failed", error)
+                    .await);
+            }
+        };
         let active = self.store.active_id().as_ref() == Some(id);
         let connected =
             active && self.inner.read().await.state.current() == CoreConnectionState::Connected;
@@ -2679,10 +2702,11 @@ where
                     (revision, physical_generation, persisted, true)
                 }
                 Err(error) => {
+                    let mapped = self.map_profile_error_logged("replace_failed", error).await;
                     return Err(if stopped_connection {
                         ProfileMutationError::Committed
                     } else {
-                        map_profile_error(error)
+                        mapped
                     });
                 }
             };
@@ -2763,6 +2787,26 @@ where
     /// actually was. `detail` is this module's own `ProfileError`/`BackendError`
     /// Display text or a plain phase name - never anything from an external
     /// server - so it's exactly as safe to log as the rest of this event.
+    /// `map_profile_error`, but a failure that collapses into the generic
+    /// Storage bucket is logged first (with its full error chain), so
+    /// refresh/activate/delete failures leave the same diagnostic trail as
+    /// import does. Not-found and limit outcomes already carry a specific
+    /// user-facing message and are mapped without logging.
+    async fn map_profile_error_logged(
+        &self,
+        phase: &str,
+        error: ProfileError,
+    ) -> ProfileMutationError {
+        if !matches!(
+            error,
+            ProfileError::NotFound(_) | ProfileError::LimitReached
+        ) {
+            self.log_mutation_storage_failure(phase, error_chain_text(&error))
+                .await;
+        }
+        map_profile_error(error)
+    }
+
     async fn log_mutation_storage_failure(&self, phase: &str, detail: impl std::fmt::Display) {
         // `Event`'s own `phase` field never reaches `EventDto` (only
         // `message` and `details` do - see core_event_to_dto), so it's
@@ -2792,15 +2836,23 @@ where
         let (snapshot, _) = fetched.into_parts();
         let prepared =
             (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?;
-        let existing = self
-            .store
-            .find_exact_source(trimmed_url)
-            .map_err(map_profile_error)?;
+        let existing = match self.store.find_exact_source(trimmed_url) {
+            Ok(existing) => existing,
+            Err(error) => {
+                return Err(self
+                    .map_profile_error_logged("import_lookup_failed", error)
+                    .await);
+            }
+        };
         let (id, maintenance_debt, previous) = if let Some(id) = existing {
-            let previous = self
-                .store
-                .profile_snapshot(&id)
-                .map_err(map_profile_error)?;
+            let previous = match self.store.profile_snapshot(&id) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    return Err(self
+                        .map_profile_error_logged("import_previous_load_failed", error)
+                        .await);
+                }
+            };
             let replace_debt = match self.store.replace_profile_loaded(&id, snapshot.clone()) {
                 Ok(_) => false,
                 Err(error) if error.mutation_committed() => {

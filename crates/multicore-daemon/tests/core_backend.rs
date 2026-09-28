@@ -2292,3 +2292,46 @@ proxy-groups:
     );
     assert!(backend.connect().await.is_ok());
 }
+
+#[tokio::test]
+async fn activation_storage_failure_leaves_a_diagnostic_event() {
+    // Regression coverage: only import used to log the Storage-bucket
+    // failures behind a generic "backend_error"; activate/refresh/delete
+    // failed with no event at all ("Событий пока нет" in the copied log).
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let first_id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://two.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(root.path().join(&first_id)).unwrap();
+
+    assert!(
+        backend
+            .activate_subscription(&profile_id(&first_id))
+            .await
+            .is_err()
+    );
+    let events = backend.events_after(0).await.unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("activate_load_failed")
+        }),
+        "{events:?}"
+    );
+}
