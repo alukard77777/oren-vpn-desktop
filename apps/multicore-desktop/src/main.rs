@@ -720,6 +720,7 @@ fn main() -> Result<(), slint::PlatformError> {
         loaded_preferences.clone(),
         preference_tracker.clone(),
     )));
+    updater::load_install_result();
     let update_state = Arc::new(Mutex::new(UpdateState::initial()));
     let update_check_started_at = Rc::new(Cell::new(Instant::now()));
 
@@ -1297,11 +1298,38 @@ fn smoke_close_requested() -> bool {
     std::env::var_os("MULTICORE_SMOKE_EXIT_ON_CLOSE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
+/// An error state (failed connect, unreachable daemon) has no tunnel up, so
+/// it is as safe to update from as a ready one. Treating it as busy used to
+/// route the install through the restart confirmation, whose "disconnect
+/// first" path does nothing for these states.
 fn runtime_allows_update(presentation: &StatePresentation) -> bool {
-    !presentation.is_connected
-        && !presentation.is_busy
-        && !presentation.is_error
-        && !presentation.is_degraded
+    !presentation.is_connected && !presentation.is_busy && !presentation.is_degraded
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateConfirmPlan {
+    InstallNow,
+    DisconnectFirst,
+    Wait,
+}
+
+/// What confirming "update and restart" may do right now. Only a
+/// Disconnect/Cleanup primary action is ever started for an update: any other
+/// action (connect, retry) would leave a mutation running that nothing
+/// completes and silently block the main button.
+fn update_confirm_plan(presentation: &StatePresentation) -> UpdateConfirmPlan {
+    if runtime_allows_update(presentation) {
+        UpdateConfirmPlan::InstallNow
+    } else if !presentation.is_busy
+        && matches!(
+            presentation.primary_action,
+            PrimaryAction::Disconnect | PrimaryAction::Cleanup
+        )
+    {
+        UpdateConfirmPlan::DisconnectFirst
+    } else {
+        UpdateConfirmPlan::Wait
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1680,24 +1708,46 @@ fn wire_updater(
 
     let weak = ui.as_weak();
     ui.on_confirm_update_restart(move || {
-        let (runtime_idle, action, client, current) = {
+        let (plan, action, client, current) = {
             let mut model = model.lock().expect("view model lock");
-            let runtime_idle = runtime_allows_update(&model.presentation());
-            let action = (!runtime_idle)
-                .then(|| model.begin_primary_action())
-                .flatten();
+            let plan = update_confirm_plan(&model.presentation());
+            // Checked under the same lock, so begin_primary_action can only
+            // start the Disconnect/Cleanup the plan was based on.
+            let action = match plan {
+                UpdateConfirmPlan::DisconnectFirst => model.begin_primary_action(),
+                UpdateConfirmPlan::InstallNow | UpdateConfirmPlan::Wait => None,
+            };
             let client = model.daemon_client();
-            (runtime_idle, action, client, snapshot(&model))
+            (plan, action, client, snapshot(&model))
         };
+        let started = match (plan, action) {
+            (UpdateConfirmPlan::InstallNow, _) => {
+                start_update_install(weak.clone(), state.clone());
+                true
+            }
+            (
+                UpdateConfirmPlan::DisconnectFirst,
+                Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)),
+            ) => {
+                run_disconnect_for_update(
+                    weak.clone(),
+                    model.clone(),
+                    client,
+                    mutation,
+                    state.clone(),
+                );
+                true
+            }
+            _ => false,
+        };
+        // Nothing could start (an operation is still running): keep the
+        // dialog open instead of closing it as if the update had begun. Its
+        // confirm button is disabled while the runtime is busy.
         if let Some(ui) = weak.upgrade() {
-            ui.set_update_confirm_open(false);
+            if started {
+                ui.set_update_confirm_open(false);
+            }
             apply_snapshot(&ui, &current);
-        }
-        if runtime_idle {
-            start_update_install(weak.clone(), state.clone());
-        } else if let Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)) = action
-        {
-            run_disconnect_for_update(weak.clone(), model.clone(), client, mutation, state.clone());
         }
     });
 }
@@ -1761,7 +1811,9 @@ fn start_update_install(weak: slint::Weak<AppWindow>, state: Arc<Mutex<UpdateSta
         Err(error) => {
             let _ = slint::invoke_from_event_loop(move || {
                 let mut current = state.lock().expect("update state lock");
-                *current = UpdateState::Error(error);
+                // Keep the release so the home banner stays with the reason
+                // and a retry, instead of vanishing as a check error would.
+                *current = UpdateState::InstallFailed(release, error);
                 if let Some(ui) = weak.upgrade() {
                     apply_update_state(&ui, &current, true);
                 }
@@ -1787,7 +1839,9 @@ fn run_update_check(
         }
     }
     thread::spawn(move || {
-        let result = updater::check_latest().unwrap_or_else(UpdateState::Error);
+        let result = updater::with_pending_install_failure(
+            updater::check_latest().unwrap_or_else(UpdateState::Error),
+        );
         let _ = slint::invoke_from_event_loop(move || {
             let runtime_idle =
                 runtime_allows_update(&model.lock().expect("view model lock").presentation());
@@ -3852,6 +3906,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_has_profile(presentation.has_profile);
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
+    ui.set_update_runtime_busy(presentation.is_busy);
     ui.set_dashboard_available(presentation.is_connected);
     ui.set_status_tone(
         match presentation.semantic_tone {
@@ -4056,14 +4111,14 @@ mod window_tests {
         MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_RETRY_DELAYS, PREFERENCE_SAVE_ERROR_RU,
         PendingImportOutcome, PendingSubscriptionConsents, PendingSubscriptionImports,
         PersistenceTracker, PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler,
-        UpdateInstallIntent, WindowObservation, WriterCommand, WriterResult,
+        UpdateConfirmPlan, UpdateInstallIntent, WindowObservation, WriterCommand, WriterResult,
         activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
         drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
         preference_error_for_result, preference_failure_is_terminal,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
-        startup_should_connect, update_check_due, update_install_intent, visible_page_from_name,
-        visible_page_name,
+        startup_should_connect, update_check_due, update_confirm_plan, update_install_intent,
+        visible_page_from_name, visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -5361,12 +5416,125 @@ mod window_tests {
             }
             .presentation()
         ));
-        assert!(!runtime_allows_update(
+        // No tunnel is up in an error state; updating from it must work
+        // directly (regression: it used to route through the restart
+        // confirmation, whose "disconnect first" path did nothing here).
+        assert!(runtime_allows_update(
             &UiState::Error {
                 message: "x".into()
             }
             .presentation()
         ));
+        assert!(runtime_allows_update(
+            &UiState::ServiceUnreachable {
+                message: "x".into()
+            }
+            .presentation()
+        ));
+        assert!(!runtime_allows_update(
+            &UiState::DaemonDegraded {
+                message: "x".into()
+            }
+            .presentation()
+        ));
+    }
+
+    #[test]
+    fn update_confirmation_only_ever_starts_an_install_or_a_disconnect() {
+        let ready = UiState::Ready {
+            profile: "profile".into(),
+            node: "auto".into(),
+        };
+        let connected = UiState::Connected {
+            profile: "profile".into(),
+            node: "node".into(),
+        };
+        let connecting = UiState::Connecting {
+            profile: "profile".into(),
+            node: "node".into(),
+            step: "x".into(),
+        };
+        let disconnecting = UiState::Disconnecting {
+            profile: "profile".into(),
+            node: "node".into(),
+        };
+        let error = UiState::Error {
+            message: "x".into(),
+        };
+        let degraded = UiState::DaemonDegraded {
+            message: "x".into(),
+        };
+        assert_eq!(
+            update_confirm_plan(&ready.presentation()),
+            UpdateConfirmPlan::InstallNow
+        );
+        assert_eq!(
+            update_confirm_plan(&error.presentation()),
+            UpdateConfirmPlan::InstallNow
+        );
+        assert_eq!(
+            update_confirm_plan(&connected.presentation()),
+            UpdateConfirmPlan::DisconnectFirst
+        );
+        assert_eq!(
+            update_confirm_plan(&degraded.presentation()),
+            UpdateConfirmPlan::DisconnectFirst
+        );
+        assert_eq!(
+            update_confirm_plan(&connecting.presentation()),
+            UpdateConfirmPlan::Wait
+        );
+        assert_eq!(
+            update_confirm_plan(&disconnecting.presentation()),
+            UpdateConfirmPlan::Wait
+        );
+
+        // A Retry/Connect primary action must never be started for an update:
+        // nothing completes it, which used to leave the main button dead.
+        let rust = include_str!("main.rs");
+        let confirm = rust
+            .split("ui.on_confirm_update_restart(move || {")
+            .nth(1)
+            .and_then(|source| source.split("fn update_check_due").next())
+            .expect("confirm handler");
+        let begin = confirm
+            .find("model.begin_primary_action()")
+            .expect("disconnect start");
+        let guard = confirm
+            .find("UpdateConfirmPlan::DisconnectFirst =>")
+            .expect("plan guard");
+        assert!(
+            guard < begin,
+            "begin_primary_action must be guarded by the plan"
+        );
+        assert_eq!(confirm.matches("model.begin_primary_action()").count(), 1);
+
+        let ui = include_str!("../ui/app.slint");
+        assert!(ui.contains("in property <bool> update-runtime-busy"));
+        assert!(ui.contains("enabled: !root.update-runtime-busy;"));
+        assert!(ui.contains("(root.update-action-label == \"\" || !root.update-runtime-busy)"));
+        assert!(ui.contains("!(root.update-runtime-busy && root.update-available)"));
+        assert!(rust.contains("ui.set_update_runtime_busy(presentation.is_busy);"));
+    }
+
+    #[test]
+    fn install_failures_keep_the_release_and_startup_reads_the_helper_result() {
+        let rust = include_str!("main.rs");
+        assert!(rust.contains("*current = UpdateState::InstallFailed(release, error);"));
+        assert!(rust.contains("updater::with_pending_install_failure("));
+        let startup = rust
+            .split("fn main()")
+            .nth(1)
+            .and_then(|source| source.split("run_refresh(").next())
+            .expect("startup");
+        let load = startup
+            .find("updater::load_install_result();")
+            .expect("startup reads helper result");
+        let check = startup.find("run_update_check(").expect("startup check");
+        assert!(
+            load < check,
+            "the helper result must be loaded before the first check"
+        );
     }
 
     #[test]

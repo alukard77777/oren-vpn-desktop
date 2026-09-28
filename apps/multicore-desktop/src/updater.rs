@@ -11,7 +11,7 @@ const UPDATE_USER_AGENT: &str = concat!("multicore-updater/", env!("CARGO_PKG_VE
 #[cfg(target_os = "linux")]
 const REPLACEMENT_DETAIL: &str = "Будет заменён файл AppImage";
 #[cfg(not(target_os = "linux"))]
-const REPLACEMENT_DETAIL: &str = "Будет заменён весь portable-пакет";
+const REPLACEMENT_DETAIL: &str = "Будет заменена установленная версия";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UpdateAction {
@@ -29,6 +29,9 @@ pub(crate) enum UpdateState {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Managed(GitHubRelease),
     Downloading(GitHubRelease),
+    /// Installing `release` failed; the release is kept so the banner stays
+    /// visible with the reason and the install can be retried.
+    InstallFailed(GitHubRelease, String),
     Error(String),
 }
 
@@ -97,7 +100,7 @@ impl UpdateState {
                 } else {
                     "Туннель будет остановлен, а клиент перезапущен".into()
                 },
-                action_label: "Обновить".into(),
+                action_label: "Установить".into(),
                 action: UpdateAction::Install,
                 action_enabled: true,
                 available: true,
@@ -121,6 +124,15 @@ impl UpdateState {
                 available: true,
                 busy: true,
             },
+            Self::InstallFailed(release, message) => UpdatePresentation {
+                status: format!("Не удалось установить версию {}", release.version()),
+                detail: message.clone(),
+                action_label: "Повторить".into(),
+                action: UpdateAction::Install,
+                action_enabled: true,
+                available: true,
+                busy: false,
+            },
             Self::Error(message) => UpdatePresentation {
                 status: "Не удалось проверить обновления".into(),
                 detail: message.clone(),
@@ -143,7 +155,7 @@ impl UpdateState {
 
     pub(crate) fn available_release(&self) -> Option<GitHubRelease> {
         match self {
-            Self::Available(release) => Some(release.clone()),
+            Self::Available(release) | Self::InstallFailed(release, _) => Some(release.clone()),
             _ => None,
         }
     }
@@ -336,11 +348,18 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
         .to_path_buf();
     let helper_source = target.join("runtime").join("multicore-updater.exe");
     if !helper_source.is_file() {
-        return Err("В portable-пакете нет runtime/multicore-updater.exe".into());
+        return Err("В установке нет программы обновления (runtime/multicore-updater.exe)".into());
     }
-    let helper = update_dir.join(format!("multicore-apply-{}.exe", release.version()));
+    remove_stale_helpers(&update_dir);
+    // The PID keeps a still-running helper from an earlier attempt at the
+    // same version (it can wait for ~90 s) from blocking this copy.
+    let helper = update_dir.join(format!(
+        "{HELPER_PREFIX}{}-{}.exe",
+        release.version(),
+        std::process::id()
+    ));
     fs::copy(&helper_source, &helper)
-        .map_err(|_| "Не удалось подготовить helper обновления".to_owned())?;
+        .map_err(|_| "Не удалось подготовить программу обновления".to_owned())?;
 
     let mut command = Command::new(helper);
     command
@@ -365,8 +384,103 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
     }
     command
         .spawn()
-        .map_err(|_| "Не удалось запустить helper обновления".to_owned())?;
+        .map_err(|_| "Не удалось запустить программу обновления".to_owned())?;
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+const HELPER_PREFIX: &str = "multicore-apply-";
+
+/// Best-effort: copies from earlier attempts are no longer needed; one that
+/// is still running is locked and simply stays until the next attempt.
+#[cfg(not(target_os = "linux"))]
+fn remove_stale_helpers(update_dir: &Path) {
+    let Ok(entries) = fs::read_dir(update_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_helper = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(HELPER_PREFIX) && name.ends_with(".exe"));
+        if is_helper {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Outcome the Windows update helper writes after it tried to swap in a new
+/// version (see `write_result` in apps/multicore-updater). Only a failure is
+/// kept: the helper relaunches the *old* client then, and without reading
+/// this the user just sees the same "update available" banner again with no
+/// explanation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstallFailure {
+    pub version: String,
+    pub message: String,
+}
+
+#[cfg(not(target_os = "linux"))]
+const RESULT_FILE: &str = "result.json";
+
+static PENDING_INSTALL_FAILURE: std::sync::Mutex<Option<InstallFailure>> =
+    std::sync::Mutex::new(None);
+
+/// Reads and deletes the helper's result file once at startup, remembering a
+/// failure for the next update check (see `with_pending_install_failure`).
+pub(crate) fn load_install_result() {
+    #[cfg(not(target_os = "linux"))]
+    if let Ok(update_dir) = update_directory()
+        && let Some(failure) = take_install_failure_in(&update_dir)
+    {
+        *PENDING_INSTALL_FAILURE
+            .lock()
+            .expect("pending install failure lock") = Some(failure);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn take_install_failure_in(update_dir: &Path) -> Option<InstallFailure> {
+    #[derive(serde::Deserialize)]
+    struct HelperResult {
+        success: bool,
+        version: String,
+        message: String,
+    }
+    let path = update_dir.join(RESULT_FILE);
+    let bytes = fs::read(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let result: HelperResult = serde_json::from_slice(&bytes).ok()?;
+    (!result.success).then(|| InstallFailure {
+        version: result.version,
+        message: result.message.chars().take(300).collect(),
+    })
+}
+
+/// Turns a fresh check result into `InstallFailed` when the last install of
+/// that same release failed, so the banner explains why it is still offered.
+pub(crate) fn with_pending_install_failure(state: UpdateState) -> UpdateState {
+    let mut pending = PENDING_INSTALL_FAILURE
+        .lock()
+        .expect("pending install failure lock");
+    merge_install_failure(state, &mut pending)
+}
+
+fn merge_install_failure(state: UpdateState, pending: &mut Option<InstallFailure>) -> UpdateState {
+    match state {
+        UpdateState::Available(release) => match pending.take() {
+            Some(failure) if failure.version == release.version().to_string() => {
+                UpdateState::InstallFailed(release, failure.message)
+            }
+            _ => UpdateState::Available(release),
+        },
+        UpdateState::Current => {
+            *pending = None;
+            UpdateState::Current
+        }
+        // A failed check keeps the install failure for the next one.
+        other => other,
+    }
 }
 
 fn download_release(release: &GitHubRelease, destination: &Path) -> Result<(), String> {
@@ -530,6 +644,112 @@ mod tests {
         assert_eq!(connected.action, UpdateAction::Install);
         assert!(connected.action_enabled);
         assert!(connected.detail.contains("перезапущен"));
+    }
+
+    #[test]
+    fn available_install_is_labelled_install_not_refresh() {
+        // "Обновить" sat right above the subscription's own "Обновить"
+        // button, and users confused the two.
+        let ui = UpdateState::Available(release()).presentation(true);
+        assert_eq!(ui.action_label, "Установить");
+        assert!(!ui.detail.contains("portable"));
+    }
+
+    #[test]
+    fn install_failure_keeps_the_banner_with_the_reason_and_a_retry() {
+        let state = UpdateState::InstallFailed(release(), "Файл занят".into());
+        let ui = state.presentation(true);
+        assert!(ui.available, "the home banner must stay visible");
+        assert_eq!(ui.action, UpdateAction::Install);
+        assert!(ui.action_enabled);
+        assert!(ui.status.contains("0.2.0"));
+        assert_eq!(ui.detail, "Файл занят");
+        assert!(state.available_release().is_some());
+    }
+
+    #[test]
+    fn a_pending_install_failure_marks_only_the_same_release() {
+        let failure = || {
+            Some(super::InstallFailure {
+                version: "0.2.0".into(),
+                message: "swap failed".into(),
+            })
+        };
+
+        let mut pending = failure();
+        match super::merge_install_failure(UpdateState::Available(release()), &mut pending) {
+            UpdateState::InstallFailed(_, message) => assert_eq!(message, "swap failed"),
+            other => panic!("expected InstallFailed, got {other:?}"),
+        }
+        assert!(pending.is_none(), "shown once");
+
+        let mut pending = Some(super::InstallFailure {
+            version: "0.1.9".into(),
+            message: "old".into(),
+        });
+        assert!(matches!(
+            super::merge_install_failure(UpdateState::Available(release()), &mut pending),
+            UpdateState::Available(_)
+        ));
+
+        let mut pending = failure();
+        assert!(matches!(
+            super::merge_install_failure(UpdateState::Error("offline".into()), &mut pending),
+            UpdateState::Error(_)
+        ));
+        assert!(
+            pending.is_some(),
+            "a failed check keeps it for the next one"
+        );
+        assert!(matches!(
+            super::merge_install_failure(UpdateState::Current, &mut pending),
+            UpdateState::Current
+        ));
+        assert!(pending.is_none());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn helper_result_file_is_read_once_and_only_failures_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = temp.path().join("result.json");
+
+        assert_eq!(super::take_install_failure_in(temp.path()), None);
+
+        std::fs::write(
+            &result,
+            br#"{"success":false,"version":"0.2.0","message":"Access denied","timestamp_unix":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::take_install_failure_in(temp.path()),
+            Some(super::InstallFailure {
+                version: "0.2.0".into(),
+                message: "Access denied".into(),
+            })
+        );
+        assert!(!result.exists(), "the result is consumed");
+
+        std::fs::write(
+            &result,
+            br#"{"success":true,"version":"0.2.0","message":"ok","timestamp_unix":1}"#,
+        )
+        .unwrap();
+        assert_eq!(super::take_install_failure_in(temp.path()), None);
+        assert!(!result.exists());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn stale_helper_copies_are_removed_but_other_files_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("multicore-apply-0.2.0-123.exe");
+        let archive = temp.path().join("multicore-0.2.0.zip");
+        std::fs::write(&helper, b"x").unwrap();
+        std::fs::write(&archive, b"x").unwrap();
+        super::remove_stale_helpers(temp.path());
+        assert!(!helper.exists());
+        assert!(archive.exists());
     }
 
     #[cfg(not(target_os = "linux"))]
