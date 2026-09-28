@@ -3,7 +3,9 @@ pub mod elevated_controller;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
-    fmt, io,
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Seek, SeekFrom, Write},
     marker::PhantomData,
     net::SocketAddr,
     sync::{
@@ -1443,6 +1445,7 @@ impl IntoResponse for ApiError {
 struct EventBuffer<T> {
     entries: VecDeque<(u64, T)>,
     next_event_id: u64,
+    persistent: Option<std::sync::Mutex<PersistentEventSink>>,
 }
 
 impl<T> Default for EventBuffer<T> {
@@ -1450,6 +1453,7 @@ impl<T> Default for EventBuffer<T> {
         Self {
             entries: VecDeque::with_capacity(MAX_RETAINED_EVENTS),
             next_event_id: 1,
+            persistent: None,
         }
     }
 }
@@ -1474,6 +1478,195 @@ impl<T> EventBuffer<T> {
             .filter(move |(id, _)| *id > cursor)
             .take(MAX_EVENT_PAGE_SIZE)
             .map(|(id, event)| (*id, event))
+    }
+}
+
+/// Caps how large a persisted event log is allowed to grow before it is
+/// cleared and started over, mirroring `multicore-core`'s
+/// `MAX_PERSISTENT_LOG_BYTES` for the (separate) core stdout log.
+const MAX_PERSISTENT_EVENT_LOG_BYTES: u64 = 1_048_576;
+
+/// Disk-backed sibling of the in-memory `EventBuffer`. Unlike
+/// `multicore-core`'s `PersistentLogSink` (which is scoped to a single
+/// process run and truncates on open), this one is opened in place and keeps
+/// prior runs' events, because the whole point is surviving a daemon
+/// restart between a real failure and a user getting around to exporting a
+/// diagnostics log. Every event was already redacted by `Event::new` before
+/// it ever reaches here, so writing it verbatim is safe.
+#[derive(Debug)]
+struct PersistentEventSink {
+    file: File,
+    bytes_written: u64,
+    disabled: bool,
+}
+
+impl PersistentEventSink {
+    fn open(path: &std::path::Path) -> io::Result<Self> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(path)?;
+        let bytes_written = file.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            file,
+            bytes_written,
+            disabled: false,
+        })
+    }
+
+    fn write_line(&mut self, line: &str) {
+        if self.disabled {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        let result = (|| -> io::Result<()> {
+            if self.bytes_written.saturating_add(bytes.len() as u64)
+                > MAX_PERSISTENT_EVENT_LOG_BYTES
+            {
+                self.file.set_len(0)?;
+                self.file.seek(SeekFrom::Start(0))?;
+                self.bytes_written = 0;
+            }
+            self.file.seek(SeekFrom::Start(self.bytes_written))?;
+            self.file.write_all(&bytes)?;
+            self.file.flush()?;
+            self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.disabled = true;
+        }
+    }
+}
+
+fn load_persisted_events(path: &std::path::Path) -> Vec<Event> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+        .collect()
+}
+
+impl EventBuffer<Event> {
+    /// Reloads events a prior daemon process persisted at `path`, then keeps
+    /// appending new ones to the same file. Falls back to memory-only (the
+    /// prior behaviour) if the file can't be created or read - a broken
+    /// diagnostics log must never stop the daemon from running.
+    fn persistent_or_memory(path: impl AsRef<std::path::Path>) -> Self {
+        let path = path.as_ref();
+        let mut buffer = Self::default();
+        for event in load_persisted_events(path) {
+            buffer.push_with(|_id| event);
+        }
+        if let Ok(sink) = PersistentEventSink::open(path) {
+            buffer.persistent = Some(std::sync::Mutex::new(sink));
+        }
+        buffer
+    }
+
+    fn push_event_with(&mut self, build: impl FnOnce(u64) -> Event) -> u64 {
+        let id = self.push_with(build);
+        if let Some(sink) = &self.persistent
+            && let Some((_, event)) = self.entries.back()
+            && let Ok(line) = serde_json::to_string(event)
+        {
+            sink.lock()
+                .expect("persistent event sink lock poisoned")
+                .write_line(&line);
+        }
+        id
+    }
+}
+
+#[cfg(test)]
+mod event_persistence_tests {
+    use super::{Component, Event, EventBuffer, Severity};
+
+    fn sample_event(id: u64) -> Event {
+        Event::new(
+            id,
+            Severity::Warning,
+            Component::Subscription,
+            "subscription_fetch_failed",
+            format!("daemon-{id:016x}"),
+            &format!("attempt {id} failed"),
+            serde_json::json!({ "host": "example.invalid" }),
+        )
+    }
+
+    #[test]
+    fn events_persisted_by_one_buffer_are_recovered_by_a_fresh_one_at_the_same_path() {
+        // Regression coverage for a real bug report: a genuine subscription-add
+        // failure on a user's machine produced an empty "Копировать лог" export
+        // because the daemon's event buffer was purely in-memory and had been
+        // wiped by a restart between the failure and the export.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("events.log");
+
+        let mut first_run = EventBuffer::<Event>::persistent_or_memory(&path);
+        first_run.push_event_with(|_| sample_event(1));
+        first_run.push_event_with(|_| sample_event(2));
+        drop(first_run);
+
+        let second_run = EventBuffer::<Event>::persistent_or_memory(&path);
+        let recovered: Vec<_> = second_run.after(0).map(|(_, event)| event).collect();
+        assert_eq!(recovered.len(), 2, "both prior-run events must survive a restart");
+        let serialized = recovered
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>();
+        assert!(serialized[0].contains("attempt 1 failed"));
+        assert!(serialized[1].contains("attempt 2 failed"));
+    }
+
+    #[test]
+    fn events_persisted_across_two_restarts_keep_accumulating() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("events.log");
+
+        let mut run_one = EventBuffer::<Event>::persistent_or_memory(&path);
+        run_one.push_event_with(|_| sample_event(1));
+        drop(run_one);
+
+        let mut run_two = EventBuffer::<Event>::persistent_or_memory(&path);
+        assert_eq!(run_two.after(0).count(), 1, "run two must recover run one's event");
+        run_two.push_event_with(|_| sample_event(2));
+        drop(run_two);
+
+        let run_three = EventBuffer::<Event>::persistent_or_memory(&path);
+        assert_eq!(
+            run_three.after(0).count(),
+            2,
+            "run three must recover both prior events, not just the latest run's"
+        );
+    }
+
+    #[test]
+    fn missing_directory_falls_back_to_memory_instead_of_failing() {
+        // The parent can't be created (it's actually a file), so
+        // `PersistentEventSink::open` fails and persistence must be skipped
+        // silently rather than ever stopping the daemon from starting.
+        let directory = tempfile::tempdir().expect("temp dir");
+        let blocking_file = directory.path().join("not-a-directory");
+        std::fs::write(&blocking_file, b"blocked").expect("write blocking file");
+        let path = blocking_file.join("events.log");
+
+        let mut buffer = EventBuffer::<Event>::persistent_or_memory(&path);
+        assert!(buffer.persistent.is_none());
+        buffer.push_event_with(|_| sample_event(1));
+        assert_eq!(buffer.after(0).count(), 1, "in-memory buffer still works");
     }
 }
 
@@ -1581,6 +1774,13 @@ impl<P: ProcessController> CoreRuntime<P> {
             message: None,
             degraded: false,
             events: EventBuffer::default(),
+        }
+    }
+
+    fn with_events_log(path: &std::path::Path) -> Self {
+        Self {
+            events: EventBuffer::persistent_or_memory(path),
+            ..Self::empty()
         }
     }
 
@@ -1768,7 +1968,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         message: &str,
         details: serde_json::Value,
     ) {
-        self.events.push_with(|id| {
+        self.events.push_event_with(|id| {
             Event::new(
                 unix_timestamp_ms(),
                 severity,
@@ -1810,7 +2010,7 @@ where
         let controller_factory: Arc<PreparedFactory<P>> = Arc::new(move |snapshot: &Snapshot| {
             controller_factory(snapshot).map(PreparedController::plain)
         });
-        Self::from_prepared_factory(store, fetcher, controller_factory, selector)
+        Self::from_prepared_factory(store, fetcher, controller_factory, selector, None)
     }
 }
 
@@ -1839,10 +2039,39 @@ where
         controller_factory: TransactionalControllerFactory<F>,
         selector: Arc<dyn MihomoSelector>,
     ) -> Result<Self, BackendError> {
+        Self::new_transactional_with_selector_and_events_log(
+            store,
+            fetcher,
+            controller_factory,
+            selector,
+            None,
+        )
+    }
+
+    /// Same as `new_transactional_with_selector`, but persists the daemon's
+    /// event log to `events_log_path` (when given) so a real failure's
+    /// diagnostics survive a daemon restart between the failure and a user
+    /// exporting the log. Falls back to memory-only if the file can't be
+    /// used. Production (`multicore-daemon`'s `main.rs`) always passes
+    /// `Some(...)`; tests generally don't need this and can keep calling
+    /// `new_transactional_with_selector`.
+    pub fn new_transactional_with_selector_and_events_log(
+        store: ProfileStore,
+        fetcher: SubscriptionFetcher<C>,
+        controller_factory: TransactionalControllerFactory<F>,
+        selector: Arc<dyn MihomoSelector>,
+        events_log_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, BackendError> {
         let factory = controller_factory.0;
         let controller_factory: Arc<PreparedFactory<P>> =
             Arc::new(move |snapshot: &Snapshot| factory(snapshot));
-        Self::from_prepared_factory(store, fetcher, controller_factory, selector)
+        Self::from_prepared_factory(
+            store,
+            fetcher,
+            controller_factory,
+            selector,
+            events_log_path,
+        )
     }
 }
 
@@ -1856,8 +2085,12 @@ where
         fetcher: SubscriptionFetcher<C>,
         controller_factory: Arc<PreparedFactory<P>>,
         selector: Arc<dyn MihomoSelector>,
+        events_log_path: Option<std::path::PathBuf>,
     ) -> Result<Self, BackendError> {
-        let mut inner = CoreRuntime::empty();
+        let mut inner = match &events_log_path {
+            Some(path) => CoreRuntime::with_events_log(path),
+            None => CoreRuntime::empty(),
+        };
         let mut profile_logo_leases = HashMap::new();
         inner.active_profile_id = store.active_id();
         if let Ok(Some((id, revision, physical_generation, snapshot))) =

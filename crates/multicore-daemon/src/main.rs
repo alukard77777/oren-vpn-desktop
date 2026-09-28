@@ -106,8 +106,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         Ok(PreparedController::with_runtime(controller, staged))
     });
-    let backend =
-        CoreBackend::new_transactional_with_selector(store, fetcher, controller_factory, selector)?;
+    // Persisted so a real subscription-add failure's diagnostics survive a
+    // daemon restart between the failure and a user exporting the log via
+    // "Копировать лог" - without this, the in-memory event buffer was empty
+    // by the time anyone checked it (see the "Событий пока нет" bug report).
+    let events_log_path = data_directory.join("logs").join("events.log");
+    let backend = CoreBackend::new_transactional_with_selector_and_events_log(
+        store,
+        fetcher,
+        controller_factory,
+        selector,
+        Some(events_log_path),
+    )?;
 
     let app = match dashboard_url {
         Some(dashboard_url) => try_router_with_dashboard_url(backend, token, dashboard_url)?,

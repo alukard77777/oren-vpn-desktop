@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 static HTTP_URL: LazyLock<Regex> =
@@ -17,7 +17,7 @@ static UUID: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static UUID regex")
 });
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Debug,
@@ -26,7 +26,7 @@ pub enum Severity {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Component {
     Core,
@@ -35,7 +35,12 @@ pub enum Component {
     Xray,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// `Deserialize` exists so a daemon can reload its own previously-persisted,
+/// already-redacted event log (see `multicore-daemon`'s `PersistentEventSink`)
+/// across a restart. Every field was already redacted by `Event::new` before
+/// it was ever serialized, so reconstructing an `Event` from that JSON never
+/// re-introduces anything sensitive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     timestamp_ms: u64,
     severity: Severity,
