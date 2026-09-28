@@ -529,7 +529,7 @@ fn open_windows_directory(
     let access = GENERIC_READ
         | if repair_permissions { GENERIC_WRITE } else { 0 }
         | if removable { DELETE } else { 0 };
-    let handle = retry_on_transient_windows_lock("open directory", path, || {
+    let handle = retry_on_transient_windows_lock("open directory", path, false, || {
         fs::OpenOptions::new()
             .read(true)
             .access_mode(access)
@@ -552,7 +552,7 @@ fn open_windows_directory(
         ));
     }
     if repair_permissions {
-        retry_on_transient_windows_lock("secure directory", path, || {
+        retry_on_transient_windows_lock("secure directory", path, false, || {
             super::snapshot::secure_directory(path)
         })?;
     }
@@ -610,8 +610,8 @@ fn open_windows_file(
         Foundation::{GENERIC_READ, GENERIC_WRITE},
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
         },
     };
     let path = directory.display_path.join(name);
@@ -625,14 +625,20 @@ fn open_windows_file(
         GENERIC_READ
     };
     let operation_name = if create_new { "create" } else { "open" };
-    let file = retry_on_transient_windows_lock(operation_name, &path, || {
+    let file = retry_on_transient_windows_lock(operation_name, &path, false, || {
         fs::OpenOptions::new()
             .read(!create_new)
             .write(create_new)
             .create_new(create_new)
             .access_mode(access)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+            // BACKUP_SEMANTICS lets an existing *directory* at this name open
+            // too, so the attribute check below reports it as "not a regular
+            // file" instead of CreateFile failing with ERROR_ACCESS_DENIED -
+            // which the lock retry would otherwise wait out for seconds.
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_BACKUP_SEMANTICS,
+            )
             .open(&path)
     })?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -646,7 +652,9 @@ fn open_windows_file(
         ));
     }
     if repair_permissions {
-        retry_on_transient_windows_lock("secure", &path, || super::snapshot::secure_file(&path))?;
+        retry_on_transient_windows_lock("secure", &path, false, || {
+            super::snapshot::secure_file(&path)
+        })?;
     }
     Ok(file)
 }
@@ -663,7 +671,7 @@ fn open_windows_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::
         },
     };
     let path = directory.display_path.join(name);
-    let file = retry_on_transient_windows_lock("open lock", &path, || {
+    let file = retry_on_transient_windows_lock("open lock", &path, false, || {
         fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -684,7 +692,9 @@ fn open_windows_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::
             "profile lock is not a regular file",
         ));
     }
-    retry_on_transient_windows_lock("secure lock", &path, || super::snapshot::secure_file(&path))?;
+    retry_on_transient_windows_lock("secure lock", &path, false, || {
+        super::snapshot::secure_file(&path)
+    })?;
     Ok(file)
 }
 
@@ -769,7 +779,7 @@ fn rename_windows_handle(
             name.len(),
         );
     }
-    retry_on_transient_windows_lock("rename", source_path, || {
+    retry_on_transient_windows_lock("rename", source_path, true, || {
         if unsafe {
             SetFileInformationByHandle(
                 source.as_raw_handle(),
@@ -779,7 +789,14 @@ fn rename_windows_handle(
             )
         } == 0
         {
-            Err(io::Error::last_os_error())
+            let error = io::Error::last_os_error();
+            if replace && target.is_dir() {
+                // Replacing an existing directory is refused with the same
+                // os error 5 a held child produces, but it never clears up
+                // on its own - fail it immediately instead of retrying.
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
+            }
+            Err(error)
         } else {
             Ok(())
         }
@@ -803,6 +820,7 @@ fn rename_windows_handle(
 fn retry_on_transient_windows_lock<T>(
     operation_name: &'static str,
     target: &Path,
+    retry_access_denied: bool,
     operation: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
     const MAX_ATTEMPTS: u32 = 40;
@@ -810,6 +828,7 @@ fn retry_on_transient_windows_lock<T>(
     retry_on_transient_windows_lock_with_budget(
         operation_name,
         target,
+        retry_access_denied,
         MAX_ATTEMPTS,
         RETRY_DELAY,
         operation,
@@ -823,6 +842,7 @@ fn retry_on_transient_windows_lock<T>(
 fn retry_on_transient_windows_lock_with_budget<T>(
     operation_name: &'static str,
     target: &Path,
+    retry_access_denied: bool,
     max_attempts: u32,
     retry_delay: std::time::Duration,
     mut operation: impl FnMut() -> io::Result<T>,
@@ -834,10 +854,14 @@ fn retry_on_transient_windows_lock_with_budget<T>(
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
-                let is_retryable = matches!(
-                    error.raw_os_error(),
-                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
-                );
+                // Opens only ever reported 32 for a held entry; a 5 there is a
+                // real permission problem and must fail fast. A directory
+                // rename reports a held child as 5, so only rename retries it.
+                let is_retryable = match error.raw_os_error() {
+                    Some(ERROR_SHARING_VIOLATION) => true,
+                    Some(ERROR_ACCESS_DENIED) => retry_access_denied,
+                    _ => false,
+                };
                 if !is_retryable {
                     return Err(error);
                 }
@@ -1227,6 +1251,7 @@ mod windows_rename_tests {
         let error = retry_on_transient_windows_lock_with_budget(
             "open",
             &path,
+            false,
             3,
             Duration::from_millis(20),
             || fs::File::open(&path),
@@ -1261,6 +1286,7 @@ mod windows_rename_tests {
         let error = retry_on_transient_windows_lock_with_budget(
             "open",
             &missing,
+            false,
             5,
             Duration::from_millis(20),
             || {

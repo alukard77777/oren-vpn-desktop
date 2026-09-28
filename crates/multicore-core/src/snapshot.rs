@@ -1839,6 +1839,17 @@ fn apply_owner_only_acl(path: &Path, inheritable: bool) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         let user = unsafe { &*(token_info.as_ptr().cast::<TOKEN_USER>()) };
+        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // Reading the current DACL is cheap and side-effect free; rewriting
+        // it is not. Every store open repairs permissions, and the profile
+        // list is polled, so an unconditional rewrite touched every snapshot
+        // file on every poll - and a security change makes real-time
+        // scanners rescan the file, keeping it open right when the next
+        // write needs it (the Windows 10 os error 32 on subscription
+        // import). Only write when the DACL is not already owner-only.
+        if dacl_is_owner_only(&wide_path, user.User.Sid, inheritable) {
+            return Ok(());
+        }
         let trustee = TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -1861,7 +1872,6 @@ fn apply_owner_only_acl(path: &Path, inheritable: bool) -> io::Result<()> {
         if status != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
-        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let status = unsafe {
             SetNamedSecurityInfoW(
                 wide_path.as_mut_ptr(),
@@ -1881,6 +1891,90 @@ fn apply_owner_only_acl(path: &Path, inheritable: bool) -> io::Result<()> {
     })();
     unsafe { CloseHandle(token) };
     result
+}
+
+/// Whether `path` already carries exactly the DACL `apply_owner_only_acl`
+/// would write: protected, one explicit allow-all ACE for `user`, with the
+/// same inheritance flags. Any failure to read it counts as "no", so the
+/// caller falls back to writing it.
+#[cfg(windows)]
+fn dacl_is_owner_only(
+    wide_path: &[u16],
+    user: windows_sys::Win32::Security::PSID,
+    inheritable: bool,
+) -> bool {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        },
+        Storage::FileSystem::FILE_ALL_ACCESS,
+    };
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const INHERITANCE_FLAGS: u8 = 0x1f;
+    let expected_flags: u8 = if inheritable { 0x03 } else { 0x00 };
+
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        return false;
+    }
+    let matches = (|| {
+        if dacl.is_null() {
+            return false;
+        }
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return false;
+        }
+        let mut size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut size as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+            || size.AceCount != 1
+        {
+            return false;
+        }
+        let mut ace: *mut c_void = ptr::null_mut();
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+            return false;
+        }
+        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        ace.Header.AceType == ACCESS_ALLOWED_ACE_TYPE
+            && ace.Header.AceFlags & INHERITANCE_FLAGS == expected_flags
+            && ace.Mask == FILE_ALL_ACCESS
+            && unsafe { EqualSid(ptr::addr_of!(ace.SidStart).cast_mut().cast(), user) } != 0
+    })();
+    unsafe { LocalFree(descriptor.cast()) };
+    matches
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1957,6 +2051,126 @@ mod persistence_tests {
             root.path()
                 .join("snapshot-00000000000000000002/service-logo.png")
                 .is_file()
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod owner_only_acl_tests {
+    use super::{dacl_is_owner_only, secure_directory, secure_file};
+    use std::{os::windows::ffi::OsStrExt, path::Path};
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn current_user_sid() -> Vec<usize> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            Security::{GetTokenInformation, TOKEN_QUERY, TokenUser},
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+        let mut token: HANDLE = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let mut needed = 0_u32;
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        let mut buffer = vec![0_usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            },
+            0
+        );
+        unsafe { CloseHandle(token) };
+        buffer
+    }
+
+    fn change_time(path: &Path) -> i64 {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+        let file = std::fs::File::open(path).unwrap();
+        let mut info = FILE_BASIC_INFO::default();
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    (&mut info as *mut FILE_BASIC_INFO).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            },
+            0
+        );
+        info.ChangeTime
+    }
+
+    #[test]
+    fn detects_owner_only_dacl_only_after_it_was_applied() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("mihomo.yaml");
+        std::fs::write(&file, b"x").unwrap();
+        let token = current_user_sid();
+        let sid = unsafe {
+            (*token
+                .as_ptr()
+                .cast::<windows_sys::Win32::Security::TOKEN_USER>())
+            .User
+            .Sid
+        };
+
+        assert!(
+            !dacl_is_owner_only(&wide(&file), sid, false),
+            "inherited DACL"
+        );
+        secure_file(&file).unwrap();
+        assert!(dacl_is_owner_only(&wide(&file), sid, false));
+        assert!(
+            !dacl_is_owner_only(&wide(&file), sid, true),
+            "a file DACL must not be mistaken for the inheritable directory one"
+        );
+
+        let directory = temp.path().join("snapshot-00000000000000000001");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(!dacl_is_owner_only(&wide(&directory), sid, true));
+        secure_directory(&directory).unwrap();
+        assert!(dacl_is_owner_only(&wide(&directory), sid, true));
+    }
+
+    /// Regression coverage for the Windows 10 import failure: repairing an
+    /// already-correct DACL must not touch the file at all, because every
+    /// security change makes real-time scanners reopen it.
+    #[test]
+    fn securing_an_already_secured_file_does_not_modify_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("xray.json");
+        std::fs::write(&file, b"{}").unwrap();
+        secure_file(&file).unwrap();
+        let before = change_time(&file);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        secure_file(&file).unwrap();
+
+        assert_eq!(change_time(&file), before, "the DACL was rewritten again");
+
+        // Self-check that ChangeTime really reflects DACL writes: applying a
+        // *different* DACL (the inheritable directory form) must move it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        secure_directory(&file).unwrap();
+        assert_ne!(
+            change_time(&file),
+            before,
+            "ChangeTime does not track DACL writes"
         );
     }
 }

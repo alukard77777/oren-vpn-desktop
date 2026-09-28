@@ -173,14 +173,12 @@ fn backend_with_mihomo(
 }
 
 fn obstruct_selection_storage(profile: &std::path::Path) {
-    #[cfg(windows)]
-    std::fs::create_dir(profile.join("selections.json.tmp")).unwrap();
-    #[cfg(unix)]
-    {
-        let target = profile.join("selections.json");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("obstruction"), b"").unwrap();
-    }
+    // A non-empty directory where the selections file must be replaced.
+    // (A stale directory at the temporary name is now cleaned up on every
+    // platform, so it no longer obstructs anything.)
+    let target = profile.join("selections.json");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("obstruction"), b"").unwrap();
 }
 
 fn persisted_backend(
