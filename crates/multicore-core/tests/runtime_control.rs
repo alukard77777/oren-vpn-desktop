@@ -75,6 +75,117 @@ fn live_dns_uses_only_yandex_for_endpoints_without_static_ip_pinning() {
 }
 
 #[test]
+fn mihomo_nameserver_policy_routes_live_endpoint_domains_directly_around_the_dns_hijack() {
+    // Mihomo's TUN device hijacks every outbound port-53 packet on the system
+    // (`dns-hijack: [any:53]`) regardless of source process or destination
+    // address, so Xray's own scoped resolver query for an endpoint domain
+    // never actually reaches 77.88.8.8: it gets redirected straight back
+    // into Mihomo, which then tries to resolve it through its normal
+    // proxy-routed nameservers - which depend on the very proxy connection
+    // that resolving this domain is needed to establish. A live capture on
+    // real hardware reproduced this exact deadlock: the endpoint domain
+    // never resolved, indefinitely, once the TUN adapter came up, even
+    // though the same resolver answered fine for every other domain.
+    // `nameserver-policy` must route it directly, breaking the cycle.
+    let mihomo = br#"
+proxies: []
+tun:
+  enable: true
+  dns-hijack: [any:53]
+dns:
+  enhanced-mode: fake-ip
+  nameserver-policy:
+    'other.example': 1.1.1.1
+"#;
+    let xray = br#"{"outbounds": [{"tag":"vpn","protocol":"shadowsocks",
+        "settings":{"address":"se.acmevpn.net","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, xray).unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let policy = runtime
+        .as_mapping()
+        .unwrap()
+        .get(Value::String("dns".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap()
+        .get(Value::String("nameserver-policy".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+
+    assert_eq!(
+        policy.get(Value::String("se.acmevpn.net".to_owned())),
+        Some(&Value::String("77.88.8.8".to_owned()))
+    );
+    // The provider's own unrelated policy entry survives the merge.
+    assert_eq!(
+        policy.get(Value::String("other.example".to_owned())),
+        Some(&Value::String("1.1.1.1".to_owned()))
+    );
+}
+
+#[test]
+fn mihomo_nameserver_policy_is_untouched_without_a_live_endpoint_domain() {
+    let mihomo = br#"
+proxies: []
+dns:
+  enhanced-mode: fake-ip
+"#;
+    // No live-DNS interface configured at all.
+    let xray = br#"{"outbounds": [{"tag":"vpn","protocol":"shadowsocks",
+        "settings":{"address":"se.acmevpn.net","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, xray).unwrap();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let directory = TempDirectory::new();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let dns = runtime
+        .as_mapping()
+        .unwrap()
+        .get(Value::String("dns".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+    assert!(
+        dns.get(Value::String("nameserver-policy".to_owned()))
+            .is_none()
+    );
+
+    // Live-DNS interface configured, but every outbound already dials a literal IP.
+    let literal_xray = br#"{"outbounds": [{"tag":"vpn","protocol":"shadowsocks",
+        "settings":{"address":"192.0.2.10","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, literal_xray).unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+    let directory = TempDirectory::new();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let dns = runtime
+        .as_mapping()
+        .unwrap()
+        .get(Value::String("dns".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+    assert!(
+        dns.get(Value::String("nameserver-policy".to_owned()))
+            .is_none()
+    );
+}
+
+#[test]
 fn runtime_overlay_owns_a_unique_tun_device() {
     let mihomo = br#"
 proxies: []

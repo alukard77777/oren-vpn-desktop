@@ -1186,6 +1186,49 @@ pub fn stage_runtime_with_mihomo_control(
             YamlValue::String("store-selected".to_owned()),
             YamlValue::Bool(false),
         );
+    if control.xray_outbound_interface.is_some() {
+        let domains = normalized_endpoint_domains(snapshot)?;
+        if !domains.is_empty() {
+            // Mihomo's TUN device hijacks every outbound port-53 packet on the
+            // system (`dns-hijack: [any:53]`) regardless of source process or
+            // destination address, so Xray's own scoped-resolver query for an
+            // endpoint domain never actually reaches the real internet: it is
+            // always redirected back into Mihomo itself. Mihomo then tries to
+            // resolve it through its normal (proxy-routed) nameservers, which
+            // depend on a working proxy connection - but that connection is
+            // exactly what resolving this domain is needed to establish. A
+            // live capture on real hardware confirmed this: the endpoint
+            // domain never resolved, indefinitely, once the TUN adapter was
+            // up, even though the same resolver answered fine for every other
+            // domain. `nameserver-policy` makes Mihomo answer a hijacked query
+            // for these specific domains directly against the plain resolver
+            // Xray's own scoped entry already uses, breaking the cycle.
+            let dns_key = YamlValue::String("dns".to_owned());
+            let dns = mapping
+                .entry(dns_key)
+                .or_insert_with(|| YamlValue::Mapping(Default::default()));
+            if !dns.is_mapping() {
+                *dns = YamlValue::Mapping(Default::default());
+            }
+            let dns = dns.as_mapping_mut().expect("dns was replaced by mapping");
+            let policy_key = YamlValue::String("nameserver-policy".to_owned());
+            let policy = dns
+                .entry(policy_key)
+                .or_insert_with(|| YamlValue::Mapping(Default::default()));
+            if !policy.is_mapping() {
+                *policy = YamlValue::Mapping(Default::default());
+            }
+            let policy = policy
+                .as_mapping_mut()
+                .expect("nameserver-policy was replaced by mapping");
+            for domain in &domains {
+                policy.insert(
+                    YamlValue::String(domain.clone()),
+                    YamlValue::String(ENDPOINT_DNS_RESOLVER.to_owned()),
+                );
+            }
+        }
+    }
     let mihomo = serde_yaml_ng::to_string(&document)
         .map_err(|error| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
     let xray = xray_runtime_bytes(snapshot, control.xray_outbound_interface.as_deref())?;
@@ -1203,17 +1246,7 @@ fn xray_runtime_bytes(
         |message: String| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, message));
     let mut document: serde_json::Value = serde_json::from_slice(snapshot.xray.raw_bytes())
         .map_err(|error| invalid(format!("validated Xray document is invalid: {error}")))?;
-    // Xray strips the terminating FQDN dot before DNS matching.
-    let domains: BTreeSet<_> = xray_outbound_server_domains(snapshot)?
-        .into_iter()
-        .map(|domain| {
-            let domain = domain.trim();
-            domain
-                .strip_suffix('.')
-                .unwrap_or(domain)
-                .to_ascii_lowercase()
-        })
-        .collect();
+    let domains = normalized_endpoint_domains(snapshot)?;
     if !domains.is_empty()
         && (contains_endpoint_dns_tag(&document) || selects_endpoint_dns_outbound(&document))
     {
@@ -1328,7 +1361,7 @@ fn xray_runtime_bytes(
             ));
         }
         servers.insert(0, serde_json::json!({
-            "address": "77.88.8.8",
+            "address": ENDPOINT_DNS_RESOLVER,
             "domains": domains.iter().map(|domain| format!("full:{domain}")).collect::<Vec<_>>(),
             "skipFallback": true, "finalQuery": true,
             "disableCache": false, "serveStale": false,
@@ -1368,6 +1401,10 @@ const ENDPOINT_DNS_OUTBOUND_TAG: &str = "multicore-endpoint-dns-direct";
 /// wait for Xray's own DNS-failure close by the same value this config
 /// actually uses - never a guessed constant that could silently drift.
 pub(crate) const ENDPOINT_DNS_TIMEOUT_MS: u64 = 3000;
+/// Shared between Xray's own scoped resolver entry and the Mihomo
+/// `nameserver-policy` override below, so both agree on the one resolver
+/// address that must be reachable for endpoint domains to ever resolve.
+const ENDPOINT_DNS_RESOLVER: &str = "77.88.8.8";
 
 fn local_dns_domain(domain: &str) -> bool {
     !domain.contains('.')
@@ -1423,6 +1460,22 @@ fn contains_endpoint_dns_tag(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(values) => values.values().any(contains_endpoint_dns_tag),
         _ => false,
     }
+}
+
+/// Xray strips the terminating FQDN dot before DNS matching; shared by both
+/// the Xray endpoint-DNS overlay and the Mihomo `nameserver-policy` override
+/// below so the two always agree on exactly which domains need it.
+fn normalized_endpoint_domains(snapshot: &Snapshot) -> Result<BTreeSet<String>, PersistenceError> {
+    Ok(xray_outbound_server_domains(snapshot)?
+        .into_iter()
+        .map(|domain| {
+            let domain = domain.trim();
+            domain
+                .strip_suffix('.')
+                .unwrap_or(domain)
+                .to_ascii_lowercase()
+        })
+        .collect())
 }
 
 pub fn xray_outbound_server_domains(snapshot: &Snapshot) -> Result<Vec<String>, PersistenceError> {
