@@ -33,9 +33,34 @@ fn low_level_log_path() -> Option<std::path::PathBuf> {
 }
 
 fn record_low_level(context: &str, detail: impl fmt::Display) {
+    static LAST_ENTRY: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let entry = format!("{context}\t{detail}");
+    // Status/event polling keeps failing the same way while the daemon is
+    // down or restarting; logging every poll flooded this file and pushed
+    // the one relevant failure out through rotation.
+    if let Ok(mut last) = LAST_ENTRY.lock() {
+        let now = std::time::Instant::now();
+        if is_repeated_low_level_entry(last.as_ref(), &entry, now) {
+            return;
+        }
+        *last = Some((entry.clone(), now));
+    }
     if let Some(path) = low_level_log_path() {
         write_low_level_entry(&path, context, detail);
     }
+}
+
+const LOW_LEVEL_REPEAT_WINDOW: Duration = Duration::from_secs(60);
+
+fn is_repeated_low_level_entry(
+    last: Option<&(String, std::time::Instant)>,
+    entry: &str,
+    now: std::time::Instant,
+) -> bool {
+    last.is_some_and(|(last_entry, at)| {
+        last_entry == entry && now.duration_since(*at) < LOW_LEVEL_REPEAT_WINDOW
+    })
 }
 
 fn write_low_level_entry(path: &std::path::Path, context: &str, detail: impl fmt::Display) {
@@ -57,21 +82,43 @@ fn write_low_level_entry(path: &std::path::Path, context: &str, detail: impl fmt
             .open(path)?;
         let mut offset = file.seek(std::io::SeekFrom::End(0))?;
         if offset > MAX_LOW_LEVEL_LOG_BYTES {
+            // Keep the newest half instead of starting from nothing, so a
+            // rotation right after a real failure doesn't erase it.
+            let mut contents = Vec::new();
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.read_to_end(&mut contents)?;
+            let cut = contents
+                .len()
+                .saturating_sub((MAX_LOW_LEVEL_LOG_BYTES / 2) as usize);
+            let keep_from = contents[cut..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(contents.len(), |newline| cut + newline + 1);
+            let kept = &contents[keep_from..];
             file.set_len(0)?;
             file.seek(std::io::SeekFrom::Start(0))?;
-            offset = 0;
+            file.write_all(kept)?;
+            offset = kept.len() as u64;
         }
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let line: String = format!("{timestamp}\t{context}\t{detail}")
-            .chars()
-            .map(|character| match character {
-                '\r' | '\n' | '\t' => ' ',
-                other => other,
-            })
-            .collect();
+        // Only the field contents are flattened; the separators between
+        // the three fields stay real tabs.
+        let flatten = |text: String| -> String {
+            text.chars()
+                .map(|character| match character {
+                    '\r' | '\n' | '\t' => ' ',
+                    other => other,
+                })
+                .collect()
+        };
+        let line = format!(
+            "{timestamp}\t{}\t{}",
+            flatten(context.to_owned()),
+            flatten(detail.to_string())
+        );
         file.seek(std::io::SeekFrom::Start(offset))?;
         writeln!(file, "{line}")
     })();
@@ -2509,19 +2556,65 @@ mod http_tests {
     }
 
     #[test]
+    fn identical_low_level_entries_are_suppressed_only_within_the_window() {
+        let now = std::time::Instant::now();
+        let last = ("daemon_request_failed\tconnection refused".to_owned(), now);
+        assert!(is_repeated_low_level_entry(
+            Some(&last),
+            "daemon_request_failed\tconnection refused",
+            now + Duration::from_secs(5)
+        ));
+        assert!(!is_repeated_low_level_entry(
+            Some(&last),
+            "daemon_request_failed\ttimed out",
+            now + Duration::from_secs(5)
+        ));
+        assert!(!is_repeated_low_level_entry(
+            Some(&last),
+            "daemon_request_failed\tconnection refused",
+            now + LOW_LEVEL_REPEAT_WINDOW
+        ));
+        assert!(!is_repeated_low_level_entry(None, "anything", now));
+    }
+
+    #[test]
+    fn rotation_keeps_the_newest_entries() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("client-errors.log");
+        write_low_level_entry(&path, "daemon_request_failed", "oldest entry");
+        for _ in 0..40 {
+            write_low_level_entry(&path, "daemon_request_failed", "x".repeat(8_192));
+        }
+        write_low_level_entry(&path, "daemon_status_error", "newest entry");
+        write_low_level_entry(&path, "daemon_status_error", "after rotation");
+
+        let contents = read_low_level_entries(&path).expect("entries recorded");
+        assert!(!contents.contains("oldest entry"));
+        assert!(
+            contents.contains("newest entry"),
+            "rotation dropped recent entries"
+        );
+        assert!(contents.contains("after rotation"));
+        assert!(contents.lines().all(|line| line.split('\t').count() == 3));
+    }
+
+    #[test]
     fn low_level_log_rotates_instead_of_growing_without_bound() {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("client-errors.log");
 
-        for _ in 0..64 {
+        let entry_bound = 8_192 + 256;
+        let mut largest = 0;
+        for _ in 0..256 {
             write_low_level_entry(&path, "daemon_request_failed", "x".repeat(8_192));
+            largest = largest.max(std::fs::metadata(&path).expect("log exists").len());
         }
-        let grown = std::fs::metadata(&path).expect("log exists").len();
-        assert!(grown > MAX_LOW_LEVEL_LOG_BYTES, "{grown}");
+        assert!(
+            largest <= MAX_LOW_LEVEL_LOG_BYTES + entry_bound,
+            "log grew past its bound: {largest}"
+        );
 
         write_low_level_entry(&path, "daemon_request_failed", "after rotation");
-        let rotated = std::fs::metadata(&path).expect("log exists").len();
-        assert!(rotated < grown, "grown={grown} rotated={rotated}");
         assert!(
             read_low_level_entries(&path)
                 .expect("entry recorded")
