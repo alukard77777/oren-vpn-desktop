@@ -2746,6 +2746,30 @@ where
         Ok(self.current_status().await)
     }
 
+    /// Every path that collapses into the generic `ProfileMutationError::Storage`
+    /// (and, via `profile_api_error`, the opaque "backend_error" the desktop
+    /// shows as a plain HTTP 500) used to do so silently - a real report
+    /// showed exactly that response with no daemon event at all, leaving no
+    /// way to tell which of several very different underlying causes
+    /// (profile-store I/O, runtime staging, the elevated broker, ...) it
+    /// actually was. `detail` is this module's own `ProfileError`/`BackendError`
+    /// Display text or a plain phase name - never anything from an external
+    /// server - so it's exactly as safe to log as the rest of this event.
+    async fn log_mutation_storage_failure(&self, phase: &str, detail: impl std::fmt::Display) {
+        // `Event`'s own `phase` field never reaches `EventDto` (only
+        // `message` and `details` do - see core_event_to_dto), so it's
+        // repeated inside `details` too: that's what actually lets
+        // "Копировать лог" show which of several very different branches
+        // failed instead of the same generic sentence every time.
+        self.inner.write().await.push_event_with_details(
+            Severity::Warning,
+            Component::Subscription,
+            phase,
+            "Не удалось сохранить изменение подписки.",
+            json!({ "phase": phase, "detail": detail.to_string(), "os": std::env::consts::OS }),
+        );
+    }
+
     async fn import_profile_locked(&self, url: &str) -> Result<StatusDto, ProfileMutationError>
     where
         C: 'static,
@@ -2775,12 +2799,18 @@ where
                     self.profile_snapshot_after_commit(&id).await?;
                     true
                 }
-                Err(error) => return Err(map_profile_error(error)),
+                Err(error) => {
+                    self.log_mutation_storage_failure("import_replace_failed", &error)
+                        .await;
+                    return Err(map_profile_error(error));
+                }
             };
             let activate_debt = match self.store.activate(&id) {
                 Ok(_) => false,
                 Err(error) if error.mutation_committed() => true,
                 Err(error) => {
+                    self.log_mutation_storage_failure("import_activate_selection_failed", &error)
+                        .await;
                     self.reconcile_authoritative().await;
                     return Err(map_profile_error(error));
                 }
@@ -2791,12 +2821,21 @@ where
                 Ok(id) => (id, false, None),
                 Err(error) if error.mutation_committed() => {
                     let Some(id) = self.store.active_id() else {
+                        self.log_mutation_storage_failure(
+                            "import_create_committed_without_active_id",
+                            &error,
+                        )
+                        .await;
                         self.reconcile_authoritative().await;
                         return Err(ProfileMutationError::Storage);
                     };
                     (id, true, None)
                 }
-                Err(error) => return Err(map_profile_error(error)),
+                Err(error) => {
+                    self.log_mutation_storage_failure("import_create_failed", &error)
+                        .await;
+                    return Err(map_profile_error(error));
+                }
             }
         };
         let (revision, physical_generation, persisted) =
@@ -2843,6 +2882,13 @@ where
             }
         }
         if prepared.activate().is_err() {
+            // `PreparedController::activate` only ever returns the opaque
+            // `BackendError` (see its doc comment), so "runtime_commit"
+            // is the most specific phase name available here - but it is
+            // still real signal, distinguishing this from the profile-store
+            // failures logged above.
+            self.log_mutation_storage_failure("import_runtime_commit_failed", "runtime_commit")
+                .await;
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Storage);
         }

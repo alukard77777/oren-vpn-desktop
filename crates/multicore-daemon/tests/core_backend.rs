@@ -790,6 +790,25 @@ async fn profile_limit_is_reported_as_a_typed_mutation_error() {
         Err(ProfileMutationError::LimitReached)
     );
     assert_eq!(backend.list_subscriptions().unwrap().len(), MAX_PROFILES);
+
+    // Regression coverage for a real bug report: a genuine subscription-add
+    // failure on a user's machine produced a bare HTTP 500 "backend_error"
+    // with a *completely empty* daemon event log, because every path that
+    // collapses into ProfileMutationError::Storage (and this LimitReached
+    // path too, since it shares the same create_profile failure branch)
+    // used to return silently with nothing logged at all.
+    let events = backend.events_after(0).await.unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("import_create_failed")
+        }),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
