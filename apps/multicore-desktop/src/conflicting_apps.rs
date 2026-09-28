@@ -25,13 +25,19 @@ const CONFLICTING_APPS: &[ConflictingApp] = &[
         // Confirmed live on real hardware: this project's own subscription
         // contract already references the "flclashx" vendor prefix
         // (docs/subscription-http-contract.md), and the actual installed app
-        // in this ecosystem runs as FlClashX.exe / FlClashCore.exe /
-        // FlClashHelperService.exe (a rebranded/white-label FlClash fork),
-        // not bare "FlClash" - its own TUN adapter shows as "FlClashX" /
-        // "Meta Tunnel". Keep the plain alias too in case an unbranded
-        // upstream build is ever encountered.
+        // in this ecosystem runs as FlClashX.exe / FlClashCore.exe (a
+        // rebranded/white-label FlClash fork), not bare "FlClash" - its own
+        // TUN adapter shows as "FlClashX" / "Meta Tunnel". Keep the plain
+        // alias too in case an unbranded upstream build is ever encountered.
+        //
+        // Deliberately NOT flagging FlClashHelperService: confirmed live
+        // (real Connect attempts, with and without it running) that this
+        // background Windows service does not actually conflict - only the
+        // GUI app's own TUN adapter does. Flagging it produced false-positive
+        // banners telling users to close something that was never the
+        // problem.
         name: "FlClash",
-        aliases: &["flclash", "flclashx", "flclashcore", "flclashhelperservice"],
+        aliases: &["flclash", "flclashx", "flclashcore"],
     },
     ConflictingApp {
         name: "Happ",
@@ -243,15 +249,20 @@ mod tests {
     #[test]
     fn matches_the_real_flclashx_process_family() {
         // Confirmed on real hardware: the actually-distributed app in this
-        // ecosystem runs as FlClashX.exe with a separate core/helper process,
-        // not bare FlClash.exe.
-        for exe in [
-            "FlClashX.exe",
-            "FlClashCore.exe",
-            "FlClashHelperService.exe",
-        ] {
+        // ecosystem runs as FlClashX.exe with a separate core process, not
+        // bare FlClash.exe.
+        for exe in ["FlClashX.exe", "FlClashCore.exe"] {
             assert_eq!(detect_from_stems(stems(&[exe])), vec!["FlClash"], "{exe}");
         }
+    }
+
+    #[test]
+    fn does_not_flag_the_flclash_helper_service() {
+        // Confirmed live (real Connect attempts, with and without it
+        // running): this background Windows service does not actually
+        // conflict - only the GUI app's own TUN adapter does. Flagging it
+        // produced false-positive banners over nothing.
+        assert!(detect_from_stems(stems(&["FlClashHelperService.exe"])).is_empty());
     }
 
     #[test]
