@@ -5229,6 +5229,30 @@ mod tests {
     }
 
     #[test]
+    fn transport_level_import_failure_shows_its_real_cause_not_a_generic_url_hint() {
+        // Regression coverage for a real bug report: a friend's genuine
+        // subscription-add failure showed "Не удалось добавить подписку.
+        // Проверьте URL и повторите попытку." even though the actual cause
+        // (confirmed by tracing map_error in daemon.rs) had nothing to do
+        // with the URL - the desktop's own request to the *local* daemon
+        // hadn't connected or hadn't heard back in time. That accurate,
+        // already-safe message was being discarded in favor of a misleading
+        // generic one just because it wasn't daemon-error-code-derived.
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let import = model
+            .begin_import("https://subscription.invalid/first")
+            .expect("start first import");
+        model.finish_import(
+            import,
+            Err(DaemonError::transport("Фоновый сервис не ответил вовремя.")),
+        );
+        assert_eq!(
+            model.import_error.as_deref(),
+            Some("Фоновый сервис не ответил вовремя.")
+        );
+    }
+
+    #[test]
     fn failed_deep_link_still_reloads_preexisting_profiles_after_startup_status() {
         let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
         let import = model

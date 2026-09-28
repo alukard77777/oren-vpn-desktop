@@ -221,8 +221,11 @@ enum DaemonErrorKind {
 pub struct DaemonError {
     message: String,
     kind: DaemonErrorKind,
-    /// The message was chosen locally from an allowlisted daemon error code
-    /// and explains the actual cause, so the UI can show it verbatim.
+    /// The message explains the actual cause and is known-safe to show
+    /// verbatim: either chosen locally from an allowlisted daemon error
+    /// code, or authored by this module itself about the local transport
+    /// (see `transport`). Never set for text that might echo anything a
+    /// remote server sent.
     specific: bool,
 }
 
@@ -299,6 +302,21 @@ impl DaemonError {
             message: message.into(),
             kind: DaemonErrorKind::Ambiguous,
             specific: false,
+        }
+    }
+
+    /// Same shape as `ambiguous`, but for a message this module authored
+    /// itself about the transport to the *local* daemon (couldn't connect,
+    /// didn't respond in time, ...), never text derived from anything a
+    /// remote server sent. The `&'static str` bound is what makes this safe
+    /// to also mark `specific`: it can never carry interpolated content, so
+    /// callers can show it verbatim instead of it being silently replaced by
+    /// a generic fallback that has nothing to do with the real cause.
+    pub(crate) fn transport(message: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            kind: DaemonErrorKind::Ambiguous,
+            specific: true,
         }
     }
 }
@@ -1008,11 +1026,11 @@ impl DaemonClient for HttpDaemonClient {
 
 fn map_error(error: reqwest::Error) -> DaemonError {
     if error.is_timeout() {
-        DaemonError::ambiguous("Фоновый сервис не ответил вовремя.")
+        DaemonError::transport("Фоновый сервис не ответил вовремя.")
     } else if error.is_connect() {
-        DaemonError::ambiguous("Фоновый сервис не запущен.")
+        DaemonError::transport("Фоновый сервис не запущен.")
     } else {
-        DaemonError::ambiguous("Не удалось выполнить запрос к фоновому сервису.")
+        DaemonError::transport("Не удалось выполнить запрос к фоновому сервису.")
     }
 }
 
