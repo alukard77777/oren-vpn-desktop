@@ -81,6 +81,7 @@ fn exact_layout_resolves_to_canonical_contained_paths() {
             .canonicalize()
             .unwrap()
     );
+    assert_eq!(resolved.data_root, fixture.data.canonicalize().unwrap());
     resolved.verify_unchanged().unwrap();
 }
 

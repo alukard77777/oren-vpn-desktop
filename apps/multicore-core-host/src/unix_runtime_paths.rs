@@ -34,6 +34,7 @@ pub(crate) struct UserContext {
 
 pub(crate) struct ResolvedRuntime {
     pub paths: RuntimePaths,
+    pub data_root: PathBuf,
     guards: Vec<GuardedPath>,
 }
 
@@ -145,7 +146,8 @@ pub(crate) fn resolve_from(
     let canonical = |path: &Path| fs::canonicalize(path).map_err(|_| ResolveError::Missing);
     let canonical_package = canonical(package)?;
     let canonical_generation = canonical(&generation_dir)?;
-    if !canonical(data_root).is_ok_and(|root| canonical_generation.starts_with(root)) {
+    let canonical_data = canonical(data_root)?;
+    if !canonical_generation.starts_with(&canonical_data) {
         return Err(ResolveError::Escape);
     }
     for binary in [host_executable, &xray, &mihomo] {
@@ -184,6 +186,7 @@ pub(crate) fn resolve_from(
             mihomo_config: canonical(&mihomo_config)?,
             dashboard_directory: canonical_dashboard,
         },
+        data_root: canonical_data,
         guards,
     })
 }
