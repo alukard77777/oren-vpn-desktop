@@ -34,6 +34,7 @@ pub(crate) struct UserContext {
 
 pub(crate) struct ResolvedRuntime {
     pub paths: RuntimePaths,
+    pub data_root: PathBuf,
     guards: Vec<GuardedPath>,
 }
 
@@ -112,6 +113,26 @@ pub(crate) fn resolve_from(
     let mihomo = cores.join("mihomo");
     let xray_config = generation_dir.join("xray.json");
     let mihomo_config = generation_dir.join("mihomo.yaml");
+    // The vendored dashboard is optional: absent in builds without one, present as an exact
+    // package-root sibling of `cores` otherwise. Its presence is decided once, up front, so a
+    // directory that appears only after that check can never be picked up mid-resolution.
+    //
+    // Presence is "something exists at this path at all" (`is_ok()`), not "is a directory"
+    // (`is_dir()`). On Unix, `symlink_metadata` never reports `is_dir()` true for a symlink -
+    // `lstat`'s mode bits report `S_IFLNK`, never `S_IFDIR`, regardless of what the symlink
+    // points to. Gating presence on `is_dir()` would make a dashboard directory replaced with a
+    // symlink silently look identical to a genuinely absent dashboard: `dashboard_present` would
+    // be `false`, the guard chain below would never run, and resolution would quietly succeed
+    // with `dashboard_directory: None` instead of failing closed. That is a real divergence from
+    // the Windows resolver's equivalent check just below: a Windows directory reparse
+    // point/symlink keeps `FILE_ATTRIBUTE_DIRECTORY` set, so it is still seen as "present" there
+    // and correctly rejected by the guard chain as `ResolveError::Reparse`. Checking `is_ok()`
+    // instead makes a symlinked (or otherwise non-directory) dashboard path reach guard_chain
+    // and its `O_NOFOLLOW` open below, which rejects a symlink as `ResolveError::Symlink` and
+    // anything else as `ResolveError::Layout` - matching the Windows fail-closed behavior instead
+    // of silently disabling the dashboard feature with no signal anything was wrong.
+    let dashboard = package.join("dashboard");
+    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok();
 
     let mut guards = Vec::new();
     for directory in [
@@ -123,6 +144,9 @@ pub(crate) fn resolve_from(
         &cores,
     ] {
         guard_chain(directory, true, owner_uid, &mut guards)?;
+    }
+    if dashboard_present {
+        guard_chain(&dashboard, true, owner_uid, &mut guards)?;
     }
     for file in [
         host_executable,
@@ -137,7 +161,8 @@ pub(crate) fn resolve_from(
     let canonical = |path: &Path| fs::canonicalize(path).map_err(|_| ResolveError::Missing);
     let canonical_package = canonical(package)?;
     let canonical_generation = canonical(&generation_dir)?;
-    if !canonical(data_root).is_ok_and(|root| canonical_generation.starts_with(root)) {
+    let canonical_data = canonical(data_root)?;
+    if !canonical_generation.starts_with(&canonical_data) {
         return Err(ResolveError::Escape);
     }
     for binary in [host_executable, &xray, &mihomo] {
@@ -150,6 +175,15 @@ pub(crate) fn resolve_from(
             return Err(ResolveError::Escape);
         }
     }
+    let canonical_dashboard = if dashboard_present {
+        let canonical_dashboard = canonical(&dashboard)?;
+        if !canonical_dashboard.starts_with(&canonical_package) {
+            return Err(ResolveError::Escape);
+        }
+        Some(canonical_dashboard)
+    } else {
+        None
+    };
     for binary in [&xray, &mihomo] {
         let guard = guards
             .iter_mut()
@@ -165,7 +199,9 @@ pub(crate) fn resolve_from(
             mihomo_binary: canonical(&mihomo)?,
             xray_config: canonical(&xray_config)?,
             mihomo_config: canonical(&mihomo_config)?,
+            dashboard_directory: canonical_dashboard,
         },
+        data_root: canonical_data,
         guards,
     })
 }

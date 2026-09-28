@@ -1,14 +1,10 @@
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::{
-    collections::BTreeMap,
     fs,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-};
-#[cfg(windows)]
-use std::{
-    net::ToSocketAddrs,
-    process::{Command, Stdio},
 };
 
 use multicore_core::{
@@ -19,6 +15,178 @@ use serde_json::Value as JsonValue;
 use serde_yaml_ng::Value;
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn live_dns_uses_only_yandex_for_endpoints_without_static_ip_pinning() {
+    let xray = br#"{
+      "dns": {"servers": ["8.8.8.8"], "hosts": {"internal.example": "192.0.2.9"}},
+      "outbounds": [{"tag":"vpn", "protocol":"shadowsocks",
+        "settings":{"address":"edge.example.com"},
+        "streamSettings":{"finalmask":{"enabled":true}}}],
+      "routing":{"rules":[{"type":"field","network":"tcp,udp","outboundTag":"vpn"}]}
+    }"#;
+    let snapshot = Snapshot::parse(b"proxies: []\n", xray).unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: JsonValue =
+        serde_json::from_slice(&fs::read(published.xray_config).unwrap()).unwrap();
+    assert_eq!(
+        runtime["dns"]["servers"][1],
+        serde_json::json!({
+            "address":"77.88.8.8", "domains":["full:edge.example.com"],
+            "skipFallback":true, "finalQuery":true, "disableCache":false,
+            "serveStale":false, "tag":"multicore-endpoint-dns", "timeoutMs":1200
+        })
+    );
+    assert_eq!(runtime["dns"]["servers"][2], "8.8.8.8");
+    assert!(runtime["dns"]["hosts"].get("edge.example.com").is_none());
+    assert_eq!(runtime["dns"]["hosts"]["internal.example"], "192.0.2.9");
+    assert_eq!(runtime["outbounds"][0]["tag"], "vpn");
+    assert_eq!(
+        runtime["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"],
+        "ForceIP"
+    );
+    assert_eq!(
+        runtime["outbounds"][0]["streamSettings"]["finalmask"]["enabled"],
+        true
+    );
+    assert_eq!(
+        runtime["outbounds"][1],
+        serde_json::json!({
+            "tag":"multicore-endpoint-dns-direct", "protocol":"freedom",
+            "settings":{"domainStrategy":"AsIs"},
+            "streamSettings":{"sockopt":{"domainStrategy":"AsIs"}}
+        }),
+        "the endpoint-DNS-direct outbound must never bind to the physical \
+         interface - Mihomo's DNS-leak protection blackholes UDP:53 \
+         explicitly bound to it, proven on real hardware"
+    );
+    assert_eq!(
+        runtime["routing"]["rules"][0],
+        serde_json::json!({
+            "type":"field", "inboundTag":["multicore-endpoint-dns"],
+            "outboundTag":"multicore-endpoint-dns-direct"
+        })
+    );
+    assert_eq!(runtime["routing"]["rules"][1]["outboundTag"], "vpn");
+    assert_eq!(snapshot.xray.raw_bytes(), xray);
+}
+
+#[test]
+fn mihomo_nameserver_policy_routes_live_endpoint_domains_directly_around_the_dns_hijack() {
+    // Mihomo's TUN device hijacks every outbound port-53 packet on the system
+    // (`dns-hijack: [any:53]`) regardless of source process or destination
+    // address, so Xray's own scoped resolver query for an endpoint domain
+    // never actually reaches 77.88.8.8: it gets redirected straight back
+    // into Mihomo, which then tries to resolve it through its normal
+    // proxy-routed nameservers - which depend on the very proxy connection
+    // that resolving this domain is needed to establish. A live capture on
+    // real hardware reproduced this exact deadlock: the endpoint domain
+    // never resolved, indefinitely, once the TUN adapter came up, even
+    // though the same resolver answered fine for every other domain.
+    // `nameserver-policy` must route it directly, breaking the cycle.
+    let mihomo = br#"
+proxies: []
+tun:
+  enable: true
+  dns-hijack: [any:53]
+dns:
+  enhanced-mode: fake-ip
+  nameserver-policy:
+    'other.example': 1.1.1.1
+"#;
+    let xray = br#"{"outbounds": [{"tag":"vpn","protocol":"shadowsocks",
+        "settings":{"address":"se.acmevpn.net","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, xray).unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let policy = runtime
+        .as_mapping()
+        .unwrap()
+        .get(Value::String("dns".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap()
+        .get(Value::String("nameserver-policy".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+
+    assert_eq!(
+        policy.get(Value::String("se.acmevpn.net".to_owned())),
+        Some(&Value::String("77.88.8.8".to_owned()))
+    );
+    // The provider's own unrelated policy entry survives the merge.
+    assert_eq!(
+        policy.get(Value::String("other.example".to_owned())),
+        Some(&Value::String("1.1.1.1".to_owned()))
+    );
+}
+
+#[test]
+fn mihomo_nameserver_policy_is_untouched_without_a_live_endpoint_domain() {
+    let mihomo = br#"
+proxies: []
+dns:
+  enhanced-mode: fake-ip
+"#;
+    // No live-DNS interface configured at all.
+    let xray = br#"{"outbounds": [{"tag":"vpn","protocol":"shadowsocks",
+        "settings":{"address":"se.acmevpn.net","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, xray).unwrap();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let directory = TempDirectory::new();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let dns = runtime
+        .as_mapping()
+        .unwrap()
+        .get(Value::String("dns".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+    assert!(
+        dns.get(Value::String("nameserver-policy".to_owned()))
+            .is_none()
+    );
+
+    // Live-DNS interface configured, but every outbound already dials a literal IP.
+    let literal_xray = br#"{"outbounds": [{"tag":"vpn","protocol":"shadowsocks",
+        "settings":{"address":"192.0.2.10","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, literal_xray).unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+    let directory = TempDirectory::new();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let dns = runtime
+        .as_mapping()
+        .unwrap()
+        .get(Value::String("dns".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+    assert!(
+        dns.get(Value::String("nameserver-policy".to_owned()))
+            .is_none()
+    );
+}
 
 #[test]
 fn runtime_overlay_owns_a_unique_tun_device() {
@@ -66,6 +234,231 @@ tun:
     assert_eq!(snapshot.mihomo.raw_yaml().as_bytes(), mihomo);
 }
 
+fn live_dns_overlay(document: JsonValue) -> Result<JsonValue, multicore_core::PersistenceError> {
+    let bytes = serde_json::to_vec(&document).unwrap();
+    let snapshot = Snapshot::parse(b"proxies: []\n", &bytes).unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+    let published = publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control)?;
+    Ok(serde_json::from_slice(&fs::read(published.xray_config).unwrap()).unwrap())
+}
+
+#[test]
+fn live_dns_rejects_reserved_tag_collisions_and_malformed_policy() {
+    for patch in [
+        serde_json::json!({"inbounds":[{"tag":"multicore-endpoint-dns"}]}),
+        serde_json::json!({"dns":{"tag":"multicore-endpoint-dns-direct"}}),
+        serde_json::json!({"routing":{"rules":[{"outboundTag":"multicore-endpoint-dns-direct"}]}}),
+        serde_json::json!({"dns":{"servers":"invalid"}}),
+        serde_json::json!({"routing":{"rules":{}}}),
+        serde_json::json!({"dns":[]}),
+        serde_json::json!({"routing":[]}),
+    ] {
+        let mut input =
+            serde_json::json!({"outbounds":[{"settings":{"address":"edge.example.com"}}]});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert!(live_dns_overlay(input.clone()).is_err(), "accepted {input}");
+    }
+}
+
+#[test]
+fn live_dns_keeps_provider_dns_policy_and_handles_absent_or_null_sections() {
+    for optional in [
+        serde_json::json!({}),
+        serde_json::json!({"dns":null,"routing":null}),
+    ] {
+        let mut input =
+            serde_json::json!({"outbounds":[{"settings":{"address":"edge.example.com"}}]});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(optional.as_object().unwrap().clone());
+        let runtime = live_dns_overlay(input).unwrap();
+        assert!(runtime["dns"].get("hosts").is_none());
+        assert_eq!(runtime["dns"]["servers"][1]["address"], "77.88.8.8");
+        assert_eq!(runtime["dns"]["servers"][2], "localhost");
+        assert_eq!(runtime["routing"]["rules"].as_array().unwrap().len(), 1);
+    }
+    let runtime = live_dns_overlay(serde_json::json!({
+        "outbounds":[{"settings":{"address":"edge.example.com"}}],
+        "dns":{"hosts":{"fixed.example":"192.0.2.3"}, "tag":"provider-dns",
+          "disableCache":true,"serveStale":true,"queryStrategy":"UseIPv4",
+          "enableParallelQuery":true,"servers":[{"address":"1.1.1.1","domains":["domain:example"]}]},
+        "routing":{"domainStrategy":"IPIfNonMatch","rules":null}
+    })).unwrap();
+    assert_eq!(runtime["dns"]["tag"], "provider-dns");
+    assert_eq!(runtime["dns"]["disableCache"], true);
+    assert_eq!(runtime["dns"]["serveStale"], true);
+    assert_eq!(runtime["dns"]["queryStrategy"], "UseIPv4");
+    assert_eq!(runtime["dns"]["servers"][1]["disableCache"], false);
+    assert_eq!(runtime["dns"]["servers"][1]["serveStale"], false);
+    assert_eq!(runtime["routing"]["domainStrategy"], "IPIfNonMatch");
+}
+
+#[test]
+fn live_dns_does_not_add_a_resolver_for_ip_only_endpoints() {
+    let input = serde_json::json!({
+        "outbounds":[{"settings":{"address":"192.0.2.10"}}],
+        "dns":{"servers":["1.1.1.1"]},"routing":{"rules":[]}
+    });
+    let runtime = live_dns_overlay(input.clone()).unwrap();
+    assert_eq!(runtime["dns"], input["dns"]);
+    assert_eq!(runtime["routing"], input["routing"]);
+    assert_eq!(runtime["outbounds"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn live_dns_preserves_the_provider_emergency_resolver() {
+    let original = serde_json::json!({"address":"192.0.2.53", "port":5353,
+        "tag":"provider-dns", "domains":["domain:private.example"],
+        "skipFallback":true,"queryStrategy":"UseIPv4"});
+    let runtime = live_dns_overlay(serde_json::json!({
+        "outbounds":[{"settings":{"address":"edge.example.com"}}],
+        "dns":{"disableFallback":true,"servers":[original.clone()]}
+    }))
+    .unwrap();
+    let mut guard = original.clone();
+    guard["domains"] = serde_json::json!([]);
+    assert_eq!(
+        runtime["dns"]["servers"][0], guard,
+        "Xray unconditionally uses server 0 when no match/fallback exists"
+    );
+    assert_eq!(runtime["dns"]["servers"][1]["address"], "77.88.8.8");
+    assert_eq!(runtime["dns"]["servers"][2], original);
+    let empty = live_dns_overlay(serde_json::json!({
+        "outbounds":[{"settings":{"address":"edge.example.com"}}],"dns":{"servers":[]}
+    }))
+    .unwrap();
+    assert_eq!(empty["dns"]["servers"][0]["address"], "localhost");
+    assert_eq!(empty["dns"]["servers"][2], "localhost");
+}
+
+#[test]
+fn live_dns_rejects_balancer_and_observatory_prefixes_that_capture_the_bypass() {
+    for selector in ["", "multicore-", "proxy,multicore-"] {
+        assert!(
+            live_dns_overlay(serde_json::json!({
+                "outbounds":[{"settings":{"address":"edge.example.com"}}],
+                "routing":{"balancers":[{"tag":"balance","selector":selector}]}
+            }))
+            .is_err(),
+            "scalar selector captures bypass: {selector}"
+        );
+    }
+    for selector in ["", "multi", "multicore-", "multicore-endpoint-dns-direct"] {
+        for section in [
+            serde_json::json!({"routing":{"balancers":[{"tag":"balance","selector":[selector]}]}}),
+            serde_json::json!({"observatory":{"subjectSelector":[selector]}}),
+            serde_json::json!({"burstObservatory":{"subjectSelector":[selector]}}),
+        ] {
+            let mut input = serde_json::json!({"outbounds":[{"tag":"proxy","settings":{"address":"edge.example.com"}}]});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(section.as_object().unwrap().clone());
+            assert!(
+                live_dns_overlay(input.clone()).is_err(),
+                "bypass captured by {input}"
+            );
+        }
+    }
+    assert!(
+        live_dns_overlay(serde_json::json!({
+            "outbounds":[{"tag":"proxy","settings":{"address":"edge.example.com"}}],
+            "routing":{"balancers":[{"tag":"balance","selector":["proxy"]}]}
+        }))
+        .is_ok()
+    );
+}
+
+#[test]
+fn live_dns_normalizes_fqdn_matching_without_rewriting_the_endpoint() {
+    let runtime = live_dns_overlay(serde_json::json!({
+        "outbounds":[{"settings":{"address":"EDGE.Example.COM."}}]
+    }))
+    .unwrap();
+    assert_eq!(
+        runtime["dns"]["servers"][1]["domains"],
+        serde_json::json!(["full:edge.example.com"])
+    );
+    assert_eq!(
+        runtime["outbounds"][0]["settings"]["address"],
+        "EDGE.Example.COM."
+    );
+}
+
+#[test]
+fn live_dns_matches_xray_whitespace_normalization() {
+    let runtime = live_dns_overlay(serde_json::json!({
+        "outbounds":[{"settings":{"address":" EDGE.Example.COM. "}}]
+    }))
+    .unwrap();
+    assert_eq!(
+        runtime["dns"]["servers"][1]["domains"],
+        serde_json::json!(["full:edge.example.com"])
+    );
+    assert_eq!(
+        runtime["outbounds"][0]["settings"]["address"],
+        " EDGE.Example.COM. "
+    );
+    assert!(
+        live_dns_overlay(serde_json::json!({
+            "outbounds":[{"settings":{"address":"edge.local"}}],
+            "dns":{"servers":[" localhost "]}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn live_dns_supports_vless_and_vmess_vnext_endpoint_shapes() {
+    let runtime = live_dns_overlay(serde_json::json!({"outbounds":[
+        {"protocol":"vless","settings":{"vnext":[{"address":"edge.example.com"}]}},
+        {"protocol":"vmess","settings":{"vnext":[{"address":"backup.example.com"}]}}
+    ]}))
+    .unwrap();
+    assert_eq!(
+        runtime["dns"]["servers"][1]["domains"],
+        serde_json::json!(["full:backup.example.com", "full:edge.example.com"])
+    );
+    for outbound in &runtime["outbounds"].as_array().unwrap()[..2] {
+        assert_eq!(
+            outbound["streamSettings"]["sockopt"]["domainStrategy"],
+            "ForceIP"
+        );
+    }
+}
+
+#[test]
+fn live_dns_rejects_localhost_implicit_matches_before_any_core_is_started() {
+    for domain in [
+        "edge",
+        "edge.local",
+        "edge.localdomain",
+        "edge.localhost",
+        "edge.lan",
+        "edge.home.arpa",
+        "edge.example",
+        "edge.invalid",
+        "edge.test",
+        "EDGE.LOCAL.",
+    ] {
+        assert!(
+            live_dns_overlay(serde_json::json!({
+                "outbounds":[{"settings":{"address":domain}}]
+            }))
+            .is_err(),
+            "localhost would outrank endpoint DNS for {domain}"
+        );
+    }
+}
+
 #[test]
 fn runtime_xray_overlay_binds_every_outbound_without_mutating_snapshot() {
     let xray = br#"{
@@ -73,7 +466,7 @@ fn runtime_xray_overlay_binds_every_outbound_without_mutating_snapshot() {
   "outbounds": [
     {
       "protocol": "shadowsocks",
-      "settings": { "address": "edge.example" },
+      "settings": { "address": "edge.example.com" },
       "streamSettings": {
         "finalmask": { "enabled": true },
         "sockopt": { "tcpFastOpen": true, "interface": "OldTunnel" }
@@ -81,7 +474,7 @@ fn runtime_xray_overlay_binds_every_outbound_without_mutating_snapshot() {
     },
     {
       "protocol": "shadowsocks",
-      "settings": { "servers": [{ "address": "backup.example" }] },
+      "settings": { "servers": [{ "address": "backup.example.com" }] },
       "streamSettings": { "network": "tcp" }
     }
   ]
@@ -91,20 +484,6 @@ fn runtime_xray_overlay_binds_every_outbound_without_mutating_snapshot() {
     let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
         .unwrap()
         .with_xray_outbound_interface("Ethernet")
-        .unwrap()
-        .with_xray_resolved_hosts(BTreeMap::from([
-            (
-                "edge.example".to_owned(),
-                vec!["203.0.113.7".parse::<IpAddr>().unwrap()],
-            ),
-            (
-                "backup.example".to_owned(),
-                vec![
-                    "198.51.100.9".parse::<IpAddr>().unwrap(),
-                    "2001:db8::9".parse::<IpAddr>().unwrap(),
-                ],
-            ),
-        ]))
         .unwrap();
 
     let published =
@@ -113,7 +492,7 @@ fn runtime_xray_overlay_binds_every_outbound_without_mutating_snapshot() {
         serde_json::from_slice(&fs::read(published.xray_config).unwrap()).unwrap();
     let outbounds = runtime["outbounds"].as_array().unwrap();
 
-    for outbound in outbounds {
+    for outbound in &outbounds[..2] {
         assert_eq!(
             outbound["streamSettings"]["sockopt"]["interface"],
             "Ethernet"
@@ -129,10 +508,10 @@ fn runtime_xray_overlay_binds_every_outbound_without_mutating_snapshot() {
         true
     );
     assert_eq!(outbounds[1]["streamSettings"]["network"], "tcp");
-    assert_eq!(runtime["dns"]["hosts"]["edge.example"], "203.0.113.7");
+    assert!(runtime["dns"].get("hosts").is_none());
     assert_eq!(
-        runtime["dns"]["hosts"]["backup.example"],
-        serde_json::json!(["198.51.100.9", "2001:db8::9"])
+        runtime["dns"]["servers"][1]["domains"],
+        serde_json::json!(["full:backup.example.com", "full:edge.example.com"])
     );
     assert_eq!(snapshot.xray.raw_bytes(), xray);
 }
@@ -143,11 +522,11 @@ fn xray_server_domain_extraction_supports_finalmask_and_standard_shadowsocks_sha
         b"proxies: []\n",
         br#"{
           "outbounds": [
-            {"settings": {"address": "edge.example"}},
+            {"settings": {"address": "edge.example.com"}},
             {"settings": {"servers": [
-              {"address": "backup.example"},
+              {"address": "backup.example.com"},
               {"address": "203.0.113.10"},
-              {"address": "edge.example"}
+              {"address": "edge.example.com"}
             ]}}
           ]
         }"#,
@@ -156,7 +535,10 @@ fn xray_server_domain_extraction_supports_finalmask_and_standard_shadowsocks_sha
 
     assert_eq!(
         xray_outbound_server_domains(&snapshot).unwrap(),
-        vec!["backup.example".to_owned(), "edge.example".to_owned()]
+        vec![
+            "backup.example.com".to_owned(),
+            "edge.example.com".to_owned()
+        ]
     );
 }
 
@@ -165,7 +547,7 @@ fn runtime_xray_overlay_treats_null_optional_sections_as_absent() {
     let xray = br#"{
       "dns": null,
       "outbounds": [
-        {"settings": {"address": "edge.example"}, "streamSettings": null},
+        {"settings": {"address": "edge.example.com"}, "streamSettings": null},
         {"streamSettings": {"sockopt": null}}
       ]
     }"#;
@@ -174,11 +556,6 @@ fn runtime_xray_overlay_treats_null_optional_sections_as_absent() {
     let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
         .unwrap()
         .with_xray_outbound_interface("Wi-Fi")
-        .unwrap()
-        .with_xray_resolved_hosts(BTreeMap::from([(
-            "edge.example".to_owned(),
-            vec!["203.0.113.7".parse::<IpAddr>().unwrap()],
-        )]))
         .unwrap();
 
     let published =
@@ -186,7 +563,7 @@ fn runtime_xray_overlay_treats_null_optional_sections_as_absent() {
     let runtime: JsonValue =
         serde_json::from_slice(&fs::read(published.xray_config).unwrap()).unwrap();
 
-    assert_eq!(runtime["dns"]["hosts"]["edge.example"], "203.0.113.7");
+    assert!(runtime["dns"].get("hosts").is_none());
     assert_eq!(
         runtime["outbounds"][0]["streamSettings"]["sockopt"]["interface"],
         "Wi-Fi"
@@ -214,34 +591,22 @@ fn runtime_xray_overlay_rejects_an_empty_outbound_set() {
 #[cfg(windows)]
 #[test]
 #[ignore = "requires explicit local Xray binary and subscription config paths"]
-fn pinned_xray_accepts_the_bootstrap_dns_runtime_overlay() {
+fn pinned_xray_accepts_the_live_dns_runtime_overlay() {
     let binary = std::env::var_os("MULTICORE_TEST_XRAY_BIN").unwrap();
     let xray_path = std::env::var_os("MULTICORE_TEST_XRAY_CONFIG").unwrap();
     let xray = fs::read(xray_path).unwrap();
     let snapshot = Snapshot::parse(b"proxies: []\n", &xray).unwrap();
-    let mut hosts = BTreeMap::new();
-    for domain in xray_outbound_server_domains(&snapshot).unwrap() {
-        let mut addresses: Vec<_> = (domain.as_str(), 0)
-            .to_socket_addrs()
-            .unwrap()
-            .map(|address| address.ip())
-            .collect();
-        addresses.sort_unstable();
-        addresses.dedup();
-        assert!(!addresses.is_empty());
-        hosts.insert(domain, addresses);
-    }
     let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
         .unwrap()
         .with_xray_outbound_interface(multicore_core::default_ipv4_interface().unwrap())
-        .unwrap()
-        .with_xray_resolved_hosts(hosts)
         .unwrap();
     let directory = TempDirectory::new();
     let published =
         publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
 
+    use std::os::windows::process::CommandExt;
     let status = Command::new(binary)
+        .creation_flags(0x0800_0000)
         .args(["run", "-test", "-c"])
         .arg(published.xray_config)
         .stdin(Stdio::null())
@@ -464,6 +829,88 @@ fn cleanup_failure_does_not_cancel_committed_runtime_and_is_retried_later() {
     assert!(newest.directory.is_dir());
     assert!(!old.directory.exists());
     assert!(!active.directory.exists());
+}
+
+#[test]
+fn runtime_publish_injects_configured_external_ui_directory() {
+    let directory = TempDirectory::new();
+    let dashboard = directory.path().join("dashboard");
+    fs::create_dir(&dashboard).unwrap();
+    fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+
+    let snapshot = Snapshot::parse(b"proxies: []\n", br#"{}"#).unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "secret")
+        .unwrap()
+        .with_external_ui_directory(&dashboard)
+        .unwrap();
+
+    let published = publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control)
+        .expect("staging with a valid external-ui directory must succeed");
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let mapping = runtime.as_mapping().unwrap();
+    assert_eq!(
+        mapping
+            .get(Value::String("external-ui".to_owned()))
+            .and_then(Value::as_str),
+        Some(dashboard.to_str().unwrap())
+    );
+    // Never our own external-ui-name/url alongside it: Mihomo's own auto-update fields must
+    // stay absent so it can never attempt a network fetch for the dashboard it already has.
+    for key in ["external-ui-name", "external-ui-url"] {
+        assert!(
+            mapping.get(Value::String(key.to_owned())).is_none(),
+            "unexpected {key} in runtime overlay"
+        );
+    }
+}
+
+#[test]
+fn runtime_publish_omits_external_ui_when_not_configured() {
+    let directory = TempDirectory::new();
+    let snapshot = Snapshot::parse(b"proxies: []\n", br#"{}"#).unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "secret").unwrap();
+
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    assert!(
+        runtime
+            .as_mapping()
+            .unwrap()
+            .get(Value::String("external-ui".to_owned()))
+            .is_none()
+    );
+}
+
+#[test]
+fn external_ui_directory_rejects_relative_missing_and_indexless_paths() {
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "secret").unwrap();
+
+    assert!(
+        control
+            .clone()
+            .with_external_ui_directory("relative/dashboard")
+            .is_err(),
+        "relative path must be rejected"
+    );
+    assert!(
+        control
+            .clone()
+            .with_external_ui_directory(directory.path().join("does-not-exist"))
+            .is_err(),
+        "missing directory must be rejected"
+    );
+    let empty_dashboard = directory.path().join("empty-dashboard");
+    fs::create_dir(&empty_dashboard).unwrap();
+    assert!(
+        control
+            .with_external_ui_directory(&empty_dashboard)
+            .is_err(),
+        "directory without index.html must be rejected"
+    );
 }
 
 #[test]

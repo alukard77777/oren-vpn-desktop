@@ -3,6 +3,7 @@
 mod app_icon;
 mod bootstrap;
 mod clipboard_text;
+mod conflicting_apps;
 mod daemon;
 #[cfg(target_os = "linux")]
 mod linux_display;
@@ -10,6 +11,8 @@ mod linux_display;
 mod linux_shell_tests;
 mod logo_cache;
 mod preferences;
+#[cfg(all(test, feature = "preview-render"))]
+mod preview_render;
 mod service_logo;
 mod single_instance;
 mod tray;
@@ -40,11 +43,11 @@ use tray::{
 };
 use updater::{UpdateAction, UpdateState};
 use view_model::{
-    CatalogDisplayKind, CatalogPresentation, DesktopViewModel, DiagnosticsPresentation,
-    LatencyPresentation, LatencyRequest, MutationToken, NodeSelectionRequest, Panel, PrimaryAction,
-    ProfileRequestToken, QueuedNodeSelection, SemanticTone, StatePresentation,
-    SubscriptionPresentation, SubscriptionProfileOperation, SubscriptionProfilesPresentation,
-    derive_catalog_display,
+    CatalogDisplayKind, CatalogPresentation, ConflictingAppsPresentation, DesktopViewModel,
+    DiagnosticsPresentation, LatencyPresentation, LatencyRequest, MutationToken,
+    NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
+    SemanticTone, StatePresentation, SubscriptionPresentation, SubscriptionProfileOperation,
+    SubscriptionProfilesPresentation, derive_catalog_display,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -66,6 +69,7 @@ struct UiSnapshot {
     catalog: CatalogPresentation,
     diagnostics: DiagnosticsPresentation,
     latency: LatencyPresentation,
+    conflicting_apps: ConflictingAppsPresentation,
 }
 
 const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
@@ -734,6 +738,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     apply_snapshot(&ui, &snapshot(&model.lock().expect("view model lock")));
     ui.set_local_page(visible_page_name(&loaded_preferences.visible_page).into());
+    ui.set_runtime_versions(env!("MULTICORE_RUNTIME_VERSIONS").into());
     ui.set_ambient_background_enabled(loaded_preferences.ambient_background);
     ui.set_auto_connect_on_startup(loaded_preferences.auto_connect_on_startup);
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
@@ -774,11 +779,14 @@ fn main() -> Result<(), slint::PlatformError> {
         profile_preferences.clone(),
         startup_connect_pending.clone(),
     );
+    wire_dashboard_action(&ui, model.clone());
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
+    wire_conflicting_apps_banner(&ui, model.clone());
+    let _conflicting_apps_timer = wire_conflicting_apps_scan(&ui, model.clone());
     wire_windows_settings(&ui);
     wire_external_activations(
         &ui,
@@ -889,6 +897,12 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_shell_active(starts_visible);
     if starts_visible {
         ui.show()?;
+    }
+    // Lets the Windows updater discard the previous version only once this
+    // build has its daemon and event loop running.
+    #[cfg(not(target_os = "linux"))]
+    if _bootstrap_guard.is_some() {
+        slint::Timer::single_shot(Duration::from_secs(2), updater::confirm_started);
     }
     let result = slint::run_event_loop_until_quit();
     flush_preferences(&ui, &model, &preference_writer, &preference_tracker);
@@ -1951,6 +1965,8 @@ fn apply_tray_popup_model(
     popup.set_status_text(model.status.into());
     popup.set_connection_label(model.connection_label.into());
     popup.set_connection_enabled(model.connection_enabled);
+    popup.set_connected(model.connected);
+    popup.set_has_profile(model.has_profile);
     popup.set_group_rows(ModelRc::new(VecModel::from(groups)));
     popup.set_node_rows(ModelRc::new(VecModel::from(nodes)));
 }
@@ -2103,6 +2119,8 @@ fn wire_tray_popup_actions(
     };
     popup.on_toggle_connection(wire_command(TrayCommand::ToggleConnection));
     popup.on_open_main(wire_command(TrayCommand::ShowWindow));
+    // Without a profile the main window opens on the inline onboarding.
+    popup.on_add_subscription(wire_command(TrayCommand::ShowWindow));
     popup.on_exit_app(wire_command(TrayCommand::Exit));
 
     let group_popup = popup_weak.clone();
@@ -2196,6 +2214,8 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
         connection_label: presentation.primary_label.into(),
         connection_enabled: presentation.primary_enabled
             && presentation.primary_action != PrimaryAction::None,
+        connected: presentation.is_connected,
+        has_profile: presentation.has_profile,
         groups: tray_groups
             .into_iter()
             .map(|group| {
@@ -2749,6 +2769,10 @@ fn wire_primary_action(
         startup_connect_pending.set(false);
         let (action, client, queued, current) = {
             let mut model = model.lock().expect("view model lock");
+            // Re-scan right at the start of the attempt: warn before a
+            // conflicting app causes a failed Connect, or explain one that
+            // just happened.
+            model.set_conflicting_apps(conflicting_apps::scan_running());
             let action = model.begin_primary_action();
             let client = model.daemon_client();
             let queued = model.queued_node_selections();
@@ -2776,6 +2800,23 @@ fn wire_primary_action(
             }
             Some((PrimaryAction::None, _)) | None => {}
         }
+    });
+}
+
+/// Opens the local Mihomo dashboard in the system's default browser. The button that triggers
+/// this is only enabled while `dashboard_available` (a live, authenticated controller session)
+/// is true, but the daemon re-checks that itself: a race between disconnect and a stale click
+/// simply surfaces as a "not connected" error here, discarded like any other transient failure of
+/// an external-browser launch. The URL contains this session's Mihomo controller secret and must
+/// never be logged, so it is deliberately not attached to any error or diagnostic path.
+fn wire_dashboard_action(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    ui.on_open_dashboard(move || {
+        let client = model.lock().expect("view model lock").daemon_client();
+        thread::spawn(move || {
+            if let Ok(url) = client.dashboard_url() {
+                let _ = webbrowser::open(&url);
+            }
+        });
     });
 }
 
@@ -2888,6 +2929,90 @@ fn begin_latency_check(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopVie
     }
 }
 
+/// Periodically re-scans for other Mihomo/Xray-based VPN client apps known
+/// to conflict with MultiCore's TUN adapter, WinTun driver session, and
+/// local ports, so the banner can warn *before* a Connect attempt fails
+/// because of one. The scan is cheap and local (see `conflicting_apps.rs`);
+/// it only runs while the window is visible and only while not already
+/// connected, since a working tunnel means there is nothing to warn about.
+fn wire_conflicting_apps_scan(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    timer.start(TimerMode::Repeated, Duration::from_secs(7), move || {
+        if !weak.upgrade().is_some_and(|ui| ui.window().is_visible()) {
+            return;
+        }
+        if model
+            .lock()
+            .expect("view model lock")
+            .presentation()
+            .is_connected
+        {
+            return;
+        }
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.set_conflicting_apps(conflicting_apps::scan_running());
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+    });
+    timer
+}
+
+fn wire_conflicting_apps_banner(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    let dismiss_model = model.clone();
+    ui.on_dismiss_conflicting_apps_banner(move || {
+        let current = {
+            let mut model = dismiss_model.lock().expect("view model lock");
+            model.dismiss_conflicting_apps_banner();
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_close_conflicting_apps(move || {
+        let apps = model.lock().expect("view model lock").conflicting_apps();
+        if apps.is_empty() {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_conflicting_apps_closing(true);
+        }
+        let model = model.clone();
+        let weak = weak.clone();
+        thread::spawn(move || {
+            // User-privilege-only, best-effort: never elevated. A process
+            // this user's own token cannot terminate (most commonly: the
+            // app's real engine runs as a Windows service in Session 0,
+            // separate from its GUI) is simply not counted -
+            // record_close_attempt below turns that into a specific note
+            // instead of the button silently appearing to do nothing.
+            for app in &apps {
+                conflicting_apps::close_running(app);
+            }
+            let current = {
+                let mut model = model.lock().expect("view model lock");
+                model.set_conflicting_apps(conflicting_apps::scan_running());
+                model.record_close_attempt(&apps);
+                snapshot(&model)
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_conflicting_apps_closing(false);
+                    apply_snapshot(&ui, &current);
+                }
+            });
+        });
+    });
+}
+
 fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     let weak = ui.as_weak();
     ui.on_filter_events(move |filter| {
@@ -2898,6 +3023,7 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         let level = match filter.as_str() {
             "Ошибки" => Some("error".to_owned()),
             "Система" => Some("system".to_owned()),
+            "Ядра" => Some("cores".to_owned()),
             _ => None,
         };
         let events = model
@@ -3049,7 +3175,13 @@ fn run_connect(
             }
             snapshot(&model)
         };
-        apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
+        apply_snapshot_from_worker(weak.clone(), current, model.clone(), refresh_catalog, false);
+        // Pull the bounded core log right away, success or failure, so the
+        // first seconds of Xray/Mihomo startup are already cached in the
+        // Events feed (see view_model::filtered_events) instead of only
+        // being fetched if the user happens to open that panel afterward -
+        // by then the window this covers may already be gone.
+        load_diagnostics(weak, model);
     });
 }
 
@@ -3642,6 +3774,7 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         catalog: model.catalog_presentation(),
         diagnostics: model.diagnostics_presentation(),
         latency: model.latency_presentation(),
+        conflicting_apps: model.conflicting_apps_presentation(),
     }
 }
 
@@ -3652,10 +3785,9 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_supporting(presentation.supporting.clone().into());
     ui.set_node_name(presentation.node.clone().into());
     ui.set_has_profile(presentation.has_profile);
-    ui.set_state_busy(presentation.is_busy);
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
-    ui.set_status_label(SharedString::from(presentation.pill_label));
+    ui.set_dashboard_available(presentation.is_connected);
     ui.set_status_tone(
         match presentation.semantic_tone {
             SemanticTone::Neutral => "neutral",
@@ -3744,6 +3876,23 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_profiles(ModelRc::new(VecModel::from(subscription_profiles)));
     ui.set_profile_menu_loading(snapshot.profiles.loading);
     ui.set_profile_menu_error(snapshot.profiles.error.clone().unwrap_or_default().into());
+    ui.set_profile_mutation_error(
+        snapshot
+            .profiles
+            .mutation_error
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_profile_switch_locked(snapshot.profiles.switch_locked);
+    ui.set_active_profile_id(
+        snapshot
+            .profiles
+            .active_id
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_profile_pending_operation(
         match snapshot.profiles.pending_operation {
             Some(SubscriptionProfileOperation::List) => "list",
@@ -3771,7 +3920,6 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_diagnostics_tun_tone(snapshot.diagnostics.tun.tone.clone().into());
     ui.set_diagnostics_loading(snapshot.diagnostics.loading);
     ui.set_latency_check_loading(snapshot.latency.loading);
-    ui.set_latency_check_queued(snapshot.latency.queued);
     ui.set_latency_check_error(snapshot.latency.error.clone().unwrap_or_default().into());
     ui.set_diagnostic_mappings(ModelRc::new(VecModel::from(
         snapshot
@@ -3785,6 +3933,8 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
             })
             .collect::<Vec<_>>(),
     )));
+    ui.set_conflicting_apps_banner_visible(snapshot.conflicting_apps.visible);
+    ui.set_conflicting_apps_message(snapshot.conflicting_apps.message.clone().into());
     apply_catalog(ui, &snapshot.catalog);
     ui.set_active_panel(
         match snapshot.panel {
@@ -3831,7 +3981,6 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
     ui.set_catalog_loading(catalog.loading);
     ui.set_catalog_selection_enabled(catalog.selection_enabled);
     ui.set_catalog_selection_pending(catalog.selection_pending);
-    ui.set_catalog_selection_queued(catalog.selection_queued);
     ui.set_catalog_error(catalog.error.clone().unwrap_or_default().into());
 }
 
@@ -4090,7 +4239,7 @@ mod window_tests {
             "in property <bool> subscription-updated-stale",
             "refresh-action-reserve := Rectangle",
             "subscription-refresh-action := FocusScope",
-            "text: root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
+            "root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
             "root.refresh-subscription();",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
             "announcement-strip := Rectangle",
@@ -4113,9 +4262,9 @@ mod window_tests {
             })
             .expect("subscription refresh action source");
         for unchanged in [
-            "x: parent.width - 140px;",
+            "x: parent.width - 164px;",
             "y: 5px;",
-            "width: 92px;",
+            "width: 116px;",
             "height: 44px;",
         ] {
             assert!(
@@ -4131,7 +4280,11 @@ mod window_tests {
             .expect("announcement source");
         assert!(announcement.contains("x: 0px;"));
         assert!(announcement.contains("width: parent.width;"));
-        assert!(announcement.contains("height: 36px;"));
+        assert!(announcement.contains("height: self.two-line ? 52px : 36px;"));
+        assert!(announcement.contains("wrap: word-wrap;"));
+        assert!(
+            announcement.contains("accessible-description: root.subscription-announcement-text;")
+        );
         assert!(announcement.contains("horizontal-alignment: center;"));
 
         let routes_header = ui
@@ -4139,14 +4292,16 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("ScrollView {").next())
             .expect("routes header source");
-        assert!(routes_header.contains("text: root.subscription-updated;"));
+        assert!(routes_header.contains(": root.subscription-updated;"));
+        assert!(routes_header.contains("root.subscription-updated-stale ? Theme.warning"));
         assert!(routes_header.contains("horizontal-alignment: right;"));
         assert!(
             routes_header.contains("Rectangle { horizontal-stretch: 1; background: transparent; }")
         );
         assert!(!routes_header.contains("route-updated-divider := Rectangle"));
         assert!(!routes_header.contains("commands: \"M 7 1.5"));
-        assert!(!routes_header.contains("latency-check-loading"));
+        // Latency progress is shown in place of the timestamp, not as extra chrome.
+        assert!(routes_header.contains("root.latency-check-loading ? \"Замеряем задержку…\""));
         assert!(!routes_header.contains("catalog-selection-queued"));
         assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
         assert!(rust.contains("ui.set_subscription_management_enabled("));
@@ -4533,7 +4688,7 @@ mod window_tests {
         for required in [
             "width: parent.width - 40px;",
             "opacity: root.profile-menu-open ? 1 : 0;",
-            "y: root.profile-menu-open ? 188px : 180px;",
+            "y: (root.profile-menu-open ? 188px : 180px) + root.home-banner-offset;",
             "animate opacity { duration: 160ms; easing: ease-out; }",
             "animate y { duration: 160ms; easing: ease-out; }",
         ] {
@@ -4636,8 +4791,10 @@ mod window_tests {
             "callback confirm-update-restart()",
             "callback cancel-update-restart()",
             "Скачать обновление и перезапустить клиент?",
-            "label: \"Да\"",
-            "label: \"Нет\"",
+            "label: \"Обновить и перезапустить\"",
+            "label: \"Отмена\"",
+            "update-modal-focus := FocusScope",
+            "focus-epoch: root.update-confirm-focus-serial;",
         ] {
             assert!(
                 ui.contains(required),
@@ -5522,12 +5679,12 @@ mod window_tests {
             .expect("deep-link confirmation overlay");
         assert!(modal.contains("background: #05070bc7;"));
         assert!(modal.contains("text: root.deep-link-confirm-host;"));
-        assert!(modal.contains("label: \"Нет\";"));
-        assert!(modal.contains("label: \"Да\";"));
+        assert!(modal.contains("label: \"Отмена\";"));
+        assert!(modal.contains("label: \"Добавить\";"));
         assert!(!modal.contains("root.subscription-draft"));
         assert!(modal.contains("key-pressed(event)"));
         assert!(modal.contains("root.cancel-deep-link();"));
-        assert!(ui.contains("enabled: !root.deep-link-confirm-open;"));
+        assert!(ui.contains("enabled: !root.deep-link-confirm-open && !root.update-confirm-open;"));
 
         let rust = include_str!("main.rs");
         let queue = rust

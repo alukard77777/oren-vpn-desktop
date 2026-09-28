@@ -26,9 +26,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
     AtomicSnapshot, Component, ConnectionState as CoreConnectionState, DiagnosticStream, Event,
-    HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError, ProfileId,
-    ProfileStore, ProfileSummary, RuntimeCheckState, ServiceLogoLease, Severity, Snapshot,
-    StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
+    FetchError, HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError,
+    ProfileId, ProfileStore, ProfileSummary, RuntimeCheckState, ServiceLogoLease, Severity,
+    Snapshot, SnapshotCommit, StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -326,6 +326,10 @@ pub enum ProfileMutationError {
     LimitReached,
     Storage,
     Committed,
+    /// The provider could not be reached or answered with something unusable.
+    Fetch(FetchError),
+    /// The subscription was downloaded but its runtime could not be prepared.
+    Prepare,
 }
 
 impl fmt::Display for ProfileMutationError {
@@ -648,6 +652,11 @@ pub trait Backend: Send + Sync + 'static {
 struct AppState {
     backend: Arc<dyn Backend>,
     event_epoch: Arc<str>,
+    /// The fully-formed local dashboard URL, secret included. Never logged or included in any
+    /// other response; only ever handed back to an already-authenticated caller, and only while a
+    /// live controller session exists. `AppState` deliberately has no `Debug` impl so this can
+    /// never be leaked through an accidental `{:?}` format.
+    dashboard_url: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -676,6 +685,27 @@ where
     ))
 }
 
+/// Fallible production constructor that also exposes the authenticated `/v1/dashboard-url`
+/// endpoint, returning `dashboard_url` to the caller only while a live controller session exists
+/// (see [`ConnectionState::Connected`]). `dashboard_url` should be the fully-formed local Mihomo
+/// dashboard URL, including its per-session secret; it is never logged and never returned from any
+/// other endpoint.
+pub fn try_router_with_dashboard_url<B>(
+    backend: B,
+    bearer_token: impl AsRef<str>,
+    dashboard_url: impl Into<Arc<str>>,
+) -> Result<Router, getrandom::Error>
+where
+    B: Backend,
+{
+    Ok(build_router(
+        backend,
+        bearer_token,
+        generate_event_epoch()?,
+        Some(dashboard_url.into()),
+    ))
+}
+
 /// Builds the local daemon HTTP API with an explicit event epoch.
 ///
 /// Production callers should use [`try_router`]. This constructor exists so transport tests can
@@ -688,9 +718,22 @@ pub fn router_with_event_epoch<B>(
 where
     B: Backend,
 {
+    build_router(backend, bearer_token, event_epoch, None)
+}
+
+fn build_router<B>(
+    backend: B,
+    bearer_token: impl AsRef<str>,
+    event_epoch: impl Into<String>,
+    dashboard_url: Option<Arc<str>>,
+) -> Router
+where
+    B: Backend,
+{
     let app_state = AppState {
         backend: Arc::new(backend),
         event_epoch: Arc::from(event_epoch.into()),
+        dashboard_url,
     };
     let auth_state = AuthState {
         token_hash: Sha256::digest(bearer_token.as_ref().as_bytes()).into(),
@@ -721,6 +764,7 @@ where
         .route("/disconnect", post(disconnect))
         .route("/events", get(events))
         .route("/diagnostics", get(diagnostics))
+        .route("/dashboard-url", get(dashboard_url_handler))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1042,8 +1086,103 @@ fn valid_subscription_source_url(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// Stays below the desktop's 150 s subscription request timeout.
+const SUBSCRIPTION_FETCH_DEADLINE: Duration = Duration::from_secs(120);
+
+fn subscription_fetch_reason(error: FetchError) -> String {
+    match error {
+        FetchError::Network => "network".to_owned(),
+        FetchError::Timeout => "timeout".to_owned(),
+        FetchError::Tls => "tls".to_owned(),
+        FetchError::Redirect => "redirect".to_owned(),
+        FetchError::HttpStatus(status) => format!("http {status}"),
+        FetchError::NotSubscription => "not a subscription".to_owned(),
+        FetchError::InvalidBundle | FetchError::InvalidConfig => "invalid config".to_owned(),
+        FetchError::Persistence => "persistence".to_owned(),
+        FetchError::TooLarge => "too large".to_owned(),
+    }
+}
+
+fn subscription_fetch_api_error(error: FetchError) -> ApiError {
+    let (status, code, message): (StatusCode, &str, String) = match error {
+        FetchError::Network => (
+            StatusCode::BAD_GATEWAY,
+            "subscription_unreachable",
+            "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
+                .to_owned(),
+        ),
+        FetchError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "subscription_timeout",
+            "Сервер подписки не ответил вовремя. Повторите попытку чуть позже.".to_owned(),
+        ),
+        FetchError::Tls => (
+            StatusCode::BAD_GATEWAY,
+            "subscription_tls",
+            "Не удалось установить защищённое соединение с сервером подписки: сертификат не принят. Проверьте ссылку или обратитесь к провайдеру."
+                .to_owned(),
+        ),
+        FetchError::Redirect => (
+            StatusCode::BAD_GATEWAY,
+            "subscription_redirect",
+            "Сервер подписки перенаправил запрос небезопасно или слишком много раз.".to_owned(),
+        ),
+        FetchError::HttpStatus(status) => (
+            StatusCode::BAD_GATEWAY,
+            match status {
+                401 | 403 => "subscription_forbidden",
+                404 | 410 => "subscription_not_found",
+                429 => "subscription_rate_limited",
+                500..=599 => "subscription_server_error",
+                _ => "subscription_http_status",
+            },
+            match status {
+                401 | 403 => format!(
+                    "Сервер подписки отказал в доступе (HTTP {status}). Проверьте ссылку и срок действия подписки."
+                ),
+                404 | 410 => format!(
+                    "Подписка не найдена (HTTP {status}). Проверьте, что ссылка скопирована полностью."
+                ),
+                429 => "Сервер подписки временно ограничил запросы (HTTP 429). Повторите попытку через минуту.".to_owned(),
+                500..=599 => format!(
+                    "Сервер подписки временно не работает (HTTP {status}). Повторите попытку позже."
+                ),
+                _ => format!("Сервер подписки вернул ошибку HTTP {status}."),
+            },
+        ),
+        FetchError::NotSubscription => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_not_multicore",
+            "По ссылке пришла веб-страница или список ссылок, а не подписка MultiCore. Скопируйте ссылку подписки для приложения у провайдера."
+                .to_owned(),
+        ),
+        FetchError::InvalidBundle | FetchError::InvalidConfig => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_invalid",
+            "Провайдер прислал повреждённую или неподдерживаемую конфигурацию.".to_owned(),
+        ),
+        FetchError::TooLarge => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_too_large",
+            "Ответ сервера подписки слишком большой.".to_owned(),
+        ),
+        FetchError::Persistence => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subscription_storage",
+            "Не удалось сохранить подписку на диск. Проверьте свободное место.".to_owned(),
+        ),
+    };
+    ApiError::new(status, code, &message)
+}
+
 fn profile_api_error(error: BackendError, internal_message: &str) -> ApiError {
     match error.profile_mutation() {
+        Some(ProfileMutationError::Fetch(error)) => subscription_fetch_api_error(error),
+        Some(ProfileMutationError::Prepare) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subscription_prepare_failed",
+            "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение и повторите попытку.",
+        ),
         Some(ProfileMutationError::NotFound) => profile_not_found(),
         Some(ProfileMutationError::Connected) => ApiError::new(
             StatusCode::CONFLICT,
@@ -1088,6 +1227,13 @@ async fn import_subscription(
         .await
         .map(Json)
         .map_err(|error| {
+            if error.profile_mutation() == Some(ProfileMutationError::Connected) {
+                return ApiError::new(
+                    StatusCode::CONFLICT,
+                    "import_requires_disconnect",
+                    "Отключите VPN, чтобы добавить подписку: новая подписка сразу становится активной.",
+                );
+            }
             profile_api_error(
                 error,
                 "Не удалось импортировать подписку. Проверьте ссылку и повторите попытку.",
@@ -1178,6 +1324,44 @@ async fn diagnostics(
         .await
         .map(Json)
         .map_err(|_| ApiError::backend("Не удалось получить диагностику. Повторите попытку."))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DashboardUrlDto {
+    pub url: String,
+}
+
+/// Returns the fully-formed, secret-bearing local Mihomo dashboard URL, but only while a live
+/// controller session exists (`ConnectionState::Connected`). The URL is never included in
+/// `/status`, `/events`, or any diagnostic output, and this handler never logs it: an error path
+/// here must not accidentally embed the URL in any tracing/log output added later.
+async fn dashboard_url_handler(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<DashboardUrlDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let Some(dashboard_url) = state.dashboard_url.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "dashboard_unavailable",
+            "Панель Mihomo недоступна в этой сборке.",
+        ));
+    };
+    let status = state
+        .backend
+        .status()
+        .await
+        .map_err(|_| ApiError::backend("Не удалось получить состояние. Повторите попытку."))?;
+    if status.state != ConnectionState::Connected {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "not_connected",
+            "Подключитесь, чтобы открыть панель Mihomo.",
+        ));
+    }
+    Ok(Json(DashboardUrlDto {
+        url: dashboard_url.to_string(),
+    }))
 }
 
 fn reject_nonempty_body(body: &Bytes) -> Result<(), ApiError> {
@@ -1980,6 +2164,34 @@ where
         Ok(self.current_status().await)
     }
 
+    /// Downloads a subscription within one overall deadline that stays below
+    /// the desktop's request timeout, and records a URL-free failure reason.
+    async fn fetch_subscription(
+        &self,
+        url: &str,
+        staging: &AtomicSnapshot,
+    ) -> Result<SnapshotCommit<Arc<Snapshot>>, ProfileMutationError> {
+        let result = tokio::time::timeout(
+            SUBSCRIPTION_FETCH_DEADLINE,
+            self.fetcher.refresh(url, staging),
+        )
+        .await
+        .unwrap_or(Err(FetchError::Timeout));
+        match result {
+            Ok(commit) => Ok(commit),
+            Err(error) => {
+                let reason = subscription_fetch_reason(error);
+                self.inner.write().await.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "subscription_fetch_failed",
+                    &format!("Subscription download failed: {reason}."),
+                );
+                Err(ProfileMutationError::Fetch(error))
+            }
+        }
+    }
+
     async fn require_disconnected_mutation(&self) -> Result<(), ProfileMutationError> {
         let state = self.inner.read().await;
         if state.degraded
@@ -2152,14 +2364,10 @@ where
         let connected =
             active && self.inner.read().await.state.current() == CoreConnectionState::Connected;
         let staging = AtomicSnapshot::default();
-        let fetched = self
-            .fetcher
-            .refresh(source_url, &staging)
-            .await
-            .map_err(|_| ProfileMutationError::Storage)?;
+        let fetched = self.fetch_subscription(source_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
         let prepared = if active && !connected {
-            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?)
+            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?)
         } else {
             None
         };
@@ -2269,14 +2477,10 @@ where
             return Err(ProfileMutationError::Storage);
         }
         let staging = AtomicSnapshot::default();
-        let fetched = self
-            .fetcher
-            .refresh(trimmed_url, &staging)
-            .await
-            .map_err(|_| ProfileMutationError::Storage)?;
+        let fetched = self.fetch_subscription(trimmed_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
         let prepared =
-            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?;
         let existing = self
             .store
             .find_exact_source(trimmed_url)
@@ -2674,6 +2878,8 @@ where
                 "Запускается подключение.",
             );
         }
+        // If this future is dropped before the outcome is recorded, leave a cleanable error.
+        let mut abandoned = AbandonedConnectGuard::new(&self.inner);
 
         let result = Supervisor::new(controller.clone()).connect().await;
         if result.is_ok() {
@@ -2681,6 +2887,7 @@ where
                 if self.selector.select(&group, &node).await.is_err() {
                     let rollback = Supervisor::new(controller.clone()).disconnect().await;
                     let mut state = self.inner.write().await;
+                    abandoned.disarm();
                     if rollback.is_ok() {
                         state
                             .state
@@ -2708,6 +2915,7 @@ where
             }
         }
         let mut state = self.inner.write().await;
+        abandoned.disarm();
         match result {
             Ok(()) => {
                 state
@@ -2725,7 +2933,9 @@ where
                 Ok(state.status())
             }
             Err(multicore_core::SupervisorError::StartFailed {
-                rollback_failed, ..
+                engine,
+                rollback_failed,
+                cause,
             }) => {
                 if rollback_failed {
                     state.mark_error(
@@ -2737,9 +2947,7 @@ where
                         .state
                         .transition(CoreConnectionState::Ready)
                         .map_err(|_| BackendError::new())?;
-                    state.message = Some(
-                        "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned(),
-                    );
+                    state.message = Some(start_failure_message(engine, cause));
                     state.degraded = false;
                 }
                 state.push_event(
@@ -3192,6 +3400,78 @@ fn runtime_check_to_dto(state: RuntimeCheckState) -> RuntimeCheckDto {
         RuntimeCheckState::Ready => RuntimeCheckDto::Ready,
         RuntimeCheckState::Failed => RuntimeCheckDto::Failed,
         RuntimeCheckState::Unsupported => RuntimeCheckDto::Unsupported,
+    }
+}
+
+/// Marks a connect whose future was dropped mid-start as a degraded error, so the state never
+/// stays `Connecting` and the next Disconnect cleans up whatever the start left running.
+struct AbandonedConnectGuard<'a, P: ProcessController> {
+    inner: &'a RwLock<CoreRuntime<P>>,
+    armed: bool,
+}
+
+impl<'a, P: ProcessController> AbandonedConnectGuard<'a, P> {
+    fn new(inner: &'a RwLock<CoreRuntime<P>>) -> Self {
+        Self { inner, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<P: ProcessController> Drop for AbandonedConnectGuard<'_, P> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop cannot await; readers hold this lock only briefly, so retry a bounded number of
+        // times rather than leaving the state stuck.
+        for _ in 0..10_000 {
+            if let Ok(mut state) = self.inner.try_write() {
+                if state.state.current() == CoreConnectionState::Connecting {
+                    state.mark_error(
+                        "Подключение прервано. Выполните отключение для очистки.",
+                        true,
+                    );
+                    state.push_event(
+                        Severity::Error,
+                        Component::Core,
+                        "connect",
+                        "Запуск подключения был прерван.",
+                    );
+                }
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn start_failure_message(
+    engine: multicore_core::Engine,
+    cause: multicore_core::StartFailureCause,
+) -> String {
+    use multicore_core::{Engine, StartFailureCause as Cause};
+    let core = match engine {
+        Engine::Xray => "Xray",
+        Engine::Mihomo => "Mihomo",
+    };
+    match cause {
+        Cause::ElevationCancelled => {
+            "Подключение отменено: не выдано разрешение администратора.".to_owned()
+        }
+        Cause::ElevationFailed => {
+            "Не удалось запустить службу подключения с правами администратора.".to_owned()
+        }
+        Cause::BrokerFailed => "Служба подключения не ответила. Повторите попытку.".to_owned(),
+        Cause::CoreFailed => format!("Не удалось запустить {core}. Проверьте исполняемые файлы."),
+        Cause::ReadinessTimedOut => {
+            format!("{core} не успел запуститься вовремя. Повторите попытку.")
+        }
+        Cause::Unknown => {
+            "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
+        }
     }
 }
 

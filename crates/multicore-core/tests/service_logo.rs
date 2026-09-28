@@ -547,8 +547,8 @@ async fn invalid_config_never_triggers_a_logo_request() {
             &multicore_core::AtomicSnapshot::default(),
         )
         .await;
-    assert!(matches!(result, Err(FetchError::InvalidBundle)));
-    assert_eq!(*calls.lock().unwrap(), [UA_NATIVE]);
+    assert!(matches!(result, Err(FetchError::NotSubscription)));
+    assert_eq!(*calls.lock().unwrap(), [UA_NATIVE, UA_MIHOMO, UA_XRAY]);
 }
 
 #[derive(Clone, Default)]

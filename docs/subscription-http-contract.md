@@ -6,8 +6,12 @@ This document is the backend-facing contract implemented by the current MultiCor
 
 For one subscription URL, the client first sends one request with `User-Agent: multicore-json-massive`.
 
-- Any successful HTTP status is terminal: the client parses that body and does not make Mihomo/Xray fallback requests.
-- Network failure or a non-success HTTP status triggers two parallel requests with `multicore-mihomo` and `multicore-xray`.
+- A successful HTTP status whose body is a JSON array is terminal: the client parses that bundle and does not make Mihomo/Xray fallback requests, even if the bundle is invalid.
+- A successful status with any other body (an HTML page, share links, Base64, plain YAML), a network failure, or a non-success HTTP status triggers two parallel requests with `multicore-mihomo` and `multicore-xray`.
+- A leading UTF-8 byte order mark is ignored on every representation.
+- Redirects are followed like a browser, up to five hops. An `https` to `http` downgrade, a non-HTTP scheme, and a redirect from a public host to loopback, private or `localhost` addresses are refused.
+- Each request is retried once: after 429/500/502/503/504 (honouring `Retry-After` up to 3 seconds), or through the operating-system proxy when a direct connection cannot be established. Each attempt has a 15-second connect and 30-second total timeout; the whole download is bounded by 120 seconds.
+- Failures are reported to the user by cause (unreachable, timeout, TLS, redirect, HTTP 401/403, 404/410, 429, 5xx, not a MultiCore subscription, invalid configuration). Subscription URLs never appear in these messages or in diagnostics.
 - Both fallback responses must succeed and validate before the client publishes anything.
 - A failed refresh preserves the complete previous last-good snapshot.
 

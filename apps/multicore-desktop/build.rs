@@ -22,15 +22,13 @@ fn main() {
         .to_string()
         .replace('\\', "/");
     let check_source = format!(
-        r#"import {{ IconAction, PrimaryAction, QuietChip, RouteNodeRow, DetailsSurface }} from "{components_path}";
+        r#"import {{ PrimaryAction, QuietChip, RouteNodeRow }} from "{components_path}";
 export component ComponentCheck inherits Window {{
     preferred-width: 480px;
     preferred-height: 720px;
-    IconAction {{ state-label: "Открыть действие"; }}
     PrimaryAction {{ label: "Подключить"; state-label: "Подключить профиль"; }}
     QuietChip {{ label: "Автовыбор"; selected: true; }}
     RouteNodeRow {{ label: "Новосибирск"; trailing-text: "42 мс"; pending: true; }}
-    DetailsSurface {{ title: "Диагностика"; }}
 }}
 "#,
     );
@@ -58,6 +56,8 @@ export component ComponentCheck inherits Window {{
     println!("cargo:rerun-if-changed=assets/trash.svg");
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=app-debug.manifest");
+
+    emit_runtime_versions(&manifest_dir);
 
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         compile_windows_resources(&manifest_dir, &output_dir, &icon_tree);
@@ -138,4 +138,34 @@ fn rasterize_app_icon(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
 
 fn unpremultiply(channel: u8, alpha: u8) -> u8 {
     ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+}
+
+/// Exposes the pinned Mihomo and Xray versions from the packaging manifest so
+/// the settings footer cannot drift from what the release actually bundles.
+fn emit_runtime_versions(manifest_dir: &std::path::Path) {
+    let relative = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        "../../packaging/windows-x64/versions.json"
+    } else {
+        "../../packaging/linux/versions.json"
+    };
+    let versions_path = manifest_dir.join(relative);
+    println!("cargo:rerun-if-changed={}", versions_path.display());
+    let runtime_versions = std::fs::read_to_string(&versions_path)
+        .ok()
+        .and_then(|manifest| {
+            let mihomo = pinned_component_version(&manifest, "mihomo")?;
+            let xray = pinned_component_version(&manifest, "xray")?;
+            Some(format!("MultiCore · Mihomo {mihomo} · Xray {xray}"))
+        })
+        .unwrap_or_else(|| "MultiCore".to_owned());
+    println!("cargo:rustc-env=MULTICORE_RUNTIME_VERSIONS={runtime_versions}");
+}
+
+fn pinned_component_version(manifest: &str, component: &str) -> Option<String> {
+    let start = manifest.find(&format!("\"{component}\": {{"))?;
+    let rest = &manifest[start..];
+    let key = "\"version\": \"";
+    let value = &rest[rest.find(key)? + key.len()..];
+    let version = &value[..value.find('"')?];
+    Some(version.trim_start_matches('v').to_owned())
 }

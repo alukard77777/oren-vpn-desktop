@@ -1,7 +1,6 @@
 use std::{
-    collections::BTreeMap,
     env, io,
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -9,12 +8,12 @@ use std::{
 use multicore_core::{
     DeviceIdentity, MihomoRuntimeControl, ProfileStore, ReqwestHttpClient, Snapshot,
     SubscriptionFetcher, default_ipv4_interface, stage_runtime_with_mihomo_control,
-    xray_outbound_server_domains,
 };
 use multicore_daemon::elevated_controller::{production_factory, runtime_generation_from_path};
 use multicore_daemon::{
     BackendError, CoreBackend, MihomoHttpSelector, PreparedController, bind_loopback,
     publish_readiness_if_enabled, transactional_controller_factory, try_router,
+    try_router_with_dashboard_url,
 };
 
 #[tokio::main]
@@ -47,6 +46,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mihomo_controller_address,
         &mihomo_controller_secret,
     )?);
+
+    // The vendored zashboard build ships as a `dashboard/` sibling of `cores/` and `runtime/` at
+    // the package root in a packaged release (see packaging/*/versions.json and
+    // apps/multicore-core-host/src/runtime_paths.rs, which resolves the same directory the same
+    // way). This executable itself lives one level deeper, inside `runtime/`, so the package
+    // root is its *grandparent*, not its parent. The directory is absent in ad hoc dev/test
+    // builds, in which case the dashboard feature is simply unavailable: no runtime download is
+    // ever attempted. `dashboard_url` embeds the per-process controller secret and must never be
+    // logged; it only leaves this process through the authenticated `/v1/dashboard-url` route.
+    let dashboard_directory = env::current_exe().ok().and_then(|executable| {
+        dashboard_directory_for(&executable).map(|package_root| package_root.join("dashboard"))
+    });
+    let runtime_control = match &dashboard_directory {
+        Some(directory) => runtime_control
+            .clone()
+            .with_external_ui_directory(directory)
+            .unwrap_or(runtime_control),
+        None => runtime_control,
+    };
+    let dashboard_url: Option<Arc<str>> = dashboard_directory
+        .as_deref()
+        .filter(|directory| directory.join("index.html").is_file())
+        .map(|_| {
+            Arc::from(format!(
+                "http://{mihomo_controller_address}/ui/#/setup?hostname={}&port={}&secret={mihomo_controller_secret}",
+                mihomo_controller_address.ip(),
+                mihomo_controller_address.port(),
+            ))
+        });
     drop(mihomo_controller_secret);
 
     let store = ProfileStore::open(
@@ -58,11 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elevated_factory = Mutex::new(None);
     let controller_factory = transactional_controller_factory(move |snapshot: &Snapshot| {
         let xray_outbound_interface = default_ipv4_interface().map_err(|_| BackendError::new())?;
-        let resolved_hosts = resolve_xray_hosts(snapshot).map_err(|_| BackendError::new())?;
         let control = runtime_control
             .clone()
             .with_xray_outbound_interface(xray_outbound_interface)
-            .and_then(|control| control.with_xray_resolved_hosts(resolved_hosts))
             .map_err(|_| BackendError::new())?;
         let staged = stage_runtime_with_mihomo_control(snapshot, &runtime_root, &control)
             .map_err(|_| BackendError::new())?;
@@ -83,7 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend =
         CoreBackend::new_transactional_with_selector(store, fetcher, controller_factory, selector)?;
 
-    let app = try_router(backend, token)?;
+    let app = match dashboard_url {
+        Some(dashboard_url) => try_router_with_dashboard_url(backend, token, dashboard_url)?,
+        None => try_router(backend, token)?,
+    };
     let listener = bind_loopback(address).await?;
     let resolved_address = listener.local_addr()?;
     {
@@ -99,6 +128,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The package root (parent of both `runtime/`, which this executable lives
+/// in, and `cores/`), where an optional vendored `dashboard/` directory is
+/// staged as a sibling of `cores/` - not as a sibling of this executable
+/// itself, which is one level deeper. Matches
+/// `apps/multicore-core-host/src/runtime_paths.rs`'s resolution of the same
+/// directory.
+fn dashboard_directory_for(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    executable
+        .parent()
+        .and_then(|runtime_dir| runtime_dir.parent())
+        .map(std::path::Path::to_path_buf)
+}
+
 fn required_env(name: &str) -> io::Result<String> {
     env::var(name)
         .ok()
@@ -111,48 +153,43 @@ fn required_env(name: &str) -> io::Result<String> {
         })
 }
 
-fn resolve_xray_hosts(snapshot: &Snapshot) -> io::Result<BTreeMap<String, Vec<IpAddr>>> {
-    let domains = xray_outbound_server_domains(snapshot)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    resolve_xray_hosts_with(domains, |domain| {
-        Ok((domain, 0)
-            .to_socket_addrs()?
-            .map(|address| address.ip())
-            .collect())
-    })
-}
-
-fn resolve_xray_hosts_with<I, F>(
-    domains: I,
-    mut resolver: F,
-) -> io::Result<BTreeMap<String, Vec<IpAddr>>>
-where
-    I: IntoIterator<Item = String>,
-    F: FnMut(&str) -> io::Result<Vec<IpAddr>>,
-{
-    let mut resolved = BTreeMap::new();
-    for domain in domains {
-        let mut addresses = resolver(&domain)?;
-        addresses.sort_unstable();
-        addresses.dedup();
-        if addresses.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Xray outbound domain resolved to no IP addresses",
-            ));
-        }
-        resolved.insert(domain, addresses);
-    }
-    Ok(resolved)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-
-    use super::resolve_xray_hosts_with;
+    use super::dashboard_directory_for;
 
     const MAIN_SOURCE: &str = include_str!("main.rs");
+
+    #[test]
+    fn dashboard_directory_is_a_sibling_of_cores_not_of_this_executable() {
+        // multicore-daemon.exe lives in `<package>/runtime/`; the vendored
+        // dashboard is staged at `<package>/dashboard/`, the same package
+        // root apps/multicore-core-host/src/runtime_paths.rs resolves `cores/`
+        // from. Regression coverage for a real bug: an earlier version only
+        // went up one `.parent()`, landing on `<package>/runtime/dashboard`,
+        // which never exists, so the dashboard silently never worked despite
+        // package-windows-release.ps1 staging it correctly.
+        #[cfg(windows)]
+        let executable = std::path::Path::new(
+            r"C:\Users\Example\AppData\Local\Programs\MultiCore\current\runtime\multicore-daemon.exe",
+        );
+        #[cfg(not(windows))]
+        let executable = std::path::Path::new("/usr/lib/multicore/runtime/multicore-daemon");
+
+        let package_root = dashboard_directory_for(executable).expect("package root resolves");
+        assert_eq!(package_root, executable.parent().unwrap().parent().unwrap());
+        assert_ne!(
+            package_root.join("dashboard"),
+            executable.parent().unwrap().join("dashboard"),
+            "must not resolve to a sibling of the executable itself"
+        );
+    }
+
+    #[test]
+    fn live_dns_does_not_resolve_and_pin_endpoint_ips_during_connect() {
+        let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("to_socket_addrs"));
+        assert!(!production.contains("with_xray_resolved_hosts"));
+    }
 
     #[test]
     fn production_daemon_uses_only_the_elevated_core_controller() {
@@ -171,43 +208,5 @@ mod tests {
                 "production main still contains {forbidden}"
             );
         }
-    }
-
-    #[test]
-    fn xray_host_bootstrap_collects_client_local_ip_answers() {
-        let resolved = resolve_xray_hosts_with(
-            vec!["backup.example".to_owned(), "edge.example".to_owned()],
-            |domain| match domain {
-                "backup.example" => Ok(vec!["198.51.100.9".parse::<IpAddr>().unwrap()]),
-                "edge.example" => Ok(vec![
-                    "203.0.113.7".parse::<IpAddr>().unwrap(),
-                    "203.0.113.7".parse::<IpAddr>().unwrap(),
-                ]),
-                _ => unreachable!(),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolved["backup.example"],
-            ["198.51.100.9".parse::<IpAddr>().unwrap()]
-        );
-        assert_eq!(
-            resolved["edge.example"],
-            ["203.0.113.7".parse::<IpAddr>().unwrap()]
-        );
-    }
-
-    #[test]
-    fn xray_host_bootstrap_fails_closed_when_a_domain_has_no_ip() {
-        assert!(
-            resolve_xray_hosts_with(vec!["edge.example".to_owned()], |_| Ok(Vec::new())).is_err()
-        );
-        assert!(
-            resolve_xray_hosts_with(vec!["edge.example".to_owned()], |_| {
-                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "dns"))
-            })
-            .is_err()
-        );
     }
 }

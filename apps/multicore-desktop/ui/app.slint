@@ -165,6 +165,55 @@ component SmallAction inherits Rectangle {
     }
 }
 
+component DashboardAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    // Shown to assistive technology (and is the closest equivalent this app has to a
+    // hover tooltip) explaining why the button is disabled, e.g. "Подключитесь, чтобы
+    // открыть панель Mihomo."
+    in property <string> disabled-hint;
+    callback activated();
+
+    min-width: 128px;
+    preferred-width: dashboard-label.preferred-width + 28px;
+    horizontal-stretch: 0;
+    height: 44px;
+    background: root.enabled ? (dashboard-touch.pressed ? Theme.elevated : dashboard-touch.has-hover ? #ffffff0d : transparent) : transparent;
+    border-color: dashboard-focus.has-focus ? Theme.focus : Theme.line;
+    border-width: dashboard-focus.has-focus ? 2px : 1px;
+    border-radius: 8px;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.enabled ? "" : root.disabled-hint;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    dashboard-label := Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-family: Theme.font-family;
+        font-size: Theme.type-metadata-size;
+        font-weight: Theme.weight-semibold;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    dashboard-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        dashboard-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
 component SettingsNavItem inherits Rectangle {
     in property <string> label;
     in property <bool> selected: false;
@@ -392,10 +441,11 @@ export component AppWindow inherits Window {
     in property <string> supporting: "Вставьте URL — остальное настроим автоматически.";
     in property <string> node-name: "Маршрут не выбран";
     in property <bool> has-profile: false;
-    in property <bool> state-busy: false;
     in property <string> primary-label: "Подключить";
     in property <bool> primary-enabled: false;
-    in property <string> status-label: "Готово";
+    // The Mihomo dashboard is only meaningful while a live, authenticated controller
+    // session exists, i.e. while Connected.
+    in property <bool> dashboard-available: false;
     in property <string> status-tone: "neutral";
     in property <bool> import-pending: false;
     in property <string> import-error;
@@ -416,6 +466,9 @@ export component AppWindow inherits Window {
     in property <[UiSubscriptionProfile]> subscription-profiles;
     in property <bool> profile-menu-loading: false;
     in property <string> profile-menu-error;
+    in property <string> profile-mutation-error;
+    in property <bool> profile-switch-locked: false;
+    in property <string> active-profile-id;
     in property <string> profile-pending-operation: "none";
     in property <string> profile-pending-id;
     in property <string> active-panel: "none";
@@ -426,10 +479,8 @@ export component AppWindow inherits Window {
     in property <bool> catalog-loading: false;
     in property <bool> catalog-selection-enabled: false;
     in property <bool> catalog-selection-pending: false;
-    in property <bool> catalog-selection-queued: false;
     in property <string> catalog-error;
     in property <bool> latency-check-loading: false;
-    in property <bool> latency-check-queued: false;
     in property <string> latency-check-error;
     in property <string> diagnostics-xray-value: "Остановлен";
     in property <string> diagnostics-xray-tone: "neutral";
@@ -448,6 +499,7 @@ export component AppWindow inherits Window {
     in-out property <bool> shell-active: true;
     in property <bool> reduced-motion: false;
     in property <string> system-name: "Windows";
+    in property <string> runtime-versions: "MultiCore";
     private property <bool> ambient-wave-phase: false;
     private property <bool> ambient-wave-started: false;
     private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
@@ -464,8 +516,11 @@ export component AppWindow inherits Window {
     in property <bool> update-action-enabled: false;
     in property <bool> update-busy: false;
     in-out property <string> update-banner-dismissed-for;
+    in property <bool> conflicting-apps-banner-visible: false;
+    in property <string> conflicting-apps-message;
     in-out property <bool> update-confirm-open: false;
     in-out property <bool> deep-link-confirm-open: false;
+    in-out property <int> update-confirm-focus-serial: 0;
     in property <string> deep-link-confirm-host;
     in-out property <string> deep-link-import-host;
     in-out property <int> deep-link-focus-serial: 0;
@@ -485,6 +540,17 @@ export component AppWindow inherits Window {
     private property <int> profile-shelf-focus-serial: 0;
     in-out property <string> profile-delete-confirm-id;
     private property <bool> catalog-group-navigation-enabled: !root.catalog-loading && root.catalog-groups.length > 0;
+    private property <bool> update-banner-visible: root.update-available && root.update-status != root.update-banner-dismissed-for;
+    // The profile menu floats under the subscription shelf, so it follows the
+    // optional update/conflicting-apps banners that sit between the
+    // connection strip and shelf.
+    private property <length> home-banner-offset: (root.update-banner-visible ? 80px : 0px)
+        + (root.conflicting-apps-banner-visible ? 80px : 0px);
+    private property <length> profile-menu-content-height: (root.profile-switch-locked ? 28px : 0px)
+        + (root.profile-mutation-error != "" ? 40px : 0px)
+        + (root.profile-menu-error != "" ? 104px
+            : root.profile-menu-loading ? 144px
+            : Math.min(288px, 16px + root.subscription-profiles.length * 54px));
     private property <length> resize-border: 6px;
     in-out property <string> subscription-draft;
 
@@ -501,6 +567,7 @@ export component AppWindow inherits Window {
     callback add-subscription();
     callback retry-profile-menu();
     callback primary-action();
+    callback open-dashboard();
     callback open-panel(string);
     callback close-panel();
     callback escape-pressed();
@@ -516,6 +583,9 @@ export component AppWindow inherits Window {
     callback update-action();
     callback confirm-update-restart();
     callback cancel-update-restart();
+    callback dismiss-conflicting-apps-banner();
+    callback close-conflicting-apps();
+    in property <bool> conflicting-apps-closing: false;
     callback confirm-deep-link();
     callback cancel-deep-link();
 
@@ -569,7 +639,7 @@ export component AppWindow inherits Window {
     }
 
     visual-frame := FocusScope {
-        enabled: !root.deep-link-confirm-open;
+        enabled: !root.deep-link-confirm-open && !root.update-confirm-open;
         x: root.resize-border;
         y: root.resize-border;
         width: parent.width - 2 * root.resize-border;
@@ -581,10 +651,19 @@ export component AppWindow inherits Window {
                 root.deep-link-focus-serial += 1;
                 return accept;
             }
+            if (root.update-confirm-open) {
+                if (event.text == Key.Escape) {
+                    root.update-confirm-open = false;
+                    root.cancel-update-restart();
+                    return accept;
+                }
+                root.update-confirm-focus-serial += 1;
+                return accept;
+            }
             return reject;
         }
         capture-key-released(event) => {
-            if (root.deep-link-confirm-open) { return accept; }
+            if (root.deep-link-confirm-open || root.update-confirm-open) { return accept; }
             return reject;
         }
         key-pressed(event) => {
@@ -656,9 +735,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                TitleBarButton { x: parent.width - 132px; kind: "minimize"; state-label: "Свернуть окно"; enabled: !root.profile-menu-open; activated => { root.window-minimize(); } }
-                TitleBarButton { x: parent.width - 88px; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; enabled: !root.profile-menu-open; activated => { root.window-toggle-maximize(); } }
-                TitleBarButton { x: parent.width - 44px; kind: "close"; state-label: "Закрыть MultiCore"; enabled: !root.profile-menu-open; activated => { root.window-close(); } }
+                TitleBarButton { x: parent.width - 132px; kind: "minimize"; state-label: "Свернуть окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
+                TitleBarButton { x: parent.width - 88px; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
+                TitleBarButton { x: parent.width - 44px; kind: "close"; state-label: "Закрыть MultiCore"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
             }
 
             HorizontalLayout {
@@ -1024,7 +1103,7 @@ export component AppWindow inherits Window {
 
                     }
 
-                    if root.update-available && root.update-status != root.update-banner-dismissed-for: update-banner := Rectangle {
+                    if root.update-banner-visible: update-banner := Rectangle {
                         height: 72px;
                         background: #101721;
                         border-color: #4c9dff55;
@@ -1034,13 +1113,18 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             padding-left: 14px;
                             padding-right: 14px;
+                            padding-top: 14px;
+                            padding-bottom: 14px;
                             spacing: 12px;
-                            Rectangle {
-                                width: 32px;
-                                height: 32px;
-                                border-radius: 8px;
-                                background: #4c9dff18;
-                                Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; }
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 32px;
+                                    height: 32px;
+                                    border-radius: 8px;
+                                    background: #4c9dff18;
+                                    Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; }
+                                }
                             }
                             VerticalLayout {
                                 horizontal-stretch: 1;
@@ -1067,7 +1151,52 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    subscription-strip := Rectangle {
+                    if root.conflicting-apps-banner-visible: conflicting-apps-banner := Rectangle {
+                        height: 72px;
+                        background: #1a1215;
+                        border-color: #f06a6a55;
+                        border-width: 1px;
+                        border-radius: 14px;
+                        clip: true;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            padding-top: 14px;
+                            padding-bottom: 14px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 32px;
+                                    height: 32px;
+                                    border-radius: 8px;
+                                    background: #f06a6a18;
+                                    Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/announcement-danger.svg"); image-fit: contain; accessible-role: none; }
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 2px;
+                                Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                                Text { text: root.conflicting-apps-message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; overflow: elide; }
+                            }
+                            SmallAction {
+                                min-width: 96px;
+                                label: root.conflicting-apps-closing ? "Закрываем…" : "Закрыть";
+                                selected: true;
+                                enabled: !root.profile-menu-open && !root.conflicting-apps-closing;
+                                activated => { root.close-conflicting-apps(); }
+                            }
+                            SmallAction {
+                                label: "Понятно";
+                                enabled: !root.profile-menu-open;
+                                activated => { root.dismiss-conflicting-apps-banner(); }
+                            }
+                        }
+                    }
+
+                    if root.has-profile: subscription-strip := Rectangle {
                         height: 54px;
                         background: Theme.surface;
                         border-radius: 16px;
@@ -1099,7 +1228,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             refresh-action-reserve := Rectangle {
-                                width: 92px;
+                                width: 116px;
                                 horizontal-stretch: 0;
                                 background: transparent;
                             }
@@ -1182,28 +1311,44 @@ export component AppWindow inherits Window {
                             }
                         }
                         subscription-refresh-action := FocusScope {
-                            x: parent.width - 140px;
+                            // Without a refreshable remote source the same slot lets the
+                            // user set the active subscription's URL instead of showing a
+                            // dead button.
+                            property <bool> source-mode: !root.subscription-refresh-available;
+                            x: parent.width - 164px;
                             y: 5px;
-                            width: 92px;
+                            width: 116px;
                             height: 44px;
-                            enabled: root.subscription-refresh-available
-                                && root.subscription-refresh-enabled
-                                && !root.subscription-refresh-pending;
+                            enabled: self.source-mode
+                                ? root.subscription-management-enabled && root.active-profile-id != "" && !root.profile-menu-open
+                                : root.subscription-refresh-enabled && !root.subscription-refresh-pending && !root.profile-menu-open;
                             focus-on-click: true;
                             focus-on-tab-navigation: true;
                             accessible-role: button;
-                            accessible-label: root.subscription-refresh-pending ? "Подписка обновляется" : "Обновить подписку";
+                            accessible-label: self.source-mode ? "Указать ссылку подписки" : root.subscription-refresh-pending ? "Подписка обновляется" : "Обновить подписку";
                             accessible-enabled: self.enabled;
-                            accessible-action-default => { if (self.enabled) { root.refresh-subscription(); } }
+                            accessible-action-default => { if (self.enabled) { self.run(); } }
+                            function run() {
+                                if (self.source-mode) {
+                                    root.local-page = "subscriptions";
+                                    root.close-panel();
+                                    root.profile-delete-confirm-id = "";
+                                    root.profile-edit-draft = "";
+                                    root.profile-edit-id = root.active-profile-id;
+                                } else {
+                                    root.refresh-subscription();
+                                }
+                            }
                             Rectangle {
                                 y: 5px;
                                 height: 34px;
                                 border-radius: Theme.radius-small;
+                                opacity: parent.enabled ? 1 : 0.45;
                                 background: subscription-refresh-touch.pressed && parent.enabled ? Theme.elevated : subscription-refresh-touch.has-hover && parent.enabled ? #ffffff0d : transparent;
                                 border-color: parent.has-focus ? Theme.focus : Theme.line;
                                 border-width: 1px;
                                 Text {
-                                    text: root.subscription-refresh-pending ? "Обновляем…" : "Обновить";
+                                    text: subscription-refresh-action.source-mode ? "Указать ссылку" : root.subscription-refresh-pending ? "Обновляем…" : "Обновить";
                                     color: Theme.text-secondary;
                                     font-size: Theme.type-metadata-size;
                                     font-weight: Theme.weight-semibold;
@@ -1213,39 +1358,40 @@ export component AppWindow inherits Window {
                             }
                             key-pressed(event) => {
                                 if ((event.text == " " || event.text == "\n") && self.enabled) {
-                                    root.refresh-subscription();
+                                    self.run();
                                     return accept;
                                 }
                                 return reject;
                             }
                             subscription-refresh-touch := TouchArea {
                                 enabled: parent.enabled;
-                                clicked => { root.refresh-subscription(); }
+                                clicked => { subscription-refresh-action.run(); }
                             }
                         }
                     }
 
                     if root.profile-menu-open: profile-menu-reserve := Rectangle {
-                        height: root.profile-menu-error != "" ? 104px
-                            : root.profile-menu-loading ? 144px
-                            : Math.min(288px, 16px + root.subscription-profiles.length * 54px);
+                        height: root.profile-menu-content-height;
                         background: transparent;
                     }
 
                     if root.subscription-announcement-text != "": Rectangle {
-                        height: 36px;
+                        height: announcement-strip.height;
                         background: transparent;
                         announcement-strip := Rectangle {
+                            // One line stays a compact 36px strip; long provider notices
+                            // get a second line instead of being cut after a few words.
+                            property <bool> two-line: announcement-copy.preferred-height > 24px;
                             x: 0px;
                             width: parent.width;
-                            height: 36px;
+                            height: self.two-line ? 52px : 36px;
                             background: root.subscription-announcement-tone == "danger" ? #211619 : root.subscription-announcement-tone == "success" ? #13231b : #131d29;
                             border-radius: 10px;
                             border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
                             border-width: 1px;
                             announcement-icon := Rectangle {
                                 x: 12px;
-                                y: 3px;
+                                y: (parent.height - self.height) / 2;
                                 width: 18px;
                                 height: 30px;
                                 background: transparent;
@@ -1272,20 +1418,25 @@ export component AppWindow inherits Window {
                                 x: 42px;
                                 y: 3px;
                                 width: parent.width - 84px;
-                                height: 30px;
+                                height: parent.height - 6px;
                                 text: root.subscription-announcement-text;
                                 color: Theme.text-secondary;
                                 font-size: Theme.type-metadata-size;
+                                wrap: word-wrap;
                                 overflow: elide;
+                                accessible-role: text;
+                                accessible-description: root.subscription-announcement-text;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
                         }
                     }
 
-                    inline-routes := Rectangle {
+                    if !root.has-profile: Rectangle { vertical-stretch: 1; background: transparent; }
+
+                    if root.has-profile: inline-routes := Rectangle {
                         vertical-stretch: 1;
-                        min-height: 270px;
+                        min-height: 140px;
                         background: transparent;
                         VerticalLayout {
                             spacing: 8px;
@@ -1304,13 +1455,15 @@ export component AppWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 route-updated-meta := Text {
-                                    width: 112px;
+                                    width: 140px;
                                     height: 28px;
                                     horizontal-stretch: 0;
-                                    text: root.subscription-updated;
-                                    color: Theme.text-muted;
+                                    text: root.latency-check-loading ? "Замеряем задержку…" : root.subscription-updated;
+                                    color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
                                     horizontal-alignment: right;
+                                    accessible-role: text;
+                                    accessible-live-region: polite;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
@@ -1332,7 +1485,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.catalog-error != "" || root.latency-check-error != "": Text { height: 28px; text: root.catalog-error != "" ? root.catalog-error : root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            if root.catalog-error != "" || root.latency-check-error != "": Text { min-height: 28px; text: root.catalog-error != "" ? root.catalog-error : root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             ScrollView {
                                 vertical-stretch: 1;
                                 VerticalLayout {
@@ -1378,10 +1531,12 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             padding-left: 16px;
                             padding-right: 16px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
                             spacing: 0px;
-                            HealthRow { label: "Xray transport"; value: root.diagnostics-xray-value; tone: root.diagnostics-xray-tone; }
-                            HealthRow { label: "Mihomo policy"; value: root.diagnostics-mihomo-value; tone: root.diagnostics-mihomo-tone; }
-                            HealthRow { label: "TUN MultiCore"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
+                            HealthRow { label: "Транспорт Xray"; value: root.diagnostics-xray-value; tone: root.diagnostics-xray-tone; }
+                            HealthRow { label: "Политики Mihomo"; value: root.diagnostics-mihomo-value; tone: root.diagnostics-mihomo-tone; }
+                            HealthRow { label: "Туннель TUN"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
                         }
                     }
                     Text { height: 24px; text: "Маппинг Mihomo → Xray"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
@@ -1409,20 +1564,27 @@ export component AppWindow inherits Window {
                         SmallAction { label: "Все"; selected: root.event-filter == "Все"; enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
                         SmallAction { label: "Система"; selected: root.event-filter == "Система"; enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
                         SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
+                        SmallAction { label: "Ядра"; selected: root.event-filter == "Ядра"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        DashboardAction {
+                            label: "Открыть дашборд";
+                            enabled: root.dashboard-available && !root.profile-menu-open;
+                            disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
+                            activated => { root.open-dashboard(); }
+                        }
                     }
                     ScrollView {
                         vertical-stretch: 1;
                         VerticalLayout {
                             spacing: 8px;
                             for event in root.events: Rectangle {
-                                height: 56px;
+                                min-height: 56px;
                                 background: #ffffff04;
                                 border-radius: 8px;
                                 VerticalLayout {
                                     padding: 8px;
                                     spacing: 3px;
-                                    Text { text: event.component + (event.timestamp == "" ? "" : " · " + event.timestamp); color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; }
+                                    Text { text: (event.level == "error" ? "Ошибка" : "Событие") + (event.timestamp == "" ? "" : " · " + event.timestamp); color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; }
                                     Text { text: event.message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                                 }
                             }
@@ -1461,7 +1623,7 @@ export component AppWindow inherits Window {
 
                         if root.visible-page == "settings" && root.settings-section == "general": VerticalLayout {
                             spacing: 16px;
-                            Text { height: 24px; text: root.system-name; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                            Text { height: 24px; text: "Основные"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
                             ToggleRow {
                                 label: "Запускать при входе в " + root.system-name;
                                 description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "Открывать MultiCore после входа в систему";
@@ -1469,10 +1631,10 @@ export component AppWindow inherits Window {
                                 enabled: !root.profile-menu-open;
                                 toggled(value) => { root.set-launch-at-sign-in(value); }
                             }
-                            if root.launch-at-sign-in-error != "": Text { height: 34px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            if root.launch-at-sign-in-error != "": Text { min-height: 20px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             ToggleRow {
-                                label: "Подключаться при запуске";
-                                description: root.launch-at-sign-in-enabled ? "После входа в систему и появления сети" : "Сначала включите автозапуск";
+                                label: "Подключаться после входа в систему";
+                                description: root.launch-at-sign-in-enabled ? "Когда появится сеть и профиль будет готов" : "Сначала включите автозапуск";
                                 checked: root.auto-connect-on-startup;
                                 enabled: root.launch-at-sign-in-enabled && !root.profile-menu-open;
                                 toggled(value) => { root.auto-connect-on-startup = value; }
@@ -1484,7 +1646,7 @@ export component AppWindow inherits Window {
                                 enabled: !root.profile-menu-open;
                                 toggled(value) => { root.ambient-background-enabled = value; }
                             }
-                            if root.preference-error != "": Text { height: 34px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            if root.preference-error != "": Text { min-height: 20px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
@@ -1493,7 +1655,7 @@ export component AppWindow inherits Window {
                             Text { height: 24px; text: "Обновления"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
                             Text { height: 24px; text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                             Text {
-                                height: 40px;
+                                min-height: 40px;
                                 text: root.update-detail;
                                 color: Theme.text-muted;
                                 font-size: Theme.type-metadata-size;
@@ -1507,7 +1669,7 @@ export component AppWindow inherits Window {
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
-                        if root.visible-page == "settings": Text { height: 24px; text: "MultiCore · Mihomo 1.19.30 · Xray 26.9.9"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                        if root.visible-page == "settings": Text { height: 24px; text: root.runtime-versions; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
 
                         if root.visible-page == "subscriptions": VerticalLayout {
                             spacing: 12px;
@@ -1520,10 +1682,10 @@ export component AppWindow inherits Window {
                                     Text { width: parent.width; text: "До 16 подписок · активна только одна"; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                                     Text { width: parent.width; text: "Ссылки хранятся локально и не показываются в интерфейсе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
                                 }
-                                SmallAction { width: 112px; label: "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
+                                SmallAction { width: 112px; label: root.import-pending ? "Добавляем…" : "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
                             }
                             if root.deep-link-import-host != "": Text {
-                                height: 24px;
+                                min-height: 24px;
                                 text: root.import-pending ? "Добавляем подписку с " + root.deep-link-import-host + "…" : "Подписка с " + root.deep-link-import-host + " ожидает добавления…";
                                 color: Theme.text-secondary;
                                 font-size: Theme.type-metadata-size;
@@ -1531,27 +1693,78 @@ export component AppWindow inherits Window {
                                 accessible-role: text;
                                 accessible-live-region: polite;
                             }
+                            // A deep-link import has no editor open; its failure still has to
+                            // be visible next to the pending line.
+                            if root.import-error != "" && !root.replace-editor-open: Text {
+                                text: root.import-error;
+                                color: Theme.error;
+                                font-size: Theme.type-metadata-size;
+                                wrap: word-wrap;
+                                accessible-role: text;
+                                accessible-live-region: polite;
+                            }
                             if root.replace-editor-open: Rectangle {
-                                height: 116px;
                                 background: Theme.surface;
                                 border-radius: 14px;
                                 VerticalLayout {
                                     padding: 12px;
                                     spacing: 8px;
-                                    LineEdit { text <=> root.subscription-draft; placeholder-text: "https://example.com/subscription"; enabled: !root.import-pending; }
+                                    LineEdit {
+                                        text <=> root.subscription-draft;
+                                        placeholder-text: "https://example.com/subscription";
+                                        enabled: !root.import-pending;
+                                        accessible-label: "URL подписки";
+                                        init => { self.focus(); }
+                                        accepted => {
+                                            if (!root.import-pending && root.subscription-draft != "") {
+                                                root.import-url(root.subscription-draft);
+                                            }
+                                        }
+                                    }
+                                    if root.import-error != "": Text {
+                                        text: root.import-error;
+                                        color: Theme.error;
+                                        font-size: Theme.type-metadata-size;
+                                        wrap: word-wrap;
+                                        accessible-role: text;
+                                        accessible-live-region: polite;
+                                    }
                                     HorizontalLayout {
-                                        if root.import-error != "": Text { text: root.import-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                                        SmallAction { label: root.import-pending ? "Проверяем…" : "Сохранить"; enabled: !root.import-pending && root.subscription-draft != ""; activated => { root.import-url(root.subscription-draft); } }
+                                        spacing: 8px;
+                                        alignment: end;
+                                        SmallAction {
+                                            label: "Отмена";
+                                            enabled: !root.import-pending;
+                                            activated => {
+                                                root.replace-editor-open = false;
+                                                root.subscription-draft = "";
+                                                root.dismiss-first-run-import();
+                                            }
+                                        }
+                                        SmallAction { label: root.import-pending ? "Добавляем…" : "Добавить"; selected: true; enabled: !root.import-pending && root.subscription-draft != ""; activated => { root.import-url(root.subscription-draft); } }
                                     }
                                 }
                             }
                             if root.profile-menu-loading: Text { height: 44px; text: "Загружаем подписки…"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
                             if root.profile-menu-error != "": HorizontalLayout {
-                                height: 52px;
+                                min-height: 52px;
                                 spacing: 12px;
-                                Text { text: root.profile-menu-error; color: Theme.error; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                                Text { horizontal-stretch: 1; text: root.profile-menu-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
                                 SmallAction { width: 108px; label: "Повторить"; activated => { root.retry-profile-menu(); } }
+                            }
+                            if root.profile-mutation-error != "": Text {
+                                text: root.profile-mutation-error;
+                                color: Theme.error;
+                                font-size: Theme.type-metadata-size;
+                                wrap: word-wrap;
+                                accessible-role: text;
+                                accessible-live-region: polite;
+                            }
+                            if root.profile-switch-locked && root.subscription-profiles.length > 1: Text {
+                                text: "Отключитесь, чтобы сменить подписку";
+                                color: Theme.text-muted;
+                                font-size: Theme.type-metadata-size;
+                                accessible-role: text;
                             }
                             if !root.profile-menu-loading && root.profile-menu-error == "" && root.subscription-profiles.length == 0: Text { height: 64px; text: "Подписок пока нет"; color: Theme.text-muted; font-size: Theme.type-label-size; vertical-alignment: center; horizontal-alignment: center; }
                             if root.subscription-profiles.length > 0: Rectangle {
@@ -1576,10 +1789,10 @@ export component AppWindow inherits Window {
                                             if profile.has-logo: Image { x: 5px; y: 5px; width: 22px; height: 22px; source: profile.logo; image-fit: contain; accessible-role: none; }
                                             if !profile.has-logo: Text { text: profile.fallback; color: Theme.text-secondary; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
                                         }
-                                        Text { x: 56px; y: 8px; width: parent.width - 244px; height: 20px; text: profile.title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: profile.active ? Theme.weight-semibold : Theme.weight-regular; overflow: elide; }
-                                        Text { x: 56px; y: 28px; width: parent.width - 244px; height: 18px; text: profile.usage + " · " + profile.expiry; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                                        Text { x: 56px; y: 8px; width: parent.width - 264px; height: 20px; text: profile.title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: profile.active ? Theme.weight-semibold : Theme.weight-regular; overflow: elide; }
+                                        Text { x: 56px; y: 28px; width: parent.width - 264px; height: 18px; text: profile.usage + " · " + profile.expiry; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
                                         Text {
-                                            x: 56px; y: 47px; width: parent.width - 244px; height: 17px;
+                                            x: 56px; y: 46px; width: parent.width - 264px; height: 18px;
                                             text: root.profile-pending-id == profile.id
                                                 ? root.profile-pending-operation == "refresh" ? "Обновляем…"
                                                 : root.profile-pending-operation == "edit" ? "Меняем ссылку…"
@@ -1588,62 +1801,74 @@ export component AppWindow inherits Window {
                                                 : !profile.available ? "Временно недоступна"
                                                 : profile.active ? "Активна" : "Доступна";
                                             color: !profile.available ? Theme.warning : profile.active ? Theme.accent-blue : Theme.text-muted;
-                                            font-size: 11px;
+                                            font-size: Theme.type-metadata-size;
                                             overflow: elide;
                                         }
 
-                                        if profile.active: Path { x: parent.width - 172px; y: 29px; width: 16px; height: 12px; viewbox-width: 16; viewbox-height: 12; commands: "M 2 6 L 6 10 L 14 2"; stroke: Theme.accent-blue; stroke-width: 1.8px; fill: transparent; }
+                                        if profile.active: Path { x: parent.width - 182px; y: 30px; width: 16px; height: 12px; viewbox-width: 16; viewbox-height: 12; commands: "M 2 6 L 6 10 L 14 2"; stroke: Theme.accent-blue; stroke-width: 1.8px; fill: transparent; }
                                         if !profile.active: activate-profile-focus := FocusScope {
-                                            x: parent.width - 192px; y: 16px; width: 40px; height: 40px;
+                                            x: parent.width - 196px; y: 14px; width: 44px; height: 44px;
                                             enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
-                                            accessible-role: button; accessible-label: "Сделать активной " + profile.title; accessible-enabled: self.enabled;
+                                            accessible-role: button; accessible-label: "Сделать активной " + profile.title; accessible-description: root.profile-switch-locked ? "Отключитесь, чтобы сменить подписку" : ""; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.activate-profile(profile.id); } }
-                                            Rectangle { border-radius: 8px; background: activate-profile-touch.has-hover && parent.enabled ? #4c9dff14 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 11px; y: 11px; width: 18px; height: 18px; source: @image-url("../assets/power.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: activate-profile-touch.has-hover && parent.enabled ? #4c9dff14 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Rectangle { x: 14px; y: 14px; width: 16px; height: 16px; border-radius: 8px; border-width: 1.5px; border-color: Theme.text-secondary; background: transparent; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.activate-profile(profile.id); return accept; } return reject; }
                                             activate-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.activate-profile(profile.id); } }
                                         }
                                         refresh-profile-focus := FocusScope {
                                             property <int> focus-serial: root.profile-management-focus-serial;
-                                            x: parent.width - 144px; y: 16px; width: 40px; height: 40px;
+                                            x: parent.width - 148px; y: 14px; width: 44px; height: 44px;
                                             enabled: root.subscription-refresh-enabled && profile.available && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Обновить " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.refresh-profile(profile.id); } }
                                             init => { if (root.profile-management-focus-id == profile.id && root.profile-management-focus-serial > 0) { self.focus(); } }
                                             changed focus-serial => { if (root.profile-management-focus-id == profile.id && self.enabled) { self.focus(); } }
-                                            Rectangle { border-radius: 8px; background: refresh-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 11px; y: 11px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: refresh-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.refresh-profile(profile.id); return accept; } return reject; }
                                             refresh-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.refresh-profile(profile.id); } }
                                         }
                                         edit-profile-focus := FocusScope {
-                                            x: parent.width - 96px; y: 16px; width: 40px; height: 40px;
+                                            x: parent.width - 100px; y: 14px; width: 44px; height: 44px;
                                             enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Изменить URL " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
-                                            Rectangle { border-radius: 8px; background: edit-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 11px; y: 11px; width: 18px; height: 18px; source: @image-url("../assets/edit.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: edit-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/edit.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; return accept; } return reject; }
                                             edit-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
                                         }
                                         delete-profile-focus := FocusScope {
                                             property <int> focus-serial: root.profile-delete-control-focus-serial;
-                                            x: parent.width - 48px; y: 16px; width: 40px; height: 40px;
+                                            x: parent.width - 52px; y: 14px; width: 44px; height: 44px;
                                             enabled: root.subscription-refresh-enabled && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Удалить " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; } }
                                             init => { if (root.profile-delete-control-focus-id == profile.id && root.profile-delete-control-focus-serial > 0) { self.focus(); } }
                                             changed focus-serial => { if (root.profile-delete-control-focus-id == profile.id && self.enabled) { self.focus(); } }
-                                            Rectangle { border-radius: 8px; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 11px; y: 11px; width: 18px; height: 18px; source: @image-url("../assets/trash.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/trash.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; return accept; } return reject; }
                                             delete-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; } }
                                         }
 
                                         if root.profile-edit-id == profile.id: HorizontalLayout {
                                             x: 56px; y: 76px; width: parent.width - 68px; height: 50px; spacing: 8px;
-                                            LineEdit { horizontal-stretch: 1; text <=> root.profile-edit-draft; placeholder-text: "Новый URL подписки"; enabled: root.profile-pending-operation == "none"; accessible-label: "Новый URL для " + profile.title; }
-                                            SmallAction { width: 96px; label: "Сохранить"; enabled: root.profile-edit-draft != "" && root.profile-pending-operation == "none"; activated => { root.replace-profile-source(profile.id, root.profile-edit-draft); } }
+                                            LineEdit {
+                                                horizontal-stretch: 1;
+                                                text <=> root.profile-edit-draft;
+                                                placeholder-text: "Новый URL подписки";
+                                                enabled: root.profile-pending-operation == "none";
+                                                accessible-label: "Новый URL для " + profile.title;
+                                                init => { self.focus(); }
+                                                accepted => {
+                                                    if (root.profile-edit-draft != "" && root.profile-pending-operation == "none") {
+                                                        root.replace-profile-source(profile.id, root.profile-edit-draft);
+                                                    }
+                                                }
+                                            }
+                                            SmallAction { width: 96px; label: root.profile-pending-operation == "edit" ? "Сохраняем…" : "Сохранить"; enabled: root.profile-edit-draft != "" && root.profile-pending-operation == "none"; activated => { root.replace-profile-source(profile.id, root.profile-edit-draft); } }
                                             SmallAction { width: 72px; label: "Отмена"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-edit-id = ""; root.profile-edit-draft = ""; } }
                                         }
                                         if root.profile-delete-confirm-id == profile.id: HorizontalLayout {
@@ -1674,12 +1899,9 @@ export component AppWindow inherits Window {
 
             profile-menu := Rectangle {
                 x: 20px;
-                y: root.profile-menu-open ? 188px : 180px;
+                y: (root.profile-menu-open ? 188px : 180px) + root.home-banner-offset;
                 width: parent.width - 40px;
-                height: Math.min(parent.height - 204px,
-                    root.profile-menu-error != "" ? 104px
-                    : root.profile-menu-loading ? 144px
-                    : Math.min(288px, 16px + root.subscription-profiles.length * 54px));
+                height: Math.min(parent.height - 204px - root.home-banner-offset, root.profile-menu-content-height);
                 background: Theme.elevated;
                 border-color: Theme.line;
                 border-width: 1px;
@@ -1692,6 +1914,36 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     padding: 8px;
                     spacing: 2px;
+
+                    if root.profile-switch-locked: HorizontalLayout {
+                        height: 26px;
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: "Отключитесь, чтобы сменить подписку";
+                            color: Theme.text-muted;
+                            font-size: Theme.type-metadata-size;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            accessible-role: text;
+                        }
+                    }
+
+                    if root.profile-mutation-error != "": HorizontalLayout {
+                        height: 38px;
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: root.profile-mutation-error;
+                            color: Theme.error;
+                            font-size: Theme.type-metadata-size;
+                            wrap: word-wrap;
+                            overflow: elide;
+                            vertical-alignment: center;
+                            accessible-role: text;
+                            accessible-live-region: polite;
+                        }
+                    }
 
                     if root.profile-menu-error != "": Rectangle {
                         height: 88px;
@@ -1759,9 +2011,10 @@ export component AppWindow inherits Window {
                             spacing: 2px;
                             for profile[index] in root.subscription-profiles: profile-row := Rectangle {
                                 height: 52px;
-                                background: profile-row-touch.has-hover ? #ffffff08 : transparent;
+                                property <bool> switchable: profile.active || (profile.available && !root.profile-switch-locked);
+                                background: profile-row-touch.has-hover && self.switchable ? #ffffff08 : transparent;
                                 border-radius: 14px;
-                                opacity: profile.available || profile.active ? 1 : 0.62;
+                                opacity: self.switchable ? 1 : 0.62;
 
                                 Rectangle {
                                     x: 10px; y: 10px; width: 32px; height: 32px;
@@ -1788,7 +2041,7 @@ export component AppWindow inherits Window {
                                 }
 
                                 profile-row-focus := FocusScope {
-                                    enabled: root.profile-menu-open && profile.available && root.profile-pending-operation == "none";
+                                    enabled: root.profile-menu-open && profile-row.switchable && root.profile-pending-operation == "none";
                                     focus-on-click: true;
                                     focus-on-tab-navigation: root.profile-menu-keyboard-open;
                                     accessible-role: button;
@@ -1841,6 +2094,26 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-radius: 16px;
 
+            update-modal-focus := FocusScope {
+                width: parent.width;
+                height: parent.height;
+                focus-on-tab-navigation: false;
+                capture-key-pressed(event) => {
+                    if (event.text == Key.Tab || event.text == Key.Backtab) {
+                        if (update-cancel-action.action-has-focus) { update-confirm-action.focus-action(); }
+                        else { update-cancel-action.focus-action(); }
+                        return accept;
+                    }
+                    return reject;
+                }
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.update-confirm-open = false;
+                        root.cancel-update-restart();
+                        return accept;
+                    }
+                    return reject;
+                }
             VerticalLayout {
                 padding: 24px;
                 spacing: 12px;
@@ -1867,21 +2140,25 @@ export component AppWindow inherits Window {
                     height: 44px;
                     alignment: end;
                     spacing: 8px;
-                    SmallAction {
+                    // Conditional creation does not fire changed focus-epoch.
+                    update-cancel-action := SmallAction {
                         width: 88px;
-                        label: "Нет";
+                        label: "Отмена";
+                        focus-epoch: root.update-confirm-focus-serial;
+                        init => { self.focus-action(); }
                         activated => {
                             root.update-confirm-open = false;
                             root.cancel-update-restart();
                         }
                     }
-                    SmallAction {
-                        width: 88px;
-                        label: "Да";
+                    update-confirm-action := SmallAction {
+                        width: 200px;
+                        label: "Обновить и перезапустить";
                         selected: true;
                         activated => { root.confirm-update-restart(); }
                     }
                 }
+            }
             }
         }
     }
@@ -1955,8 +2232,8 @@ export component AppWindow inherits Window {
                         alignment: end;
                         spacing: 8px;
                         // Conditional creation does not fire changed focus-epoch.
-                        no-action := SmallAction { width: 88px; label: "Нет"; focus-epoch: root.deep-link-focus-serial; init => { self.focus-action(); } activated => { root.cancel-deep-link(); } }
-                        yes-action := SmallAction { width: 88px; label: "Да"; selected: true; activated => { root.confirm-deep-link(); } }
+                        no-action := SmallAction { width: 88px; label: "Отмена"; focus-epoch: root.deep-link-focus-serial; init => { self.focus-action(); } activated => { root.cancel-deep-link(); } }
+                        yes-action := SmallAction { width: 104px; label: "Добавить"; selected: true; activated => { root.confirm-deep-link(); } }
                     }
                 }
             }

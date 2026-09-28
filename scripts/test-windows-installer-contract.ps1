@@ -126,6 +126,40 @@ try {
     try { & $BuilderPath -PackagePath $payload -AppVersion '0.1.0' -ValidateOnly } catch { $failed = $true }
     Assert-True $failed 'tampered portable payload must fail installer validation'
 
+    # The vendored dashboard's asset filenames are content-hashed and change on
+    # every re-vendor, so the builder must trust the package's own hash-verified
+    # SHA256SUMS.txt for that part of the inventory rather than a hardcoded list.
+    $dashboardPayload = Join-Path $testRoot 'dashboard-payload'
+    foreach ($directory in @($dashboardPayload, (Join-Path $dashboardPayload 'cores'), (Join-Path $dashboardPayload 'licenses'), (Join-Path $dashboardPayload 'runtime'), (Join-Path $dashboardPayload 'dashboard'))) {
+        New-Item -ItemType Directory -Path $directory | Out-Null
+    }
+    $dashboardFiles = @($files + @('dashboard\index-a1b2c3.js', 'dashboard\index.html'))
+    $dashboardLines = foreach ($relative in $dashboardFiles) {
+        $path = Join-Path $dashboardPayload $relative
+        [IO.File]::WriteAllText($path, "fixture:$relative", [Text.UTF8Encoding]::new($false))
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash *$($relative.Replace('\', '/'))"
+    }
+    [IO.File]::WriteAllLines((Join-Path $dashboardPayload 'SHA256SUMS.txt'), $dashboardLines, [Text.UTF8Encoding]::new($false))
+    & $BuilderPath -PackagePath $dashboardPayload -AppVersion '0.1.0' -ValidateOnly
+    Assert-True $true 'a payload with an unlisted-but-checksummed optional dashboard must validate'
+
+    # A file that exists on disk but has no SHA256SUMS.txt entry must still fail
+    # closed - dynamic inventory only trusts what the manifest actually covers.
+    [IO.File]::WriteAllText((Join-Path $dashboardPayload 'dashboard\rogue.js'), 'not-in-manifest', [Text.UTF8Encoding]::new($false))
+    $failed = $false
+    try { & $BuilderPath -PackagePath $dashboardPayload -AppVersion '0.1.0' -ValidateOnly } catch { $failed = $true }
+    Assert-True $failed 'a file missing from SHA256SUMS.txt must fail installer validation even under dashboard'
+    Remove-Item -LiteralPath (Join-Path $dashboardPayload 'dashboard\rogue.js')
+
+    # A required core file dropped from the manifest must still fail closed,
+    # even though the dashboard directory itself is optional.
+    $withoutCoreFile = $dashboardLines | Where-Object { $_ -notmatch 'cores/mihomo\.exe$' }
+    [IO.File]::WriteAllLines((Join-Path $dashboardPayload 'SHA256SUMS.txt'), $withoutCoreFile, [Text.UTF8Encoding]::new($false))
+    $failed = $false
+    try { & $BuilderPath -PackagePath $dashboardPayload -AppVersion '0.1.0' -ValidateOnly } catch { $failed = $true }
+    Assert-True $failed 'dropping a required core file from the manifest must fail installer validation'
+
     Write-Output 'PASS: Windows installer contract'
 } finally {
     $resolvedRoot = [IO.Path]::GetFullPath($testRoot)

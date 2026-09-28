@@ -232,6 +232,13 @@ pub struct RuntimePaths {
     pub mihomo_binary: PathBuf,
     pub xray_config: PathBuf,
     pub mihomo_config: PathBuf,
+    /// The vendored, checksum-verified static dashboard directory (see
+    /// `crates/multicore-core/src/snapshot.rs`'s `external-ui` overlay). When set, Mihomo is
+    /// launched with `SAFE_PATHS` naming this exact directory, which is the only way to let
+    /// Mihomo serve an `external-ui` directory that lies outside its own home directory without
+    /// copying the dashboard into the ephemeral runtime tree on every Connect. Absent in builds
+    /// without a vendored dashboard.
+    pub dashboard_directory: Option<PathBuf>,
 }
 
 impl RuntimePaths {
@@ -245,6 +252,7 @@ impl RuntimePaths {
                     OsString::from("-config"),
                     self.xray_config.clone().into_os_string(),
                 ],
+                env: Vec::new(),
             },
             Engine::Mihomo => CommandSpec {
                 engine,
@@ -253,6 +261,16 @@ impl RuntimePaths {
                     OsString::from("-f"),
                     self.mihomo_config.clone().into_os_string(),
                 ],
+                env: self
+                    .dashboard_directory
+                    .iter()
+                    .map(|directory| {
+                        (
+                            OsString::from("SAFE_PATHS"),
+                            directory.clone().into_os_string(),
+                        )
+                    })
+                    .collect(),
             },
         }
     }
@@ -263,7 +281,22 @@ pub struct CommandSpec {
     pub engine: Engine,
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    /// Additional environment variables the launcher must set on top of its own sanitized base
+    /// environment (never used to remove or replace anything already set).
+    pub env: Vec<(OsString, OsString)>,
 }
+
+/// Longest time a launched core may take to report readiness before its start is failed.
+///
+/// Callers that wait on a remote start (the daemon talking to the elevated host) must allow at
+/// least this long plus launch overhead.
+pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How often a readiness-wait loop re-checks a launched core.
+///
+/// Small enough that a core becoming ready between checks is reported with only brief latency,
+/// not a busy loop that wastes CPU while a core takes its full startup time.
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ProcessError {
@@ -275,6 +308,8 @@ pub enum ProcessError {
     StopFailed(Engine),
     #[error("{0:?} did not become ready")]
     ReadinessFailed(Engine),
+    #[error("{0:?} did not become ready in time")]
+    ReadinessTimedOut(Engine),
 }
 
 pub trait ManagedChild: Send {
@@ -372,7 +407,21 @@ impl TokioProcessLauncher {
                         return false;
                     }
                 }
-                true
+                // The SOCKS ports accepting a raw TCP connection only proves
+                // Xray's listeners are bound; it proves nothing about its DNS
+                // client or the interface-bound outbound sockets it dials
+                // through, which settle on their own timeline right after
+                // this fresh process (and MultiCore's own brand-new TUN
+                // adapter) starts. A live, real-hardware Connect showed a
+                // domain-scoped endpoint DNS lookup that this port check
+                // alone would have called "ready" for repeatedly fail with
+                // "record not found" for several seconds right after
+                // startup - live traffic (through Mihomo) was already
+                // flowing into Xray during exactly that unsettled window.
+                // Require one real proxied dial to succeed first, so nothing
+                // downstream starts until Xray's actual DNS+dial path is
+                // proven, not just its listeners.
+                xray_domain_dns_warm(&runtime.paths.xray_config).await
             }
             Engine::Mihomo => {
                 let Ok((controller, device)) =
@@ -490,9 +539,9 @@ impl ProcessLauncher for TokioProcessLauncher {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
-                    return Err(ProcessError::ReadinessFailed(command.engine));
+                    return Err(ProcessError::ReadinessTimedOut(command.engine));
                 }
-                sleep(Duration::from_millis(100)).await;
+                sleep(READINESS_POLL_INTERVAL).await;
             }
         })
     }
@@ -603,9 +652,9 @@ pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(ProcessError::ReadinessFailed(command.engine));
+            return Err(ProcessError::ReadinessTimedOut(command.engine));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
 }
 
@@ -682,6 +731,201 @@ fn xray_loopback_inbounds(path: &std::path::Path) -> Result<Vec<std::net::Socket
         }
     }
     Ok(addresses)
+}
+
+/// Finds one loopback SOCKS inbound whose 1:1-tagged outbound requires DNS
+/// resolution (its `address` is a domain, not a literal IP) - i.e. one of
+/// this app's own endpoint-DNS-scoped outbounds, never anything
+/// provider/user supplied outside that overlay. Returns the inbound to dial
+/// through and the outbound's own domain:port to dial to. `None` means
+/// nothing in this config needs a DNS warm-up (every outbound already
+/// dials a literal IP), not an error.
+fn xray_domain_warmup_target(
+    path: &std::path::Path,
+) -> Option<(std::net::SocketAddr, String, u16)> {
+    let bytes = std::fs::read(path).ok()?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let inbounds = document.get("inbounds")?.as_array()?;
+    let outbounds = document.get("outbounds")?.as_array()?;
+    for inbound in inbounds {
+        if inbound.get("protocol").and_then(serde_json::Value::as_str) != Some("socks") {
+            continue;
+        }
+        let Some(tag) = inbound.get("tag").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(port) = inbound
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+        else {
+            continue;
+        };
+        let listen = inbound
+            .get("listen")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("127.0.0.1");
+        let Ok(ip) = listen.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if !ip.is_loopback() {
+            continue;
+        }
+        let Some(outbound) = outbounds
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(serde_json::Value::as_str) == Some(tag))
+        else {
+            continue;
+        };
+        // Most single-server protocols (shadowsocks, vmess, vless, trojan -
+        // everything this app's own overlay generates) put `address`/`port`
+        // directly under `settings`. A few (socks, http) nest the same pair
+        // one level deeper under `settings.servers[0]`. Accept either shape
+        // rather than assuming one, since this only has to find *a* domain
+        // to warm up, not fully understand every outbound protocol.
+        let settings = outbound.get("settings");
+        let nested_server = settings
+            .and_then(|settings| settings.get("servers"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|servers| servers.first());
+        let target = settings.into_iter().chain(nested_server).find(|candidate| {
+            candidate
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address.parse::<std::net::IpAddr>().is_err())
+        });
+        let Some(target) = target else {
+            continue;
+        };
+        let address = target
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .expect("matched by the address-is-a-domain predicate above");
+        let Some(destination_port) = target
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+        else {
+            continue;
+        };
+        return Some((
+            std::net::SocketAddr::new(ip, port),
+            address.to_owned(),
+            destination_port,
+        ));
+    }
+    None
+}
+
+/// Proves Xray's real DNS-resolve-then-dial path works, not just that its
+/// SOCKS listener accepts a connection: a real SOCKS5 CONNECT through one
+/// loopback inbound to its own outbound's real domain:port, so an actual
+/// endpoint-DNS lookup happens. `None` from `xray_domain_warmup_target`
+/// (nothing in this config needs DNS) is treated as already warm.
+///
+/// A live-hardware capture (real pinned Xray, real endpoint domain) proved
+/// the client-facing SOCKS5 CONNECT reply is sent the instant Xray accepts
+/// the request into its dispatcher, entirely independent of whether the
+/// real DNS lookup or outbound dial ever succeeds: the "success" header
+/// arrived in well under a second while a deliberately-blocked scoped
+/// resolver still hadn't answered. Only once Xray's own configured DNS
+/// timeoutMs genuinely elapsed did it close the client-facing connection to
+/// report the resolve-then-dial had failed. So the reply header alone is
+/// not proof of readiness. This instead treats that reply as a mere
+/// acknowledgement and watches the connection for that failure-close signal
+/// over a window bounded by Xray's own DNS timeout (`ENDPOINT_DNS_TIMEOUT_MS`,
+/// shared with the config generator so the two can never drift apart): if
+/// the connection is still alive once that window elapses, the resolve-
+/// then-dial genuinely succeeded.
+async fn xray_domain_dns_warm(config_path: &std::path::Path) -> bool {
+    use tokio::io::AsyncWriteExt;
+
+    let Some((inbound, domain, destination_port)) = xray_domain_warmup_target(config_path) else {
+        return true;
+    };
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(inbound)).await
+    else {
+        return false;
+    };
+    if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+        return false;
+    }
+    let mut greeting = [0_u8; 2];
+    if tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut greeting))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    if greeting != [0x05, 0x00] {
+        return false;
+    }
+    let domain_bytes = domain.as_bytes();
+    if domain_bytes.len() > u8::MAX as usize {
+        return false;
+    }
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, domain_bytes.len() as u8];
+    request.extend_from_slice(domain_bytes);
+    request.extend_from_slice(&destination_port.to_be_bytes());
+    if stream.write_all(&request).await.is_err() {
+        return false;
+    }
+
+    let mut reply_head = [0_u8; 4];
+    if tokio::time::timeout(
+        Duration::from_millis(2_000),
+        stream.read_exact(&mut reply_head),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    if reply_head[1] != 0x00 {
+        return false;
+    }
+    // Drain BND.ADDR + BND.PORT per ATYP so nothing is left unread to be
+    // mistaken for the later close/data signal being watched for below.
+    let addr_len: usize = match reply_head[3] {
+        0x01 => 4,
+        0x03 => {
+            let mut len = [0_u8; 1];
+            if tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut len))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            len[0] as usize
+        }
+        0x04 => 16,
+        _ => return false,
+    };
+    let mut rest = vec![0_u8; addr_len + 2];
+    if tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut rest))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let confirm_window = Duration::from_millis(crate::snapshot::ENDPOINT_DNS_TIMEOUT_MS)
+        + Duration::from_millis(300);
+    let deadline = tokio::time::Instant::now() + confirm_window;
+    let mut probe_buf = [0_u8; 64];
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut probe_buf)).await {
+            Ok(Ok(0)) => return false,
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => return false,
+            Err(_) => return true,
+        }
+    }
 }
 
 fn mihomo_readiness_targets(path: &std::path::Path) -> Result<(std::net::SocketAddr, String), ()> {
@@ -766,14 +1010,14 @@ pub struct SidecarProcessController<L: ProcessLauncher = TokioProcessLauncher> {
 
 impl SidecarProcessController<TokioProcessLauncher> {
     pub fn new(paths: RuntimePaths) -> Self {
-        let launcher = TokioProcessLauncher::for_runtime(paths.clone(), Duration::from_secs(12));
+        let launcher = TokioProcessLauncher::for_runtime(paths.clone(), CORE_READINESS_TIMEOUT);
         Self::with_launcher(paths, launcher)
     }
 
     pub fn new_with_logs(paths: RuntimePaths, logs: Arc<CoreLogBuffer>) -> Self {
         let launcher = TokioProcessLauncher::for_runtime_with_logs(
             paths.clone(),
-            Duration::from_secs(12),
+            CORE_READINESS_TIMEOUT,
             logs,
         );
         Self::with_launcher(paths, launcher)
@@ -818,6 +1062,13 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
             children.insert(engine, child);
             Ok(())
         })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> crate::StartFailureCause {
+        match error {
+            ProcessError::ReadinessTimedOut(_) => crate::StartFailureCause::ReadinessTimedOut,
+            _ => crate::StartFailureCause::CoreFailed,
+        }
     }
 
     fn stop<'a>(

@@ -35,9 +35,9 @@ pub use service_logo::{
     MAX_SERVICE_LOGO_BYTES, MAX_SERVICE_LOGO_OUTPUT_BYTES, normalize_service_logo,
 };
 pub use sidecar::{
-    CommandSpec, CoreLogBuffer, CoreLogRecord, DiagnosticStream, ManagedChild, ProcessDiagnostics,
-    ProcessError, ProcessLauncher, RuntimeCheckState, RuntimePaths, SidecarProcessController,
-    TokioManagedChild, TokioProcessLauncher,
+    CORE_READINESS_TIMEOUT, CommandSpec, CoreLogBuffer, CoreLogRecord, DiagnosticStream,
+    ManagedChild, ProcessDiagnostics, ProcessError, ProcessLauncher, RuntimeCheckState,
+    RuntimePaths, SidecarProcessController, TokioManagedChild, TokioProcessLauncher,
 };
 pub use snapshot::{
     AtomicSnapshot, MihomoRuntimeControl, PersistenceError, PersistentSnapshotStore,
@@ -46,7 +46,7 @@ pub use snapshot::{
     stage_runtime_with_mihomo_control, xray_outbound_server_domains,
 };
 pub use state::{ConnectionState, StateError, StateMachine};
-pub use supervisor::{Engine, ProcessController, Supervisor, SupervisorError};
+pub use supervisor::{Engine, ProcessController, StartFailureCause, Supervisor, SupervisorError};
 #[cfg(unix)]
 pub use unix_group::{UnixGroupLauncher, UnixGroupManagedChild};
 #[cfg(windows)]

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -750,7 +750,7 @@ pub struct MihomoRuntimeControl {
     address: SocketAddr,
     secret: String,
     xray_outbound_interface: Option<String>,
-    xray_resolved_hosts: BTreeMap<String, Vec<IpAddr>>,
+    external_ui_directory: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for MihomoRuntimeControl {
@@ -766,7 +766,7 @@ impl std::fmt::Debug for MihomoRuntimeControl {
                     .as_ref()
                     .map(|_| "[CONFIGURED]"),
             )
-            .field("xray_resolved_host_count", &self.xray_resolved_hosts.len())
+            .field("external_ui_directory", &self.external_ui_directory)
             .finish()
     }
 }
@@ -790,7 +790,7 @@ impl MihomoRuntimeControl {
             address,
             secret,
             xray_outbound_interface: None,
-            xray_resolved_hosts: BTreeMap::new(),
+            external_ui_directory: None,
         })
     }
 
@@ -815,22 +815,46 @@ impl MihomoRuntimeControl {
         Ok(self)
     }
 
-    pub fn with_xray_resolved_hosts(
-        mut self,
-        hosts: BTreeMap<String, Vec<IpAddr>>,
-    ) -> io::Result<Self> {
-        if hosts.iter().any(|(domain, addresses)| {
-            domain.is_empty()
-                || domain.len() > 253
-                || domain.chars().any(char::is_control)
-                || addresses.is_empty()
-        }) {
+    /// Points Mihomo's `external-ui` at a vendored, already-staged static dashboard directory so
+    /// the runtime overlay serves it itself (see `crates/multicore-core/src/snapshot.rs` docs on
+    /// `stage_runtime_with_mihomo_control`). The directory must be an absolute, existing directory
+    /// containing an `index.html`; this crate never downloads or writes dashboard content, it only
+    /// references a path the caller has already validated (checksum-verified at package time).
+    ///
+    /// Mihomo additionally requires this path to be a subpath of its own home directory, or listed
+    /// in the `SAFE_PATHS` environment variable of the process that spawns it — this crate cannot
+    /// enforce that from here; the caller that launches the Mihomo process is responsible for it.
+    pub fn with_external_ui_directory(mut self, directory: impl Into<PathBuf>) -> io::Result<Self> {
+        let directory = directory.into();
+        if !directory.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Xray resolved hosts must contain safe domains and at least one IP",
+                "Mihomo external-ui directory must be an absolute path",
             ));
         }
-        self.xray_resolved_hosts = hosts;
+        if directory
+            .as_os_str()
+            .to_str()
+            .is_none_or(|value| value.chars().any(char::is_control))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must be valid, control-character-free Unicode",
+            ));
+        }
+        if !fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must exist",
+            ));
+        }
+        if !fs::metadata(directory.join("index.html")).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo external-ui directory must contain index.html",
+            ));
+        }
+        self.external_ui_directory = Some(directory);
         Ok(self)
     }
 }
@@ -1122,6 +1146,18 @@ pub fn stage_runtime_with_mihomo_control(
         YamlValue::String("secret".to_owned()),
         YamlValue::String(control.secret.clone()),
     );
+    if let Some(external_ui_directory) = &control.external_ui_directory {
+        let external_ui_directory = external_ui_directory.to_str().ok_or_else(|| {
+            PersistenceError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Mihomo external-ui directory is not valid Unicode",
+            ))
+        })?;
+        mapping.insert(
+            YamlValue::String("external-ui".to_owned()),
+            YamlValue::String(external_ui_directory.to_owned()),
+        );
+    }
     let tun_key = YamlValue::String("tun".to_owned());
     let tun = mapping
         .entry(tun_key)
@@ -1150,20 +1186,58 @@ pub fn stage_runtime_with_mihomo_control(
             YamlValue::String("store-selected".to_owned()),
             YamlValue::Bool(false),
         );
+    if control.xray_outbound_interface.is_some() {
+        let domains = normalized_endpoint_domains(snapshot)?;
+        if !domains.is_empty() {
+            // Mihomo's TUN device hijacks every outbound port-53 packet on the
+            // system (`dns-hijack: [any:53]`) regardless of source process or
+            // destination address, so Xray's own scoped-resolver query for an
+            // endpoint domain never actually reaches the real internet: it is
+            // always redirected back into Mihomo itself. Mihomo then tries to
+            // resolve it through its normal (proxy-routed) nameservers, which
+            // depend on a working proxy connection - but that connection is
+            // exactly what resolving this domain is needed to establish. A
+            // live capture on real hardware confirmed this: the endpoint
+            // domain never resolved, indefinitely, once the TUN adapter was
+            // up, even though the same resolver answered fine for every other
+            // domain. `nameserver-policy` makes Mihomo answer a hijacked query
+            // for these specific domains directly against the plain resolver
+            // Xray's own scoped entry already uses, breaking the cycle.
+            let dns_key = YamlValue::String("dns".to_owned());
+            let dns = mapping
+                .entry(dns_key)
+                .or_insert_with(|| YamlValue::Mapping(Default::default()));
+            if !dns.is_mapping() {
+                *dns = YamlValue::Mapping(Default::default());
+            }
+            let dns = dns.as_mapping_mut().expect("dns was replaced by mapping");
+            let policy_key = YamlValue::String("nameserver-policy".to_owned());
+            let policy = dns
+                .entry(policy_key)
+                .or_insert_with(|| YamlValue::Mapping(Default::default()));
+            if !policy.is_mapping() {
+                *policy = YamlValue::Mapping(Default::default());
+            }
+            let policy = policy
+                .as_mapping_mut()
+                .expect("nameserver-policy was replaced by mapping");
+            for domain in &domains {
+                policy.insert(
+                    YamlValue::String(domain.clone()),
+                    YamlValue::String(ENDPOINT_DNS_RESOLVER.to_owned()),
+                );
+            }
+        }
+    }
     let mihomo = serde_yaml_ng::to_string(&document)
         .map_err(|error| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    let xray = xray_runtime_bytes(
-        snapshot,
-        control.xray_outbound_interface.as_deref(),
-        &control.xray_resolved_hosts,
-    )?;
+    let xray = xray_runtime_bytes(snapshot, control.xray_outbound_interface.as_deref())?;
     stage_runtime_payloads(mihomo.as_bytes(), &xray, runtime_root)
 }
 
 fn xray_runtime_bytes(
     snapshot: &Snapshot,
     outbound_interface: Option<&str>,
-    resolved_hosts: &BTreeMap<String, Vec<IpAddr>>,
 ) -> Result<Vec<u8>, PersistenceError> {
     let Some(outbound_interface) = outbound_interface else {
         return Ok(snapshot.xray.raw_bytes().to_vec());
@@ -1172,6 +1246,14 @@ fn xray_runtime_bytes(
         |message: String| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, message));
     let mut document: serde_json::Value = serde_json::from_slice(snapshot.xray.raw_bytes())
         .map_err(|error| invalid(format!("validated Xray document is invalid: {error}")))?;
+    let domains = normalized_endpoint_domains(snapshot)?;
+    if !domains.is_empty()
+        && (contains_endpoint_dns_tag(&document) || selects_endpoint_dns_outbound(&document))
+    {
+        return Err(invalid(
+            "Xray subscription captures a reserved endpoint DNS tag".to_owned(),
+        ));
+    }
     let root = document
         .as_object_mut()
         .ok_or_else(|| invalid("validated Xray document is not an object".to_owned()))?;
@@ -1185,13 +1267,11 @@ fn xray_runtime_bytes(
         ));
     }
 
-    for outbound in outbounds {
+    for outbound in outbounds.iter_mut() {
         let outbound = outbound
             .as_object_mut()
             .ok_or_else(|| invalid("validated Xray outbound is not an object".to_owned()))?;
-        let must_force_resolved_ip = outbound_server_domains(outbound)
-            .iter()
-            .any(|domain| resolved_hosts.contains_key(domain));
+        let must_resolve_endpoint = !outbound_server_domains(outbound).is_empty();
         let stream_settings = outbound
             .entry("streamSettings")
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
@@ -1214,7 +1294,7 @@ fn xray_runtime_bytes(
             "interface".to_owned(),
             serde_json::Value::String(outbound_interface.to_owned()),
         );
-        if must_force_resolved_ip {
+        if must_resolve_endpoint {
             sockopt.insert(
                 "domainStrategy".to_owned(),
                 serde_json::Value::String("ForceIP".to_owned()),
@@ -1222,7 +1302,28 @@ fn xray_runtime_bytes(
         }
     }
 
-    if !resolved_hosts.is_empty() {
+    if !domains.is_empty() {
+        // Append, never replace the provider's first/default outbound. DNS uses
+        // a literal resolver IP, so this dial cannot recurse into endpoint DNS.
+        //
+        // Deliberately NOT bound to `outbound_interface`: a live-hardware
+        // capture proved Mihomo's own DNS-leak protection (`strict-route`)
+        // silently blackholes any UDP:53 packet explicitly source-bound to
+        // the physical adapter - proven with a raw socket test that failed
+        // identically for this endpoint domain and for an unrelated control
+        // domain on port 53, while the exact same bind on a TCP/443 socket
+        // (matching every other outbound above) connected fine. So this
+        // query must NOT try to escape the tunnel by binding to the real
+        // interface; it goes out unbound instead, which Mihomo's own TUN
+        // captures via its system-wide DNS hijack and, thanks to the
+        // `nameserver-policy` override above, answers directly and
+        // correctly for exactly these domains.
+        outbounds.push(serde_json::json!({
+            "tag": ENDPOINT_DNS_OUTBOUND_TAG,
+            "protocol": "freedom",
+            "settings": {"domainStrategy": "AsIs"},
+            "streamSettings": {"sockopt": {"domainStrategy": "AsIs"}}
+        }));
         let dns = root
             .entry("dns")
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
@@ -1232,34 +1333,171 @@ fn xray_runtime_bytes(
         let dns = dns
             .as_object_mut()
             .ok_or_else(|| invalid("validated Xray dns section is not an object".to_owned()))?;
-        let hosts = dns
-            .entry("hosts")
-            .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        if hosts.is_null() {
-            *hosts = serde_json::Value::Object(Default::default());
+        let servers = dns.entry("servers").or_insert(serde_json::Value::Null);
+        // Preserve the old system resolver for unrelated Xray DNS consumers.
+        // Endpoint lookups are scoped to the generated final-query entry.
+        if servers.is_null() {
+            *servers = serde_json::json!(["localhost"]);
         }
-        let hosts = hosts.as_object_mut().ok_or_else(|| {
-            invalid("validated Xray dns.hosts section is not an object".to_owned())
+        let servers = servers.as_array_mut().ok_or_else(|| {
+            invalid("validated Xray dns.servers section is not an array".to_owned())
         })?;
-        for (domain, addresses) in resolved_hosts {
-            let mut addresses = addresses.iter().map(ToString::to_string);
-            let first = addresses.next().expect("resolved hosts were validated");
-            let value = match addresses.next() {
-                None => serde_json::Value::String(first),
-                Some(second) => serde_json::Value::Array(
-                    std::iter::once(first)
-                        .chain(std::iter::once(second))
-                        .chain(addresses)
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            };
-            hosts.insert(domain.clone(), value);
+        if servers.is_empty() {
+            servers.push(serde_json::json!("localhost"));
         }
+        // Xray uses clients[0] even when skipFallback/disableFallback leave no
+        // eligible clients. Keep the original resolver in that emergency slot,
+        // with no matches and excluded from the normal fallback list.
+        let mut emergency = match &servers[0] {
+            serde_json::Value::String(address) => serde_json::json!({"address": address}),
+            serde_json::Value::Object(_) => servers[0].clone(),
+            _ => {
+                return Err(invalid(
+                    "validated Xray DNS server is not an object or string".to_owned(),
+                ));
+            }
+        };
+        emergency["domains"] = serde_json::json!([]);
+        emergency["skipFallback"] = serde_json::json!(true);
+        // Xray silently adds local-TLD/dotless rules to every localhost DNS
+        // entry. Those would run before our scoped resolver. Such endpoints
+        // require private DNS and cannot safely use this public-DNS policy.
+        if emergency["address"]
+            .as_str()
+            .is_some_and(|address| address.trim().eq_ignore_ascii_case("localhost"))
+            && domains.iter().any(|domain| local_dns_domain(domain))
+        {
+            return Err(invalid(
+                "Xray public endpoint DNS cannot override local-only domains".to_owned(),
+            ));
+        }
+        servers.insert(0, serde_json::json!({
+            "address": ENDPOINT_DNS_RESOLVER,
+            "domains": domains.iter().map(|domain| format!("full:{domain}")).collect::<Vec<_>>(),
+            "skipFallback": true, "finalQuery": true,
+            "disableCache": false, "serveStale": false,
+            "tag": ENDPOINT_DNS_TAG, "timeoutMs": ENDPOINT_DNS_TIMEOUT_MS
+        }));
+        servers.insert(0, emergency);
+        let routing = root.entry("routing").or_insert(serde_json::Value::Null);
+        if routing.is_null() {
+            *routing = serde_json::json!({});
+        }
+        let routing = routing
+            .as_object_mut()
+            .ok_or_else(|| invalid("validated Xray routing section is not an object".to_owned()))?;
+        let rules = routing.entry("rules").or_insert(serde_json::Value::Null);
+        if rules.is_null() {
+            *rules = serde_json::json!([]);
+        }
+        let rules = rules.as_array_mut().ok_or_else(|| {
+            invalid("validated Xray routing.rules section is not an array".to_owned())
+        })?;
+        rules.insert(
+            0,
+            serde_json::json!({
+                "type": "field", "inboundTag": [ENDPOINT_DNS_TAG],
+                "outboundTag": ENDPOINT_DNS_OUTBOUND_TAG
+            }),
+        );
     }
 
     serde_json::to_vec(&document)
         .map_err(|error| invalid(format!("Xray runtime serialization failed: {error}")))
+}
+
+const ENDPOINT_DNS_TAG: &str = "multicore-endpoint-dns";
+const ENDPOINT_DNS_OUTBOUND_TAG: &str = "multicore-endpoint-dns-direct";
+/// Shared with the readiness warm-up in `sidecar.rs`, which must bound its
+/// wait for Xray's own DNS-failure close by the same value this config
+/// actually uses - never a guessed constant that could silently drift.
+///
+/// This was 3000: a defensive value chosen back when the endpoint
+/// resolver's own query still had to survive Mihomo routing it through a
+/// proxy-dependent nameserver, an indefinite failure mode with no safe
+/// fast bound. A live-hardware capture then found and fixed the actual bug
+/// (an interface-bound UDP:53 packet silently blackholed by Mihomo's own
+/// DNS-leak protection); with that gone, the resolver answers in well
+/// under a second even over a real link, so this - and the readiness
+/// warm-up window it bounds - can be far tighter without reintroducing the
+/// original false-"ready" failure mode this whole mechanism exists to
+/// avoid.
+pub(crate) const ENDPOINT_DNS_TIMEOUT_MS: u64 = 1200;
+/// Shared between Xray's own scoped resolver entry and the Mihomo
+/// `nameserver-policy` override below, so both agree on the one resolver
+/// address that must be reachable for endpoint domains to ever resolve.
+const ENDPOINT_DNS_RESOLVER: &str = "77.88.8.8";
+
+fn local_dns_domain(domain: &str) -> bool {
+    !domain.contains('.')
+        || [
+            "local",
+            "localdomain",
+            "localhost",
+            "lan",
+            "home.arpa",
+            "example",
+            "invalid",
+            "test",
+        ]
+        .iter()
+        .any(|suffix| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
+}
+
+fn selects_endpoint_dns_outbound(document: &serde_json::Value) -> bool {
+    let matches = |selector: &serde_json::Value| {
+        if let Some(prefixes) = selector.as_str() {
+            // Xray's StringList accepts comma-separated scalar selectors.
+            return prefixes
+                .split(',')
+                .any(|prefix| ENDPOINT_DNS_OUTBOUND_TAG.starts_with(prefix));
+        }
+        selector.as_array().is_some_and(|prefixes| {
+            prefixes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|prefix| ENDPOINT_DNS_OUTBOUND_TAG.starts_with(prefix))
+        })
+    };
+    document
+        .pointer("/routing/balancers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|balancers| {
+            balancers
+                .iter()
+                .any(|balancer| matches(&balancer["selector"]))
+        })
+        || matches(&document["observatory"]["subjectSelector"])
+        || matches(&document["burstObservatory"]["subjectSelector"])
+}
+
+fn contains_endpoint_dns_tag(value: &serde_json::Value) -> bool {
+    // Fail closed even for references to a missing provider tag: injecting an
+    // outbound with that name could otherwise make an unrelated rule direct.
+    match value {
+        serde_json::Value::String(value) => {
+            value == ENDPOINT_DNS_TAG || value == ENDPOINT_DNS_OUTBOUND_TAG
+        }
+        serde_json::Value::Array(values) => values.iter().any(contains_endpoint_dns_tag),
+        serde_json::Value::Object(values) => values.values().any(contains_endpoint_dns_tag),
+        _ => false,
+    }
+}
+
+/// Xray strips the terminating FQDN dot before DNS matching; shared by both
+/// the Xray endpoint-DNS overlay and the Mihomo `nameserver-policy` override
+/// below so the two always agree on exactly which domains need it.
+fn normalized_endpoint_domains(snapshot: &Snapshot) -> Result<BTreeSet<String>, PersistenceError> {
+    Ok(xray_outbound_server_domains(snapshot)?
+        .into_iter()
+        .map(|domain| {
+            let domain = domain.trim();
+            domain
+                .strip_suffix('.')
+                .unwrap_or(domain)
+                .to_ascii_lowercase()
+        })
+        .collect())
 }
 
 pub fn xray_outbound_server_domains(snapshot: &Snapshot) -> Result<Vec<String>, PersistenceError> {
@@ -1300,10 +1538,9 @@ fn outbound_server_domains(outbound: &serde_json::Map<String, serde_json::Value>
         return Vec::new();
     };
     let direct = settings.get("address").and_then(serde_json::Value::as_str);
-    let servers = settings
-        .get("servers")
-        .and_then(serde_json::Value::as_array)
+    let servers = ["servers", "vnext"]
         .into_iter()
+        .filter_map(|key| settings.get(key).and_then(serde_json::Value::as_array))
         .flatten()
         .filter_map(serde_json::Value::as_object)
         .filter_map(|server| server.get("address"))

@@ -13,7 +13,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, SetHandleInformation},
+    Foundation::{HANDLE, HANDLE_FLAG_INHERIT, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0},
     Security::SECURITY_ATTRIBUTES,
     System::{
         JobObjects::{
@@ -81,7 +81,7 @@ impl WindowsJobLauncher {
             job: Arc::new(Job(handle)),
             logs,
             readiness: None,
-            readiness_timeout: Duration::from_secs(12),
+            readiness_timeout: crate::CORE_READINESS_TIMEOUT,
         })
     }
 
@@ -132,7 +132,7 @@ impl WindowsJobLauncher {
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
         let application = wide_nul(command.program.as_os_str());
         let mut command_line = wide_nul(&build_command_line(&command.program, &command.args));
-        let environment = sanitized_environment();
+        let environment = sanitized_environment(&command.env);
         let created = unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -198,12 +198,21 @@ impl ManagedChild for WindowsJobManagedChild {
             if unsafe { TerminateProcess(self.process.as_raw_handle(), 1) } == 0 {
                 return Err(ProcessError::StopFailed(self.engine));
             }
-            unsafe {
-                WaitForSingleObject(self.process.as_raw_handle(), INFINITE);
+            if !wait_for_termination(self.process.as_raw_handle(), STOP_TIMEOUT) {
+                return Err(ProcessError::StopFailed(self.engine));
             }
             Ok(())
         })
     }
+}
+
+/// Upper bound for a terminated core to be reaped. A process stuck in a
+/// driver call can outlive `TerminateProcess`; the caller must not hang.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn wait_for_termination(process: HANDLE, timeout: Duration) -> bool {
+    let milliseconds = timeout.as_millis().min(u128::from(INFINITE - 1)) as u32;
+    unsafe { WaitForSingleObject(process, milliseconds) == WAIT_OBJECT_0 }
 }
 
 impl ProcessLauncher for WindowsJobLauncher {
@@ -366,7 +375,7 @@ fn quote_windows(value: &OsStr) -> OsString {
     OsString::from(out)
 }
 
-fn sanitized_environment() -> Vec<u16> {
+fn sanitized_environment(extra: &[(OsString, OsString)]) -> Vec<u16> {
     const ALLOWED: &[&str] = &[
         "SYSTEMROOT",
         "WINDIR",
@@ -388,6 +397,15 @@ fn sanitized_environment() -> Vec<u16> {
                 .then(|| format!("{}={}", key_text, value.to_string_lossy()))
         })
         .collect::<Vec<_>>();
+    // `extra` (e.g. SAFE_PATHS for the vendored dashboard directory) comes only from this
+    // process's own fixed `CommandSpec` construction, never from the broker's untrusted input.
+    for (key, value) in extra {
+        entries.push(format!(
+            "{}={}",
+            key.to_string_lossy(),
+            value.to_string_lossy()
+        ));
+    }
     entries.sort_by_key(|entry| entry.to_ascii_uppercase());
     let mut block = Vec::new();
     for entry in entries {
@@ -416,8 +434,41 @@ mod tests {
     #[test]
     fn environment_excludes_daemon_credentials() {
         unsafe { std::env::set_var("MULTICORE_DAEMON_TOKEN", "never-inherit") };
-        let block = String::from_utf16_lossy(&sanitized_environment());
+        let block = String::from_utf16_lossy(&sanitized_environment(&[]));
         assert!(!block.contains("never-inherit"));
+    }
+    #[test]
+    fn environment_carries_explicit_extra_entries_such_as_safe_paths() {
+        let extra = [(
+            OsString::from("SAFE_PATHS"),
+            OsString::from(r"C:\Program Files\MultiCore\dashboard"),
+        )];
+        let block = String::from_utf16_lossy(&sanitized_environment(&extra));
+        assert!(block.contains(r"SAFE_PATHS=C:\Program Files\MultiCore\dashboard"));
+    }
+    #[test]
+    fn termination_wait_is_bounded() {
+        // The current process never exits during the test, so the wait must
+        // return after its timeout instead of blocking forever.
+        let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let started = std::time::Instant::now();
+        assert!(!wait_for_termination(current, Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    #[tokio::test]
+    async fn stop_terminates_a_running_child_within_the_bound() {
+        let launcher = WindowsJobLauncher::new(Arc::new(CoreLogBuffer::default())).unwrap();
+        let mut child = launcher
+            .launch(CommandSpec {
+                engine: Engine::Xray,
+                program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                args: vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+                env: Vec::new(),
+            })
+            .await
+            .unwrap();
+        child.stop().await.unwrap();
+        assert!(child.has_exited().unwrap());
     }
     #[tokio::test]
     async fn child_is_created_inside_job_and_job_close_reaps_it() {
@@ -427,6 +478,7 @@ mod tests {
                 engine: Engine::Xray,
                 program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
                 args: vec!["/D".into(), "/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+                env: Vec::new(),
             })
             .await
             .unwrap();

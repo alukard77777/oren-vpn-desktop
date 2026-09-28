@@ -50,6 +50,11 @@ pub enum UiState {
     Error {
         message: String,
     },
+    /// The status poll itself failed: the local service did not answer, so the
+    /// tunnel state is unknown rather than a failed connection attempt.
+    ServiceUnreachable {
+        message: String,
+    },
     DaemonDegraded {
         message: String,
     },
@@ -217,6 +222,8 @@ pub(crate) struct CatalogPresentation {
     pub(crate) group_navigation_enabled: bool,
     pub(crate) selection_enabled: bool,
     pub(crate) selection_pending: bool,
+    #[allow(dead_code)]
+    // Queue state is asserted in tests; the UI shows the queued route as selected.
     pub(crate) selection_queued: bool,
     pub(crate) error: Option<String>,
 }
@@ -264,7 +271,13 @@ pub(crate) struct SubscriptionProfilesPresentation {
     pub(crate) active_id: Option<String>,
     pub(crate) profiles: Vec<SubscriptionProfilePresentation>,
     pub(crate) loading: bool,
+    /// The profile list could not be loaded; retrying the list request helps.
     pub(crate) error: Option<String>,
+    /// A profile mutation was rejected or failed. Reloading the list does not
+    /// resolve it, so it is shown without a retry action.
+    pub(crate) mutation_error: Option<String>,
+    /// Switching the active subscription requires a disconnected tunnel.
+    pub(crate) switch_locked: bool,
     pub(crate) pending_operation: Option<SubscriptionProfileOperation>,
     pub(crate) pending_id: Option<String>,
 }
@@ -294,6 +307,11 @@ enum EventFilter {
     All,
     System,
     Error,
+    /// Just the vendored cores' own startup/runtime log lines (Xray,
+    /// Mihomo), stripped of every other app event - the "first 15 seconds
+    /// of startup" a user chasing a real connect failure actually needs,
+    /// without having to scroll past unrelated events to find them.
+    Cores,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,7 +324,6 @@ pub struct StatePresentation {
     pub primary_label: &'static str,
     pub primary_action: PrimaryAction,
     pub primary_enabled: bool,
-    pub pill_label: &'static str,
     pub semantic_tone: SemanticTone,
     pub has_profile: bool,
     pub is_connected: bool,
@@ -327,7 +344,6 @@ impl UiState {
                 primary_label: "Подключиться",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ГОТОВО",
                 semantic_tone: SemanticTone::Neutral,
                 has_profile: false,
                 is_connected: false,
@@ -344,7 +360,6 @@ impl UiState {
                 primary_label: "Добавляем…",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ПОДКЛЮЧЕНИЕ",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: false,
                 is_connected: false,
@@ -361,7 +376,6 @@ impl UiState {
                 primary_label: "Подключиться",
                 primary_action: PrimaryAction::Connect,
                 primary_enabled: true,
-                pill_label: "ГОТОВО",
                 semantic_tone: SemanticTone::Accent,
                 has_profile: true,
                 is_connected: false,
@@ -382,7 +396,6 @@ impl UiState {
                 primary_label: "Подключаем…",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ПОДКЛЮЧЕНИЕ",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: false,
@@ -399,7 +412,6 @@ impl UiState {
                 primary_label: "Отключиться",
                 primary_action: PrimaryAction::Disconnect,
                 primary_enabled: true,
-                pill_label: "В СЕТИ",
                 semantic_tone: SemanticTone::Success,
                 has_profile: true,
                 is_connected: true,
@@ -416,7 +428,6 @@ impl UiState {
                 primary_label: "Отключаем…",
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
-                pill_label: "ОТКЛЮЧЕНИЕ",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: true,
@@ -430,10 +441,25 @@ impl UiState {
                 supporting: message.clone(),
                 profile: "—".into(),
                 node: "Авто".into(),
-                primary_label: "Повторить",
+                primary_label: "Проверить снова",
                 primary_action: PrimaryAction::Retry,
                 primary_enabled: true,
-                pill_label: "ОШИБКА",
+                semantic_tone: SemanticTone::Danger,
+                has_profile: true,
+                is_connected: false,
+                is_busy: false,
+                is_error: true,
+                is_degraded: false,
+            },
+            Self::ServiceUnreachable { message } => StatePresentation {
+                eyebrow: "Нет связи с сервисом",
+                headline: "Сервис не отвечает".into(),
+                supporting: message.clone(),
+                profile: "Состояние неизвестно".into(),
+                node: "—".into(),
+                primary_label: "Проверить снова",
+                primary_action: PrimaryAction::Retry,
+                primary_enabled: true,
                 semantic_tone: SemanticTone::Danger,
                 has_profile: true,
                 is_connected: false,
@@ -447,10 +473,9 @@ impl UiState {
                 supporting: message.clone(),
                 profile: "Состояние неизвестно".into(),
                 node: "—".into(),
-                primary_label: "Очистить",
+                primary_label: "Остановить туннель",
                 primary_action: PrimaryAction::Cleanup,
                 primary_enabled: true,
-                pill_label: "СЕРВИС",
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: false,
@@ -503,6 +528,37 @@ pub struct ProxyMappingPresentation {
     pub proxy_name: String,
     pub address: String,
     pub xray_label: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConflictingAppsPresentation {
+    pub visible: bool,
+    pub apps: Vec<String>,
+    pub message: String,
+}
+
+/// Builds the Russian banner copy for one or more detected conflicting apps,
+/// appending a note about any app a close attempt could not fully remove.
+fn conflicting_apps_message(apps: &[&'static str], close_note: &[&'static str]) -> String {
+    let names = apps.join(", ");
+    let mut message = if apps.len() > 1 {
+        format!(
+            "Обнаружены другие VPN-приложения ({names}): они могут конфликтовать с MultiCore. Закройте их перед подключением."
+        )
+    } else {
+        format!(
+            "Обнаружено другое VPN-приложение ({names}): оно может конфликтовать с MultiCore. Закройте его перед подключением."
+        )
+    };
+    if !close_note.is_empty() {
+        let stuck = close_note.join(", ");
+        message.push_str(&format!(
+            " Закрыть удалось не всё: {stuck} запускает свой движок как службу Windows, \
+            которую наша кнопка не трогает без повышения прав. Отключитесь в самом \
+            приложении перед закрытием или остановите его службу в «Службах Windows»."
+        ));
+    }
+    message
 }
 
 pub fn redact_event_text(input: &str) -> String {
@@ -583,6 +639,7 @@ pub struct DesktopViewModel {
     active_profile_id: Option<String>,
     subscription_profiles: Vec<SubscriptionProfilePresentation>,
     profile_error: Option<String>,
+    profile_list_error: Option<String>,
     profile_status_reload_needed: bool,
     profile_reload_needed: bool,
     profile_catalog_reload_needed: bool,
@@ -629,6 +686,17 @@ pub struct DesktopViewModel {
     latency_request_group_ids: Vec<String>,
     latency_queued: bool,
     latency_error: Option<String>,
+    conflicting_apps: Vec<&'static str>,
+    conflicting_apps_dismissed_key: Option<String>,
+    /// Apps a close attempt just targeted but could not fully remove (some of
+    /// their processes are still running after `close_running`). Common
+    /// cause: the app's actual engine runs as a Windows service in Session 0
+    /// (a separate, protected security context), while its GUI runs in the
+    /// user's own session - our close button is deliberately unprivileged
+    /// and can only close what the user's own token can, so it closes the
+    /// GUI but the service outlives it. Surfaced so the button closing
+    /// something doesn't silently look like it did nothing.
+    conflicting_apps_close_note: Vec<&'static str>,
 }
 
 impl DesktopViewModel {
@@ -648,6 +716,7 @@ impl DesktopViewModel {
             active_profile_id: None,
             subscription_profiles: Vec::new(),
             profile_error: None,
+            profile_list_error: None,
             profile_status_reload_needed: false,
             profile_reload_needed: false,
             profile_catalog_reload_needed: false,
@@ -693,6 +762,9 @@ impl DesktopViewModel {
             latency_request_group_ids: Vec::new(),
             latency_queued: false,
             latency_error: None,
+            conflicting_apps: Vec::new(),
+            conflicting_apps_dismissed_key: None,
+            conflicting_apps_close_note: Vec::new(),
         }
     }
 
@@ -709,7 +781,6 @@ impl DesktopViewModel {
             presentation.eyebrow = "Проверка";
             presentation.headline = "Проверяем состояние…".into();
             presentation.primary_label = "Проверяем…";
-            presentation.pill_label = "ПРОВЕРКА";
             presentation.semantic_tone = SemanticTone::Warning;
             presentation.is_connected = false;
             presentation.is_busy = true;
@@ -764,7 +835,14 @@ impl DesktopViewModel {
             active_id: self.active_profile_id.clone(),
             profiles: self.subscription_profiles.clone(),
             loading: self.profile_list_request_pending.is_some(),
-            error: self.profile_error.clone(),
+            error: self.profile_list_error.clone(),
+            mutation_error: self.profile_error.clone(),
+            switch_locked: matches!(
+                self.state,
+                UiState::Connected { .. }
+                    | UiState::Connecting { .. }
+                    | UiState::Disconnecting { .. }
+            ),
             pending_operation: self
                 .active_profile_mutation
                 .as_ref()
@@ -782,6 +860,7 @@ impl DesktopViewModel {
 
     pub(crate) fn begin_profile_list(&mut self) -> Option<ProfileRequestToken> {
         self.profile_error = None;
+        self.profile_list_error = None;
         self.profile_reload_needed = false;
         self.next_profile_list_generation = self.next_profile_list_generation.wrapping_add(1);
         let token = ProfileRequestToken(self.next_profile_list_generation);
@@ -802,11 +881,12 @@ impl DesktopViewModel {
             Ok(list) => {
                 self.replace_profile_list(list);
                 self.profile_error = None;
+                self.profile_list_error = None;
                 self.profile_list_reconciliation_pending = false;
                 self.arm_profile_catalog_reconciliation();
             }
             Err(_) => {
-                self.profile_error =
+                self.profile_list_error =
                     Some("Не удалось загрузить подписки. Повторите попытку.".into());
                 if self.profile_list_reconciliation_pending {
                     self.profile_reload_needed = true;
@@ -1604,7 +1684,7 @@ impl DesktopViewModel {
                 if self.profile_status_reconciliation_pending {
                     self.profile_status_reload_needed = true;
                 }
-                UiState::Error {
+                UiState::ServiceUnreachable {
                     message: error.to_string(),
                 }
             }
@@ -1637,8 +1717,11 @@ impl DesktopViewModel {
             }
             Err(error) => {
                 self.state = previous_state;
-                self.import_error =
-                    Some("Не удалось добавить подписку. Проверьте URL и повторите попытку.".into());
+                self.import_error = Some(if error.is_specific() {
+                    error.to_string()
+                } else {
+                    "Не удалось добавить подписку. Проверьте URL и повторите попытку.".into()
+                });
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }
@@ -1737,6 +1820,7 @@ impl DesktopViewModel {
         self.event_filter = match level {
             Some(level) if level.eq_ignore_ascii_case("system") => EventFilter::System,
             Some(level) if level.eq_ignore_ascii_case("error") => EventFilter::Error,
+            Some(level) if level.eq_ignore_ascii_case("cores") => EventFilter::Cores,
             _ => EventFilter::All,
         };
         self.filtered_events()
@@ -1907,6 +1991,81 @@ impl DesktopViewModel {
             loading: self.latency_request_pending.is_some(),
             queued: self.latency_queued,
             error: self.latency_error.clone(),
+        }
+    }
+
+    /// Records the currently-detected conflicting VPN client apps (from a
+    /// local process-name scan; see `conflicting_apps.rs`). When the set
+    /// becomes empty — meaning every previously-detected app is no longer
+    /// running — any prior dismissal is cleared too, so the banner reappears
+    /// if the same app is closed and later reopened, rather than staying
+    /// silently dismissed forever.
+    pub(crate) fn set_conflicting_apps(&mut self, mut apps: Vec<&'static str>) {
+        apps.sort_unstable();
+        apps.dedup();
+        if apps.is_empty() {
+            self.conflicting_apps_dismissed_key = None;
+        }
+        // Drop the note for any noted app that isn't detected anymore
+        // (whether or not other apps are still/newly present).
+        self.conflicting_apps_close_note
+            .retain(|noted| apps.contains(noted));
+        self.conflicting_apps = apps;
+    }
+
+    /// Called right after a close-app attempt re-scans. Any `targeted` app
+    /// still present afterward gets an explanatory note appended to the
+    /// banner (see `conflicting_apps_close_note`'s doc comment for why this
+    /// happens); a `targeted` app no longer present needs no note.
+    pub(crate) fn record_close_attempt(&mut self, targeted: &[&'static str]) {
+        self.conflicting_apps_close_note = targeted
+            .iter()
+            .filter(|app| self.conflicting_apps.contains(app))
+            .copied()
+            .collect();
+    }
+
+    /// Dismisses the banner for exactly the currently-detected set of apps.
+    /// A later detection of a *different* set (a new app appears, or this
+    /// set shrinks/grows) compares unequal and the banner reappears.
+    pub(crate) fn dismiss_conflicting_apps_banner(&mut self) {
+        self.conflicting_apps_dismissed_key = Some(self.conflicting_apps_key());
+    }
+
+    fn conflicting_apps_key(&self) -> String {
+        self.conflicting_apps.join("\u{1f}")
+    }
+
+    /// The currently-detected app names, as the canonical `&'static str`
+    /// values (not the display-only `String`s `conflicting_apps_presentation`
+    /// returns), so callers can round-trip them into `close_running` and
+    /// `record_close_attempt` without re-parsing.
+    pub(crate) fn conflicting_apps(&self) -> Vec<&'static str> {
+        self.conflicting_apps.clone()
+    }
+
+    pub(crate) fn conflicting_apps_presentation(&self) -> ConflictingAppsPresentation {
+        if self.conflicting_apps.is_empty() {
+            return ConflictingAppsPresentation::default();
+        }
+        // Purely informational: never shown once the tunnel is already
+        // connected and working, only before/while attempting to connect.
+        if matches!(self.state, UiState::Connected { .. }) {
+            return ConflictingAppsPresentation::default();
+        }
+        let visible =
+            self.conflicting_apps_dismissed_key.as_deref() != Some(&self.conflicting_apps_key());
+        ConflictingAppsPresentation {
+            visible,
+            apps: self
+                .conflicting_apps
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            message: conflicting_apps_message(
+                &self.conflicting_apps,
+                &self.conflicting_apps_close_note,
+            ),
         }
     }
 
@@ -2586,6 +2745,10 @@ impl DesktopViewModel {
             EventFilter::Error => {
                 events.retain(|event| event.level.eq_ignore_ascii_case("error"));
             }
+            EventFilter::Cores => {
+                events
+                    .retain(|event| matches!(event.component.as_str(), "xray" | "mihomo" | "core"));
+            }
         }
         events
     }
@@ -2615,16 +2778,9 @@ fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPres
 
 fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
     match (status, latency_ms) {
-        ("ok", Some(value)) => {
-            let tone = if value < 80 {
-                "success"
-            } else if value < 150 {
-                "warning"
-            } else {
-                "danger"
-            };
-            (format!("{value} ms"), tone.into())
-        }
+        // Any answered ping is a working node: the exact millisecond count
+        // isn't a failure signal, so it stays green regardless of value.
+        ("ok", Some(value)) => (format!("{value} ms"), "success".into()),
         ("timeout", _) => ("таймаут".into(), "danger".into()),
         ("error" | "unavailable", _) => ("нет связи".into(), "danger".into()),
         _ => ("нет данных".into(), "neutral".into()),
@@ -3267,9 +3423,10 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            model.profile_presentation().error.as_deref(),
+            model.profile_presentation().mutation_error.as_deref(),
             Some("Введите корректный HTTP(S) URL.")
         );
+        assert_eq!(model.profile_presentation().error, None);
 
         let edit = model
             .begin_profile_source_edit("profile-a", "https://replacement.invalid/sub?token=secret")
@@ -3516,6 +3673,61 @@ mod tests {
     }
 
     #[test]
+    fn connected_state_locks_profile_switching_and_reports_it_as_a_mutation_error() {
+        let mut model = model_with_profiles();
+        assert!(!model.profile_presentation().switch_locked);
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Alpha".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+
+        assert!(model.profile_presentation().switch_locked);
+        assert!(model.begin_profile_activation("profile-b").is_none());
+        let presentation = model.profile_presentation();
+        assert_eq!(presentation.error, None);
+        assert_eq!(
+            presentation.mutation_error.as_deref(),
+            Some("Отключитесь перед изменением подписки.")
+        );
+    }
+
+    #[test]
+    fn profile_list_failure_is_retryable_and_cleared_by_the_next_list_request() {
+        let mut model = model_with_profiles();
+        let list = model.begin_profile_list().expect("profile list");
+        assert!(
+            model.finish_profile_list(list, Err(crate::daemon::DaemonError::new("unavailable")),)
+        );
+        let presentation = model.profile_presentation();
+        assert_eq!(
+            presentation.error.as_deref(),
+            Some("Не удалось загрузить подписки. Повторите попытку.")
+        );
+        assert_eq!(presentation.mutation_error, None);
+
+        model.begin_profile_list().expect("retry list");
+        assert_eq!(model.profile_presentation().error, None);
+    }
+
+    #[test]
+    fn failed_status_poll_reports_an_unreachable_service_not_a_failed_connection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Err(crate::daemon::DaemonError::new("unavailable")));
+        let presentation = model.presentation();
+        assert_eq!(presentation.eyebrow, "Нет связи с сервисом");
+        assert_eq!(presentation.primary_label, "Проверить снова");
+        assert_eq!(presentation.primary_action, PrimaryAction::Retry);
+        assert_eq!(presentation.semantic_tone, SemanticTone::Danger);
+    }
+
+    #[test]
     fn degraded_profile_mutations_are_rejected_without_issuing_tokens() {
         let mut model = model_with_profiles();
         model.state = UiState::DaemonDegraded {
@@ -3527,7 +3739,11 @@ mod tests {
         assert!(model.begin_profile_target_refresh("profile-b").is_none());
         let presentation = model.profile_presentation();
         assert_eq!(presentation.pending_operation, None);
-        let error = presentation.error.expect("bounded degraded error");
+        assert_eq!(
+            presentation.error, None,
+            "mutation errors are not list errors"
+        );
+        let error = presentation.mutation_error.expect("bounded degraded error");
         assert!(error.chars().count() < 128);
         assert!(!error.contains("private.invalid"));
         assert!(!error.contains("secret"));
@@ -3761,23 +3977,13 @@ mod tests {
     }
 
     #[test]
-    fn latency_tone_boundaries_are_stable() {
-        assert_eq!(
-            latency_display("ok", Some(79)),
-            ("79 ms".into(), "success".into())
-        );
-        assert_eq!(
-            latency_display("ok", Some(80)),
-            ("80 ms".into(), "warning".into())
-        );
-        assert_eq!(
-            latency_display("ok", Some(149)),
-            ("149 ms".into(), "warning".into())
-        );
-        assert_eq!(
-            latency_display("ok", Some(150)),
-            ("150 ms".into(), "danger".into())
-        );
+    fn any_answered_ping_is_success_only_timeout_and_errors_are_danger() {
+        for value in [1, 79, 80, 149, 150, 999, 5000] {
+            assert_eq!(
+                latency_display("ok", Some(value)),
+                (format!("{value} ms"), "success".into())
+            );
+        }
         assert_eq!(latency_display("timeout", None).1, "danger");
         assert_eq!(latency_display("unavailable", None).1, "danger");
         assert_eq!(latency_display("unknown", None).1, "neutral");
@@ -4126,7 +4332,12 @@ mod tests {
         assert!(!app.contains("Задержка обновляется автоматически"));
         assert!(app.contains("routes-heading := HorizontalLayout"));
         assert!(app.contains("route-updated-meta := Text"));
-        assert!(app.contains("text: root.subscription-updated;"));
+        assert!(app.contains(
+            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated;"
+        ));
+        assert!(app.contains(
+            "color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;"
+        ));
         assert!(app.contains("horizontal-alignment: right;"));
         assert!(app.contains("trailing-text: node.latency-text;"));
         assert!(!main.contains("ui.on_check_latencies"));
@@ -4207,8 +4418,10 @@ mod tests {
             .and_then(|source| source.split("if root.profile-menu-open").next())
             .expect("home subscription refresh action source");
 
-        assert!(refresh_action.contains("width: 92px;"));
+        assert!(refresh_action.contains("width: 116px;"));
         assert!(refresh_action.contains("height: 44px;"));
+        assert!(refresh_action.contains("opacity: parent.enabled ? 1 : 0.45;"));
+        assert!(refresh_action.contains("\"Указать ссылку\""));
         let compact = refresh_action.split_whitespace().collect::<String>();
         assert!(compact.contains("Rectangle{y:5px;height:34px;"));
     }
@@ -5742,7 +5955,6 @@ mod tests {
             "padding: 20px;",
             "preferred-height: 44px;",
             "preferred-height: 92px;",
-            "state-busy",
             "LineEdit",
             "multicore://install-sub?url=…",
             "QuietChip",
@@ -5803,7 +6015,6 @@ mod tests {
             );
         }
         assert!(main.contains("ui.set_has_profile(presentation.has_profile);"));
-        assert!(main.contains("ui.set_state_busy(presentation.is_busy);"));
         assert!(main.contains("if refresh_catalog && current.presentation.has_profile"));
         assert!(main.contains("load_catalog(weak, model);"));
     }
@@ -5940,15 +6151,15 @@ mod tests {
             assert!(status.contains(padding), "status missing {padding}");
         }
 
-        assert_eq!(
-            source
-                .matches("MultiCore · Mihomo 1.19.30 · Xray 26.9.9")
-                .count(),
-            1
-        );
+        assert!(!source.contains("Mihomo 1.19.30"));
         assert!(source.contains(
-            "if root.visible-page == \"settings\": Text { height: 24px; text: \"MultiCore · Mihomo 1.19.30 · Xray 26.9.9\";"
+            "if root.visible-page == \"settings\": Text { height: 24px; text: root.runtime-versions;"
         ));
+        assert!(
+            include_str!("main.rs")
+                .contains("ui.set_runtime_versions(env!(\"MULTICORE_RUNTIME_VERSIONS\").into());")
+        );
+        assert!(include_str!("../build.rs").contains("packaging/windows-x64/versions.json"));
     }
 
     #[test]
@@ -5977,7 +6188,7 @@ mod tests {
         assert!(subscription_header.contains("width: parent.width - 128px;"));
         assert!(subscription_header.contains("overflow: elide;"));
         assert!(settings.contains("// Historical minimum-height contract used spacing: 18px;."));
-        assert!(settings.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(settings.contains("text <=> root.subscription-draft;"));
         assert!(settings.matches("ToggleRow {").count() >= 2);
         assert!(
             settings.find("settings-scroll := ScrollView").unwrap()
@@ -6114,8 +6325,21 @@ mod tests {
             .nth(1)
             .expect("subscription management page");
         assert!(management.contains("root.add-subscription();"));
-        assert!(management.contains("LineEdit { text <=> root.subscription-draft;"));
+        assert!(management.contains("text <=> root.subscription-draft;"));
+        assert!(management.contains("accessible-label: \"URL подписки\";"));
+        assert!(management.contains("accepted => {"));
+        assert!(management.contains("label: \"Отмена\";"));
+        assert!(management.contains("root.import-pending ? \"Добавляем…\" : \"Добавить\""));
         assert!(management.contains("root.import-url(root.subscription-draft);"));
+        // A failed deep-link import renders on the page even without the editor.
+        assert!(
+            management
+                .contains("if root.import-error != \"\" && !root.replace-editor-open: Text {")
+        );
+
+        // First launch shows only onboarding: no empty shelf or route list noise.
+        assert!(source.contains("if root.has-profile: subscription-strip := Rectangle {"));
+        assert!(source.contains("if root.has-profile: inline-routes := Rectangle {"));
     }
 
     #[test]
@@ -6208,10 +6432,13 @@ mod tests {
             })
             .expect("subscription strip source");
         assert!(subscription_strip.contains("border-radius: 16px;"));
-        assert!(subscription_strip.contains("x: parent.width - 140px;"));
-        assert!(subscription_strip.contains("width: 92px;"));
+        assert!(subscription_strip.contains("x: parent.width - 164px;"));
+        assert!(subscription_strip.contains("width: 116px;"));
         assert!(subscription_strip.contains("height: 44px;"));
-        assert!(subscription_strip.contains("accessible-label: root.subscription-refresh-pending"));
+        assert!(
+            subscription_strip
+                .contains("root.subscription-refresh-pending ? \"Подписка обновляется\"")
+        );
         assert!(subscription_strip.contains("root.refresh-subscription();"));
         assert!(subscription_strip.contains("padding-right: 16px;"));
         assert!(subscription_strip.contains("padding-top: 5px;"));
@@ -6335,7 +6562,7 @@ mod tests {
             "text: \"Маршруты\";",
             "routes-heading := HorizontalLayout",
             "route-updated-meta := Text",
-            "text: root.subscription-updated;",
+            "root.subscription-updated;",
             "root.open-panel(\"events\")",
             "root.refresh-subscription();",
             "root.primary-action();",
@@ -6423,7 +6650,6 @@ mod tests {
         let route = components
             .split("export component RouteNodeRow")
             .nth(1)
-            .and_then(|source| source.split("export component DetailsSurface").next())
             .expect("RouteNodeRow source");
         assert!(route.contains("font-size: Theme.type-metadata-size;"));
         assert!(route.contains("text: root.icon;"));
@@ -6681,13 +6907,11 @@ mod tests {
         assert!(!components.contains("std-widgets.slint"));
         assert!(!components.contains(" Button "));
 
-        for component in [
-            "IconAction",
-            "PrimaryAction",
-            "QuietChip",
-            "RouteNodeRow",
-            "DetailsSurface",
-        ] {
+        for unused in ["IconAction", "DetailsSurface"] {
+            assert!(!components.contains(&format!("export component {unused}")));
+            assert!(!build.contains(unused));
+        }
+        for component in ["PrimaryAction", "QuietChip", "RouteNodeRow"] {
             assert!(
                 components.contains(&format!("export component {component}")),
                 "missing Quiet Signal primitive: {component}"
@@ -6706,15 +6930,10 @@ mod tests {
             next.and_then(|next| source.split(&format!("export component {next}")).next())
                 .unwrap_or(source)
         };
-        let icon_action = component_source("IconAction", Some("PrimaryAction"));
-        assert!(icon_action.contains("preferred-width: Theme.interactive-min;"));
-        assert!(icon_action.contains("preferred-height: Theme.interactive-min;"));
-        assert!(icon_action.contains("accessible-label: root.state-label;"));
-
         for (name, next) in [
             ("PrimaryAction", "QuietChip"),
             ("QuietChip", "RouteNodeRow"),
-            ("RouteNodeRow", "DetailsSurface"),
+            ("RouteNodeRow", "RouteNodeRow-end"),
         ] {
             let source = component_source(name, Some(next));
             assert!(
@@ -6737,7 +6956,7 @@ mod tests {
         );
         assert!(!primary.contains("destructive"));
 
-        let route = component_source("RouteNodeRow", Some("DetailsSurface"));
+        let route = component_source("RouteNodeRow", None);
         assert!(route.contains("pending-state-label"));
         assert!(route.contains("root.pending ?"));
         assert!(route.contains("font-size: Theme.type-metadata-size;"));
@@ -6753,15 +6972,6 @@ mod tests {
         assert!(route.contains("enabled: root.enabled;"));
         assert!(route.contains("clicked => { root.activated(); }"));
         assert!(!route.contains("parent.width - 136px"));
-
-        let details = component_source("DetailsSurface", None);
-        assert!(details.contains("width: Theme.interactive-min;"));
-        assert!(details.contains("height: Theme.interactive-min;"));
-        assert!(details.contains("Theme.focus-width"));
-        assert!(details.contains("event.text == \" \""));
-        assert!(details.contains("event.text == \"\\n\""));
-        assert!(details.contains("dismiss-label"));
-        assert!(!details.contains("\"Close "));
 
         let capture_runner = include_str!("../../../scripts/run-preview-capture.ps1");
         assert!(capture_runner.contains("$captureFileNames = @("));
@@ -7271,19 +7481,19 @@ mod tests {
     #[test]
     fn presentation_exposes_exact_status_tone_and_inline_profile_mode() {
         let cases = [
-            (UiState::Empty, "ГОТОВО", SemanticTone::Neutral, false),
             (
-                UiState::Importing,
-                "ПОДКЛЮЧЕНИЕ",
-                SemanticTone::Warning,
+                UiState::Empty,
+                "Профиль не добавлен",
+                SemanticTone::Neutral,
                 false,
             ),
+            (UiState::Importing, "Импорт", SemanticTone::Warning, false),
             (
                 UiState::Ready {
                     profile: "Работа".into(),
                     node: "Авто".into(),
                 },
-                "ГОТОВО",
+                "Готово",
                 SemanticTone::Accent,
                 true,
             ),
@@ -7293,7 +7503,7 @@ mod tests {
                     node: "Авто".into(),
                     step: "Запуск".into(),
                 },
-                "ПОДКЛЮЧЕНИЕ",
+                "Подключение",
                 SemanticTone::Warning,
                 true,
             ),
@@ -7302,7 +7512,7 @@ mod tests {
                     profile: "Работа".into(),
                     node: "nl-01".into(),
                 },
-                "В СЕТИ",
+                "Подключено",
                 SemanticTone::Success,
                 true,
             ),
@@ -7310,7 +7520,15 @@ mod tests {
                 UiState::Error {
                     message: "Ошибка".into(),
                 },
-                "ОШИБКА",
+                "Не удалось подключиться",
+                SemanticTone::Danger,
+                true,
+            ),
+            (
+                UiState::ServiceUnreachable {
+                    message: "Нет ответа".into(),
+                },
+                "Нет связи с сервисом",
                 SemanticTone::Danger,
                 true,
             ),
@@ -7318,7 +7536,7 @@ mod tests {
                 UiState::DaemonDegraded {
                     message: "Сервис".into(),
                 },
-                "СЕРВИС",
+                "Сервис недоступен",
                 SemanticTone::Warning,
                 true,
             ),
@@ -7326,7 +7544,7 @@ mod tests {
 
         for (state, label, tone, has_profile) in cases {
             let presentation = state.presentation();
-            assert_eq!(presentation.pill_label, label);
+            assert_eq!(presentation.eyebrow, label);
             assert_eq!(presentation.semantic_tone, tone);
             assert_eq!(presentation.has_profile, has_profile);
         }
@@ -7421,7 +7639,15 @@ mod tests {
                 },
                 "Что-то пошло не так",
                 PrimaryAction::Retry,
-                "Повторить",
+                "Проверить снова",
+            ),
+            (
+                UiState::ServiceUnreachable {
+                    message: "Нет ответа".into(),
+                },
+                "Сервис не отвечает",
+                PrimaryAction::Retry,
+                "Проверить снова",
             ),
             (
                 UiState::DaemonDegraded {
@@ -7429,7 +7655,7 @@ mod tests {
                 },
                 "Ограниченный режим",
                 PrimaryAction::Cleanup,
-                "Очистить",
+                "Остановить туннель",
             ),
         ];
 
@@ -7706,6 +7932,70 @@ mod tests {
     }
 
     #[test]
+    fn cores_filter_isolates_xray_and_mihomo_log_lines_from_other_events() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let request = view_model
+            .begin_diagnostics_request()
+            .expect("start diagnostics request");
+        view_model
+            .finish_diagnostics(
+                request.token,
+                Ok(DaemonDiagnostics {
+                    xray: "ready".into(),
+                    mihomo: "ready".into(),
+                    tun: "ready".into(),
+                    logs: vec![
+                        DaemonDiagnosticLog {
+                            id: 1,
+                            timestamp: "1".into(),
+                            component: "xray".into(),
+                            level: "info".into(),
+                            message: "xray started".into(),
+                        },
+                        DaemonDiagnosticLog {
+                            id: 2,
+                            timestamp: "2".into(),
+                            component: "mihomo".into(),
+                            level: "info".into(),
+                            message: "mihomo started".into(),
+                        },
+                        DaemonDiagnosticLog {
+                            id: 3,
+                            timestamp: "3".into(),
+                            component: "unlabeled".into(),
+                            level: "info".into(),
+                            message: "unlabeled core line".into(),
+                        },
+                    ],
+                    mappings: Vec::new(),
+                }),
+            )
+            .expect("current diagnostics completion");
+
+        let events = view_model.set_event_filter(Some("cores"));
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.component.as_str(), "xray" | "mihomo" | "core"))
+        );
+
+        // An unrelated app-level event must not appear under "Ядра".
+        view_model.event_cache.push(PresentedEvent {
+            id: 99,
+            timestamp: "99".into(),
+            component: "subscription".into(),
+            level: "info".into(),
+            message: "profile imported".into(),
+        });
+        let events = view_model.set_event_filter(Some("cores"));
+        assert!(!events.iter().any(|event| event.id == 99));
+    }
+
+    #[test]
     #[ignore = "superseded by desktop_control_center_source_contract"]
     fn diagnostics_surface_has_compact_owned_health_dashboard_and_log_feed() {
         let source = include_str!("../ui/app.slint");
@@ -7723,5 +8013,163 @@ mod tests {
         }
         assert!(source.contains("height: 76px"));
         assert!(!source.contains("Диагностика FlClashX"));
+    }
+
+    #[test]
+    fn conflicting_apps_banner_is_hidden_with_no_detections() {
+        let model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let presentation = model.conflicting_apps_presentation();
+        assert!(!presentation.visible);
+        assert!(presentation.apps.is_empty());
+    }
+
+    #[test]
+    fn conflicting_apps_banner_shows_one_detection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        let presentation = model.conflicting_apps_presentation();
+        assert!(presentation.visible);
+        assert_eq!(presentation.apps, vec!["FlClash".to_string()]);
+        assert!(presentation.message.contains("FlClash"));
+        assert!(presentation.message.contains("оно может конфликтовать"));
+    }
+
+    #[test]
+    fn conflicting_apps_banner_lists_multiple_simultaneous_detections() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["Koala Clash", "FlClash", "Incy"]);
+        let presentation = model.conflicting_apps_presentation();
+        assert!(presentation.visible);
+        // Sorted and deduplicated.
+        assert_eq!(
+            presentation.apps,
+            vec![
+                "FlClash".to_string(),
+                "Incy".to_string(),
+                "Koala Clash".to_string(),
+            ]
+        );
+        assert!(presentation.message.contains("они могут конфликтовать"));
+        assert!(presentation.message.contains("FlClash"));
+        assert!(presentation.message.contains("Incy"));
+        assert!(presentation.message.contains("Koala Clash"));
+    }
+
+    #[test]
+    fn conflicting_apps_banner_deduplicates_repeated_detections() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash", "FlClash"]);
+        assert_eq!(
+            model.conflicting_apps_presentation().apps,
+            vec!["FlClash".to_string()]
+        );
+    }
+
+    #[test]
+    fn record_close_attempt_notes_an_app_that_survives_the_close() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(
+            !model
+                .conflicting_apps_presentation()
+                .message
+                .contains("службу Windows")
+        );
+
+        // Closing found nothing this token could terminate (e.g. only a
+        // Session-0 service is left), so the rescan still detects it.
+        model.record_close_attempt(&["FlClash"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.contains("FlClash"));
+        assert!(message.contains("службу Windows"));
+    }
+
+    #[test]
+    fn record_close_attempt_adds_no_note_when_the_app_is_gone() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.record_close_attempt(&["FlClash"]);
+        assert!(
+            model
+                .conflicting_apps_presentation()
+                .message
+                .contains("службу Windows")
+        );
+
+        // The next scan (run before record_close_attempt, matching the real
+        // main.rs call order) no longer detects it at all.
+        model.set_conflicting_apps(vec![]);
+        assert!(!model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn close_note_for_one_app_does_not_leak_onto_a_different_later_detection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.record_close_attempt(&["FlClash"]);
+
+        // FlClash's service finally exits, but a different app now shows up.
+        model.set_conflicting_apps(vec!["Incy"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.contains("Incy"));
+        assert!(!message.contains("FlClash"));
+        assert!(!message.contains("службу Windows"));
+    }
+
+    #[test]
+    fn dismissing_conflicting_apps_banner_hides_it_for_the_same_detection() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(model.conflicting_apps_presentation().visible);
+
+        model.dismiss_conflicting_apps_banner();
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // Re-detecting the exact same set on a later scan stays dismissed.
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(!model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn dismissed_banner_reappears_for_a_newly_detected_different_app() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.dismiss_conflicting_apps_banner();
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // A different app joins the detected set: the banner reappears even
+        // though FlClash is still present, because the set changed.
+        model.set_conflicting_apps(vec!["FlClash", "Incy"]);
+        assert!(model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn conflicting_apps_clearing_resets_dismissal_so_a_relaunch_warns_again() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.dismiss_conflicting_apps_banner();
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // The app closes: the scan reports nothing running anymore.
+        model.set_conflicting_apps(vec![]);
+        assert!(!model.conflicting_apps_presentation().visible);
+
+        // The same app is reopened later: since the conflict fully cleared,
+        // dismissal was reset and the banner warns again.
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert!(model.conflicting_apps_presentation().visible);
+    }
+
+    #[test]
+    fn conflicting_apps_banner_is_never_shown_while_connected() {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        model.state = UiState::Connected {
+            profile: "Profile".into(),
+            node: "Node".into(),
+        };
+        let presentation = model.conflicting_apps_presentation();
+        assert!(!presentation.visible);
+        assert!(presentation.apps.is_empty());
     }
 }

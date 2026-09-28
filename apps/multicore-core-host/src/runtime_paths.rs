@@ -28,6 +28,11 @@ pub(crate) enum ResolveError {
 
 pub(crate) struct ResolvedRuntime {
     pub paths: RuntimePaths,
+    /// The user's `%LOCALAPPDATA%\MultiCore` directory (already resolved and
+    /// trusted by this same function for `runtime/`) - exposed so callers
+    /// can place their own per-user files (for example a persistent core
+    /// log) alongside `profiles/`, `runtime/`, etc. without a second lookup.
+    pub data_root: PathBuf,
     guards: Vec<GuardedPath>,
 }
 
@@ -114,6 +119,11 @@ pub(crate) fn resolve_from(
     let mihomo = cores.join("mihomo.exe");
     let xray_config = generation_dir.join("xray.json");
     let mihomo_config = generation_dir.join("mihomo.yaml");
+    // The vendored dashboard is optional: absent in builds without one, present as an exact
+    // package-root sibling of `cores` otherwise. Its presence is decided once, up front, so a
+    // directory that appears only after that check can never be picked up mid-resolution.
+    let dashboard = package_lexical.join("dashboard");
+    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok_and(|meta| meta.is_dir());
     let mut guards = Vec::new();
     for directory in [
         data_root,
@@ -124,6 +134,9 @@ pub(crate) fn resolve_from(
         &cores,
     ] {
         guard_lexical_chain(directory, true, &mut guards)?;
+    }
+    if dashboard_present {
+        guard_lexical_chain(&dashboard, true, &mut guards)?;
     }
     for file in [
         host_executable,
@@ -154,6 +167,23 @@ pub(crate) fn resolve_from(
             &fs::canonicalize(config).map_err(|_| ResolveError::Missing)?,
         )?;
     }
+    let dashboard_directory = if dashboard_present {
+        let canonical_dashboard =
+            fs::canonicalize(&dashboard).map_err(|_| ResolveError::Missing)?;
+        canonical_contained(&package, &canonical_dashboard)?;
+        // `fs::canonicalize` returns Windows' `\\?\`-prefixed extended-length form. That form is
+        // kept for the containment check above (it defeats reparse-point tricks the way the rest
+        // of this resolver relies on), but Mihomo's own SAFE_PATHS check does a plain string
+        // prefix comparison against the *unprefixed* `external-ui` path the daemon writes into
+        // the generated config (crates/multicore-daemon/src/main.rs), never normalizing away
+        // `\\?\`. Passed through unprefixed, Mihomo rejected every dashboard path as "not a
+        // subpath of home directory or SAFE_PATHS" and refused to start at all - confirmed live
+        // against the pinned Mihomo binary. Strip it only for the value that leaves this
+        // function as SAFE_PATHS.
+        Some(strip_verbatim_prefix(canonical_dashboard))
+    } else {
+        None
+    };
     for binary in [&xray, &mihomo] {
         let guard = guards
             .iter_mut()
@@ -163,14 +193,33 @@ pub(crate) fn resolve_from(
         validate_amd64_pe(&mut guard.handle)?;
     }
     Ok(ResolvedRuntime {
+        data_root: canonical_data.clone(),
         paths: RuntimePaths {
             xray_binary: fs::canonicalize(xray).map_err(|_| ResolveError::Missing)?,
             mihomo_binary: fs::canonicalize(mihomo).map_err(|_| ResolveError::Missing)?,
             xray_config: fs::canonicalize(xray_config).map_err(|_| ResolveError::Missing)?,
             mihomo_config: fs::canonicalize(mihomo_config).map_err(|_| ResolveError::Missing)?,
+            dashboard_directory,
         },
         guards,
     })
+}
+
+/// Strips Windows' `\\?\` (or `\\?\UNC\`) extended-length prefix that
+/// `fs::canonicalize` adds, without altering anything else about the path.
+/// Only for values that must byte-for-byte string-match a path written
+/// elsewhere by code that never adds this prefix (Mihomo's own SAFE_PATHS
+/// comparison); the security-relevant containment check runs on the
+/// still-fully-canonical path before this ever applies.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
 }
 
 fn canonical_contained(root: &Path, target: &Path) -> Result<(), ResolveError> {
@@ -336,7 +385,65 @@ mod tests {
     #[test]
     fn accepts_exact_layout() {
         let (_r, d, h) = fixture();
-        assert!(resolve_from(&d, &h, 7).is_ok());
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        assert_eq!(resolved.paths.dashboard_directory, None);
+        // The exact `%LOCALAPPDATA%\MultiCore` directory this function
+        // already validated for `runtime/`, exposed so callers (the
+        // persistent core log) don't need a second lookup.
+        assert_eq!(resolved.data_root, fs::canonicalize(&d).unwrap());
+    }
+    #[test]
+    fn resolves_an_optional_dashboard_sibling_of_cores() {
+        let (_r, d, h) = fixture();
+        let package = h.parent().unwrap().parent().unwrap().to_path_buf();
+        let dashboard = package.join("dashboard");
+        fs::create_dir_all(&dashboard).unwrap();
+        fs::write(dashboard.join("index.html"), b"<html></html>").unwrap();
+
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        let canonical = fs::canonicalize(&dashboard).unwrap();
+        let stripped = resolved.paths.dashboard_directory.clone().unwrap();
+        // Must resolve to the same real directory as fs::canonicalize (still fully
+        // symlink/reparse-point resistant - see the reparse-point test below) but without the
+        // `\\?\` prefix, which is required to byte-for-byte string-match the unprefixed
+        // `external-ui` path the daemon writes elsewhere for Mihomo's own SAFE_PATHS comparison.
+        assert_eq!(stripped, strip_verbatim_prefix(canonical));
+        assert!(!stripped.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn strips_only_the_windows_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\Example\dashboard")),
+            PathBuf::from(r"C:\Users\Example\dashboard")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\dashboard")),
+            PathBuf::from(r"\\server\share\dashboard")
+        );
+        // A path without the prefix is returned unchanged.
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\Users\Example\dashboard")),
+            PathBuf::from(r"C:\Users\Example\dashboard")
+        );
+    }
+    #[test]
+    fn rejects_a_dashboard_directory_replaced_with_a_reparse_point() {
+        let (_r, d, h) = fixture();
+        let package = h.parent().unwrap().parent().unwrap().to_path_buf();
+        let dashboard = package.join("dashboard");
+        let outside = d.parent().unwrap().join("outside-dashboard");
+        fs::create_dir_all(&outside).unwrap();
+        match std::os::windows::fs::symlink_dir(&outside, &dashboard) {
+            Ok(()) => assert!(matches!(
+                resolve_from(&d, &h, 7),
+                Err(ResolveError::Reparse)
+            )),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("could not create dashboard reparse fixture: {error}"),
+        }
     }
     #[test]
     fn rejects_zero_missing_and_wrong_pe() {

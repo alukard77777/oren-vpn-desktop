@@ -5,10 +5,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use multicore_release::{
-    Version, extract_verified_bundle, transactional_swap, verify_archive_file,
+    Version, extract_verified_bundle, rename_with_retry, transactional_swap, verify_archive_file,
 };
 use serde::Serialize;
 
@@ -102,78 +102,198 @@ fn apply_update(request: &ApplyRequest) -> Result<(), Box<dyn std::error::Error>
         &request.expected_sha256,
     )?;
     wait_for_process_exit(request.wait_pid, WAIT_TIMEOUT_MS)?;
+
+    let target = request.target.canonicalize()?;
+    // The daemon and the elevated core host (with its cores) run from the
+    // install directory and may outlive the desktop briefly.
+    let lingering = wait_for_install_processes(&target, INSTALL_PROCESS_TIMEOUT);
+    if !lingering.is_empty() {
+        write_log(
+            request,
+            &format!("processes still running from the install directory: {lingering:?}"),
+        );
+    }
     verify_archive_file(
         &request.archive,
         request.expected_size,
         &request.expected_sha256,
     )?;
 
-    let target = request.target.canonicalize()?;
     let parent = target.parent().ok_or("install directory has no parent")?;
+    remove_stale_work_directories(parent);
     let suffix = format!("{}-{}", request.version, std::process::id());
-    let staged = parent.join(format!(".multicore-stage-{suffix}"));
-    let backup = parent.join(format!(".multicore-previous-{suffix}"));
+    let staged = parent.join(format!("{STAGE_PREFIX}{suffix}"));
+    let backup = parent.join(format!("{BACKUP_PREFIX}{suffix}"));
     if staged.exists() || backup.exists() {
         return Err("update staging paths already exist".into());
     }
 
     extract_verified_bundle(&request.archive, &staged)?;
-    transactional_swap(&target, &staged, &backup)?;
+    if let Err(error) = transactional_swap(&target, &staged, &backup) {
+        let _ = remove_scoped_directory(&staged, STAGE_PREFIX);
+        if backup.exists() {
+            write_log(
+                request,
+                &format!("previous version preserved at {}", backup.display()),
+            );
+        }
+        return Err(error.into());
+    }
 
-    launch_and_finalize(
+    // Record the outcome before the new client starts so it can report it.
+    write_result(request, true, "Обновление установлено");
+    let marker = update_state_dir(request).map(|directory| directory.join(STARTED_MARKER));
+    if let Some(marker) = &marker {
+        let _ = fs::remove_file(marker);
+    }
+    let version = request.version.to_string();
+    let outcome = launch_and_finalize(
         &target,
         &backup,
         |executable| {
             Command::new(executable)
                 .current_dir(&target)
                 .spawn()
-                .map(|_| ())
+                .map(|child| Box::new(child) as Box<dyn LaunchedClient>)
         },
-        |error| {
-            write_log(
-                request,
-                &format!("installed; previous version cleanup deferred: {error}"),
-            )
+        || {
+            marker
+                .as_deref()
+                .is_some_and(|marker| marker_confirms(marker, &version))
         },
+        STARTUP_CONFIRM_TIMEOUT,
+        std::thread::sleep,
     )
     .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
-    write_log(request, "installed and launched");
-    write_result(request, true, "Обновление установлено");
+    match outcome {
+        Finalization::Confirmed(Ok(())) => write_log(request, "installed and launched"),
+        Finalization::Confirmed(Err(error)) => write_log(
+            request,
+            &format!(
+                "installed; previous version cleanup deferred ({}): {error}",
+                backup.display()
+            ),
+        ),
+        Finalization::Unconfirmed => write_log(
+            request,
+            &format!(
+                "installed; start not yet confirmed, previous version kept at {}",
+                backup.display()
+            ),
+        ),
+    }
     let _ = fs::remove_file(&request.archive);
     Ok(())
 }
 
-fn discard_backup(backup: &Path) -> io::Result<()> {
-    let name = backup
+const STAGE_PREFIX: &str = ".multicore-stage-";
+const BACKUP_PREFIX: &str = ".multicore-previous-";
+const FAILED_PREFIX: &str = ".multicore-failed-";
+/// Written by the desktop (containing its version) once its window and daemon are up.
+const STARTED_MARKER: &str = "started-ok";
+const INSTALL_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
+const STARTUP_POLL: Duration = Duration::from_millis(250);
+
+fn marker_confirms(marker: &Path, version: &str) -> bool {
+    fs::read_to_string(marker).is_ok_and(|content| content.trim() == version)
+}
+
+fn remove_scoped_directory(path: &Path, prefix: &str) -> io::Result<()> {
+    let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::other("invalid backup directory name"))?;
-    if !name.starts_with(".multicore-previous-") {
+        .ok_or_else(|| io::Error::other("invalid update directory name"))?;
+    if !name.starts_with(prefix) {
         return Err(io::Error::other(
             "refusing to remove an unrelated directory",
         ));
     }
-    fs::remove_dir_all(backup)
+    fs::remove_dir_all(path)
+}
+
+/// Remove staging and failed-install leftovers of earlier interrupted attempts.
+/// Previous-version backups are kept: they may be the only working copy.
+fn remove_stale_work_directories(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        for prefix in [STAGE_PREFIX, FAILED_PREFIX] {
+            if remove_scoped_directory(&path, prefix).is_ok() {
+                break;
+            }
+        }
+    }
+}
+
+fn discard_backup(backup: &Path) -> io::Result<()> {
+    remove_scoped_directory(backup, BACKUP_PREFIX)
+}
+
+trait LaunchedClient {
+    fn has_exited(&mut self) -> bool;
+}
+
+impl LaunchedClient for std::process::Child {
+    fn has_exited(&mut self) -> bool {
+        !matches!(self.try_wait(), Ok(None))
+    }
+}
+
+#[derive(Debug)]
+enum Finalization {
+    /// The new client confirmed its start; carries the backup cleanup result.
+    Confirmed(io::Result<()>),
+    /// The new client is still running but has not confirmed yet. The backup is
+    /// kept; the desktop removes it on a later confirmed start.
+    Unconfirmed,
 }
 
 fn launch_and_finalize(
     target: &Path,
     backup: &Path,
-    launch: impl FnOnce(&Path) -> io::Result<()>,
-    on_cleanup_error: impl FnOnce(io::Error),
-) -> Result<(), String> {
+    launch: impl FnOnce(&Path) -> io::Result<Box<dyn LaunchedClient>>,
+    confirmed: impl Fn() -> bool,
+    timeout: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Finalization, String> {
     let executable = target.join("MultiCore.exe");
-    if let Err(launch_error) = launch(&executable) {
-        rollback_after_launch_failure(target, backup).map_err(|rollback_error| {
-            format!("new client could not start: {launch_error}; rollback failed: {rollback_error}")
-        })?;
-        return Err(format!("new client could not start: {launch_error}"));
-    }
-    if let Err(error) = discard_backup(backup) {
-        on_cleanup_error(error);
-    }
-    Ok(())
+    let failure = match launch(&executable) {
+        Err(launch_error) => format!("new client could not start: {launch_error}"),
+        Ok(mut client) => {
+            let mut waited = Duration::ZERO;
+            loop {
+                if confirmed() {
+                    return Ok(Finalization::Confirmed(discard_backup(backup)));
+                }
+                if client.has_exited() {
+                    // The client may have confirmed just before exiting normally.
+                    if confirmed() {
+                        return Ok(Finalization::Confirmed(discard_backup(backup)));
+                    }
+                    break "new client exited before confirming its start".to_owned();
+                }
+                if waited >= timeout {
+                    return Ok(Finalization::Unconfirmed);
+                }
+                sleep(STARTUP_POLL);
+                waited += STARTUP_POLL;
+            }
+        }
+    };
+    rollback_after_launch_failure(target, backup).map_err(|rollback_error| {
+        format!(
+            "{failure}; rollback failed: {rollback_error}; previous version preserved at {}",
+            backup.display()
+        )
+    })?;
+    Err(failure)
 }
 
 fn relaunch_current_client(request: &ApplyRequest) -> io::Result<()> {
@@ -190,21 +310,123 @@ fn relaunch_current_client(request: &ApplyRequest) -> io::Result<()> {
         .map(|_| ())
 }
 
-fn rollback_after_launch_failure(
-    target: &std::path::Path,
-    backup: &std::path::Path,
-) -> io::Result<()> {
+fn rollback_after_launch_failure(target: &Path, backup: &Path) -> io::Result<()> {
     let parent = target
         .parent()
         .ok_or_else(|| io::Error::other("install directory has no parent"))?;
-    let failed = parent.join(format!(".multicore-failed-{}", std::process::id()));
-    fs::rename(target, &failed)?;
-    if let Err(rollback_error) = fs::rename(backup, target) {
-        let _ = fs::rename(&failed, target);
+    let failed = parent.join(format!("{FAILED_PREFIX}{}", std::process::id()));
+    rename_with_retry(target, &failed)?;
+    if let Err(rollback_error) = rename_with_retry(backup, target) {
+        let _ = rename_with_retry(&failed, target);
         return Err(rollback_error);
     }
     let _ = fs::remove_dir_all(failed);
     Ok(())
+}
+
+/// Wait until no process whose image lives under `install` is running, or the
+/// timeout elapses. Returns the PIDs still running at the deadline.
+fn wait_for_install_processes(install: &Path, timeout: Duration) -> Vec<u32> {
+    wait_until_clear(
+        || processes_under(install),
+        timeout,
+        STARTUP_POLL,
+        std::thread::sleep,
+    )
+}
+
+fn wait_until_clear(
+    mut running: impl FnMut() -> Vec<u32>,
+    timeout: Duration,
+    poll: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Vec<u32> {
+    let mut waited = Duration::ZERO;
+    loop {
+        let remaining = running();
+        if remaining.is_empty() || waited >= timeout {
+            return remaining;
+        }
+        sleep(poll);
+        waited += poll;
+    }
+}
+
+fn normalized_windows_path(path: &str) -> String {
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_owned()
+    };
+    path.replace('/', "\\").to_lowercase()
+}
+
+// Pure path-matching logic used by processes_under on Windows and exercised
+// directly by cross-platform unit tests; it has no Windows-only body itself.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn image_is_within(image: &str, install: &Path) -> bool {
+    let mut root = normalized_windows_path(&install.to_string_lossy());
+    if !root.ends_with('\\') {
+        root.push('\\');
+    }
+    normalized_windows_path(image).starts_with(&root)
+}
+
+#[cfg(windows)]
+fn processes_under(install: &Path) -> Vec<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+
+    let own = std::process::id();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let pid = entry.th32ProcessID;
+        if pid != 0 && pid != own {
+            // Limited query access also works for elevated same-user processes.
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if !process.is_null() {
+                let mut buffer = [0_u16; 1024];
+                let mut length = buffer.len() as u32;
+                let queried = unsafe {
+                    QueryFullProcessImageNameW(
+                        process,
+                        PROCESS_NAME_WIN32,
+                        buffer.as_mut_ptr(),
+                        &mut length,
+                    )
+                } != 0;
+                unsafe { CloseHandle(process) };
+                if queried {
+                    let image = String::from_utf16_lossy(&buffer[..length as usize]);
+                    if image_is_within(&image, install) {
+                        found.push(pid);
+                    }
+                }
+            }
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    found
+}
+
+#[cfg(not(windows))]
+fn processes_under(_install: &Path) -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(windows)]
@@ -293,7 +515,43 @@ fn write_log(request: &ApplyRequest, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{discard_backup, launch_and_finalize, parse_args};
+    use super::{
+        Finalization, LaunchedClient, discard_backup, image_is_within, launch_and_finalize,
+        marker_confirms, parse_args, remove_stale_work_directories, wait_until_clear,
+    };
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    struct FakeClient {
+        exits_after_polls: Option<u32>,
+        polls: u32,
+    }
+
+    impl LaunchedClient for FakeClient {
+        fn has_exited(&mut self) -> bool {
+            self.polls += 1;
+            self.exits_after_polls
+                .is_some_and(|limit| self.polls >= limit)
+        }
+    }
+
+    fn running(exits_after_polls: Option<u32>) -> Box<dyn LaunchedClient> {
+        Box::new(FakeClient {
+            exits_after_polls,
+            polls: 0,
+        })
+    }
+
+    fn install_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+        let target = temp.join("MultiCore");
+        let backup = temp.join(".multicore-previous-0.2.0-42");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(target.join("new.exe"), b"new").unwrap();
+        std::fs::write(backup.join("old.exe"), b"old").unwrap();
+        (target, backup)
+    }
 
     #[test]
     fn parses_exact_apply_request() {
@@ -357,28 +615,203 @@ mod tests {
     }
 
     #[test]
-    fn successful_launch_discards_backup_but_failed_launch_restores_it() {
+    fn backup_is_discarded_only_after_the_new_client_confirms_its_start() {
         let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("MultiCore");
-        let backup = temp.path().join(".multicore-previous-0.2.0-42");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(target.join("new.exe"), b"new").unwrap();
-        std::fs::write(backup.join("old.exe"), b"old").unwrap();
-        launch_and_finalize(&target, &backup, |_| Ok(()), |_| {}).unwrap();
+        let (target, backup) = install_fixture(temp.path());
+        let polls = Cell::new(0);
+        let outcome = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Ok(running(None)),
+            || {
+                polls.set(polls.get() + 1);
+                assert!(backup.exists(), "backup must survive until confirmation");
+                polls.get() >= 3
+            },
+            Duration::from_secs(60),
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(outcome, Finalization::Confirmed(Ok(()))));
         assert!(!backup.exists());
+        assert_eq!(std::fs::read(target.join("new.exe")).unwrap(), b"new");
+    }
 
-        std::fs::create_dir(&backup).unwrap();
-        std::fs::write(backup.join("old.exe"), b"old").unwrap();
+    #[test]
+    fn client_crashing_before_confirmation_rolls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, backup) = install_fixture(temp.path());
+        let error = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Ok(running(Some(2))),
+            || false,
+            Duration::from_secs(60),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("exited before confirming"), "{error}");
+        assert_eq!(std::fs::read(target.join("old.exe")).unwrap(), b"old");
+        assert!(!target.join("new.exe").exists());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn unconfirmed_running_client_keeps_the_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, backup) = install_fixture(temp.path());
+        let outcome = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Ok(running(None)),
+            || false,
+            Duration::from_secs(1),
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(outcome, Finalization::Unconfirmed));
+        assert!(backup.join("old.exe").is_file());
+        assert!(target.join("new.exe").is_file());
+    }
+
+    #[test]
+    fn failed_launch_restores_the_previous_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, backup) = install_fixture(temp.path());
         let error = launch_and_finalize(
             &target,
             &backup,
             |_| Err(std::io::Error::other("fixture launch failure")),
+            || false,
+            Duration::from_secs(60),
             |_| {},
         )
         .unwrap_err();
         assert!(error.contains("could not start"));
         assert_eq!(std::fs::read(target.join("old.exe")).unwrap(), b"old");
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn failed_rollback_names_the_preserved_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("MultiCore");
+        let backup = temp.path().join(".multicore-previous-0.2.0-42");
+        std::fs::create_dir(&target).unwrap();
+        // The backup is missing, so the restoring rename fails.
+        let error = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Err(std::io::Error::other("fixture launch failure")),
+            || false,
+            Duration::from_secs(60),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("rollback failed"), "{error}");
+        assert!(error.contains(&backup.display().to_string()), "{error}");
+        assert!(target.is_dir(), "the failed install must be put back");
+    }
+
+    #[test]
+    fn marker_must_name_the_installed_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("started-ok");
+        assert!(!marker_confirms(&marker, "0.2.0"));
+        std::fs::write(&marker, "0.1.0").unwrap();
+        assert!(!marker_confirms(&marker, "0.2.0"));
+        std::fs::write(&marker, "0.2.0\n").unwrap();
+        assert!(marker_confirms(&marker, "0.2.0"));
+    }
+
+    #[test]
+    fn stale_staging_and_failed_directories_are_removed_but_backups_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            ".multicore-stage-0.2.0-7",
+            ".multicore-failed-7",
+            ".multicore-previous-0.1.0-7",
+            "current",
+        ] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+            std::fs::write(temp.path().join(name).join("f"), b"x").unwrap();
+        }
+        remove_stale_work_directories(temp.path());
+        assert!(!temp.path().join(".multicore-stage-0.2.0-7").exists());
+        assert!(!temp.path().join(".multicore-failed-7").exists());
+        assert!(temp.path().join(".multicore-previous-0.1.0-7").is_dir());
+        assert!(temp.path().join("current").is_dir());
+    }
+
+    #[test]
+    fn install_directory_membership_is_case_insensitive_and_prefix_safe() {
+        let install = Path::new(r"\\?\C:\Users\A\Programs\MultiCore\current");
+        assert!(image_is_within(
+            r"C:\users\a\programs\multicore\CURRENT\runtime\multicore-daemon.exe",
+            install
+        ));
+        assert!(image_is_within(
+            r"C:\Users\A\Programs\MultiCore\current\cores\xray.exe",
+            install
+        ));
+        assert!(!image_is_within(
+            r"C:\Users\A\Programs\MultiCore\current-old\MultiCore.exe",
+            install
+        ));
+        assert!(!image_is_within(r"C:\Windows\explorer.exe", install));
+    }
+
+    #[test]
+    fn install_process_wait_is_bounded() {
+        let mut calls = 0;
+        let remaining = wait_until_clear(
+            || {
+                calls += 1;
+                if calls >= 3 { Vec::new() } else { vec![7] }
+            },
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+            |_| {},
+        );
+        assert!(remaining.is_empty());
+        assert_eq!(calls, 3);
+
+        let remaining = wait_until_clear(
+            || vec![7, 8],
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            |_| {},
+        );
+        assert_eq!(remaining, vec![7, 8]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "flaky under this CI runner's process-enumeration/security-software environment; run locally with --ignored"]
+    fn running_processes_are_found_by_install_directory() {
+        let exe = std::env::current_exe().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let copy = temp.path().join("probe.exe");
+        std::fs::copy(r"C:\Windows\System32\cmd.exe", &copy).unwrap();
+        let mut child = std::process::Command::new(&copy)
+            .args(["/D", "/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        // Toolhelp snapshots and QueryFullProcessImageNameW are point-in-time;
+        // a freshly spawned process is not always visible on the very first
+        // snapshot, especially under security-software hooks on CI. Poll
+        // briefly instead of asserting immediately after spawn().
+        let install = temp.path().canonicalize().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = super::processes_under(&install);
+        while !found.contains(&child.id()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            found = super::processes_under(&install);
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(found.contains(&child.id()), "{found:?}");
+        // The test binary itself is excluded because it is the calling process.
+        assert!(!super::processes_under(exe.parent().unwrap()).contains(&std::process::id()));
     }
 }

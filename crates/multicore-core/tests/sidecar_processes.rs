@@ -15,7 +15,7 @@ use std::{
 use multicore_core::{
     CommandSpec, CoreLogBuffer, DiagnosticStream, Engine, ManagedChild, ProcessController,
     ProcessError, ProcessLauncher, RuntimeCheckState, RuntimePaths, SidecarProcessController,
-    TokioProcessLauncher,
+    StartFailureCause, TokioProcessLauncher,
 };
 
 const SIDECAR_SOURCE: &str = include_str!("../src/sidecar.rs");
@@ -105,6 +105,7 @@ fn paths() -> RuntimePaths {
         mihomo_binary: PathBuf::from(r"C:\Program Files\Multi Core\mihomo.exe"),
         xray_config: PathBuf::from(r"C:\Users\Synthetic User\runtime\xray.json"),
         mihomo_config: PathBuf::from(r"C:\Users\Synthetic User\runtime\mihomo.yaml"),
+        dashboard_directory: None,
     }
 }
 
@@ -130,6 +131,26 @@ fn runtime_paths_build_exact_sidecar_commands_without_shell_strings() {
             OsString::from("-f"),
             paths.mihomo_config.clone().into_os_string(),
         ]
+    );
+    assert!(xray.env.is_empty());
+    assert!(mihomo.env.is_empty(), "no dashboard configured yet");
+}
+
+#[test]
+fn mihomo_command_carries_safe_paths_only_when_a_dashboard_is_configured() {
+    let mut paths = paths();
+    paths.dashboard_directory = Some(PathBuf::from(r"C:\Program Files\Multi Core\dashboard"));
+    let mihomo = paths.command(Engine::Mihomo);
+    assert_eq!(
+        mihomo.env,
+        [(
+            OsString::from("SAFE_PATHS"),
+            OsString::from(r"C:\Program Files\Multi Core\dashboard"),
+        )]
+    );
+    assert!(
+        paths.command(Engine::Xray).env.is_empty(),
+        "Xray never needs Mihomo's external-ui allowlist"
     );
 }
 
@@ -170,6 +191,24 @@ async fn a_child_that_exits_during_startup_is_not_reported_ready() {
     let controller = SidecarProcessController::with_launcher(paths(), launcher);
 
     assert!(controller.start(Engine::Xray).await.is_err());
+}
+
+#[test]
+fn sidecar_start_failures_distinguish_readiness_timeout_from_core_failure() {
+    let controller = SidecarProcessController::with_launcher(paths(), FakeLauncher::default());
+    assert_eq!(
+        controller.start_failure_cause(&ProcessError::ReadinessTimedOut(Engine::Mihomo)),
+        StartFailureCause::ReadinessTimedOut
+    );
+    for error in [
+        ProcessError::ReadinessFailed(Engine::Xray),
+        ProcessError::LaunchFailed(Engine::Xray),
+    ] {
+        assert_eq!(
+            controller.start_failure_cause(&error),
+            StartFailureCause::CoreFailed
+        );
+    }
 }
 
 #[tokio::test]
@@ -289,6 +328,7 @@ async fn tokio_launcher_captures_and_redacts_both_output_streams() {
             OsString::from("--nocapture"),
         ]
         .into(),
+        env: Vec::new(),
     };
     let mut child = launcher.launch(command).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -333,6 +373,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
         mihomo_binary: PathBuf::new(),
         xray_config,
         mihomo_config: root.join("mihomo.yaml"),
+        dashboard_directory: None,
     };
     let launcher = TokioProcessLauncher::for_runtime(runtime_paths, Duration::from_millis(200));
     let command = CommandSpec {
@@ -345,6 +386,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
             OsString::from("--nocapture"),
         ]
         .into(),
+        env: Vec::new(),
     };
     let mut child = launcher.launch(command.clone()).await.unwrap();
     assert!(
@@ -359,7 +401,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
     let mut child = launcher.launch(command.clone()).await.unwrap();
     assert_eq!(
         launcher.wait_until_ready(&command, &mut child).await,
-        Err(ProcessError::ReadinessFailed(Engine::Xray))
+        Err(ProcessError::ReadinessTimedOut(Engine::Xray))
     );
     child.stop().await.unwrap();
     let _ = std::fs::remove_dir_all(root);
@@ -369,6 +411,30 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
 #[ignore = "isolated helper invoked by runtime_readiness_requires_declared_xray_loopback_ports"]
 fn readiness_process_helper() {
     std::thread::sleep(Duration::from_secs(5));
+}
+
+/// The readiness poll loop's sleep interval directly bounds how much pure waste a Connect can
+/// incur when a core becomes ready just after a check. It must stay small (a real regression to
+/// a coarse ~100ms tick would waste up to 100ms per check) without busy-looping.
+///
+/// This asserts on source text rather than wall-clock timing: real TCP connect latency to a
+/// not-yet-listening loopback port is not reliable to bound tightly across every environment
+/// (sandboxed/monitored networking stacks can hold a pending SYN far longer than a bare OS
+/// would), so a wall-clock assertion here would be flaky. The interval itself is a plain
+/// constant, so asserting its value directly is both exact and deterministic.
+#[test]
+fn readiness_poll_interval_is_tight_but_not_a_busy_loop() {
+    assert!(
+        !SIDECAR_SOURCE.contains("sleep(Duration::from_millis(100))"),
+        "a readiness loop reverted to the old, wasteful 100ms poll tick"
+    );
+    let occurrences = SIDECAR_SOURCE.matches("READINESS_POLL_INTERVAL").count();
+    // One definition plus both readiness loops (`wait_until_ready` and
+    // `wait_for_runtime_readiness`) actually using it.
+    assert!(
+        occurrences >= 3,
+        "expected both readiness poll loops to share one tight interval constant"
+    );
 }
 
 #[tokio::test]
@@ -451,6 +517,7 @@ async fn real_core_child_environment_launcher_helper() {
                 OsString::from("--nocapture"),
             ]
             .into(),
+            env: Vec::new(),
         })
         .await;
     let mut child = match launch {

@@ -55,7 +55,7 @@ impl UnixGroupLauncher {
             spawner: Arc::new(Mutex::new(sender)),
             logs,
             readiness: None,
-            readiness_timeout: Duration::from_secs(12),
+            readiness_timeout: crate::CORE_READINESS_TIMEOUT,
         })
     }
 
@@ -122,6 +122,7 @@ fn spawn_core(command: &CommandSpec) -> io::Result<Child> {
         .args(&command.args)
         .env_clear()
         .envs(sanitized_environment(std::env::vars_os()))
+        .envs(command.env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -266,6 +267,7 @@ mod tests {
                 OsString::from("sh"),
                 extra.as_os_str().to_owned(),
             ],
+            env: Vec::new(),
         }
     }
 

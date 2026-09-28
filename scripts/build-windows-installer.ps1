@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PackagePath,
     [string]$OutputDirectory = 'dist\release',
-    [string]$AppVersion = '0.3.0',
+    [string]$AppVersion = '0.3.1',
     [string]$CompilerPath,
     [switch]$ValidateOnly
 )
@@ -13,10 +13,17 @@ Set-StrictMode -Version Latest
 
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $DefinitionPath = Join-Path $RepositoryRoot 'packaging\windows-x64\installer.iss'
-$ExpectedFiles = @(
+# Fixed, non-negotiable payload every package must carry. The optional
+# vendored dashboard's asset filenames are content-hashed by its own build
+# and change on every re-vendor, so they are never hardcoded here: instead
+# the full inventory is taken from the package's own SHA256SUMS.txt below,
+# which package-windows-release.ps1 already generated from hash-verified,
+# pinned-provenance files. This still fails closed on any untracked file,
+# missing file, wrong hash, or malformed/unsafe checksum line - it only
+# stops assuming the exact dashboard filenames in advance.
+$RequiredCoreFiles = @(
     'MultiCore.exe',
     'README.md',
-    'SHA256SUMS.txt',
     'THIRD_PARTY_NOTICES.md',
     'cores/mihomo.exe',
     'cores/xray.exe',
@@ -61,16 +68,12 @@ function Assert-Package {
     $actual = @(Get-ChildItem -LiteralPath $root -File -Recurse | ForEach-Object {
         $_.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
     } | Sort-Object)
-    $expected = @($ExpectedFiles | Sort-Object)
-    if (($actual -join "`n") -cne ($expected -join "`n")) {
-        throw "Portable package inventory does not match the installer contract.`nExpected:`n$($expected -join "`n")`nActual:`n$($actual -join "`n")"
-    }
 
     $sumPath = Join-Path $root 'SHA256SUMS.txt'
-    $lines = @(Get-Content -LiteralPath $sumPath | Where-Object { $_ })
-    if ($lines.Count -ne ($ExpectedFiles.Count - 1)) {
-        throw 'SHA256SUMS.txt must cover every payload file except itself'
+    if (-not (Test-Path -LiteralPath $sumPath -PathType Leaf)) {
+        throw "Portable package is missing SHA256SUMS.txt: $root"
     }
+    $lines = @(Get-Content -LiteralPath $sumPath | Where-Object { $_ })
     $seen = @{}
     foreach ($line in $lines) {
         if ($line -cnotmatch '^([0-9a-f]{64}) \*([A-Za-z0-9._/-]+)$') {
@@ -91,8 +94,16 @@ function Assert-Package {
         }
         $seen[$relative] = $true
     }
-    foreach ($relative in $ExpectedFiles | Where-Object { $_ -ne 'SHA256SUMS.txt' }) {
-        if (-not $seen.ContainsKey($relative)) { throw "Checksum is missing for $relative" }
+
+    # The package's own hash-verified manifest is the source of truth for the
+    # full inventory (dashboard assets included); every file on disk must be
+    # covered by it, and nothing covered by it may be missing from disk.
+    $expected = @(@($seen.Keys) + @('SHA256SUMS.txt') | Sort-Object)
+    if (($actual -join "`n") -cne ($expected -join "`n")) {
+        throw "Portable package inventory does not match its own SHA256SUMS.txt.`nExpected:`n$($expected -join "`n")`nActual:`n$($actual -join "`n")"
+    }
+    foreach ($relative in $RequiredCoreFiles) {
+        if (-not $seen.ContainsKey($relative)) { throw "Checksum is missing for required file: $relative" }
     }
     return $root
 }
