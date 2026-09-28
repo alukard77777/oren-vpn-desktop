@@ -2800,8 +2800,11 @@ where
                     true
                 }
                 Err(error) => {
-                    self.log_mutation_storage_failure("import_replace_failed", &error)
-                        .await;
+                    self.log_mutation_storage_failure(
+                        "import_replace_failed",
+                        error_chain_text(&error),
+                    )
+                    .await;
                     return Err(map_profile_error(error));
                 }
             };
@@ -2809,8 +2812,11 @@ where
                 Ok(_) => false,
                 Err(error) if error.mutation_committed() => true,
                 Err(error) => {
-                    self.log_mutation_storage_failure("import_activate_selection_failed", &error)
-                        .await;
+                    self.log_mutation_storage_failure(
+                        "import_activate_selection_failed",
+                        error_chain_text(&error),
+                    )
+                    .await;
                     self.reconcile_authoritative().await;
                     return Err(map_profile_error(error));
                 }
@@ -2823,7 +2829,7 @@ where
                     let Some(id) = self.store.active_id() else {
                         self.log_mutation_storage_failure(
                             "import_create_committed_without_active_id",
-                            &error,
+                            error_chain_text(&error),
                         )
                         .await;
                         self.reconcile_authoritative().await;
@@ -2832,8 +2838,11 @@ where
                     (id, true, None)
                 }
                 Err(error) => {
-                    self.log_mutation_storage_failure("import_create_failed", &error)
-                        .await;
+                    self.log_mutation_storage_failure(
+                        "import_create_failed",
+                        error_chain_text(&error),
+                    )
+                    .await;
                     return Err(map_profile_error(error));
                 }
             }
@@ -2901,6 +2910,51 @@ fn map_profile_error(error: ProfileError) -> ProfileMutationError {
         ProfileError::NotFound(_) => ProfileMutationError::NotFound,
         ProfileError::LimitReached => ProfileMutationError::LimitReached,
         _ => ProfileMutationError::Storage,
+    }
+}
+
+/// `ProfileError` (and the `PersistenceError`/`io::Error` it usually wraps)
+/// each use a fixed, generic `#[error("...")]` message with no
+/// interpolation - real coverage confirmed this via an actual failure that
+/// only ever logged "profile snapshot operation failed", with the *actual*
+/// OS error (permissions, disk full, a lock, ...) thrown away. Walking
+/// `.source()` down to the innermost error recovers it - still entirely
+/// this module's own or the OS's own text, never anything external, so
+/// exactly as safe to log as the top-level message alone.
+fn error_chain_text(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut current = error;
+    while let Some(source) = current.source() {
+        parts.push(source.to_string());
+        current = source;
+    }
+    parts.join(" <- ")
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::error_chain_text;
+    use multicore_core::{PersistenceError, ProfileError};
+
+    #[test]
+    fn walks_through_generic_wrapper_messages_to_the_real_os_error() {
+        // Regression coverage for a real bug: a genuine subscription-add
+        // failure only ever logged "profile snapshot operation failed" -
+        // ProfileError::Snapshot and PersistenceError::Io both use a fixed,
+        // generic #[error("...")] message, so the actual OS error (which
+        // would have said exactly what was wrong - permissions, disk full,
+        // a lock, ...) was thrown away before it ever reached a log.
+        let io_error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access is denied. (os error 5)",
+        );
+        let error = ProfileError::Snapshot(PersistenceError::Io(io_error));
+
+        let chain = error_chain_text(&error);
+
+        assert!(chain.contains("profile snapshot operation failed"), "{chain}");
+        assert!(chain.contains("snapshot persistence operation failed"), "{chain}");
+        assert!(chain.contains("Access is denied"), "{chain}");
     }
 }
 
