@@ -44,7 +44,11 @@ pub fn with_logo_cache<R>(f: impl FnOnce(&mut LogoImageCache) -> R) -> R {
     })
 }
 
-/// Caches decoded logo handles, including failed decode attempts, by durable path.
+/// Caches successfully decoded logo handles by durable path. A failed
+/// attempt is never cached (see `PathImageCache::get_or_load`), so a
+/// transient read/decode failure - for example Windows Defender briefly
+/// locking a just-written PNG - gets retried on the next lookup instead of
+/// silently hiding that logo for the rest of the session.
 #[derive(Default)]
 pub struct LogoImageCache {
     entries: PathImageCache<slint::Image>,
@@ -55,7 +59,8 @@ impl LogoImageCache {
         Self::default()
     }
 
-    /// Returns the decoded image for `path`, loading it only on the first lookup.
+    /// Returns the decoded image for `path`. A successful decode is cached;
+    /// a failed one is retried on the next call instead of being remembered.
     pub fn image_for_path(&mut self, path: impl AsRef<Path>) -> Option<slint::Image> {
         let path = path.as_ref();
         self.entries.get_or_load(path, crate::service_logo::load)
@@ -108,10 +113,18 @@ impl<T: Clone> PathImageCache<T> {
             path: path.to_path_buf(),
             identity: file_identity(path),
         };
-        self.entries
-            .entry(key)
-            .or_insert_with(|| loader(path))
-            .clone()
+        if let Some(Some(cached)) = self.entries.get(&key) {
+            return Some(cached.clone());
+        }
+        // Only remember successes. `file_identity` is a no-op on Windows
+        // (see below), so a failed attempt has no reliable way to notice a
+        // later successful replacement at the same path - retrying instead
+        // of caching `None` sidesteps that entirely.
+        let loaded = loader(path);
+        if loaded.is_some() {
+            self.entries.insert(key, loaded.clone());
+        }
+        loaded
     }
 
     fn retain_paths<I, P>(&mut self, paths: I)
@@ -152,7 +165,12 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failure_loads_once() {
+    fn repeated_failure_retries_every_attempt() {
+        // Regression coverage for a real bug report: on Windows, a transient
+        // decode failure (for example antivirus briefly locking a
+        // just-written PNG) used to be cached forever, so a subscription's
+        // logo would silently stay broken for the rest of the session even
+        // once the file was perfectly readable again.
         let calls = Cell::new(0);
         let mut cache = PathImageCache::<u8>::default();
 
@@ -166,7 +184,38 @@ mod tests {
             );
         }
 
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_transient_failure_heals_once_a_later_attempt_succeeds_and_then_stays_cached() {
+        let mut cache = PathImageCache::<u8>::default();
+        let path = Path::new("flaky.png");
+        let mut attempts = 0;
+
+        assert_eq!(
+            cache.get_or_load(path, |_| {
+                attempts += 1;
+                None
+            }),
+            None
+        );
+        assert_eq!(
+            cache.get_or_load(path, |_| {
+                attempts += 1;
+                Some(9_u8)
+            }),
+            Some(9)
+        );
+        assert_eq!(
+            cache.get_or_load(path, |_| {
+                attempts += 1;
+                None
+            }),
+            Some(9),
+            "a success must stay cached without re-invoking the loader"
+        );
+        assert_eq!(attempts, 2);
     }
 
     #[test]
