@@ -6948,11 +6948,17 @@ mod tests {
             assert!(source.contains("accessible-label:"), "{name}");
         }
         let primary = component_source("PrimaryAction", Some("QuietChip"));
-        assert!(primary.contains("font-size: Theme.type-value-size;"));
+        assert!(primary.contains("font-size: Theme.type-label-size;"));
         assert!(primary.contains("action-touch.pressed"));
         assert!(
             primary.contains("max-height: Theme.interactive-min;"),
             "primary action must not stretch into a giant color block"
+        );
+        assert!(
+            primary.contains("max-width: 184px;"),
+            "primary action must have a real width cap, not one a long label can override \
+             (regression: a long label like \"Вставить из буфера\" used to blow the button out \
+             to fit its own text instead of eliding)"
         );
         assert!(!primary.contains("destructive"));
 

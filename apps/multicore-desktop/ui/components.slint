@@ -14,9 +14,9 @@ export component PrimaryAction inherits Rectangle {
         }
     }
 
-    min-width: max(Theme.interactive-min, action-label.preferred-width + Theme.space-4 * 2);
+    min-width: Theme.interactive-min;
     horizontal-stretch: 0;
-    max-width: max(184px, action-label.preferred-width + Theme.space-4 * 2);
+    max-width: 184px;
     min-height: Theme.interactive-min;
     preferred-height: Theme.interactive-min;
     max-height: Theme.interactive-min;
@@ -46,7 +46,7 @@ export component PrimaryAction inherits Rectangle {
         text: root.label;
         color: root.enabled ? Theme.text-primary : Theme.text-muted;
         font-family: Theme.font-family;
-        font-size: Theme.type-value-size;
+        font-size: Theme.type-label-size;
         font-weight: Theme.weight-semibold;
         horizontal-alignment: center;
         vertical-alignment: center;
