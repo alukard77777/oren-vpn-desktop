@@ -18,6 +18,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const TTL: u32 = 3;
+/// A syntactically valid (correct length, base64) but meaningless
+/// 2022-blake3-aes-128-gcm key: only the TCP-level dial-after-resolve is
+/// exercised, never a real shadowsocks handshake.
+const WARMUP_PLACEHOLDER_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZg==";
 
 struct Fixture {
     stop: Arc<AtomicBool>,
@@ -346,4 +350,168 @@ fn live_dns_refreshes_after_ttl_without_core_restart_or_blocked_fallback() {
     );
     assert_eq!(queries.load(Ordering::SeqCst), endpoint_queries);
     assert_eq!(fallback_queries.load(Ordering::SeqCst), 1);
+}
+
+/// Regression coverage for a real failure found on real hardware tonight:
+/// right after Xray starts (and, in production, right as MultiCore's own
+/// brand-new TUN adapter attaches), a domain-scoped endpoint DNS lookup can
+/// fail ("record not found") for a few seconds even though the resolver
+/// itself is healthy - confirmed by reproducing the exact same failure on
+/// two different physical machines, one of them with no other VPN software
+/// running at all, so it is not a cross-app conflict. The SOCKS listener
+/// accepting a TCP connection proved nothing about whether Xray's DNS
+/// client and interface-bound outbound sockets had actually settled, so
+/// Mihomo (and real traffic) could start during exactly that unsettled
+/// window. `TokioProcessLauncher::wait_until_ready` must now hold Xray
+/// "not ready" until a real SOCKS5 CONNECT through one of its own loopback
+/// inbounds - which forces a real domain resolve-then-dial - has actually
+/// succeeded once, not just until the listener answers.
+///
+/// Uses "ordinary.example.com" (already recognized by `Fixture::dns`'s
+/// wire-format stub above), never "edge.example": Xray silently treats a
+/// bare `.example` suffix as a local-only name and resolves it via its
+/// `localhost` client regardless of any scoped-resolver config, entirely
+/// bypassing the resolver under test - the exact landmine
+/// `local_dns_domain` in crates/multicore-core/src/snapshot.rs exists to
+/// keep provider endpoint domains away from.
+#[tokio::test]
+#[ignore = "requires explicit MULTICORE_TEST_XRAY_BIN; loopback-only native core smoke"]
+async fn readiness_gate_waits_for_a_real_dns_resolve_then_dial_before_reporting_ready() {
+    use multicore_core::{
+        CORE_READINESS_TIMEOUT, CommandSpec, Engine, ProcessLauncher, RuntimePaths,
+        TokioProcessLauncher,
+    };
+
+    let binary =
+        PathBuf::from(std::env::var_os("MULTICORE_TEST_XRAY_BIN").expect("Xray binary required"));
+    #[cfg(windows)]
+    assert_eq!(
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
+        "0d0fc0ea2b05641acb78c01fc36ad694e7b029861b2d5eb93da0e3e9fda9a98f"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
+        "c4ae6798c38e0e5343b192406746333cd0ba7ff3eb984f8c4b9939dcb68c3f8a"
+    );
+
+    let mut fixture = Fixture::new();
+    // Starts blocked (phase 2 drops every query), matching the real
+    // just-after-startup failure window; flipped healthy from a background
+    // task below, never by this test racing the readiness wait itself.
+    let phase = Arc::new(AtomicU8::new(2));
+    let queries = Arc::new(AtomicUsize::new(0));
+    let dns = fixture.dns(phase.clone(), queries.clone());
+
+    // A raw TCP target, not `fixture.socks()`: a SOCKS-proxy target would
+    // let Xray pass the domain straight through for the *upstream* proxy to
+    // resolve (real SOCKS5 domain addressing), never resolving it locally
+    // at all - which would make this test pass without exercising Xray's
+    // own DNS client, the exact thing being proven here. shadowsocks (like
+    // every real production outbound this app generates) is a raw relay
+    // protocol: Xray must resolve `settings.address` itself before dialing.
+    // A bogus key still completes the TCP-level dial and the client-facing
+    // SOCKS5 CONNECT reply before any shadowsocks handshake is attempted.
+    // Bound to 127.0.0.2, not 127.0.0.1: the shared `Fixture::dns` stub
+    // (written for the sibling TTL-refresh test below) always answers a
+    // healthy query with 127.0.0.2, so the target must live there too.
+    let target = TcpListener::bind("127.0.0.2:0").unwrap();
+    let target_port = target.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let _ = target.accept();
+    });
+
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let inbound_port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+
+    let domain = "ordinary.example.com";
+    // The DNS client's own outgoing query carries the DNS server's own
+    // `tag` as its virtual inbound. Without an explicit routing rule for
+    // it, Xray's default route sends it out the *same* outbound being
+    // resolved for - a circular dependency (the query needs the outbound,
+    // the outbound needs the query) that production
+    // (crates/multicore-core/src/snapshot.rs) avoids with a dedicated
+    // freedom outbound. Mirrored here for the same reason.
+    const DNS_OUTBOUND_TAG: &str = "warm-dns-direct";
+    let config = json!({
+        "log": {"loglevel": "debug"},
+        "dns": {"servers": [
+            {"address": "127.0.0.1", "port": dns.port(), "domains": [format!("full:{domain}")],
+             "skipFallback": true, "finalQuery": true, "tag": "warm-dns", "timeoutMs": 1500}
+        ]},
+        "inbounds": [{"tag": "warm", "listen": "127.0.0.1", "port": inbound_port,
+            "protocol": "socks", "settings": {"auth": "noauth", "udp": false}}],
+        "outbounds": [
+            {"tag": "warm", "protocol": "shadowsocks",
+                "settings": {"address": domain, "port": target_port,
+                    "method": "2022-blake3-aes-128-gcm", "password": WARMUP_PLACEHOLDER_KEY},
+                "streamSettings": {"sockopt": {"domainStrategy": "ForceIP"}}},
+            {"tag": DNS_OUTBOUND_TAG, "protocol": "freedom",
+                "settings": {"domainStrategy": "AsIs"}}
+        ],
+        "routing": {"rules": [
+            {"type": "field", "inboundTag": ["warm-dns"], "outboundTag": DNS_OUTBOUND_TAG},
+            {"type": "field", "inboundTag": ["warm"], "outboundTag": "warm"}
+        ]}
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let xray_config = directory.path().join("xray.json");
+    fs::write(&xray_config, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let paths = RuntimePaths {
+        xray_binary: binary.clone(),
+        // Never launched or read for an Engine::Xray readiness wait; must
+        // simply exist as a path.
+        mihomo_binary: binary.clone(),
+        xray_config: xray_config.clone(),
+        mihomo_config: xray_config.clone(),
+        dashboard_directory: None,
+    };
+    let command = CommandSpec {
+        engine: Engine::Xray,
+        program: paths.xray_binary.clone(),
+        args: vec![
+            "run".into(),
+            "-c".into(),
+            xray_config.clone().into_os_string(),
+        ],
+        env: Vec::new(),
+    };
+    let launcher = TokioProcessLauncher::for_runtime(paths, CORE_READINESS_TIMEOUT);
+    let mut child = launcher.launch(command.clone()).await.unwrap();
+
+    // Held blocked well past the fixture DNS entry's own 1500ms timeoutMs so
+    // at least one real readiness attempt observes Xray close the
+    // client-facing tunnel after its internal resolve-then-dial genuinely
+    // fails, then recovers - proving the gate both rejects a still-broken
+    // resolver and eventually accepts a real recovery, not just an
+    // optimistic first reply.
+    let flip_phase = phase.clone();
+    let flip = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        flip_phase.store(0, Ordering::SeqCst);
+    });
+
+    let started = Instant::now();
+    launcher
+        .wait_until_ready(&command, &mut child)
+        .await
+        .expect("Xray must become ready once DNS recovers, well within the budget");
+    let elapsed = started.elapsed();
+    flip.await.unwrap();
+
+    // The confirm window alone (crate::snapshot::ENDPOINT_DNS_TIMEOUT_MS +
+    // margin, see sidecar.rs) is several seconds; a low elapsed here would
+    // mean the gate went back to trusting the optimistic first SOCKS5
+    // reply instead of actually watching for the close/no-close signal.
+    assert!(
+        elapsed >= Duration::from_millis(3_000),
+        "readiness returned before the DNS resolver recovered (after only {elapsed:?}) - \
+         the gate is not actually requiring a successful resolve-then-dial"
+    );
+    assert!(
+        queries.load(Ordering::SeqCst) > 0,
+        "no endpoint DNS query was ever observed"
+    );
 }

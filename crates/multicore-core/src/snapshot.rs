@@ -1332,7 +1332,7 @@ fn xray_runtime_bytes(
             "domains": domains.iter().map(|domain| format!("full:{domain}")).collect::<Vec<_>>(),
             "skipFallback": true, "finalQuery": true,
             "disableCache": false, "serveStale": false,
-            "tag": ENDPOINT_DNS_TAG, "timeoutMs": 3000
+            "tag": ENDPOINT_DNS_TAG, "timeoutMs": ENDPOINT_DNS_TIMEOUT_MS
         }));
         servers.insert(0, emergency);
         let routing = root.entry("routing").or_insert(serde_json::Value::Null);
@@ -1364,6 +1364,10 @@ fn xray_runtime_bytes(
 
 const ENDPOINT_DNS_TAG: &str = "multicore-endpoint-dns";
 const ENDPOINT_DNS_OUTBOUND_TAG: &str = "multicore-endpoint-dns-direct";
+/// Shared with the readiness warm-up in `sidecar.rs`, which must bound its
+/// wait for Xray's own DNS-failure close by the same value this config
+/// actually uses - never a guessed constant that could silently drift.
+pub(crate) const ENDPOINT_DNS_TIMEOUT_MS: u64 = 3000;
 
 fn local_dns_domain(domain: &str) -> bool {
     !domain.contains('.')
