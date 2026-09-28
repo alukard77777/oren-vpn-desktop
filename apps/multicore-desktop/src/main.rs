@@ -47,7 +47,7 @@ use view_model::{
     DiagnosticsPresentation, LatencyPresentation, LatencyRequest, MutationToken,
     NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
     SemanticTone, StatePresentation, SubscriptionPresentation, SubscriptionProfileOperation,
-    SubscriptionProfilesPresentation, derive_catalog_display,
+    SubscriptionProfilesPresentation, derive_catalog_display, split_leading_symbol,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -3817,7 +3817,9 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_status_eyebrow(SharedString::from(presentation.eyebrow));
     ui.set_headline(presentation.headline.clone().into());
     ui.set_supporting(presentation.supporting.clone().into());
-    ui.set_node_name(presentation.node.clone().into());
+    let (node_icon, node_name) = split_leading_symbol(&presentation.node);
+    ui.set_node_icon(node_icon.into());
+    ui.set_node_name(node_name.into());
     ui.set_has_profile(presentation.has_profile);
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
@@ -4944,7 +4946,8 @@ mod window_tests {
         assert!(ui.contains("in-out property <string> profile-edit-id;"));
         assert!(ui.contains("in-out property <string> profile-edit-draft;"));
         assert!(ui.contains("root.replace-profile-source(profile.id, root.profile-edit-draft);"));
-        assert!(ui.contains("profile.usage + \" · \" + profile.expiry"));
+        // Expiry first: at the minimum width the elide must eat the usage, not the expiry.
+        assert!(ui.contains("profile.expiry + \" · \" + profile.usage"));
         assert!(ui.contains("accessible-label: \"Изменить URL \" + profile.title"));
         assert!(ui.contains("@image-url(\"../assets/edit.svg\")"));
         let edit_control = ui

@@ -141,7 +141,10 @@ component SmallAction inherits Rectangle {
     accessible-action-default => { if (root.enabled) { root.activated(); } }
 
     small-label := Text {
+        x: 8px;
+        width: parent.width - 16px;
         text: root.label;
+        overflow: elide;
         color: root.selected ? Theme.text-primary : Theme.text-secondary;
         font-family: Theme.font-family;
         font-size: Theme.type-metadata-size;
@@ -440,6 +443,7 @@ export component AppWindow inherits Window {
     in property <string> headline: "Добавьте подписку";
     in property <string> supporting: "Вставьте URL — остальное настроим автоматически.";
     in property <string> node-name: "Маршрут не выбран";
+    in property <string> node-icon: "";
     in property <bool> has-profile: false;
     in property <string> primary-label: "Подключить";
     in property <bool> primary-enabled: false;
@@ -969,35 +973,44 @@ export component AppWindow inherits Window {
                                         image-fit: contain;
                                         accessible-role: none;
                                     }
-                                    if root.has-service-logo: service-logo-badge := Rectangle {
-                                        x: parent.width - 30px;
-                                        y: parent.height - 30px;
-                                        width: 28px;
-                                        height: 28px;
-                                        border-radius: 14px;
-                                        background: #0d0f12e8;
-                                        border-color: #ffffff33;
-                                        border-width: 1px;
-                                        accessible-role: none;
+                                }
 
-                                        Image {
-                                            x: 4px;
-                                            y: 4px;
-                                            width: 20px;
-                                            height: 20px;
-                                            source: root.service-logo;
+                                // Sibling of the circular, clipped power button (not a child),
+                                // so the circle's clip no longer cuts the badge's outer edge.
+                                if root.has-service-logo: service-logo-badge := Rectangle {
+                                    x: parent.width - 28px;
+                                    y: parent.height - 28px;
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 14px;
+                                    background: #0d0f12f2;
+                                    border-color: #ffffff33;
+                                    border-width: 1px;
+                                    opacity: root.primary-enabled ? 1 : 0.45;
+                                    accessible-role: none;
+
+                                    Image {
+                                        x: 4px;
+                                        y: 4px;
+                                        width: 20px;
+                                        height: 20px;
+                                        source: root.service-logo;
                                         image-fit: contain;
                                         accessible-role: none;
                                     }
-                                    }
                                 }
-
                             }
                             VerticalLayout {
                                 spacing: 2px;
                                 Text { text: root.status-eyebrow; color: Theme.text-muted; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; overflow: elide; }
                                 Text { text: root.headline; color: Theme.text-primary; font-size: 18px; font-weight: Theme.weight-semibold; overflow: elide; }
-                                Text { text: root.node-name + (root.supporting == "" ? "" : " · " + root.supporting); color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    // A leading flag/symbol is drawn with the emoji font; the
+                                    // UI font renders regional-indicator flags as letters ("SE").
+                                    if root.node-icon != "": Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
+                                    Text { horizontal-stretch: 1; text: root.node-name + (root.supporting == "" ? "" : " · " + root.supporting); color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                                }
                             }
                         }
 
@@ -1194,17 +1207,25 @@ export component AppWindow inherits Window {
                                 Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                                 Text { text: root.conflicting-apps-message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; overflow: elide; }
                             }
-                            SmallAction {
-                                min-width: 96px;
-                                label: root.conflicting-apps-closing ? "Закрываем…" : "Закрыть";
-                                selected: true;
-                                enabled: !root.profile-menu-open && !root.conflicting-apps-closing;
-                                activated => { root.close-conflicting-apps(); }
-                            }
-                            SmallAction {
-                                label: "Понятно";
-                                enabled: !root.profile-menu-open;
-                                activated => { root.dismiss-conflicting-apps-banner(); }
+                            // Centered vertically like the icon and text: the banner is
+                            // taller than the buttons, which otherwise sit at the top.
+                            VerticalLayout {
+                                alignment: center;
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    SmallAction {
+                                        min-width: 96px;
+                                        label: root.conflicting-apps-closing ? "Закрываем…" : "Закрыть";
+                                        selected: true;
+                                        enabled: !root.profile-menu-open && !root.conflicting-apps-closing;
+                                        activated => { root.close-conflicting-apps(); }
+                                    }
+                                    SmallAction {
+                                        label: "Понятно";
+                                        enabled: !root.profile-menu-open;
+                                        activated => { root.dismiss-conflicting-apps-banner(); }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1502,6 +1523,8 @@ export component AppWindow inherits Window {
                             ScrollView {
                                 vertical-stretch: 1;
                                 VerticalLayout {
+                                    // Keeps the overlay scrollbar off the rows' right border.
+                                    padding-right: 12px;
                                     spacing: 4px;
                                     for node in root.catalog-nodes: RouteNodeRow {
                                         height: 46px;
@@ -1558,7 +1581,20 @@ export component AppWindow inherits Window {
                             HealthRow { label: "Туннель TUN"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
                         }
                     }
-                    Text { height: 24px; text: "Маппинг Mihomo → Xray"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                    // The dashboard action lives on the Mihomo header row: next to the
+                    // four event filters it overflowed the page at the minimum width.
+                    HorizontalLayout {
+                        height: 44px;
+                        spacing: 8px;
+                        Text { text: "Маппинг Mihomo → Xray"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; vertical-alignment: center; overflow: elide; }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        DashboardAction {
+                            label: "Открыть дашборд";
+                            enabled: root.dashboard-available && !root.profile-menu-open;
+                            disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
+                            activated => { root.open-dashboard(); }
+                        }
+                    }
                     ScrollView {
                         height: root.diagnostic-mappings.length > 0 ? 138px : 44px;
                         VerticalLayout {
@@ -1585,16 +1621,12 @@ export component AppWindow inherits Window {
                         SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
                         SmallAction { label: "Ядра"; selected: root.event-filter == "Ядра"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        DashboardAction {
-                            label: "Открыть дашборд";
-                            enabled: root.dashboard-available && !root.profile-menu-open;
-                            disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
-                            activated => { root.open-dashboard(); }
-                        }
                     }
                     ScrollView {
                         vertical-stretch: 1;
                         VerticalLayout {
+                            // Keeps the overlay scrollbar off the event cards' right edge.
+                            padding-right: 12px;
                             spacing: 8px;
                             for event in root.events: Rectangle {
                                 min-height: 56px;
@@ -1661,8 +1693,10 @@ export component AppWindow inherits Window {
                             ToggleRow {
                                 label: "Живой фон";
                                 description: root.reduced-motion ? "Анимация отключена настройками " + root.system-name : "Спокойные волны на главной";
-                                checked: root.ambient-background-enabled;
-                                enabled: !root.profile-menu-open;
+                                // Under system reduced-motion the animation never runs, so the
+                                // switch must not look on/enabled while the text says it's off.
+                                checked: root.ambient-background-enabled && !root.reduced-motion;
+                                enabled: !root.profile-menu-open && !root.reduced-motion;
                                 toggled(value) => { root.ambient-background-enabled = value; }
                             }
                             if root.preference-error != "": Text { min-height: 20px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
@@ -1809,7 +1843,7 @@ export component AppWindow inherits Window {
                                             if !profile.has-logo: Text { text: profile.fallback; color: Theme.text-secondary; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
                                         }
                                         Text { x: 56px; y: 8px; width: parent.width - 264px; height: 20px; text: profile.title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: profile.active ? Theme.weight-semibold : Theme.weight-regular; overflow: elide; }
-                                        Text { x: 56px; y: 28px; width: parent.width - 264px; height: 18px; text: profile.usage + " · " + profile.expiry; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
+                                        Text { x: 56px; y: 28px; width: parent.width - 264px; height: 18px; text: profile.expiry + " · " + profile.usage; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
                                         Text {
                                             x: 56px; y: 46px; width: parent.width - 264px; height: 18px;
                                             text: root.profile-pending-id == profile.id
@@ -1896,7 +1930,7 @@ export component AppWindow inherits Window {
                                             SmallAction { width: 96px; label: "Удалить"; enabled: root.profile-pending-operation == "none"; activated => { root.delete-profile(profile.id); } }
                                             SmallAction { width: 72px; label: "Отмена"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; } }
                                         }
-                                        Rectangle { x: 12px; y: parent.height - 1px; width: parent.width - 24px; height: 1px; background: Theme.line; }
+                                        Rectangle { visible: index < root.subscription-profiles.length - 1; x: 12px; y: parent.height - 1px; width: parent.width - 24px; height: 1px; background: Theme.line; }
                                     }
                                 }
                             }

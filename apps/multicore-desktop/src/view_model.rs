@@ -3127,6 +3127,20 @@ pub(crate) fn derive_catalog_display(label: &str, kind: CatalogDisplayKind) -> C
     }
 }
 
+/// Splits a leading flag or known symbol off `label` so it can be drawn with
+/// the emoji font (the UI text font renders regional-indicator flags as
+/// plain letters, e.g. "SE"). Unlike `derive_catalog_display`, no icon is
+/// ever invented: a label without such a prefix comes back unchanged.
+pub(crate) fn split_leading_symbol(label: &str) -> (String, String) {
+    let value = label.trim();
+    let display = derive_catalog_display(value, CatalogDisplayKind::Node);
+    if display.label == value {
+        (String::new(), label.to_owned())
+    } else {
+        (display.icon, display.label)
+    }
+}
+
 fn is_regional_indicator(character: char) -> bool {
     ('\u{1f1e6}'..='\u{1f1ff}').contains(&character)
 }
@@ -5969,6 +5983,27 @@ mod tests {
         assert!(!source.contains(
             "enabled: root.catalog-selection-enabled;\n                            checkable: true;"
         ));
+    }
+
+    #[test]
+    fn status_node_splits_only_a_real_leading_flag_or_symbol() {
+        assert_eq!(
+            split_leading_symbol("🇸🇪 Auto Sweden"),
+            ("🇸🇪".to_owned(), "Auto Sweden".to_owned())
+        );
+        assert_eq!(
+            split_leading_symbol("🌍 Автовыбор"),
+            ("🌍".to_owned(), "Автовыбор".to_owned())
+        );
+        assert_eq!(
+            split_leading_symbol("Auto Sweden"),
+            (String::new(), "Auto Sweden".to_owned()),
+            "no icon may be invented for a plain name"
+        );
+        assert_eq!(
+            split_leading_symbol("Маршрут не выбран"),
+            (String::new(), "Маршрут не выбран".to_owned())
+        );
     }
 
     #[test]
