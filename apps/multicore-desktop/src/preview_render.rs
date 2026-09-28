@@ -179,7 +179,8 @@ fn ready(ui: &AppWindow) {
     ui.set_status_eyebrow(s("Готово"));
     ui.set_headline(s("Можно подключаться"));
     ui.set_supporting(s(""));
-    ui.set_node_name(s("🌍 Автовыбор"));
+    ui.set_node_icon(s("🌍"));
+    ui.set_node_name(s("Автовыбор"));
     ui.set_primary_label(s("Подключиться"));
     ui.set_primary_enabled(true);
     ui.set_status_tone(s("accent"));

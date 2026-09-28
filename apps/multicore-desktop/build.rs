@@ -40,6 +40,10 @@ export component ComponentCheck inherits Window {{
         check_input,
         output_dir.join("multicore_components_check.rs"),
         slint_build::CompilerConfiguration::new()
+            // The app is dark-only; the plain "fluent" style follows the OS
+            // color scheme and drew white LineEdits/scrollbars on a light
+            // Windows theme.
+            .with_style("fluent-dark".into())
             .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles),
     )
     .expect("failed to validate the MultiCore component library");
@@ -66,6 +70,10 @@ export component ComponentCheck inherits Window {{
     slint_build::compile_with_config(
         "ui/app.slint",
         slint_build::CompilerConfiguration::new()
+            // The app is dark-only; the plain "fluent" style follows the OS
+            // color scheme and drew white LineEdits/scrollbars on a light
+            // Windows theme.
+            .with_style("fluent-dark".into())
             .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles),
     )
     .expect("failed to compile the Slint UI");
