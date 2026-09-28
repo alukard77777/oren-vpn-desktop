@@ -3041,32 +3041,63 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
 fn wire_copy_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     let weak = ui.as_weak();
     ui.on_copy_diagnostics(move || {
-        let mut text = model
+        // Events are otherwise only fetched when the Status panel opens, so
+        // a failure that happened while it was already open was missing
+        // from the export. Pull the newest events first, then copy.
+        let request = model
             .lock()
             .expect("view model lock")
-            .diagnostics_export_text();
-        // Failures in the desktop-to-local-daemon HTTP call itself (couldn't
-        // connect, response didn't parse, ...) never produce a daemon-side
-        // event - the daemon has no way to know its own response failed to
-        // reach or decode here. Fold in the raw low-level log so this export
-        // still carries real diagnostic signal for exactly that case.
-        if let Some(low_level) = daemon::read_low_level_log() {
-            text.push_str("\n\n--- low-level ---\n");
-            text.push_str(&low_level);
-        }
-        if clipboard_text::write_clipboard_text(text).is_err() {
-            return;
-        }
-        let Some(ui) = weak.upgrade() else {
+            .begin_events_request();
+        let Some(request) = request else {
+            copy_diagnostics_now(&weak, &model);
             return;
         };
-        ui.set_diagnostics_copied(true);
-        let reset_weak = weak.clone();
-        Timer::single_shot(Duration::from_secs(2), move || {
-            if let Some(ui) = reset_weak.upgrade() {
-                ui.set_diagnostics_copied(false);
-            }
+        let weak = weak.clone();
+        let model = model.clone();
+        thread::spawn(move || {
+            let result = request
+                .client
+                .events(request.after, request.known_epoch.as_deref());
+            let events = model
+                .lock()
+                .expect("view model lock")
+                .finish_events(request.token, result);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let (Some(ui), Some(events)) = (weak.upgrade(), events) {
+                    apply_events(&ui, events);
+                }
+                copy_diagnostics_now(&weak, &model);
+            });
         });
+    });
+}
+
+fn copy_diagnostics_now(weak: &slint::Weak<AppWindow>, model: &Arc<Mutex<DesktopViewModel>>) {
+    let mut text = model
+        .lock()
+        .expect("view model lock")
+        .diagnostics_export_text();
+    // Failures in the desktop-to-local-daemon HTTP call itself (couldn't
+    // connect, response didn't parse, ...) never produce a daemon-side
+    // event - the daemon has no way to know its own response failed to
+    // reach or decode here. Fold in the raw low-level log so this export
+    // still carries real diagnostic signal for exactly that case.
+    if let Some(low_level) = daemon::read_low_level_log() {
+        text.push_str("\n\n--- low-level ---\n");
+        text.push_str(&low_level);
+    }
+    if clipboard_text::write_clipboard_text(text).is_err() {
+        return;
+    }
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    ui.set_diagnostics_copied(true);
+    let reset_weak = weak.clone();
+    Timer::single_shot(Duration::from_secs(2), move || {
+        if let Some(ui) = reset_weak.upgrade() {
+            ui.set_diagnostics_copied(false);
+        }
     });
 }
 
@@ -4074,6 +4105,25 @@ mod window_tests {
         assert!(!ambient_motion_allowed(true, true, true, false, true));
         assert!(!ambient_motion_allowed(true, true, false, true, true));
         assert!(!ambient_motion_allowed(true, true, false, false, false));
+    }
+
+    #[test]
+    fn copy_diagnostics_fetches_fresh_events_before_copying() {
+        // Regression coverage: events used to be fetched only when the
+        // Status panel opened, so "Копировать лог" could copy a stale or
+        // empty cache while the real failure was already in the daemon log.
+        let rust = include_str!("main.rs");
+        let body = rust
+            .split("fn wire_copy_diagnostics(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn copy_diagnostics_now(").next())
+            .expect("wire_copy_diagnostics body");
+        let fetch = body.find(".begin_events_request()").expect("fetches events");
+        let finish = body.find(".finish_events(").expect("applies fetched events");
+        let copy = body
+            .rfind("copy_diagnostics_now(&weak, &model)")
+            .expect("copies after fetching");
+        assert!(fetch < finish && finish < copy);
     }
 
     #[test]
