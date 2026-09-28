@@ -544,8 +544,13 @@ export component AppWindow inherits Window {
     // The profile menu floats under the subscription shelf, so it follows the
     // optional update/conflicting-apps banners that sit between the
     // connection strip and shelf.
+    // Matches each banner's own fixed height below + the 8px VerticalLayout
+    // spacing after it. Slint does not allow referencing an element defined
+    // inside an `if` block from outside it, so this can't just read
+    // `conflicting-apps-banner.height` - both this and the banner's own
+    // `height:` must be kept in sync by hand.
     private property <length> home-banner-offset: (root.update-banner-visible ? 80px : 0px)
-        + (root.conflicting-apps-banner-visible ? 80px : 0px);
+        + (root.conflicting-apps-banner-visible ? 168px : 0px);
     private property <length> profile-menu-content-height: (root.profile-switch-locked ? 28px : 0px)
         + (root.profile-mutation-error != "" ? 40px : 0px)
         + (root.profile-menu-error != "" ? 104px
@@ -1154,7 +1159,12 @@ export component AppWindow inherits Window {
                     }
 
                     if root.conflicting-apps-banner-visible: conflicting-apps-banner := Rectangle {
-                        height: 72px;
+                        // Generous enough for a realistic worst case (two
+                        // conflicting apps plus the appended "couldn't fully
+                        // close it, it's a Windows service" note) at the
+                        // app's own minimum window width. Kept in sync by
+                        // hand with `home-banner-offset` above.
+                        height: 160px;
                         background: #1a1215;
                         border-color: #f06a6a55;
                         border-width: 1px;
@@ -1178,9 +1188,10 @@ export component AppWindow inherits Window {
                             }
                             VerticalLayout {
                                 horizontal-stretch: 1;
+                                preferred-width: 0px;
                                 alignment: center;
                                 spacing: 2px;
-                                Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                                Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                                 Text { text: root.conflicting-apps-message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; overflow: elide; }
                             }
                             SmallAction {
@@ -1521,10 +1532,16 @@ export component AppWindow inherits Window {
                     padding-bottom: 40px;
                     spacing: 16px;
                     HorizontalLayout {
-                        height: 34px;
+                        height: 44px;
+                        spacing: 8px;
                         Text { text: "Состояние"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         Text { text: root.diagnostics-loading ? "Обновляем…" : "Локальная диагностика"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
+                        SmallAction {
+                            label: root.diagnostics-copied ? "Скопировано ✓" : "Копировать лог";
+                            enabled: !root.profile-menu-open;
+                            activated => { root.copy-diagnostics(); }
+                        }
                     }
                     Rectangle {
                         height: 154px;
@@ -1568,11 +1585,6 @@ export component AppWindow inherits Window {
                         SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
                         SmallAction { label: "Ядра"; selected: root.event-filter == "Ядра"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        SmallAction {
-                            label: root.diagnostics-copied ? "Скопировано ✓" : "Скопировать диагностику";
-                            enabled: !root.profile-menu-open;
-                            activated => { root.copy-diagnostics(); }
-                        }
                         DashboardAction {
                             label: "Открыть дашборд";
                             enabled: root.dashboard-available && !root.profile-menu-open;

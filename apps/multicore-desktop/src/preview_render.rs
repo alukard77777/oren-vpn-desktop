@@ -330,6 +330,89 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_update_action_enabled(true);
             ui.set_active_panel(s("subscription"));
         }),
+        ("home-update-banner", 840, 720, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+        }),
+        ("home-update-banner-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+        }),
+        ("home-update-banner-longstatus-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s(
+                "Доступна версия 0.4.0 с исправлениями безопасности и стабильности",
+            ));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+        }),
+        ("home-conflicting-banner-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_conflicting_apps_banner_visible(true);
+            ui.set_conflicting_apps_message(s(
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+            ));
+        }),
+        ("home-conflicting-banner", 840, 720, |ui| {
+            ready(ui);
+            ui.set_conflicting_apps_banner_visible(true);
+            ui.set_conflicting_apps_message(s(
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+            ));
+        }),
+        // Realistic worst case: two conflicting apps plus the appended
+        // "couldn't fully close it, it's a Windows service" note.
+        ("home-conflicting-banner-worstcase-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_conflicting_apps_banner_visible(true);
+            ui.set_conflicting_apps_message(s(
+                "Обнаружены другие VPN-приложения (FlClash, Happ): они могут конфликтовать с MultiCore. Закройте их перед подключением. Закрыть удалось не всё: FlClash запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows».",
+            ));
+        }),
+        ("home-conflicting-banner-menu-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_conflicting_apps_banner_visible(true);
+            ui.set_conflicting_apps_message(s(
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+            ));
+            ui.set_active_panel(s("subscription"));
+        }),
+        ("home-both-banners-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+            ui.set_conflicting_apps_banner_visible(true);
+            ui.set_conflicting_apps_message(s(
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+            ));
+        }),
+        ("home-ready-wide", 1600, 900, ready),
+        ("home-update-banner-wide", 1600, 900, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+        }),
+        ("subscriptions-wide", 1600, 900, |ui| {
+            ready(ui);
+            ui.set_subscription_profiles(profiles(5));
+            ui.set_local_page(s("subscriptions"));
+        }),
+        ("status-wide", 1600, 900, |ui| {
+            connected(ui);
+            ui.set_local_page(s("status"));
+            ui.set_events(events());
+        }),
         ("home-menu-connected", 840, 720, |ui| {
             connected(ui);
             ui.set_subscription_profiles(profiles(4));
