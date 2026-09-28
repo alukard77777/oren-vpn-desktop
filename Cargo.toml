@@ -19,9 +19,19 @@ license = "MIT OR Apache-2.0"
 base64 = "0.22"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 quick-xml = "0.41.0"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 resvg = { version = "0.47.0", default-features = false }
 regex = "1"
+# Pinned explicitly (matching a working precedent in the same problem
+# domain - Clash Verge Rev does the same) instead of letting reqwest's
+# plain "rustls" feature pull in aws-lc-rs. Rustls 0.23 links whichever
+# crypto-provider features the dependency graph unifies to, and this
+# workspace also carries reqwest 0.12 (apps/multicore-desktop), whose own
+# "rustls-tls" feature defaults to ring - so the two majors were ending up
+# with *both* aws-lc-rs and ring linked into the same desktop binary, a
+# documented source of ambiguous/inconsistent crypto-provider
+# initialization. See fetch.rs's `ensure_crypto_provider_installed`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"

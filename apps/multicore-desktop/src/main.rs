@@ -674,6 +674,7 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    multicore_core::ensure_crypto_provider_installed();
     #[cfg(target_os = "linux")]
     linux_display::prefer_desktop_scale();
     let launch_arguments =

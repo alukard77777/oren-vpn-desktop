@@ -445,6 +445,7 @@ impl MihomoHttpSelector {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let authorization = header::HeaderValue::from_str(&format!("Bearer {secret}"))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        multicore_core::ensure_crypto_provider_installed();
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(1))

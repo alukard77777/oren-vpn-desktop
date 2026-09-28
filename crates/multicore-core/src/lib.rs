@@ -51,3 +51,26 @@ pub use supervisor::{Engine, ProcessController, StartFailureCause, Supervisor, S
 pub use unix_group::{UnixGroupLauncher, UnixGroupManagedChild};
 #[cfg(windows)]
 pub use windows_job::{WindowsJobLauncher, WindowsJobManagedChild};
+
+static CRYPTO_PROVIDER_INSTALL: std::sync::Once = std::sync::Once::new();
+
+/// Installs `ring` as the process-wide default rustls crypto provider.
+/// Idempotent and safe to call from multiple sites or threads - only the
+/// first call does anything, later ones are no-ops.
+///
+/// This workspace carries two reqwest majors across its binaries (0.12 in
+/// the desktop app, 0.13 here), and reqwest 0.13's plain `rustls` feature
+/// pulls in `aws-lc-rs` by default. Left alone, a binary that links both
+/// (the desktop app does, since it depends on this crate too) ends up with
+/// *both* `aws-lc-rs` and `ring` in its dependency graph, which rustls
+/// resolves ambiguously depending on install order - a documented source
+/// of inconsistent crypto-provider initialization. This workspace instead
+/// pins `rustls-no-provider` everywhere and installs `ring` explicitly
+/// here, matching a working precedent in the same problem domain (Clash
+/// Verge Rev does the same). Must run before any TLS connection is
+/// attempted; every `reqwest::Client` this crate builds calls this first.
+pub fn ensure_crypto_provider_installed() {
+    CRYPTO_PROVIDER_INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}

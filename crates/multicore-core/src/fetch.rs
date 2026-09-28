@@ -319,6 +319,7 @@ pub struct ReqwestHttpClient {
 
 impl ReqwestHttpClient {
     pub fn new(identity: DeviceIdentity) -> Result<Self, FetchError> {
+        crate::ensure_crypto_provider_installed();
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-hwid",
@@ -629,6 +630,7 @@ fn build_pinned_logo_client(
     host: &str,
     addresses: &[SocketAddr],
 ) -> Result<reqwest::Client, FetchError> {
+    crate::ensure_crypto_provider_installed();
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())

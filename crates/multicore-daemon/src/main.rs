@@ -18,6 +18,7 @@ use multicore_daemon::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    multicore_core::ensure_crypto_provider_installed();
     let token = required_env("MULTICORE_DAEMON_TOKEN")?;
     let address: SocketAddr = env::var("MULTICORE_DAEMON_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())

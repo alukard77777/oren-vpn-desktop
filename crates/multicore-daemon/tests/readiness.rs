@@ -105,6 +105,11 @@ impl Drop for ChildGuard {
 
 #[tokio::test]
 async fn spawned_daemon_announces_real_address_and_serves_authenticated_status() {
+    // This test's own HTTP client - unlike the daemon it spawns below - is
+    // never routed through multicore_core::ensure_crypto_provider_installed,
+    // so it needs its own call: this workspace's reqwest no longer
+    // auto-selects a crypto provider (see the root Cargo.toml comment).
+    multicore_core::ensure_crypto_provider_installed();
     let root = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_multicore-daemon"))
         .env("MULTICORE_DAEMON_TOKEN", TOKEN)
