@@ -911,7 +911,7 @@ async fn xray_domain_dns_warm(config_path: &std::path::Path) -> bool {
     }
 
     let confirm_window = Duration::from_millis(crate::snapshot::ENDPOINT_DNS_TIMEOUT_MS)
-        + Duration::from_millis(800);
+        + Duration::from_millis(300);
     let deadline = tokio::time::Instant::now() + confirm_window;
     let mut probe_buf = [0_u8; 64];
     loop {

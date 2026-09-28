@@ -40,7 +40,7 @@ fn live_dns_uses_only_yandex_for_endpoints_without_static_ip_pinning() {
         serde_json::json!({
             "address":"77.88.8.8", "domains":["full:edge.example.com"],
             "skipFallback":true, "finalQuery":true, "disableCache":false,
-            "serveStale":false, "tag":"multicore-endpoint-dns", "timeoutMs":3000
+            "serveStale":false, "tag":"multicore-endpoint-dns", "timeoutMs":1200
         })
     );
     assert_eq!(runtime["dns"]["servers"][2], "8.8.8.8");

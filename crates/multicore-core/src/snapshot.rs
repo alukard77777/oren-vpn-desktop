@@ -1411,7 +1411,18 @@ const ENDPOINT_DNS_OUTBOUND_TAG: &str = "multicore-endpoint-dns-direct";
 /// Shared with the readiness warm-up in `sidecar.rs`, which must bound its
 /// wait for Xray's own DNS-failure close by the same value this config
 /// actually uses - never a guessed constant that could silently drift.
-pub(crate) const ENDPOINT_DNS_TIMEOUT_MS: u64 = 3000;
+///
+/// This was 3000: a defensive value chosen back when the endpoint
+/// resolver's own query still had to survive Mihomo routing it through a
+/// proxy-dependent nameserver, an indefinite failure mode with no safe
+/// fast bound. A live-hardware capture then found and fixed the actual bug
+/// (an interface-bound UDP:53 packet silently blackholed by Mihomo's own
+/// DNS-leak protection); with that gone, the resolver answers in well
+/// under a second even over a real link, so this - and the readiness
+/// warm-up window it bounds - can be far tighter without reintroducing the
+/// original false-"ready" failure mode this whole mechanism exists to
+/// avoid.
+pub(crate) const ENDPOINT_DNS_TIMEOUT_MS: u64 = 1200;
 /// Shared between Xray's own scoped resolver entry and the Mihomo
 /// `nameserver-policy` override below, so both agree on the one resolver
 /// address that must be reachable for endpoint domains to ever resolve.

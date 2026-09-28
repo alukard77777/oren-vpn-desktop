@@ -236,6 +236,16 @@ fn live_dns_refreshes_after_ttl_without_core_restart_or_blocked_fallback() {
     runtime["dns"]["servers"][1]["address"] = json!("127.0.0.1");
     runtime["dns"]["servers"][1]["port"] = json!(dns.port());
     for outbound in runtime["outbounds"].as_array_mut().unwrap() {
+        if outbound["tag"] == "multicore-endpoint-dns-direct" {
+            // Deliberately unbound: Mihomo's DNS-leak protection blackholes
+            // UDP:53 explicitly bound to the physical interface (proven on
+            // real hardware), so this one outbound must never carry it.
+            assert_eq!(
+                outbound["streamSettings"]["sockopt"]["interface"],
+                json!(null)
+            );
+            continue;
+        }
         assert_eq!(
             outbound["streamSettings"]["sockopt"]["interface"],
             "fixture-interface"
@@ -502,11 +512,13 @@ async fn readiness_gate_waits_for_a_real_dns_resolve_then_dial_before_reporting_
     flip.await.unwrap();
 
     // The confirm window alone (crate::snapshot::ENDPOINT_DNS_TIMEOUT_MS +
-    // margin, see sidecar.rs) is several seconds; a low elapsed here would
-    // mean the gate went back to trusting the optimistic first SOCKS5
-    // reply instead of actually watching for the close/no-close signal.
+    // margin, see sidecar.rs) is over a second on its own, before even
+    // accounting for the blocked retries this scenario forces first; a low
+    // elapsed here would mean the gate went back to trusting the optimistic
+    // first SOCKS5 reply instead of actually watching for the close/no-close
+    // signal.
     assert!(
-        elapsed >= Duration::from_millis(3_000),
+        elapsed >= Duration::from_millis(1_200),
         "readiness returned before the DNS resolver recovered (after only {elapsed:?}) - \
          the gate is not actually requiring a successful resolve-then-dial"
     );
