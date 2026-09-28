@@ -1623,7 +1623,11 @@ mod event_persistence_tests {
 
         let second_run = EventBuffer::<Event>::persistent_or_memory(&path);
         let recovered: Vec<_> = second_run.after(0).map(|(_, event)| event).collect();
-        assert_eq!(recovered.len(), 2, "both prior-run events must survive a restart");
+        assert_eq!(
+            recovered.len(),
+            2,
+            "both prior-run events must survive a restart"
+        );
         let serialized = recovered
             .iter()
             .map(|event| serde_json::to_string(event).unwrap())
@@ -1642,7 +1646,11 @@ mod event_persistence_tests {
         drop(run_one);
 
         let mut run_two = EventBuffer::<Event>::persistent_or_memory(&path);
-        assert_eq!(run_two.after(0).count(), 1, "run two must recover run one's event");
+        assert_eq!(
+            run_two.after(0).count(),
+            1,
+            "run two must recover run one's event"
+        );
         run_two.push_event_with(|_| sample_event(2));
         drop(run_two);
 
@@ -2952,8 +2960,14 @@ mod error_chain_tests {
 
         let chain = error_chain_text(&error);
 
-        assert!(chain.contains("profile snapshot operation failed"), "{chain}");
-        assert!(chain.contains("snapshot persistence operation failed"), "{chain}");
+        assert!(
+            chain.contains("profile snapshot operation failed"),
+            "{chain}"
+        );
+        assert!(
+            chain.contains("snapshot persistence operation failed"),
+            "{chain}"
+        );
         assert!(chain.contains("Access is denied"), "{chain}");
     }
 }

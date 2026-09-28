@@ -529,14 +529,16 @@ fn open_windows_directory(
     let access = GENERIC_READ
         | if repair_permissions { GENERIC_WRITE } else { 0 }
         | if removable { DELETE } else { 0 };
-    let handle = fs::OpenOptions::new()
-        .read(true)
-        .access_mode(access)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH,
-        )
-        .open(path)?;
+    let handle = retry_on_transient_windows_lock("open directory", path, || {
+        fs::OpenOptions::new()
+            .read(true)
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH,
+            )
+            .open(path)
+    })?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
@@ -550,7 +552,9 @@ fn open_windows_directory(
         ));
     }
     if repair_permissions {
-        super::snapshot::secure_directory(path)?;
+        retry_on_transient_windows_lock("secure directory", path, || {
+            super::snapshot::secure_directory(path)
+        })?;
     }
     Ok(DirectoryCapability {
         display_path: absolute_display_path(path)?,
@@ -620,14 +624,17 @@ fn open_windows_file(
     } else {
         GENERIC_READ
     };
-    let file = fs::OpenOptions::new()
-        .read(!create_new)
-        .write(create_new)
-        .create_new(create_new)
-        .access_mode(access)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
-        .open(&path)?;
+    let operation_name = if create_new { "create" } else { "open" };
+    let file = retry_on_transient_windows_lock(operation_name, &path, || {
+        fs::OpenOptions::new()
+            .read(!create_new)
+            .write(create_new)
+            .create_new(create_new)
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH)
+            .open(&path)
+    })?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
@@ -639,7 +646,7 @@ fn open_windows_file(
         ));
     }
     if repair_permissions {
-        super::snapshot::secure_file(&path)?;
+        retry_on_transient_windows_lock("secure", &path, || super::snapshot::secure_file(&path))?;
     }
     Ok(file)
 }
@@ -656,15 +663,17 @@ fn open_windows_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::
         },
     };
     let path = directory.display_path.join(name);
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .access_mode(GENERIC_READ | GENERIC_WRITE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&path)?;
+    let file = retry_on_transient_windows_lock("open lock", &path, || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+    })?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
@@ -675,7 +684,7 @@ fn open_windows_lock_file(directory: &DirectoryCapability, name: &OsStr) -> io::
             "profile lock is not a regular file",
         ));
     }
-    super::snapshot::secure_file(&path)?;
+    retry_on_transient_windows_lock("secure lock", &path, || super::snapshot::secure_file(&path))?;
     Ok(file)
 }
 
@@ -709,7 +718,7 @@ fn rename_child(
     old: &DirectoryCapability,
     new_name: &OsStr,
 ) -> io::Result<()> {
-    rename_windows_handle(parent, &old.handle, new_name, false)
+    rename_windows_handle(parent, &old.handle, &old.display_path, new_name, false)
 }
 
 #[cfg(windows)]
@@ -719,13 +728,20 @@ fn replace_file(
     new_name: &OsStr,
 ) -> io::Result<()> {
     let file = open_windows_file(parent, old_name, false, true, true)?;
-    rename_windows_handle(parent, &file, new_name, true)
+    rename_windows_handle(
+        parent,
+        &file,
+        &parent.display_path.join(old_name),
+        new_name,
+        true,
+    )
 }
 
 #[cfg(windows)]
 fn rename_windows_handle(
     parent: &DirectoryCapability,
     source: &fs::File,
+    source_path: &Path,
     new_name: &OsStr,
     replace: bool,
 ) -> io::Result<()> {
@@ -753,49 +769,238 @@ fn rename_windows_handle(
             name.len(),
         );
     }
-    // A real Windows-10-only bug report traced an otherwise-inexplicable
-    // subscription-add failure to exactly this call returning os error 32
-    // (ERROR_SHARING_VIOLATION, "the process cannot access the file because
-    // it is being used by another process") - almost always a real-time
-    // antivirus scanner briefly holding one of the just-written staging
-    // files open for scanning. A real reproduction of that same shape
-    // (a plain read handle held open on a file inside the directory being
-    // renamed) surfaced as os error 5 (ERROR_ACCESS_DENIED) instead - so
-    // Windows doesn't report this one consistently, and both are treated
-    // the same way here. Either is transient by nature (the other process
-    // releases its handle shortly after), so - matching how Git for
-    // Windows, Cargo, and other well-known tools handle the exact same
-    // class of failure - retry a bounded number of times with a short
-    // delay instead of failing the whole subscription import outright.
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    const ERROR_ACCESS_DENIED: i32 = 5;
-    const RENAME_SHARING_VIOLATION_ATTEMPTS: u32 = 10;
-    const RENAME_SHARING_VIOLATION_RETRY_DELAY: std::time::Duration =
-        std::time::Duration::from_millis(50);
-    for attempt in 1..=RENAME_SHARING_VIOLATION_ATTEMPTS {
-        let succeeded = unsafe {
+    retry_on_transient_windows_lock("rename", source_path, || {
+        if unsafe {
             SetFileInformationByHandle(
                 source.as_raw_handle(),
                 FileRenameInfo,
                 buffer.as_ptr().cast(),
                 bytes as u32,
             )
-        } != 0;
-        if succeeded {
-            return Ok(());
+        } == 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
-        let error = io::Error::last_os_error();
-        let is_last_attempt = attempt == RENAME_SHARING_VIOLATION_ATTEMPTS;
-        let is_retryable = matches!(
-            error.raw_os_error(),
-            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
-        );
-        if !is_retryable || is_last_attempt {
-            return Err(error);
+    })
+}
+
+/// Every Windows 10 machine (and no Windows 11 one) failed subscription
+/// import with os error 32 (ERROR_SHARING_VIOLATION) inside snapshot
+/// persistence. Measured on real Windows: renaming a directory while some
+/// process holds a file inside it fails with os error 5, never 32, so the
+/// 32 comes from *opening* a file or directory another process is holding,
+/// consistent with an OS component (most likely the built-in real-time
+/// scanner) that behaves differently between the two Windows versions. A
+/// first rename-only 500ms retry did not help, which fits: it retried the
+/// wrong operation. Every store open and rename now goes through here, is
+/// retried for a bounded time, and - if the lock outlives the budget - the
+/// error names the operation, the entry, and which processes Windows'
+/// Restart Manager reports as holding it, so a remaining failure says
+/// exactly who is responsible instead of just "file is in use".
+#[cfg(windows)]
+fn retry_on_transient_windows_lock<T>(
+    operation_name: &'static str,
+    target: &Path,
+    operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    const MAX_ATTEMPTS: u32 = 40;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(125);
+    retry_on_transient_windows_lock_with_budget(
+        operation_name,
+        target,
+        MAX_ATTEMPTS,
+        RETRY_DELAY,
+        operation,
+    )
+}
+
+/// Same as `retry_on_transient_windows_lock`, but with the attempt count
+/// and delay as parameters so tests can exercise the "retries are
+/// eventually exhausted" path without taking the full production budget.
+#[cfg(windows)]
+fn retry_on_transient_windows_lock_with_budget<T>(
+    operation_name: &'static str,
+    target: &Path,
+    max_attempts: u32,
+    retry_delay: std::time::Duration,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    let started = std::time::Instant::now();
+    for attempt in 1..=max_attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let is_retryable = matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
+                );
+                if !is_retryable {
+                    return Err(error);
+                }
+                if attempt == max_attempts {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        StillLockedError {
+                            operation: operation_name,
+                            entry: target
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            attempts: attempt,
+                            elapsed: started.elapsed(),
+                            holders: processes_holding(target),
+                            source: error,
+                        },
+                    ));
+                }
+                std::thread::sleep(retry_delay);
+            }
         }
-        std::thread::sleep(RENAME_SHARING_VIOLATION_RETRY_DELAY);
     }
     unreachable!("loop always returns on its last attempt")
+}
+
+/// Carries only the entry's own name (never the full path, which contains
+/// the Windows user name) and process names/PIDs, so it stays as safe to
+/// log as the rest of the event it ends up in.
+#[cfg(windows)]
+#[derive(Debug)]
+struct StillLockedError {
+    operation: &'static str,
+    entry: String,
+    attempts: u32,
+    elapsed: std::time::Duration,
+    holders: Vec<String>,
+    source: io::Error,
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for StillLockedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} '{}' still blocked after {} attempts over {} ms; held by: {}",
+            self.operation,
+            self.entry,
+            self.attempts,
+            self.elapsed.as_millis(),
+            if self.holders.is_empty() {
+                "no process reported by Restart Manager".to_owned()
+            } else {
+                self.holders.join(", ")
+            }
+        )
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for StillLockedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Asks Windows' Restart Manager which processes hold `target` open (or,
+/// for a directory, any file directly inside it - Restart Manager only
+/// tracks files). Best-effort: any failure just yields an empty list.
+#[cfg(windows)]
+fn processes_holding(target: &Path) -> Vec<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::RestartManager::{
+        CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
+        RmStartSession,
+    };
+    const ERROR_MORE_DATA: u32 = 234;
+    const MAX_PROBED_FILES: usize = 32;
+
+    let files: Vec<PathBuf> = if target.is_dir() {
+        fs::read_dir(target)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_file())
+                    .take(MAX_PROBED_FILES)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![target.to_path_buf()]
+    };
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let wide: Vec<Vec<u16>> = files
+        .iter()
+        .map(|path| path.as_os_str().encode_wide().chain(Some(0)).collect())
+        .collect();
+    let names: Vec<*const u16> = wide.iter().map(|name| name.as_ptr()).collect();
+
+    let mut session = 0_u32;
+    let mut key = [0_u16; CCH_RM_SESSION_KEY as usize + 1];
+    if unsafe { RmStartSession(&mut session, 0, key.as_mut_ptr()) } != 0 {
+        return Vec::new();
+    }
+    let mut holders = Vec::new();
+    let registered = unsafe {
+        RmRegisterResources(
+            session,
+            names.len() as u32,
+            names.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        )
+    } == 0;
+    if registered {
+        let mut needed = 0_u32;
+        let mut count = 0_u32;
+        let mut reasons = 0_u32;
+        let status = unsafe {
+            RmGetList(
+                session,
+                &mut needed,
+                &mut count,
+                std::ptr::null_mut(),
+                &mut reasons,
+            )
+        };
+        if status == ERROR_MORE_DATA && needed > 0 {
+            let mut infos = vec![RM_PROCESS_INFO::default(); needed as usize];
+            count = needed;
+            let status = unsafe {
+                RmGetList(
+                    session,
+                    &mut needed,
+                    &mut count,
+                    infos.as_mut_ptr(),
+                    &mut reasons,
+                )
+            };
+            if status == 0 {
+                for info in infos.iter().take(count as usize) {
+                    let wide_name = |raw: &[u16]| {
+                        let length = raw.iter().position(|&unit| unit == 0).unwrap_or(raw.len());
+                        String::from_utf16_lossy(&raw[..length])
+                    };
+                    let app = wide_name(&info.strAppName);
+                    let service = wide_name(&info.strServiceShortName);
+                    holders.push(if service.is_empty() {
+                        format!("{app} (pid {})", info.Process.dwProcessId)
+                    } else {
+                        format!("{app} [{service}] (pid {})", info.Process.dwProcessId)
+                    });
+                }
+            }
+        }
+    }
+    unsafe { RmEndSession(session) };
+    holders
 }
 
 #[cfg(windows)]
@@ -953,20 +1158,25 @@ mod windows_rename_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Regression coverage for a real Windows-10-only bug report: importing
-    /// a subscription failed with os error 32 (ERROR_SHARING_VIOLATION)
-    /// while publishing the staged snapshot, because a real-time antivirus
-    /// scanner briefly held one of the just-written files open. Reproduces
-    /// exactly that shape here - a plain `File::open` handle (no
-    /// FILE_SHARE_DELETE) held on a file inside the directory being
-    /// renamed - and confirms the rename now survives it instead of
-    /// failing the whole import outright.
+    fn inner_os_error(error: &io::Error) -> Option<i32> {
+        error.raw_os_error().or_else(|| {
+            std::error::Error::source(error)
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .and_then(io::Error::raw_os_error)
+        })
+    }
+
+    /// A held child file blocks renaming its directory; the rename must
+    /// succeed as soon as the other handle goes away instead of failing
+    /// the whole import outright.
     #[test]
-    fn rename_survives_a_transient_sharing_violation_from_another_handle() {
+    fn rename_survives_a_transient_lock_from_another_handle() {
         let temp = tempfile::tempdir().unwrap();
         let root = DirectoryCapability::open(temp.path()).unwrap();
         let staging = root.create_child(OsStr::new("staging")).unwrap();
-        staging.write_file(OsStr::new("mihomo.yaml"), b"placeholder").unwrap();
+        staging
+            .write_file(OsStr::new("mihomo.yaml"), b"placeholder")
+            .unwrap();
 
         let blocking_path = temp.path().join("staging").join("mihomo.yaml");
         let blocking_handle = fs::File::open(&blocking_path).unwrap();
@@ -984,34 +1194,82 @@ mod windows_rename_tests {
         let finished = Instant::now();
         releaser.join().unwrap();
 
+        assert!(finished >= released_at.lock().unwrap().expect("releaser ran"));
         assert!(
-            finished >= released_at.lock().unwrap().expect("releaser ran"),
-            "rename must not report success before the conflicting handle was released"
-        );
-        assert!(
-            finished - started < Duration::from_secs(1),
-            "rename took implausibly long: {:?}",
+            finished - started < Duration::from_secs(2),
+            "{:?}",
             finished - started
         );
         assert!(temp.path().join("published").join("mihomo.yaml").is_file());
     }
 
+    /// Regression coverage for the real Windows-10-only os error 32: an
+    /// open of an entry another process holds exclusively is a sharing
+    /// violation. It must be retried, and once the budget is exhausted the
+    /// error must name the operation, the entry, and the holding process
+    /// (here: this very test process, found via Restart Manager), while
+    /// keeping the original OS error reachable as its source.
     #[test]
-    fn rename_gives_up_and_reports_the_real_error_once_retries_are_exhausted() {
+    fn an_exhausted_lock_names_the_operation_entry_and_holding_process() {
         let temp = tempfile::tempdir().unwrap();
-        let root = DirectoryCapability::open(temp.path()).unwrap();
-        let staging = root.create_child(OsStr::new("staging")).unwrap();
-        staging.write_file(OsStr::new("mihomo.yaml"), b"placeholder").unwrap();
+        let path = temp.path().join("mihomo.yaml");
+        fs::write(&path, b"placeholder").unwrap();
+        let _exclusive = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap()
+        };
 
-        let blocking_path = temp.path().join("staging").join("mihomo.yaml");
-        let _blocking_handle = fs::File::open(&blocking_path).unwrap();
+        let started = Instant::now();
+        let error = retry_on_transient_windows_lock_with_budget(
+            "open",
+            &path,
+            3,
+            Duration::from_millis(20),
+            || fs::File::open(&path),
+        )
+        .expect_err("an exclusively held file cannot be opened");
 
-        let error = root
-            .rename_child(&staging, OsStr::new("published"))
-            .expect_err("rename must fail while the conflicting handle is held for good");
         assert!(
-            matches!(error.raw_os_error(), Some(5) | Some(32)),
-            "expected ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION, got {error}"
+            started.elapsed() >= Duration::from_millis(40),
+            "must actually retry"
         );
+        assert_eq!(inner_os_error(&error), Some(32), "{error}");
+        let text = error.to_string();
+        assert!(
+            text.contains("open 'mihomo.yaml' still blocked after 3 attempts"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("(pid {})", std::process::id())),
+            "Restart Manager must report this test process as the holder: {text}"
+        );
+        assert!(
+            !text.contains(&temp.path().display().to_string()),
+            "full path leaked: {text}"
+        );
+    }
+
+    #[test]
+    fn non_lock_errors_are_returned_immediately_and_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.yaml");
+        let mut calls = 0;
+        let error = retry_on_transient_windows_lock_with_budget(
+            "open",
+            &missing,
+            5,
+            Duration::from_millis(20),
+            || {
+                calls += 1;
+                fs::File::open(&missing)
+            },
+        )
+        .expect_err("missing file");
+        assert_eq!(calls, 1);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }

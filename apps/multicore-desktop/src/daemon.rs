@@ -811,10 +811,13 @@ fn decode_bounded_json<T: DeserializeOwned>(
             .unwrap_or_default()
             .min(response_limit as u64) as usize,
     );
-    response.take(response_limit as u64 + 1).read_to_end(&mut bytes).map_err(|error| {
-        record_low_level("daemon_response_read_failed", &error);
-        DaemonError::transport("Не удалось прочитать ответ фонового сервиса.")
-    })?;
+    response
+        .take(response_limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            record_low_level("daemon_response_read_failed", &error);
+            DaemonError::transport("Не удалось прочитать ответ фонового сервиса.")
+        })?;
     if bytes.len() > response_limit {
         return Err(response_too_large());
     }
@@ -2477,7 +2480,11 @@ mod http_tests {
         assert_eq!(read_low_level_entries(&path), None);
 
         write_low_level_entry(&path, "daemon_request_failed", "connection refused");
-        write_low_level_entry(&path, "daemon_response_decode_failed", "unexpected end of json");
+        write_low_level_entry(
+            &path,
+            "daemon_response_decode_failed",
+            "unexpected end of json",
+        );
 
         let contents = read_low_level_entries(&path).expect("entries recorded");
         assert!(contents.contains("daemon_request_failed"));
@@ -2491,7 +2498,11 @@ mod http_tests {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("client-errors.log");
 
-        write_low_level_entry(&path, "daemon_response_decode_failed", "line one\nline two\ttabbed");
+        write_low_level_entry(
+            &path,
+            "daemon_response_decode_failed",
+            "line one\nline two\ttabbed",
+        );
 
         let contents = read_low_level_entries(&path).expect("entry recorded");
         assert_eq!(contents.lines().count(), 1, "{contents:?}");
