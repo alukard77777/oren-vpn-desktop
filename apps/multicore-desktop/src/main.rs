@@ -4175,8 +4175,12 @@ mod window_tests {
             .nth(1)
             .and_then(|rest| rest.split("fn copy_diagnostics_now(").next())
             .expect("wire_copy_diagnostics body");
-        let fetch = body.find(".begin_events_request()").expect("fetches events");
-        let finish = body.find(".finish_events(").expect("applies fetched events");
+        let fetch = body
+            .find(".begin_events_request()")
+            .expect("fetches events");
+        let finish = body
+            .find(".finish_events(")
+            .expect("applies fetched events");
         let copy = body
             .rfind("copy_diagnostics_now(&weak, &model)")
             .expect("copies after fetching");
