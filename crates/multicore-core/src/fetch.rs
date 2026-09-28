@@ -182,6 +182,123 @@ pub enum FetchError {
     TooLarge,
 }
 
+impl FetchError {
+    /// A short, URL-free label for diagnostics: never includes the path,
+    /// query, or fragment a subscription token could live in.
+    fn diagnostic_reason(self) -> &'static str {
+        match self {
+            Self::Network => "connect_failed",
+            Self::Timeout => "timed_out",
+            Self::Tls => "tls_rejected",
+            Self::Redirect => "redirect_rejected",
+            Self::HttpStatus(_) => "http_status",
+            Self::NotSubscription => "not_a_subscription",
+            Self::InvalidBundle => "invalid_bundle",
+            Self::InvalidConfig => "invalid_config",
+            Self::Persistence => "could_not_persist",
+            Self::TooLarge => "response_too_large",
+        }
+    }
+}
+
+/// One request flavour's outcome, for `FetchDiagnostics`. Never carries the
+/// response body or the request path/query - only what is needed to tell
+/// apart "never reached the server" from "server answered but rejected the
+/// request" from "server answered with something we can't use".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// Never attempted (e.g. the native combined request already answered).
+    Skipped,
+    Ok {
+        status: u16,
+    },
+    Failed {
+        reason: &'static str,
+        status: Option<u16>,
+    },
+}
+
+impl AttemptOutcome {
+    fn from_result(result: &Result<HttpResponse, FetchError>) -> Self {
+        match result {
+            Ok(response) if response.status_is_success() => Self::Ok {
+                status: response.status,
+            },
+            Ok(response) => Self::Failed {
+                reason: FetchError::HttpStatus(response.status).diagnostic_reason(),
+                status: Some(response.status),
+            },
+            Err(error) => Self::Failed {
+                reason: error.diagnostic_reason(),
+                status: match error {
+                    FetchError::HttpStatus(status) => Some(*status),
+                    _ => None,
+                },
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Skipped => write!(formatter, "skipped"),
+            Self::Ok { status } => write!(formatter, "ok({status})"),
+            Self::Failed {
+                reason,
+                status: Some(status),
+            } => write!(formatter, "{reason}({status})"),
+            Self::Failed {
+                reason,
+                status: None,
+            } => write!(formatter, "{reason}"),
+        }
+    }
+}
+
+/// A redacted, shareable record of exactly what happened on one subscription
+/// refresh attempt, safe to log or hand to a user for support: it never
+/// contains the request path, query string, headers, or response body -
+/// only the host reached and a short outcome label per request flavour.
+#[derive(Debug, Clone)]
+pub struct FetchDiagnostics {
+    /// `host[:port]` (no scheme, no path/query - a subscription token would
+    /// live in the path/query, and the event pipeline's own redaction wipes
+    /// any `scheme://...`-shaped text as if it were a full URL).
+    pub host: String,
+    pub native: AttemptOutcome,
+    pub mihomo: AttemptOutcome,
+    pub xray: AttemptOutcome,
+    pub elapsed_ms: u64,
+}
+
+impl std::fmt::Display for FetchDiagnostics {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "host={} native={} mihomo={} xray={} elapsed_ms={}",
+            self.host, self.native, self.mihomo, self.xray, self.elapsed_ms
+        )
+    }
+}
+
+/// `host[:port]` only - deliberately never the scheme (this event pipeline's
+/// own redaction treats any `scheme://...` text as a full URL and wipes it
+/// entirely, host included) and never the path, query, or fragment, which is
+/// where a subscription URL's access token lives.
+fn safe_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            let host = parsed.host_str()?.to_owned();
+            Some(match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| "unknown-host".to_owned())
+}
+
 pub trait HttpClient: Send + Sync {
     fn get<'a>(
         &'a self,
@@ -573,17 +690,59 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         url: &str,
         store: &S,
     ) -> Result<SnapshotCommit<Arc<Snapshot>>, FetchError> {
-        let native_error = match self.client.get(url, UA_NATIVE).await {
+        self.refresh_with_diagnostics(url, store).await.0
+    }
+
+    /// Same as `refresh`, but also returns a redacted per-attempt summary
+    /// (which of the native/Mihomo/Xray requests reached the server, and
+    /// with what outcome) safe to show a user or attach to a bug report: it
+    /// never contains the request path/query (where a subscription token
+    /// lives), headers, or response bodies - only the host reached and a
+    /// short outcome label per request flavour.
+    pub async fn refresh_with_diagnostics<S: SnapshotSink>(
+        &self,
+        url: &str,
+        store: &S,
+    ) -> (
+        Result<SnapshotCommit<Arc<Snapshot>>, FetchError>,
+        FetchDiagnostics,
+    ) {
+        let started = std::time::Instant::now();
+        let host = safe_host(url);
+        let native_response = self.client.get(url, UA_NATIVE).await;
+        let native_outcome = AttemptOutcome::from_result(&native_response);
+
+        let native_error = match native_response {
             Ok(response) if response.status_is_success() => {
                 let body = strip_utf8_bom(&response.body);
                 if looks_like_native_bundle(body) {
                     // A JSON array means the backend recognised the combined
                     // MultiCore request, so its answer is final.
-                    let mut snapshot = parse_native(body)?
-                        .with_subscription_metadata(url, &response.metadata, current_unix_time())
-                        .map_err(|_| FetchError::InvalidBundle)?;
-                    self.fetch_optional_logo(&mut snapshot).await;
-                    return store.save(snapshot).map_err(|_| FetchError::Persistence);
+                    let outcome = parse_native(body).and_then(|snapshot| {
+                        snapshot
+                            .with_subscription_metadata(
+                                url,
+                                &response.metadata,
+                                current_unix_time(),
+                            )
+                            .map_err(|_| FetchError::InvalidBundle)
+                    });
+                    let outcome = match outcome {
+                        Ok(mut snapshot) => {
+                            self.fetch_optional_logo(&mut snapshot).await;
+                            store.save(snapshot).map_err(|_| FetchError::Persistence)
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let diagnostics = FetchDiagnostics {
+                        host,
+                        native: native_outcome,
+                        mihomo: AttemptOutcome::Skipped,
+                        xray: AttemptOutcome::Skipped,
+                        elapsed_ms: u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    };
+                    return (outcome, diagnostics);
                 }
                 // HTML, share links, Base64 or plain YAML: the panel did not
                 // recognise the combined request; try the per-core requests.
@@ -597,10 +756,25 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             self.client.get(url, UA_MIHOMO),
             self.client.get(url, UA_XRAY)
         );
-        let mut snapshot = parse_fallback(url, mihomo, xray)
-            .map_err(|error| prefer_informative(native_error, error))?;
-        self.fetch_optional_logo(&mut snapshot).await;
-        store.save(snapshot).map_err(|_| FetchError::Persistence)
+        let mihomo_outcome = AttemptOutcome::from_result(&mihomo);
+        let xray_outcome = AttemptOutcome::from_result(&xray);
+        let outcome = match parse_fallback(url, mihomo, xray)
+            .map_err(|error| prefer_informative(native_error, error))
+        {
+            Ok(mut snapshot) => {
+                self.fetch_optional_logo(&mut snapshot).await;
+                store.save(snapshot).map_err(|_| FetchError::Persistence)
+            }
+            Err(error) => Err(error),
+        };
+        let diagnostics = FetchDiagnostics {
+            host,
+            native: native_outcome,
+            mihomo: mihomo_outcome,
+            xray: xray_outcome,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        (outcome, diagnostics)
     }
 
     async fn fetch_optional_logo(&self, snapshot: &mut Snapshot) {
@@ -1075,5 +1249,123 @@ mod persistence_outcome_tests {
             committed.subscription_source_url(),
             Some("https://subscription.invalid/private")
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    use crate::PersistentSnapshotStore;
+
+    #[test]
+    fn safe_host_never_carries_a_scheme_path_query_or_token() {
+        assert_eq!(
+            safe_host("https://user:pw@provider.example:8443/sub?token=super-secret#frag"),
+            "provider.example:8443"
+        );
+        assert_eq!(safe_host("http://plain.example/sub"), "plain.example");
+        assert_eq!(safe_host("not a url at all"), "unknown-host");
+        // The event pipeline's own redaction wipes any `scheme://...`-shaped
+        // text wholesale, so the host must never come back with one.
+        assert!(!safe_host("https://provider.example/sub?token=x").contains("://"));
+    }
+
+    #[derive(Clone)]
+    struct PerFlavourClient;
+
+    impl HttpClient for PerFlavourClient {
+        fn get<'a>(
+            &'a self,
+            url: &'a str,
+            user_agent: &'static str,
+        ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+            let url = url.to_owned();
+            Box::pin(async move {
+                match user_agent {
+                    UA_NATIVE => Ok(HttpResponse::new(
+                        404,
+                        b"not found".to_vec(),
+                        std::iter::empty::<(&str, &str)>(),
+                    )),
+                    UA_MIHOMO => Err(FetchError::Tls),
+                    UA_XRAY if url.contains("provider.example") => Err(FetchError::Timeout),
+                    _ => Err(FetchError::Network),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_with_diagnostics_reports_a_redacted_per_attempt_breakdown_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let (result, diagnostics) = SubscriptionFetcher::new(PerFlavourClient)
+            .refresh_with_diagnostics("https://provider.example/sub?token=super-secret", &store)
+            .await;
+        assert!(result.is_err());
+        assert_eq!(diagnostics.host, "provider.example");
+        assert!(!diagnostics.host.contains("token"));
+        assert_eq!(
+            diagnostics.native,
+            AttemptOutcome::Failed {
+                reason: "http_status",
+                status: Some(404),
+            }
+        );
+        assert_eq!(
+            diagnostics.mihomo,
+            AttemptOutcome::Failed {
+                reason: "tls_rejected",
+                status: None,
+            }
+        );
+        assert_eq!(
+            diagnostics.xray,
+            AttemptOutcome::Failed {
+                reason: "timed_out",
+                status: None,
+            }
+        );
+        let rendered = diagnostics.to_string();
+        assert!(!rendered.contains("token"), "{rendered}");
+        assert!(!rendered.contains("://"), "{rendered}");
+    }
+
+    #[derive(Clone)]
+    struct NativeSuccessClient;
+
+    impl HttpClient for NativeSuccessClient {
+        fn get<'a>(
+            &'a self,
+            _url: &'a str,
+            _user_agent: &'static str,
+        ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+            Box::pin(async move {
+                let mihomo = "proxies: []\nproxy-groups: []\nrules: []\n";
+                let bundle = format!(
+                    "[{},{}]",
+                    serde_json::to_string(mihomo).unwrap(),
+                    r#"{"outbounds":[]}"#
+                );
+                Ok(HttpResponse::new(
+                    200,
+                    bundle.into_bytes(),
+                    std::iter::empty::<(&str, &str)>(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_with_diagnostics_skips_fallback_attempts_once_the_native_bundle_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let (result, diagnostics) = SubscriptionFetcher::new(NativeSuccessClient)
+            .refresh_with_diagnostics("https://provider.example/sub", &store)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(diagnostics.native, AttemptOutcome::Ok { status: 200 });
+        assert_eq!(diagnostics.mihomo, AttemptOutcome::Skipped);
+        assert_eq!(diagnostics.xray, AttemptOutcome::Skipped);
     }
 }

@@ -25,10 +25,11 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
-    AtomicSnapshot, Component, ConnectionState as CoreConnectionState, DiagnosticStream, Event,
-    FetchError, HttpClient, MAX_PROFILES, ProcessController, ProcessDiagnostics, ProfileError,
-    ProfileId, ProfileStore, ProfileSummary, RuntimeCheckState, ServiceLogoLease, Severity,
-    Snapshot, SnapshotCommit, StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
+    AtomicSnapshot, AttemptOutcome, Component, ConnectionState as CoreConnectionState,
+    DiagnosticStream, Event, FetchDiagnostics, FetchError, HttpClient, MAX_PROFILES,
+    ProcessController, ProcessDiagnostics, ProfileError, ProfileId, ProfileStore, ProfileSummary,
+    RuntimeCheckState, ServiceLogoLease, Severity, Snapshot, SnapshotCommit, StagedRuntime,
+    StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -152,7 +153,10 @@ pub struct EventDto {
     pub id: u64,
     pub timestamp: String,
     pub level: String,
+    pub component: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1748,6 +1752,22 @@ impl<P: ProcessController> CoreRuntime<P> {
     }
 
     fn push_event(&mut self, severity: Severity, component: Component, phase: &str, message: &str) {
+        self.push_event_with_details(severity, component, phase, message, json!({}));
+    }
+
+    /// Same as `push_event`, but attaches a structured payload for cases
+    /// where the plain message alone isn't enough to diagnose a failure.
+    /// `Event::new` redacts it the same way it redacts the message, so this
+    /// is exactly as safe to log or hand to a user as `push_event` already
+    /// is - it just carries more of what actually happened.
+    fn push_event_with_details(
+        &mut self,
+        severity: Severity,
+        component: Component,
+        phase: &str,
+        message: &str,
+        details: serde_json::Value,
+    ) {
         self.events.push_with(|id| {
             Event::new(
                 unix_timestamp_ms(),
@@ -1756,7 +1776,7 @@ impl<P: ProcessController> CoreRuntime<P> {
                 phase,
                 format!("daemon-{id:016x}"),
                 message,
-                json!({}),
+                details,
             )
         });
     }
@@ -2165,27 +2185,52 @@ where
     }
 
     /// Downloads a subscription within one overall deadline that stays below
-    /// the desktop's request timeout, and records a URL-free failure reason.
+    /// the desktop's request timeout. Always records a URL-free diagnostic
+    /// event (the reason, plus a redacted per-attempt breakdown - which of
+    /// the native/Mihomo/Xray requests reached the host and what happened),
+    /// so a user hitting this can grab the event log and hand it over
+    /// instead of just "не удалось добавить подписку".
     async fn fetch_subscription(
         &self,
         url: &str,
         staging: &AtomicSnapshot,
     ) -> Result<SnapshotCommit<Arc<Snapshot>>, ProfileMutationError> {
-        let result = tokio::time::timeout(
+        let deadline_diagnostics = FetchDiagnostics {
+            host: "unknown-host".to_owned(),
+            native: AttemptOutcome::Skipped,
+            mihomo: AttemptOutcome::Skipped,
+            xray: AttemptOutcome::Skipped,
+            elapsed_ms: SUBSCRIPTION_FETCH_DEADLINE
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        };
+        let (result, diagnostics) = match tokio::time::timeout(
             SUBSCRIPTION_FETCH_DEADLINE,
-            self.fetcher.refresh(url, staging),
+            self.fetcher.refresh_with_diagnostics(url, staging),
         )
         .await
-        .unwrap_or(Err(FetchError::Timeout));
+        {
+            Ok((result, diagnostics)) => (result, diagnostics),
+            Err(_) => (Err(FetchError::Timeout), deadline_diagnostics),
+        };
         match result {
             Ok(commit) => Ok(commit),
             Err(error) => {
                 let reason = subscription_fetch_reason(error);
-                self.inner.write().await.push_event(
+                self.inner.write().await.push_event_with_details(
                     Severity::Warning,
                     Component::Subscription,
                     "subscription_fetch_failed",
                     &format!("Subscription download failed: {reason}."),
+                    json!({
+                        "host": diagnostics.host,
+                        "native": diagnostics.native.to_string(),
+                        "mihomo": diagnostics.mihomo.to_string(),
+                        "xray": diagnostics.xray.to_string(),
+                        "elapsed_ms": diagnostics.elapsed_ms,
+                        "os": std::env::consts::OS,
+                    }),
                 );
                 Err(ProfileMutationError::Fetch(error))
             }
@@ -3833,6 +3878,12 @@ fn contains_uuid_like(source: &str) -> bool {
 
 fn core_event_to_dto(id: u64, event: &Event) -> EventDto {
     let value = serde_json::to_value(event).unwrap_or_default();
+    let details = value
+        .get("structured_details")
+        .filter(
+            |details| !matches!(details, serde_json::Value::Object(fields) if fields.is_empty()),
+        )
+        .cloned();
     EventDto {
         id,
         timestamp: value
@@ -3845,11 +3896,17 @@ fn core_event_to_dto(id: u64, event: &Event) -> EventDto {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("error")
             .to_owned(),
+        component: value
+            .get("component")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("core")
+            .to_owned(),
         message: value
             .get("safe_message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Событие недоступно.")
             .to_owned(),
+        details,
     }
 }
 
@@ -3952,7 +4009,9 @@ impl MemoryState {
             id,
             timestamp: id.to_string(),
             level: level.to_owned(),
+            component: "system".to_owned(),
             message: message.to_owned(),
+            details: None,
         });
     }
 }

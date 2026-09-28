@@ -498,14 +498,51 @@ pub struct PresentedEvent {
 
 impl From<DaemonEvent> for PresentedEvent {
     fn from(event: DaemonEvent) -> Self {
+        let mut message = redact_event_text(&event.message);
+        if let Some(details) = format_event_details(event.details.as_ref()) {
+            message.push(' ');
+            message.push_str(&redact_event_text(&details));
+        }
         Self {
             id: event.id,
             timestamp: event.timestamp,
-            component: "system".into(),
+            component: if event.component.is_empty() {
+                "system".into()
+            } else {
+                event.component
+            },
             level: event.level,
-            message: redact_event_text(&event.message),
+            message,
         }
     }
+}
+
+/// Turns the daemon's already-redacted structured detail object into a
+/// compact `[key=value key=value]` suffix for the event message - the
+/// event feed's only real estate. Applies `redact_event_text` again on the
+/// caller's side (see above) as defense in depth: this is the whole reason
+/// the field exists, so a user hitting an opaque failure can grab the
+/// event feed text and hand it over instead of just "не удалось...".
+fn format_event_details(details: Option<&serde_json::Value>) -> Option<String> {
+    let fields = details?.as_object()?;
+    if fields.is_empty() {
+        return None;
+    }
+    let mut keys: Vec<&String> = fields.keys().collect();
+    keys.sort();
+    let rendered = keys
+        .into_iter()
+        .map(|key| {
+            let value = &fields[key];
+            let value = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!("[{rendered}]"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2702,7 +2739,7 @@ impl DesktopViewModel {
         }
     }
 
-    fn filtered_events(&self) -> Vec<PresentedEvent> {
+    fn all_events(&self) -> Vec<PresentedEvent> {
         let mut events = self
             .diagnostics
             .as_ref()
@@ -2737,6 +2774,36 @@ impl DesktopViewModel {
         if let Some(error) = &self.event_load_error {
             events.insert(0, error.clone());
         }
+        events
+    }
+
+    /// A plain-text export of every currently-known event (ignoring the
+    /// active tab filter), newest first, for a "copy diagnostics" action: a
+    /// user hitting an opaque failure can paste this into a support message
+    /// instead of just describing "не удалось добавить подписку". Every
+    /// message here has already gone through the same redaction as the live
+    /// feed, so this is exactly as safe to hand over as what is already on
+    /// screen.
+    pub(crate) fn diagnostics_export_text(&self) -> String {
+        let mut events = self.all_events();
+        events.sort_by_key(|event| std::cmp::Reverse(event.id));
+        if events.is_empty() {
+            return "Событий пока нет.".to_owned();
+        }
+        events
+            .into_iter()
+            .map(|event| {
+                format!(
+                    "[{}] {} {}: {}",
+                    event.timestamp, event.level, event.component, event.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn filtered_events(&self) -> Vec<PresentedEvent> {
+        let mut events = self.all_events();
         match self.event_filter {
             EventFilter::All => {}
             EventFilter::System => {
@@ -5270,7 +5337,9 @@ mod tests {
                 id,
                 timestamp: id.to_string(),
                 level: "info".into(),
+                component: String::new(),
                 message: format!("event {id}"),
+                details: None,
             })
             .collect();
         let first_page = view_model
@@ -5299,7 +5368,9 @@ mod tests {
                         id: 1,
                         timestamp: "new".into(),
                         level: "warning".into(),
+                        component: String::new(),
                         message: "new epoch".into(),
+                        details: None,
                     }],
                 }),
             )
@@ -5335,13 +5406,17 @@ mod tests {
                             id: 1,
                             timestamp: "1".into(),
                             level: "info".into(),
+                            component: String::new(),
                             message: "info".into(),
+                            details: None,
                         },
                         DaemonEvent {
                             id: 2,
                             timestamp: "2".into(),
                             level: "error".into(),
+                            component: String::new(),
                             message: "error".into(),
+                            details: None,
                         },
                     ],
                 }),
@@ -5375,6 +5450,54 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn diagnostics_export_includes_structured_details_ignores_the_active_filter_and_stays_redacted()
+    {
+        let client = Arc::new(MockDaemonClient::ready());
+        let mut view_model = DesktopViewModel::new(client);
+        let request = view_model.begin_events_request().expect("event request");
+        view_model
+            .finish_events(
+                request.token,
+                Ok(DaemonEventBatch {
+                    epoch: "epoch-a".into(),
+                    events: vec![DaemonEvent {
+                        id: 1,
+                        timestamp: "12:00".into(),
+                        level: "warning".into(),
+                        component: "subscription".into(),
+                        message: "Subscription download failed: timed_out.".into(),
+                        details: Some(serde_json::json!({
+                            "host": "provider.example",
+                            "native": "http_status(404)",
+                            "mihomo": "tls_rejected",
+                            "xray": "timed_out",
+                            "elapsed_ms": 1234,
+                            "os": "windows",
+                        })),
+                    }],
+                }),
+            )
+            .expect("current completion");
+        // Only errors would survive this filter; the export must ignore it.
+        view_model.set_event_filter(Some("error"));
+
+        let export = view_model.diagnostics_export_text();
+        assert!(export.contains("provider.example"), "{export}");
+        assert!(export.contains("tls_rejected"), "{export}");
+        assert!(export.contains("timed_out"), "{export}");
+        assert!(export.contains("elapsed_ms=1234"), "{export}");
+        assert!(export.contains("subscription"), "{export}");
+        assert!(!export.contains("://"), "{export}");
+    }
+
+    #[test]
+    fn diagnostics_export_reports_an_empty_state_instead_of_a_blank_string() {
+        let client = Arc::new(MockDaemonClient::ready());
+        let view_model = DesktopViewModel::new(client);
+        assert_eq!(view_model.diagnostics_export_text(), "Событий пока нет.");
     }
 
     fn catalog_fixture() -> DaemonCatalog {
@@ -7564,13 +7687,17 @@ mod tests {
                 id: 7,
                 timestamp: "1".into(),
                 level: "info".into(),
+                component: String::new(),
                 message: "Started".into(),
+                details: None,
             },
             DaemonEvent {
                 id: 9,
                 timestamp: "2".into(),
                 level: "warning".into(),
+                component: String::new(),
                 message: "Updated".into(),
+                details: None,
             },
         ];
         let client = Arc::new(client);
@@ -7691,8 +7818,10 @@ mod tests {
             id: 1,
             timestamp: "12:04:07".into(),
             level: "info".into(),
+            component: String::new(),
             message: "import url=https://user:pass@example.test/sub?token=abc token=xyz password: hunter2"
                 .into(),
+            details: None,
         };
 
         let presented = PresentedEvent::from(event);
@@ -7777,7 +7906,9 @@ mod tests {
                         id: 7,
                         timestamp: "now".into(),
                         level: "info".into(),
+                        component: String::new(),
                         message: "cached".into(),
+                        details: None,
                     }],
                 }),
             )
@@ -7843,19 +7974,25 @@ mod tests {
                 id: 1,
                 timestamp: "1".into(),
                 level: "info".into(),
+                component: String::new(),
                 message: "Started".into(),
+                details: None,
             },
             DaemonEvent {
                 id: 2,
                 timestamp: "2".into(),
                 level: "warning".into(),
+                component: String::new(),
                 message: "Degraded".into(),
+                details: None,
             },
             DaemonEvent {
                 id: 3,
                 timestamp: "3".into(),
                 level: "error".into(),
+                component: String::new(),
                 message: "Failed".into(),
+                details: None,
             },
         ];
         let mut view_model = DesktopViewModel::new(Arc::new(client));

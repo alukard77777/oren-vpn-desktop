@@ -235,12 +235,14 @@ async fn status_connect_disconnect_and_events_form_a_testable_contract() {
     let events = events["events"].as_array().expect("events is an array");
     assert_eq!(events.len(), 2);
     let fields = events[0].as_object().unwrap();
-    assert_eq!(fields.len(), 4);
+    assert_eq!(fields.len(), 5, "details is omitted when empty: {fields:?}");
     assert_eq!(fields["id"], 1);
     assert_eq!(events[1]["id"], 2);
     assert!(fields.contains_key("timestamp"));
     assert!(fields.contains_key("level"));
+    assert!(fields.contains_key("component"));
     assert!(fields.contains_key("message"));
+    assert!(!fields.contains_key("details"));
 
     let events_after_first = app
         .clone()

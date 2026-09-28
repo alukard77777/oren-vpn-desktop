@@ -107,18 +107,22 @@ pub struct DaemonSubscriptionInfo {
     pub refresh_available: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct DaemonEvent {
     pub id: u64,
     #[serde(default)]
     pub timestamp: String,
     #[serde(default)]
     pub level: String,
+    #[serde(default)]
+    pub component: String,
     #[serde(default, alias = "summary")]
     pub message: String,
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct DaemonEventBatch {
     pub epoch: String,
     pub events: Vec<DaemonEvent>,
@@ -1699,7 +1703,9 @@ mod http_tests {
                     id: 43,
                     timestamp: "1".into(),
                     level: "info".into(),
+                    component: String::new(),
                     message: "Подключение установлено.".into(),
+                    details: None,
                 }],
             }
         );

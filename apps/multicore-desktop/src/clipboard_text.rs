@@ -27,6 +27,16 @@ pub(crate) fn read_subscription_text() -> Result<String, ClipboardTextError> {
     normalize_subscription_text(&contents)
 }
 
+/// Used by the "copy diagnostics" action: the caller is responsible for
+/// only ever passing already-redacted text (see
+/// `DesktopViewModel::diagnostics_export_text`).
+pub(crate) fn write_clipboard_text(text: String) -> Result<(), ClipboardTextError> {
+    let mut clipboard = ClipboardContext::new().map_err(|_| ClipboardTextError::Unavailable)?;
+    clipboard
+        .set_contents(text)
+        .map_err(|_| ClipboardTextError::Unavailable)
+}
+
 fn normalize_subscription_text(contents: &str) -> Result<String, ClipboardTextError> {
     let trimmed = contents.trim();
     if trimmed.is_empty() {

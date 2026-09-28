@@ -19,8 +19,8 @@ mod windows_job;
 pub use device_identity::{DeviceIdentity, DeviceIdentityError, derive_incy_hwid, is_valid_hwid};
 pub use event::{Component, Event, Severity};
 pub use fetch::{
-    FetchError, HttpClient, HttpResponse, ReqwestHttpClient, SubscriptionFetcher, UA_MIHOMO,
-    UA_NATIVE, UA_SERVICE_LOGO, UA_XRAY,
+    AttemptOutcome, FetchDiagnostics, FetchError, HttpClient, HttpResponse, ReqwestHttpClient,
+    SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO, UA_XRAY,
 };
 pub use input::{
     ConfigError, MAX_CONFIG_BYTES, MihomoConfig, MihomoSocksMapping, ProxyGroup, XrayConfig,

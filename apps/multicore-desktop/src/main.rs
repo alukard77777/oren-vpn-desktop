@@ -782,6 +782,7 @@ fn main() -> Result<(), slint::PlatformError> {
     wire_dashboard_action(&ui, model.clone());
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
+    wire_copy_diagnostics(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
@@ -3033,6 +3034,29 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         if let Some(ui) = weak.upgrade() {
             apply_events(&ui, events);
         }
+    });
+}
+
+fn wire_copy_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    ui.on_copy_diagnostics(move || {
+        let text = model
+            .lock()
+            .expect("view model lock")
+            .diagnostics_export_text();
+        if clipboard_text::write_clipboard_text(text).is_err() {
+            return;
+        }
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        ui.set_diagnostics_copied(true);
+        let reset_weak = weak.clone();
+        Timer::single_shot(Duration::from_secs(2), move || {
+            if let Some(ui) = reset_weak.upgrade() {
+                ui.set_diagnostics_copied(false);
+            }
+        });
     });
 }
 

@@ -572,6 +572,8 @@ export component AppWindow inherits Window {
     callback close-panel();
     callback escape-pressed();
     callback filter-events(string);
+    callback copy-diagnostics();
+    in-out property <bool> diagnostics-copied: false;
     callback select-catalog-group(string);
     callback select-catalog-node(string);
     callback set-launch-at-sign-in(bool);
@@ -1566,6 +1568,11 @@ export component AppWindow inherits Window {
                         SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
                         SmallAction { label: "Ядра"; selected: root.event-filter == "Ядра"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        SmallAction {
+                            label: root.diagnostics-copied ? "Скопировано ✓" : "Скопировать диагностику";
+                            enabled: !root.profile-menu-open;
+                            activated => { root.copy-diagnostics(); }
+                        }
                         DashboardAction {
                             label: "Открыть дашборд";
                             enabled: root.dashboard-available && !root.profile-menu-open;
