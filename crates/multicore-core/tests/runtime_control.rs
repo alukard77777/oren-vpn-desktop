@@ -60,8 +60,11 @@ fn live_dns_uses_only_yandex_for_endpoints_without_static_ip_pinning() {
         serde_json::json!({
             "tag":"multicore-endpoint-dns-direct", "protocol":"freedom",
             "settings":{"domainStrategy":"AsIs"},
-            "streamSettings":{"sockopt":{"interface":"Ethernet", "domainStrategy":"AsIs"}}
-        })
+            "streamSettings":{"sockopt":{"domainStrategy":"AsIs"}}
+        }),
+        "the endpoint-DNS-direct outbound must never bind to the physical \
+         interface - Mihomo's DNS-leak protection blackholes UDP:53 \
+         explicitly bound to it, proven on real hardware"
     );
     assert_eq!(
         runtime["routing"]["rules"][0],

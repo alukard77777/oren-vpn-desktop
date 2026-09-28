@@ -1305,13 +1305,24 @@ fn xray_runtime_bytes(
     if !domains.is_empty() {
         // Append, never replace the provider's first/default outbound. DNS uses
         // a literal resolver IP, so this dial cannot recurse into endpoint DNS.
+        //
+        // Deliberately NOT bound to `outbound_interface`: a live-hardware
+        // capture proved Mihomo's own DNS-leak protection (`strict-route`)
+        // silently blackholes any UDP:53 packet explicitly source-bound to
+        // the physical adapter - proven with a raw socket test that failed
+        // identically for this endpoint domain and for an unrelated control
+        // domain on port 53, while the exact same bind on a TCP/443 socket
+        // (matching every other outbound above) connected fine. So this
+        // query must NOT try to escape the tunnel by binding to the real
+        // interface; it goes out unbound instead, which Mihomo's own TUN
+        // captures via its system-wide DNS hijack and, thanks to the
+        // `nameserver-policy` override above, answers directly and
+        // correctly for exactly these domains.
         outbounds.push(serde_json::json!({
             "tag": ENDPOINT_DNS_OUTBOUND_TAG,
             "protocol": "freedom",
             "settings": {"domainStrategy": "AsIs"},
-            "streamSettings": {"sockopt": {
-                "interface": outbound_interface, "domainStrategy": "AsIs"
-            }}
+            "streamSettings": {"sockopt": {"domainStrategy": "AsIs"}}
         }));
         let dns = root
             .entry("dns")
