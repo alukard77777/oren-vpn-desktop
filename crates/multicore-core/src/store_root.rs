@@ -753,19 +753,49 @@ fn rename_windows_handle(
             name.len(),
         );
     }
-    if unsafe {
-        SetFileInformationByHandle(
-            source.as_raw_handle(),
-            FileRenameInfo,
-            buffer.as_ptr().cast(),
-            bytes as u32,
-        )
-    } == 0
-    {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+    // A real Windows-10-only bug report traced an otherwise-inexplicable
+    // subscription-add failure to exactly this call returning os error 32
+    // (ERROR_SHARING_VIOLATION, "the process cannot access the file because
+    // it is being used by another process") - almost always a real-time
+    // antivirus scanner briefly holding one of the just-written staging
+    // files open for scanning. A real reproduction of that same shape
+    // (a plain read handle held open on a file inside the directory being
+    // renamed) surfaced as os error 5 (ERROR_ACCESS_DENIED) instead - so
+    // Windows doesn't report this one consistently, and both are treated
+    // the same way here. Either is transient by nature (the other process
+    // releases its handle shortly after), so - matching how Git for
+    // Windows, Cargo, and other well-known tools handle the exact same
+    // class of failure - retry a bounded number of times with a short
+    // delay instead of failing the whole subscription import outright.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const RENAME_SHARING_VIOLATION_ATTEMPTS: u32 = 10;
+    const RENAME_SHARING_VIOLATION_RETRY_DELAY: std::time::Duration =
+        std::time::Duration::from_millis(50);
+    for attempt in 1..=RENAME_SHARING_VIOLATION_ATTEMPTS {
+        let succeeded = unsafe {
+            SetFileInformationByHandle(
+                source.as_raw_handle(),
+                FileRenameInfo,
+                buffer.as_ptr().cast(),
+                bytes as u32,
+            )
+        } != 0;
+        if succeeded {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        let is_last_attempt = attempt == RENAME_SHARING_VIOLATION_ATTEMPTS;
+        let is_retryable = matches!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
+        );
+        if !is_retryable || is_last_attempt {
+            return Err(error);
+        }
+        std::thread::sleep(RENAME_SHARING_VIOLATION_RETRY_DELAY);
     }
+    unreachable!("loop always returns on its last attempt")
 }
 
 #[cfg(windows)]
@@ -914,6 +944,74 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_rename_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Regression coverage for a real Windows-10-only bug report: importing
+    /// a subscription failed with os error 32 (ERROR_SHARING_VIOLATION)
+    /// while publishing the staged snapshot, because a real-time antivirus
+    /// scanner briefly held one of the just-written files open. Reproduces
+    /// exactly that shape here - a plain `File::open` handle (no
+    /// FILE_SHARE_DELETE) held on a file inside the directory being
+    /// renamed - and confirms the rename now survives it instead of
+    /// failing the whole import outright.
+    #[test]
+    fn rename_survives_a_transient_sharing_violation_from_another_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DirectoryCapability::open(temp.path()).unwrap();
+        let staging = root.create_child(OsStr::new("staging")).unwrap();
+        staging.write_file(OsStr::new("mihomo.yaml"), b"placeholder").unwrap();
+
+        let blocking_path = temp.path().join("staging").join("mihomo.yaml");
+        let blocking_handle = fs::File::open(&blocking_path).unwrap();
+        let released_at = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let released_at_writer = released_at.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(blocking_handle);
+            *released_at_writer.lock().unwrap() = Some(Instant::now());
+        });
+
+        let started = Instant::now();
+        root.rename_child(&staging, OsStr::new("published"))
+            .expect("rename must succeed once the other handle releases its lock");
+        let finished = Instant::now();
+        releaser.join().unwrap();
+
+        assert!(
+            finished >= released_at.lock().unwrap().expect("releaser ran"),
+            "rename must not report success before the conflicting handle was released"
+        );
+        assert!(
+            finished - started < Duration::from_secs(1),
+            "rename took implausibly long: {:?}",
+            finished - started
+        );
+        assert!(temp.path().join("published").join("mihomo.yaml").is_file());
+    }
+
+    #[test]
+    fn rename_gives_up_and_reports_the_real_error_once_retries_are_exhausted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DirectoryCapability::open(temp.path()).unwrap();
+        let staging = root.create_child(OsStr::new("staging")).unwrap();
+        staging.write_file(OsStr::new("mihomo.yaml"), b"placeholder").unwrap();
+
+        let blocking_path = temp.path().join("staging").join("mihomo.yaml");
+        let _blocking_handle = fs::File::open(&blocking_path).unwrap();
+
+        let error = root
+            .rename_child(&staging, OsStr::new("published"))
+            .expect_err("rename must fail while the conflicting handle is held for good");
+        assert!(
+            matches!(error.raw_os_error(), Some(5) | Some(32)),
+            "expected ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION, got {error}"
         );
     }
 }
