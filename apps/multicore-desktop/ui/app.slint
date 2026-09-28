@@ -515,6 +515,8 @@ export component AppWindow inherits Window {
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
     in property <bool> update-busy: false;
+    // A connect/disconnect/import is in flight: installing now cannot start.
+    in property <bool> update-runtime-busy: false;
     in-out property <string> update-banner-dismissed-for;
     in property <bool> conflicting-apps-banner-visible: false;
     in property <string> conflicting-apps-message;
@@ -1144,7 +1146,8 @@ export component AppWindow inherits Window {
                                 min-width: 96px;
                                 label: root.update-action-label != "" ? root.update-action-label : "Подробнее";
                                 selected: true;
-                                enabled: !root.update-busy && !root.profile-menu-open && !root.update-confirm-open;
+                                enabled: !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
+                                    && (root.update-action-label == "" || !root.update-runtime-busy);
                                 activated => {
                                     if (root.update-action-label != "") { root.update-action(); }
                                     else { root.local-page = "settings"; root.settings-section = "updates"; }
@@ -1682,7 +1685,8 @@ export component AppWindow inherits Window {
                             }
                             if root.update-action-label != "": SmallAction {
                                 label: root.update-action-label;
-                                enabled: root.update-action-enabled && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open;
+                                enabled: root.update-action-enabled && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
+                                    && !(root.update-runtime-busy && root.update-available);
                                 activated => { root.update-action(); }
                             }
                             Rectangle { vertical-stretch: 1; background: transparent; }
@@ -2174,6 +2178,7 @@ export component AppWindow inherits Window {
                         width: 200px;
                         label: "Обновить и перезапустить";
                         selected: true;
+                        enabled: !root.update-runtime-busy;
                         activated => { root.confirm-update-restart(); }
                     }
                 }
