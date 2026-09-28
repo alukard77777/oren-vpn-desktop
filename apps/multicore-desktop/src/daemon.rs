@@ -1,13 +1,95 @@
 use std::{
     error::Error,
     fmt,
-    io::Read,
+    io::{Read, Seek, Write as _},
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+/// Raw, low-level detail for a daemon-HTTP-call failure - the exact
+/// reqwest/io/serde error text, or a bounded snippet of an unparseable
+/// response body. This exists specifically for failures the daemon's own
+/// event log can never record: it has no way to know its own response
+/// failed to reach or decode on the desktop, or that the desktop couldn't
+/// even connect to it in the first place. A real report showed "Копировать
+/// лог" exporting an empty daemon event log while the visible error was
+/// still the generic fallback - i.e. exactly this class of failure with no
+/// diagnostic trail at all. Only ever fed text this module already treats
+/// as safe to show the user (see `DaemonError`'s doc comment), plus raw
+/// reqwest/io/serde error text, which for a fixed loopback URL and a body
+/// sent separately from the URL never carries the subscription URL or
+/// token. Best-effort and bounded: a logging failure must never break the
+/// request that triggered it.
+const LOW_LEVEL_LOG_FILE_NAME: &str = "client-errors.log";
+const MAX_LOW_LEVEL_LOG_BYTES: u64 = 262_144;
+
+fn low_level_log_path() -> Option<std::path::PathBuf> {
+    multicore_platform::dirs::user_data_root()
+        .ok()
+        .map(|root| root.join("logs").join(LOW_LEVEL_LOG_FILE_NAME))
+}
+
+fn record_low_level(context: &str, detail: impl fmt::Display) {
+    if let Some(path) = low_level_log_path() {
+        write_low_level_entry(&path, context, detail);
+    }
+}
+
+fn write_low_level_entry(path: &std::path::Path, context: &str, detail: impl fmt::Display) {
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Deliberately not opened with `.append(true)`: on Windows that
+        // grants only FILE_APPEND_DATA, which can silently keep every write
+        // pinned to end-of-file even after `set_len(0)`, defeating rotation
+        // below. Tracking and seeking to the position ourselves (the same
+        // pattern multicore-daemon's PersistentEventSink already uses)
+        // avoids that entirely.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(path)?;
+        let mut offset = file.seek(std::io::SeekFrom::End(0))?;
+        if offset > MAX_LOW_LEVEL_LOG_BYTES {
+            file.set_len(0)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            offset = 0;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let line: String = format!("{timestamp}\t{context}\t{detail}")
+            .chars()
+            .map(|character| match character {
+                '\r' | '\n' | '\t' => ' ',
+                other => other,
+            })
+            .collect();
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        writeln!(file, "{line}")
+    })();
+}
+
+/// Everything `record_low_level` has captured since this log was last
+/// rotated, for the "Копировать лог" export to fold in alongside the
+/// daemon's own event log. `None` when nothing has been recorded yet or the
+/// file can't be read.
+pub(crate) fn read_low_level_log() -> Option<String> {
+    read_low_level_entries(&low_level_log_path()?)
+}
+
+fn read_low_level_entries(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .filter(|contents| !contents.trim().is_empty())
+}
 
 const STATUS_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
 const EVENTS_RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
@@ -297,6 +379,26 @@ impl DaemonError {
         }
     }
 
+    /// Same shape as `definitive_http`, but for a local HTTP status the
+    /// daemon returned with a body this module couldn't map to a known
+    /// error code. Only the numeric status is interpolated - never
+    /// anything from the response body - so, like `transport`, this is
+    /// safe to show verbatim instead of it being replaced by a generic
+    /// fallback that names no real cause.
+    fn definitive_http_with_status(status: reqwest::StatusCode) -> Self {
+        Self {
+            message: format!("Фоновый сервис ответил ошибкой (HTTP {}).", status.as_u16()),
+            kind: DaemonErrorKind::DefinitiveHttp,
+            specific: true,
+        }
+    }
+
+    /// No production call site builds a non-specific ambiguous error
+    /// anymore (every safe, locally-authored message now uses `transport`
+    /// instead - see its doc comment). Kept as a general-purpose test
+    /// double for exercising `requires_reconciliation()` independently of
+    /// `is_specific()`.
+    #[allow(dead_code)]
     pub(crate) fn ambiguous(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -621,7 +723,7 @@ impl HttpDaemonClient {
             status if status.is_server_error() => {
                 let code = error_code(response);
                 Err(if code == "profile_mutation_ambiguous" {
-                    DaemonError::ambiguous(
+                    DaemonError::transport(
                         "Изменение могло сохраниться. Обновляем состояние подписок.",
                     )
                 } else {
@@ -634,10 +736,7 @@ impl HttpDaemonClient {
             }
             status if !status.is_success() => {
                 let code = error_code(response);
-                Err(
-                    DaemonError::definitive_http("Фоновый сервис отклонил запрос подписки.")
-                        .with_known_code(&code),
-                )
+                Err(DaemonError::definitive_http_with_status(status).with_known_code(&code))
             }
             _ => decode_bounded_json(response, response_limit),
         }
@@ -650,11 +749,13 @@ impl HttpDaemonClient {
     ) -> Result<T, DaemonError> {
         let response = request.bearer_auth(&self.token).send().map_err(map_error)?;
         if !response.status().is_success() {
+            let status = response.status();
             let code = error_code(response);
-            return Err(
-                DaemonError::definitive_http("Фоновый сервис отклонил запрос.")
-                    .with_known_code(&code),
+            record_low_level(
+                "daemon_status_error",
+                format!("status={status} code={code:?}"),
             );
+            return Err(DaemonError::definitive_http_with_status(status).with_known_code(&code));
         }
         decode_bounded_json(response, response_limit)
     }
@@ -710,19 +811,25 @@ fn decode_bounded_json<T: DeserializeOwned>(
             .unwrap_or_default()
             .min(response_limit as u64) as usize,
     );
-    response
-        .take(response_limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| DaemonError::ambiguous("Не удалось прочитать ответ фонового сервиса."))?;
+    response.take(response_limit as u64 + 1).read_to_end(&mut bytes).map_err(|error| {
+        record_low_level("daemon_response_read_failed", &error);
+        DaemonError::transport("Не удалось прочитать ответ фонового сервиса.")
+    })?;
     if bytes.len() > response_limit {
         return Err(response_too_large());
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| DaemonError::ambiguous("Фоновый сервис вернул некорректный ответ."))
+    serde_json::from_slice(&bytes).map_err(|error| {
+        let snippet: String = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned();
+        record_low_level(
+            "daemon_response_decode_failed",
+            format!("{error}; body={snippet:?}"),
+        );
+        DaemonError::transport("Фоновый сервис вернул некорректный ответ.")
+    })
 }
 
 fn response_too_large() -> DaemonError {
-    DaemonError::ambiguous("Ответ фонового сервиса превышает допустимый размер.")
+    DaemonError::transport("Ответ фонового сервиса превышает допустимый размер.")
 }
 
 #[derive(Serialize)]
@@ -1025,6 +1132,7 @@ impl DaemonClient for HttpDaemonClient {
 }
 
 fn map_error(error: reqwest::Error) -> DaemonError {
+    record_low_level("daemon_request_failed", &error);
     if error.is_timeout() {
         DaemonError::transport("Фоновый сервис не ответил вовремя.")
     } else if error.is_connect() {
@@ -2091,6 +2199,14 @@ mod http_tests {
             assert!(!text.contains("https://"));
         }
 
+        // Regression coverage for a real bug report: an import failure whose
+        // code the client doesn't recognize used to fall all the way back
+        // to a generic "check your URL" message that named no real cause at
+        // all - and, worse, a request that failed even earlier (before the
+        // daemon ever attempted the subscription fetch) left the daemon's
+        // own event log completely empty too, so there was no diagnostic
+        // trail whatsoever. The numeric HTTP status alone is always safe to
+        // show (never anything from the body), so this must stay specific.
         let (base_url, server) =
             start_selection_server("500 Internal Server Error", r#"{"code":"unknown"}"#);
         let client = HttpDaemonClient::new(base_url, "import-token").expect("import client");
@@ -2098,7 +2214,8 @@ mod http_tests {
             .import_subscription("https://example.invalid/sub")
             .expect_err("import must fail");
         server.join().expect("import error server");
-        assert!(!error.is_specific());
+        assert!(error.is_specific());
+        assert!(error.to_string().contains("HTTP 500"));
     }
 
     #[test]
@@ -2350,5 +2467,54 @@ mod http_tests {
         server.join().unwrap();
         assert!(SUBSCRIPTION_MUTATION_TIMEOUT > REQUEST_TIMEOUT);
         assert!(SUBSCRIPTION_MUTATION_TIMEOUT >= Duration::from_secs(150));
+    }
+
+    #[test]
+    fn low_level_entries_accumulate_and_read_back_together() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("logs").join("client-errors.log");
+
+        assert_eq!(read_low_level_entries(&path), None);
+
+        write_low_level_entry(&path, "daemon_request_failed", "connection refused");
+        write_low_level_entry(&path, "daemon_response_decode_failed", "unexpected end of json");
+
+        let contents = read_low_level_entries(&path).expect("entries recorded");
+        assert!(contents.contains("daemon_request_failed"));
+        assert!(contents.contains("connection refused"));
+        assert!(contents.contains("daemon_response_decode_failed"));
+        assert!(contents.contains("unexpected end of json"));
+    }
+
+    #[test]
+    fn low_level_entry_control_characters_never_split_a_line() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("client-errors.log");
+
+        write_low_level_entry(&path, "daemon_response_decode_failed", "line one\nline two\ttabbed");
+
+        let contents = read_low_level_entries(&path).expect("entry recorded");
+        assert_eq!(contents.lines().count(), 1, "{contents:?}");
+    }
+
+    #[test]
+    fn low_level_log_rotates_instead_of_growing_without_bound() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("client-errors.log");
+
+        for _ in 0..64 {
+            write_low_level_entry(&path, "daemon_request_failed", "x".repeat(8_192));
+        }
+        let grown = std::fs::metadata(&path).expect("log exists").len();
+        assert!(grown > MAX_LOW_LEVEL_LOG_BYTES, "{grown}");
+
+        write_low_level_entry(&path, "daemon_request_failed", "after rotation");
+        let rotated = std::fs::metadata(&path).expect("log exists").len();
+        assert!(rotated < grown, "grown={grown} rotated={rotated}");
+        assert!(
+            read_low_level_entries(&path)
+                .expect("entry recorded")
+                .contains("after rotation")
+        );
     }
 }

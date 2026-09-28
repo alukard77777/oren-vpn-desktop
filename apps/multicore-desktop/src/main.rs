@@ -3040,10 +3040,19 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
 fn wire_copy_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     let weak = ui.as_weak();
     ui.on_copy_diagnostics(move || {
-        let text = model
+        let mut text = model
             .lock()
             .expect("view model lock")
             .diagnostics_export_text();
+        // Failures in the desktop-to-local-daemon HTTP call itself (couldn't
+        // connect, response didn't parse, ...) never produce a daemon-side
+        // event - the daemon has no way to know its own response failed to
+        // reach or decode here. Fold in the raw low-level log so this export
+        // still carries real diagnostic signal for exactly that case.
+        if let Some(low_level) = daemon::read_low_level_log() {
+            text.push_str("\n\n--- low-level ---\n");
+            text.push_str(&low_level);
+        }
         if clipboard_text::write_clipboard_text(text).is_err() {
             return;
         }
