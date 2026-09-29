@@ -45,6 +45,7 @@ pub struct AppPreferences {
     pub selections_by_profile: BTreeMap<String, BTreeMap<String, String>>,
     pub ambient_background: bool,
     pub auto_connect_on_startup: bool,
+    pub navigation_collapsed: bool,
 }
 
 impl Default for AppPreferences {
@@ -59,6 +60,8 @@ impl Default for AppPreferences {
             selections_by_profile: BTreeMap::new(),
             ambient_background: true,
             auto_connect_on_startup: false,
+            // First run starts with the icon-only rail.
+            navigation_collapsed: true,
         }
     }
 }
@@ -625,6 +628,7 @@ mod tests {
             )]),
             ambient_background: true,
             auto_connect_on_startup: true,
+            navigation_collapsed: false,
         };
 
         store.save(&expected).unwrap();
@@ -653,6 +657,7 @@ mod tests {
                 selections_by_profile: BTreeMap::new(),
                 ambient_background: true,
                 auto_connect_on_startup: false,
+                navigation_collapsed: true,
             }
         );
     }

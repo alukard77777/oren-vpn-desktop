@@ -272,6 +272,10 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-ready", 840, 720, ready),
         ("home-ready-min", 700, 620, ready),
+        ("home-nav-expanded", 840, 720, |ui| {
+            ready(ui);
+            ui.set_navigation_collapsed(false);
+        }),
         ("home-connected", 840, 720, connected),
         ("home-pending-selection", 840, 720, |ui| {
             connected(ui);

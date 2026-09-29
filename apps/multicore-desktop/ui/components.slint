@@ -199,6 +199,9 @@ export component RouteNodeRow inherits Rectangle {
     in property <string> supporting-text;
     in property <string> trailing-text;
     in property <string> trailing-tone: "neutral";
+    // No latency yet: a placeholder holds the value's place (pulsing while
+    // a measurement runs) instead of the number appearing from nowhere.
+    in property <bool> trailing-measuring: false;
     in property <string> selected-state-label: "выбрано";
     in property <string> pending-state-label: "выбор применяется";
     in property <string> state-label:
@@ -318,6 +321,19 @@ export component RouteNodeRow inherits Rectangle {
         font-weight: Theme.weight-regular;
         horizontal-alignment: right;
         vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    if root.trailing-text == "": Rectangle {
+        x: parent.width - self.width - 40px;
+        y: (parent.height - self.height) / 2;
+        width: 34px;
+        height: 8px;
+        border-radius: 4px;
+        background: Theme.text-muted;
+        opacity: root.trailing-measuring
+            ? 0.14 + 0.12 * (1 + sin(animation-tick() / 1200ms * 360deg)) / 2
+            : 0.14;
         accessible-role: none;
     }
 

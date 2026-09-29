@@ -52,6 +52,7 @@ component NavItem inherits Rectangle {
     in property <image> icon-source;
     in property <bool> active;
     in property <bool> enabled: true;
+    in property <bool> compact: false;
     callback activated();
 
     height: 44px;
@@ -74,15 +75,16 @@ component NavItem inherits Rectangle {
     }
 
     Image {
-        x: 16px;
+        x: root.compact ? (parent.width - self.width) / 2 : 16px;
         y: 12px;
         width: 20px;
         height: 20px;
         source: root.icon-source;
         image-fit: contain;
+        animate x { duration: 180ms; easing: ease-in-out; }
     }
 
-    Text {
+    if !root.compact: Text {
         x: 48px;
         width: parent.width - 60px;
         height: parent.height;
@@ -106,6 +108,58 @@ component NavItem inherits Rectangle {
             return reject;
         }
         nav-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
+component NavToggle inherits Rectangle {
+    in property <bool> collapsed;
+    callback activated();
+
+    height: 40px;
+    border-radius: 8px;
+    background: toggle-touch.has-hover ? #ffffff08 : transparent;
+    border-width: toggle-focus.has-focus ? 2px : 0px;
+    border-color: Theme.focus;
+    accessible-role: button;
+    accessible-label: root.collapsed ? "Развернуть меню" : "Свернуть меню";
+    accessible-action-default => { root.activated(); }
+
+    Path {
+        x: root.collapsed ? (parent.width - self.width) / 2 : 18px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        commands: root.collapsed ? "M 6 3 L 11 8 L 6 13" : "M 10 3 L 5 8 L 10 13";
+        stroke: toggle-touch.has-hover ? Theme.text-primary : Theme.text-muted;
+        stroke-width: 1.6px;
+        fill: transparent;
+        animate x { duration: 180ms; easing: ease-in-out; }
+    }
+
+    if !root.collapsed: Text {
+        x: 48px;
+        width: parent.width - 60px;
+        height: parent.height;
+        text: "Свернуть";
+        color: Theme.text-muted;
+        font-family: Theme.font-family;
+        font-size: Theme.type-metadata-size;
+        vertical-alignment: center;
+    }
+
+    toggle-focus := FocusScope {
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        toggle-touch := TouchArea { clicked => { root.activated(); } }
     }
 }
 
@@ -503,6 +557,8 @@ export component AppWindow inherits Window {
     in-out property <bool> auto-connect-on-startup: false;
     in property <string> preference-error;
     in-out property <bool> ambient-background-enabled: true;
+    // Icon-only navigation rail; collapsed on first run, remembered after.
+    in-out property <bool> navigation-collapsed: true;
     in-out property <bool> shell-active: true;
     in property <bool> reduced-motion: false;
     in property <string> system-name: "Windows";
@@ -724,15 +780,16 @@ export component AppWindow inherits Window {
                     background: transparent;
 
                     Image {
-                        x: 14px;
+                        x: root.navigation-collapsed ? 22px : 14px;
                         y: 12px;
                         width: 20px;
                         height: 20px;
                         source: @image-url("../assets/app-icon.svg");
                         image-fit: contain;
+                        animate x { duration: 180ms; easing: ease-in-out; }
                     }
 
-                    Text {
+                    if !root.navigation-collapsed: Text {
                         x: 42px;
                         width: 112px;
                         height: parent.height;
@@ -760,21 +817,27 @@ export component AppWindow inherits Window {
                 spacing: 0px;
 
         navigation-rail := Rectangle {
-            width: 176px;
+            width: root.navigation-collapsed ? 64px : 176px;
             background: #0a0c0f;
             border-color: Theme.line;
             border-width: 0px;
+            animate width { duration: 180ms; easing: ease-in-out; }
 
             VerticalLayout {
-                padding: 16px;
+                padding: root.navigation-collapsed ? 10px : 16px;
                 spacing: 8px;
 
-                NavItem { icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
-                NavItem { icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
-                NavItem { icon-source: @image-url("../assets/link.svg"); label: "Подписки"; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
-                NavItem { icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/link.svg"); label: "Подписки"; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
+
+                NavToggle {
+                    collapsed: root.navigation-collapsed;
+                    activated => { root.navigation-collapsed = !root.navigation-collapsed; }
+                }
             }
         }
 
@@ -1542,6 +1605,7 @@ export component AppWindow inherits Window {
                                         label: node.label;
                                         supporting-text: "";
                                         trailing-text: node.latency-text;
+                                        trailing-measuring: root.latency-check-loading;
                                         trailing-tone: node.latency-tone;
                                         selected: node.selected;
                                         pending: root.catalog-selection-pending && node.selected;

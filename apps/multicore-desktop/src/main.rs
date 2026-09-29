@@ -373,6 +373,10 @@ impl PersistenceTracker {
         self.desired.auto_connect_on_startup = enabled;
     }
 
+    fn set_navigation_collapsed(&mut self, collapsed: bool) {
+        self.desired.navigation_collapsed = collapsed;
+    }
+
     fn set_route_preferences(
         &mut self,
         profile: String,
@@ -767,6 +771,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_local_page(visible_page_name(&loaded_preferences.visible_page).into());
     ui.set_runtime_versions(env!("MULTICORE_RUNTIME_VERSIONS").into());
     ui.set_ambient_background_enabled(loaded_preferences.ambient_background);
+    ui.set_navigation_collapsed(loaded_preferences.navigation_collapsed);
     ui.set_auto_connect_on_startup(loaded_preferences.auto_connect_on_startup);
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
         client_area_animation_enabled(),
@@ -1618,6 +1623,7 @@ fn flush_preferences(
         let mut tracker = tracker.lock().expect("preference tracker lock");
         tracker.set_ambient_background(ui.get_ambient_background_enabled());
         tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
+        tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
         if let Some((profile, selected_group, selections)) = route_preferences {
             tracker.set_route_preferences(profile, selected_group, selections);
         }
@@ -1671,6 +1677,7 @@ fn wire_preference_persistence(
             let mut tracker = tracker.lock().expect("preference tracker lock");
             tracker.set_ambient_background(ui.get_ambient_background_enabled());
             tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
+            tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
             }
