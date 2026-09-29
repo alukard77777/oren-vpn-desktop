@@ -336,10 +336,19 @@ fn built_release_bundle_matches_updater_contract() {
 
     let inventory = extract_verified_bundle(&archive, &destination).unwrap();
 
-    assert_eq!(inventory.files(), 12);
-    assert!(
-        destination
-            .join("runtime/multicore-core-host.exe")
-            .is_file()
-    );
+    // Every payload file is listed in SHA256SUMS.txt, which is itself in the
+    // bundle; a fixed count broke once the dashboard (32 files) was bundled.
+    let listed = std::fs::read_to_string(destination.join("SHA256SUMS.txt"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(inventory.files(), listed + 1);
+    for required in [
+        "MultiCore.exe",
+        "runtime/multicore-core-host.exe",
+        "dashboard/index.html",
+    ] {
+        assert!(destination.join(required).is_file(), "{required}");
+    }
 }
