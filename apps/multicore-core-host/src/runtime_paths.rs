@@ -123,7 +123,10 @@ pub(crate) fn resolve_from(
     // package-root sibling of `cores` otherwise. Its presence is decided once, up front, so a
     // directory that appears only after that check can never be picked up mid-resolution.
     let dashboard = package_lexical.join("dashboard");
-    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok_and(|meta| meta.is_dir());
+    // Any entry counts as present, so a dashboard replaced by a link or junction is rejected
+    // by the reparse guard below rather than silently treated as absent (a directory symlink's
+    // own metadata is not `is_dir`).
+    let dashboard_present = fs::symlink_metadata(&dashboard).is_ok();
     let mut guards = Vec::new();
     for directory in [
         data_root,
