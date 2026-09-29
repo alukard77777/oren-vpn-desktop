@@ -76,6 +76,9 @@ export component PrimaryAction inherits Rectangle {
 export component QuietChip inherits Rectangle {
     in property <string> icon;
     in property <image> icon-image;
+    // The icon and label are centred as one group; a centred label with a
+    // left-pinned icon left a gap that varied with the label's length.
+    property <length> content-x: root.icon == "" ? Theme.space-4 : max(Theme.space-3, (root.width - 24px - chip-label.preferred-width) / 2);
     in property <string> label;
     in property <string> selected-state-label: "выбрано";
     in property <string> state-label:
@@ -133,7 +136,7 @@ export component QuietChip inherits Rectangle {
     }
 
     if root.icon-image.width > 0: Image {
-        x: Theme.space-3 + 1px;
+        x: root.content-x + 1px;
         y: (parent.height - self.height) / 2;
         width: 18px;
         height: 18px;
@@ -143,7 +146,7 @@ export component QuietChip inherits Rectangle {
     }
 
     if root.icon != "" && root.icon-image.width == 0: Text {
-        x: Theme.space-3;
+        x: root.content-x;
         width: 20px;
         height: parent.height;
         text: root.icon;
@@ -156,7 +159,7 @@ export component QuietChip inherits Rectangle {
     }
 
     chip-label := Text {
-        x: root.icon == "" ? Theme.space-4 : 36px;
+        x: root.icon == "" ? Theme.space-4 : root.content-x + 24px;
         width: parent.width - self.x - Theme.space-4;
         height: parent.height;
         text: root.label;
@@ -164,7 +167,7 @@ export component QuietChip inherits Rectangle {
         font-family: Theme.font-family;
         font-size: Theme.type-metadata-size;
         font-weight: root.selected ? Theme.weight-semibold : Theme.weight-regular;
-        horizontal-alignment: center;
+        horizontal-alignment: root.icon == "" ? center : left;
         vertical-alignment: center;
         overflow: elide;
         accessible-role: none;

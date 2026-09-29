@@ -1458,17 +1458,7 @@ impl DesktopViewModel {
             (None, Some(total)) => format!("— / {}", format_gib(total)),
             _ => "Нет данных".into(),
         };
-        let expiry = info.expires_at_unix.map_or_else(
-            || "Срок неизвестен".into(),
-            |expires| {
-                if expires <= now_unix {
-                    "Срок истёк".into()
-                } else {
-                    let days = (expires - now_unix).div_ceil(86_400);
-                    format!("Осталось {days} {}", russian_days(days))
-                }
-            },
-        );
+        let expiry = format_expiry(info.expires_at_unix, now_unix);
         let updated = format_update_date(info.updated_at_unix);
         let updated_stale = info.updated_at_unix != 0
             && now_unix
@@ -2924,18 +2914,7 @@ fn present_subscription_profile(
         (None, Some(total)) => format!("— / {}", format_gib(total)),
         (None, None) => "Нет данных".into(),
     };
-    let expiry = profile.expires_at_unix.map_or_else(
-        || "Срок неизвестен".into(),
-        |expires| {
-            let now = current_unix_time();
-            if expires <= now {
-                "Срок истёк".into()
-            } else {
-                let days = (expires - now).div_ceil(86_400);
-                format!("Осталось {days} {}", russian_days(days))
-            }
-        },
-    );
+    let expiry = format_expiry(profile.expires_at_unix, current_unix_time());
     Some(SubscriptionProfilePresentation {
         id,
         active: profile.active,
@@ -3042,6 +3021,25 @@ fn local_logo_path(value: &str) -> Option<String> {
         return None;
     }
     Path::new(value).is_absolute().then(|| value.to_owned())
+}
+
+/// Providers mark unlimited subscriptions with an expiry decades away; a
+/// real one reported "Осталось 12073 дня".
+const UNLIMITED_EXPIRY_DAYS: u64 = 10 * 365;
+
+fn format_expiry(expires_at_unix: Option<u64>, now_unix: u64) -> String {
+    let Some(expires) = expires_at_unix else {
+        return "Срок неизвестен".into();
+    };
+    if expires <= now_unix {
+        return "Срок истёк".into();
+    }
+    let days = (expires - now_unix).div_ceil(86_400);
+    if days > UNLIMITED_EXPIRY_DAYS {
+        "Бессрочно".into()
+    } else {
+        format!("Осталось {days} {}", russian_days(days))
+    }
 }
 
 fn russian_days(days: u64) -> &'static str {
@@ -4407,7 +4405,7 @@ mod tests {
         assert!(app.contains("routes-heading := HorizontalLayout"));
         assert!(app.contains("route-updated-meta := Text"));
         assert!(app.contains(
-            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated;"
+            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated == \"Не обновлялась\" ? root.subscription-updated : \"Обновлено \" + root.subscription-updated;"
         ));
         assert!(app.contains(
             "color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;"
@@ -5976,6 +5974,20 @@ mod tests {
         assert!(!source.contains(
             "enabled: root.catalog-selection-enabled;\n                            checkable: true;"
         ));
+    }
+
+    #[test]
+    fn expiry_decades_away_reads_as_unlimited() {
+        let now = 1_790_000_000;
+        let day = 86_400;
+        assert_eq!(format_expiry(None, now), "Срок неизвестен");
+        assert_eq!(format_expiry(Some(now), now), "Срок истёк");
+        assert_eq!(format_expiry(Some(now + day), now), "Осталось 1 день");
+        assert_eq!(
+            format_expiry(Some(now + UNLIMITED_EXPIRY_DAYS * day), now),
+            "Осталось 3650 дней"
+        );
+        assert_eq!(format_expiry(Some(now + 12_073 * day), now), "Бессрочно");
     }
 
     #[test]

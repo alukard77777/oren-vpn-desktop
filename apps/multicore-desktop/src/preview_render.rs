@@ -190,7 +190,7 @@ fn ready(ui: &AppWindow) {
     ui.set_subscription_title(s("Локальный профиль"));
     ui.set_subscription_usage(s("874.9 GiB"));
     ui.set_subscription_expiry(s("Срок неизвестен"));
-    ui.set_subscription_updated(s("Обновлено 27.09"));
+    ui.set_subscription_updated(s("27.09.2026"));
     ui.set_subscription_refresh_available(true);
     ui.set_subscription_refresh_enabled(true);
     ui.set_subscription_management_enabled(true);

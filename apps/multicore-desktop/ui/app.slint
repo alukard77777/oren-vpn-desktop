@@ -1500,7 +1500,7 @@ export component AppWindow inherits Window {
                                     width: 140px;
                                     height: 28px;
                                     horizontal-stretch: 0;
-                                    text: root.latency-check-loading ? "Замеряем задержку…" : root.subscription-updated;
+                                    text: root.latency-check-loading ? "Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? root.subscription-updated : "Обновлено " + root.subscription-updated;
                                     color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
                                     horizontal-alignment: right;

@@ -4467,7 +4467,8 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("ScrollView {").next())
             .expect("routes header source");
-        assert!(routes_header.contains(": root.subscription-updated;"));
+        // The bare date ("29.09.2026") next to "Маршруты" read as unexplained.
+        assert!(routes_header.contains(": \"Обновлено \" + root.subscription-updated;"));
         assert!(routes_header.contains("root.subscription-updated-stale ? Theme.warning"));
         assert!(routes_header.contains("horizontal-alignment: right;"));
         assert!(
