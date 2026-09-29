@@ -8,6 +8,8 @@ mod unix_runtime_paths;
 mod unix_socket;
 #[cfg(windows)]
 mod windows_pipe;
+#[cfg(windows)]
+mod wintun_cleanup;
 
 #[cfg(any(windows, unix))]
 fn main() {

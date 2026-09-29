@@ -45,6 +45,14 @@ impl Controller for ProductionController {
             self._validated_files
                 .verify_unchanged()
                 .map_err(|_| BrokerErrorCode::NotReady)?;
+            #[cfg(windows)]
+            if engine == Engine::Mihomo
+                && let crate::wintun_cleanup::PhantomCleanup::Failed(code) =
+                    crate::wintun_cleanup::remove_phantom_tun_adapter()
+            {
+                // Best effort: Mihomo still starts, only slower (see the module docs).
+                eprintln!("stale TUN adapter could not be removed (CONFIGRET {code})");
+            }
             self.controller
                 .start(engine)
                 .await

@@ -7,6 +7,8 @@ const WINDOWS_PIPE: &str = include_str!("../src/windows_pipe.rs");
 mod runtime_host;
 #[path = "../src/runtime_paths.rs"]
 mod runtime_paths;
+#[path = "../src/wintun_cleanup.rs"]
+mod wintun_cleanup;
 
 #[path = "../src/windows_pipe.rs"]
 #[allow(dead_code)]

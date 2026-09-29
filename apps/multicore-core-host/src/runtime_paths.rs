@@ -198,8 +198,12 @@ pub(crate) fn resolve_from(
     Ok(ResolvedRuntime {
         data_root: canonical_data.clone(),
         paths: RuntimePaths {
-            xray_binary: fs::canonicalize(xray).map_err(|_| ResolveError::Missing)?,
-            mihomo_binary: fs::canonicalize(mihomo).map_err(|_| ResolveError::Missing)?,
+            xray_binary: launchable_program_path(
+                fs::canonicalize(xray).map_err(|_| ResolveError::Missing)?,
+            ),
+            mihomo_binary: launchable_program_path(
+                fs::canonicalize(mihomo).map_err(|_| ResolveError::Missing)?,
+            ),
             xray_config: fs::canonicalize(xray_config).map_err(|_| ResolveError::Missing)?,
             mihomo_config: fs::canonicalize(mihomo_config).map_err(|_| ResolveError::Missing)?,
             dashboard_directory,
@@ -222,6 +226,25 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
         PathBuf::from(rest)
     } else {
         path
+    }
+}
+
+/// The path a core is launched from. Mihomo's TUN (sing-tun, `stack: system`)
+/// adds its own inbound Windows Firewall rule for its executable path, and
+/// that fails silently for a `\\?\`-prefixed path: launched that way no rule
+/// was created and the firewall dropped the connections the TUN redirects to
+/// Mihomo, so on a machine without a leftover rule most traffic (Telegram,
+/// browsers) failed while connected. From the plain path the rule is
+/// created. The files stay guarded and were checked against their canonical
+/// paths above; the prefix is only kept when the plain form would exceed
+/// `MAX_PATH`.
+fn launchable_program_path(canonical: PathBuf) -> PathBuf {
+    const MAX_PATH: usize = 260;
+    let plain = strip_verbatim_prefix(canonical.clone());
+    if plain.as_os_str().len() < MAX_PATH {
+        plain
+    } else {
+        canonical
     }
 }
 
@@ -430,6 +453,19 @@ mod tests {
             PathBuf::from(r"C:\Users\Example\dashboard")
         );
     }
+    #[test]
+    fn cores_launch_from_plain_paths_unless_too_long() {
+        assert_eq!(
+            launchable_program_path(PathBuf::from(r"\\?\C:\Users\Example\cores\mihomo.exe")),
+            PathBuf::from(r"C:\Users\Example\cores\mihomo.exe")
+        );
+        let long = format!(r"\\?\C:\{}\mihomo.exe", "d".repeat(300));
+        assert_eq!(
+            launchable_program_path(PathBuf::from(&long)),
+            PathBuf::from(&long)
+        );
+    }
+
     #[test]
     fn rejects_a_dashboard_directory_replaced_with_a_reparse_point() {
         let (_r, d, h) = fixture();
