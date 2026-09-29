@@ -7011,7 +7011,7 @@ mod tests {
         assert!(title_subscription.contains("root.refresh-subscription();"));
         assert!(title_subscription.contains("announcement-bell := FocusScope"));
         assert!(title_subscription.contains("root.announcement-open = !root.announcement-open;"));
-        assert!(title_subscription.contains("animate x { duration: 180ms; easing: ease-in-out; }"));
+        assert!(title_subscription.contains("animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
         assert!(pill_mesh.contains("opacity: self.active ? 1 : 0;"));
         assert!(!pill_mesh.contains("opacity: self.active ? 1 : 0.1;"));
         assert!(!source.contains("cursor-glow-field := Rectangle"));

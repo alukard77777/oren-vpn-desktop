@@ -90,7 +90,7 @@ component NavItem inherits Rectangle {
         source: root.icon-source;
         colorize: root.active || nav-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
         image-fit: contain;
-        animate x { duration: 180ms; easing: ease-in-out; }
+        animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         animate colorize { duration: 140ms; easing: ease-out; }
     }
 
@@ -111,7 +111,7 @@ component NavItem inherits Rectangle {
         visible: self.opacity > 0;
         accessible-role: none;
         animate opacity { duration: root.compact ? 80ms : 160ms; delay: root.compact ? 0ms : 90ms; easing: ease-out; }
-        animate x { duration: 180ms; easing: ease-in-out; }
+        animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
         animate color { duration: 140ms; easing: ease-out; }
     }
 
@@ -169,7 +169,7 @@ component NavToggle inherits Rectangle {
         stroke: toggle-touch.has-hover ? Theme.text-primary : Theme.text-muted;
         stroke-width: 1.6px;
         fill: transparent;
-        animate x { duration: 180ms; easing: ease-in-out; }
+        animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     }
 
     Text {
@@ -885,7 +885,7 @@ export component AppWindow inherits Window {
                     height: parent.height;
                     background: Theme.line;
                     opacity: root.navigation-collapsed ? 0 : 1;
-                    animate x { duration: 180ms; easing: ease-in-out; }
+                    animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                     animate opacity { duration: 160ms; easing: ease-out; }
                 }
 
@@ -903,7 +903,7 @@ export component AppWindow inherits Window {
                         height: 20px;
                         source: @image-url("../assets/app-icon.svg");
                         image-fit: contain;
-                        animate x { duration: 180ms; easing: ease-in-out; }
+                        animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                     }
 
                     if !root.navigation-collapsed: Text {
@@ -936,7 +936,7 @@ export component AppWindow inherits Window {
                     y: 8px;
                     width: Math.max(0px, parent.width - self.x - 148px);
                     height: 28px;
-                    animate x { duration: 180ms; easing: ease-in-out; }
+                    animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
                     subscription-chip := Rectangle {
                         x: 0;
@@ -1158,7 +1158,7 @@ export component AppWindow inherits Window {
             background: #0a0c0f;
             border-color: Theme.line;
             border-width: 0px;
-            animate width { duration: 180ms; easing: ease-in-out; }
+            animate width { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
             Rectangle { x: parent.width - 1px; y: 0; width: 1px; height: parent.height; background: Theme.line; }
 
