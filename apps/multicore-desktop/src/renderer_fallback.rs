@@ -27,6 +27,8 @@ pub fn software_renderer_requested() -> bool {
         || marker_path().is_some_and(|path| path.is_file())
 }
 
+/// Linux selects its backend in `select_linux_backend`, passing the renderer.
+#[cfg(not(target_os = "linux"))]
 pub fn select_software_renderer() -> Result<(), slint::PlatformError> {
     slint::BackendSelector::new()
         .backend_name("winit".into())
