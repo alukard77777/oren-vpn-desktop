@@ -534,6 +534,13 @@ fn scenarios() -> Vec<Scenario> {
         ("settings-min", 700, 620, |ui| {
             ready(ui);
             ui.set_local_page(s("settings"));
+            ui.set_tun_toggle_available(true);
+        }),
+        ("settings-proxy-mode", 840, 720, |ui| {
+            ready(ui);
+            ui.set_local_page(s("settings"));
+            ui.set_tun_toggle_available(true);
+            ui.set_tun_enabled(false);
         }),
         ("settings-updates", 840, 720, |ui| {
             ready(ui);

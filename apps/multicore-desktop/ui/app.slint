@@ -616,6 +616,9 @@ export component AppWindow inherits Window {
     in property <bool> launch-at-sign-in-stale: false;
     in property <string> launch-at-sign-in-error;
     in-out property <bool> auto-connect-on-startup: false;
+    // TUN (all traffic) vs the system proxy without an administrator prompt; next connect.
+    in-out property <bool> tun-enabled: true;
+    in property <bool> tun-toggle-available: false;
     in property <string> preference-error;
     in-out property <bool> ambient-background-enabled: true;
     // Icon-only navigation rail; collapsed on first run, remembered after.
@@ -2047,6 +2050,18 @@ export component AppWindow inherits Window {
                             padding-top: 4px;
                             padding-bottom: 4px;
                             spacing: 0px;
+                            if root.tun-toggle-available: ToggleRow {
+                                label: "Режим TUN — весь трафик";
+                                description: root.toggle-on || root.toggle-busy
+                                    ? "Применится при следующем подключении"
+                                    : root.tun-enabled
+                                        ? "Все приложения идут через VPN"
+                                        : "Только программы с системным прокси · без прав администратора";
+                                checked: root.tun-enabled;
+                                // The mode is chosen at connect time, so it is locked while connected.
+                                enabled: !root.toggle-on && !root.toggle-busy && !root.profile-menu-open;
+                                toggled(value) => { root.tun-enabled = value; }
+                            }
                             ToggleRow {
                                 label: "Запускать при входе в " + root.system-name;
                                 description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "Открывать MultiCore после входа в систему";

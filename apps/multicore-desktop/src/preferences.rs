@@ -49,6 +49,9 @@ pub struct AppPreferences {
     /// Fingerprint of the last provider notice shown, so a new notice opens its
     /// popover once on launch. A hash, never the text (notices may carry links).
     pub announcement_seen: Option<String>,
+    /// TUN (all traffic) or, when off, the system proxy without an administrator prompt.
+    /// Applies from the next connect.
+    pub tun_enabled: bool,
 }
 
 impl Default for AppPreferences {
@@ -66,6 +69,7 @@ impl Default for AppPreferences {
             // First run starts with the icon-only rail.
             navigation_collapsed: true,
             announcement_seen: None,
+            tun_enabled: true,
         }
     }
 }
@@ -634,6 +638,7 @@ mod tests {
             auto_connect_on_startup: true,
             navigation_collapsed: false,
             announcement_seen: Some("9f2c1d0a44b1e3c7".into()),
+            tun_enabled: false,
         };
 
         store.save(&expected).unwrap();
@@ -664,8 +669,16 @@ mod tests {
                 auto_connect_on_startup: false,
                 navigation_collapsed: true,
                 announcement_seen: None,
+                tun_enabled: true,
             }
         );
+    }
+
+    #[test]
+    fn older_preferences_keep_tun_mode() {
+        let old = br#"{"schema_version":1,"auto_connect_on_startup":true}"#;
+        let loaded: AppPreferences = serde_json::from_slice(old).unwrap();
+        assert!(loaded.tun_enabled);
     }
 
     #[test]

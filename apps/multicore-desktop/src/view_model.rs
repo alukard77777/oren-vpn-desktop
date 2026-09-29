@@ -2824,6 +2824,7 @@ fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPres
         Some("starting") => ("Запуск", "warning"),
         Some("failed") => ("Сбой", "danger"),
         Some("unsupported") => ("Без проверки", "neutral"),
+        Some("disabled") => ("Выключен", "neutral"),
         Some("stopped") => ("Выкл", "neutral"),
         Some(_) => ("Неизвестно", "danger"),
         None => ("Нет данных", "neutral"),
@@ -6637,6 +6638,40 @@ mod tests {
             settings.find("settings-scroll := ScrollView").unwrap()
                 < settings.find("settings-content := VerticalLayout").unwrap()
         );
+    }
+
+    #[test]
+    fn a_disabled_tun_reads_as_switched_off_not_as_a_failure() {
+        let check = super::present_runtime_check(Some("disabled"), false);
+        assert_eq!(check.value, "Выключен");
+        assert_eq!(check.tone, "neutral");
+    }
+
+    #[test]
+    fn tun_mode_toggle_is_windows_only_locked_while_connected_and_persisted() {
+        let app = include_str!("../ui/app.slint");
+        let main = include_str!("main.rs");
+        let row = app
+            .split("if root.tun-toggle-available: ToggleRow {")
+            .nth(1)
+            .and_then(|source| source.split("toggled(value)").next())
+            .expect("TUN mode row");
+        assert!(row.contains("label: \"Режим TUN — весь трафик\";"));
+        assert!(row.contains("enabled: !root.toggle-on && !root.toggle-busy"));
+        assert!(row.contains("\"Применится при следующем подключении\""));
+        // First row of the general settings card.
+        assert!(
+            app.find("if root.tun-toggle-available: ToggleRow {")
+                .unwrap()
+                < app
+                    .find("label: \"Запускать при входе в \" + root.system-name;")
+                    .unwrap()
+        );
+        assert!(main.contains("ui.set_tun_toggle_available(cfg!(windows));"));
+        assert!(main.contains("ui.set_tun_enabled(loaded_preferences.tun_enabled);"));
+        assert!(main.contains("tracker.set_tun_enabled(ui.get_tun_enabled());"));
+        assert!(main.contains("client.connect_with_tun(tun)"));
+        assert!(main.contains("!ui.get_tun_toggle_available() || ui.get_tun_enabled()"));
     }
 
     #[test]

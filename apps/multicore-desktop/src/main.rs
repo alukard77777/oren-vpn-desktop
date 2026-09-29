@@ -379,6 +379,10 @@ impl PersistenceTracker {
         self.desired.navigation_collapsed = collapsed;
     }
 
+    fn set_tun_enabled(&mut self, enabled: bool) {
+        self.desired.tun_enabled = enabled;
+    }
+
     fn set_announcement_seen(&mut self, fingerprint: String) {
         self.desired.announcement_seen = (!fingerprint.is_empty()).then_some(fingerprint);
     }
@@ -778,6 +782,9 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_runtime_versions(env!("MULTICORE_RUNTIME_VERSIONS").into());
     ui.set_ambient_background_enabled(loaded_preferences.ambient_background);
     ui.set_navigation_collapsed(loaded_preferences.navigation_collapsed);
+    ui.set_tun_enabled(loaded_preferences.tun_enabled);
+    // The TUN-off (system proxy) mode exists on Windows only.
+    ui.set_tun_toggle_available(cfg!(windows));
     ui.set_announcement_seen(
         loaded_preferences
             .announcement_seen
@@ -1639,6 +1646,7 @@ fn flush_preferences(
         tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
         tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
         tracker.set_announcement_seen(ui.get_announcement_seen().into());
+        tracker.set_tun_enabled(ui.get_tun_enabled());
         if let Some((profile, selected_group, selections)) = route_preferences {
             tracker.set_route_preferences(profile, selected_group, selections);
         }
@@ -1694,6 +1702,7 @@ fn wire_preference_persistence(
             tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
             tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
             tracker.set_announcement_seen(ui.get_announcement_seen().into());
+            tracker.set_tun_enabled(ui.get_tun_enabled());
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
             }
@@ -2890,7 +2899,8 @@ fn wire_primary_action(
 
         match action {
             Some((PrimaryAction::Connect, mutation)) => {
-                run_connect(weak.clone(), model.clone(), client, mutation, queued);
+                let tun = weak.upgrade().is_none_or(|ui| connect_uses_tun(&ui));
+                run_connect(weak.clone(), model.clone(), client, mutation, queued, tun);
             }
             Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)) => {
                 run_disconnect(weak.clone(), model.clone(), client, mutation);
@@ -3399,15 +3409,21 @@ fn run_import(
     });
 }
 
+/// The mode for the next connect: TUN unless the user switched it off (Windows only).
+fn connect_uses_tun(ui: &AppWindow) -> bool {
+    !ui.get_tun_toggle_available() || ui.get_tun_enabled()
+}
+
 fn run_connect(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
     queued: Vec<QueuedNodeSelection>,
+    tun: bool,
 ) {
     thread::spawn(move || {
-        let result = client.connect();
+        let result = client.connect_with_tun(tun);
         let connect_succeeded = result.is_ok();
         let queued_results = if connect_succeeded {
             queued

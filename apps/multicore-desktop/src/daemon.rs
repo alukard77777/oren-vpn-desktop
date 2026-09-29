@@ -559,6 +559,13 @@ pub trait DaemonClient: Send + Sync {
     /// never interprets Xray JSON or constructs proxy mappings.
     fn connect(&self) -> Result<DaemonStatus, DaemonError>;
 
+    /// POST /v1/connect choosing the mode: `tun == false` connects through the system proxy
+    /// without an administrator prompt (Windows).
+    fn connect_with_tun(&self, tun: bool) -> Result<DaemonStatus, DaemonError> {
+        let _ = tun;
+        self.connect()
+    }
+
     /// POST /v1/disconnect.
     fn disconnect(&self) -> Result<DaemonStatus, DaemonError>;
 
@@ -900,6 +907,11 @@ fn response_too_large() -> DaemonError {
 }
 
 #[derive(Serialize)]
+struct ConnectRequest {
+    tun: bool,
+}
+
+#[derive(Serialize)]
 struct ImportRequest<'a> {
     url: &'a str,
 }
@@ -1063,11 +1075,21 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn connect(&self) -> Result<DaemonStatus, DaemonError> {
-        self.parse_status(
-            self.http
-                .post(self.endpoint("/v1/connect"))
-                .timeout(self.connect_request_timeout),
-        )
+        self.connect_with_tun(true)
+    }
+
+    fn connect_with_tun(&self, tun: bool) -> Result<DaemonStatus, DaemonError> {
+        let request = self
+            .http
+            .post(self.endpoint("/v1/connect"))
+            .timeout(self.connect_request_timeout);
+        // TUN is the daemon's default, so only the proxy mode sends a body.
+        let request = if tun {
+            request
+        } else {
+            request.json(&ConnectRequest { tun })
+        };
+        self.parse_status(request)
     }
 
     fn disconnect(&self) -> Result<DaemonStatus, DaemonError> {
@@ -2511,6 +2533,27 @@ mod http_tests {
             }
         });
         (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn connect_sends_the_mode_only_when_tun_is_off() {
+        let (base_url, server) = start_server(2);
+        let client = HttpDaemonClient::new(base_url, "token").unwrap();
+        client.connect_with_tun(true).unwrap();
+        client.connect_with_tun(false).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("POST /v1/connect "));
+        assert!(
+            !requests[0]
+                .to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
+        assert!(requests[1].starts_with("POST /v1/connect "));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("content-length: 13")
+        );
     }
 
     #[test]
