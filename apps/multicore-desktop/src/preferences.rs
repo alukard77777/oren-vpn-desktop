@@ -46,6 +46,9 @@ pub struct AppPreferences {
     pub ambient_background: bool,
     pub auto_connect_on_startup: bool,
     pub navigation_collapsed: bool,
+    /// Fingerprint of the last provider notice shown, so a new notice opens its
+    /// popover once on launch. A hash, never the text (notices may carry links).
+    pub announcement_seen: Option<String>,
 }
 
 impl Default for AppPreferences {
@@ -62,6 +65,7 @@ impl Default for AppPreferences {
             auto_connect_on_startup: false,
             // First run starts with the icon-only rail.
             navigation_collapsed: true,
+            announcement_seen: None,
         }
     }
 }
@@ -629,6 +633,7 @@ mod tests {
             ambient_background: true,
             auto_connect_on_startup: true,
             navigation_collapsed: false,
+            announcement_seen: Some("9f2c1d0a44b1e3c7".into()),
         };
 
         store.save(&expected).unwrap();
@@ -658,6 +663,7 @@ mod tests {
                 ambient_background: true,
                 auto_connect_on_startup: false,
                 navigation_collapsed: true,
+                announcement_seen: None,
             }
         );
     }

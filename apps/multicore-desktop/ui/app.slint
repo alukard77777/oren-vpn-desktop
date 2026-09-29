@@ -644,6 +644,8 @@ export component AppWindow inherits Window {
     in-out property <string> update-banner-dismissed-for;
     // Provider notice popover, opened from the title-bar bell.
     in-out property <bool> announcement-open: false;
+    // Fingerprint of the notice last shown (persisted); see announcement_fingerprint.
+    in-out property <string> announcement-seen;
     in property <bool> conflicting-apps-banner-visible: false;
     in property <string> conflicting-apps-message;
     in-out property <bool> update-confirm-open: false;

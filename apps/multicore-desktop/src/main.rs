@@ -379,6 +379,10 @@ impl PersistenceTracker {
         self.desired.navigation_collapsed = collapsed;
     }
 
+    fn set_announcement_seen(&mut self, fingerprint: String) {
+        self.desired.announcement_seen = (!fingerprint.is_empty()).then_some(fingerprint);
+    }
+
     fn set_route_preferences(
         &mut self,
         profile: String,
@@ -774,6 +778,13 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_runtime_versions(env!("MULTICORE_RUNTIME_VERSIONS").into());
     ui.set_ambient_background_enabled(loaded_preferences.ambient_background);
     ui.set_navigation_collapsed(loaded_preferences.navigation_collapsed);
+    ui.set_announcement_seen(
+        loaded_preferences
+            .announcement_seen
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_auto_connect_on_startup(loaded_preferences.auto_connect_on_startup);
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
         client_area_animation_enabled(),
@@ -1627,6 +1638,7 @@ fn flush_preferences(
         tracker.set_ambient_background(ui.get_ambient_background_enabled());
         tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
         tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
+        tracker.set_announcement_seen(ui.get_announcement_seen().into());
         if let Some((profile, selected_group, selections)) = route_preferences {
             tracker.set_route_preferences(profile, selected_group, selections);
         }
@@ -1681,6 +1693,7 @@ fn wire_preference_persistence(
             tracker.set_ambient_background(ui.get_ambient_background_enabled());
             tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
             tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
+            tracker.set_announcement_seen(ui.get_announcement_seen().into());
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
             }
@@ -4054,6 +4067,19 @@ fn toggle_presentation(presentation: &StatePresentation) -> TogglePresentation {
     }
 }
 
+/// Stable 64-bit FNV-1a fingerprint of a provider notice (`None` when there is
+/// none). Stable across Rust versions, unlike `DefaultHasher`.
+fn announcement_fingerprint(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    Some(format!("{hash:016x}"))
+}
+
 /// Splits a leading emoji (a provider flag) off `name` as an image, since the UI
 /// font draws regional-indicator flags as letters ("AL").
 fn split_leading_emoji_image(name: &str) -> (slint::Image, &str) {
@@ -4104,6 +4130,14 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_updated(snapshot.subscription.updated.clone().into());
     ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
+    // A notice the user has not seen yet opens its popover once, on launch or
+    // when a refresh brings a new one; an unchanged notice stays behind the bell.
+    if let Some(fingerprint) = announcement_fingerprint(&snapshot.subscription.announcement_text)
+        && ui.get_announcement_seen().as_str() != fingerprint
+    {
+        ui.set_announcement_seen(fingerprint.into());
+        ui.set_announcement_open(true);
+    }
     ui.set_subscription_announcement_tone(snapshot.subscription.announcement_tone.clone().into());
     let referenced_logo_paths = snapshot
         .subscription
@@ -6000,6 +6034,25 @@ mod window_tests {
             .find("single_instance::claim_or_forward(&activation)")
             .expect("single-instance forwarding");
         assert!(repair < forwarding);
+    }
+
+    #[test]
+    fn announcement_fingerprint_is_stable_and_ignores_blank_notices() {
+        assert_eq!(super::announcement_fingerprint("   "), None);
+        assert_eq!(super::announcement_fingerprint(""), None);
+        // FNV-1a 64 of "a" (reference value).
+        assert_eq!(
+            super::announcement_fingerprint("a").as_deref(),
+            Some("af63dc4c8601ec8c")
+        );
+        assert_eq!(
+            super::announcement_fingerprint(" Работы в 23:00 "),
+            super::announcement_fingerprint("Работы в 23:00")
+        );
+        assert_ne!(
+            super::announcement_fingerprint("Работы в 23:00"),
+            super::announcement_fingerprint("Работы в 22:00")
+        );
     }
 
     #[test]
