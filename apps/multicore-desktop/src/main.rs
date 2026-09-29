@@ -5437,8 +5437,8 @@ mod window_tests {
             "VisiblePage::Subscriptions => \"subscriptions\"",
             "\"subscriptions\" => Some(VisiblePage::Subscriptions)",
             "Subscriptions,",
-            "if root.visible-page == \"settings\" && root.settings-section == \"general\"",
-            "if root.visible-page == \"settings\" && root.settings-section == \"updates\"",
+            "if root.visible-page == \"settings\": Rectangle {",
+            "if (root.settings-section == \"updates\") {",
         ] {
             assert!(
                 ui.contains(required) || rust.contains(required) || preferences.contains(required),
