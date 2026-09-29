@@ -136,7 +136,13 @@ function Invoke-PinnedRustBuild {
         $encodedFlags = @(
             "--remap-path-prefix=$RepositoryRoot=multicore-src",
             "--remap-path-prefix=$userProfile=builder-home",
-            '-Clink-arg=/PDBALTPATH:multicore.pdb'
+            '-Clink-arg=/PDBALTPATH:multicore.pdb',
+            # Link the MSVC C runtime statically. Otherwise every shipped exe
+            # imports vcruntime140.dll, which Windows does not include (it
+            # comes only with the Visual C++ Redistributable): on a clean
+            # Windows 10 install the daemon died at startup with
+            # STATUS_DLL_NOT_FOUND (0xC0000135) before doing anything.
+            '-Ctarget-feature=+crt-static'
         )
         $env:CARGO_ENCODED_RUSTFLAGS = $encodedFlags -join [char]0x1f
         $nativePathFlags = "/experimental:deterministic /pathmap:$userProfile=builder-home /d1trimfile:$userProfile\"

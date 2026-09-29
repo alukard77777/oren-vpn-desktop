@@ -95,7 +95,7 @@ impl DirectoryCapability {
 
     pub(crate) fn open_child(&self, name: &OsStr) -> io::Result<Self> {
         validate_component(name)?;
-        open_child(self, name, self.repair_permissions)
+        open_child(self, name, self.repair_permissions, false)
     }
 
     pub(crate) fn create_child(&self, name: &OsStr) -> io::Result<Self> {
@@ -103,6 +103,20 @@ impl DirectoryCapability {
         validate_component(name)?;
         create_child(self, name)?;
         self.open_child(name)
+    }
+
+    /// Like `create_child`, but the returned capability may later be passed
+    /// to `rename_child` as the source. Only such a staging capability holds
+    /// DELETE access: Windows 10 refuses to rename a directory with os error
+    /// 32 while its *parent* is held open with DELETE access (Windows 11
+    /// allows it), so every other long-lived directory handle - in
+    /// particular each store root that staging directories are published
+    /// into - must be opened without it.
+    pub(crate) fn create_child_for_rename(&self, name: &OsStr) -> io::Result<Self> {
+        self.require_mutable()?;
+        validate_component(name)?;
+        create_child(self, name)?;
+        open_child(self, name, self.repair_permissions, true)
     }
 
     pub(crate) fn file_metadata(&self, name: &OsStr) -> io::Result<Option<(bool, u64)>> {
@@ -276,6 +290,7 @@ fn open_child(
     parent: &DirectoryCapability,
     name: &OsStr,
     repair_permissions: bool,
+    _delete_access: bool,
 ) -> io::Result<DirectoryCapability> {
     use rustix::fs::{Mode, OFlags, fchmod, openat};
     let fd = openat(
@@ -503,10 +518,11 @@ fn open_child(
     parent: &DirectoryCapability,
     name: &OsStr,
     repair_permissions: bool,
+    delete_access: bool,
 ) -> io::Result<DirectoryCapability> {
     open_windows_directory(
         &parent.display_path.join(name),
-        repair_permissions,
+        delete_access && repair_permissions,
         repair_permissions,
     )
 }
@@ -1051,7 +1067,8 @@ fn mark_delete(file: &fs::File) -> io::Result<()> {
 
 #[cfg(windows)]
 fn remove_child_tree(parent: &DirectoryCapability, name: &OsStr) -> io::Result<()> {
-    match parent.open_child(name) {
+    validate_component(name)?;
+    match open_child(parent, name, parent.repair_permissions, true) {
         Ok(child) => {
             for entry in child.entries()? {
                 if entry.is_directory {
@@ -1190,6 +1207,55 @@ mod windows_rename_tests {
         })
     }
 
+    /// Regression coverage for the Windows-10-only subscription import
+    /// failure (os error 32 on every import): Windows 10 refuses to rename a
+    /// directory while its parent is held open with DELETE access, and
+    /// every profile store root was such a parent. Proven with a minimal
+    /// repro on Windows 10 19045 (fails) vs Windows 11 26200 (succeeds), so
+    /// this pins the invariant that is checkable on any Windows version:
+    /// ordinary directory capabilities carry no DELETE access - only a
+    /// staging capability that is itself renamed does.
+    #[test]
+    fn only_rename_staging_capabilities_hold_delete_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = DirectoryCapability::open(temp.path()).unwrap();
+        let profile = root.create_child(OsStr::new("profile")).unwrap();
+        let reopened = root.open_child(OsStr::new("profile")).unwrap();
+        for capability in [&root, &profile, &reopened] {
+            let error = mark_delete(&capability.handle)
+                .expect_err("a store root handle must not be able to delete its directory");
+            assert_eq!(error.raw_os_error(), Some(5), "{error}");
+        }
+
+        let staging = profile
+            .create_child_for_rename(OsStr::new("staging"))
+            .unwrap();
+        staging.write_file(OsStr::new("mihomo.yaml"), b"x").unwrap();
+        let started = Instant::now();
+        profile
+            .rename_child(&staging, OsStr::new("snapshot-1"))
+            .expect("publishing into a store root must succeed");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "rename needed retries"
+        );
+        assert!(
+            temp.path()
+                .join("profile")
+                .join("snapshot-1")
+                .join("mihomo.yaml")
+                .is_file()
+        );
+
+        // Removal still works: it opens its own DELETE handle (once nothing
+        // else holds the directory, as in production).
+        drop(staging);
+        drop(reopened);
+        drop(profile);
+        root.remove_child_tree(OsStr::new("profile")).unwrap();
+        assert!(!temp.path().join("profile").exists());
+    }
+
     /// A held child file blocks renaming its directory; the rename must
     /// succeed as soon as the other handle goes away instead of failing
     /// the whole import outright.
@@ -1197,7 +1263,7 @@ mod windows_rename_tests {
     fn rename_survives_a_transient_lock_from_another_handle() {
         let temp = tempfile::tempdir().unwrap();
         let root = DirectoryCapability::open(temp.path()).unwrap();
-        let staging = root.create_child(OsStr::new("staging")).unwrap();
+        let staging = root.create_child_for_rename(OsStr::new("staging")).unwrap();
         staging
             .write_file(OsStr::new("mihomo.yaml"), b"placeholder")
             .unwrap();

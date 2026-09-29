@@ -1751,7 +1751,7 @@ fn create_snapshot_staging(
     published_name: &str,
 ) -> Result<(OsString, DirectoryCapability), PersistenceError> {
     let name = OsString::from(format!(".{published_name}.staging-{}", std::process::id()));
-    let child = root.create_child(&name)?;
+    let child = root.create_child_for_rename(&name)?;
     Ok((name, child))
 }
 

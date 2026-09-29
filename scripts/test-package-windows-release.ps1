@@ -176,6 +176,7 @@ Assert-True (Test-Path -LiteralPath $Packager) 'packager script must exist'
 Assert-True ($PackagerSource.Contains('$PrivilegedBrokerReleaseReady = $true')) 'production release gate marker must be true after broker Tasks 2-4 are complete'
 Assert-True ($PackagerSource.Contains('$AssertReleaseReady')) 'packager must expose the explicit CI readiness check'
 Assert-True ($PackagerSource.Contains("fixtureContract -ceq 'multicore-package-test-v1'")) 'fixture authorization must require the synthetic manifest marker'
+Assert-True ($PackagerSource.Contains("'-Ctarget-feature=+crt-static'")) 'release builds must link the C runtime statically (clean Windows has no vcruntime140.dll)'
 Assert-True ($PackagerSource.IndexOf('$PrivilegedBrokerReleaseReady = $true', [StringComparison]::Ordinal) -lt $PackagerSource.IndexOf('function Invoke-PinnedRustBuild', [StringComparison]::Ordinal)) 'release gate must be evaluated before Rust builds or downloads'
 foreach ($required in @('README.md', 'THIRD_PARTY_NOTICES.md', 'licenses\Xray-core-MPL-2.0.txt', 'licenses\mihomo-GPL-3.0.txt')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $MetadataRoot $required)) "metadata file $required must exist"
