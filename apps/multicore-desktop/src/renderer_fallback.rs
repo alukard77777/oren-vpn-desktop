@@ -53,8 +53,11 @@ fn is_gpu_renderer_failure_text(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-/// Records the fallback and starts a new instance with the same arguments.
-/// The caller must already have released the single-instance guard.
+/// Records the fallback and runs a new instance with the same arguments,
+/// waiting for it to exit. The caller must already have released the
+/// single-instance guard. Waiting matters when the updater launched this
+/// process: it rolls the update back if the process it started exits before
+/// the new version confirms its start, which the restarted instance does.
 pub fn remember_and_relaunch(arguments: Vec<OsString>) -> io::Result<()> {
     if let Some(path) = marker_path() {
         if let Some(parent) = path.parent() {
@@ -67,7 +70,8 @@ pub fn remember_and_relaunch(arguments: Vec<OsString>) -> io::Result<()> {
     Command::new(std::env::current_exe()?)
         .args(arguments)
         .env(SOFTWARE_RENDERER_ENV, "1")
-        .spawn()
+        .spawn()?
+        .wait()
         .map(drop)
 }
 
