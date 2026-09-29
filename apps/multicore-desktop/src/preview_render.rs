@@ -282,9 +282,16 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-ready", 840, 720, ready),
         ("home-ready-min", 700, 620, ready),
-        ("home-nav-expanded", 840, 720, |ui| {
-            ready(ui);
+        // The window grows by the expanded rail (176px) so the content keeps its width.
+        ("home-nav-expanded", 1016, 720, |ui| {
+            connected(ui);
             ui.set_navigation_collapsed(false);
+        }),
+        ("home-catalog-loading", 840, 720, |ui| {
+            ready(ui);
+            ui.set_catalog_groups(ModelRc::new(VecModel::from(Vec::<UiCatalogGroup>::new())));
+            ui.set_catalog_nodes(ModelRc::new(VecModel::from(Vec::<UiCatalogNode>::new())));
+            ui.set_catalog_loading(true);
         }),
         ("home-connected", 840, 720, connected),
         ("home-pending-selection", 840, 720, |ui| {

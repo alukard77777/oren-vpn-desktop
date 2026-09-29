@@ -55,9 +55,10 @@ use view_model::{
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
-    CloseDisposition, MinimizeDisposition, MonitorRect, MonitorSignature, PhysicalPosition,
-    apply_tray_popup_native_rounding, close_disposition, minimize_disposition, monitor_cap_changed,
-    next_maximized, parse_resize_edge, place_tray_popup, restore_placement,
+    CloseDisposition, EXPANDED_RAIL_WIDTH, MinimizeDisposition, MonitorRect, MonitorSignature,
+    PhysicalPosition, RailGrowth, apply_tray_popup_native_rounding, close_disposition,
+    minimize_disposition, monitor_cap_changed, next_maximized, parse_resize_edge, place_tray_popup,
+    rail_grow_delta, rail_shrink_width, restore_placement,
 };
 
 slint::include_modules!();
@@ -1543,6 +1544,48 @@ fn set_current_monitor_max_size(
     signature
 }
 
+fn resize_for_rail(
+    window: &slint::winit_030::winit::window::Window,
+    collapsed: bool,
+    growth: &std::cell::Cell<Option<RailGrowth>>,
+) {
+    use slint::winit_030::winit::dpi::PhysicalSize;
+
+    let maximized = window.is_maximized();
+    let inner = window.inner_size();
+    if collapsed {
+        if let Some(width) = rail_shrink_width(growth.take(), maximized, inner.width) {
+            let _ = window.request_inner_size(PhysicalSize::new(width, inner.height));
+        }
+        return;
+    }
+    let Some(monitor) = window.current_monitor() else {
+        return;
+    };
+    let (Some((work_position, work_size)), Ok(outer_position)) =
+        (monitor_work_area(&monitor), window.outer_position())
+    else {
+        return;
+    };
+    let wanted = (f64::from(EXPANDED_RAIL_WIDTH) * window.scale_factor()).round() as u32;
+    let delta = rail_grow_delta(
+        maximized,
+        outer_position.x,
+        window.outer_size().width,
+        work_position.x,
+        work_size.width,
+        wanted,
+    );
+    if delta == 0 {
+        growth.set(None);
+        return;
+    }
+    let grown_width = inner.width + delta;
+    let _ = set_current_monitor_max_size(window);
+    let _ = window.request_inner_size(PhysicalSize::new(grown_width, inner.height));
+    growth.set(Some(RailGrowth { delta, grown_width }));
+}
+
 fn apply_saved_placement(ui: &AppWindow, preferences: &AppPreferences) {
     use slint::winit_030::winit::dpi::{LogicalSize, PhysicalPosition};
 
@@ -1946,6 +1989,19 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
                 let _ = window.drag_resize_window(edge.into());
             });
         }
+    });
+
+    // The window grows with the expanded rail so the content keeps its width,
+    // and shrinks back on collapse unless the user resized it in between.
+    let weak = ui.as_weak();
+    let rail_growth = std::rc::Rc::new(std::cell::Cell::new(None::<RailGrowth>));
+    ui.on_navigation_toggled(move |collapsed| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let _ = ui.window().with_winit_window(|window| {
+            resize_for_rail(window, collapsed, &rail_growth);
+        });
     });
 
     let weak = ui.as_weak();

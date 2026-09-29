@@ -543,6 +543,55 @@ pub fn next_maximized(current: bool) -> bool {
     !current
 }
 
+/// Logical width the expanded navigation rail adds (176px rail - 64px rail is
+/// what the content loses; the window grows by the whole expanded rail so the
+/// content keeps its collapsed-layout width).
+pub const EXPANDED_RAIL_WIDTH: u32 = 176;
+
+/// How much a window grew when the rail expanded, so collapsing can undo it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RailGrowth {
+    /// Physical pixels added to the inner width.
+    pub delta: u32,
+    /// Physical inner width right after growing; a different width at collapse
+    /// time means the user resized in between.
+    pub grown_width: u32,
+}
+
+/// Physical width to add when the rail expands: the full `wanted` amount, or
+/// what still fits between the window's right edge and the work area's right
+/// edge (the left edge stays put). Maximized windows never grow.
+pub fn rail_grow_delta(
+    maximized: bool,
+    outer_x: i32,
+    outer_width: u32,
+    work_x: i32,
+    work_width: u32,
+    wanted: u32,
+) -> u32 {
+    if maximized {
+        return 0;
+    }
+    let right_edge = i64::from(outer_x) + i64::from(outer_width);
+    let work_right = i64::from(work_x) + i64::from(work_width);
+    let room = (work_right - right_edge).max(0);
+    u32::try_from(room.min(i64::from(wanted))).unwrap_or(0)
+}
+
+/// Inner width to restore when the rail collapses: only when the window still
+/// has exactly the width it had right after growing (and is not maximized).
+pub fn rail_shrink_width(
+    growth: Option<RailGrowth>,
+    maximized: bool,
+    current_inner_width: u32,
+) -> Option<u32> {
+    let growth = growth?;
+    if maximized || growth.delta == 0 || current_inner_width != growth.grown_width {
+        return None;
+    }
+    Some(current_inner_width.saturating_sub(growth.delta))
+}
+
 impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
     fn from(edge: ResizeEdge) -> Self {
         use slint::winit_030::winit::window::ResizeDirection;
@@ -564,11 +613,67 @@ impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
 mod tests {
     use super::{
         CloseDisposition, DEFAULT_HEIGHT, DEFAULT_WIDTH, MinimizeDisposition, MonitorRect,
-        MonitorSignature, PhysicalPosition, ResizeEdge, ResizeHitLayout, TrayTaskbarEdge,
-        close_disposition, minimize_disposition, monitor_cap_changed, next_maximized,
-        parse_resize_edge, place_tray_popup, restore_bounds, restore_placement,
+        MonitorSignature, PhysicalPosition, RailGrowth, ResizeEdge, ResizeHitLayout,
+        TrayTaskbarEdge, close_disposition, minimize_disposition, monitor_cap_changed,
+        next_maximized, parse_resize_edge, place_tray_popup, rail_grow_delta, rail_shrink_width,
+        restore_bounds, restore_placement,
     };
     use crate::preferences::WindowBounds;
+
+    #[test]
+    fn rail_grows_by_the_full_width_when_there_is_room() {
+        // 840px window at x=100 on a 1920px work area: 980px to spare.
+        assert_eq!(rail_grow_delta(false, 100, 840, 0, 1920, 176), 176);
+    }
+
+    #[test]
+    fn rail_grow_is_clamped_to_the_work_area_and_never_negative() {
+        // Right edge at 1850 on a 1920px work area: only 70px fit.
+        assert_eq!(rail_grow_delta(false, 1010, 840, 0, 1920, 176), 70);
+        // Already past the right edge (window hangs off-screen): no growth.
+        assert_eq!(rail_grow_delta(false, 1200, 840, 0, 1920, 176), 0);
+        // Secondary monitor to the left with negative coordinates.
+        assert_eq!(rail_grow_delta(false, -1900, 840, -1920, 1920, 176), 176);
+    }
+
+    #[test]
+    fn maximized_windows_neither_grow_nor_shrink() {
+        assert_eq!(rail_grow_delta(true, 0, 1920, 0, 1920, 176), 0);
+        let growth = RailGrowth {
+            delta: 176,
+            grown_width: 1016,
+        };
+        assert_eq!(rail_shrink_width(Some(growth), true, 1016), None);
+    }
+
+    #[test]
+    fn collapse_undoes_exactly_the_growth() {
+        let growth = RailGrowth {
+            delta: 176,
+            grown_width: 1016,
+        };
+        assert_eq!(rail_shrink_width(Some(growth), false, 1016), Some(840));
+        let partial = RailGrowth {
+            delta: 70,
+            grown_width: 910,
+        };
+        assert_eq!(rail_shrink_width(Some(partial), false, 910), Some(840));
+    }
+
+    #[test]
+    fn collapse_keeps_a_size_the_user_chose_meanwhile() {
+        let growth = RailGrowth {
+            delta: 176,
+            grown_width: 1016,
+        };
+        assert_eq!(rail_shrink_width(Some(growth), false, 1200), None);
+        assert_eq!(rail_shrink_width(None, false, 1016), None);
+        let nothing = RailGrowth {
+            delta: 0,
+            grown_width: 840,
+        };
+        assert_eq!(rail_shrink_width(Some(nothing), false, 840), None);
+    }
 
     fn monitor(x: i32, y: i32, width: u32, height: u32, primary: bool) -> MonitorRect {
         MonitorRect {
