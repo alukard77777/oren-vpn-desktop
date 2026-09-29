@@ -4648,7 +4648,7 @@ mod tests {
         assert!(!route_row.contains("trailing-label.width - (root.selected"));
         assert!(!route_row.contains("self.width - (root.selected"));
         assert!(route_row.contains("if root.selected && !root.pending: Image {"));
-        assert!(route_row.contains("source: @image-url(\"../assets/circle-check.svg\");"));
+        assert!(route_row.contains("source: @image-url(\"../assets/check.svg\");"));
         assert!(route_row.contains("if root.pending: Text {"));
         assert!(route_row.contains("text: \"…\";"));
         assert!(!route_row.contains("\"✓\""));
@@ -4714,8 +4714,9 @@ mod tests {
         }
 
         assert!(!components.contains("#0091ff"));
-        assert!(components.contains("#4c9dff1f"));
-        assert!(components.contains("#4c9dff42"));
+        // Route flags sit bare in an inset grouped list; no tinted tile remains.
+        assert!(!components.contains("#4c9dff42"));
+        assert!(components.contains("in property <bool> show-separator: false;"));
     }
 
     #[test]
@@ -6544,7 +6545,7 @@ mod tests {
         // The connection module is a flat surface; state lives in its hairline and badge.
         assert!(source.contains("background: root.has-profile ? Theme.surface : #101721;"));
         assert!(components.contains(
-            "background: root.selected ? Theme.elevated : row-touch.has-hover && root.enabled ? #ffffff08 : transparent;"
+            "background: row-touch.has-hover && root.enabled ? #ffffff06 : transparent;"
         ));
         assert!(!components.contains("#172433"));
         assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
@@ -7065,15 +7066,26 @@ mod tests {
             .split("export component RouteNodeRow")
             .nth(1)
             .expect("RouteNodeRow source");
-        assert!(route_row.contains("border-radius: 10px;"));
-        assert!(route_row.contains("border-radius: 7px;"));
-        assert!(route_row.contains("selection-bar := Rectangle"));
+        // iOS-style inset grouped list: one card, inset hairlines, bare flags, a check.
+        assert!(!route_row.contains("selection-bar := Rectangle"));
         assert!(route_row.contains("row-cursor-wash := Rectangle"));
-        assert!(route_row.contains("circle-check.svg"));
+        assert!(route_row.contains("check.svg"));
+        assert!(route_row.contains(
+            "if root.show-separator: Rectangle {
+        x: 56px;"
+        ));
+        let route_card = source
+            .split("route-list-card := Rectangle {")
+            .nth(1)
+            .and_then(|card| card.split("route-list := VerticalLayout").next())
+            .expect("route list card");
+        assert!(route_card.contains("border-radius: 14px;"));
+        assert!(route_card.contains("clip: true;"));
         assert!(!source.contains("min-width: 132px;"));
         assert!(source.contains("padding: 20px;"));
-        assert!(source.contains("for node in root.catalog-nodes: RouteNodeRow"));
-        assert!(source.contains("height: 44px;"));
+        assert!(source.contains("for node[index] in root.catalog-nodes: RouteNodeRow"));
+        assert!(source.contains("show-separator: index < root.catalog-nodes.length - 1;"));
+        assert!(source.contains("height: 48px;"));
         for filter in ["Все", "Система", "Ошибки"] {
             assert!(source.contains(&format!("selected: root.event-filter == \"{filter}\";")));
         }
@@ -7513,8 +7525,8 @@ mod tests {
         assert!(route.contains("if root.pending: Text {"));
         assert!(route.contains("font-size: Theme.type-metadata-size;"));
         assert!(route.contains("min-height: Theme.interactive-min;"));
-        assert!(route.contains("preferred-height: 44px;"));
-        assert!(route.contains("max-height: 44px;"));
+        assert!(route.contains("preferred-height: 48px;"));
+        assert!(route.contains("max-height: 48px;"));
         assert!(
             !route.contains("opacity: root.enabled"),
             "read-only and selected route rows must remain fully legible"

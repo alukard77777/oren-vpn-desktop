@@ -205,6 +205,7 @@ fn ready(ui: &AppWindow) {
 }
 
 fn connected(ui: &AppWindow) {
+    ui.set_node_latency(s("42 мс"));
     ready(ui);
     ui.set_status_eyebrow(s("Подключено"));
     ui.set_headline(s("Соединение защищено"));

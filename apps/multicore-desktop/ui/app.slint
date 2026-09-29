@@ -568,6 +568,8 @@ export component AppWindow inherits Window {
     in property <bool> toggle-detail-is-exit: true;
     in property <string> session-uptime;
     in property <string> traffic-down;
+    // Latency of the exit node, when the visible route list knows it.
+    in property <string> node-latency;
     in property <string> traffic-up;
     in property <bool> import-pending: false;
     in property <string> import-error;
@@ -1363,9 +1365,9 @@ export component AppWindow inherits Window {
                                     }
                                     if root.session-uptime != "": Text {
                                         text: root.session-uptime;
-                                        color: Theme.text-muted;
-                                        font-size: Theme.type-metadata-size;
-                                        font-weight: Theme.weight-medium;
+                                        color: Theme.text-secondary;
+                                        font-size: 13px;
+                                        font-weight: Theme.weight-regular;
                                         vertical-alignment: bottom;
                                         accessible-label: "Время сессии " + root.session-uptime;
                                     }
@@ -1380,6 +1382,7 @@ export component AppWindow inherits Window {
                                     if root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
                                     if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
                                     Text { horizontal-stretch: 0; max-width: 220px; text: root.node-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
+                                    if root.node-latency != "": Text { text: "· " + root.node-latency; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
                                     // Live speed follows the exit inline; each arrow only shows with a value.
                                     if root.traffic-down != "": Text { text: "·  ↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.traffic-down != "": Text { min-width: 56px; text: root.traffic-down; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Загрузка " + root.traffic-down; }
@@ -1821,11 +1824,22 @@ export component AppWindow inherits Window {
                             ScrollView {
                                 vertical-stretch: 1;
                                 VerticalLayout {
-                                    // Keeps the overlay scrollbar off the rows' right edge.
+                                    // Keeps the overlay scrollbar off the list's right edge.
                                     padding-right: 12px;
-                                    spacing: 4px;
-                                    for node in root.catalog-nodes: RouteNodeRow {
-                                        height: 44px;
+                                    alignment: start;
+                                    // iOS-style inset grouped list: one card, hairlines between rows.
+                                    route-list-card := Rectangle {
+                                    height: route-list.preferred-height;
+                                    background: Theme.surface;
+                                    border-color: #ffffff0a;
+                                    border-width: 1px;
+                                    border-radius: 14px;
+                                    clip: true;
+                                    route-list := VerticalLayout {
+                                    spacing: 0px;
+                                    for node[index] in root.catalog-nodes: RouteNodeRow {
+                                        height: 48px;
+                                        show-separator: index < root.catalog-nodes.length - 1;
                                         icon: node.icon;
                                         icon-image: node.icon-image;
                                         label: node.label;
@@ -1839,6 +1853,8 @@ export component AppWindow inherits Window {
                                         activated => { root.select-catalog-node(node.id); }
                                     }
                                     if root.catalog-nodes.length == 0: Text { height: 52px; text: root.catalog-loading ? "Загружаем маршруты…" : "В этой группе нет доступных серверов"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
+                                    }
+                                    }
                                 }
                             }
                         }
