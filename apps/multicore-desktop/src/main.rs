@@ -13,6 +13,7 @@ mod logo_cache;
 mod preferences;
 #[cfg(all(test, feature = "preview-render"))]
 mod preview_render;
+mod renderer_fallback;
 mod service_logo;
 mod single_instance;
 mod tray;
@@ -648,9 +649,14 @@ thread_local! {
 }
 
 #[cfg(target_os = "linux")]
-fn select_linux_backend() -> Result<(), slint::PlatformError> {
-    slint::BackendSelector::new()
-        .backend_name("winit".into())
+fn select_linux_backend(software_renderer: bool) -> Result<(), slint::PlatformError> {
+    let selector = slint::BackendSelector::new().backend_name("winit".into());
+    let selector = if software_renderer {
+        selector.renderer_name("software".into())
+    } else {
+        selector
+    };
+    selector
         .with_winit_window_attributes_hook(|attributes| {
             if CREATING_TRAY_POPUP.with(Cell::get) {
                 use slint::winit_030::winit::platform::x11::{WindowAttributesExtX11, WindowType};
@@ -674,6 +680,20 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    let software_renderer = renderer_fallback::software_renderer_requested();
+    match run_desktop(software_renderer) {
+        // Everything run_desktop held (single-instance guard, owned daemon,
+        // tray) is released by now, so the restarted instance starts clean.
+        Err(error) if !software_renderer && renderer_fallback::is_gpu_renderer_failure(&error) => {
+            eprintln!("GPU renderer unavailable ({error}); restarting with the software renderer");
+            renderer_fallback::remember_and_relaunch(std::env::args_os().skip(1).collect())
+                .map_err(|_| error)
+        }
+        result => result,
+    }
+}
+
+fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     multicore_core::ensure_crypto_provider_installed();
     #[cfg(target_os = "linux")]
     linux_display::prefer_desktop_scale();
@@ -725,7 +745,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let update_check_started_at = Rc::new(Cell::new(Instant::now()));
 
     #[cfg(target_os = "linux")]
-    select_linux_backend()?;
+    select_linux_backend(software_renderer)?;
+    #[cfg(not(target_os = "linux"))]
+    if software_renderer {
+        renderer_fallback::select_software_renderer()?;
+    }
     let ui = AppWindow::new()?;
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
