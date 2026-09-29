@@ -6591,15 +6591,25 @@ mod tests {
         for padding in [
             "padding-left: 28px;",
             "padding-right: 28px;",
-            "padding-top: 28px;",
-            "padding-bottom: 40px;",
+            "padding-top: 22px;",
+            "padding-bottom: 24px;",
         ] {
             assert!(status.contains(padding), "status missing {padding}");
         }
 
         assert!(!source.contains("Mihomo 1.19.30"));
-        assert!(source.contains(
-            "if root.visible-page == \"settings\": Text { height: 24px; text: root.runtime-versions;"
+        let settings = source
+            .split("if root.visible-page == \"settings\": Rectangle {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.visible-page == \"subscriptions\": Rectangle {")
+                    .next()
+            })
+            .expect("settings page block");
+        // Build identity is the settings page's footer.
+        assert!(settings.contains(
+            "Text { height: 24px; text: root.runtime-versions; color: Theme.text-muted;"
         ));
         assert!(
             include_str!("main.rs")
@@ -6612,34 +6622,72 @@ mod tests {
     fn settings_page_scrolls_at_minimum_height_without_flattening_hierarchy() {
         let source = include_str!("../ui/app.slint");
         let settings = source
-            .split(
-                "if root.visible-page == \"settings\" || root.visible-page == \"subscriptions\": Rectangle {",
-            )
+            .split("if root.visible-page == \"settings\": Rectangle {")
             .nth(1)
-            .and_then(|source| source.split("changed minimized =>").next())
+            .and_then(|source| {
+                source
+                    .split("if root.visible-page == \"subscriptions\": Rectangle {")
+                    .next()
+            })
             .expect("settings page block");
+        let subscriptions = source
+            .split("if root.visible-page == \"subscriptions\": Rectangle {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.profile-menu-open: TouchArea {")
+                    .next()
+            })
+            .expect("subscriptions page block");
 
-        assert!(settings.contains("settings-scroll := ScrollView"));
-        assert!(settings.contains("settings-content := VerticalLayout"));
-        assert!(settings.contains("vertical-stretch: 1;"));
-        assert!(settings.contains("width: settings-scroll.visible-width;"));
-        assert!(settings.contains("min-height: settings-scroll.visible-height;"));
-        assert!(settings.contains("padding: 28px;"));
-        assert!(settings.contains("? settings-scroll.visible-width - 56px"));
-        let subscription_header = settings
-            .split("if root.visible-page == \"subscriptions\": VerticalLayout")
+        // Each page scrolls as one column at the minimum window height.
+        for (page, scroll, content) in [
+            (settings, "settings-scroll", "settings-content"),
+            (
+                subscriptions,
+                "subscriptions-scroll",
+                "subscriptions-content",
+            ),
+        ] {
+            assert!(page.contains(&format!("{scroll} := ScrollView")));
+            assert!(page.contains(&format!("{content} := VerticalLayout")));
+            assert!(page.contains(&format!("width: {scroll}.visible-width;")));
+            assert!(page.contains(&format!("min-height: {scroll}.visible-height;")));
+            assert!(page.contains("vertical-stretch: 1;"));
+            assert!(page.contains("padding-left: 28px;"));
+            assert!(
+                page.find(&format!("{scroll} := ScrollView")).unwrap()
+                    < page.find(&format!("{content} := VerticalLayout")).unwrap()
+            );
+        }
+        // Settings is one iOS page: captioned grouped cards, no sub-navigation.
+        assert!(!source.contains("SettingsNavItem"));
+        let connection = settings
+            .find("text: \"ПОДКЛЮЧЕНИЕ\";")
+            .expect("connection section");
+        let app = settings.find("text: \"ПРИЛОЖЕНИЕ\";").expect("app section");
+        let updates = settings
+            .find("text: \"ОБНОВЛЕНИЯ\";")
+            .expect("updates section");
+        assert!(connection < app && app < updates);
+        assert!(settings.matches("ToggleRow {").count() >= 4);
+        // The home update banner's "Подробнее" lands on the updates section.
+        assert!(settings.contains("if (root.settings-section == \"updates\") {"));
+        assert!(settings.contains(
+            "self.viewport-y = Math.min(0px, self.visible-height - settings-content.preferred-height);"
+        ));
+        // Subscriptions header: title + quiet "Добавить", the inline add editor keeps the draft.
+        let header = subscriptions
+            .split("subscriptions-content := VerticalLayout")
             .nth(1)
             .and_then(|source| source.split("if root.replace-editor-open").next())
             .expect("subscription header");
-        assert!(subscription_header.contains("width: parent.width - 128px;"));
-        assert!(subscription_header.contains("overflow: elide;"));
-        assert!(settings.contains("// Historical minimum-height contract used spacing: 18px;."));
-        assert!(settings.contains("text <=> root.subscription-draft;"));
-        assert!(settings.matches("ToggleRow {").count() >= 2);
-        assert!(
-            settings.find("settings-scroll := ScrollView").unwrap()
-                < settings.find("settings-content := VerticalLayout").unwrap()
-        );
+        assert!(header.contains("label: root.import-pending ? \"Добавляем…\" : \"Добавить\";"));
+        assert!(header.contains(
+            "focus-epoch: root.profile-management-focus-id == \"\" ? root.profile-management-focus-serial : 0;"
+        ));
+        assert!(header.contains("root.add-subscription();"));
+        assert!(subscriptions.contains("text <=> root.subscription-draft;"));
     }
 
     #[test]
@@ -6712,12 +6760,76 @@ mod tests {
     }
 
     #[test]
+    fn tabs_use_inset_grouped_cards_with_attached_editors() {
+        let app = include_str!("../ui/app.slint").replace(
+            "
+", "
+",
+        );
+        // Status: captioned cards; the log is one card of rows, not boxed cards.
+        for caption in ["text: \"ЯДРА\";", "text: \"МАППИНГ\";", "text: \"ЖУРНАЛ\";"]
+        {
+            assert!(app.contains(caption), "missing status section {caption}");
+        }
+        assert!(app.contains("cores-card := Rectangle"));
+        assert!(app.contains("mapping-card := Rectangle"));
+        assert!(app.contains("event-log-card := Rectangle"));
+        assert!(!app.contains("background: event.level == \"error\" ? #f06a6a0d"));
+        assert!(app.contains("disabled-hint: \"Подключитесь, чтобы открыть панель Mihomo.\";"));
+        // Subscriptions: one card; the editor and delete confirmation attach under their row.
+        let row = app
+            .split("settings-profile-row := Rectangle {")
+            .nth(1)
+            .and_then(|row| row.split("Footnote {").next())
+            .expect("subscription row");
+        assert!(row.contains("height: 56px + (self.editing || self.confirming ? 52px : 0px);"));
+        // Premium but cheap motion: ease-out-quint heights, the attached rows fade with the
+        // height itself (no timer), and everything collapses to 0ms under reduced motion.
+        assert!(row.contains(
+            "animate height { duration: Motion.reduced ? 0ms : 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"
+        ));
+        assert!(row.contains(
+            "opacity: Math.max(0, Math.min(1, (settings-profile-row.height - 56px) / 52px));"
+        ));
+        assert!(row.contains("background: profile.active ? Theme.elevated : transparent;"));
+        assert!(row.contains("text: \"АКТИВНА\";"));
+        assert!(row.contains("if settings-profile-row.editing: HorizontalLayout {"));
+        assert!(row.contains("if settings-profile-row.confirming: HorizontalLayout {"));
+        assert!(row.contains("label: \"Удалить\"; tone: \"danger\";"));
+        // Clicking an inactive row activates it; keyboard and a11y stay on the same scope.
+        assert!(row.contains("if !profile.active: activate-profile-focus := FocusScope {"));
+        assert!(row.contains("activate-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.activate-profile(profile.id); } }"));
+        // Switches are green when on and animate their knob.
+        let toggle = app
+            .split("component ToggleRow inherits Rectangle {")
+            .nth(1)
+            .and_then(|toggle| toggle.split("component TitleBarButton").next())
+            .expect("ToggleRow");
+        assert!(toggle.contains("background: root.checked ? Theme.accent-green : Theme.line;"));
+        // The knob lands with a small spring overshoot.
+        assert!(toggle.contains(
+            "animate x { duration: Motion.reduced ? 0ms : 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }"
+        ));
+        assert!(
+            app.contains("changed reduced-motion => { Motion.reduced = root.reduced-motion; }")
+        );
+        // Cards of a page fade in one after another (24ms apart) when the page appears.
+        assert!(app.contains("animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
+        assert!(app.contains("animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
+        // "Скопировано ✓" crossfades over the label instead of swapping text.
+        assert!(app.contains("swap-label: \"Скопировано ✓\";"));
+        assert!(app.contains("swapped: root.diagnostics-copied;"));
+        // URL fields forward focus to their input so `self.focus()` keeps working.
+        assert!(app.contains("forward-focus: url-input;"));
+    }
+
+    #[test]
     fn first_run_home_uses_inline_subscription_onboarding() {
         let source = include_str!("../ui/app.slint");
         let onboarding = source
             .split("first-run-onboarding := VerticalLayout")
             .nth(1)
-            .and_then(|source| source.split("first-run-toggle-preview := Rectangle").next())
+            .and_then(|source| source.split("if root.has-profile: inline-routes").next())
             .expect("inline first-run onboarding block");
 
         for required in [
@@ -6739,13 +6851,13 @@ mod tests {
             "text: \"Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена\";",
             "text: \"Ссылка хранится только на этом устройстве\";",
             "onboarding-copy := VerticalLayout",
-            "first-run-actions := HorizontalLayout",
+            "first-run-actions := VerticalLayout",
             "label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";",
             "root.paste-subscription();",
-            "label: \"Ввести вручную\";",
+            "label: \"Ввести ссылку вручную\";",
             "focus-epoch: root.first-run-trigger-focus-serial;",
-            "first-run-url-input := LineEdit",
-            "accessible-label: \"URL подписки\";",
+            "first-run-url-input := UrlField",
+            "accessible-name: \"URL подписки\";",
             "changed focus-serial => { self.focus(); }",
             "init => { self.focus(); }",
             "label: root.import-pending ? \"Добавляем…\" : \"Добавить\";",
@@ -6764,13 +6876,13 @@ mod tests {
 
         assert!(onboarding.contains("if root.first-run-manual-open"));
         let paste_action = onboarding
-            .split("PrimaryAction {")
+            .split("label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";")
             .nth(1)
-            .and_then(|action| action.split("SmallAction {").next())
+            .and_then(|action| action.split("activated =>").next())
             .expect("paste action");
         assert!(paste_action.contains("enabled: !root.import-pending;"));
         let manual_trigger = onboarding
-            .split("label: \"Ввести вручную\";")
+            .split("label: \"Ввести ссылку вручную\";")
             .nth(1)
             .and_then(|action| action.split("activated =>").next())
             .expect("manual trigger");
@@ -6837,12 +6949,12 @@ mod tests {
 
         // Subscription management retains its independent add/edit flow.
         let management = source
-            .split("if root.visible-page == \"subscriptions\": VerticalLayout")
+            .split("if root.visible-page == \"subscriptions\": Rectangle {")
             .nth(1)
             .expect("subscription management page");
         assert!(management.contains("root.add-subscription();"));
         assert!(management.contains("text <=> root.subscription-draft;"));
-        assert!(management.contains("accessible-label: \"URL подписки\";"));
+        assert!(management.contains("accessible-name: \"URL подписки\";"));
         assert!(management.contains("accepted => {"));
         assert!(management.contains("label: \"Отмена\";"));
         assert!(management.contains("root.import-pending ? \"Добавляем…\" : \"Добавить\""));
@@ -7071,7 +7183,7 @@ mod tests {
         // iOS-style inset grouped list: one card, inset hairlines, bare flags, a check.
         assert!(route_row.contains("selection-bar := Rectangle"));
         assert!(route_row.contains("row-cursor-wash := Rectangle"));
-        assert!(route_row.contains(
+        assert!(route_row.replace("\r\n", "\n").contains(
             "if root.show-separator: Rectangle {
         x: 56px;"
         ));
