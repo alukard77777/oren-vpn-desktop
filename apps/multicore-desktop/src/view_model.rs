@@ -4405,7 +4405,7 @@ mod tests {
         assert!(app.contains("routes-heading := HorizontalLayout"));
         assert!(app.contains("route-updated-meta := Text"));
         assert!(app.contains(
-            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated == \"Не обновлялась\" ? root.subscription-updated : \"Обновлено \" + root.subscription-updated;"
+            "text: root.latency-check-loading ? \"· Замеряем задержку…\" : root.subscription-updated == \"Не обновлялась\" ? \"· \" + root.subscription-updated : \"· Обновлено \" + root.subscription-updated;"
         ));
         assert!(app.contains(
             "color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;"
@@ -4432,8 +4432,11 @@ mod tests {
         assert!(route_row.contains("parent.width - self.x - trailing-label.width - 48px"));
         assert!(!route_row.contains("trailing-label.width - (root.selected"));
         assert!(!route_row.contains("self.width - (root.selected"));
-        assert!(route_row.contains("root.pending ? \"…\" : root.selected ? \"✓\" : \"\""));
-        assert!(!route_row.contains("root.selected ? \"✓\" : \"…\""));
+        assert!(route_row.contains("if root.selected && !root.pending: Image {"));
+        assert!(route_row.contains("source: @image-url(\"../assets/circle-check.svg\");"));
+        assert!(route_row.contains("if root.pending: Text {"));
+        assert!(route_row.contains("text: \"…\";"));
+        assert!(!route_row.contains("\"✓\""));
         assert!(main.contains("run_latency_check"));
         assert!(main.contains("if outcome.refresh_catalog"));
     }
@@ -4457,8 +4460,20 @@ mod tests {
         assert!(!app.contains("Text { text: \"Главная\";"));
         assert!(!app.contains("profile-name"));
         assert!(!main.contains("set_profile_name"));
+        let group_track = app
+            .split("route-group-track := Rectangle {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("for group in root.catalog-groups: QuietChip")
+                    .next()
+            })
+            .expect("route group track");
+        assert!(group_track.contains("height: 38px;"));
+        assert!(group_track.contains("border-radius: 10px;"));
+        assert!(group_track.contains("ScrollView {"));
         assert!(
-            normalized_app
+            !normalized_app
                 .contains("height: 60px;\n                                horizontal-stretch: 1;")
         );
         // The home shelf moved into the window title: the provider logo leads the
@@ -4485,7 +4500,7 @@ mod tests {
 
         assert!(!components.contains("#0091ff"));
         assert!(components.contains("#4c9dff1f"));
-        assert!(components.contains("#4c9dff66"));
+        assert!(components.contains("#4c9dff42"));
     }
 
     #[test]
@@ -6313,7 +6328,10 @@ mod tests {
         }
         // The connection module is a flat surface; state lives in its hairline and badge.
         assert!(source.contains("background: root.has-profile ? Theme.surface : #101721;"));
-        assert!(components.contains("background: root.selected ? #172433 : Theme.surface;"));
+        assert!(components.contains(
+            "background: root.selected ? Theme.elevated : row-touch.has-hover && root.enabled ? #ffffff08 : transparent;"
+        ));
+        assert!(!components.contains("#172433"));
         assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
         assert!(home_layer.contains("ambient-touch.mouse-x"));
         assert!(home_layer.contains("ambient-touch.mouse-y"));
@@ -6747,21 +6765,31 @@ mod tests {
         assert!(!snapshot.contains("slint::Image"));
         assert!(!main.contains("Image::load_from_path(Path::new(\"http"));
         assert!(!source.contains("if root.has-profile: PrimaryAction"));
-        assert!(components.contains("border-radius: 14px;"));
-        assert!(components.contains("border-radius: 6px;"));
         let quiet_chip = components
             .split("export component QuietChip")
             .nth(1)
             .and_then(|source| source.split("export component RouteNodeRow").next())
             .expect("QuietChip source");
-        assert!(quiet_chip.contains("horizontal-stretch: 0;"));
-        assert!(quiet_chip.contains("max-width: 164px;"));
-        assert!(quiet_chip.contains("border-radius: 14px;"));
-        assert!(source.contains("min-width: 104px;"));
+        // Group chips are equal-width segments of one track.
+        assert!(quiet_chip.contains("horizontal-stretch: 1;"));
+        assert!(quiet_chip.contains("min-width: 96px;"));
+        assert!(!quiet_chip.contains("max-width: 164px;"));
+        assert!(quiet_chip.contains("border-radius: 8px;"));
+        assert!(quiet_chip.contains("background: root.selected ? Theme.elevated"));
+        assert!(quiet_chip.contains("chip-cursor-wash := Rectangle"));
+        let route_row = components
+            .split("export component RouteNodeRow")
+            .nth(1)
+            .expect("RouteNodeRow source");
+        assert!(route_row.contains("border-radius: 10px;"));
+        assert!(route_row.contains("border-radius: 7px;"));
+        assert!(route_row.contains("selection-bar := Rectangle"));
+        assert!(route_row.contains("row-cursor-wash := Rectangle"));
+        assert!(route_row.contains("circle-check.svg"));
         assert!(!source.contains("min-width: 132px;"));
         assert!(source.contains("padding: 20px;"));
         assert!(source.contains("for node in root.catalog-nodes: RouteNodeRow"));
-        assert!(source.contains("height: 46px;"));
+        assert!(source.contains("height: 44px;"));
         for filter in ["Все", "Система", "Ошибки"] {
             assert!(source.contains(&format!("selected: root.event-filter == \"{filter}\";")));
         }
@@ -7171,7 +7199,8 @@ mod tests {
             let source = component_source(name, Some(next));
             assert!(
                 source.contains("min-height: Theme.interactive-min;")
-                    || (name == "RouteNodeRow" && source.contains("min-height: 52px;")),
+                    || (name == "RouteNodeRow" && source.contains("min-height: 52px;"))
+                    || (name == "QuietChip" && source.contains("min-height: 32px;")),
                 "{name}"
             );
             assert!(source.contains("Theme.focus-width"), "{name}");
@@ -7197,11 +7226,11 @@ mod tests {
 
         let route = component_source("RouteNodeRow", None);
         assert!(route.contains("pending-state-label"));
-        assert!(route.contains("root.pending ?"));
+        assert!(route.contains("if root.pending: Text {"));
         assert!(route.contains("font-size: Theme.type-metadata-size;"));
         assert!(route.contains("min-height: Theme.interactive-min;"));
-        assert!(route.contains("preferred-height: 46px;"));
-        assert!(route.contains("max-height: 46px;"));
+        assert!(route.contains("preferred-height: 44px;"));
+        assert!(route.contains("max-height: 44px;"));
         assert!(
             !route.contains("opacity: root.enabled"),
             "read-only and selected route rows must remain fully legible"

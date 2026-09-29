@@ -4518,16 +4518,14 @@ mod window_tests {
             .and_then(|source| source.split("ScrollView {").next())
             .expect("routes header source");
         // The bare date ("29.09.2026") next to "Маршруты" read as unexplained.
-        assert!(routes_header.contains(": \"Обновлено \" + root.subscription-updated;"));
+        assert!(routes_header.contains(": \"· Обновлено \" + root.subscription-updated;"));
         assert!(routes_header.contains("root.subscription-updated-stale ? Theme.warning"));
-        assert!(routes_header.contains("horizontal-alignment: right;"));
-        assert!(
-            routes_header.contains("Rectangle { horizontal-stretch: 1; background: transparent; }")
-        );
+        assert!(routes_header.contains("horizontal-alignment: left;"));
+        assert!(!routes_header.contains("horizontal-alignment: right;"));
         assert!(!routes_header.contains("route-updated-divider := Rectangle"));
         assert!(!routes_header.contains("commands: \"M 7 1.5"));
         // Latency progress is shown in place of the timestamp, not as extra chrome.
-        assert!(routes_header.contains("root.latency-check-loading ? \"Замеряем задержку…\""));
+        assert!(routes_header.contains("root.latency-check-loading ? \"· Замеряем задержку…\""));
         assert!(!routes_header.contains("catalog-selection-queued"));
         assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
         assert!(rust.contains("ui.set_subscription_management_enabled("));

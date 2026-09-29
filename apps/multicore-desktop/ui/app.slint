@@ -1558,9 +1558,8 @@ export component AppWindow inherits Window {
                             spacing: 8px;
                             routes-heading := HorizontalLayout {
                                 height: 28px;
-                                spacing: 12px;
+                                spacing: 8px;
                                 routes-title := Text {
-                                    width: 76px;
                                     height: 28px;
                                     horizontal-stretch: 0;
                                     text: "Маршруты";
@@ -1569,29 +1568,33 @@ export component AppWindow inherits Window {
                                     font-weight: Theme.weight-semibold;
                                     vertical-alignment: center;
                                 }
-                                Rectangle { horizontal-stretch: 1; background: transparent; }
                                 route-updated-meta := Text {
-                                    width: 140px;
                                     height: 28px;
-                                    horizontal-stretch: 0;
-                                    text: root.latency-check-loading ? "Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? root.subscription-updated : "Обновлено " + root.subscription-updated;
+                                    horizontal-stretch: 1;
+                                    text: root.latency-check-loading ? "· Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? "· " + root.subscription-updated : "· Обновлено " + root.subscription-updated;
                                     color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
-                                    horizontal-alignment: right;
+                                    horizontal-alignment: left;
                                     accessible-role: text;
                                     accessible-live-region: polite;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
                             }
-                            ScrollView {
-                                height: 60px;
-                                horizontal-stretch: 1;
+                            // Segmented control: one dark track, the selected group is a raised pill.
+                            route-group-track := Rectangle {
+                                height: 38px;
+                                background: #0a0c0f;
+                                border-color: Theme.line;
+                                border-width: 1px;
+                                border-radius: 10px;
+                                clip: true;
+                                ScrollView {
                                 HorizontalLayout {
-                                    spacing: 8px;
+                                    padding: 2px;
+                                    spacing: 2px;
                                     for group in root.catalog-groups: QuietChip {
-                                        min-width: 104px;
-                                        height: 44px;
+                                        height: 32px;
                                         icon: group.icon;
                                         icon-image: group.icon-image;
                                         label: group.label;
@@ -1601,16 +1604,17 @@ export component AppWindow inherits Window {
                                         activated => { root.select-catalog-group(group.id); }
                                     }
                                 }
+                                }
                             }
                             if root.catalog-error != "" || root.latency-check-error != "": Text { min-height: 28px; text: root.catalog-error != "" ? root.catalog-error : root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             ScrollView {
                                 vertical-stretch: 1;
                                 VerticalLayout {
-                                    // Keeps the overlay scrollbar off the rows' right border.
+                                    // Keeps the overlay scrollbar off the rows' right edge.
                                     padding-right: 12px;
                                     spacing: 4px;
                                     for node in root.catalog-nodes: RouteNodeRow {
-                                        height: 46px;
+                                        height: 44px;
                                         icon: node.icon;
                                         icon-image: node.icon-image;
                                         label: node.label;
