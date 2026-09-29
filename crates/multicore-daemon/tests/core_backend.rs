@@ -1926,6 +1926,63 @@ async fn default_transactional_constructor_connects_without_replaying_an_implici
     );
 }
 
+struct NoSelector;
+
+#[async_trait]
+impl multicore_daemon::MihomoSelector for NoSelector {
+    async fn select(
+        &self,
+        _raw_group: &str,
+        _raw_node: &str,
+    ) -> Result<(), multicore_daemon::SelectorError> {
+        Err(multicore_daemon::SelectorError::new())
+    }
+}
+
+#[tokio::test]
+async fn connect_options_reach_the_controller_factory() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = directory.path().join("runtime");
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    store
+        .create_profile(Arc::new(
+            Snapshot::parse(MIHOMO.as_bytes(), br#"{}"#).unwrap(),
+        ))
+        .unwrap();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let factory = multicore_daemon::options_controller_factory(
+        move |snapshot: &Snapshot, options: multicore_daemon::ConnectOptions| {
+            recorded.lock().unwrap().push(options.tun);
+            let staged = stage_runtime_with_mihomo_control(snapshot, &runtime, &control)
+                .map_err(|_| BackendError::new())?;
+            Ok(PreparedController::with_runtime(
+                Arc::new(RecordingController::default()),
+                staged,
+            ))
+        },
+    );
+    let backend = CoreBackend::new_with_connect_options(
+        store,
+        SubscriptionFetcher::new(OfflineHttp),
+        factory,
+        Arc::new(NoSelector),
+        None,
+    )
+    .unwrap();
+
+    let status = backend
+        .connect_with(multicore_daemon::ConnectOptions { tun: false })
+        .await
+        .unwrap();
+    assert_eq!(status.state, ConnectionState::Connected);
+    backend.disconnect().await.unwrap();
+    backend.connect().await.unwrap();
+    assert_eq!(*seen.lock().unwrap(), [false, true]);
+}
+
 #[test]
 fn status_states_serialize_exactly_as_the_desktop_contract() {
     let cases = [

@@ -1,4 +1,6 @@
+pub mod connection_mode;
 pub mod elevated_controller;
+pub mod system_proxy;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -167,6 +169,26 @@ pub struct EventPageDto {
     pub events: Vec<EventDto>,
 }
 
+/// Per-connect choices sent as the optional JSON body of `POST /v1/connect`. An empty body
+/// keeps the historical behaviour (TUN).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectOptions {
+    /// `false` connects in system-proxy mode: no TUN adapter and no administrator prompt.
+    #[serde(default = "default_tun")]
+    pub tun: bool,
+}
+
+fn default_tun() -> bool {
+    true
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self { tun: true }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeCheckDto {
@@ -176,6 +198,8 @@ pub enum RuntimeCheckDto {
     Ready,
     Failed,
     Unsupported,
+    /// Deliberately off (TUN in system-proxy mode).
+    Disabled,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -710,6 +734,10 @@ pub trait Backend: Send + Sync + 'static {
         Err(BackendError::new())
     }
     async fn connect(&self) -> Result<StatusDto, BackendError>;
+    /// Connects with per-connect options; backends without modes ignore them.
+    async fn connect_with(&self, _options: ConnectOptions) -> Result<StatusDto, BackendError> {
+        self.connect().await
+    }
     async fn disconnect(&self) -> Result<StatusDto, BackendError>;
     async fn select(&self, _request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
         Err(SelectionError::NotConnected)
@@ -1344,10 +1372,10 @@ async fn refresh_subscription(
 }
 
 async fn connect(State(state): State<AppState>, body: Bytes) -> Result<Json<StatusDto>, ApiError> {
-    reject_nonempty_body(&body)?;
+    let options = parse_connect_options(&body)?;
     state
         .backend
-        .connect()
+        .connect_with(options)
         .await
         .map(Json)
         .map_err(|_| ApiError::backend("Не удалось подключиться. Повторите попытку."))
@@ -1462,6 +1490,18 @@ async fn session(State(state): State<AppState>, body: Bytes) -> Result<Json<Sess
                 "Сначала установите подключение.",
             )
         })
+}
+
+/// An empty body keeps the default (TUN); otherwise it must be exactly `ConnectOptions`.
+fn parse_connect_options(body: &Bytes) -> Result<ConnectOptions, ApiError> {
+    if body.is_empty() {
+        return Ok(ConnectOptions::default());
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        ApiError::bad_request(
+            "Неверные параметры подключения. Обновите приложение и повторите попытку.",
+        )
+    })
 }
 
 fn reject_nonempty_body(body: &Bytes) -> Result<(), ApiError> {
@@ -1811,7 +1851,15 @@ pub fn transactional_controller_factory<F>(factory: F) -> TransactionalControlle
 }
 
 type PreparedFactory<P> =
-    dyn Fn(&Snapshot) -> Result<PreparedController<P>, BackendError> + Send + Sync;
+    dyn Fn(&Snapshot, ConnectOptions) -> Result<PreparedController<P>, BackendError> + Send + Sync;
+
+/// A factory that prepares the controller for the connect's [`ConnectOptions`] (TUN or system
+/// proxy). Plain and transactional factories ignore the options.
+pub struct OptionsControllerFactory<F>(F);
+
+pub fn options_controller_factory<F>(factory: F) -> OptionsControllerFactory<F> {
+    OptionsControllerFactory(factory)
+}
 
 struct ProfileLogoLease {
     physical_generation: u64,
@@ -1835,6 +1883,8 @@ where
     selector: Arc<dyn MihomoSelector>,
     latency_permits: Arc<tokio::sync::Semaphore>,
     operation: tokio::sync::Mutex<()>,
+    /// Options of the latest connect; background preparation reuses them.
+    connect_options: std::sync::Mutex<ConnectOptions>,
     post_commit_load_fault: AtomicBool,
     list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
     profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
@@ -2141,9 +2191,10 @@ where
         controller_factory: F,
         selector: Arc<dyn MihomoSelector>,
     ) -> Result<Self, BackendError> {
-        let controller_factory: Arc<PreparedFactory<P>> = Arc::new(move |snapshot: &Snapshot| {
-            controller_factory(snapshot).map(PreparedController::plain)
-        });
+        let controller_factory: Arc<PreparedFactory<P>> =
+            Arc::new(move |snapshot: &Snapshot, _options: ConnectOptions| {
+                controller_factory(snapshot).map(PreparedController::plain)
+            });
         Self::from_prepared_factory(store, fetcher, controller_factory, selector, None)
     }
 }
@@ -2198,7 +2249,36 @@ where
     ) -> Result<Self, BackendError> {
         let factory = controller_factory.0;
         let controller_factory: Arc<PreparedFactory<P>> =
-            Arc::new(move |snapshot: &Snapshot| factory(snapshot));
+            Arc::new(move |snapshot: &Snapshot, _options: ConnectOptions| factory(snapshot));
+        Self::from_prepared_factory(
+            store,
+            fetcher,
+            controller_factory,
+            selector,
+            events_log_path,
+        )
+    }
+}
+
+impl<C, P, F> CoreBackend<C, P, OptionsControllerFactory<F>>
+where
+    C: HttpClient,
+    P: ProcessController,
+    F: Fn(&Snapshot, ConnectOptions) -> Result<PreparedController<P>, BackendError>
+        + Send
+        + Sync
+        + 'static,
+{
+    /// Like `new_transactional_with_selector_and_events_log`, for a factory that honours
+    /// [`ConnectOptions`] (production: TUN or system-proxy mode).
+    pub fn new_with_connect_options(
+        store: ProfileStore,
+        fetcher: SubscriptionFetcher<C>,
+        controller_factory: OptionsControllerFactory<F>,
+        selector: Arc<dyn MihomoSelector>,
+        events_log_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, BackendError> {
+        let controller_factory: Arc<PreparedFactory<P>> = Arc::new(controller_factory.0);
         Self::from_prepared_factory(
             store,
             fetcher,
@@ -2255,6 +2335,7 @@ where
             selector,
             latency_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES)),
             operation: tokio::sync::Mutex::new(()),
+            connect_options: std::sync::Mutex::new(ConnectOptions::default()),
             post_commit_load_fault: AtomicBool::new(false),
             list_logo_publish_hook: std::sync::Mutex::new(None),
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
@@ -2930,7 +3011,12 @@ where
         phase: &str,
         snapshot: &Snapshot,
     ) -> Option<PreparedController<P>> {
-        match (self.controller_factory)(snapshot) {
+        let options = self
+            .connect_options
+            .lock()
+            .map(|options| *options)
+            .unwrap_or_default();
+        match (self.controller_factory)(snapshot, options) {
             Ok(prepared) => Some(prepared),
             Err(_) => {
                 self.inner.write().await.push_event_with_details(
@@ -3449,7 +3535,14 @@ where
     }
 
     async fn connect(&self) -> Result<StatusDto, BackendError> {
+        self.connect_with(ConnectOptions::default()).await
+    }
+
+    async fn connect_with(&self, options: ConnectOptions) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
+        if let Ok(mut current) = self.connect_options.lock() {
+            *current = options;
+        }
         let (snapshot, queued_selections) = {
             let state = self.inner.read().await;
             if state.degraded {
@@ -3469,7 +3562,7 @@ where
                 .collect::<Vec<_>>();
             (snapshot, queued_selections)
         };
-        let prepared = match (self.controller_factory)(&snapshot) {
+        let prepared = match (self.controller_factory)(&snapshot, options) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut state = self.inner.write().await;
@@ -4063,6 +4156,7 @@ fn runtime_check_to_dto(state: RuntimeCheckState) -> RuntimeCheckDto {
         RuntimeCheckState::Ready => RuntimeCheckDto::Ready,
         RuntimeCheckState::Failed => RuntimeCheckDto::Failed,
         RuntimeCheckState::Unsupported => RuntimeCheckDto::Unsupported,
+        RuntimeCheckState::Disabled => RuntimeCheckDto::Disabled,
     }
 }
 

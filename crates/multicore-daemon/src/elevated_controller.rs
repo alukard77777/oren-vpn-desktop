@@ -1602,6 +1602,8 @@ pub mod windows {
 #[cfg(windows)]
 pub type ProductionElevatedControllerFactory =
     ElevatedControllerFactory<windows::WindowsBrokerConnector>;
+#[cfg(windows)]
+pub type ProductionElevatedController = ElevatedProcessController<windows::WindowsBrokerConnector>;
 
 #[cfg(windows)]
 pub fn production_factory() -> Result<ProductionElevatedControllerFactory, ElevationError> {
@@ -1925,6 +1927,8 @@ pub mod unix {
 
 #[cfg(unix)]
 pub type ProductionElevatedControllerFactory = ElevatedControllerFactory<unix::UnixBrokerConnector>;
+#[cfg(unix)]
+pub type ProductionElevatedController = ElevatedProcessController<unix::UnixBrokerConnector>;
 
 #[cfg(unix)]
 pub fn production_factory() -> Result<ProductionElevatedControllerFactory, ElevationError> {

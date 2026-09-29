@@ -9,10 +9,21 @@ use multicore_core::{
     DeviceIdentity, MihomoRuntimeControl, ProfileStore, ReqwestHttpClient, Snapshot,
     SubscriptionFetcher, default_ipv4_interface, stage_runtime_with_mihomo_control,
 };
+use multicore_daemon::connection_mode::ModeController;
+#[cfg(not(windows))]
+use multicore_daemon::{
+    connection_mode::NoProxyController, elevated_controller::ProductionElevatedController,
+};
+
+/// The daemon's connection controller: elevated TUN, or (Windows) the local proxy mode.
+#[cfg(windows)]
+type Controller = proxy_mode::Controller;
+#[cfg(not(windows))]
+type Controller = ModeController<ProductionElevatedController, NoProxyController>;
 use multicore_daemon::elevated_controller::{production_factory, runtime_generation_from_path};
 use multicore_daemon::{
-    BackendError, CoreBackend, MihomoHttpSelector, PreparedController, bind_loopback,
-    publish_readiness_if_enabled, transactional_controller_factory, try_router,
+    BackendError, ConnectOptions, CoreBackend, MihomoHttpSelector, PreparedController,
+    bind_loopback, options_controller_factory, publish_readiness_if_enabled, try_router,
     try_router_with_dashboard_url,
 };
 
@@ -84,35 +95,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let fetcher = SubscriptionFetcher::new(ReqwestHttpClient::new(device_identity)?);
     let runtime_root = data_directory.join("runtime");
+    // A proxy left pointing at a dead Mihomo by a crashed session is put back before anything
+    // else runs (see `system_proxy`).
+    #[cfg(windows)]
+    let system_proxy_marker = data_directory.join("system-proxy.json");
+    #[cfg(windows)]
+    if let Err(error) = multicore_daemon::system_proxy::recover(
+        &multicore_daemon::system_proxy::WinInetSettings,
+        &system_proxy_marker,
+    ) {
+        eprintln!("system proxy recovery failed: {error}");
+    }
+    #[cfg(windows)]
+    let proxy_mode = proxy_mode::ProxyMode {
+        package_root: env::current_exe()
+            .ok()
+            .and_then(|executable| dashboard_directory_for(&executable)),
+        dashboard_directory: dashboard_directory.clone(),
+        log_path: data_directory.join("logs").join("latest-core.log"),
+        marker_path: system_proxy_marker,
+    };
     let elevated_factory = Mutex::new(None);
-    let controller_factory = transactional_controller_factory(move |snapshot: &Snapshot| {
-        let xray_outbound_interface = default_ipv4_interface().map_err(|_| BackendError::new())?;
-        let control = runtime_control
-            .clone()
-            .with_xray_outbound_interface(xray_outbound_interface)
-            .map_err(|_| BackendError::new())?;
-        let staged = stage_runtime_with_mihomo_control(snapshot, &runtime_root, &control)
-            .map_err(|_| BackendError::new())?;
-        let generation = runtime_generation_from_path(&staged.paths().directory)
-            .map_err(|_| BackendError::new())?;
-        let mut elevated_factory = elevated_factory.lock().map_err(|_| BackendError::new())?;
-        if elevated_factory.is_none() {
-            *elevated_factory = Some(production_factory().map_err(|_| BackendError::new())?);
-        }
-        let elevated_factory = elevated_factory.as_ref().ok_or_else(BackendError::new)?;
-        let controller = Arc::new(
-            elevated_factory
-                .controller(generation)
-                .map_err(|_| BackendError::new())?,
-        );
-        Ok(PreparedController::with_runtime(controller, staged))
-    });
+    let controller_factory =
+        options_controller_factory(move |snapshot: &Snapshot, options: ConnectOptions| {
+            let xray_outbound_interface =
+                default_ipv4_interface().map_err(|_| BackendError::new())?;
+            let control = runtime_control
+                .clone()
+                .with_xray_outbound_interface(xray_outbound_interface)
+                .map_err(|_| BackendError::new())?;
+            // TUN off: cores run as this user, no administrator prompt (Windows only; elsewhere
+            // the option is ignored and TUN is used).
+            #[cfg(windows)]
+            if !options.tun {
+                return proxy_mode.prepare(snapshot, &runtime_root, control);
+            }
+            #[cfg(not(windows))]
+            let _ = options;
+            let staged = stage_runtime_with_mihomo_control(snapshot, &runtime_root, &control)
+                .map_err(|_| BackendError::new())?;
+            let generation = runtime_generation_from_path(&staged.paths().directory)
+                .map_err(|_| BackendError::new())?;
+            let mut elevated_factory = elevated_factory.lock().map_err(|_| BackendError::new())?;
+            if elevated_factory.is_none() {
+                *elevated_factory = Some(production_factory().map_err(|_| BackendError::new())?);
+            }
+            let elevated_factory = elevated_factory.as_ref().ok_or_else(BackendError::new)?;
+            let controller: Arc<Controller> = Arc::new(ModeController::Tun(
+                elevated_factory
+                    .controller(generation)
+                    .map_err(|_| BackendError::new())?,
+            ));
+            Ok(PreparedController::with_runtime(controller, staged))
+        });
     // Persisted so a real subscription-add failure's diagnostics survive a
     // daemon restart between the failure and a user exporting the log via
     // "Копировать лог" - without this, the in-memory event buffer was empty
     // by the time anyone checked it (see the "Событий пока нет" bug report).
     let events_log_path = data_directory.join("logs").join("events.log");
-    let backend = CoreBackend::new_transactional_with_selector_and_events_log(
+    let backend = CoreBackend::new_with_connect_options(
         store,
         fetcher,
         controller_factory,
@@ -145,6 +186,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// itself, which is one level deeper. Matches
 /// `apps/multicore-core-host/src/runtime_paths.rs`'s resolution of the same
 /// directory.
+/// System-proxy mode (TUN off) on Windows: the daemon runs the cores itself, as the logged-in
+/// user, in a kill-on-close job, and points the user's proxy settings at Mihomo while it runs.
+#[cfg(windows)]
+mod proxy_mode {
+    use std::{net::TcpListener, path::PathBuf, sync::Arc};
+
+    use multicore_core::{
+        CORE_READINESS_TIMEOUT, CoreLogBuffer, MihomoRuntimeControl, RuntimePaths,
+        SidecarProcessController, Snapshot, WindowsJobLauncher, stage_runtime_with_mihomo_control,
+    };
+    use multicore_daemon::{
+        BackendError, PreparedController,
+        connection_mode::{ModeController, SystemProxyController},
+        elevated_controller::ProductionElevatedController,
+        system_proxy::{SystemProxy, WinInetSettings},
+    };
+
+    pub(crate) type LocalController =
+        SystemProxyController<SidecarProcessController<WindowsJobLauncher>>;
+    pub(crate) type Controller = ModeController<ProductionElevatedController, LocalController>;
+
+    pub(crate) struct ProxyMode {
+        pub(crate) package_root: Option<PathBuf>,
+        pub(crate) dashboard_directory: Option<PathBuf>,
+        pub(crate) log_path: PathBuf,
+        pub(crate) marker_path: PathBuf,
+    }
+
+    impl ProxyMode {
+        pub(crate) fn prepare(
+            &self,
+            snapshot: &Snapshot,
+            runtime_root: &std::path::Path,
+            control: MihomoRuntimeControl,
+        ) -> Result<PreparedController<Controller>, BackendError> {
+            let port = free_loopback_port().ok_or_else(BackendError::new)?;
+            let control = control
+                .with_proxy_mode(port)
+                .map_err(|_| BackendError::new())?;
+            let staged = stage_runtime_with_mihomo_control(snapshot, runtime_root, &control)
+                .map_err(|_| BackendError::new())?;
+            let cores = self
+                .package_root
+                .as_ref()
+                .ok_or_else(BackendError::new)?
+                .join("cores");
+            let paths = RuntimePaths {
+                xray_binary: cores.join("xray.exe"),
+                mihomo_binary: cores.join("mihomo.exe"),
+                xray_config: staged.paths().xray_config.clone(),
+                mihomo_config: staged.paths().mihomo_config.clone(),
+                dashboard_directory: self
+                    .dashboard_directory
+                    .clone()
+                    .filter(|directory| directory.join("index.html").is_file()),
+            };
+            let logs = Arc::new(CoreLogBuffer::persistent_or_memory(&self.log_path));
+            let launcher =
+                WindowsJobLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
+                    .map_err(|_| BackendError::new())?;
+            let proxy = SystemProxy::new(Box::new(WinInetSettings), self.marker_path.clone(), port);
+            let controller = Arc::new(ModeController::Proxy(SystemProxyController::new(
+                SidecarProcessController::with_launcher(paths, launcher),
+                Arc::new(proxy),
+            )));
+            Ok(PreparedController::with_runtime(controller, staged))
+        }
+    }
+
+    /// A loopback port free right now; Mihomo binds it moments later. A port taken in between
+    /// fails Mihomo's readiness check and the connect reports it.
+    fn free_loopback_port() -> Option<u16> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        listener.local_addr().ok().map(|address| address.port())
+    }
+}
+
 fn dashboard_directory_for(executable: &std::path::Path) -> Option<std::path::PathBuf> {
     executable
         .parent()
@@ -203,21 +321,36 @@ mod tests {
     }
 
     #[test]
-    fn production_daemon_uses_only_the_elevated_core_controller() {
+    fn production_daemon_runs_tun_elevated_and_proxy_mode_only_with_the_system_proxy() {
         let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
-        assert!(production.contains("elevated_factory"));
-        assert!(production.contains(".controller(generation)"));
-        assert!(production.contains("runtime_generation_from_path"));
-        for forbidden in [
-            "MULTICORE_XRAY_BIN",
-            "MULTICORE_MIHOMO_BIN",
-            "SidecarProcessController",
-            "RuntimePaths",
-        ] {
+        let (tun_path, proxy_mode) = production
+            .split_once("mod proxy_mode {")
+            .expect("proxy mode module");
+        // TUN mode: cores only ever start in the elevated host.
+        assert!(tun_path.contains("elevated_factory"));
+        assert!(tun_path.contains(".controller(generation)"));
+        assert!(tun_path.contains("runtime_generation_from_path"));
+        assert!(tun_path.contains("if !options.tun {"));
+        for forbidden in ["SidecarProcessController", "RuntimePaths"] {
             assert!(
-                !production.contains(forbidden),
-                "production main still contains {forbidden}"
+                !tun_path.contains(forbidden),
+                "the TUN path must not launch cores itself: {forbidden}"
             );
         }
+        // Proxy mode: the package's own cores, TUN disabled, system proxy tied to Mihomo.
+        assert!(proxy_mode.contains(".with_proxy_mode(port)"));
+        assert!(proxy_mode.contains("SystemProxyController::new("));
+        assert!(proxy_mode.contains(".join(\"cores\")"));
+        for forbidden in ["MULTICORE_XRAY_BIN", "MULTICORE_MIHOMO_BIN"] {
+            assert!(
+                !production.contains(forbidden),
+                "core binaries must come from the package, not the environment: {forbidden}"
+            );
+        }
+        // A crashed session's proxy is restored before the daemon serves anything.
+        assert!(
+            tun_path.find("system_proxy::recover(").unwrap()
+                < tun_path.find("axum::serve(").unwrap()
+        );
     }
 }

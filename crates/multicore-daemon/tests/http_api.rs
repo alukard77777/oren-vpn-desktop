@@ -483,7 +483,7 @@ async fn bodyless_routes_reject_body_without_content_length() {
             "DELETE",
             "/v1/subscriptions/00000000-0000-4000-8000-000000000001",
         ),
-        ("POST", "/v1/connect"),
+        // `/v1/connect` takes optional JSON options (tests/connect_options_api.rs).
         ("POST", "/v1/disconnect"),
         ("GET", "/v1/events?after=0"),
     ];
