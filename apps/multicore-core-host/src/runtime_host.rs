@@ -328,7 +328,10 @@ fn state(v: RuntimeCheckState) -> ElevatedRuntimeState {
         RuntimeCheckState::Starting => ElevatedRuntimeState::Starting,
         RuntimeCheckState::Ready => ElevatedRuntimeState::Ready,
         RuntimeCheckState::Failed => ElevatedRuntimeState::Failed,
-        RuntimeCheckState::Unsupported => ElevatedRuntimeState::Unsupported,
+        // The elevated host only runs TUN mode; a disabled TUN never reaches it.
+        RuntimeCheckState::Unsupported | RuntimeCheckState::Disabled => {
+            ElevatedRuntimeState::Unsupported
+        }
     }
 }
 

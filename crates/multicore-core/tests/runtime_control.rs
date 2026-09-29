@@ -234,6 +234,95 @@ tun:
     assert_eq!(snapshot.mihomo.raw_yaml().as_bytes(), mihomo);
 }
 
+#[test]
+fn proxy_mode_disables_tun_and_listens_on_loopback_only() {
+    let mihomo = br#"
+proxies: []
+allow-lan: true
+bind-address: "*"
+mixed-port: 7890
+tun:
+  enable: true
+  device: FlClashX
+  stack: system
+"#;
+    let snapshot = Snapshot::parse(mihomo, br#"{}"#).unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_proxy_mode(28765)
+        .unwrap();
+    assert_eq!(control.proxy_mixed_port(), Some(28765));
+
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let mapping = runtime.as_mapping().unwrap();
+    let key = |name: &str| Value::String(name.to_owned());
+    let tun = mapping.get(key("tun")).and_then(Value::as_mapping).unwrap();
+
+    assert_eq!(tun.get(key("enable")).and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        tun.get(key("device")).and_then(Value::as_str),
+        Some("MultiCore")
+    );
+    assert_eq!(
+        mapping.get(key("mixed-port")).and_then(Value::as_u64),
+        Some(28765)
+    );
+    assert_eq!(
+        mapping.get(key("bind-address")).and_then(Value::as_str),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        mapping.get(key("allow-lan")).and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+#[test]
+fn proxy_mode_requires_a_concrete_port() {
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    assert!(control.with_proxy_mode(0).is_err());
+}
+
+#[test]
+fn tun_mode_leaves_provider_listeners_untouched() {
+    let snapshot = Snapshot::parse(
+        b"proxies: []
+allow-lan: true
+",
+        br#"{}"#,
+    )
+    .unwrap();
+    let directory = TempDirectory::new();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let mapping = runtime.as_mapping().unwrap();
+    assert_eq!(
+        mapping
+            .get(Value::String("allow-lan".to_owned()))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        mapping
+            .get(Value::String("mixed-port".to_owned()))
+            .is_none()
+    );
+    let tun = mapping
+        .get(Value::String("tun".to_owned()))
+        .and_then(Value::as_mapping)
+        .unwrap();
+    assert!(tun.get(Value::String("enable".to_owned())).is_none());
+}
+
 fn live_dns_overlay(document: JsonValue) -> Result<JsonValue, multicore_core::PersistenceError> {
     let bytes = serde_json::to_vec(&document).unwrap();
     let snapshot = Snapshot::parse(b"proxies: []\n", &bytes).unwrap();

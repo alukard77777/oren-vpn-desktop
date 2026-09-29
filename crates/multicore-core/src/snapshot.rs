@@ -776,6 +776,9 @@ pub struct MihomoRuntimeControl {
     secret: String,
     xray_outbound_interface: Option<String>,
     external_ui_directory: Option<PathBuf>,
+    /// System-proxy mode: TUN is disabled and Mihomo instead listens on this loopback
+    /// mixed (HTTP+SOCKS) port, which the OS proxy settings point at.
+    proxy_mixed_port: Option<u16>,
 }
 
 impl std::fmt::Debug for MihomoRuntimeControl {
@@ -792,6 +795,7 @@ impl std::fmt::Debug for MihomoRuntimeControl {
                     .map(|_| "[CONFIGURED]"),
             )
             .field("external_ui_directory", &self.external_ui_directory)
+            .field("proxy_mixed_port", &self.proxy_mixed_port)
             .finish()
     }
 }
@@ -816,11 +820,31 @@ impl MihomoRuntimeControl {
             secret,
             xray_outbound_interface: None,
             external_ui_directory: None,
+            proxy_mixed_port: None,
         })
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Switches the runtime to system-proxy mode: the provider's `tun` is kept but disabled,
+    /// and Mihomo listens on `127.0.0.1:<port>` only (`bind-address`, no LAN access). Without
+    /// TUN no core needs administrator rights.
+    pub fn with_proxy_mode(mut self, port: u16) -> io::Result<Self> {
+        if port == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Mihomo proxy port must be a concrete loopback port",
+            ));
+        }
+        self.proxy_mixed_port = Some(port);
+        Ok(self)
+    }
+
+    /// The loopback mixed port in system-proxy mode; `None` in TUN mode.
+    pub fn proxy_mixed_port(&self) -> Option<u16> {
+        self.proxy_mixed_port
     }
 
     pub fn with_xray_outbound_interface(
@@ -1235,6 +1259,24 @@ pub fn stage_runtime_with_mihomo_control(
         YamlValue::String("device".to_owned()),
         YamlValue::String("MultiCore".to_owned()),
     );
+    if let Some(port) = control.proxy_mixed_port {
+        tun.insert(
+            YamlValue::String("enable".to_owned()),
+            YamlValue::Bool(false),
+        );
+        mapping.insert(
+            YamlValue::String("mixed-port".to_owned()),
+            YamlValue::Number(port.into()),
+        );
+        mapping.insert(
+            YamlValue::String("bind-address".to_owned()),
+            YamlValue::String("127.0.0.1".to_owned()),
+        );
+        mapping.insert(
+            YamlValue::String("allow-lan".to_owned()),
+            YamlValue::Bool(false),
+        );
+    }
     let profile_key = YamlValue::String("profile".to_owned());
     let profile = mapping
         .entry(profile_key)

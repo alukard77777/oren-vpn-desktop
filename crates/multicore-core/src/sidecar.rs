@@ -48,6 +48,8 @@ pub enum RuntimeCheckState {
     Ready,
     Failed,
     Unsupported,
+    /// Deliberately off: TUN in system-proxy mode.
+    Disabled,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -424,12 +426,20 @@ impl TokioProcessLauncher {
                 xray_domain_dns_warm(&runtime.paths.xray_config).await
             }
             Engine::Mihomo => {
-                let Ok((controller, device)) =
-                    mihomo_readiness_targets(&runtime.paths.mihomo_config)
-                else {
+                let Ok(targets) = mihomo_readiness_targets(&runtime.paths.mihomo_config) else {
                     return false;
                 };
-                TcpStream::connect(controller).await.is_ok() && tun_device_is_up(&device).await
+                if TcpStream::connect(targets.controller).await.is_err() {
+                    return false;
+                }
+                match targets.traffic {
+                    MihomoTrafficEntry::Tun { device } => tun_device_is_up(&device).await,
+                    // System-proxy mode: the proxy port accepting a connection is what
+                    // applications will actually use.
+                    MihomoTrafficEntry::MixedPort(address) => {
+                        TcpStream::connect(address).await.is_ok()
+                    }
+                }
             }
         }
     }
@@ -562,8 +572,11 @@ impl ProcessLauncher for TokioProcessLauncher {
             let Some(runtime) = &self.runtime else {
                 return RuntimeCheckState::Unsupported;
             };
-            let Ok((_, device)) = mihomo_readiness_targets(&runtime.paths.mihomo_config) else {
+            let Ok(targets) = mihomo_readiness_targets(&runtime.paths.mihomo_config) else {
                 return RuntimeCheckState::Failed;
+            };
+            let MihomoTrafficEntry::Tun { device } = targets.traffic else {
+                return RuntimeCheckState::Disabled;
             };
             if tun_device_is_up(&device).await {
                 RuntimeCheckState::Ready
@@ -928,9 +941,27 @@ async fn xray_domain_dns_warm(config_path: &std::path::Path) -> bool {
     }
 }
 
-fn mihomo_readiness_targets(path: &std::path::Path) -> Result<(std::net::SocketAddr, String), ()> {
+/// Where application traffic enters Mihomo: its TUN device, or (system-proxy mode, TUN
+/// disabled) its loopback mixed port.
+#[derive(Debug, PartialEq, Eq)]
+enum MihomoTrafficEntry {
+    Tun { device: String },
+    MixedPort(std::net::SocketAddr),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MihomoReadinessTargets {
+    controller: std::net::SocketAddr,
+    traffic: MihomoTrafficEntry,
+}
+
+fn mihomo_readiness_targets(path: &std::path::Path) -> Result<MihomoReadinessTargets, ()> {
     let bytes = std::fs::read(path).map_err(|_| ())?;
-    let document: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&bytes).map_err(|_| ())?;
+    mihomo_readiness_targets_from(&bytes)
+}
+
+fn mihomo_readiness_targets_from(bytes: &[u8]) -> Result<MihomoReadinessTargets, ()> {
+    let document: serde_yaml_ng::Value = serde_yaml_ng::from_slice(bytes).map_err(|_| ())?;
     let mapping = document.as_mapping().ok_or(())?;
     let controller = mapping
         .get(serde_yaml_ng::Value::String(
@@ -943,14 +974,48 @@ fn mihomo_readiness_targets(path: &std::path::Path) -> Result<(std::net::SocketA
     if !controller.ip().is_loopback() {
         return Err(());
     }
-    let device = mapping
-        .get(serde_yaml_ng::Value::String("tun".to_owned()))
-        .and_then(serde_yaml_ng::Value::as_mapping)
-        .and_then(|tun| tun.get(serde_yaml_ng::Value::String("device".to_owned())))
+    let key = |name: &str| serde_yaml_ng::Value::String(name.to_owned());
+    let tun = mapping
+        .get(key("tun"))
+        .and_then(serde_yaml_ng::Value::as_mapping);
+    let tun_disabled = tun
+        .and_then(|tun| tun.get(key("enable")))
+        .and_then(serde_yaml_ng::Value::as_bool)
+        == Some(false);
+    if tun_disabled {
+        // Only the loopback-bound mixed port written by the proxy-mode overlay counts.
+        if mapping
+            .get(key("bind-address"))
+            .and_then(serde_yaml_ng::Value::as_str)
+            != Some("127.0.0.1")
+        {
+            return Err(());
+        }
+        let port = mapping
+            .get(key("mixed-port"))
+            .and_then(serde_yaml_ng::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+            .ok_or(())?;
+        return Ok(MihomoReadinessTargets {
+            controller,
+            traffic: MihomoTrafficEntry::MixedPort(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                port,
+            ))),
+        });
+    }
+    let device = tun
+        .and_then(|tun| tun.get(key("device")))
         .and_then(serde_yaml_ng::Value::as_str)
         .filter(|device| !device.trim().is_empty())
         .ok_or(())?;
-    Ok((controller, device.to_owned()))
+    Ok(MihomoReadinessTargets {
+        controller,
+        traffic: MihomoTrafficEntry::Tun {
+            device: device.to_owned(),
+        },
+    })
 }
 
 #[cfg(windows)]
@@ -1135,6 +1200,41 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    #[test]
+    fn readiness_targets_use_the_tun_device_by_default() {
+        let targets = mihomo_readiness_targets_from(
+            b"external-controller: 127.0.0.1:19090\ntun:\n  device: MultiCore\n",
+        )
+        .unwrap();
+        assert_eq!(targets.controller, "127.0.0.1:19090".parse().unwrap());
+        assert_eq!(
+            targets.traffic,
+            MihomoTrafficEntry::Tun {
+                device: "MultiCore".into()
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_targets_without_tun_use_the_loopback_mixed_port() {
+        let targets = mihomo_readiness_targets_from(
+            b"external-controller: 127.0.0.1:19090\nmixed-port: 28765\nbind-address: 127.0.0.1\ntun:\n  enable: false\n  device: MultiCore\n",
+        )
+        .unwrap();
+        assert_eq!(
+            targets.traffic,
+            MihomoTrafficEntry::MixedPort("127.0.0.1:28765".parse().unwrap())
+        );
+        // Disabled TUN without a loopback-bound proxy port is not a runnable runtime.
+        for yaml in [
+            &b"external-controller: 127.0.0.1:19090\ntun:\n  enable: false\n"[..],
+            b"external-controller: 127.0.0.1:19090\nmixed-port: 7890\nbind-address: '*'\ntun:\n  enable: false\n",
+            b"external-controller: 127.0.0.1:19090\nmixed-port: 0\nbind-address: 127.0.0.1\ntun:\n  enable: false\n",
+        ] {
+            assert!(mihomo_readiness_targets_from(yaml).is_err());
+        }
+    }
 
     #[test]
     fn adapter_requires_exact_alias_and_operational_up() {
