@@ -339,6 +339,59 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_toggle_detail_is_exit(false);
             ui.set_subscription_refresh_available(false);
         }),
+        // The approved home-state mockups (.superdesign home-notice/-error/-warning/-connecting).
+        ("home-state-notice", 840, 720, |ui| {
+            connected(ui);
+            ui.set_subscription_title(s("Fjord VPN"));
+            ui.set_subscription_expiry(s("Бессрочно"));
+            ui.set_subscription_announcement_text(s("Плановые работы сегодня в 23:00 по московскому времени. Возможны кратковременные отключения серверов в Германии и Нидерландах."));
+            ui.set_announcement_open(true);
+        }),
+        ("home-state-error", 840, 720, |ui| {
+            ready(ui);
+            ui.set_subscription_title(s("Fjord VPN"));
+            ui.set_status_eyebrow(s("Не удалось подключиться"));
+            ui.set_supporting(s(
+                "Сервер не ответил за 15 с — повторите или выберите другой маршрут",
+            ));
+            ui.set_status_tone(s("danger"));
+            ui.set_toggle_title(s("Не удалось подключиться"));
+            ui.set_toggle_detail_is_exit(false);
+            ui.set_subscription_refresh_error(s("Не удалось обновить подписку"));
+            ui.set_catalog_nodes(ModelRc::default());
+            ui.set_catalog_error(s(
+                "Не удалось загрузить маршруты. Каталог устарел — обновите подписку, чтобы получить актуальный список серверов.",
+            ));
+        }),
+        ("home-state-warning", 840, 720, |ui| {
+            ready(ui);
+            ui.set_subscription_title(s("Fjord VPN"));
+            ui.set_subscription_expiry(s("Бессрочно"));
+            ui.set_status_tone(s("warning"));
+            ui.set_toggle_title(s("Нет связи с сервисом"));
+            ui.set_supporting(s("Служба MultiCore не отвечает — перезапускаем…"));
+            ui.set_toggle_detail_is_exit(false);
+            ui.set_primary_enabled(false);
+            ui.set_conflicting_apps_banner_visible(true);
+            ui.set_conflicting_apps_message(s(
+                "Запущен Happ — он перехватывает туннель. Закройте его, чтобы MultiCore мог подключиться.",
+            ));
+        }),
+        ("home-state-connecting", 840, 720, |ui| {
+            ready(ui);
+            ui.set_subscription_title(s("Fjord VPN"));
+            ui.set_subscription_expiry(s("Бессрочно"));
+            ui.set_toggle_title(s("Подключение…"));
+            ui.set_toggle_on(true);
+            ui.set_toggle_busy(true);
+            ui.set_primary_enabled(false);
+            ui.set_update_available(true);
+            ui.set_update_status(s(
+                "MultiCore 0.3.4 · установится после отключения",
+            ));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+        }),
         ("home-local-profile", 840, 720, |ui| {
             ready(ui);
             ui.set_subscription_refresh_available(false);

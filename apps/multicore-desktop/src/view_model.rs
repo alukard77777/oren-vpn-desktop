@@ -6863,7 +6863,8 @@ mod tests {
     #[test]
     fn desktop_control_center_source_contract() {
         let source = include_str!("../ui/app.slint");
-        let components = include_str!("../ui/components.slint");
+        // Checkouts may use CRLF; the multi-line contracts below are written with LF.
+        let components = &include_str!("../ui/components.slint").replace("\r\n", "\n");
         let main = include_str!("main.rs");
         let logo_cache = include_str!("logo_cache.rs");
 
@@ -6896,7 +6897,7 @@ mod tests {
         let connection_strip = source
             .split("connection-strip := Rectangle")
             .nth(1)
-            .and_then(|source| source.split("update-banner := Rectangle").next())
+            .and_then(|source| source.split("conflicting-apps-banner := Rectangle").next())
             .expect("connection strip source");
         let toggle_module = connection_strip
             .split("toggle-module := Rectangle")
@@ -6919,7 +6920,9 @@ mod tests {
             toggle_module.contains("x: root.toggle-on ? parent.width - self.width - 4px : 4px;")
         );
         assert!(
-            toggle_module.contains("animate x, width { duration: 180ms; easing: ease-in-out; }")
+            toggle_module.contains(
+                "animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }"
+            )
         );
         assert!(
             connection_strip
@@ -7009,7 +7012,7 @@ mod tests {
         assert!(source.contains("subscription-announcement-text"));
         assert!(source.contains("subscription-announcement-tone"));
         for semantic_icon in [
-            "announcement-info.svg",
+            "info.svg",
             "announcement-success.svg",
             "announcement-danger.svg",
         ] {
@@ -7021,11 +7024,18 @@ mod tests {
             .split("announcement-popover := Rectangle {")
             .nth(1)
             .expect("announcement popover source");
-        let announcement = announcement.chars().take(2400).collect::<String>();
+        let announcement = announcement.chars().take(6000).collect::<String>();
         assert!(announcement.contains("x: -8px;"));
         assert!(announcement.contains("width: Math.min(420px, parent.width - 16px);"));
         assert!(announcement.contains("wrap: word-wrap;"));
-        assert!(announcement.contains("animate opacity { duration: 160ms; easing: ease-out; }"));
+        // Grows out of the bell: fade, slide and a slight scale-up.
+        assert!(announcement.contains(
+            "animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"
+        ));
+        assert!(announcement.contains("transform-scale: self.shown ? 1 : 0.97;"));
+        assert!(announcement.contains("text: \"НОВОЕ ОТ ПРОВАЙДЕРА\";"));
+        assert!(announcement.contains("announcement-close := FocusScope"));
+        assert!(announcement.contains("accessible-label: \"Закрыть сообщение провайдера\";"));
         assert!(announcement.contains("accessible-role: none;"));
         assert!(source.contains("clicked => { root.announcement-open = false; }"));
         assert!(source.contains("in property <string> subscription-title:"));
