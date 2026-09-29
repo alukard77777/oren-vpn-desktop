@@ -3931,8 +3931,49 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
     }
 }
 
+/// What the home screen's connection toggle shows for a connection state.
+#[derive(Debug, PartialEq, Eq)]
+struct TogglePresentation {
+    title: String,
+    /// Switch position: on while connected or while a connection is being made.
+    on: bool,
+    /// A connect or disconnect is in progress.
+    busy: bool,
+    /// The line under the title names the exit node; otherwise it carries
+    /// the state's own explanation (an error, degraded mode).
+    detail_is_exit: bool,
+}
+
+fn toggle_presentation(presentation: &StatePresentation) -> TogglePresentation {
+    let (title, on, busy, detail_is_exit) = if presentation.is_busy {
+        // Disconnecting still reports is_connected, so busy is decided first.
+        if presentation.is_connected {
+            ("Отключение…".to_owned(), false, true, true)
+        } else {
+            ("Подключение…".to_owned(), true, true, true)
+        }
+    } else if presentation.is_connected {
+        ("Защита включена".to_owned(), true, false, true)
+    } else if presentation.is_error || presentation.is_degraded {
+        (presentation.eyebrow.to_owned(), false, false, false)
+    } else {
+        ("Защита выключена".to_owned(), false, false, true)
+    };
+    TogglePresentation {
+        title,
+        on,
+        busy,
+        detail_is_exit,
+    }
+}
+
 fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     let presentation = &snapshot.presentation;
+    let toggle = toggle_presentation(presentation);
+    ui.set_toggle_title(toggle.title.into());
+    ui.set_toggle_on(toggle.on);
+    ui.set_toggle_busy(toggle.busy);
+    ui.set_toggle_detail_is_exit(toggle.detail_is_exit);
     ui.set_status_eyebrow(SharedString::from(presentation.eyebrow));
     ui.set_headline(presentation.headline.clone().into());
     ui.set_supporting(presentation.supporting.clone().into());
@@ -4419,12 +4460,12 @@ mod window_tests {
         for required in [
             "in property <string> subscription-updated",
             "in property <bool> subscription-updated-stale",
-            "refresh-action-reserve := Rectangle",
+            "title-subscription := Rectangle",
             "subscription-refresh-action := FocusScope",
-            "root.subscription-refresh-pending ? \"Обновляем…\" : \"Обновить\"",
+            "root.subscription-refresh-pending ? \"Подписка обновляется\" : \"Обновить подписку\"",
             "root.refresh-subscription();",
             "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
-            "announcement-strip := Rectangle",
+            "announcement-popover := Rectangle",
             "announcement-copy := Text",
             "routes-heading := HorizontalLayout",
             "route-updated-meta := Text",
@@ -4434,20 +4475,20 @@ mod window_tests {
                 "missing updated-at UI contract: {required}"
             );
         }
+        // Refresh is a 28px icon right after the title-bar subscription chip; it spins
+        // while the fetch runs (unless reduced motion is on).
         let refresh_action = ui
             .split("subscription-refresh-action := FocusScope")
             .nth(1)
-            .and_then(|source| {
-                source
-                    .split("if root.subscription-announcement-text")
-                    .next()
-            })
+            .and_then(|source| source.split("announcement-bell := FocusScope").next())
             .expect("subscription refresh action source");
         for unchanged in [
-            "x: parent.width - 164px;",
-            "y: 5px;",
-            "width: 116px;",
-            "height: 44px;",
+            "x: parent.chip-width + 4px;",
+            "y: 0;",
+            "width: 28px;",
+            "height: 28px;",
+            "@image-url(\"../assets/refresh.svg\")",
+            "root.subscription-refresh-pending && !root.reduced-motion",
         ] {
             assert!(
                 refresh_action.contains(unchanged),
@@ -4455,19 +4496,21 @@ mod window_tests {
             );
         }
 
+        // Provider notices open from the bell as a popover sized to their text.
         let announcement = ui
-            .split("announcement-strip := Rectangle")
+            .split("announcement-popover := Rectangle")
             .nth(1)
-            .and_then(|source| source.split("inline-routes := Rectangle").next())
             .expect("announcement source");
-        assert!(announcement.contains("x: 0px;"));
-        assert!(announcement.contains("width: parent.width;"));
-        assert!(announcement.contains("height: self.two-line ? 52px : 36px;"));
+        let announcement = announcement.chars().take(2400).collect::<String>();
+        assert!(announcement.contains("property <bool> shown: root.announcement-open"));
+        assert!(announcement.contains("height: announcement-copy.preferred-height + 28px;"));
         assert!(announcement.contains("wrap: word-wrap;"));
         assert!(
             announcement.contains("accessible-description: root.subscription-announcement-text;")
         );
-        assert!(announcement.contains("horizontal-alignment: center;"));
+        assert!(ui.contains(
+            "if root.subscription-announcement-text != \"\": announcement-bell := FocusScope"
+        ));
 
         let routes_header = ui
             .split("inline-routes := Rectangle")
@@ -4819,7 +4862,7 @@ mod window_tests {
         for required in [
             "export struct UiSubscriptionProfile",
             "root.active-panel == \"subscription\"",
-            "profile-menu-reserve := Rectangle",
+            "shelf-open-focus := FocusScope",
             "callback activate-profile(string);",
             "callback refresh-profile(string);",
             "callback replace-profile-source(string, string);",
@@ -4848,30 +4891,35 @@ mod window_tests {
         }
         assert!(!ui.contains("label: \"Профили\";"));
 
+        // The switcher is the title-bar chip: transparent at rest, tinted on hover/open.
+        assert!(!ui.contains("profile-menu-reserve"));
         let switcher = ui
-            .split("subscription-strip := Rectangle")
+            .split("subscription-chip := Rectangle")
             .nth(1)
             .and_then(|source| {
                 source
-                    .split("if root.subscription-announcement-text")
+                    .split("subscription-refresh-action := FocusScope")
                     .next()
             })
-            .expect("home subscription switcher source");
-        assert!(switcher.contains("background: Theme.surface;"));
-        assert!(
-            !switcher
-                .contains("background: root.profile-menu-open ? Theme.elevated : Theme.surface;")
-        );
+            .expect("title subscription switcher source");
+        assert!(switcher.contains(
+            "background: root.profile-menu-open ? #ffffff12 : chip-touch.has-hover ? #ffffff0a : transparent;"
+        ));
+        assert!(switcher.contains("function toggle-menu(keyboard: bool)"));
+        assert!(switcher.contains("root.profile-menu-keyboard-open = keyboard;"));
 
         let popover = ui
             .split("profile-menu := Rectangle")
             .nth(1)
             .and_then(|source| source.split("// A taskbar restore").next())
             .expect("animated profile popover source");
+        // The menu hangs under the title chip, 8px left of the main pane.
         for required in [
-            "width: parent.width - 40px;",
+            "x: -8px;",
+            "width: Math.min(420px, parent.width - 16px);",
+            "height: Math.min(parent.height - 16px, root.profile-menu-content-height);",
             "opacity: root.profile-menu-open ? 1 : 0;",
-            "y: (root.profile-menu-open ? 188px : 180px) + root.home-banner-offset;",
+            "y: root.profile-menu-open ? 8px : 0px;",
             "animate opacity { duration: 160ms; easing: ease-out; }",
             "animate y { duration: 160ms; easing: ease-out; }",
         ] {
@@ -4886,7 +4934,7 @@ mod window_tests {
         assert!(!ui.contains("drop-shadow-blur: 18px"));
         assert!(!ui.contains("text: \"Обн.\""));
         assert!(!ui.contains("text: \"×\""));
-        assert!(ui.contains("width: parent.width - 40px;"));
+        assert!(!ui.contains("home-banner-offset"));
         assert!(ui.contains("Math.min(288px, 16px + root.subscription-profiles.length * 54px)"));
         assert!(!ui.contains("text: \"Профили\""));
         assert!(main.contains("model.finish_profile_list(token, result)"));
@@ -5850,6 +5898,95 @@ mod window_tests {
             .find("single_instance::claim_or_forward(&activation)")
             .expect("single-instance forwarding");
         assert!(repair < forwarding);
+    }
+
+    #[test]
+    fn toggle_reflects_every_connection_state() {
+        use crate::view_model::UiState;
+
+        let cases = [
+            (
+                UiState::Ready {
+                    profile: "p".into(),
+                    node: "n".into(),
+                },
+                "Защита выключена",
+                false,
+                false,
+                true,
+            ),
+            (
+                UiState::Connecting {
+                    profile: "p".into(),
+                    node: "n".into(),
+                    step: "s".into(),
+                },
+                "Подключение…",
+                true,
+                true,
+                true,
+            ),
+            (
+                UiState::Connected {
+                    profile: "p".into(),
+                    node: "n".into(),
+                },
+                "Защита включена",
+                true,
+                false,
+                true,
+            ),
+            (
+                UiState::Disconnecting {
+                    profile: "p".into(),
+                    node: "n".into(),
+                },
+                "Отключение…",
+                false,
+                true,
+                true,
+            ),
+            (
+                UiState::Error {
+                    message: "boom".into(),
+                },
+                "Не удалось подключиться",
+                false,
+                false,
+                false,
+            ),
+            (
+                UiState::ServiceUnreachable {
+                    message: "m".into(),
+                },
+                "Нет связи с сервисом",
+                false,
+                false,
+                false,
+            ),
+            (
+                UiState::DaemonDegraded {
+                    message: "m".into(),
+                },
+                "Сервис недоступен",
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (state, title, on, busy, detail_is_exit) in cases {
+            let toggle = super::toggle_presentation(&state.presentation());
+            assert_eq!(
+                toggle,
+                super::TogglePresentation {
+                    title: title.into(),
+                    on,
+                    busy,
+                    detail_is_exit
+                },
+                "{state:?}"
+            );
+        }
     }
 
     #[test]

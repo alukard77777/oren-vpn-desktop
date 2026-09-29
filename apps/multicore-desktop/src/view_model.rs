@@ -4420,8 +4420,9 @@ mod tests {
         assert!(main.contains("apply_latest_snapshot(&ui, &model).latency.queued"));
         assert!(app.contains("trailing-tone: node.latency-tone;"));
         assert!(!app.contains("Local signal grid: structural guides"));
-        assert!(app.contains("height: 54px;"));
-        assert!(app.contains("border-color: root.status-tone == \"success\""));
+        // The connection module keeps a state-tinted hairline.
+        assert!(app.contains("? 88px"));
+        assert!(app.contains(": root.status-tone == \"success\" ? #3ccb7f59"));
         assert!(include_str!("../ui/components.slint").contains("width: 76px;"));
         let route_row = include_str!("../ui/components.slint")
             .split("export component RouteNodeRow")
@@ -4460,21 +4461,27 @@ mod tests {
             normalized_app
                 .contains("height: 60px;\n                                horizontal-stretch: 1;")
         );
-        assert!(app.contains("if root.has-service-logo: service-logo-badge := Rectangle"));
-        assert!(app.contains("source: @image-url(\"../assets/power.svg\")"));
-
-        let shelf = app
-            .split("height: 54px;")
+        // The home shelf moved into the window title: the provider logo leads the
+        // subscription chip, and a failed refresh replaces the expiry in place.
+        assert!(!app.contains("subscription-strip"));
+        assert!(!app.contains("service-logo-badge"));
+        let chip = app
+            .split("subscription-chip := Rectangle {")
             .nth(1)
             .and_then(|source| {
                 source
-                    .split("if root.subscription-announcement-text")
+                    .split("subscription-refresh-action := FocusScope")
                     .next()
             })
-            .expect("subscription shelf source");
-        assert!(shelf.contains("border-radius: 16px;"));
-        assert!(shelf.contains("root.subscription-refresh-error != \"\""));
-        assert!(!shelf.contains("if root.subscription-refresh-error != \"\": Text"));
+            .expect("title subscription chip source");
+        assert!(chip.contains("if root.has-service-logo: Image {"));
+        assert!(chip.contains("source: root.service-logo;"));
+        assert!(chip.contains("root.subscription-refresh-error != \"\" ? \"Не удалось обновить\""));
+        assert!(!chip.contains("if root.subscription-refresh-error != \"\": Text"));
+        assert!(app.contains("toggle-module := Rectangle"));
+        for shield in ["shield-check.svg", "shield-alert.svg", "shield-off.svg"] {
+            assert!(app.contains(&format!("@image-url(\"../assets/{shield}\")")));
+        }
 
         assert!(!components.contains("#0091ff"));
         assert!(components.contains("#4c9dff1f"));
@@ -4484,18 +4491,32 @@ mod tests {
     #[test]
     fn home_subscription_refresh_button_has_balanced_vertical_padding() {
         let app = include_str!("../ui/app.slint");
-        let refresh_action = app
+        let title_subscription = app
+            .split("title-subscription := Rectangle {")
+            .nth(1)
+            .expect("title subscription source");
+        let refresh_action = title_subscription
             .split("subscription-refresh-action := FocusScope")
             .nth(1)
-            .and_then(|source| source.split("if root.profile-menu-open").next())
-            .expect("home subscription refresh action source");
+            .and_then(|source| source.split("announcement-bell := FocusScope").next())
+            .expect("title subscription refresh action source");
 
-        assert!(refresh_action.contains("width: 116px;"));
-        assert!(refresh_action.contains("height: 44px;"));
-        assert!(refresh_action.contains("opacity: parent.enabled ? 1 : 0.45;"));
-        assert!(refresh_action.contains("\"Указать ссылку\""));
-        let compact = refresh_action.split_whitespace().collect::<String>();
-        assert!(compact.contains("Rectangle{y:5px;height:34px;"));
+        // A square icon button centred in the 28px chip row of the 44px title bar.
+        assert!(title_subscription.contains("y: 8px;"));
+        assert!(title_subscription.contains("height: 28px;"));
+        assert!(refresh_action.contains("width: 28px;"));
+        assert!(refresh_action.contains("height: 28px;"));
+        assert!(refresh_action.contains("x: 7px;"));
+        assert!(refresh_action.contains("y: 7px;"));
+        assert!(refresh_action.contains("width: 14px;"));
+        assert!(refresh_action.contains("height: 14px;"));
+        assert!(
+            refresh_action
+                .contains("property <bool> source-mode: !root.subscription-refresh-available;")
+        );
+        assert!(refresh_action.contains("\"Указать ссылку подписки\""));
+        assert!(refresh_action.contains("root.refresh-subscription();"));
+        assert!(refresh_action.contains("subscription-refresh-action.run();"));
     }
 
     #[test]
@@ -6290,7 +6311,8 @@ mod tests {
         ] {
             assert!(wave_b.contains(required), "wave B missing: {required}");
         }
-        assert!(source.contains("background: root.status-tone == \"success\" ? #101a16 : root.status-tone == \"danger\" ? #1a1215 : #101721;"));
+        // The connection module is a flat surface; state lives in its hairline and badge.
+        assert!(source.contains("background: root.has-profile ? Theme.surface : #101721;"));
         assert!(components.contains("background: root.selected ? #172433 : Theme.surface;"));
         assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
         assert!(home_layer.contains("ambient-touch.mouse-x"));
@@ -6317,7 +6339,9 @@ mod tests {
             .and_then(|source| source.rsplit("VerticalLayout {").next())
             .expect("home content stack");
         assert!(home_stack.contains("padding: 20px;"));
-        assert!(home_stack.contains("spacing: 8px;"));
+        // One step between the connection module and the routes (no extra gap).
+        assert!(home_stack.contains("spacing: 16px;"));
+        assert!(!home_stack.contains("spacing: 8px;"));
         assert!(!home_stack.contains("spacing: 10px;"));
     }
 
@@ -6524,8 +6548,10 @@ mod tests {
                 .contains("if root.import-error != \"\" && !root.replace-editor-open: Text {")
         );
 
-        // First launch shows only onboarding: no empty shelf or route list noise.
-        assert!(source.contains("if root.has-profile: subscription-strip := Rectangle {"));
+        // First launch shows only onboarding: no subscription chip, toggle or route list noise.
+        assert!(source.contains("if root.has-profile: title-subscription := Rectangle {"));
+        assert!(source.contains("if root.has-profile: toggle-module := Rectangle {"));
+        assert!(source.contains("if root.has-profile: mesh-clip := Rectangle {"));
         assert!(source.contains("if root.has-profile: inline-routes := Rectangle {"));
     }
 
@@ -6550,20 +6576,16 @@ mod tests {
         assert!(source.contains("inline-routes := Rectangle"));
         assert!(source.contains("connection-strip := Rectangle"));
         assert!(source.contains("height: root.has-profile"));
-        assert!(source.contains("? 96px"));
+        assert!(source.contains("? 88px"));
         assert!(source.contains("power-action := FocusScope"));
-        assert!(source.contains("width: 72px;"));
-        assert!(source.contains("height: 72px;"));
         assert!(source.contains("accessible-label: root.primary-label;"));
         assert!(source.contains("in property <image> service-logo;"));
         assert!(source.contains("in property <bool> has-service-logo: false;"));
-        assert!(source.contains("power-glyph := Image"));
-        assert!(source.contains("width: 32px;"));
-        assert!(source.contains("service-logo-badge := Rectangle"));
-        assert!(source.contains("width: 28px;"));
         assert!(source.contains("source: root.service-logo;"));
         assert!(!source.contains("if !root.has-service-logo: Image"));
-        assert!(source.contains("@image-url(\"../assets/power.svg\")"));
+        // The power circle became a switch; the provider logo moved to the title chip.
+        assert!(!source.contains("power-glyph := Image"));
+        assert!(!source.contains("service-logo-badge := Rectangle"));
         assert!(source.contains("signal-mesh-field := Rectangle"));
         assert!(source.contains("strip-glow-touch := TouchArea"));
         let connection_strip = source
@@ -6571,20 +6593,41 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("update-banner := Rectangle").next())
             .expect("connection strip source");
-        assert!(connection_strip.contains("alignment: start;"));
-        assert!(!connection_strip.contains("alignment: center;"));
+        let toggle_module = connection_strip
+            .split("toggle-module := Rectangle")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("first-run-onboarding := VerticalLayout")
+                    .next()
+            })
+            .expect("toggle module source");
+        assert!(toggle_module.contains("shield-badge := Rectangle"));
+        assert!(toggle_module.contains("width: 44px;"));
+        assert!(toggle_module.contains("text: root.toggle-title;"));
+        assert!(toggle_module.contains("if root.toggle-detail-is-exit: HorizontalLayout"));
+        assert!(toggle_module.contains("alignment: start;"));
+        assert!(toggle_module.contains("width: 72px;"));
+        assert!(toggle_module.contains("height: 40px;"));
+        assert!(toggle_module.contains("toggle-knob := Rectangle"));
+        assert!(
+            toggle_module.contains("x: root.toggle-on ? parent.width - self.width - 4px : 4px;")
+        );
+        assert!(
+            toggle_module.contains("animate x, width { duration: 180ms; easing: ease-in-out; }")
+        );
         assert!(
             connection_strip
                 .find("signal-mesh-field := Rectangle")
                 .expect("pill mesh")
                 < connection_strip
-                    .find("HorizontalLayout")
-                    .expect("pill layout")
+                    .find("toggle-module := Rectangle")
+                    .expect("toggle module")
         );
         let pill_mesh = connection_strip
             .split("signal-mesh-field := Rectangle")
             .nth(1)
-            .and_then(|source| source.split("HorizontalLayout").next())
+            .and_then(|source| source.split("toggle-module := Rectangle").next())
             .expect("pill mesh source");
         assert!(pill_mesh.contains("x: 0;"));
         assert!(pill_mesh.contains("y: 0;"));
@@ -6609,31 +6652,27 @@ mod tests {
         assert!(connection_strip.contains("root.primary-action();"));
         assert!(connection_strip.contains("strip-glow-touch.pressed"));
         assert!(source.contains("subscription-refresh-action := FocusScope"));
-        let subscription_strip = source
-            .split("subscription-strip := Rectangle")
+        // The subscription shelf is gone from home: name, expiry, refresh and the
+        // provider-notice bell live in the window title.
+        assert!(!source.contains("subscription-strip := Rectangle"));
+        assert!(!source.contains("profile-menu-reserve"));
+        assert!(!source.contains("home-banner-offset"));
+        let title_subscription = source
+            .split("title-subscription := Rectangle {")
             .nth(1)
-            .and_then(|source| {
-                source
-                    .split("if root.subscription-announcement-text")
-                    .next()
-            })
-            .expect("subscription strip source");
-        assert!(subscription_strip.contains("border-radius: 16px;"));
-        assert!(subscription_strip.contains("x: parent.width - 164px;"));
-        assert!(subscription_strip.contains("width: 116px;"));
-        assert!(subscription_strip.contains("height: 44px;"));
+            .and_then(|source| source.split("TitleBarButton {").next())
+            .expect("title subscription source");
+        assert!(title_subscription.contains("subscription-chip := Rectangle"));
+        assert!(title_subscription.contains("shelf-open-focus := FocusScope"));
+        assert!(title_subscription.contains("chip-chevron := Path"));
         assert!(
-            subscription_strip
+            title_subscription
                 .contains("root.subscription-refresh-pending ? \"Подписка обновляется\"")
         );
-        assert!(subscription_strip.contains("root.refresh-subscription();"));
-        assert!(subscription_strip.contains("padding-right: 16px;"));
-        assert!(subscription_strip.contains("padding-top: 5px;"));
-        assert!(subscription_strip.contains("padding-bottom: 5px;"));
-        assert!(subscription_strip.contains("subscription-copy := VerticalLayout"));
-        assert!(subscription_strip.contains("padding-top: 2px;"));
-        assert!(subscription_strip.contains("spacing: 0px;"));
-        assert!(subscription_strip.contains("border-radius: 11px;"));
+        assert!(title_subscription.contains("root.refresh-subscription();"));
+        assert!(title_subscription.contains("announcement-bell := FocusScope"));
+        assert!(title_subscription.contains("root.announcement-open = !root.announcement-open;"));
+        assert!(title_subscription.contains("animate x { duration: 180ms; easing: ease-in-out; }"));
         assert!(pill_mesh.contains("opacity: self.active ? 1 : 0;"));
         assert!(!pill_mesh.contains("opacity: self.active ? 1 : 0.1;"));
         assert!(!source.contains("cursor-glow-field := Rectangle"));
@@ -6645,7 +6684,8 @@ mod tests {
         assert!(pill_mesh.contains("glow-soft 52%"));
         assert!(source.contains("mesh-clip := Rectangle"));
         assert!(source.contains("for _[grid-x] in 120"));
-        assert!(source.contains("for _[grid-cell-y] in 12"));
+        // 11 rows of 8px cells cover the 88px connection module.
+        assert!(source.contains("for _[grid-cell-y] in 11"));
         assert!(source.contains("property <float> distance: Math.sqrt("));
         assert!(source.contains("border-width: 0.5px;"));
         assert!(source.contains("signal-mesh-field.active ? Math.max(0, 1 - self.distance) : 0"));
@@ -6654,7 +6694,6 @@ mod tests {
         assert!(source.contains("#8ea39770"));
         assert!(!source.contains("144px * self.reveal"));
         assert!(!source.contains("352px * self.reveal"));
-        assert!(source.contains("#0d1814f0"));
         assert!(!source.contains("connect-halo := Rectangle"));
         assert!(!source.contains("power-cursor-wash := Rectangle"));
         assert!(!source.contains("power-mesh := Rectangle"));
@@ -6671,12 +6710,19 @@ mod tests {
         ] {
             assert!(source.contains(semantic_icon));
         }
+        // The notice is a popover under the title chip, closed by an outside click.
+        assert!(!source.contains("announcement-strip"));
         let announcement = source
-            .split("if root.subscription-announcement-text != \"\": Rectangle")
+            .split("announcement-popover := Rectangle {")
             .nth(1)
-            .and_then(|source| source.split("inline-routes := Rectangle").next())
-            .expect("announcement strip source");
-        assert_eq!(announcement.matches("accessible-role: none;").count(), 3);
+            .expect("announcement popover source");
+        let announcement = announcement.chars().take(2400).collect::<String>();
+        assert!(announcement.contains("x: -8px;"));
+        assert!(announcement.contains("width: Math.min(420px, parent.width - 16px);"));
+        assert!(announcement.contains("wrap: word-wrap;"));
+        assert!(announcement.contains("animate opacity { duration: 160ms; easing: ease-out; }"));
+        assert!(announcement.contains("accessible-role: none;"));
+        assert!(source.contains("clicked => { root.announcement-open = false; }"));
         assert!(source.contains("in property <string> subscription-title:"));
         assert!(source.contains("text: root.subscription-title;"));
         assert!(!source.to_ascii_lowercase().contains("text: \"acmevpn\""));

@@ -508,6 +508,11 @@ export component AppWindow inherits Window {
     // session exists, i.e. while Connected.
     in property <bool> dashboard-available: false;
     in property <string> status-tone: "neutral";
+    // Connection toggle (home): see toggle_presentation in main.rs.
+    in property <string> toggle-title: "Защита выключена";
+    in property <bool> toggle-on: false;
+    in property <bool> toggle-busy: false;
+    in property <bool> toggle-detail-is-exit: true;
     in property <bool> import-pending: false;
     in property <string> import-error;
     in property <string> subscription-title: "Подписка";
@@ -581,6 +586,8 @@ export component AppWindow inherits Window {
     // A connect/disconnect/import is in flight: installing now cannot start.
     in property <bool> update-runtime-busy: false;
     in-out property <string> update-banner-dismissed-for;
+    // Provider notice popover, opened from the title-bar bell.
+    in-out property <bool> announcement-open: false;
     in property <bool> conflicting-apps-banner-visible: false;
     in property <string> conflicting-apps-message;
     in-out property <bool> update-confirm-open: false;
@@ -606,16 +613,6 @@ export component AppWindow inherits Window {
     in-out property <string> profile-delete-confirm-id;
     private property <bool> catalog-group-navigation-enabled: !root.catalog-loading && root.catalog-groups.length > 0;
     private property <bool> update-banner-visible: root.update-available && root.update-status != root.update-banner-dismissed-for;
-    // The profile menu floats under the subscription shelf, so it follows the
-    // optional update/conflicting-apps banners that sit between the
-    // connection strip and shelf.
-    // Matches each banner's own fixed height below + the 8px VerticalLayout
-    // spacing after it. Slint does not allow referencing an element defined
-    // inside an `if` block from outside it, so this can't just read
-    // `conflicting-apps-banner.height` - both this and the banner's own
-    // `height:` must be kept in sync by hand.
-    private property <length> home-banner-offset: (root.update-banner-visible ? 80px : 0px)
-        + (root.conflicting-apps-banner-visible ? 168px : 0px);
     private property <length> profile-menu-content-height: (root.profile-switch-locked ? 28px : 0px)
         + (root.profile-mutation-error != "" ? 40px : 0px)
         + (root.profile-menu-error != "" ? 104px
@@ -750,6 +747,8 @@ export component AppWindow inherits Window {
                     root.subscription-draft = "";
                     root.dismiss-first-run-import();
                     root.first-run-trigger-focus-serial += 1;
+                } else if (root.announcement-open) {
+                    root.announcement-open = false;
                 } else if (root.profile-delete-confirm-id != "") {
                     root.profile-delete-control-focus-id = root.profile-delete-confirm-id;
                     root.profile-delete-confirm-id = "";
@@ -793,18 +792,237 @@ export component AppWindow inherits Window {
                         x: 42px;
                         width: 112px;
                         height: parent.height;
-                        text: "MULTICORE";
-                        color: Theme.text-secondary;
+                        text: "MultiCore";
+                        color: Theme.text-primary;
                         font-family: Theme.font-family;
-                        font-size: Theme.type-metadata-size;
-                        font-weight: Theme.weight-bold;
-                        letter-spacing: 1px;
+                        font-size: Theme.type-label-size;
+                        font-weight: Theme.weight-semibold;
                         vertical-alignment: center;
                     }
 
                     drag-touch := TouchArea {
                         moved => { root.window-drag(); }
                         double-clicked => { root.window-toggle-maximize(); }
+                    }
+                }
+
+                // Active subscription lives in the window title: name + expiry opens the
+                // profile menu, then refresh and the provider-notice bell.
+                if root.has-profile: title-subscription := Rectangle {
+                    property <length> logo-space: root.has-service-logo ? 22px : 0px;
+                    property <length> chip-width: Math.min(
+                        self.width - 72px,
+                        10px + self.logo-space + chip-title.preferred-width + 6px + chip-meta.preferred-width + 8px + 12px + 8px);
+                    x: root.navigation-collapsed ? 56px : 168px;
+                    y: 8px;
+                    width: Math.max(0px, parent.width - self.x - 148px);
+                    height: 28px;
+                    animate x { duration: 180ms; easing: ease-in-out; }
+
+                    subscription-chip := Rectangle {
+                        x: 0;
+                        y: 0;
+                        width: parent.chip-width;
+                        height: parent.height;
+                        border-radius: 6px;
+                        background: root.profile-menu-open ? #ffffff12 : chip-touch.has-hover ? #ffffff0a : transparent;
+                        border-color: shelf-open-focus.has-focus ? Theme.focus : transparent;
+                        border-width: shelf-open-focus.has-focus ? Theme.focus-width : 0px;
+                        animate background { duration: 120ms; easing: ease-out; }
+
+                        if root.has-service-logo: Image {
+                            x: 8px;
+                            y: 6px;
+                            width: 16px;
+                            height: 16px;
+                            source: root.service-logo;
+                            image-fit: contain;
+                            accessible-role: none;
+                        }
+                        chip-title := Text {
+                            x: 10px + title-subscription.logo-space;
+                            width: Math.min(self.preferred-width, Math.max(24px, parent.width - self.x - chip-meta.preferred-width - 34px));
+                            height: parent.height;
+                            text: root.subscription-title;
+                            color: Theme.text-primary;
+                            font-size: Theme.type-metadata-size;
+                            font-weight: Theme.weight-semibold;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        chip-meta := Text {
+                            x: chip-title.x + chip-title.width + 6px;
+                            width: Math.max(0px, Math.min(self.preferred-width, parent.width - self.x - 28px));
+                            height: parent.height;
+                            text: root.subscription-refresh-error != "" ? "Не удалось обновить" : "· " + root.subscription-expiry;
+                            color: root.subscription-refresh-error != "" ? Theme.error : Theme.text-muted;
+                            font-size: Theme.type-metadata-size;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        chip-chevron := Path {
+                            x: parent.width - 20px;
+                            y: 10px;
+                            width: 12px;
+                            height: 8px;
+                            viewbox-width: 12;
+                            viewbox-height: 8;
+                            commands: root.profile-menu-open ? "M 1 7 L 6 2 L 11 7" : "M 1 1 L 6 6 L 11 1";
+                            stroke: Theme.text-muted;
+                            stroke-width: 1.5px;
+                            fill: transparent;
+                        }
+
+                        shelf-open-focus := FocusScope {
+                            property <int> focus-serial: root.profile-shelf-focus-serial;
+                            enabled: true;
+                            focus-on-click: true;
+                            focus-on-tab-navigation: true;
+                            accessible-role: button;
+                            accessible-label: "Выбрать профиль подписки";
+                            accessible-description: root.subscription-title + ". Обновлено " + root.subscription-updated + ". " + (root.profile-menu-open ? "Список профилей открыт" : "Открыть список профилей");
+                            accessible-enabled: self.enabled;
+                            accessible-action-default => { self.toggle-menu(true); }
+                            changed focus-serial => { self.focus(); }
+                            function toggle-menu(keyboard: bool) {
+                                root.announcement-open = false;
+                                if (root.profile-menu-open) { root.close-profile-menu(); }
+                                else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
+                                    root.local-page = "subscriptions";
+                                    root.close-panel();
+                                } else { root.profile-menu-keyboard-open = keyboard; root.open-profile-menu(); }
+                            }
+                            key-pressed(event) => {
+                                if (event.text == " " || event.text == "\n") {
+                                    self.toggle-menu(true);
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                            chip-touch := TouchArea {
+                                clicked => { shelf-open-focus.toggle-menu(false); }
+                            }
+                        }
+                    }
+
+                    subscription-refresh-action := FocusScope {
+                        // Without a refreshable remote source the same slot lets the
+                        // user set the active subscription's URL instead of showing a
+                        // dead button.
+                        property <bool> source-mode: !root.subscription-refresh-available;
+                        x: parent.chip-width + 4px;
+                        y: 0;
+                        width: 28px;
+                        height: 28px;
+                        enabled: self.source-mode
+                            ? root.subscription-management-enabled && root.active-profile-id != "" && !root.profile-menu-open
+                            : root.subscription-refresh-enabled && !root.subscription-refresh-pending && !root.profile-menu-open;
+                        focus-on-click: true;
+                        focus-on-tab-navigation: true;
+                        accessible-role: button;
+                        accessible-label: self.source-mode ? "Указать ссылку подписки" : root.subscription-refresh-pending ? "Подписка обновляется" : "Обновить подписку";
+                        accessible-enabled: self.enabled;
+                        accessible-action-default => { if (self.enabled) { self.run(); } }
+                        function run() {
+                            if (self.source-mode) {
+                                root.local-page = "subscriptions";
+                                root.close-panel();
+                                root.profile-delete-confirm-id = "";
+                                root.profile-edit-draft = "";
+                                root.profile-edit-id = root.active-profile-id;
+                            } else {
+                                root.refresh-subscription();
+                            }
+                        }
+                        key-pressed(event) => {
+                            if ((event.text == " " || event.text == "\n") && self.enabled) {
+                                self.run();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: subscription-refresh-touch.pressed && parent.enabled ? Theme.elevated : subscription-refresh-touch.has-hover && parent.enabled ? #ffffff0d : transparent;
+                            border-color: parent.has-focus ? Theme.focus : transparent;
+                            border-width: parent.has-focus ? Theme.focus-width : 0px;
+                            animate background { duration: 120ms; easing: ease-out; }
+                            Image {
+                                x: 7px;
+                                y: 7px;
+                                width: 14px;
+                                height: 14px;
+                                source: subscription-refresh-action.source-mode ? @image-url("../assets/link.svg") : @image-url("../assets/refresh.svg");
+                                colorize: root.subscription-refresh-pending ? Theme.accent-blue : Theme.text-secondary;
+                                opacity: subscription-refresh-action.enabled || root.subscription-refresh-pending ? 1 : 0.45;
+                                // Spins while the subscription is being fetched.
+                                transform-rotation: root.subscription-refresh-pending && !root.reduced-motion
+                                    ? Math.mod(animation-tick() / 1ms, 900) / 900 * 360deg
+                                    : 0deg;
+                                image-fit: contain;
+                                accessible-role: none;
+                            }
+                        }
+                        subscription-refresh-touch := TouchArea {
+                            enabled: parent.enabled;
+                            clicked => { subscription-refresh-action.run(); }
+                        }
+                    }
+
+                    if root.subscription-announcement-text != "": announcement-bell := FocusScope {
+                        x: parent.chip-width + 36px;
+                        y: 0;
+                        width: 28px;
+                        height: 28px;
+                        focus-on-click: true;
+                        focus-on-tab-navigation: true;
+                        accessible-role: button;
+                        accessible-label: root.announcement-open ? "Скрыть сообщение провайдера" : "Сообщение провайдера";
+                        accessible-action-default => { self.toggle(); }
+                        function toggle() {
+                            if (root.profile-menu-open) { root.close-profile-menu(); }
+                            root.announcement-open = !root.announcement-open;
+                        }
+                        key-pressed(event) => {
+                            if (event.text == " " || event.text == "\n") {
+                                self.toggle();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: root.announcement-open ? #ffffff12 : bell-touch.has-hover ? #ffffff0d : transparent;
+                            border-color: parent.has-focus ? Theme.focus : transparent;
+                            border-width: parent.has-focus ? Theme.focus-width : 0px;
+                            animate background { duration: 120ms; easing: ease-out; }
+                            Image {
+                                x: 6px;
+                                y: 6px;
+                                width: 16px;
+                                height: 16px;
+                                source: @image-url("../assets/bell.svg");
+                                colorize: Theme.text-secondary;
+                                image-fit: contain;
+                                accessible-role: none;
+                            }
+                            // Unread-style dot tinted by the notice's tone.
+                            Rectangle {
+                                x: 17px;
+                                y: 5px;
+                                width: 7px;
+                                height: 7px;
+                                border-radius: 3.5px;
+                                border-width: 1.5px;
+                                border-color: #0a0c0f;
+                                background: root.subscription-announcement-tone == "danger" ? Theme.error
+                                    : root.subscription-announcement-tone == "success" ? Theme.accent-green
+                                    : Theme.accent-blue;
+                            }
+                        }
+                        bell-touch := TouchArea {
+                            clicked => { announcement-bell.toggle(); }
+                        }
                     }
                 }
 
@@ -911,28 +1129,29 @@ export component AppWindow inherits Window {
 
                 VerticalLayout {
                     padding: 20px;
-                    spacing: 8px;
+                    spacing: 16px;
 
                     connection-strip := Rectangle {
                         height: root.has-profile
-                            ? 96px
+                            ? 88px
                             : root.first-run-manual-open
                                 ? (root.import-error == "" ? 174px : 200px)
                                 : (root.import-error == "" ? 124px : 150px);
-                        background: root.status-tone == "success" ? #101a16 : root.status-tone == "danger" ? #1a1215 : #101721;
-                        border-color: root.status-tone == "success" ? #3ccb7f66 : root.status-tone == "danger" ? #f06a6a66 : #4c9dff55;
+                        background: root.has-profile ? Theme.surface : #101721;
+                        border-color: !root.has-profile ? #4c9dff55
+                            : root.status-tone == "success" ? #3ccb7f59
+                            : root.status-tone == "danger" ? #f06a6a59
+                            : root.status-tone == "warning" && !root.toggle-busy ? #e7aa4559
+                            : #ffffff0a;
                         border-width: 1px;
-                        border-radius: 18px;
+                        border-radius: 14px;
                         clip: true;
+                        animate border-color { duration: 180ms; easing: ease-in-out; }
 
                         // Only the cell mesh reacts to hover. An outer halo would be clipped by
                         // the main-content plane and read as a rectangular light patch.
-                        mesh-clip := Rectangle {
-                            x: 0;
-                            y: 0;
-                            width: parent.width;
-                            height: parent.height;
-                            border-radius: 18px;
+                        if root.has-profile: mesh-clip := Rectangle {
+                            border-radius: 14px;
                             clip: true;
                             background: transparent;
 
@@ -947,7 +1166,6 @@ export component AppWindow inherits Window {
                                 x: 0;
                                 y: 0;
                                 width: parent.width;
-                                height: parent.height;
                                 opacity: self.active ? 1 : 0;
                                 background: @radial-gradient(
                                     circle 160px at cursor-x cursor-y,
@@ -965,7 +1183,7 @@ export component AppWindow inherits Window {
                                     height: parent.height;
                                     background: transparent;
 
-                                    for _[grid-cell-y] in 12: Rectangle {
+                                    for _[grid-cell-y] in 11: Rectangle {
                                         property <float> normalized-x: (grid-x * 8px + 4px - signal-mesh-field.cursor-x) / 176px;
                                         property <float> normalized-y: (grid-cell-y * 8px + 4px - signal-mesh-field.cursor-y) / 72px;
                                         property <float> distance: Math.sqrt(
@@ -985,17 +1203,81 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        if root.has-profile: HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            padding-top: 12px;
-                            padding-bottom: 12px;
-                            spacing: 16px;
-                            alignment: start;
+                        if root.has-profile: toggle-module := Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.width;
+                            height: parent.height;
+                            background: strip-glow-touch.has-hover ? #ffffff04 : transparent;
+
+                            shield-badge := Rectangle {
+                                x: 20px;
+                                y: (parent.height - self.height) / 2;
+                                width: 44px;
+                                height: 44px;
+                                border-radius: 12px;
+                                background: root.status-tone == "success" ? #3ccb7f24
+                                    : root.status-tone == "danger" ? #f06a6a24
+                                    : root.status-tone == "warning" && !root.toggle-busy ? #e7aa4524
+                                    : Theme.elevated;
+                                animate background { duration: 180ms; easing: ease-in-out; }
+
+                                shield-glyph := Image {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 22px;
+                                    height: 22px;
+                                    source: root.status-tone == "success" ? @image-url("../assets/shield-check.svg")
+                                        : root.status-tone == "danger" || (root.status-tone == "warning" && !root.toggle-busy) ? @image-url("../assets/shield-alert.svg")
+                                        : @image-url("../assets/shield-off.svg");
+                                    colorize: root.status-tone == "success" ? Theme.accent-green
+                                        : root.status-tone == "danger" ? Theme.error
+                                        : root.toggle-busy ? Theme.accent-blue
+                                        : root.status-tone == "warning" ? Theme.warning
+                                        : Theme.text-muted;
+                                    image-fit: contain;
+                                    accessible-role: none;
+                                }
+                            }
+
+                            VerticalLayout {
+                                x: 78px;
+                                width: parent.width - 78px - 112px;
+                                height: parent.height;
+                                alignment: center;
+                                spacing: 5px;
+                                Text {
+                                    text: root.toggle-title;
+                                    color: Theme.text-primary;
+                                    font-size: Theme.type-value-size;
+                                    font-weight: Theme.weight-semibold;
+                                    overflow: elide;
+                                }
+                                if root.toggle-detail-is-exit: HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Text { text: "Выход"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
+                                    // A leading emoji is drawn as an embedded image (colour in
+                                    // every renderer); other symbols use the emoji font, as the
+                                    // UI font renders regional-indicator flags as letters ("SE").
+                                    if root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
+                                    if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
+                                    Text { horizontal-stretch: 1; text: root.node-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
+                                }
+                                if !root.toggle-detail-is-exit: Text {
+                                    text: root.supporting;
+                                    color: Theme.text-secondary;
+                                    font-size: Theme.type-metadata-size;
+                                    overflow: elide;
+                                }
+                            }
+
                             power-action := FocusScope {
                                 property <int> focus-epoch: root.power-action-focus-serial;
+                                x: parent.width - self.width - 20px;
+                                y: (parent.height - self.height) / 2;
                                 width: 72px;
-                                height: 72px;
+                                height: 40px;
                                 enabled: root.primary-enabled && !root.profile-menu-open;
                                 focus-on-click: true;
                                 focus-on-tab-navigation: true;
@@ -1020,66 +1302,32 @@ export component AppWindow inherits Window {
                                     return reject;
                                 }
 
+                                // The switch track; its knob slides between off (left) and on (right).
                                 power-button := Rectangle {
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    width: strip-glow-touch.pressed ? 69px : 72px;
-                                    height: strip-glow-touch.pressed ? 69px : 72px;
-                                    border-radius: self.width / 2;
-                                    clip: true;
-                                    background: root.status-tone == "success" ? #0d1814f0 : root.status-tone == "danger" ? #1a1013f0 : #101722f0;
-                                    border-color: power-action.has-focus ? Theme.focus : root.status-tone == "success" ? Theme.accent-green : root.status-tone == "danger" ? Theme.error : Theme.accent-blue;
-                                    border-width: power-action.has-focus ? Theme.focus-width : 1px;
-                                    opacity: root.primary-enabled ? 1 : 0.45;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    border-radius: self.height / 2;
+                                    background: root.toggle-busy ? #4c9dff59
+                                        : root.toggle-on ? Theme.accent-green
+                                        : root.status-tone == "warning" ? #e7aa4566
+                                        : Theme.line;
+                                    border-color: Theme.focus;
+                                    border-width: power-action.has-focus ? Theme.focus-width : 0px;
+                                    opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.45;
+                                    animate background { duration: 180ms; easing: ease-in-out; }
 
-                                    power-glyph := Image {
-                                        x: (parent.width - self.width) / 2;
-                                        y: (parent.height - self.height) / 2 - 1px;
-                                        width: 32px;
+                                    toggle-knob := Rectangle {
+                                        x: root.toggle-on ? parent.width - self.width - 4px : 4px;
+                                        y: (parent.height - self.height) / 2;
+                                        width: strip-glow-touch.pressed ? 36px : 32px;
                                         height: 32px;
-                                        source: @image-url("../assets/power.svg");
-                                        image-fit: contain;
-                                        accessible-role: none;
+                                        border-radius: 16px;
+                                        background: #ffffff;
+                                        drop-shadow-blur: 6px;
+                                        drop-shadow-offset-y: 2px;
+                                        drop-shadow-color: #00000059;
+                                        animate x, width { duration: 180ms; easing: ease-in-out; }
                                     }
-                                }
-
-                                // Sibling of the circular, clipped power button (not a child),
-                                // so the circle's clip no longer cuts the badge's outer edge.
-                                if root.has-service-logo: service-logo-badge := Rectangle {
-                                    x: parent.width - 28px;
-                                    y: parent.height - 28px;
-                                    width: 28px;
-                                    height: 28px;
-                                    border-radius: 14px;
-                                    background: #0d0f12f2;
-                                    border-color: #ffffff33;
-                                    border-width: 1px;
-                                    opacity: root.primary-enabled ? 1 : 0.45;
-                                    accessible-role: none;
-
-                                    Image {
-                                        x: 4px;
-                                        y: 4px;
-                                        width: 20px;
-                                        height: 20px;
-                                        source: root.service-logo;
-                                        image-fit: contain;
-                                        accessible-role: none;
-                                    }
-                                }
-                            }
-                            VerticalLayout {
-                                spacing: 2px;
-                                Text { text: root.status-eyebrow; color: Theme.text-muted; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; overflow: elide; }
-                                Text { text: root.headline; color: Theme.text-primary; font-size: 18px; font-weight: Theme.weight-semibold; overflow: elide; }
-                                HorizontalLayout {
-                                    spacing: 4px;
-                                    // A leading emoji is drawn as an embedded image (colour in
-                                    // every renderer); other symbols use the emoji font, as the
-                                    // UI font renders regional-indicator flags as letters ("SE").
-                                    if root.node-icon-image.width > 0: Image { width: 14px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
-                                    if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
-                                    Text { horizontal-stretch: 1; text: root.node-name + (root.supporting == "" ? "" : " · " + root.supporting); color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
                                 }
                             }
                         }
@@ -1246,8 +1494,7 @@ export component AppWindow inherits Window {
                         // Generous enough for a realistic worst case (two
                         // conflicting apps plus the appended "couldn't fully
                         // close it, it's a Windows service" note) at the
-                        // app's own minimum window width. Kept in sync by
-                        // hand with `home-banner-offset` above.
+                        // app's own minimum window width.
                         height: 160px;
                         background: #1a1215;
                         border-color: #f06a6a55;
@@ -1297,242 +1544,6 @@ export component AppWindow inherits Window {
                                         activated => { root.dismiss-conflicting-apps-banner(); }
                                     }
                                 }
-                            }
-                        }
-                    }
-
-                    if root.has-profile: subscription-strip := Rectangle {
-                        height: 54px;
-                        background: Theme.surface;
-                        border-radius: 16px;
-                        border-color: shelf-open-focus.has-focus ? Theme.focus : transparent;
-                        border-width: shelf-open-focus.has-focus ? 2px : 0px;
-                        HorizontalLayout {
-                            padding-left: 16px;
-                            padding-right: 16px;
-                            padding-top: 5px;
-                            padding-bottom: 5px;
-                            spacing: 12px;
-                            subscription-copy := VerticalLayout {
-                                horizontal-stretch: 1;
-                                padding-top: 2px;
-                                spacing: 0px;
-                                HorizontalLayout {
-                                    height: 20px;
-                                    Text { horizontal-stretch: 1; text: root.subscription-title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
-                                }
-                                HorizontalLayout {
-                                    height: 18px;
-                                    Text {
-                                        horizontal-stretch: 1;
-                                        text: root.subscription-refresh-error != "" ? root.subscription-refresh-error : root.subscription-usage + " · " + root.subscription-expiry;
-                                        color: root.subscription-refresh-error != "" ? Theme.error : Theme.text-muted;
-                                        font-size: Theme.type-metadata-size;
-                                        overflow: elide;
-                                    }
-                                }
-                            }
-                            refresh-action-reserve := Rectangle {
-                                width: 116px;
-                                horizontal-stretch: 0;
-                                background: transparent;
-                            }
-                            shelf-chevron := Rectangle {
-                                width: 20px;
-                                background: root.profile-menu-open ? #ffffff08 : transparent;
-                                border-radius: 11px;
-                                down-chevron := Path {
-                                    x: 4px;
-                                    y: 18px;
-                                    width: 12px;
-                                    height: 8px;
-                                    viewbox-width: 12;
-                                    viewbox-height: 8;
-                                    commands: "M 1 1 L 6 6 L 11 1";
-                                    stroke: Theme.text-muted;
-                                    stroke-width: 1.5px;
-                                    fill: transparent;
-                                    opacity: root.profile-menu-open ? 0 : 1;
-                                    animate opacity { duration: 120ms; easing: ease-out; }
-                                }
-                                up-chevron := Path {
-                                    x: 4px;
-                                    y: 18px;
-                                    width: 12px;
-                                    height: 8px;
-                                    viewbox-width: 12;
-                                    viewbox-height: 8;
-                                    commands: "M 1 7 L 6 2 L 11 7";
-                                    stroke: Theme.text-muted;
-                                    stroke-width: 1.5px;
-                                    fill: transparent;
-                                    opacity: root.profile-menu-open ? 1 : 0;
-                                    animate opacity { duration: 120ms; easing: ease-out; }
-                                }
-                            }
-                        }
-                        shelf-open-focus := FocusScope {
-                            property <int> focus-serial: root.profile-shelf-focus-serial;
-                            x: 0;
-                            y: 0;
-                            width: parent.width;
-                            height: parent.height;
-                            enabled: true;
-                            focus-on-click: true;
-                            focus-on-tab-navigation: true;
-                            accessible-role: button;
-                            accessible-label: "Выбрать профиль подписки";
-                            accessible-description: root.subscription-title + ". Обновлено " + root.subscription-updated + ". " + (root.profile-menu-open ? "Список профилей открыт" : "Открыть список профилей");
-                            accessible-enabled: self.enabled;
-                            accessible-action-default => {
-                                if (root.profile-menu-open) { root.close-profile-menu(); }
-                                else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
-                                    root.local-page = "subscriptions";
-                                    root.close-panel();
-                                } else { root.profile-menu-keyboard-open = true; root.open-profile-menu(); }
-                            }
-                            changed focus-serial => { self.focus(); }
-                            key-pressed(event) => {
-                                if (event.text == " " || event.text == "\n") {
-                                    if (root.profile-menu-open) { root.close-profile-menu(); }
-                                    else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
-                                        root.local-page = "subscriptions";
-                                        root.close-panel();
-                                    }
-                                    else { root.profile-menu-keyboard-open = true; root.open-profile-menu(); }
-                                    return accept;
-                                }
-                                return reject;
-                            }
-                            TouchArea {
-                                clicked => {
-                                    if (root.profile-menu-open) { root.close-profile-menu(); }
-                                    else if (root.subscription-profiles.length == 0 && !root.profile-menu-loading && root.profile-menu-error == "") {
-                                        root.local-page = "subscriptions";
-                                        root.close-panel();
-                                    }
-                                    else { root.profile-menu-keyboard-open = false; root.open-profile-menu(); }
-                                }
-                            }
-                        }
-                        subscription-refresh-action := FocusScope {
-                            // Without a refreshable remote source the same slot lets the
-                            // user set the active subscription's URL instead of showing a
-                            // dead button.
-                            property <bool> source-mode: !root.subscription-refresh-available;
-                            x: parent.width - 164px;
-                            y: 5px;
-                            width: 116px;
-                            height: 44px;
-                            enabled: self.source-mode
-                                ? root.subscription-management-enabled && root.active-profile-id != "" && !root.profile-menu-open
-                                : root.subscription-refresh-enabled && !root.subscription-refresh-pending && !root.profile-menu-open;
-                            focus-on-click: true;
-                            focus-on-tab-navigation: true;
-                            accessible-role: button;
-                            accessible-label: self.source-mode ? "Указать ссылку подписки" : root.subscription-refresh-pending ? "Подписка обновляется" : "Обновить подписку";
-                            accessible-enabled: self.enabled;
-                            accessible-action-default => { if (self.enabled) { self.run(); } }
-                            function run() {
-                                if (self.source-mode) {
-                                    root.local-page = "subscriptions";
-                                    root.close-panel();
-                                    root.profile-delete-confirm-id = "";
-                                    root.profile-edit-draft = "";
-                                    root.profile-edit-id = root.active-profile-id;
-                                } else {
-                                    root.refresh-subscription();
-                                }
-                            }
-                            Rectangle {
-                                y: 5px;
-                                height: 34px;
-                                border-radius: Theme.radius-small;
-                                opacity: parent.enabled ? 1 : 0.45;
-                                background: subscription-refresh-touch.pressed && parent.enabled ? Theme.elevated : subscription-refresh-touch.has-hover && parent.enabled ? #ffffff0d : transparent;
-                                border-color: parent.has-focus ? Theme.focus : Theme.line;
-                                border-width: 1px;
-                                Text {
-                                    text: subscription-refresh-action.source-mode ? "Указать ссылку" : root.subscription-refresh-pending ? "Обновляем…" : "Обновить";
-                                    color: Theme.text-secondary;
-                                    font-size: Theme.type-metadata-size;
-                                    font-weight: Theme.weight-semibold;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                            key-pressed(event) => {
-                                if ((event.text == " " || event.text == "\n") && self.enabled) {
-                                    self.run();
-                                    return accept;
-                                }
-                                return reject;
-                            }
-                            subscription-refresh-touch := TouchArea {
-                                enabled: parent.enabled;
-                                clicked => { subscription-refresh-action.run(); }
-                            }
-                        }
-                    }
-
-                    if root.profile-menu-open: profile-menu-reserve := Rectangle {
-                        height: root.profile-menu-content-height;
-                        background: transparent;
-                    }
-
-                    if root.subscription-announcement-text != "": Rectangle {
-                        height: announcement-strip.height;
-                        background: transparent;
-                        announcement-strip := Rectangle {
-                            // One line stays a compact 36px strip; long provider notices
-                            // get a second line instead of being cut after a few words.
-                            property <bool> two-line: announcement-copy.preferred-height > 24px;
-                            x: 0px;
-                            width: parent.width;
-                            height: self.two-line ? 52px : 36px;
-                            background: root.subscription-announcement-tone == "danger" ? #211619 : root.subscription-announcement-tone == "success" ? #13231b : #131d29;
-                            border-radius: 10px;
-                            border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
-                            border-width: 1px;
-                            announcement-icon := Rectangle {
-                                x: 12px;
-                                y: (parent.height - self.height) / 2;
-                                width: 18px;
-                                height: 30px;
-                                background: transparent;
-                                if root.subscription-announcement-tone == "danger": Image {
-                                    x: 0px; y: 6px; width: 18px; height: 18px;
-                                    source: @image-url("../assets/announcement-danger.svg");
-                                    image-fit: contain;
-                                    accessible-role: none;
-                                }
-                                if root.subscription-announcement-tone == "success": Image {
-                                    x: 0px; y: 6px; width: 18px; height: 18px;
-                                    source: @image-url("../assets/announcement-success.svg");
-                                    image-fit: contain;
-                                    accessible-role: none;
-                                }
-                                if root.subscription-announcement-tone != "danger" && root.subscription-announcement-tone != "success": Image {
-                                    x: 0px; y: 6px; width: 18px; height: 18px;
-                                    source: @image-url("../assets/announcement-info.svg");
-                                    image-fit: contain;
-                                    accessible-role: none;
-                                }
-                            }
-                            announcement-copy := Text {
-                                x: 42px;
-                                y: 3px;
-                                width: parent.width - 84px;
-                                height: parent.height - 6px;
-                                text: root.subscription-announcement-text;
-                                color: Theme.text-secondary;
-                                font-size: Theme.type-metadata-size;
-                                wrap: word-wrap;
-                                overflow: elide;
-                                accessible-role: text;
-                                accessible-description: root.subscription-announcement-text;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
                             }
                         }
                     }
@@ -2026,10 +2037,14 @@ export component AppWindow inherits Window {
             }
 
             profile-menu := Rectangle {
-                x: 20px;
-                y: (root.profile-menu-open ? 188px : 180px) + root.home-banner-offset;
-                width: parent.width - 40px;
-                height: Math.min(parent.height - 204px - root.home-banner-offset, root.profile-menu-content-height);
+                x: -8px;
+                y: root.profile-menu-open ? 8px : 0px;
+                width: Math.min(420px, parent.width - 16px);
+                height: Math.min(parent.height - 16px, root.profile-menu-content-height);
+                visible: self.opacity > 0;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: #00000080;
                 background: Theme.elevated;
                 border-color: Theme.line;
                 border-width: 1px;
@@ -2190,6 +2205,56 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+
+            if root.announcement-open && root.subscription-announcement-text != "": TouchArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.announcement-open = false; }
+            }
+
+            announcement-popover := Rectangle {
+                property <bool> shown: root.announcement-open && root.subscription-announcement-text != "";
+                x: -8px;
+                y: self.shown ? 8px : 0px;
+                width: Math.min(420px, parent.width - 16px);
+                height: announcement-copy.preferred-height + 28px;
+                visible: self.opacity > 0;
+                opacity: self.shown ? 1 : 0;
+                background: Theme.elevated;
+                border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
+                border-width: 1px;
+                border-radius: 12px;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: #00000080;
+                animate opacity { duration: 160ms; easing: ease-out; }
+                animate y { duration: 160ms; easing: ease-out; }
+
+                Image {
+                    x: 14px;
+                    y: 14px;
+                    width: 18px;
+                    height: 18px;
+                    source: root.subscription-announcement-tone == "danger" ? @image-url("../assets/announcement-danger.svg")
+                        : root.subscription-announcement-tone == "success" ? @image-url("../assets/announcement-success.svg")
+                        : @image-url("../assets/announcement-info.svg");
+                    image-fit: contain;
+                    accessible-role: none;
+                }
+                announcement-copy := Text {
+                    x: 42px;
+                    y: 14px;
+                    width: parent.width - 56px;
+                    text: root.subscription-announcement-text;
+                    color: Theme.text-secondary;
+                    font-size: Theme.type-metadata-size;
+                    wrap: word-wrap;
+                    accessible-role: text;
+                    accessible-description: root.subscription-announcement-text;
                 }
             }
             }

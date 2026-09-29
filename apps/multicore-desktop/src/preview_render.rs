@@ -211,6 +211,8 @@ fn connected(ui: &AppWindow) {
     ui.set_supporting(s("Текущий маршрут"));
     ui.set_primary_label(s("Отключиться"));
     ui.set_status_tone(s("success"));
+    ui.set_toggle_title(s("Защита включена"));
+    ui.set_toggle_on(true);
     ui.set_subscription_management_enabled(false);
     ui.set_profile_switch_locked(true);
     ui.set_catalog_selection_enabled(true);
@@ -293,6 +295,13 @@ fn scenarios() -> Vec<Scenario> {
                 "Плановые работы сегодня в 23:00 по московскому времени. В это время возможны кратковременные отключения серверов в Германии и Нидерландах.",
             ));
         }),
+        ("home-announcement-open", 840, 720, |ui| {
+            ready(ui);
+            ui.set_subscription_announcement_text(s(
+                "Плановые работы сегодня в 23:00 по московскому времени. В это время возможны кратковременные отключения серверов в Германии и Нидерландах.",
+            ));
+            ui.set_announcement_open(true);
+        }),
         ("home-catalog-error", 840, 720, |ui| {
             ready(ui);
             ui.set_catalog_error(s(
@@ -307,6 +316,8 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_node_name(s("—"));
             ui.set_primary_label(s("Проверить снова"));
             ui.set_status_tone(s("danger"));
+            ui.set_toggle_title(s("Нет связи с сервисом"));
+            ui.set_toggle_detail_is_exit(false);
             ui.set_subscription_refresh_error(s("Не удалось обновить. Рабочий профиль сохранён."));
         }),
         ("home-degraded", 840, 720, |ui| {
@@ -316,6 +327,8 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_supporting(s("Фоновый сервис отвечает не полностью."));
             ui.set_primary_label(s("Остановить туннель"));
             ui.set_status_tone(s("warning"));
+            ui.set_toggle_title(s("Сервис недоступен"));
+            ui.set_toggle_detail_is_exit(false);
             ui.set_subscription_refresh_available(false);
         }),
         ("home-local-profile", 840, 720, |ui| {
