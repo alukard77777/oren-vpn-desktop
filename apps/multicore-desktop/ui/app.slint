@@ -1945,20 +1945,25 @@ export component AppWindow inherits Window {
                                         color: Theme.text-primary;
                                         font-size: Theme.type-value-size;
                                         font-weight: Theme.weight-semibold;
-                                        vertical-alignment: center;
+                                        vertical-alignment: top;
                                         overflow: elide;
                                     }
                                     // Fixed slot: proportional digits would otherwise nudge the
-                                    // timer every second.
-                                    if root.session-uptime != "": Text {
-                                        min-width: 58px;
-                                        horizontal-alignment: left;
-                                        text: root.session-uptime;
-                                        color: Theme.text-secondary;
-                                        font-size: 13px;
-                                        font-weight: Theme.weight-regular;
-                                        vertical-alignment: center;
-                                        accessible-label: "Время сессии " + root.session-uptime;
+                                    // timer every second. Dropped by the size difference so its
+                                    // baseline meets the title's.
+                                    if root.session-uptime != "": VerticalLayout {
+                                        padding-top: (Theme.type-value-size - 13px) * 1.05;
+                                        alignment: start;
+                                        Text {
+                                            min-width: 58px;
+                                            horizontal-alignment: left;
+                                            text: root.session-uptime;
+                                            color: Theme.text-secondary;
+                                            font-size: 13px;
+                                            font-weight: Theme.weight-regular;
+                                            vertical-alignment: top;
+                                            accessible-label: "Время сессии " + root.session-uptime;
+                                        }
                                     }
                                 }
                                 if root.toggle-detail-is-exit: HorizontalLayout {
@@ -2025,15 +2030,21 @@ export component AppWindow inherits Window {
 
                                 // The switch track; its knob slides between off (left) and on (right).
                                 power-button := Rectangle {
+                                    // Pointer over the switch (plus a small margin), not just the card.
+                                    property <bool> hovered: strip-glow-touch.has-hover
+                                        && strip-glow-touch.mouse-x >= power-action.x - 6px
+                                        && strip-glow-touch.mouse-x <= power-action.x + power-action.width + 6px
+                                        && strip-glow-touch.mouse-y >= power-action.y - 6px
+                                        && strip-glow-touch.mouse-y <= power-action.y + power-action.height + 6px;
                                     width: parent.width;
                                     height: parent.height;
                                     border-radius: self.height / 2;
                                     background: root.toggle-busy ? #4c9dff59
-                                        : root.toggle-on ? (strip-glow-touch.has-hover ? #4ad98c : Theme.accent-green)
-                                        : (strip-glow-touch.has-hover ? #3a414b : Theme.line);
+                                        : root.toggle-on ? (self.hovered ? #4ad98c : Theme.accent-green)
+                                        : (self.hovered ? #3a414b : Theme.line);
                                     border-color: power-action.has-focus ? Theme.focus : #ffffff59;
                                     border-width: power-action.has-focus ? Theme.focus-width
-                                        : strip-glow-touch.has-hover && root.primary-enabled ? 2px : 0px;
+                                        : self.hovered && root.primary-enabled ? 2px : 0px;
                                     animate border-width { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                                     opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;
                                     animate opacity { duration: 180ms; easing: ease-in-out; }
@@ -2042,8 +2053,8 @@ export component AppWindow inherits Window {
                                     toggle-knob := Rectangle {
                                         x: root.toggle-on ? parent.width - self.width - 4px : 4px;
                                         y: (parent.height - self.height) / 2;
-                                        width: strip-glow-touch.pressed ? 36px : strip-glow-touch.has-hover ? 33px : 32px;
-                                        height: strip-glow-touch.has-hover ? 33px : 32px;
+                                        width: strip-glow-touch.pressed ? 36px : power-button.hovered ? 33px : 32px;
+                                        height: power-button.hovered ? 33px : 32px;
                                         border-radius: self.height / 2;
                                         background: #ffffff;
                                         drop-shadow-blur: 6px;

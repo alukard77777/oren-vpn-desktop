@@ -7134,7 +7134,9 @@ mod tests {
         // Rail labels fade in after the rail has widened.
         assert!(app.contains("animate opacity { duration: root.compact ? 80ms : 160ms; delay: root.compact ? 0ms : 90ms; easing: ease-out; }"));
         // Session timer shares the title's bottom edge; speeds show only with a value.
-        assert!(app.contains("if root.session-uptime != \"\": Text {"));
+        assert!(app.contains("if root.session-uptime != \"\": VerticalLayout {"));
+        // Baseline alignment: both top-aligned, the smaller timer dropped by the size gap.
+        assert!(app.contains("padding-top: (Theme.type-value-size - 13px) * 1.05;"));
         assert!(app.contains("if root.traffic-down != \"\": Text {"));
         assert!(app.contains("if root.traffic-up != \"\": Text {"));
     }
