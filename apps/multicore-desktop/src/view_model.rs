@@ -6677,6 +6677,39 @@ mod tests {
     }
 
     #[test]
+    fn expanded_rail_and_route_skeletons_match_the_mockup() {
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
+        let main = include_str!("main.rs");
+        // The host resizes the window when the user toggles the rail.
+        assert!(app.contains("callback navigation-toggled(bool);"));
+        assert!(app.contains("root.navigation-toggled(root.navigation-collapsed);"));
+        assert!(main.contains("ui.on_navigation_toggled(move |collapsed| {"));
+        assert!(main.contains("rail_grow_delta("));
+        assert!(main.contains("rail_shrink_width(growth.take(), maximized, inner.width)"));
+        // Expanded rail: 18px icons, 13px labels, double chevron, hairlines.
+        assert!(app.contains("width: root.compact ? 20px : 18px;"));
+        assert!(app.contains("\"M 8 3 L 3 8 L 8 13 M 13 3 L 8 8 L 13 13\""));
+        assert!(app.contains("brand-divider := Rectangle {"));
+        assert!(app.contains("x: root.navigation-collapsed ? 56px : 184px;"));
+        // Skeletons: shimmer reads animation-tick() only while a skeleton shows.
+        assert!(app.contains(
+            "private property <bool> catalog-skeleton: root.catalog-loading && root.catalog-nodes.length == 0;"
+        ));
+        assert!(app.contains(
+            "private property <float> skeleton-pulse: (root.catalog-skeleton || root.profile-menu-loading) && !root.reduced-motion"
+        ));
+        assert!(app.contains("if root.catalog-skeleton: route-skeleton := VerticalLayout {"));
+        assert!(app.contains("accessible-label: \"Загружаем маршруты\";"));
+        assert!(!app.contains("\"Загружаем маршруты…\""));
+        assert!(app.contains(
+            "if root.catalog-loading && root.catalog-groups.length == 0: HorizontalLayout {"
+        ));
+        // Real rows fade in once, when they replace the skeleton.
+        assert!(app.contains("routes-enter := Timer {\n        interval: 16ms;\n        running: root.routes-entering;"));
+        assert!(app.contains("opacity: root.routes-entering ? 0 : 1;"));
+    }
+
+    #[test]
     fn redesign_motion_is_lightweight_and_respects_reduced_motion() {
         // Checkouts may use CRLF; the multi-line contracts below are written with LF.
         let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
@@ -6863,7 +6896,8 @@ mod tests {
     #[test]
     fn desktop_control_center_source_contract() {
         let source = include_str!("../ui/app.slint");
-        let components = include_str!("../ui/components.slint");
+        // Checkouts may use CRLF; multi-line contracts below are written with LF.
+        let components = include_str!("../ui/components.slint").replace("\r\n", "\n");
         let main = include_str!("main.rs");
         let logo_cache = include_str!("logo_cache.rs");
 
@@ -6977,7 +7011,7 @@ mod tests {
         assert!(title_subscription.contains("root.refresh-subscription();"));
         assert!(title_subscription.contains("announcement-bell := FocusScope"));
         assert!(title_subscription.contains("root.announcement-open = !root.announcement-open;"));
-        assert!(title_subscription.contains("animate x { duration: 180ms; easing: ease-in-out; }"));
+        assert!(title_subscription.contains("animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
         assert!(pill_mesh.contains("opacity: self.active ? 1 : 0;"));
         assert!(!pill_mesh.contains("opacity: self.active ? 1 : 0.1;"));
         assert!(!source.contains("cursor-glow-field := Rectangle"));

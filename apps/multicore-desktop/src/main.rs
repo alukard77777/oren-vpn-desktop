@@ -35,7 +35,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemon::{DaemonClient, DaemonError, UnavailableDaemonClient};
-use preferences::{AppPreferences, PreferenceStore, VisiblePage, WindowBounds};
+use preferences::{
+    AppPreferences, PreferenceStore, RailGrowthPreference, VisiblePage, WindowBounds,
+};
 use slint::winit_030::WinitWindowAccessor;
 use slint::{
     CloseRequestResponse, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
@@ -55,9 +57,10 @@ use view_model::{
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
-    CloseDisposition, MinimizeDisposition, MonitorRect, MonitorSignature, PhysicalPosition,
-    apply_tray_popup_native_rounding, close_disposition, minimize_disposition, monitor_cap_changed,
-    next_maximized, parse_resize_edge, place_tray_popup, restore_placement,
+    CloseDisposition, EXPANDED_RAIL_WIDTH, MinimizeDisposition, MonitorRect, MonitorSignature,
+    PhysicalPosition, RailGrowth, apply_tray_popup_native_rounding, close_disposition,
+    minimize_disposition, monitor_cap_changed, next_maximized, parse_resize_edge, place_tray_popup,
+    rail_grow_delta, rail_shrink_width, restore_placement,
 };
 
 slint::include_modules!();
@@ -381,6 +384,13 @@ impl PersistenceTracker {
 
     fn set_tun_enabled(&mut self, enabled: bool) {
         self.desired.tun_enabled = enabled;
+    }
+
+    fn set_rail_growth(&mut self, delta: i32, grown_width: i32) {
+        self.desired.rail_growth = (delta > 0 && grown_width > 0).then(|| RailGrowthPreference {
+            delta: delta.unsigned_abs(),
+            grown_width: grown_width.unsigned_abs(),
+        });
     }
 
     fn set_announcement_seen(&mut self, fingerprint: String) {
@@ -785,6 +795,10 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_tun_enabled(loaded_preferences.tun_enabled);
     // The TUN-off (system proxy) mode exists on Windows only.
     ui.set_tun_toggle_available(cfg!(windows));
+    if let Some(growth) = loaded_preferences.rail_growth {
+        ui.set_rail_growth_delta(i32::try_from(growth.delta).unwrap_or(0));
+        ui.set_rail_grown_width(i32::try_from(growth.grown_width).unwrap_or(0));
+    }
     ui.set_announcement_seen(
         loaded_preferences
             .announcement_seen
@@ -1543,6 +1557,48 @@ fn set_current_monitor_max_size(
     signature
 }
 
+fn resize_for_rail(
+    window: &slint::winit_030::winit::window::Window,
+    collapsed: bool,
+    growth: &std::cell::Cell<Option<RailGrowth>>,
+) {
+    use slint::winit_030::winit::dpi::PhysicalSize;
+
+    let maximized = window.is_maximized();
+    let inner = window.inner_size();
+    if collapsed {
+        if let Some(width) = rail_shrink_width(growth.take(), maximized, inner.width) {
+            let _ = window.request_inner_size(PhysicalSize::new(width, inner.height));
+        }
+        return;
+    }
+    let Some(monitor) = window.current_monitor() else {
+        return;
+    };
+    let (Some((work_position, work_size)), Ok(outer_position)) =
+        (monitor_work_area(&monitor), window.outer_position())
+    else {
+        return;
+    };
+    let wanted = (f64::from(EXPANDED_RAIL_WIDTH) * window.scale_factor()).round() as u32;
+    let delta = rail_grow_delta(
+        maximized,
+        outer_position.x,
+        window.outer_size().width,
+        work_position.x,
+        work_size.width,
+        wanted,
+    );
+    if delta == 0 {
+        growth.set(None);
+        return;
+    }
+    let grown_width = inner.width + delta;
+    let _ = set_current_monitor_max_size(window);
+    let _ = window.request_inner_size(PhysicalSize::new(grown_width, inner.height));
+    growth.set(Some(RailGrowth { delta, grown_width }));
+}
+
 fn apply_saved_placement(ui: &AppWindow, preferences: &AppPreferences) {
     use slint::winit_030::winit::dpi::{LogicalSize, PhysicalPosition};
 
@@ -1646,6 +1702,7 @@ fn flush_preferences(
         tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
         tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
         tracker.set_announcement_seen(ui.get_announcement_seen().into());
+        tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
         tracker.set_tun_enabled(ui.get_tun_enabled());
         if let Some((profile, selected_group, selections)) = route_preferences {
             tracker.set_route_preferences(profile, selected_group, selections);
@@ -1702,6 +1759,7 @@ fn wire_preference_persistence(
             tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
             tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
             tracker.set_announcement_seen(ui.get_announcement_seen().into());
+            tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
             tracker.set_tun_enabled(ui.get_tun_enabled());
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
@@ -1946,6 +2004,33 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
                 let _ = window.drag_resize_window(edge.into());
             });
         }
+    });
+
+    // The window grows with the expanded rail so the content keeps its width,
+    // and shrinks back on collapse unless the user resized it in between.
+    let weak = ui.as_weak();
+    ui.on_navigation_toggled(move |collapsed| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        // The growth lives on the window in logical px (persisted with the other
+        // preferences); resize_for_rail works in physical px for this monitor.
+        let scale = f64::from(ui.window().scale_factor());
+        let to_physical = |logical: i32| (f64::from(logical.max(0)) * scale).round() as u32;
+        let growth = std::cell::Cell::new((ui.get_rail_growth_delta() > 0).then(|| RailGrowth {
+            delta: to_physical(ui.get_rail_growth_delta()),
+            grown_width: to_physical(ui.get_rail_grown_width()),
+        }));
+        let _ = ui.window().with_winit_window(|window| {
+            resize_for_rail(window, collapsed, &growth);
+        });
+        let to_logical = |physical: u32| (f64::from(physical) / scale).round() as i32;
+        let (delta, grown_width) = growth
+            .get()
+            .map(|growth| (to_logical(growth.delta), to_logical(growth.grown_width)))
+            .unwrap_or((0, 0));
+        ui.set_rail_growth_delta(delta);
+        ui.set_rail_grown_width(grown_width);
     });
 
     let weak = ui.as_weak();
