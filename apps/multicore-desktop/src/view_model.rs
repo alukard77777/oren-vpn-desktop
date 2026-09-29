@@ -3072,12 +3072,9 @@ pub(crate) struct CatalogDisplay {
 
 pub(crate) fn derive_catalog_display(label: &str, kind: CatalogDisplayKind) -> CatalogDisplay {
     let value = label.trim();
-    let mut characters = value.char_indices();
-    if let (Some((_, first)), Some((second_index, second))) = (characters.next(), characters.next())
-        && is_regional_indicator(first)
-        && is_regional_indicator(second)
-    {
-        let end = second_index + second.len_utf8();
+    // Any leading emoji (a flag, a ZWJ sequence, a skin-toned hand, ...)
+    // becomes the icon, drawn as an embedded image by `emoji_images`.
+    if let Some(end) = crate::emoji_images::leading_emoji_len(value) {
         return CatalogDisplay {
             icon: value[..end].to_owned(),
             label: trim_catalog_decorators(&value[end..]).to_owned(),
@@ -3139,10 +3136,6 @@ pub(crate) fn split_leading_symbol(label: &str) -> (String, String) {
     } else {
         (display.icon, display.label)
     }
-}
-
-fn is_regional_indicator(character: char) -> bool {
-    ('\u{1f1e6}'..='\u{1f1ff}').contains(&character)
 }
 
 fn trim_catalog_decorators(value: &str) -> &str {

@@ -75,6 +75,7 @@ export component PrimaryAction inherits Rectangle {
 
 export component QuietChip inherits Rectangle {
     in property <string> icon;
+    in property <image> icon-image;
     in property <string> label;
     in property <string> selected-state-label: "выбрано";
     in property <string> state-label:
@@ -131,7 +132,17 @@ export component QuietChip inherits Rectangle {
         animate opacity { duration: 160ms; easing: ease-out; }
     }
 
-    if root.icon != "": Text {
+    if root.icon-image.width > 0: Image {
+        x: Theme.space-3 + 1px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        source: root.icon-image;
+        image-fit: contain;
+        accessible-role: none;
+    }
+
+    if root.icon != "" && root.icon-image.width == 0: Text {
         x: Theme.space-3;
         width: 20px;
         height: parent.height;
@@ -180,6 +191,7 @@ export component QuietChip inherits Rectangle {
 
 export component RouteNodeRow inherits Rectangle {
     in property <string> icon;
+    in property <image> icon-image;
     in property <string> label;
     in property <string> supporting-text;
     in property <string> trailing-text;
@@ -239,7 +251,17 @@ export component RouteNodeRow inherits Rectangle {
         border-color: root.selected ? #4c9dff42 : #ffffff0f;
         border-width: 1px;
 
-        Text {
+        if root.icon-image.width > 0: Image {
+            x: 6px;
+            y: 6px;
+            width: 20px;
+            height: 20px;
+            source: root.icon-image;
+            image-fit: contain;
+            accessible-role: none;
+        }
+
+        if root.icon-image.width == 0: Text {
             text: root.icon;
             color: root.selected ? Theme.accent-blue-hover : Theme.text-secondary;
             font-family: Theme.emoji-font-family;

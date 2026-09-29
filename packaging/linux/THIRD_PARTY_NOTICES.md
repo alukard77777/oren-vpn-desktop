@@ -38,6 +38,16 @@ projects. MultiCore does not claim ownership of either project or its marks.
 - Font packaging attribution: Twemoji Mozilla COLR/CPAL font packaging by Mozilla
 - License reference: `https://creativecommons.org/licenses/by/4.0/`
 
+## Noto Emoji 3D images
+
+- Project: googlefonts/noto-emoji (`3D/png/72`, commit `e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e`)
+- Source: `https://github.com/googlefonts/noto-emoji`
+- License: image resources Apache License 2.0; fonts SIL Open Font License 1.1
+  (bundled as `assets/emoji/LICENSE`); flag images are public domain or
+  otherwise exempt from copyright
+- Use: every emoji rescaled to 40px WebP and embedded in the desktop app so
+  colour emoji render without GPU font support
+
 ## Rust update-bundle libraries
 
 - `sha2` by the RustCrypto Developers — MIT OR Apache-2.0

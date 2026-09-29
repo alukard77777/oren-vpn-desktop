@@ -14,6 +14,7 @@ export struct UiEvent {
 export struct UiCatalogGroup {
     id: string,
     icon: string,
+    icon-image: image,
     label: string,
     selected: bool,
 }
@@ -21,6 +22,7 @@ export struct UiCatalogGroup {
 export struct UiCatalogNode {
     id: string,
     icon: string,
+    icon-image: image,
     label: string,
     selected: bool,
     latency-text: string,
@@ -444,6 +446,7 @@ export component AppWindow inherits Window {
     in property <string> supporting: "Вставьте URL — остальное настроим автоматически.";
     in property <string> node-name: "Маршрут не выбран";
     in property <string> node-icon: "";
+    in property <image> node-icon-image;
     in property <bool> has-profile: false;
     in property <string> primary-label: "Подключить";
     in property <bool> primary-enabled: false;
@@ -1008,9 +1011,11 @@ export component AppWindow inherits Window {
                                 Text { text: root.headline; color: Theme.text-primary; font-size: 18px; font-weight: Theme.weight-semibold; overflow: elide; }
                                 HorizontalLayout {
                                     spacing: 4px;
-                                    // A leading flag/symbol is drawn with the emoji font; the
+                                    // A leading emoji is drawn as an embedded image (colour in
+                                    // every renderer); other symbols use the emoji font, as the
                                     // UI font renders regional-indicator flags as letters ("SE").
-                                    if root.node-icon != "": Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
+                                    if root.node-icon-image.width > 0: Image { width: 14px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
+                                    if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
                                     Text { horizontal-stretch: 1; text: root.node-name + (root.supporting == "" ? "" : " · " + root.supporting); color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
                                 }
                             }
@@ -1514,6 +1519,7 @@ export component AppWindow inherits Window {
                                         min-width: 104px;
                                         height: 44px;
                                         icon: group.icon;
+                                        icon-image: group.icon-image;
                                         label: group.label;
                                         selected: group.selected;
                                         enabled: root.catalog-group-navigation-enabled;
@@ -1532,6 +1538,7 @@ export component AppWindow inherits Window {
                                     for node in root.catalog-nodes: RouteNodeRow {
                                         height: 46px;
                                         icon: node.icon;
+                                        icon-image: node.icon-image;
                                         label: node.label;
                                         supporting-text: "";
                                         trailing-text: node.latency-text;

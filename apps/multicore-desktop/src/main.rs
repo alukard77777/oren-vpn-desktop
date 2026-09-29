@@ -5,6 +5,7 @@ mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
 mod daemon;
+mod emoji_images;
 #[cfg(target_os = "linux")]
 mod linux_display;
 #[cfg(all(test, target_os = "linux"))]
@@ -2000,6 +2001,7 @@ fn apply_tray_popup_model(
                 id: node_id.clone().into(),
                 group_id: group_id.clone().into(),
                 icon: entry.icon.clone().into(),
+                icon_image: emoji_images::image_for(&entry.icon),
                 label: entry.label.clone().into(),
                 detail: "".into(),
                 selected: entry.checked,
@@ -2028,6 +2030,7 @@ fn apply_tray_popup_model(
                 id: group_id.clone().into(),
                 group_id: "".into(),
                 icon: entry.icon.clone().into(),
+                icon_image: emoji_images::image_for(&entry.icon),
                 label: entry.label.clone().into(),
                 detail: entry.detail.clone().into(),
                 selected: false,
@@ -3927,6 +3930,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_headline(presentation.headline.clone().into());
     ui.set_supporting(presentation.supporting.clone().into());
     let (node_icon, node_name) = split_leading_symbol(&presentation.node);
+    ui.set_node_icon_image(emoji_images::image_for(&node_icon));
     ui.set_node_icon(node_icon.into());
     ui.set_node_name(node_name.into());
     ui.set_has_profile(presentation.has_profile);
@@ -4101,6 +4105,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
             let display = derive_catalog_display(&group.label, CatalogDisplayKind::Group);
             UiCatalogGroup {
                 id: group.id.clone().into(),
+                icon_image: emoji_images::image_for(&display.icon),
                 icon: display.icon.into(),
                 label: display.label.into(),
                 selected: group.selected,
@@ -4114,6 +4119,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
             let display = derive_catalog_display(&node.label, CatalogDisplayKind::Node);
             UiCatalogNode {
                 id: node.id.clone().into(),
+                icon_image: emoji_images::image_for(&display.icon),
                 icon: display.icon.into(),
                 label: display.label.into(),
                 selected: node.selected,

@@ -6,6 +6,7 @@ export struct TrayMenuRow {
     id: string,
     group-id: string,
     icon: string,
+    icon-image: image,
     label: string,
     detail: string,
     selected: bool,
@@ -17,6 +18,7 @@ export struct TrayMenuRow {
 component PopupAction inherits Rectangle {
     in property <string> label;
     in property <string> icon;
+    in property <image> icon-image;
     in property <string> icon-kind;
     in property <bool> selected: false;
     in property <bool> enabled: true;
@@ -31,7 +33,16 @@ component PopupAction inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
 
-    if root.icon != "": Text {
+    if root.icon-image.width > 0: Image {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        source: root.icon-image;
+        image-fit: contain;
+    }
+
+    if root.icon != "" && root.icon-image.width == 0: Text {
         x: 10px;
         width: 22px;
         height: parent.height;
@@ -250,6 +261,7 @@ component TrayConnectAction inherits Rectangle {
 
 component RouteGroupAction inherits Rectangle {
     in property <string> icon;
+    in property <image> icon-image;
     in property <string> label;
     in property <string> detail;
     in property <bool> expanded: false;
@@ -287,7 +299,16 @@ component RouteGroupAction inherits Rectangle {
         }
     }
 
-    Text {
+    if root.icon-image.width > 0: Image {
+        x: 14px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        source: root.icon-image;
+        image-fit: contain;
+    }
+
+    if root.icon-image.width == 0: Text {
         x: 12px;
         width: 22px;
         height: parent.height;
@@ -464,6 +485,7 @@ export component TrayPopup inherits Window {
                                 y: 0px;
                                 width: parent.width;
                                 icon: group.icon;
+                                icon-image: group.icon-image;
                                 label: group.label;
                                 detail: group.detail;
                                 expanded: group.expanded;
@@ -486,6 +508,7 @@ export component TrayPopup inherits Window {
                                         visible: parent.height > 0px;
                                         label: node.label;
                                         icon: node.icon;
+                                        icon-image: node.icon-image;
                                         selected: node.selected;
                                         enabled: node.enabled;
                                         activated => { root.select-node(node.group-id, node.id); }

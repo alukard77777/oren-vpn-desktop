@@ -97,6 +97,7 @@ fn groups() -> ModelRc<UiCatalogGroup> {
     .map(|(id, icon, label, selected)| UiCatalogGroup {
         id: s(id),
         icon: s(icon),
+        icon_image: crate::emoji_images::image_for(icon),
         label: s(label),
         selected,
     })
@@ -117,6 +118,7 @@ fn nodes(pending_selected: bool) -> ModelRc<UiCatalogNode> {
     .map(|(id, icon, label, selected, latency, tone)| UiCatalogNode {
         id: s(id),
         icon: s(icon),
+        icon_image: crate::emoji_images::image_for(icon),
         label: s(label),
         selected: selected && !pending_selected || (pending_selected && id == "n2"),
         latency_text: s(latency),
@@ -179,6 +181,7 @@ fn ready(ui: &AppWindow) {
     ui.set_status_eyebrow(s("Готово"));
     ui.set_headline(s("Можно подключаться"));
     ui.set_supporting(s(""));
+    ui.set_node_icon_image(crate::emoji_images::image_for("🌍"));
     ui.set_node_icon(s("🌍"));
     ui.set_node_name(s("Автовыбор"));
     ui.set_primary_label(s("Подключиться"));
@@ -535,6 +538,7 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
             id: s(id),
             group_id: s(""),
             icon: s(icon),
+            icon_image: crate::emoji_images::image_for(icon),
             label: s(label),
             detail: s(detail),
             selected: false,
@@ -546,6 +550,7 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
         id: s(id),
         group_id: s(group_id),
         icon: s(icon),
+        icon_image: crate::emoji_images::image_for(icon),
         label: s(label),
         detail: s(""),
         selected,
