@@ -53,11 +53,18 @@ fn is_gpu_renderer_failure_text(text: &str) -> bool {
     .any(|needle| text.contains(needle))
 }
 
-/// Records the fallback and runs a new instance with the same arguments,
-/// waiting for it to exit. The caller must already have released the
-/// single-instance guard. Waiting matters when the updater launched this
-/// process: it rolls the update back if the process it started exits before
-/// the new version confirms its start, which the restarted instance does.
+/// Upper bound on how long the launcher lingers for the restarted instance.
+#[cfg(windows)]
+const TAKEOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Records the fallback and starts a new instance with the same arguments.
+/// The caller must already have released the single-instance guard.
+///
+/// On Windows the updater rolls an update back if the process it started
+/// exits before the new version confirms its start, so this process stays
+/// until the restarted instance has confirmed (or exited, or a minute has
+/// passed). Its own window, left behind by the failed GPU renderer and no
+/// longer serviced, is hidden first so no "not responding" frame shows.
 pub fn remember_and_relaunch(arguments: Vec<OsString>) -> io::Result<()> {
     if let Some(path) = marker_path() {
         if let Some(parent) = path.parent() {
@@ -67,12 +74,50 @@ pub fn remember_and_relaunch(arguments: Vec<OsString>) -> io::Result<()> {
             eprintln!("software renderer preference not saved: {error}");
         }
     }
-    Command::new(std::env::current_exe()?)
+    #[cfg(windows)]
+    let started = std::time::SystemTime::now();
+    #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
+    let mut child = Command::new(std::env::current_exe()?)
         .args(arguments)
         .env(SOFTWARE_RENDERER_ENV, "1")
-        .spawn()?
-        .wait()
-        .map(drop)
+        .spawn()?;
+    #[cfg(windows)]
+    {
+        hide_own_windows();
+        let deadline = std::time::Instant::now() + TAKEOVER_TIMEOUT;
+        while std::time::Instant::now() < deadline
+            && child.try_wait()?.is_none()
+            && !crate::updater::start_confirmed_since(started)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hide_own_windows() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, SW_HIDE, ShowWindow,
+    };
+
+    unsafe extern "system" fn hide_if_ours(window: HWND, _: LPARAM) -> i32 {
+        let mut process_id = 0;
+        // SAFETY: `window` comes from EnumWindows and the out pointer is valid.
+        unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+        // SAFETY: GetCurrentProcessId has no preconditions.
+        if process_id == unsafe { GetCurrentProcessId() } {
+            // Synchronous: the window belongs to this thread, which no longer
+            // pumps messages, so a posted (async) hide would never run.
+            // SAFETY: `window` is a valid top-level window handle.
+            unsafe { ShowWindow(window, SW_HIDE) };
+        }
+        1
+    }
+    // SAFETY: the callback matches WNDENUMPROC and ignores its LPARAM.
+    unsafe { EnumWindows(Some(hide_if_ours), 0) };
 }
 
 fn marker_path() -> Option<PathBuf> {
