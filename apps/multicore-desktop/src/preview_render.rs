@@ -248,10 +248,14 @@ fn mappings() -> ModelRc<UiProxyMapping> {
         ("🇩🇪 Germany", "127.0.0.1:20802", "germany-xhttp"),
     ]
     .into_iter()
-    .map(|(proxy, address, xray)| UiProxyMapping {
-        proxy_name: s(proxy),
-        address: s(address),
-        xray_label: s(xray),
+    .map(|(proxy, address, xray)| {
+        let (icon, name) = proxy.split_once(' ').expect("flag prefix");
+        UiProxyMapping {
+            icon_image: crate::emoji_images::image_for(icon),
+            proxy_name: s(name),
+            address: s(address),
+            xray_label: s(xray),
+        }
     })
     .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(rows))

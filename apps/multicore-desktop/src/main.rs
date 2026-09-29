@@ -4054,6 +4054,19 @@ fn toggle_presentation(presentation: &StatePresentation) -> TogglePresentation {
     }
 }
 
+/// Splits a leading emoji (a provider flag) off `name` as an image, since the UI
+/// font draws regional-indicator flags as letters ("AL").
+fn split_leading_emoji_image(name: &str) -> (slint::Image, &str) {
+    let name = name.trim();
+    match emoji_images::leading_emoji_len(name) {
+        Some(end) => (
+            emoji_images::image_for(&name[..end]),
+            name[end..].trim_start(),
+        ),
+        None => (slint::Image::default(), name),
+    }
+}
+
 fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     let presentation = &snapshot.presentation;
     let toggle = toggle_presentation(presentation);
@@ -4211,10 +4224,14 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
             .diagnostics
             .mappings
             .iter()
-            .map(|mapping| UiProxyMapping {
-                proxy_name: mapping.proxy_name.clone().into(),
-                address: mapping.address.clone().into(),
-                xray_label: mapping.xray_label.clone().into(),
+            .map(|mapping| {
+                let (icon_image, proxy_name) = split_leading_emoji_image(&mapping.proxy_name);
+                UiProxyMapping {
+                    icon_image,
+                    proxy_name: proxy_name.into(),
+                    address: mapping.address.clone().into(),
+                    xray_label: mapping.xray_label.clone().into(),
+                }
             })
             .collect::<Vec<_>>(),
     )));
@@ -5983,6 +6000,16 @@ mod window_tests {
             .find("single_instance::claim_or_forward(&activation)")
             .expect("single-instance forwarding");
         assert!(repair < forwarding);
+    }
+
+    #[test]
+    fn mapping_flags_are_drawn_as_images_not_letters() {
+        let (icon, name) = super::split_leading_emoji_image(" 🇦🇱 Albania");
+        assert_eq!(name, "Albania");
+        assert!(icon.size().width > 0);
+        let (icon, name) = super::split_leading_emoji_image("Plain name");
+        assert_eq!(name, "Plain name");
+        assert_eq!(icon.size().width, 0);
     }
 
     #[test]

@@ -30,6 +30,8 @@ export struct UiCatalogNode {
 }
 
 export struct UiProxyMapping {
+    // A leading emoji (usually a flag) split off the name and drawn as an image.
+    icon-image: image,
     proxy-name: string,
     address: string,
     xray-label: string,
@@ -1919,6 +1921,10 @@ export component AppWindow inherits Window {
                                     padding-left: 4px;
                                     padding-right: 4px;
                                     spacing: 12px;
+                                    if mapping.icon-image.width > 0: VerticalLayout {
+                                        alignment: center;
+                                        Image { width: 16px; height: 16px; source: mapping.icon-image; image-fit: contain; accessible-role: none; }
+                                    }
                                     Text { text: mapping.proxy-name; color: Theme.text-primary; font-size: Theme.type-metadata-size; vertical-alignment: center; overflow: elide; }
                                     Text { width: 128px; text: mapping.address; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; }
                                     Text { width: 132px; text: mapping.xray-label; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
