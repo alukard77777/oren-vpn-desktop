@@ -587,7 +587,6 @@ pub(crate) fn confirm_started() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 /// Whether this build has confirmed its start (see `confirm_started`) at or
 /// after `since`; used by the renderer-fallback launcher to know when the
 /// restarted instance has taken over.
@@ -604,6 +603,7 @@ pub(crate) fn start_confirmed_since(since: std::time::SystemTime) -> bool {
             .is_ok_and(|content| content.trim() == env!("CARGO_PKG_VERSION"))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn confirm_started_in(
     update_dir: &Path,
     install_parent: &Path,
