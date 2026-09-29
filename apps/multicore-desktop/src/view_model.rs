@@ -4647,8 +4647,9 @@ mod tests {
         assert!(route_row.contains("parent.width - self.x - trailing-label.width - 48px"));
         assert!(!route_row.contains("trailing-label.width - (root.selected"));
         assert!(!route_row.contains("self.width - (root.selected"));
-        assert!(route_row.contains("if root.selected && !root.pending: Image {"));
-        assert!(route_row.contains("source: @image-url(\"../assets/check.svg\");"));
+        // The selection reads from the tint and blue bar alone: no check mark.
+        assert!(!route_row.contains("if root.selected && !root.pending: Image {"));
+        assert!(!route_row.contains("check.svg"));
         assert!(route_row.contains("if root.pending: Text {"));
         assert!(route_row.contains("text: \"…\";"));
         assert!(!route_row.contains("\"✓\""));
@@ -6545,7 +6546,7 @@ mod tests {
         // The connection module is a flat surface; state lives in its hairline and badge.
         assert!(source.contains("background: root.has-profile ? Theme.surface : #101721;"));
         assert!(components.contains(
-            "background: row-touch.has-hover && root.enabled ? #ffffff06 : transparent;"
+            "background: root.selected ? Theme.elevated : row-touch.has-hover && root.enabled ? #ffffff06 : transparent;"
         ));
         assert!(!components.contains("#172433"));
         assert!(home_layer.contains("ambient-pointer-glow := Rectangle"));
@@ -7067,9 +7068,8 @@ mod tests {
             .nth(1)
             .expect("RouteNodeRow source");
         // iOS-style inset grouped list: one card, inset hairlines, bare flags, a check.
-        assert!(!route_row.contains("selection-bar := Rectangle"));
+        assert!(route_row.contains("selection-bar := Rectangle"));
         assert!(route_row.contains("row-cursor-wash := Rectangle"));
-        assert!(route_row.contains("check.svg"));
         assert!(route_row.contains(
             "if root.show-separator: Rectangle {
         x: 56px;"

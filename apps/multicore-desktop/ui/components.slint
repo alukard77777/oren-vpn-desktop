@@ -222,13 +222,13 @@ export component RouteNodeRow inherits Rectangle {
     in property <bool> show-separator: false;
     callback activated();
 
-    // Row of an inset grouped list: bare flag, label, latency and a check on
-    // the selection; rows only tint on hover.
+    // Row of an inset grouped list: bare flag, label, latency; the selected row
+    // is tinted with a blue leading bar (no check mark), others tint on hover.
     min-width: Theme.interactive-min;
     min-height: Theme.interactive-min;
     preferred-height: 48px;
     max-height: 48px;
-    background: row-touch.has-hover && root.enabled ? #ffffff06 : transparent;
+    background: root.selected ? Theme.elevated : row-touch.has-hover && root.enabled ? #ffffff06 : transparent;
     border-color: Theme.focus;
     border-width: row-focus.has-focus ? Theme.focus-width : 0px;
     border-radius: row-focus.has-focus ? 10px : 0px;
@@ -254,6 +254,17 @@ export component RouteNodeRow inherits Rectangle {
         );
         opacity: row-touch.has-hover ? 1 : 0;
         animate opacity { duration: 180ms; easing: ease-out; }
+    }
+
+    selection-bar := Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: root.selected ? 20px : 8px;
+        border-radius: 1.5px;
+        background: Theme.accent-blue;
+        opacity: root.selected ? 1 : 0;
+        animate opacity, height { duration: 180ms; easing: ease-out; }
     }
 
     // Bare flag in a fixed 30px slot, so labels stay aligned without a tile.
@@ -342,17 +353,6 @@ export component RouteNodeRow inherits Rectangle {
         opacity: root.trailing-measuring
             ? 0.14 + 0.12 * (1 + sin(animation-tick() / 1200ms * 360deg)) / 2
             : 0.14;
-        accessible-role: none;
-    }
-
-    if root.selected && !root.pending: Image {
-        x: parent.width - 32px;
-        y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
-        source: @image-url("../assets/check.svg");
-        colorize: Theme.accent-blue;
-        image-fit: contain;
         accessible-role: none;
     }
 
