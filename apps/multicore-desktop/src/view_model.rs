@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::daemon::{
     DaemonCatalog, DaemonClient, DaemonDiagnostics, DaemonEvent, DaemonEventBatch, DaemonLatencies,
-    DaemonStatus, DaemonSubscriptionInfo, DaemonSubscriptionList, DaemonSubscriptionProfile,
+    DaemonSession, DaemonStatus, DaemonSubscriptionInfo, DaemonSubscriptionList,
+    DaemonSubscriptionProfile,
 };
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
@@ -3148,6 +3149,219 @@ fn trim_catalog_decorators(value: &str) -> &str {
         value.trim()
     } else {
         trimmed
+    }
+}
+
+/// What the home toggle's exit line shows for a live session. Empty strings mean "not known
+/// yet" (no second sample, or Mihomo's counters were unreadable) and are left out by the UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionLine {
+    pub(crate) uptime: String,
+    pub(crate) down: String,
+    pub(crate) up: String,
+}
+
+/// Turns successive `/v1/session` samples into uptime and current speed. Speed is the byte
+/// delta between two samples over the time between them.
+#[derive(Debug, Default)]
+pub(crate) struct SessionTraffic {
+    previous: Option<TrafficSample>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrafficSample {
+    at: std::time::Instant,
+    connected_since_unix_ms: u64,
+    download: u64,
+    upload: u64,
+}
+
+impl SessionTraffic {
+    pub(crate) fn reset(&mut self) {
+        self.previous = None;
+    }
+
+    pub(crate) fn sample(
+        &mut self,
+        session: &DaemonSession,
+        at: std::time::Instant,
+        now_unix_ms: u64,
+    ) -> SessionLine {
+        let uptime = format_uptime(now_unix_ms.saturating_sub(session.connected_since_unix_ms));
+        let (Some(download), Some(upload)) = (session.download_total, session.upload_total) else {
+            // Keep the last good sample: the next readable one still yields a real rate.
+            return SessionLine {
+                uptime,
+                ..SessionLine::default()
+            };
+        };
+        let current = TrafficSample {
+            at,
+            connected_since_unix_ms: session.connected_since_unix_ms,
+            download,
+            upload,
+        };
+        let previous = self.previous.replace(current);
+        let Some(previous) = previous
+            .filter(|previous| previous.connected_since_unix_ms == current.connected_since_unix_ms)
+        else {
+            return SessionLine {
+                uptime,
+                ..SessionLine::default()
+            };
+        };
+        let seconds = at.saturating_duration_since(previous.at).as_secs_f64();
+        if seconds <= 0.0 {
+            return SessionLine {
+                uptime,
+                ..SessionLine::default()
+            };
+        }
+        // Counters restart with Mihomo; a smaller value is a reset, not negative traffic.
+        let rate = |now: u64, before: u64| now.saturating_sub(before) as f64 / seconds;
+        SessionLine {
+            uptime,
+            down: format_speed(rate(download, previous.download)),
+            up: format_speed(rate(upload, previous.upload)),
+        }
+    }
+}
+
+/// "00:12:43"; hours keep growing past 99 instead of wrapping.
+pub(crate) fn format_uptime(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// "0 Б/с", "320 КБ/с", "2.4 МБ/с": binary units, one decimal below 10, whole numbers above.
+pub(crate) fn format_speed(bytes_per_second: f64) -> String {
+    const UNITS: [&str; 4] = ["Б/с", "КБ/с", "МБ/с", "ГБ/с"];
+    let mut value = bytes_per_second.max(0.0);
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && value >= 1024.0 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 && value.round() < 1024.0 {
+        return format!("{} {}", value.round(), UNITS[0]);
+    }
+    if unit == 0 {
+        return format!("1.0 {}", UNITS[1]);
+    }
+    if value < 10.0 && format!("{value:.1}") != "10.0" {
+        format!("{value:.1} {}", UNITS[unit])
+    } else if value.round() >= 1024.0 && unit + 1 < UNITS.len() {
+        format!("1.0 {}", UNITS[unit + 1])
+    } else {
+        format!("{} {}", value.round(), UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod session_traffic_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{DaemonSession, SessionLine, SessionTraffic, format_speed, format_uptime};
+
+    fn session(since: u64, down: Option<u64>, up: Option<u64>) -> DaemonSession {
+        DaemonSession {
+            connected_since_unix_ms: since,
+            download_total: down,
+            upload_total: up,
+        }
+    }
+
+    #[test]
+    fn uptime_is_hours_minutes_seconds() {
+        assert_eq!(format_uptime(0), "00:00:00");
+        assert_eq!(format_uptime(763_999), "00:12:43");
+        assert_eq!(format_uptime(3_600_000), "01:00:00");
+        assert_eq!(format_uptime(360_000_000), "100:00:00");
+    }
+
+    #[test]
+    fn speed_uses_binary_russian_units_and_one_decimal_below_ten() {
+        assert_eq!(format_speed(0.0), "0 Б/с");
+        assert_eq!(format_speed(-5.0), "0 Б/с");
+        assert_eq!(format_speed(512.0), "512 Б/с");
+        assert_eq!(format_speed(1023.4), "1023 Б/с");
+        assert_eq!(format_speed(1023.6), "1.0 КБ/с");
+        assert_eq!(format_speed(1024.0), "1.0 КБ/с");
+        assert_eq!(format_speed(320.0 * 1024.0), "320 КБ/с");
+        assert_eq!(format_speed(2.4 * 1024.0 * 1024.0), "2.4 МБ/с");
+        assert_eq!(format_speed(9.99 * 1024.0), "10 КБ/с");
+        assert_eq!(format_speed(1023.7 * 1024.0), "1.0 МБ/с");
+        assert_eq!(format_speed(3.0 * 1024.0 * 1024.0 * 1024.0), "3.0 ГБ/с");
+    }
+
+    #[test]
+    fn speed_is_the_delta_between_samples_and_a_counter_reset_reads_as_zero() {
+        let mut traffic = SessionTraffic::default();
+        let start = Instant::now();
+        let first = traffic.sample(&session(1_000, Some(10_000), Some(500)), start, 61_000);
+        assert_eq!(
+            first,
+            SessionLine {
+                uptime: "00:01:00".into(),
+                down: String::new(),
+                up: String::new(),
+            }
+        );
+
+        let second = traffic.sample(
+            &session(1_000, Some(10_000 + 2 * 1024 * 1024), Some(500 + 2048)),
+            start + Duration::from_secs(2),
+            63_000,
+        );
+        assert_eq!(second.uptime, "00:01:02");
+        assert_eq!(second.down, "1.0 МБ/с");
+        assert_eq!(second.up, "1.0 КБ/с");
+
+        // Mihomo restarted its counters: never negative, just zero for this interval.
+        let reset = traffic.sample(
+            &session(1_000, Some(100), Some(0)),
+            start + Duration::from_secs(3),
+            64_000,
+        );
+        assert_eq!(reset.down, "0 Б/с");
+        assert_eq!(reset.up, "0 Б/с");
+    }
+
+    #[test]
+    fn unreadable_counters_and_a_new_session_restart_the_rate() {
+        let mut traffic = SessionTraffic::default();
+        let start = Instant::now();
+        traffic.sample(&session(1_000, Some(0), Some(0)), start, 2_000);
+
+        let unreadable = traffic.sample(
+            &session(1_000, None, None),
+            start + Duration::from_secs(1),
+            3_000,
+        );
+        assert_eq!(unreadable.uptime, "00:00:02");
+        assert!(unreadable.down.is_empty() && unreadable.up.is_empty());
+
+        // A reconnect is a new session: its first sample has no rate yet.
+        let reconnected = traffic.sample(
+            &session(9_000, Some(50_000), Some(50_000)),
+            start + Duration::from_secs(2),
+            10_000,
+        );
+        assert_eq!(reconnected.uptime, "00:00:01");
+        assert!(reconnected.down.is_empty());
+
+        traffic.reset();
+        let after_reset = traffic.sample(
+            &session(9_000, Some(60_000), Some(60_000)),
+            start + Duration::from_secs(3),
+            11_000,
+        );
+        assert!(after_reset.down.is_empty());
     }
 }
 
@@ -6426,12 +6640,46 @@ mod tests {
     }
 
     #[test]
+    fn redesign_motion_is_lightweight_and_respects_reduced_motion() {
+        let app = include_str!("../ui/app.slint");
+        // Page enter is a one-frame flag, not a running animation clock.
+        assert!(app.contains(
+            "page-enter := Timer {
+        interval: 16ms;
+        running: root.page-entering;"
+        ));
+        assert!(app.contains(
+            "changed visible-page => {
+        if (!root.reduced-motion) {
+            root.page-entering = true;"
+        ));
+        for page in ["\"home\"", "\"status\""] {
+            let head = format!(
+                "if root.visible-page == {page}: Rectangle {{
+                opacity: root.page-entering ? 0 : 1;"
+            );
+            assert!(app.contains(&head), "{page} must fade in");
+        }
+        // Continuous animation-tick() work only runs while its state is active.
+        assert!(app.contains("if root.toggle-busy && !root.reduced-motion: Rectangle {"));
+        assert!(app.contains(
+            "transform-rotation: root.subscription-refresh-pending && !root.reduced-motion"
+        ));
+        // Rail labels fade in after the rail has widened.
+        assert!(app.contains("animate opacity { duration: root.compact ? 80ms : 160ms; delay: root.compact ? 0ms : 90ms; easing: ease-out; }"));
+        // Session timer shares the title's bottom edge; speeds show only with a value.
+        assert!(app.contains("if root.session-uptime != \"\": Text {"));
+        assert!(app.contains("if root.traffic-down != \"\": Text {"));
+        assert!(app.contains("if root.traffic-up != \"\": Text {"));
+    }
+
+    #[test]
     fn first_run_home_uses_inline_subscription_onboarding() {
         let source = include_str!("../ui/app.slint");
         let onboarding = source
             .split("first-run-onboarding := VerticalLayout")
             .nth(1)
-            .and_then(|source| source.split("strip-glow-touch := TouchArea").next())
+            .and_then(|source| source.split("first-run-toggle-preview := Rectangle").next())
             .expect("inline first-run onboarding block");
 
         for required in [
@@ -6450,7 +6698,8 @@ mod tests {
 
         for required in [
             "text: \"Добавьте подписку\";",
-            "text: \"Ссылка хранится локально на этом устройстве\";",
+            "text: \"Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена\";",
+            "text: \"Ссылка хранится только на этом устройстве\";",
             "onboarding-copy := VerticalLayout",
             "first-run-actions := HorizontalLayout",
             "label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";",

@@ -147,6 +147,7 @@ const LATENCIES_RESPONSE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const API_ERROR_RESPONSE_LIMIT_BYTES: usize = 16 * 1024;
 const DASHBOARD_URL_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
+const SESSION_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DaemonStatus {
@@ -292,6 +293,16 @@ pub struct DaemonDiagnostics {
     pub logs: Vec<DaemonDiagnosticLog>,
     #[serde(default)]
     pub mappings: Vec<DaemonProxyMapping>,
+}
+
+/// GET /v1/session: when the live connection started and Mihomo's cumulative byte counters.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DaemonSession {
+    pub connected_since_unix_ms: u64,
+    #[serde(default)]
+    pub download_total: Option<u64>,
+    #[serde(default)]
+    pub upload_total: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -568,6 +579,12 @@ pub trait DaemonClient: Send + Sync {
     /// log it, persist it, or surface it in diagnostics.
     fn dashboard_url(&self) -> Result<String, DaemonError> {
         Err(DaemonError::new("Панель Mihomo недоступна."))
+    }
+
+    /// GET /v1/session. Polled about once a second while connected, so a refusal (the session
+    /// just ended) is not recorded in the low-level log.
+    fn session(&self) -> Result<DaemonSession, DaemonError> {
+        Err(DaemonError::new("Данные сессии недоступны."))
     }
 
     /// GET /v1/catalog. IDs are opaque daemon values; labels are presentation data.
@@ -1101,6 +1118,22 @@ impl DaemonClient for HttpDaemonClient {
         let response: DashboardUrlResponse =
             decode_bounded_json(response, DASHBOARD_URL_RESPONSE_LIMIT_BYTES)?;
         Ok(response.url)
+    }
+
+    fn session(&self) -> Result<DaemonSession, DaemonError> {
+        let response = self
+            .http
+            .get(self.endpoint("/v1/session"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(map_error)?;
+        if !response.status().is_success() {
+            let code = error_code(response);
+            return Err(
+                DaemonError::definitive_http("Данные сессии недоступны.").with_known_code(&code)
+            );
+        }
+        decode_bounded_json(response, SESSION_RESPONSE_LIMIT_BYTES)
     }
 
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError> {

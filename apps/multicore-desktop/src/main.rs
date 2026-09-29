@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -48,8 +49,9 @@ use view_model::{
     CatalogDisplayKind, CatalogPresentation, ConflictingAppsPresentation, DesktopViewModel,
     DiagnosticsPresentation, LatencyPresentation, LatencyRequest, MutationToken,
     NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
-    SemanticTone, StatePresentation, SubscriptionPresentation, SubscriptionProfileOperation,
-    SubscriptionProfilesPresentation, derive_catalog_display, split_leading_symbol,
+    SemanticTone, SessionLine, SessionTraffic, StatePresentation, SubscriptionPresentation,
+    SubscriptionProfileOperation, SubscriptionProfilesPresentation, derive_catalog_display,
+    split_leading_symbol,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -818,6 +820,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
+    let _session_stats_timer = wire_session_stats(&ui, model.clone());
     wire_conflicting_apps_banner(&ui, model.clone());
     let _conflicting_apps_timer = wire_conflicting_apps_scan(&ui, model.clone());
     wire_windows_settings(&ui);
@@ -3005,6 +3008,90 @@ fn wire_automatic_latency(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -
     timer
 }
 
+/// Feeds the home toggle's exit line with session uptime and live speed. Polls `/v1/session`
+/// about once a second, but only while connected and the window is on screen; any other tick
+/// returns at once without touching the daemon.
+fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    let traffic = Arc::new(Mutex::new(SessionTraffic::default()));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let connected = model
+            .lock()
+            .expect("view model lock")
+            .presentation()
+            .is_connected;
+        if !connected {
+            traffic.lock().expect("session traffic lock").reset();
+            apply_session_line(&ui, &SessionLine::default());
+            return;
+        }
+        if !ui.window().is_visible() || ui.window().is_minimized() || !ui.get_shell_active() {
+            return;
+        }
+        if in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let client = model.lock().expect("view model lock").daemon_client();
+        let weak = weak.clone();
+        let model = model.clone();
+        let traffic = traffic.clone();
+        let in_flight = in_flight.clone();
+        thread::spawn(move || {
+            let line = match client.session() {
+                Ok(session) => traffic.lock().expect("session traffic lock").sample(
+                    &session,
+                    Instant::now(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |elapsed| {
+                            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                ),
+                Err(_) => {
+                    traffic.lock().expect("session traffic lock").reset();
+                    SessionLine::default()
+                }
+            };
+            in_flight.store(false, Ordering::Release);
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                // The connection may have ended while the request was in flight.
+                let connected = model
+                    .lock()
+                    .expect("view model lock")
+                    .presentation()
+                    .is_connected;
+                let line = if connected {
+                    line
+                } else {
+                    SessionLine::default()
+                };
+                apply_session_line(&ui, &line);
+            });
+        });
+    });
+    timer
+}
+
+fn apply_session_line(ui: &AppWindow, line: &SessionLine) {
+    if ui.get_session_uptime() != line.uptime.as_str() {
+        ui.set_session_uptime(line.uptime.as_str().into());
+    }
+    if ui.get_traffic_down() != line.down.as_str() {
+        ui.set_traffic_down(line.down.as_str().into());
+    }
+    if ui.get_traffic_up() != line.up.as_str() {
+        ui.set_traffic_up(line.up.as_str().into());
+    }
+}
+
 fn begin_latency_check(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewModel>>) {
     let (request, current) = {
         let mut model = model.lock().expect("view model lock");
@@ -5115,7 +5202,7 @@ mod window_tests {
         let preferences = include_str!("preferences.rs");
 
         for required in [
-            "label: \"Подписки\"; active: root.visible-page == \"subscriptions\"",
+            "label: \"Подписки\"; badge: root.subscription-profiles.length > 1 ? \"\" + root.subscription-profiles.length : \"\"; active: root.visible-page == \"subscriptions\"",
             "if root.visible-page == \"subscriptions\"",
             "VisiblePage::Subscriptions => \"subscriptions\"",
             "\"subscriptions\" => Some(VisiblePage::Subscriptions)",

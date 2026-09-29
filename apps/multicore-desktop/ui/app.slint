@@ -53,9 +53,11 @@ component NavItem inherits Rectangle {
     in property <bool> active;
     in property <bool> enabled: true;
     in property <bool> compact: false;
+    // Small trailing count in the expanded rail (e.g. number of subscriptions).
+    in property <string> badge;
     callback activated();
 
-    height: 44px;
+    height: root.compact ? 44px : 40px;
     background: root.active ? Theme.elevated : nav-touch.has-hover ? #ffffff08 : transparent;
     border-radius: 8px;
     border-width: nav-focus.has-focus ? 2px : 0px;
@@ -64,36 +66,65 @@ component NavItem inherits Rectangle {
     accessible-label: root.label;
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
+    animate background { duration: 140ms; easing: ease-out; }
 
     Rectangle {
         x: 0;
-        y: 10px;
+        y: (parent.height - self.height) / 2;
         width: 3px;
-        height: 24px;
-        border-radius: 2px;
-        background: root.active ? Theme.accent-blue : transparent;
+        height: root.active ? 20px : 8px;
+        border-radius: 1.5px;
+        background: Theme.accent-blue;
+        opacity: root.active ? 1 : 0;
+        animate opacity, height { duration: 180ms; easing: ease-out; }
     }
 
     Image {
-        x: root.compact ? (parent.width - self.width) / 2 : 16px;
-        y: 12px;
+        x: root.compact ? (parent.width - self.width) / 2 : 12px;
+        y: (parent.height - self.height) / 2;
         width: 20px;
         height: 20px;
         source: root.icon-source;
+        colorize: root.active || nav-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
         image-fit: contain;
         animate x { duration: 180ms; easing: ease-in-out; }
+        animate colorize { duration: 140ms; easing: ease-out; }
     }
 
-    if !root.compact: Text {
-        x: 48px;
-        width: parent.width - 60px;
+    // Always present so the label can fade in once the rail has widened,
+    // instead of popping in over a still-narrow rail.
+    nav-label := Text {
+        x: root.compact ? 36px : 44px;
+        width: Math.max(0px, parent.width - self.x - 12px - (root.badge == "" ? 0px : 24px));
         height: parent.height;
         text: root.label;
-        color: root.active ? Theme.text-primary : Theme.text-secondary;
+        color: root.active || nav-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
         font-family: Theme.font-family;
         font-size: Theme.type-label-size;
-        font-weight: root.active ? Theme.weight-semibold : Theme.weight-regular;
+        font-weight: root.active ? Theme.weight-semibold : Theme.weight-medium;
         vertical-alignment: center;
+        overflow: clip;
+        opacity: root.compact ? 0 : 1;
+        visible: self.opacity > 0;
+        accessible-role: none;
+        animate opacity { duration: root.compact ? 80ms : 160ms; delay: root.compact ? 0ms : 90ms; easing: ease-out; }
+        animate x { duration: 180ms; easing: ease-in-out; }
+        animate color { duration: 140ms; easing: ease-out; }
+    }
+
+    if root.badge != "": Text {
+        x: parent.width - self.width - 12px;
+        width: 20px;
+        height: parent.height;
+        text: root.badge;
+        color: Theme.text-muted;
+        font-family: Theme.font-family;
+        font-size: Theme.type-metadata-size;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        opacity: nav-label.opacity;
+        visible: self.opacity > 0;
+        accessible-role: none;
     }
 
     nav-focus := FocusScope {
@@ -138,15 +169,20 @@ component NavToggle inherits Rectangle {
         animate x { duration: 180ms; easing: ease-in-out; }
     }
 
-    if !root.collapsed: Text {
-        x: 48px;
-        width: parent.width - 60px;
+    Text {
+        x: 44px;
+        width: Math.max(0px, parent.width - 56px);
         height: parent.height;
         text: "Свернуть";
-        color: Theme.text-muted;
+        color: toggle-touch.has-hover ? Theme.text-secondary : Theme.text-muted;
         font-family: Theme.font-family;
         font-size: Theme.type-metadata-size;
         vertical-alignment: center;
+        overflow: clip;
+        opacity: root.collapsed ? 0 : 1;
+        visible: self.opacity > 0;
+        accessible-role: none;
+        animate opacity { duration: root.collapsed ? 80ms : 160ms; delay: root.collapsed ? 0ms : 90ms; easing: ease-out; }
     }
 
     toggle-focus := FocusScope {
@@ -293,6 +329,16 @@ component SettingsNavItem inherits Rectangle {
     }
 }
 
+component SectionCaption inherits Text {
+    color: Theme.text-muted;
+    font-family: Theme.font-family;
+    font-size: 11px;
+    font-weight: Theme.weight-semibold;
+    letter-spacing: 0.6px;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
 component HealthRow inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -342,8 +388,7 @@ component ToggleRow inherits Rectangle {
     callback toggled(bool);
 
     height: 64px;
-    background: toggle-touch.has-hover && root.enabled ? #ffffff06 : transparent;
-    border-radius: 8px;
+    background: transparent;
     accessible-role: checkbox;
     accessible-label: root.label;
     accessible-checked: root.checked;
@@ -371,21 +416,27 @@ component ToggleRow inherits Rectangle {
         overflow: elide;
     }
     Rectangle {
-        x: parent.width - 52px;
-        y: 18px;
-        width: 44px;
-        height: 26px;
-        border-radius: 13px;
-        background: root.checked ? Theme.accent-blue : Theme.elevated;
-        border-color: toggle-focus.has-focus ? Theme.focus : root.checked ? Theme.accent-blue : Theme.line;
-        border-width: toggle-focus.has-focus ? 2px : 1px;
+        x: parent.width - 44px;
+        y: 20px;
+        width: 40px;
+        height: 24px;
+        border-radius: 12px;
+        background: root.checked ? Theme.accent-blue : Theme.line;
+        border-color: Theme.focus;
+        border-width: toggle-focus.has-focus ? 2px : 0px;
+        opacity: root.enabled ? 1 : 0.45;
+        animate background { duration: 160ms; easing: ease-out; }
         Rectangle {
-            x: root.checked ? 21px : 3px;
+            x: root.checked ? parent.width - self.width - 3px : 3px;
             y: 3px;
             width: 18px;
             height: 18px;
             border-radius: 9px;
-            background: root.enabled ? Theme.text-primary : Theme.text-muted;
+            background: #ffffff;
+            drop-shadow-blur: 4px;
+            drop-shadow-offset-y: 1px;
+            drop-shadow-color: #00000059;
+            animate x { duration: 160ms; easing: ease-in-out; }
         }
     }
     toggle-focus := FocusScope {
@@ -513,6 +564,9 @@ export component AppWindow inherits Window {
     in property <bool> toggle-on: false;
     in property <bool> toggle-busy: false;
     in property <bool> toggle-detail-is-exit: true;
+    in property <string> session-uptime;
+    in property <string> traffic-down;
+    in property <string> traffic-up;
     in property <bool> import-pending: false;
     in property <string> import-error;
     in property <string> subscription-title: "Подписка";
@@ -607,6 +661,9 @@ export component AppWindow inherits Window {
     in-out property <int> profile-delete-control-focus-serial;
     private property <string> visible-page: root.active-panel == "routes" ? "home" : root.active-panel == "events" ? "status" : root.local-page;
     private property <bool> profile-menu-open: root.active-panel == "subscription";
+    // True for one frame after the page changes, so the new page starts hidden and
+    // eases in. Pages are created by `if`, so this is the only enter hook.
+    private property <bool> page-entering: false;
     private property <bool> profile-menu-was-open: false;
     private property <bool> profile-menu-keyboard-open: false;
     private property <int> profile-shelf-focus-serial: 0;
@@ -657,6 +714,18 @@ export component AppWindow inherits Window {
     in property <bool> conflicting-apps-closing: false;
     callback confirm-deep-link();
     callback cancel-deep-link();
+
+    page-enter := Timer {
+        interval: 16ms;
+        running: root.page-entering;
+        triggered => { root.page-entering = false; }
+    }
+
+    changed visible-page => {
+        if (!root.reduced-motion) {
+            root.page-entering = true;
+        }
+    }
 
     wave-kickoff := Timer {
         interval: 80ms;
@@ -1042,15 +1111,22 @@ export component AppWindow inherits Window {
             animate width { duration: 180ms; easing: ease-in-out; }
 
             VerticalLayout {
-                padding: root.navigation-collapsed ? 10px : 16px;
-                spacing: 8px;
+                padding: 10px;
+                spacing: root.navigation-collapsed ? 8px : 4px;
 
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/link.svg"); label: "Подписки"; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/link.svg"); label: "Подписки"; badge: root.subscription-profiles.length > 1 ? "" + root.subscription-profiles.length : ""; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.line;
+                    opacity: root.navigation-collapsed ? 0 : 1;
+                    animate opacity { duration: 160ms; easing: ease-out; }
+                }
 
                 NavToggle {
                     collapsed: root.navigation-collapsed;
@@ -1063,6 +1139,10 @@ export component AppWindow inherits Window {
             background: Theme.canvas;
 
             if root.visible-page == "home": Rectangle {
+                opacity: root.page-entering ? 0 : 1;
+                y: root.page-entering ? 6px : 0px;
+                animate opacity { duration: 180ms; easing: ease-out; }
+                animate y { duration: 220ms; easing: ease-out; }
                 background: transparent;
                 clip: true;
 
@@ -1131,7 +1211,7 @@ export component AppWindow inherits Window {
                     padding: 20px;
                     spacing: 16px;
 
-                    connection-strip := Rectangle {
+                    if root.has-profile: connection-strip := Rectangle {
                         height: root.has-profile
                             ? 88px
                             : root.first-run-manual-open
@@ -1222,6 +1302,20 @@ export component AppWindow inherits Window {
                                     : Theme.elevated;
                                 animate background { duration: 180ms; easing: ease-in-out; }
 
+                                // Soft ring that breathes only while connecting/disconnecting.
+                                if root.toggle-busy && !root.reduced-motion: Rectangle {
+                                    property <float> phase: (1 + Math.sin(animation-tick() / 1400ms * 360deg)) / 2;
+                                    x: -3px;
+                                    y: -3px;
+                                    width: parent.width + 6px;
+                                    height: parent.height + 6px;
+                                    border-radius: 15px;
+                                    border-width: 1.5px;
+                                    border-color: Theme.accent-blue;
+                                    background: transparent;
+                                    opacity: 0.15 + 0.45 * self.phase;
+                                }
+
                                 shield-glyph := Image {
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
@@ -1246,12 +1340,28 @@ export component AppWindow inherits Window {
                                 height: parent.height;
                                 alignment: center;
                                 spacing: 5px;
-                                Text {
-                                    text: root.toggle-title;
-                                    color: Theme.text-primary;
-                                    font-size: Theme.type-value-size;
-                                    font-weight: Theme.weight-semibold;
-                                    overflow: elide;
+                                // Title and session timer share one bottom edge, so the smaller
+                                // timer sits on the title's baseline instead of floating mid-line.
+                                HorizontalLayout {
+                                    height: 20px;
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text {
+                                        text: root.toggle-title;
+                                        color: Theme.text-primary;
+                                        font-size: Theme.type-value-size;
+                                        font-weight: Theme.weight-semibold;
+                                        vertical-alignment: bottom;
+                                        overflow: elide;
+                                    }
+                                    if root.session-uptime != "": Text {
+                                        text: root.session-uptime;
+                                        color: Theme.text-muted;
+                                        font-size: Theme.type-metadata-size;
+                                        font-weight: Theme.weight-medium;
+                                        vertical-alignment: bottom;
+                                        accessible-label: "Время сессии " + root.session-uptime;
+                                    }
                                 }
                                 if root.toggle-detail-is-exit: HorizontalLayout {
                                     spacing: 6px;
@@ -1262,7 +1372,13 @@ export component AppWindow inherits Window {
                                     // UI font renders regional-indicator flags as letters ("SE").
                                     if root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
                                     if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
-                                    Text { horizontal-stretch: 1; text: root.node-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
+                                    Text { horizontal-stretch: 0; max-width: 220px; text: root.node-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
+                                    // Live speed follows the exit inline; each arrow only shows with a value.
+                                    if root.traffic-down != "": Text { text: "·  ↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
+                                    if root.traffic-down != "": Text { min-width: 56px; text: root.traffic-down; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Загрузка " + root.traffic-down; }
+                                    if root.traffic-up != "": Text { text: "↑"; color: Theme.accent-green; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
+                                    if root.traffic-up != "": Text { text: root.traffic-up; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Отдача " + root.traffic-up; }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
                                 }
                                 if !root.toggle-detail-is-exit: Text {
                                     text: root.supporting;
@@ -1329,98 +1445,6 @@ export component AppWindow inherits Window {
                                         animate x, width { duration: 180ms; easing: ease-in-out; }
                                     }
                                 }
-                            }
-                        }
-
-                        if !root.has-profile: first-run-onboarding := VerticalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            padding-top: 12px;
-                            padding-bottom: 12px;
-                            spacing: 8px;
-
-                            onboarding-copy := VerticalLayout {
-                                spacing: 2px;
-                                Text {
-                                    text: "Добавьте подписку";
-                                    color: Theme.text-primary;
-                                    font-size: 18px;
-                                    font-weight: Theme.weight-semibold;
-                                    overflow: elide;
-                                    accessible-role: text;
-                                }
-                                Text {
-                                    text: "Ссылка хранится локально на этом устройстве";
-                                    color: Theme.text-secondary;
-                                    font-size: Theme.type-metadata-size;
-                                    overflow: elide;
-                                    accessible-role: text;
-                                }
-                            }
-
-                            first-run-actions := HorizontalLayout {
-                                spacing: 10px;
-                                PrimaryAction {
-                                    preferred-width: 184px;
-                                    label: root.import-pending ? "Добавляем…" : "Вставить из буфера";
-                                    state-label: "Вставить подписку из буфера обмена";
-                                    enabled: !root.import-pending;
-                                    activated => { root.paste-subscription(); }
-                                }
-                                SmallAction {
-                                    width: 136px;
-                                    label: "Ввести вручную";
-                                    selected: root.first-run-manual-open;
-                                    enabled: !root.import-pending;
-                                    focus-epoch: root.first-run-trigger-focus-serial;
-                                    activated => {
-                                        root.first-run-manual-open = true;
-                                        root.first-run-input-focus-serial += 1;
-                                    }
-                                }
-                            }
-
-                            if root.first-run-manual-open: HorizontalLayout {
-                                spacing: 8px;
-                                first-run-url-input := LineEdit {
-                                    horizontal-stretch: 1;
-                                    property <int> focus-serial: root.first-run-input-focus-serial;
-                                    text <=> root.subscription-draft;
-                                    placeholder-text: "https://example.com/subscription";
-                                    enabled: !root.import-pending;
-                                    accessible-label: "URL подписки";
-                                    init => { self.focus(); }
-                                    changed focus-serial => { self.focus(); }
-                                    accepted => {
-                                        if (!root.import-pending && root.subscription-draft != "") {
-                                            root.import-url(root.subscription-draft);
-                                        }
-                                    }
-                                }
-                                SmallAction {
-                                    label: root.import-pending ? "Добавляем…" : "Добавить";
-                                    enabled: !root.import-pending && root.subscription-draft != "";
-                                    activated => { root.import-url(root.subscription-draft); }
-                                }
-                                SmallAction {
-                                    label: "Отмена";
-                                    enabled: !root.import-pending;
-                                    activated => {
-                                        root.first-run-manual-open = false;
-                                        root.subscription-draft = "";
-                                        root.dismiss-first-run-import();
-                                        root.first-run-trigger-focus-serial += 1;
-                                    }
-                                }
-                            }
-
-                            if root.import-error != "": Text {
-                                text: root.import-error;
-                                color: Theme.error;
-                                font-size: Theme.type-metadata-size;
-                                wrap: word-wrap;
-                                accessible-role: text;
-                                accessible-live-region: polite;
                             }
                         }
 
@@ -1548,7 +1572,187 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if !root.has-profile: Rectangle { vertical-stretch: 1; background: transparent; }
+                    // First run: a centred welcome card, the three steps, and a dimmed
+                    // preview of the connect switch that appears once a subscription exists.
+                    if !root.has-profile: first-run-stage := VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        spacing: 16px;
+
+                        HorizontalLayout {
+                            alignment: center;
+                            first-run-card := Rectangle {
+                                width: Math.min(500px, root.width - 200px);
+                                height: first-run-onboarding.preferred-height;
+                                background: Theme.surface;
+                                border-color: Theme.line;
+                                border-width: 1px;
+                                border-radius: 14px;
+                                drop-shadow-blur: 24px;
+                                drop-shadow-offset-y: 8px;
+                                drop-shadow-color: #00000040;
+
+                                first-run-onboarding := VerticalLayout {
+                                    padding-left: 28px;
+                                    padding-right: 28px;
+                                    padding-top: 24px;
+                                    padding-bottom: 24px;
+                                    spacing: 14px;
+
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        Image {
+                                            width: 44px;
+                                            height: 44px;
+                                            source: @image-url("../assets/app-icon.svg");
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
+                                    }
+
+                                    onboarding-copy := VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: "Добавьте подписку";
+                                            color: Theme.text-primary;
+                                            font-size: 20px;
+                                            font-weight: Theme.weight-semibold;
+                                            horizontal-alignment: center;
+                                            overflow: elide;
+                                            accessible-role: text;
+                                        }
+                                        Text {
+                                            text: "Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена";
+                                            color: Theme.text-secondary;
+                                            font-size: Theme.type-metadata-size;
+                                            horizontal-alignment: center;
+                                            wrap: word-wrap;
+                                            accessible-role: text;
+                                        }
+                                    }
+
+                                    first-run-actions := HorizontalLayout {
+                                        alignment: center;
+                                        spacing: 10px;
+                                        PrimaryAction {
+                                            preferred-width: 184px;
+                                            label: root.import-pending ? "Добавляем…" : "Вставить из буфера";
+                                            state-label: "Вставить подписку из буфера обмена";
+                                            enabled: !root.import-pending;
+                                            activated => { root.paste-subscription(); }
+                                        }
+                                        SmallAction {
+                                            width: 136px;
+                                            label: "Ввести вручную";
+                                            selected: root.first-run-manual-open;
+                                            enabled: !root.import-pending;
+                                            focus-epoch: root.first-run-trigger-focus-serial;
+                                            activated => {
+                                                root.first-run-manual-open = true;
+                                                root.first-run-input-focus-serial += 1;
+                                            }
+                                        }
+                                    }
+
+                                    if root.first-run-manual-open: HorizontalLayout {
+                                        spacing: 8px;
+                                        first-run-url-input := LineEdit {
+                                            horizontal-stretch: 1;
+                                            property <int> focus-serial: root.first-run-input-focus-serial;
+                                            text <=> root.subscription-draft;
+                                            placeholder-text: "https://example.com/subscription";
+                                            enabled: !root.import-pending;
+                                            accessible-label: "URL подписки";
+                                            init => { self.focus(); }
+                                            changed focus-serial => { self.focus(); }
+                                            accepted => {
+                                                if (!root.import-pending && root.subscription-draft != "") {
+                                                    root.import-url(root.subscription-draft);
+                                                }
+                                            }
+                                        }
+                                        SmallAction {
+                                            label: root.import-pending ? "Добавляем…" : "Добавить";
+                                            enabled: !root.import-pending && root.subscription-draft != "";
+                                            activated => { root.import-url(root.subscription-draft); }
+                                        }
+                                        SmallAction {
+                                            label: "Отмена";
+                                            enabled: !root.import-pending;
+                                            activated => {
+                                                root.first-run-manual-open = false;
+                                                root.subscription-draft = "";
+                                                root.dismiss-first-run-import();
+                                                root.first-run-trigger-focus-serial += 1;
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "Ссылка хранится только на этом устройстве";
+                                        color: Theme.text-muted;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        accessible-role: text;
+                                    }
+
+                                    if root.import-error != "": Text {
+                                        text: root.import-error;
+                                        color: Theme.error;
+                                        font-size: Theme.type-metadata-size;
+                                        horizontal-alignment: center;
+                                        wrap: word-wrap;
+                                        accessible-role: text;
+                                        accessible-live-region: polite;
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 24px;
+                            for step[i] in ["скопируйте ссылку", "вставьте", "включите защиту"]: HorizontalLayout {
+                                spacing: 6px;
+                                Text { text: i + 1; color: Theme.accent-blue; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; }
+                                Text { text: step; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            first-run-toggle-preview := Rectangle {
+                                width: Math.min(500px, root.width - 200px);
+                                height: 88px;
+                                opacity: 0.4;
+                                background: Theme.surface;
+                                border-color: #ffffff0a;
+                                border-width: 1px;
+                                border-radius: 14px;
+                                accessible-role: none;
+                                Rectangle {
+                                    x: 20px;
+                                    y: 22px;
+                                    width: 44px;
+                                    height: 44px;
+                                    border-radius: 12px;
+                                    background: Theme.elevated;
+                                    Image { x: 11px; y: 11px; width: 22px; height: 22px; source: @image-url("../assets/shield-off.svg"); colorize: Theme.text-muted; image-fit: contain; }
+                                }
+                                Text { x: 78px; y: 24px; text: "Защита выключена"; color: Theme.text-primary; font-size: Theme.type-value-size; font-weight: Theme.weight-semibold; }
+                                Text { x: 78px; y: 50px; text: "Появится после добавления подписки"; color: Theme.text-muted; font-size: Theme.type-metadata-size; }
+                                Rectangle {
+                                    x: parent.width - self.width - 20px;
+                                    y: 24px;
+                                    width: 72px;
+                                    height: 40px;
+                                    border-radius: 20px;
+                                    background: Theme.line;
+                                    Rectangle { x: 4px; y: 4px; width: 32px; height: 32px; border-radius: 16px; background: #ffffff; }
+                                }
+                            }
+                        }
+                    }
 
                     if root.has-profile: inline-routes := Rectangle {
                         vertical-stretch: 1;
@@ -1636,6 +1840,10 @@ export component AppWindow inherits Window {
             }
 
             if root.visible-page == "status": Rectangle {
+                opacity: root.page-entering ? 0 : 1;
+                y: root.page-entering ? 6px : 0px;
+                animate opacity { duration: 180ms; easing: ease-out; }
+                animate y { duration: 220ms; easing: ease-out; }
                 background: transparent;
                 VerticalLayout {
                     padding-left: 28px;
@@ -1647,18 +1855,32 @@ export component AppWindow inherits Window {
                         height: 44px;
                         spacing: 8px;
                         Text { text: "Состояние"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; }
+                        VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            height: 24px;
+                            width: diagnostics-tag.preferred-width + 16px;
+                            border-radius: 6px;
+                            background: #ffffff08;
+                            border-color: Theme.line;
+                            border-width: 1px;
+                            diagnostics-tag := Text { text: root.diagnostics-loading ? "Обновляем…" : "Локальная диагностика"; color: Theme.text-muted; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text { text: root.diagnostics-loading ? "Обновляем…" : "Локальная диагностика"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
                         SmallAction {
                             label: root.diagnostics-copied ? "Скопировано ✓" : "Копировать лог";
                             enabled: !root.profile-menu-open;
                             activated => { root.copy-diagnostics(); }
                         }
                     }
+                    SectionCaption { height: 16px; text: "ЯДРА И ТУННЕЛЬ"; }
                     Rectangle {
                         height: 154px;
                         background: Theme.surface;
-                        border-radius: 12px;
+                        border-color: #ffffff0a;
+                        border-width: 1px;
+                        border-radius: 14px;
                         VerticalLayout {
                             padding-left: 16px;
                             padding-right: 16px;
@@ -1675,7 +1897,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         height: 44px;
                         spacing: 8px;
-                        Text { text: "Маппинг Mihomo → Xray"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; vertical-alignment: center; overflow: elide; }
+                        SectionCaption { text: "МАППИНГ MIHOMO → XRAY"; }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         DashboardAction {
                             label: "Открыть дашборд";
@@ -1690,9 +1912,12 @@ export component AppWindow inherits Window {
                             spacing: 0px;
                             for mapping in root.diagnostic-mappings: Rectangle {
                                 height: 42px;
-                                border-color: Theme.line;
-                                border-width: 0px;
+                                border-radius: 8px;
+                                background: mapping-touch.has-hover ? #ffffff06 : transparent;
+                                mapping-touch := TouchArea { }
                                 HorizontalLayout {
+                                    padding-left: 4px;
+                                    padding-right: 4px;
                                     spacing: 12px;
                                     Text { text: mapping.proxy-name; color: Theme.text-primary; font-size: Theme.type-metadata-size; vertical-alignment: center; overflow: elide; }
                                     Text { width: 128px; text: mapping.address; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; }
@@ -1703,13 +1928,25 @@ export component AppWindow inherits Window {
                         }
                     }
                     HorizontalLayout {
-                        height: 44px;
-                        spacing: 8px;
-                        SmallAction { label: "Все"; selected: root.event-filter == "Все"; enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
-                        SmallAction { label: "Система"; selected: root.event-filter == "Система"; enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
-                        SmallAction { label: "Ошибки"; selected: root.event-filter == "Ошибки"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
-                        SmallAction { label: "Ядра"; selected: root.event-filter == "Ядра"; enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
+                        height: 38px;
+                        spacing: 12px;
+                        SectionCaption { text: "ЖУРНАЛ СОБЫТИЙ"; }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                        event-filter-track := Rectangle {
+                            width: 360px;
+                            background: #0a0c0f;
+                            border-color: Theme.line;
+                            border-width: 1px;
+                            border-radius: 10px;
+                            HorizontalLayout {
+                                padding: 2px;
+                                spacing: 2px;
+                                QuietChip { min-width: 0px; label: "Все"; selected: root.event-filter == "Все"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
+                                QuietChip { min-width: 0px; label: "Система"; selected: root.event-filter == "Система"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
+                                QuietChip { min-width: 0px; label: "Ошибки"; selected: root.event-filter == "Ошибки"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
+                                QuietChip { min-width: 0px; label: "Ядра"; selected: root.event-filter == "Ядра"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
+                            }
+                        }
                     }
                     ScrollView {
                         vertical-stretch: 1;
@@ -1718,14 +1955,36 @@ export component AppWindow inherits Window {
                             padding-right: 12px;
                             spacing: 8px;
                             for event in root.events: Rectangle {
-                                min-height: 56px;
-                                background: #ffffff04;
-                                border-radius: 8px;
-                                VerticalLayout {
-                                    padding: 8px;
-                                    spacing: 3px;
-                                    Text { text: (event.level == "error" ? "Ошибка" : "Событие") + (event.timestamp == "" ? "" : " · " + event.timestamp); color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: Theme.type-metadata-size; font-weight: Theme.weight-semibold; }
-                                    Text { text: event.message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                height: Math.max(40px, event-row.preferred-height);
+                                background: event.level == "error" ? #f06a6a0d : #ffffff04;
+                                border-color: event.level == "error" ? #f06a6a33 : #ffffff08;
+                                border-width: 1px;
+                                border-radius: 10px;
+                                event-row := HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    padding-top: 10px;
+                                    padding-bottom: 10px;
+                                    spacing: 10px;
+                                    alignment: start;
+                                    Text { width: 58px; text: event.timestamp; color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: Theme.type-metadata-size; }
+                                    VerticalLayout {
+                                        width: 6px;
+                                        padding-top: 5px;
+                                        alignment: start;
+                                        Rectangle {
+                                            width: 6px;
+                                            height: 6px;
+                                            border-radius: 3px;
+                                            background: event.level == "error" ? Theme.error : event.level == "warning" ? Theme.warning : Theme.accent-blue;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 2px;
+                                        Text { text: (event.level == "error" ? "Ошибка" : "Событие") + (event.component == "" ? "" : " · " + event.component); color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: 11px; font-weight: Theme.weight-semibold; }
+                                        Text { text: event.message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                    }
                                 }
                             }
                             if root.events.length == 0: Text { height: 56px; text: "Событий пока нет"; color: Theme.text-muted; font-size: Theme.type-label-size; vertical-alignment: center; horizontal-alignment: center; }
@@ -1735,6 +1994,10 @@ export component AppWindow inherits Window {
             }
 
             if root.visible-page == "settings" || root.visible-page == "subscriptions": Rectangle {
+                opacity: root.page-entering ? 0 : 1;
+                y: root.page-entering ? 6px : 0px;
+                animate opacity { duration: 180ms; easing: ease-out; }
+                animate y { duration: 220ms; easing: ease-out; }
                 background: transparent;
                 settings-scroll := ScrollView {
                     vertical-stretch: 1;
@@ -1763,7 +2026,19 @@ export component AppWindow inherits Window {
 
                         if root.visible-page == "settings" && root.settings-section == "general": VerticalLayout {
                             spacing: 16px;
-                            Text { height: 24px; text: "Основные"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                            SectionCaption { height: 16px; text: "ОСНОВНЫЕ"; }
+                            general-card := Rectangle {
+                            vertical-stretch: 0;
+                            background: Theme.surface;
+                            border-color: #ffffff0a;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 12px;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            spacing: 0px;
                             ToggleRow {
                                 label: "Запускать при входе в " + root.system-name;
                                 description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "Открывать MultiCore после входа в систему";
@@ -1788,26 +2063,43 @@ export component AppWindow inherits Window {
                                 enabled: !root.profile-menu-open && !root.reduced-motion;
                                 toggled(value) => { root.ambient-background-enabled = value; }
                             }
+                            }
+                            }
                             if root.preference-error != "": Text { min-height: 20px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
 
                         if root.visible-page == "settings" && root.settings-section == "updates": VerticalLayout {
                             spacing: 16px;
-                            Text { height: 24px; text: "Обновления"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
-                            Text { height: 24px; text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
-                            Text {
-                                min-height: 40px;
-                                text: root.update-detail;
-                                color: Theme.text-muted;
-                                font-size: Theme.type-metadata-size;
-                                wrap: word-wrap;
-                            }
-                            if root.update-action-label != "": SmallAction {
-                                label: root.update-action-label;
-                                enabled: root.update-action-enabled && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
-                                    && !(root.update-runtime-busy && root.update-available);
-                                activated => { root.update-action(); }
+                            SectionCaption { height: 16px; text: "ОБНОВЛЕНИЯ"; }
+                            updates-card := Rectangle {
+                                vertical-stretch: 0;
+                                background: Theme.surface;
+                                border-color: root.update-available ? #4c9dff55 : #ffffff0a;
+                                border-width: 1px;
+                                border-radius: 14px;
+                                VerticalLayout {
+                                    padding: 16px;
+                                    spacing: 8px;
+                                    Text { height: 24px; text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                                    Text {
+                                        min-height: 40px;
+                                        text: root.update-detail;
+                                        color: Theme.text-muted;
+                                        font-size: Theme.type-metadata-size;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.update-action-label != "": HorizontalLayout {
+                                        alignment: start;
+                                        SmallAction {
+                                            label: root.update-action-label;
+                                            selected: root.update-available;
+                                            enabled: root.update-action-enabled && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
+                                                && !(root.update-runtime-busy && root.update-available);
+                                            activated => { root.update-action(); }
+                                        }
+                                    }
+                                }
                             }
                             Rectangle { vertical-stretch: 1; background: transparent; }
                         }
@@ -1825,7 +2117,7 @@ export component AppWindow inherits Window {
                                     Text { width: parent.width; text: "До 16 подписок · активна только одна"; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                                     Text { width: parent.width; text: "Ссылки хранятся локально и не показываются в интерфейсе"; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
                                 }
-                                SmallAction { width: 112px; label: root.import-pending ? "Добавляем…" : "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
+                                SmallAction { width: 112px; selected: true; label: root.import-pending ? "Добавляем…" : "Добавить"; enabled: !root.import-pending; focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0; activated => { root.add-subscription(); } }
                             }
                             if root.deep-link-import-host != "": Text {
                                 min-height: 24px;
@@ -1910,21 +2202,24 @@ export component AppWindow inherits Window {
                                 accessible-role: text;
                             }
                             if !root.profile-menu-loading && root.profile-menu-error == "" && root.subscription-profiles.length == 0: Text { height: 64px; text: "Подписок пока нет"; color: Theme.text-muted; font-size: Theme.type-label-size; vertical-alignment: center; horizontal-alignment: center; }
+                            // Each subscription is its own card; the active one carries a green hairline.
                             if root.subscription-profiles.length > 0: Rectangle {
-                                height: root.subscription-profiles.length * 73px
+                                height: root.subscription-profiles.length * 80px - 8px
                                     + (root.profile-edit-id == "" ? 0px : 62px)
                                     + (root.profile-delete-confirm-id == "" ? 0px : 62px);
-                                background: Theme.surface;
-                                border-radius: 14px;
-                                clip: true;
+                                background: transparent;
                                 VerticalLayout {
-                                    spacing: 0px;
+                                    spacing: 8px;
                                     for profile[index] in root.subscription-profiles: settings-profile-row := Rectangle {
                                         height: 72px
                                             + (root.profile-edit-id == profile.id ? 62px : 0px)
                                             + (root.profile-delete-confirm-id == profile.id ? 62px : 0px);
-                                        background: profile.active ? #4c9dff0c : transparent;
+                                        background: Theme.surface;
+                                        border-color: profile.active ? #3ccb7f59 : #ffffff0a;
+                                        border-width: 1px;
+                                        border-radius: 14px;
                                         opacity: profile.available || profile.active ? 1 : 0.62;
+                                        animate border-color { duration: 180ms; easing: ease-out; }
 
                                         Rectangle {
                                             x: 12px; y: 20px; width: 32px; height: 32px;
@@ -1943,19 +2238,19 @@ export component AppWindow inherits Window {
                                                 : "Применяем…"
                                                 : !profile.available ? "Временно недоступна"
                                                 : profile.active ? "Активна" : "Доступна";
-                                            color: !profile.available ? Theme.warning : profile.active ? Theme.accent-blue : Theme.text-muted;
+                                            color: !profile.available ? Theme.warning : profile.active ? Theme.accent-green : Theme.text-muted;
                                             font-size: Theme.type-metadata-size;
                                             overflow: elide;
                                         }
 
-                                        if profile.active: Path { x: parent.width - 182px; y: 30px; width: 16px; height: 12px; viewbox-width: 16; viewbox-height: 12; commands: "M 2 6 L 6 10 L 14 2"; stroke: Theme.accent-blue; stroke-width: 1.8px; fill: transparent; }
+                                        if profile.active: Path { x: parent.width - 182px; y: 30px; width: 16px; height: 12px; viewbox-width: 16; viewbox-height: 12; commands: "M 2 6 L 6 10 L 14 2"; stroke: Theme.accent-green; stroke-width: 1.8px; fill: transparent; }
                                         if !profile.active: activate-profile-focus := FocusScope {
                                             x: parent.width - 196px; y: 14px; width: 44px; height: 44px;
                                             enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Сделать активной " + profile.title; accessible-description: root.profile-switch-locked ? "Отключитесь, чтобы сменить подписку" : ""; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.activate-profile(profile.id); } }
-                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: activate-profile-touch.has-hover && parent.enabled ? #4c9dff14 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Rectangle { x: 14px; y: 14px; width: 16px; height: 16px; border-radius: 8px; border-width: 1.5px; border-color: Theme.text-secondary; background: transparent; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: activate-profile-touch.has-hover && parent.enabled ? #4c9dff14 : transparent; border-color: Theme.focus; border-width: parent.has-focus ? Theme.focus-width : 0px; Rectangle { x: 14px; y: 14px; width: 16px; height: 16px; border-radius: 8px; border-width: 1.5px; border-color: Theme.text-secondary; background: transparent; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.activate-profile(profile.id); return accept; } return reject; }
                                             activate-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.activate-profile(profile.id); } }
                                         }
@@ -1968,7 +2263,7 @@ export component AppWindow inherits Window {
                                             accessible-action-default => { if (self.enabled) { root.refresh-profile(profile.id); } }
                                             init => { if (root.profile-management-focus-id == profile.id && root.profile-management-focus-serial > 0) { self.focus(); } }
                                             changed focus-serial => { if (root.profile-management-focus-id == profile.id && self.enabled) { self.focus(); } }
-                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: refresh-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: refresh-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: Theme.focus; border-width: parent.has-focus ? Theme.focus-width : 0px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.refresh-profile(profile.id); return accept; } return reject; }
                                             refresh-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.refresh-profile(profile.id); } }
                                         }
@@ -1978,7 +2273,7 @@ export component AppWindow inherits Window {
                                             focus-on-click: true; focus-on-tab-navigation: true;
                                             accessible-role: button; accessible-label: "Изменить URL " + profile.title; accessible-enabled: self.enabled;
                                             accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
-                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: edit-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/edit.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: edit-profile-touch.has-hover && parent.enabled ? #ffffff0a : transparent; border-color: Theme.focus; border-width: parent.has-focus ? Theme.focus-width : 0px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/edit.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; return accept; } return reject; }
                                             edit-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
                                         }
@@ -1991,7 +2286,7 @@ export component AppWindow inherits Window {
                                             accessible-action-default => { if (self.enabled) { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; } }
                                             init => { if (root.profile-delete-control-focus-id == profile.id && root.profile-delete-control-focus-serial > 0) { self.focus(); } }
                                             changed focus-serial => { if (root.profile-delete-control-focus-id == profile.id && self.enabled) { self.focus(); } }
-                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: parent.has-focus ? Theme.focus : Theme.line; border-width: 1px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/trash.svg"); image-fit: contain; accessible-role: none; } }
+                                            Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: delete-profile-touch.has-hover && parent.enabled ? #f06a6a12 : transparent; border-color: Theme.focus; border-width: parent.has-focus ? Theme.focus-width : 0px; Image { x: 13px; y: 13px; width: 18px; height: 18px; source: @image-url("../assets/trash.svg"); image-fit: contain; accessible-role: none; } }
                                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; return accept; } return reject; }
                                             delete-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; } }
                                         }
@@ -2020,7 +2315,6 @@ export component AppWindow inherits Window {
                                             SmallAction { width: 96px; label: "Удалить"; enabled: root.profile-pending-operation == "none"; activated => { root.delete-profile(profile.id); } }
                                             SmallAction { width: 72px; label: "Отмена"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; } }
                                         }
-                                        Rectangle { visible: index < root.subscription-profiles.length - 1; x: 12px; y: parent.height - 1px; width: parent.width - 24px; height: 1px; background: Theme.line; }
                                     }
                                 }
                             }

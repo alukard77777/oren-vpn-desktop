@@ -213,6 +213,9 @@ fn connected(ui: &AppWindow) {
     ui.set_status_tone(s("success"));
     ui.set_toggle_title(s("Защита включена"));
     ui.set_toggle_on(true);
+    ui.set_session_uptime(s("00:12:43"));
+    ui.set_traffic_down(s("2.4 МБ/с"));
+    ui.set_traffic_up(s("320 КБ/с"));
     ui.set_subscription_management_enabled(false);
     ui.set_profile_switch_locked(true);
     ui.set_catalog_selection_enabled(true);
