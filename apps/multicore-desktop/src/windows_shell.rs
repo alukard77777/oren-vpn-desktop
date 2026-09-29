@@ -594,6 +594,23 @@ pub fn rail_shrink_width(
     Some(current_inner_width.saturating_sub(growth.delta))
 }
 
+/// Duration of the window-width animation that follows the rail; matches the
+/// rail's own 240ms width animation in app.slint.
+pub const RAIL_RESIZE_MS: u32 = 240;
+
+/// Inner width `elapsed_ms` into a rail resize from `from` to `to`, eased with
+/// ease-out-quint (the rail uses cubic-bezier(0.22, 1, 0.36, 1), which it
+/// closely tracks), so window and rail grow together and the content stays put.
+pub fn rail_resize_frame(from: u32, to: u32, elapsed_ms: u32, duration_ms: u32) -> u32 {
+    if duration_ms == 0 || elapsed_ms >= duration_ms {
+        return to;
+    }
+    let t = f64::from(elapsed_ms) / f64::from(duration_ms);
+    let eased = 1.0 - (1.0 - t).powi(5);
+    let width = f64::from(from) + (f64::from(to) - f64::from(from)) * eased;
+    width.round().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
 impl From<ResizeEdge> for slint::winit_030::winit::window::ResizeDirection {
     fn from(edge: ResizeEdge) -> Self {
         use slint::winit_030::winit::window::ResizeDirection;
@@ -670,6 +687,18 @@ mod tests {
         };
         assert_eq!(rail_shrink_width(Some(growth), false, 1200), None);
         assert_eq!(rail_shrink_width(None, false, 1016), None);
+        // The window width eases out and always lands exactly on the target.
+        assert_eq!(super::rail_resize_frame(840, 1016, 0, 240), 840);
+        assert_eq!(super::rail_resize_frame(840, 1016, 240, 240), 1016);
+        assert_eq!(super::rail_resize_frame(840, 1016, 999, 240), 1016);
+        let early = super::rail_resize_frame(840, 1016, 48, 240);
+        assert!(
+            early > 840 + 88,
+            "ease-out moves most of the way early: {early}"
+        );
+        assert_eq!(super::rail_resize_frame(1016, 840, 240, 240), 840);
+        assert!(super::rail_resize_frame(1016, 840, 120, 240) < 850);
+        assert_eq!(super::rail_resize_frame(840, 1016, 10, 0), 1016);
         // Growth restored from preferences tolerates scale rounding.
         assert_eq!(rail_shrink_width(Some(growth), false, 1017), Some(841));
         let nothing = RailGrowth {

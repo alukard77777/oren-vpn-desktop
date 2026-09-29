@@ -800,6 +800,13 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             snapshot.mark_service_logo_unfetched();
             return;
         };
+        // A host placeholder ("image unavailable") means the provider's logo is gone:
+        // show no logo rather than the placeholder or a stale copy of it.
+        if response.status_is_success()
+            && crate::service_logo::is_image_host_placeholder(&response.body)
+        {
+            return;
+        }
         if response.status_is_success()
             && let Some(png) = normalize_service_logo(&response.body)
         {

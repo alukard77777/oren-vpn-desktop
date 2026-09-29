@@ -1083,6 +1083,8 @@ export component AppWindow inherits Window {
     in-out property <bool> announcement-open: false;
     // Fingerprint of the notice last shown (persisted); see announcement_fingerprint.
     in-out property <string> announcement-seen;
+    // A new notice nobody has opened yet: the bell shows its dot only then.
+    in-out property <bool> announcement-unread: false;
     // Window growth from the expanded rail (logical px; 0 = none), persisted so a
     // collapse after a restart still shrinks the window back.
     in-out property <int> rail-growth-delta: 0;
@@ -1106,6 +1108,8 @@ export component AppWindow inherits Window {
     in-out property <int> profile-delete-control-focus-serial;
     private property <string> visible-page: root.active-panel == "routes" ? "home" : root.active-panel == "events" ? "status" : root.local-page;
     private property <bool> profile-menu-open: root.active-panel == "subscription";
+    // Dim for everything under the title bar while the profile menu is open.
+    private property <color> menu-scrim: #00000073;
     // True for one frame after the page changes, so the new page starts hidden and
     // eases in. Pages are created by `if`, so this is the only enter hook.
     private property <bool> page-entering: false;
@@ -1255,6 +1259,12 @@ export component AppWindow inherits Window {
         interval: 16ms;
         running: root.page-entering;
         triggered => { root.page-entering = false; }
+    }
+
+    changed announcement-open => {
+        if (root.announcement-open) {
+            root.announcement-unread = false;
+        }
     }
 
     changed visible-page => {
@@ -1637,8 +1647,8 @@ export component AppWindow inherits Window {
                                 image-fit: contain;
                                 accessible-role: none;
                             }
-                            // Unread-style dot tinted by the notice's tone.
-                            Rectangle {
+                            // Unread dot, tinted by the notice's tone; gone once the notice is opened.
+                            if root.announcement-unread: Rectangle {
                                 x: 17px;
                                 y: 5px;
                                 width: 7px;
@@ -1698,6 +1708,18 @@ export component AppWindow inherits Window {
                         root.navigation-collapsed = !root.navigation-collapsed;
                         root.navigation-toggled(root.navigation-collapsed);
                     }
+                }
+            }
+            // The rail dims with the content while the profile menu is open;
+            // a click here closes the menu like anywhere else outside it.
+            rail-scrim := Rectangle {
+                background: root.menu-scrim;
+                opacity: root.profile-menu-open ? 1 : 0;
+                visible: self.opacity > 0;
+                animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                TouchArea {
+                    enabled: root.profile-menu-open;
+                    clicked => { root.close-profile-menu(); }
                 }
             }
         }
@@ -1923,7 +1945,11 @@ export component AppWindow inherits Window {
                                         vertical-alignment: bottom;
                                         overflow: elide;
                                     }
+                                    // Fixed slot: proportional digits would otherwise nudge the
+                                    // timer every second.
                                     if root.session-uptime != "": Text {
+                                        min-width: 58px;
+                                        horizontal-alignment: left;
                                         text: root.session-uptime;
                                         color: Theme.text-secondary;
                                         font-size: 13px;
@@ -3364,12 +3390,20 @@ export component AppWindow inherits Window {
                 }
             }
 
-            if root.profile-menu-open: TouchArea {
+            // Whole-pane scrim under the menu (not only the dimmed controls).
+            content-scrim := Rectangle {
                 x: 0;
                 y: 0;
                 width: parent.width;
                 height: parent.height;
-                clicked => { root.close-profile-menu(); }
+                background: root.menu-scrim;
+                opacity: root.profile-menu-open ? 1 : 0;
+                visible: self.opacity > 0;
+                animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                TouchArea {
+                    enabled: root.profile-menu-open;
+                    clicked => { root.close-profile-menu(); }
+                }
             }
 
             profile-menu := Rectangle {

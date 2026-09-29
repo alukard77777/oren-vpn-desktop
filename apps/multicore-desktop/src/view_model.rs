@@ -2873,9 +2873,17 @@ fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPres
 
 fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
     match (status, latency_ms) {
-        // Any answered ping is a working node: the exact millisecond count
-        // isn't a failure signal, so it stays green regardless of value.
-        ("ok", Some(value)) => (format!("{value} ms"), "success".into()),
+        // Answered pings are graded: under 100 ms green, 100–249 ms amber,
+        // 250 ms and slower red (still a working node, just a slow one).
+        ("ok", Some(value)) => (
+            format!("{value} ms"),
+            match value {
+                0..100 => "success",
+                100..250 => "warning",
+                _ => "danger",
+            }
+            .into(),
+        ),
         ("timeout", _) => ("таймаут".into(), "danger".into()),
         ("error" | "unavailable", _) => ("нет связи".into(), "danger".into()),
         _ => ("нет данных".into(), "neutral".into()),
@@ -4504,11 +4512,21 @@ mod tests {
     }
 
     #[test]
-    fn any_answered_ping_is_success_only_timeout_and_errors_are_danger() {
-        for value in [1, 79, 80, 149, 150, 999, 5000] {
+    fn answered_pings_are_graded_and_timeouts_and_errors_are_danger() {
+        for (value, tone) in [
+            (1, "success"),
+            (99, "success"),
+            (100, "warning"),
+            (149, "warning"),
+            (249, "warning"),
+            (250, "danger"),
+            (999, "danger"),
+            (5000, "danger"),
+        ] {
             assert_eq!(
                 latency_display("ok", Some(value)),
-                (format!("{value} ms"), "success".into())
+                (format!("{value} ms"), tone.into()),
+                "{value} ms"
             );
         }
         assert_eq!(latency_display("timeout", None).1, "danger");

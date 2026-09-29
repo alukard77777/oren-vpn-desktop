@@ -58,9 +58,10 @@ use view_model::{
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
     CloseDisposition, EXPANDED_RAIL_WIDTH, MinimizeDisposition, MonitorRect, MonitorSignature,
-    PhysicalPosition, RailGrowth, apply_tray_popup_native_rounding, close_disposition,
-    minimize_disposition, monitor_cap_changed, next_maximized, parse_resize_edge, place_tray_popup,
-    rail_grow_delta, rail_shrink_width, restore_placement,
+    PhysicalPosition, RAIL_RESIZE_MS, RailGrowth, apply_tray_popup_native_rounding,
+    close_disposition, minimize_disposition, monitor_cap_changed, next_maximized,
+    parse_resize_edge, place_tray_popup, rail_grow_delta, rail_resize_frame, rail_shrink_width,
+    restore_placement,
 };
 
 slint::include_modules!();
@@ -1558,28 +1559,24 @@ fn set_current_monitor_max_size(
     signature
 }
 
+/// Physical inner widths `(from, to)` for a rail toggle, or `None` when the
+/// window keeps its size. Updates `growth` for the collapse that follows.
 fn resize_for_rail(
     window: &slint::winit_030::winit::window::Window,
     collapsed: bool,
     growth: &std::cell::Cell<Option<RailGrowth>>,
-) {
-    use slint::winit_030::winit::dpi::PhysicalSize;
-
+) -> Option<(u32, u32)> {
     let maximized = window.is_maximized();
     let inner = window.inner_size();
     if collapsed {
-        if let Some(width) = rail_shrink_width(growth.take(), maximized, inner.width) {
-            let _ = window.request_inner_size(PhysicalSize::new(width, inner.height));
-        }
-        return;
+        return rail_shrink_width(growth.take(), maximized, inner.width)
+            .map(|width| (inner.width, width));
     }
-    let Some(monitor) = window.current_monitor() else {
-        return;
-    };
+    let monitor = window.current_monitor()?;
     let (Some((work_position, work_size)), Ok(outer_position)) =
         (monitor_work_area(&monitor), window.outer_position())
     else {
-        return;
+        return None;
     };
     let wanted = (f64::from(EXPANDED_RAIL_WIDTH) * window.scale_factor()).round() as u32;
     let delta = rail_grow_delta(
@@ -1592,12 +1589,52 @@ fn resize_for_rail(
     );
     if delta == 0 {
         growth.set(None);
-        return;
+        return None;
     }
     let grown_width = inner.width + delta;
     let _ = set_current_monitor_max_size(window);
-    let _ = window.request_inner_size(PhysicalSize::new(grown_width, inner.height));
     growth.set(Some(RailGrowth { delta, grown_width }));
+    Some((inner.width, grown_width))
+}
+
+/// Eases the window's inner width from `from` to `to` over RAIL_RESIZE_MS in
+/// step with the rail's own width animation. The timer only runs for that
+/// quarter second; a new toggle first lands the previous animation on its target.
+fn animate_rail_resize(
+    ui: &AppWindow,
+    animation: &std::rc::Rc<(Timer, std::cell::Cell<Option<u32>>)>,
+    from: u32,
+    to: u32,
+) {
+    use slint::winit_030::winit::dpi::PhysicalSize;
+
+    let resize = |ui: &AppWindow, width: u32| {
+        let _ = ui.window().with_winit_window(|window| {
+            let height = window.inner_size().height;
+            let _ = window.request_inner_size(PhysicalSize::new(width, height));
+        });
+    };
+    if ui.get_reduced_motion() || from == to {
+        resize(ui, to);
+        return;
+    }
+    animation.1.set(Some(to));
+    let started = std::time::Instant::now();
+    let weak = ui.as_weak();
+    let state = std::rc::Rc::downgrade(animation);
+    animation
+        .0
+        .start(TimerMode::Repeated, Duration::from_millis(16), move || {
+            let (Some(ui), Some(state)) = (weak.upgrade(), state.upgrade()) else {
+                return;
+            };
+            let elapsed = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            resize(&ui, rail_resize_frame(from, to, elapsed, RAIL_RESIZE_MS));
+            if elapsed >= RAIL_RESIZE_MS {
+                state.0.stop();
+                state.1.set(None);
+            }
+        });
 }
 
 fn apply_saved_placement(ui: &AppWindow, preferences: &AppPreferences) {
@@ -2010,6 +2047,7 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
     // The window grows with the expanded rail so the content keeps its width,
     // and shrinks back on collapse unless the user resized it in between.
     let weak = ui.as_weak();
+    let rail_animation = std::rc::Rc::new((Timer::default(), std::cell::Cell::new(None::<u32>)));
     ui.on_navigation_toggled(move |collapsed| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -2022,9 +2060,23 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
             delta: to_physical(ui.get_rail_growth_delta()),
             grown_width: to_physical(ui.get_rail_grown_width()),
         }));
-        let _ = ui.window().with_winit_window(|window| {
-            resize_for_rail(window, collapsed, &growth);
-        });
+        // Land an in-flight animation first, so the new toggle measures real sizes.
+        if let Some(target) = rail_animation.1.take() {
+            rail_animation.0.stop();
+            let _ = ui.window().with_winit_window(|window| {
+                let height = window.inner_size().height;
+                let _ = window.request_inner_size(slint::winit_030::winit::dpi::PhysicalSize::new(
+                    target, height,
+                ));
+            });
+        }
+        let widths = ui
+            .window()
+            .with_winit_window(|window| resize_for_rail(window, collapsed, &growth))
+            .flatten();
+        if let Some((from, to)) = widths {
+            animate_rail_resize(&ui, &rail_animation, from, to);
+        }
         let to_logical = |physical: u32| (f64::from(physical) / scale).round() as i32;
         let (delta, grown_width) = growth
             .get()
@@ -4305,6 +4357,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
         && ui.get_announcement_seen().as_str() != fingerprint
     {
         ui.set_announcement_seen(fingerprint.into());
+        ui.set_announcement_unread(true);
         ui.set_announcement_open(true);
     }
     ui.set_subscription_announcement_tone(snapshot.subscription.announcement_tone.clone().into());

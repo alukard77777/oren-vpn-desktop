@@ -114,7 +114,7 @@ export component QuietChip inherits Rectangle {
     border-radius: 8px;
     clip: true;
     animate background { duration: 140ms; easing: ease-out; }
-    opacity: root.enabled && root.modal-enabled ? 1 : 0.5;
+    opacity: root.enabled ? 1 : 0.5;
     accessible-role: button;
     accessible-label: root.state-label;
     accessible-enabled: root.enabled && root.modal-enabled;

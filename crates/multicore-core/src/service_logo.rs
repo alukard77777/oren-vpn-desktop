@@ -16,6 +16,23 @@ const MAX_SVG_ELEMENTS: usize = 4096;
 const MAX_SVG_DEPTH: usize = 64;
 const MAX_SVG_PATH_SEGMENTS: usize = 16_384;
 
+/// SHA-256 of image-host "image unavailable" placeholders that are served with
+/// HTTP 200 in place of a provider's logo (imgbox answers dead thumbnails and
+/// originals with the same card). Such a response means "no logo", not a logo.
+const IMAGE_HOST_PLACEHOLDERS: &[&str] = &[
+    // imgbox "Thumbnail Temporarily Unavailable" (JPEG, 240x240).
+    "c0ff95f9ec7fea007b8236e8efddfcc6c0dfdd56f8e4c38c8ffed8fde655d8a7",
+];
+
+/// True when `source` is a known image-host placeholder rather than a logo.
+pub(crate) fn is_image_host_placeholder(source: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(source);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    IMAGE_HOST_PLACEHOLDERS.contains(&hex.as_str())
+}
+
 /// Validates an untrusted provider image and converts it into a bounded RGBA PNG.
 /// The input format is detected from its bytes; filenames and response MIME types are ignored.
 pub fn normalize_service_logo(source: &[u8]) -> Option<Vec<u8>> {
@@ -305,7 +322,17 @@ fn contains_webp_animation(source: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_xml_preflight;
+    use super::{bounded_xml_preflight, is_image_host_placeholder};
+
+    #[test]
+    fn image_host_placeholders_are_recognised_by_content() {
+        let placeholder = include_bytes!("../tests/fixtures/imgbox-unavailable-placeholder.jpg");
+        assert!(is_image_host_placeholder(placeholder));
+        let mut altered = placeholder.to_vec();
+        altered[100] ^= 1;
+        assert!(!is_image_host_placeholder(&altered));
+        assert!(!is_image_host_placeholder(b""));
+    }
 
     #[test]
     fn streaming_preflight_rejects_expanding_svg_constructs_directly() {
