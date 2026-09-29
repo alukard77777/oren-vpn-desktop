@@ -117,6 +117,7 @@ struct FixtureHttp {
     xray: String,
     metadata: FixtureMetadata,
     include_logo: Arc<std::sync::atomic::AtomicBool>,
+    logo_download_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for FixtureHttp {
@@ -127,6 +128,7 @@ impl Default for FixtureHttp {
             xray: "{}".to_owned(),
             metadata: FixtureMetadata::Standard,
             include_logo: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            logo_download_fails: Arc::default(),
         }
     }
 }
@@ -139,6 +141,7 @@ impl FixtureHttp {
             xray: "{}".to_owned(),
             metadata: FixtureMetadata::Standard,
             include_logo: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            logo_download_fails: Arc::default(),
         }
     }
 
@@ -149,6 +152,7 @@ impl FixtureHttp {
             xray,
             metadata: FixtureMetadata::Maximal,
             include_logo: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            logo_download_fails: Arc::default(),
         }
     }
 
@@ -264,6 +268,9 @@ impl HttpClient for FixtureHttp {
         let xray = self.xray.clone();
         let metadata = self.metadata;
         let include_logo = self.include_logo.load(std::sync::atomic::Ordering::SeqCst);
+        let logo_download_fails = self
+            .logo_download_fails
+            .load(std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             let response = match user_agent {
                 UA_NATIVE => HttpResponse::new(
@@ -284,6 +291,7 @@ impl HttpClient for FixtureHttp {
                 UA_XRAY => {
                     HttpResponse::new(200, xray.into_bytes(), std::iter::empty::<(&str, &str)>())
                 }
+                UA_SERVICE_LOGO if logo_download_fails => return Err(FetchError::Network),
                 UA_SERVICE_LOGO => HttpResponse::new(
                     200,
                     b"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><circle cx='8' cy='8' r='8'/></svg>".to_vec(),
@@ -1046,6 +1054,46 @@ async fn importing_an_existing_subscription_preserves_its_selected_node() {
     )
     .unwrap();
     assert!(restarted.catalog().await.unwrap().groups[0].nodes[1].selected);
+}
+
+#[tokio::test]
+async fn refresh_keeps_the_logo_when_only_its_download_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let http = FixtureHttp::default();
+    let logo_download_fails = http.logo_download_fails.clone();
+    let include_logo = http.include_logo.clone();
+    let backend = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(http),
+        |_snapshot| Ok(Arc::new(RecordingController::default())),
+    )
+    .unwrap();
+    let imported = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://provider.example/sub".into(),
+        })
+        .await
+        .unwrap();
+    let logo_of = |status: &multicore_daemon::StatusDto| {
+        status
+            .subscription
+            .as_ref()
+            .unwrap()
+            .service_logo_path
+            .as_ref()
+            .map(|path| std::fs::read(path).unwrap())
+    };
+    let original = logo_of(&imported).expect("imported with a logo");
+
+    // A network blip or a fake-ip VPN makes only the logo download fail.
+    logo_download_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+    let refreshed = backend.refresh_subscription().await.unwrap();
+    assert_eq!(logo_of(&refreshed), Some(original));
+
+    // A provider that stops naming a logo does drop it.
+    include_logo.store(false, std::sync::atomic::Ordering::SeqCst);
+    let refreshed = backend.refresh_subscription().await.unwrap();
+    assert_eq!(logo_of(&refreshed), None);
 }
 
 #[tokio::test]

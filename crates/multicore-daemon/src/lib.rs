@@ -2710,6 +2710,12 @@ where
         let staging = AtomicSnapshot::default();
         let fetched = self.fetch_subscription(source_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
+        // A different source is a different provider; its logo is not ours to keep.
+        let snapshot = if previous.subscription_source_url() == Some(source_url) {
+            snapshot.with_service_logo_carried_from(&previous)
+        } else {
+            snapshot
+        };
         let prepared = if active && !connected {
             self.prepare_controller_or_defer("refresh_prepare_deferred", &snapshot)
                 .await

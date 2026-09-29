@@ -31,6 +31,9 @@ pub struct Snapshot {
     service_logo_png: Option<Vec<u8>>,
     service_logo_path: Option<PathBuf>,
     service_logo_file: Option<CapabilityFile>,
+    /// The subscription named a logo but it could not be downloaded this
+    /// time (never persisted); see `with_service_logo_carried_from`.
+    service_logo_unfetched: bool,
 }
 
 /// A lightweight lease that keeps a validated, app-owned service-logo file addressable.
@@ -143,6 +146,7 @@ impl Snapshot {
             service_logo_png: None,
             service_logo_path: None,
             service_logo_file: None,
+            service_logo_unfetched: false,
         })
     }
 
@@ -262,6 +266,27 @@ impl Snapshot {
         self.service_logo_png = Some(png);
         self.service_logo_path = None;
         self.service_logo_file = None;
+        self.service_logo_unfetched = false;
+    }
+
+    pub(crate) fn mark_service_logo_unfetched(&mut self) {
+        self.service_logo_unfetched = true;
+    }
+
+    /// A refresh re-downloads the provider logo; when that download fails
+    /// (a network blip, or a fake-ip VPN answering DNS) the refreshed profile
+    /// used to be saved without any logo. Keeps `previous`'s logo in that
+    /// case only - a subscription that no longer names a logo drops it.
+    pub fn with_service_logo_carried_from(self: Arc<Self>, previous: &Snapshot) -> Arc<Self> {
+        if !self.service_logo_unfetched || self.service_logo_png.is_some() {
+            return self;
+        }
+        let Some(png) = previous.service_logo_png.clone() else {
+            return self;
+        };
+        let mut carried = Arc::unwrap_or_clone(self);
+        carried.set_service_logo_png(png);
+        Arc::new(carried)
     }
 
     pub fn service_logo_path(&self) -> Option<&Path> {

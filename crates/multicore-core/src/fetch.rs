@@ -620,10 +620,23 @@ where
 }
 
 fn approve_logo_addresses(addresses: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, FetchError> {
-    if addresses.is_empty() || addresses.iter().any(|address| !is_global_ip(address.ip())) {
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| !is_global_ip(address.ip()) && !is_fake_ip(address.ip()))
+    {
         return Err(FetchError::Network);
     }
     Ok(addresses)
+}
+
+/// 198.18.0.0/15 is reserved for benchmarking and holds no real hosts; proxy
+/// clients (Mihomo/Clash "fake-ip", including MultiCore itself while
+/// connected) answer DNS from it and route the connection through the
+/// tunnel. Rejecting it meant no provider logo while any such VPN was on;
+/// loopback, private and link-local answers stay rejected.
+fn is_fake_ip(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(ip) if ip.octets()[0] == 198 && matches!(ip.octets()[1], 18 | 19))
 }
 
 fn build_pinned_logo_client(
@@ -784,12 +797,15 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             return;
         };
         let Ok(response) = self.client.get(&url, UA_SERVICE_LOGO).await else {
+            snapshot.mark_service_logo_unfetched();
             return;
         };
         if response.status_is_success()
             && let Some(png) = normalize_service_logo(&response.body)
         {
             snapshot.set_service_logo_png(png);
+        } else {
+            snapshot.mark_service_logo_unfetched();
         }
     }
 }
@@ -1094,6 +1110,21 @@ mod logo_network_tests {
             ]),
             Err(FetchError::Network)
         );
+    }
+
+    #[test]
+    fn logo_addresses_from_a_fake_ip_vpn_are_accepted_but_not_private_ones() {
+        for address in ["198.18.0.24:443", "198.19.255.1:443"] {
+            let answer = vec![address.parse().unwrap()];
+            assert_eq!(approve_logo_addresses(answer.clone()), Ok(answer));
+        }
+        for address in ["192.168.0.1:443", "127.0.0.1:443", "10.0.0.1:443"] {
+            assert_eq!(
+                approve_logo_addresses(vec![address.parse().unwrap()]),
+                Err(FetchError::Network),
+                "{address}"
+            );
+        }
     }
 
     #[tokio::test]
