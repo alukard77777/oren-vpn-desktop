@@ -6897,7 +6897,18 @@ mod tests {
         // Heading and field cross-fade in one 36px slot.
         assert!(app.contains("opacity: root.route-search-open ? 0 : 1;"));
         assert!(app.contains("opacity: root.route-search-open ? 1 : 0;"));
-        assert!(app.contains("animate opacity, x { duration: 160ms; easing: ease-out; }"));
+        // The leaving element is quick, the arriving one eases out longer (ease-out-quint).
+        assert!(app.contains(
+            "animate opacity, x { duration: root.route-search-open ? 160ms : 280ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"
+        ));
+        assert!(app.contains(
+            "animate opacity, x { duration: root.route-search-open ? 280ms : 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"
+        ));
+        // Result rows cascade in once: index * 24ms, capped at 8 rows.
+        assert!(app.contains(
+            "animate opacity, y { duration: 260ms; delay: Math.min(root.stagger-index, 8) * 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"
+        ));
+        assert!(app.contains("entering: root.route-search-entering;"));
         // Results replace the list; skeletons pulse only while loading and motion is allowed.
         assert!(app.contains("if !root.route-search-results-shown: ScrollView {"));
         assert!(

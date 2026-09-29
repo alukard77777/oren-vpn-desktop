@@ -565,6 +565,9 @@ component RouteSearchRow inherits Rectangle {
     in property <bool> selected;
     in property <bool> show-separator;
     in property <bool> enabled: true;
+    // First appearance: rows fade and rise in a short cascade (index * 24ms, capped).
+    in property <bool> entering;
+    in property <int> stagger-index;
     callback activated();
 
     height: 48px;
@@ -580,6 +583,13 @@ component RouteSearchRow inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
     animate background { duration: 140ms; easing: ease-out; }
+
+    row-content := Rectangle {
+    y: root.entering ? 6px : 0px;
+    width: parent.width;
+    height: parent.height;
+    opacity: root.entering ? 0 : 1;
+    animate opacity, y { duration: 260ms; delay: Math.min(root.stagger-index, 8) * 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
     Rectangle {
         x: 0;
@@ -643,6 +653,7 @@ component RouteSearchRow inherits Rectangle {
         width: parent.width - 56px;
         height: 1px;
         background: #ffffff0f;
+    }
     }
 
     result-focus := FocusScope {
@@ -1962,13 +1973,13 @@ export component AppWindow inherits Window {
                             height: 36px;
                             background: transparent;
                             routes-heading := HorizontalLayout {
-                                x: root.route-search-open ? -8px : 0px;
+                                x: root.route-search-open ? -10px : 0px;
                                 width: parent.width;
                                 height: 36px;
                                 spacing: 8px;
                                 opacity: root.route-search-open ? 0 : 1;
                                 visible: self.opacity > 0;
-                                animate opacity, x { duration: 160ms; easing: ease-out; }
+                                animate opacity, x { duration: root.route-search-open ? 160ms : 280ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                                 routes-title := Text {
                                     height: 36px;
                                     horizontal-stretch: 0;
@@ -2030,12 +2041,12 @@ export component AppWindow inherits Window {
                             }
 
                             route-search-bar := Rectangle {
-                                x: root.route-search-open ? 0px : 12px;
+                                x: root.route-search-open ? 0px : 14px;
                                 width: parent.width;
                                 height: 36px;
                                 opacity: root.route-search-open ? 1 : 0;
                                 visible: self.opacity > 0;
-                                animate opacity, x { duration: 160ms; easing: ease-out; }
+                                animate opacity, x { duration: root.route-search-open ? 280ms : 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
                                 route-search-field := Rectangle {
                                     x: 0;
@@ -2210,7 +2221,7 @@ export component AppWindow inherits Window {
                             if root.route-search-results-shown: route-search-results := ScrollView {
                                 vertical-stretch: 1;
                                 opacity: root.route-search-entering ? 0 : 1;
-                                animate opacity { duration: 160ms; easing: ease-out; }
+                                animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                                 VerticalLayout {
                                     alignment: start;
                                     spacing: 8px;
@@ -2257,6 +2268,8 @@ export component AppWindow inherits Window {
                                                 latency-tone: hit.latency-tone;
                                                 selected: hit.selected;
                                                 show-separator: index < root.route-search-hits.length - 1;
+                                                entering: root.route-search-entering;
+                                                stagger-index: index;
                                                 enabled: root.catalog-selection-enabled && !root.profile-menu-open;
                                                 activated => {
                                                     root.choose-route-search-hit(hit.group-id, hit.node-id);
