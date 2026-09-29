@@ -2147,7 +2147,12 @@ async fn degraded_mode_blocks_reconnect_until_successful_disconnect_cleanup() {
 }
 
 #[tokio::test]
-async fn publication_failure_does_not_commit_new_snapshot_across_restart() {
+async fn preparation_failure_keeps_the_new_import_and_the_previous_profile() {
+    // Preparing the connection runtime used to gate the import itself, so an
+    // environmental failure (no default route, another VPN owning it) meant a
+    // downloaded subscription was silently not saved. Preparation is redone on
+    // every connect, so the import is now kept and connect reports the cause;
+    // the previously active profile stays available to switch back to.
     const REPLACEMENT: &str = r#"
 proxies:
   - name: Replacement Node
@@ -2189,13 +2194,15 @@ proxy-groups:
         },
     )
     .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://example.invalid/replacement".into(),
+        })
+        .await
+        .expect("a preparation failure no longer rejects the import");
     assert!(
-        backend
-            .import_subscription(ImportSubscriptionRequest {
-                url: "https://example.invalid/replacement".into(),
-            })
-            .await
-            .is_err()
+        backend.connect().await.is_err(),
+        "connect reports it instead"
     );
     drop(backend);
 
@@ -2209,7 +2216,12 @@ proxy-groups:
             .mihomo
             .groups()[0]
             .name,
-        "Main"
+        "Replacement"
+    );
+    assert_eq!(
+        reopened.list().unwrap().len(),
+        2,
+        "the original profile is kept"
     );
 }
 
@@ -2333,5 +2345,53 @@ async fn activation_storage_failure_leaves_a_diagnostic_event() {
                 == Some("activate_load_failed")
         }),
         "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_succeeds_even_when_connection_preparation_fails() {
+    // Regression coverage: import used to prepare the connection runtime up
+    // front and fail as a whole when that failed (no default network route,
+    // another VPN owning it) - the subscription was downloaded fine but never
+    // saved. Preparation is redone on connect anyway, so only connect may fail.
+    let root = tempfile::tempdir().unwrap();
+    let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory_calls_clone = factory_calls.clone();
+    let backend = test_backend(
+        ProfileStore::open(root.path(), None).unwrap(),
+        SubscriptionFetcher::new(ProfileHttp::default()),
+        move |_snapshot: &Snapshot| -> Result<Arc<RecordingController>, BackendError> {
+            factory_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::new())
+        },
+    )
+    .unwrap();
+
+    let imported = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .expect("a downloaded subscription is kept even if preparation fails");
+    assert_eq!(imported.state, ConnectionState::Ready);
+    assert!(imported.active_profile_id.is_some());
+    assert_eq!(backend.list_subscriptions().unwrap().len(), 1);
+
+    let events = backend.events_after(0).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event
+            .details
+            .as_ref()
+            .and_then(|details| details.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            == Some("import_prepare_deferred")
+    }));
+
+    // Connect prepares again and reports the real failure there.
+    let before = factory_calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(backend.connect().await.is_err());
+    assert_eq!(
+        factory_calls.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1
     );
 }

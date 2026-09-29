@@ -1882,6 +1882,34 @@ impl<P: ProcessController> CoreRuntime<P> {
         self.apply_snapshot_metadata(snapshot, revision, selected_nodes, explicit_selected_nodes);
     }
 
+    fn apply_snapshot_with_optional_controller(
+        &mut self,
+        id: ProfileId,
+        snapshot: Arc<Snapshot>,
+        controller: Option<Arc<P>>,
+        revision: u64,
+        selected_nodes: Vec<Option<String>>,
+        explicit_selected_nodes: Vec<Option<String>>,
+    ) {
+        match controller {
+            Some(controller) => self.apply_snapshot(
+                id,
+                snapshot,
+                controller,
+                revision,
+                selected_nodes,
+                explicit_selected_nodes,
+            ),
+            None => self.apply_snapshot_without_controller(
+                id,
+                snapshot,
+                revision,
+                selected_nodes,
+                explicit_selected_nodes,
+            ),
+        }
+    }
+
     fn apply_snapshot_without_controller(
         &mut self,
         id: ProfileId,
@@ -2304,8 +2332,9 @@ where
                 }
             };
         self.retain_profile_logo(id, physical_generation, &snapshot);
-        let prepared =
-            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Storage)?;
+        let prepared = self
+            .prepare_controller_or_defer("activate_prepare_deferred", &snapshot)
+            .await;
         let maintenance_debt = match self.store.activate(id) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => {
@@ -2333,11 +2362,11 @@ where
         };
         let (selections, explicit_selections) =
             initial_and_explicit_selections(&self.store, id, revision, &snapshot);
-        let controller = prepared.controller();
+        let controller = prepared.as_ref().map(PreparedController::controller);
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(
+            state.apply_snapshot_with_optional_controller(
                 id.clone(),
                 snapshot,
                 controller,
@@ -2354,7 +2383,9 @@ where
                 );
             }
         }
-        if prepared.activate().is_err() {
+        if let Some(prepared) = prepared
+            && prepared.activate().is_err()
+        {
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Storage);
         }
@@ -2677,7 +2708,8 @@ where
         let fetched = self.fetch_subscription(source_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
         let prepared = if active && !connected {
-            Some((self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?)
+            self.prepare_controller_or_defer("refresh_prepare_deferred", &snapshot)
+                .await
         } else {
             None
         };
@@ -2747,14 +2779,13 @@ where
             }
             return Ok(state.status());
         }
-        let prepared = prepared.expect("active refresh prepares a controller");
         let (selections, explicit_selections) =
             initial_and_explicit_selections(&self.store, id, revision, &persisted);
-        let controller = prepared.controller();
+        let controller = prepared.as_ref().map(PreparedController::controller);
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(
+            state.apply_snapshot_with_optional_controller(
                 id.clone(),
                 persisted,
                 controller,
@@ -2771,22 +2802,42 @@ where
                 );
             }
         }
-        if prepared.activate().is_err() {
+        if let Some(prepared) = prepared
+            && prepared.activate().is_err()
+        {
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Committed);
         }
         Ok(self.current_status().await)
     }
 
-    /// Every path that collapses into the generic `ProfileMutationError::Storage`
-    /// (and, via `profile_api_error`, the opaque "backend_error" the desktop
-    /// shows as a plain HTTP 500) used to do so silently - a real report
-    /// showed exactly that response with no daemon event at all, leaving no
-    /// way to tell which of several very different underlying causes
-    /// (profile-store I/O, runtime staging, the elevated broker, ...) it
-    /// actually was. `detail` is this module's own `ProfileError`/`BackendError`
-    /// Display text or a plain phase name - never anything from an external
-    /// server - so it's exactly as safe to log as the rest of this event.
+    /// Prepares a controller for a snapshot that is being made active while
+    /// disconnected. That is only an optimisation: every connect prepares
+    /// its own controller again, and a daemon that starts with a saved
+    /// profile runs without one. So a preparation failure (no default
+    /// network route, another VPN owning it, a staging error) must not fail
+    /// the import/activation/refresh itself - the profile is kept, the
+    /// failure is logged, and a later connect reports its real cause.
+    async fn prepare_controller_or_defer(
+        &self,
+        phase: &str,
+        snapshot: &Snapshot,
+    ) -> Option<PreparedController<P>> {
+        match (self.controller_factory)(snapshot) {
+            Ok(prepared) => Some(prepared),
+            Err(_) => {
+                self.inner.write().await.push_event_with_details(
+                    Severity::Warning,
+                    Component::Core,
+                    phase,
+                    "Подготовка к подключению отложена до подключения.",
+                    json!({ "phase": phase, "os": std::env::consts::OS }),
+                );
+                None
+            }
+        }
+    }
+
     /// `map_profile_error`, but a failure that collapses into the generic
     /// Storage bucket is logged first (with its full error chain), so
     /// refresh/activate/delete failures leave the same diagnostic trail as
@@ -2807,6 +2858,15 @@ where
         map_profile_error(error)
     }
 
+    /// Every path that collapses into the generic `ProfileMutationError::Storage`
+    /// (and, via `profile_api_error`, the opaque "backend_error" the desktop
+    /// shows as a plain HTTP 500) used to do so silently - a real report
+    /// showed exactly that response with no daemon event at all, leaving no
+    /// way to tell which of several very different underlying causes
+    /// (profile-store I/O, runtime staging, the elevated broker, ...) it
+    /// actually was. `detail` is this module's own `ProfileError`/`BackendError`
+    /// Display text or a plain phase name - never anything from an external
+    /// server - so it's exactly as safe to log as the rest of this event.
     async fn log_mutation_storage_failure(&self, phase: &str, detail: impl std::fmt::Display) {
         // `Event`'s own `phase` field never reaches `EventDto` (only
         // `message` and `details` do - see core_event_to_dto), so it's
@@ -2834,8 +2894,9 @@ where
         let staging = AtomicSnapshot::default();
         let fetched = self.fetch_subscription(trimmed_url, &staging).await?;
         let (snapshot, _) = fetched.into_parts();
-        let prepared =
-            (self.controller_factory)(&snapshot).map_err(|_| ProfileMutationError::Prepare)?;
+        let prepared = self
+            .prepare_controller_or_defer("import_prepare_deferred", &snapshot)
+            .await;
         let existing = match self.store.find_exact_source(trimmed_url) {
             Ok(existing) => existing,
             Err(error) => {
@@ -2923,11 +2984,11 @@ where
         self.retain_profile_logo(&id, physical_generation, &persisted);
         let (selections, explicit_selections) =
             initial_and_explicit_selections(&self.store, &id, revision, &persisted);
-        let controller = prepared.controller();
+        let controller = prepared.as_ref().map(PreparedController::controller);
         {
             let mut state = self.inner.write().await;
             state.clear_for_active(Some(id.clone()));
-            state.apply_snapshot(
+            state.apply_snapshot_with_optional_controller(
                 id,
                 persisted,
                 controller,
@@ -2950,7 +3011,9 @@ where
                 );
             }
         }
-        if prepared.activate().is_err() {
+        if let Some(prepared) = prepared
+            && prepared.activate().is_err()
+        {
             // `PreparedController::activate` only ever returns the opaque
             // `BackendError` (see its doc comment), so "runtime_commit"
             // is the most specific phase name available here - but it is
@@ -3395,11 +3458,21 @@ where
                     state.message = Some(start_failure_message(engine, cause));
                     state.degraded = false;
                 }
-                state.push_event(
+                // The cause used to reach only the status line, so a copied
+                // log said "connect failed" with nothing to act on.
+                let shown = start_failure_message(engine, cause);
+                state.push_event_with_details(
                     Severity::Error,
                     Component::Core,
                     "connect",
                     "Запуск подключения завершился ошибкой.",
+                    json!({
+                        "engine": format!("{engine:?}"),
+                        "cause": format!("{cause:?}"),
+                        "rollback_failed": rollback_failed,
+                        "shown": shown,
+                        "os": std::env::consts::OS,
+                    }),
                 );
                 Err(BackendError::new())
             }
@@ -3408,11 +3481,12 @@ where
                     "Состояние процессов неизвестно. Выполните отключение для очистки.",
                     true,
                 );
-                state.push_event(
+                state.push_event_with_details(
                     Severity::Error,
                     Component::Core,
                     "connect",
                     "Запуск подключения завершился ошибкой.",
+                    json!({ "cause": "stop_failed_during_start", "os": std::env::consts::OS }),
                 );
                 Err(BackendError::new())
             }
