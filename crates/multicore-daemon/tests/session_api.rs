@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     io::{Read, Write},
     net::TcpListener,
@@ -20,7 +21,7 @@ use multicore_core::{
 };
 use multicore_daemon::{
     Backend, BackendError, CoreBackend, MihomoHttpSelector, MihomoSelector, SelectorError,
-    SessionError, TrafficTotals, router,
+    SessionError, TrafficTotals, resolve_exit_now, router,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -234,6 +235,134 @@ async fn http_traffic_totals_read_connections_with_an_authenticated_request() {
     let request = captured.lock().unwrap().clone();
     assert!(
         request.starts_with("GET /connections HTTP/1.1\r\n"),
+        "{request}"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer private-secret\r\n"),
+        "{request}"
+    );
+}
+
+/// Answers `now` from a fixed table; names missing from it are unreadable proxies.
+struct NowController {
+    now: HashMap<&'static str, Option<&'static str>>,
+}
+
+#[async_trait]
+impl MihomoSelector for NowController {
+    async fn select(&self, _: &str, _: &str) -> Result<(), SelectorError> {
+        Ok(())
+    }
+
+    async fn proxy_now(&self, raw_name: &str) -> Result<Option<String>, SelectorError> {
+        self.now
+            .get(raw_name)
+            .map(|now| now.map(str::to_owned))
+            .ok_or_else(SelectorError::new)
+    }
+}
+
+fn now_controller(entries: &[(&'static str, Option<&'static str>)]) -> NowController {
+    NowController {
+        now: entries.iter().copied().collect(),
+    }
+}
+
+#[tokio::test]
+async fn exit_now_follows_group_chains_to_the_node() {
+    let controller = now_controller(&[
+        ("Автовыбор", Some("Europe")),
+        ("Europe", Some("🇸🇪 Sweden")),
+        ("🇸🇪 Sweden", None),
+    ]);
+    assert_eq!(
+        resolve_exit_now(&controller, "Автовыбор").await.as_deref(),
+        Some("🇸🇪 Sweden")
+    );
+    // A plain node is its own exit: nothing extra to show.
+    assert_eq!(resolve_exit_now(&controller, "🇸🇪 Sweden").await, None);
+}
+
+#[tokio::test]
+async fn exit_now_gives_up_on_cycles_and_unreadable_proxies() {
+    let cycle = now_controller(&[("A", Some("B")), ("B", Some("A"))]);
+    assert_eq!(resolve_exit_now(&cycle, "A").await, None);
+
+    let missing = now_controller(&[("Автовыбор", Some("gone"))]);
+    assert_eq!(resolve_exit_now(&missing, "Автовыбор").await, None);
+
+    let chain: Vec<(&'static str, Option<&'static str>)> = vec![
+        ("g0", Some("g1")),
+        ("g1", Some("g2")),
+        ("g2", Some("g3")),
+        ("g3", Some("g4")),
+        ("g4", Some("g5")),
+        ("g5", Some("g6")),
+        ("g6", Some("g7")),
+        ("g7", Some("g8")),
+        ("g8", Some("g9")),
+        ("g9", None),
+    ];
+    assert_eq!(resolve_exit_now(&now_controller(&chain), "g0").await, None);
+}
+
+#[tokio::test]
+async fn session_reports_the_node_behind_an_automatic_exit() {
+    let controller = Arc::new(now_controller(&[
+        ("private / fast", Some("🇸🇪 Sweden")),
+        ("🇸🇪 Sweden", None),
+    ]));
+    let backend = backend(controller);
+    backend.connect().await.unwrap();
+
+    let response = router(backend, TOKEN).oneshot(request(true)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["exit_now"], "🇸🇪 Sweden");
+}
+
+#[tokio::test]
+async fn session_omits_exit_now_for_a_plain_node_exit() {
+    let controller = Arc::new(now_controller(&[("private / fast", None)]));
+    let backend = backend(controller);
+    backend.connect().await.unwrap();
+
+    let response = router(backend, TOKEN).oneshot(request(true)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(json_body(response).await.get("exit_now").is_none());
+}
+
+#[tokio::test]
+async fn http_proxy_now_reads_the_group_with_an_authenticated_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(String::new()));
+    let server_capture = captured.clone();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let count = stream.read(&mut request).unwrap();
+        *server_capture.lock().unwrap() = String::from_utf8_lossy(&request[..count]).into_owned();
+        let body = r#"{"name":"auto","type":"URLTest","now":"sweden","all":["sweden"]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+
+    let controller = MihomoHttpSelector::new(address, "private-secret").unwrap();
+    assert_eq!(
+        controller.proxy_now("auto").await.unwrap().as_deref(),
+        Some("sweden")
+    );
+    server.join().unwrap();
+
+    let request = captured.lock().unwrap().clone();
+    assert!(
+        request.starts_with("GET /proxies/auto HTTP/1.1\r\n"),
         "{request}"
     );
     assert!(

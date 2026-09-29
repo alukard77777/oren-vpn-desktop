@@ -215,6 +215,9 @@ fn connected(ui: &AppWindow) {
     ui.set_toggle_title(s("Защита включена"));
     ui.set_toggle_on(true);
     ui.set_session_uptime(s("00:12:43"));
+    ui.set_exit_now_name(s("Sweden"));
+    ui.set_exit_now_icon(s("🇸🇪"));
+    ui.set_exit_now_icon_image(crate::emoji_images::image_for("🇸🇪"));
     ui.set_traffic_down(s("2.4 МБ/с"));
     ui.set_traffic_up(s("320 КБ/с"));
     ui.set_subscription_management_enabled(false);

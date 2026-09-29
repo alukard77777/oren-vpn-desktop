@@ -53,7 +53,7 @@ use view_model::{
     NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
     SemanticTone, SessionLine, SessionTraffic, StatePresentation, SubscriptionPresentation,
     SubscriptionProfileOperation, SubscriptionProfilesPresentation, derive_catalog_display,
-    search_routes, split_leading_symbol,
+    exit_now_display, search_routes, split_leading_symbol,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -3259,6 +3259,13 @@ fn apply_session_line(ui: &AppWindow, line: &SessionLine) {
     if ui.get_traffic_up() != line.up.as_str() {
         ui.set_traffic_up(line.up.as_str().into());
     }
+    let (icon, name) =
+        exit_now_display(&line.exit_now, ui.get_node_name().as_str()).unwrap_or_default();
+    if ui.get_exit_now_name() != name.as_str() {
+        ui.set_exit_now_icon_image(emoji_images::image_for(&icon));
+        ui.set_exit_now_icon(icon.as_str().into());
+        ui.set_exit_now_name(name.as_str().into());
+    }
 }
 
 fn begin_latency_check(weak: slint::Weak<AppWindow>, model: Arc<Mutex<DesktopViewModel>>) {
@@ -6305,6 +6312,31 @@ mod window_tests {
             ui.contains("color: root.status-tone == \"danger\" ? #f0a3a3 : Theme.text-secondary;")
         );
         assert!(ui.contains("opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;"));
+    }
+
+    #[test]
+    fn exit_line_leads_with_the_real_node_behind_an_automatic_group() {
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
+        let main = include_str!("main.rs").replace("\r\n", "\n");
+        for property in [
+            "in property <string> exit-now-name;",
+            "in property <string> exit-now-icon;",
+            "in property <image> exit-now-icon-image;",
+        ] {
+            assert!(app.contains(property), "{property}");
+        }
+        // Real node first, the group follows muted; plain node exits stay as before.
+        assert!(app.contains("if root.exit-now-name != \"\": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name;"));
+        assert!(app.contains(
+            "text: root.exit-now-name != \"\" ? \"· \" + root.node-name : root.node-name;"
+        ));
+        assert!(
+            app.contains("if root.exit-now-name == \"\" && root.node-icon-image.width > 0: Image")
+        );
+        // The name crossfades in on change via a one-frame flag, gated by reduced motion.
+        assert!(app.contains("exit-now-enter := Timer {\n        interval: 16ms;\n        running: root.exit-now-entering;"));
+        assert!(app.contains("if (root.exit-now-name != \"\" && !root.reduced-motion) {"));
+        assert!(main.contains("exit_now_display(&line.exit_now, ui.get_node_name().as_str())"));
     }
 
     #[test]

@@ -3353,6 +3353,19 @@ pub(crate) struct SessionLine {
     pub(crate) uptime: String,
     pub(crate) down: String,
     pub(crate) up: String,
+    /// Label of the node behind an automatic exit group; empty when the exit is a node.
+    pub(crate) exit_now: String,
+}
+
+/// The real node to show behind the exit, split into (icon, name) like node names; `None`
+/// when there is none or it is the exit itself (nothing extra to say).
+pub(crate) fn exit_now_display(exit_now: &str, exit_name: &str) -> Option<(String, String)> {
+    if exit_now.trim().is_empty() {
+        return None;
+    }
+    let (icon, name) = split_leading_symbol(exit_now);
+    let (_, exit) = split_leading_symbol(exit_name);
+    (!name.is_empty() && name != exit).then_some((icon, name))
 }
 
 /// Turns successive `/v1/session` samples into uptime and current speed. Speed is the byte
@@ -3382,10 +3395,12 @@ impl SessionTraffic {
         now_unix_ms: u64,
     ) -> SessionLine {
         let uptime = format_uptime(now_unix_ms.saturating_sub(session.connected_since_unix_ms));
+        let exit_now = session.exit_now.clone().unwrap_or_default();
         let (Some(download), Some(upload)) = (session.download_total, session.upload_total) else {
             // Keep the last good sample: the next readable one still yields a real rate.
             return SessionLine {
                 uptime,
+                exit_now,
                 ..SessionLine::default()
             };
         };
@@ -3401,6 +3416,7 @@ impl SessionTraffic {
         else {
             return SessionLine {
                 uptime,
+                exit_now,
                 ..SessionLine::default()
             };
         };
@@ -3408,6 +3424,7 @@ impl SessionTraffic {
         if seconds <= 0.0 {
             return SessionLine {
                 uptime,
+                exit_now,
                 ..SessionLine::default()
             };
         }
@@ -3417,6 +3434,7 @@ impl SessionTraffic {
             uptime,
             down: format_speed(rate(download, previous.download)),
             up: format_speed(rate(upload, previous.upload)),
+            exit_now,
         }
     }
 }
@@ -3460,14 +3478,42 @@ pub(crate) fn format_speed(bytes_per_second: f64) -> String {
 mod session_traffic_tests {
     use std::time::{Duration, Instant};
 
-    use super::{DaemonSession, SessionLine, SessionTraffic, format_speed, format_uptime};
+    use super::{
+        DaemonSession, SessionLine, SessionTraffic, exit_now_display, format_speed, format_uptime,
+    };
 
     fn session(since: u64, down: Option<u64>, up: Option<u64>) -> DaemonSession {
         DaemonSession {
             connected_since_unix_ms: since,
             download_total: down,
             upload_total: up,
+            exit_now: None,
         }
+    }
+
+    #[test]
+    fn exit_now_shows_only_a_different_real_node() {
+        assert_eq!(
+            exit_now_display("🇸🇪 Sweden", "🌍 Автовыбор"),
+            Some(("🇸🇪".to_owned(), "Sweden".to_owned()))
+        );
+        assert_eq!(exit_now_display("", "🌍 Автовыбор"), None);
+        assert_eq!(exit_now_display("   ", "Автовыбор"), None);
+        // The exit already is that node: nothing extra.
+        assert_eq!(exit_now_display("🇸🇪 Sweden", "🇸🇪 Sweden"), None);
+        assert_eq!(exit_now_display("🇸🇪 Sweden", "Sweden"), None);
+    }
+
+    #[test]
+    fn session_line_carries_exit_now_even_without_counters() {
+        let mut traffic = SessionTraffic::default();
+        let sample = DaemonSession {
+            exit_now: Some("🇸🇪 Sweden".into()),
+            ..session(1_000, None, None)
+        };
+        let line = traffic.sample(&sample, Instant::now(), 2_000);
+        assert_eq!(line.exit_now, "🇸🇪 Sweden");
+        assert_eq!(line.down, "");
     }
 
     #[test]
@@ -3504,6 +3550,7 @@ mod session_traffic_tests {
                 uptime: "00:01:00".into(),
                 down: String::new(),
                 up: String::new(),
+                exit_now: String::new(),
             }
         );
 

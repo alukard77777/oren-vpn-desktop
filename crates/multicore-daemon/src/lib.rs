@@ -236,6 +236,10 @@ pub struct SessionDto {
     /// Absent when the Mihomo controller could not be read this time.
     pub download_total: Option<u64>,
     pub upload_total: Option<u64>,
+    /// The node an automatic group (url-test, fallback, ...) currently routes through,
+    /// when the selected exit is such a group; absent when the exit is already a node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_now: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -468,6 +472,42 @@ pub trait MihomoSelector: Send + Sync + 'static {
     async fn traffic_totals(&self) -> Result<TrafficTotals, SelectorError> {
         Err(SelectorError::new())
     }
+
+    /// The `now` member of a Mihomo proxy group (`None` for a plain node).
+    async fn proxy_now(&self, _raw_name: &str) -> Result<Option<String>, SelectorError> {
+        Err(SelectorError::new())
+    }
+}
+
+/// Deepest `now` chain followed from the selected exit (group -> group -> node).
+const MAX_EXIT_NOW_DEPTH: usize = 8;
+/// How long a resolved exit is reused; the session is polled about once a second.
+const EXIT_NOW_TTL: Duration = Duration::from_secs(5);
+
+/// Follows Mihomo `now` pointers from `start` to the node traffic actually leaves through.
+/// Returns `None` when `start` is itself a node, on a cycle, on too deep a chain, or when the
+/// controller cannot be read.
+pub async fn resolve_exit_now(selector: &dyn MihomoSelector, start: &str) -> Option<String> {
+    let mut visited = HashSet::from([start.to_owned()]);
+    let mut current = start.to_owned();
+    for _ in 0..MAX_EXIT_NOW_DEPTH {
+        match selector.proxy_now(&current).await.ok()? {
+            Some(next) if !next.is_empty() => {
+                if !visited.insert(next.clone()) {
+                    return None;
+                }
+                current = next;
+            }
+            _ => return (current != start).then_some(current),
+        }
+    }
+    None
+}
+
+struct ExitNowCache {
+    at: std::time::Instant,
+    start: String,
+    resolved: Option<String>,
 }
 
 struct UnavailableSelector;
@@ -626,6 +666,38 @@ impl MihomoSelector for MihomoHttpSelector {
             .ok()
             .and_then(|value| value.get("delay").and_then(serde_json::Value::as_u64))
             .ok_or(LatencyProbeError::Unavailable)
+    }
+
+    async fn proxy_now(&self, raw_name: &str) -> Result<Option<String>, SelectorError> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| SelectorError::new())?
+            .extend(["proxies", raw_name]);
+        let mut response = self
+            .client
+            .get(url)
+            .header(header::AUTHORIZATION, self.authorization.clone())
+            .send()
+            .await
+            .map_err(|_| SelectorError::new())?;
+        if response.status() != StatusCode::OK {
+            return Err(SelectorError::new());
+        }
+        const MAX_PROXY_STATUS_BYTES: usize = 1024 * 1024;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| SelectorError::new())? {
+            if body.len().saturating_add(chunk.len()) > MAX_PROXY_STATUS_BYTES {
+                return Err(SelectorError::new());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let live: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| SelectorError::new())?;
+        Ok(live
+            .get("now")
+            .and_then(serde_json::Value::as_str)
+            .filter(|now| !now.is_empty())
+            .map(str::to_owned))
     }
 
     async fn traffic_totals(&self) -> Result<TrafficTotals, SelectorError> {
@@ -1882,6 +1954,7 @@ where
     factory_type: PhantomData<fn() -> F>,
     selector: Arc<dyn MihomoSelector>,
     latency_permits: Arc<tokio::sync::Semaphore>,
+    exit_now_cache: std::sync::Mutex<Option<ExitNowCache>>,
     operation: tokio::sync::Mutex<()>,
     /// Options of the latest connect; background preparation reuses them.
     connect_options: std::sync::Mutex<ConnectOptions>,
@@ -2334,6 +2407,7 @@ where
             factory_type: PhantomData,
             selector,
             latency_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES)),
+            exit_now_cache: std::sync::Mutex::new(None),
             operation: tokio::sync::Mutex::new(()),
             connect_options: std::sync::Mutex::new(ConnectOptions::default()),
             post_commit_load_fault: AtomicBool::new(false),
@@ -3923,18 +3997,53 @@ where
     }
 
     async fn session(&self) -> Result<SessionDto, SessionError> {
-        let connected_since_unix_ms = {
+        let (connected_since_unix_ms, exit_start) = {
             let state = self.inner.read().await;
             if state.state.current() != CoreConnectionState::Connected || state.degraded {
                 return Err(SessionError::NotConnected);
             }
-            state.connected_since_unix_ms
+            // The raw name behind the exit the status reports: the selected group's node.
+            let exit_start = state
+                .catalog
+                .groups
+                .iter()
+                .position(|group| group.selected)
+                .and_then(|index| state.selected_nodes.get(index).cloned().flatten())
+                .or_else(|| state.current_node.clone());
+            (state.connected_since_unix_ms, exit_start)
         };
         let totals = self.selector.traffic_totals().await.ok();
+        // At most one short Mihomo `now` walk per EXIT_NOW_TTL for an unchanged exit.
+        let exit_now = match exit_start {
+            Some(start) => {
+                let cached = self.exit_now_cache.lock().ok().and_then(|cache| {
+                    cache
+                        .as_ref()
+                        .filter(|cache| cache.start == start && cache.at.elapsed() < EXIT_NOW_TTL)
+                        .map(|cache| cache.resolved.clone())
+                });
+                match cached {
+                    Some(resolved) => resolved,
+                    None => {
+                        let resolved = resolve_exit_now(self.selector.as_ref(), &start).await;
+                        if let Ok(mut cache) = self.exit_now_cache.lock() {
+                            *cache = Some(ExitNowCache {
+                                at: std::time::Instant::now(),
+                                start,
+                                resolved: resolved.clone(),
+                            });
+                        }
+                        resolved
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(SessionDto {
             connected_since_unix_ms,
             download_total: totals.map(|totals| totals.download),
             upload_total: totals.map(|totals| totals.upload),
+            exit_now: exit_now.map(|raw| safe_catalog_label(&raw, "Узел", 0)),
         })
     }
 

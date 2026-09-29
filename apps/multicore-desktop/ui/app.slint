@@ -987,6 +987,12 @@ export component AppWindow inherits Window {
     in property <string> traffic-down;
     // Latency of the exit node, when the visible route list knows it.
     in property <string> node-latency;
+    // The real node behind an automatic exit group (url-test, fallback...); empty otherwise.
+    in property <string> exit-now-name;
+    in property <string> exit-now-icon;
+    in property <image> exit-now-icon-image;
+    // True for one frame when the real node changes, so its name crossfades in.
+    private property <bool> exit-now-entering: false;
     // Route search on home: the routes header turns into a field; results span all groups.
     in-out property <bool> route-search-open: false;
     in-out property <string> route-search-query;
@@ -1232,6 +1238,18 @@ export component AppWindow inherits Window {
     }
     init => { Motion.reduced = root.reduced-motion; }
     changed reduced-motion => { Motion.reduced = root.reduced-motion; }
+
+    exit-now-enter := Timer {
+        interval: 16ms;
+        running: root.exit-now-entering;
+        triggered => { root.exit-now-entering = false; }
+    }
+
+    changed exit-now-name => {
+        if (root.exit-now-name != "" && !root.reduced-motion) {
+            root.exit-now-entering = true;
+        }
+    }
 
     page-enter := Timer {
         interval: 16ms;
@@ -1921,9 +1939,14 @@ export component AppWindow inherits Window {
                                     // A leading emoji is drawn as an embedded image (colour in
                                     // every renderer); other symbols use the emoji font, as the
                                     // UI font renders regional-indicator flags as letters ("SE").
-                                    if root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
-                                    if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
-                                    Text { horizontal-stretch: 0; max-width: 220px; text: root.node-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
+                                    // Behind an automatic group, the real node leads (flag + name) and the
+                                    // group follows muted: "Выход 🇸🇪 Sweden · Автовыбор".
+                                    if root.exit-now-name != "" && root.exit-now-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.exit-now-icon-image; image-fit: contain; accessible-role: none; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } }
+                                    if root.exit-now-name != "" && root.exit-now-icon != "" && root.exit-now-icon-image.width == 0: Text { text: root.exit-now-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
+                                    if root.exit-now-name != "": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } accessible-label: "Текущий узел " + root.exit-now-name; }
+                                    if root.exit-now-name == "" && root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
+                                    if root.exit-now-name == "" && root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
+                                    Text { horizontal-stretch: 0; max-width: 220px; text: root.exit-now-name != "" ? "· " + root.node-name : root.node-name; color: root.exit-now-name != "" ? Theme.text-muted : Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
                                     if root.node-latency != "": Text { text: "· " + root.node-latency; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
                                     // Live speed follows the exit inline; each arrow only shows with a value.
                                     if root.traffic-down != "": Text { text: "·  ↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }

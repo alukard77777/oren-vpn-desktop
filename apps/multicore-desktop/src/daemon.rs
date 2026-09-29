@@ -303,6 +303,9 @@ pub struct DaemonSession {
     pub download_total: Option<u64>,
     #[serde(default)]
     pub upload_total: Option<u64>,
+    /// The node an automatic exit group currently routes through (daemon-side label).
+    #[serde(default)]
+    pub exit_now: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
