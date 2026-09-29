@@ -299,7 +299,7 @@ export component RouteNodeRow inherits Rectangle {
     Text {
         x: 56px;
         y: root.supporting-text == "" ? 0 : 2px;
-        width: parent.width - self.x - trailing-label.width - 48px;
+        width: parent.width - self.x - trailing-label.width - 36px;
         height: root.supporting-text == "" ? parent.height : 24px;
         text: root.label;
         color: root.selected || row-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
@@ -315,7 +315,7 @@ export component RouteNodeRow inherits Rectangle {
     if root.supporting-text != "": Text {
         x: 56px;
         y: 23px;
-        width: parent.width - self.x - trailing-label.width - 48px;
+        width: parent.width - self.x - trailing-label.width - 36px;
         text: root.supporting-text;
         color: Theme.text-muted;
         font-family: Theme.font-family;
@@ -326,10 +326,11 @@ export component RouteNodeRow inherits Rectangle {
     }
 
     trailing-label := Text {
-        x: parent.width - self.width - 40px;
+        x: parent.width - self.width - (root.pending ? 44px : 20px);
         width: 76px;
         height: parent.height;
         text: root.trailing-text;
+        animate x { duration: 140ms; easing: ease-out; }
         color: root.trailing-tone == "success"
             ? Theme.accent-green
             : root.trailing-tone == "warning"
@@ -344,7 +345,7 @@ export component RouteNodeRow inherits Rectangle {
     }
 
     if root.trailing-text == "": Rectangle {
-        x: parent.width - self.width - 40px;
+        x: parent.width - self.width - (root.pending ? 44px : 20px);
         y: (parent.height - self.height) / 2;
         width: 34px;
         height: 8px;

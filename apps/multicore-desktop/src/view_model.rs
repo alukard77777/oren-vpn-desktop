@@ -4643,8 +4643,8 @@ mod tests {
             .split("export component RouteNodeRow")
             .nth(1)
             .expect("route row source");
-        assert!(route_row.contains("x: parent.width - self.width - 40px;"));
-        assert!(route_row.contains("parent.width - self.x - trailing-label.width - 48px"));
+        assert!(route_row.contains("x: parent.width - self.width - (root.pending ? 44px : 20px);"));
+        assert!(route_row.contains("parent.width - self.x - trailing-label.width - 36px"));
         assert!(!route_row.contains("trailing-label.width - (root.selected"));
         assert!(!route_row.contains("self.width - (root.selected"));
         // The selection reads from the tint and blue bar alone: no check mark.
@@ -6678,7 +6678,8 @@ mod tests {
 
     #[test]
     fn redesign_motion_is_lightweight_and_respects_reduced_motion() {
-        let app = include_str!("../ui/app.slint");
+        // Checkouts may use CRLF; the multi-line contracts below are written with LF.
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // Page enter is a one-frame flag, not a running animation clock.
         assert!(app.contains(
             "page-enter := Timer {
