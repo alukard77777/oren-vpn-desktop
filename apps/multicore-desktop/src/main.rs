@@ -3073,6 +3073,13 @@ fn wire_panels(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
 }
 
 fn wire_catalog_group(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    // "Повторить" on the failed-catalog card runs the same load as opening routes.
+    let retry_weak = ui.as_weak();
+    let retry_model = model.clone();
+    ui.on_retry_catalog(move || {
+        load_catalog(retry_weak.clone(), retry_model.clone());
+    });
+
     let weak = ui.as_weak();
     ui.on_select_catalog_group(move |id| {
         let current = {
@@ -4810,9 +4817,9 @@ mod window_tests {
             .split("announcement-popover := Rectangle")
             .nth(1)
             .expect("announcement source");
-        let announcement = announcement.chars().take(2400).collect::<String>();
+        let announcement = announcement.chars().take(6000).collect::<String>();
         assert!(announcement.contains("property <bool> shown: root.announcement-open"));
-        assert!(announcement.contains("height: announcement-copy.preferred-height + 28px;"));
+        assert!(announcement.contains("height: announcement-copy.preferred-height + 50px;"));
         assert!(announcement.contains("wrap: word-wrap;"));
         assert!(
             announcement.contains("accessible-description: root.subscription-announcement-text;")
@@ -6225,6 +6232,79 @@ mod window_tests {
             super::announcement_fingerprint("Работы в 23:00"),
             super::announcement_fingerprint("Работы в 22:00")
         );
+    }
+
+    #[test]
+    fn home_states_use_ios_cards_and_a_catalog_retry() {
+        let ui = include_str!("../ui/app.slint").replace("\r\n", "\n");
+        let rust = include_str!("main.rs");
+        const ENTER: &str = "cubic-bezier(0.22, 1, 0.36, 1)";
+        // The conflict banner is a card with quiet text actions and a one-shot enter.
+        let card = ui
+            .split("conflict-card := Rectangle {")
+            .nth(1)
+            .expect("conflict card");
+        let card = card.chars().take(900).collect::<String>();
+        assert!(card.contains("background: Theme.surface;"));
+        assert!(card.contains("border-radius: 14px;"));
+        assert!(card.contains(&format!(
+            "animate opacity {{ duration: 240ms; easing: {ENTER}; }}"
+        )));
+        // The update notice is a bottom-right toast that never pushes the routes.
+        assert!(!ui.contains("update-banner := Rectangle"));
+        let toast = ui
+            .split("update-toast := Rectangle {")
+            .nth(1)
+            .expect("update toast");
+        let toast = toast.chars().take(4500).collect::<String>();
+        for required in [
+            "width: Math.min(356px, parent.width - 32px);",
+            "x: parent.width - self.width - 16px;",
+            "y: parent.height - self.height - 16px + self.motion;",
+            "property <length> motion: root.reduced-motion ? 0px",
+            ": root.update-banner-entering ? 16px",
+            "visible: self.opacity > 0;",
+            "border-color: update-toast-hover.has-hover ? #3a414b : Theme.line;",
+            "filled: true;",
+            "label: root.update-action-label != \"\" ? root.update-action-label : \"Подробнее\";",
+            "root.update-banner-dismissed-for = root.update-status;",
+        ] {
+            assert!(toast.contains(required), "update toast missing: {required}");
+        }
+        assert!(toast.contains(&format!(
+            "animate opacity {{ duration: self.shown ? 320ms : 200ms; easing: {ENTER}; }}"
+        )));
+        // Below the popovers in z-order: declared before the profile menu.
+        assert!(
+            ui.find("update-toast := Rectangle").unwrap()
+                < ui.find("profile-menu := Rectangle").unwrap()
+        );
+        // The connect knob slides with a soft overshoot.
+        assert!(
+            ui.contains(
+                "animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }"
+            )
+        );
+        assert!(ui.contains("banner-enter := Timer {\n        interval: 16ms;"));
+        assert!(ui.contains("if (root.update-banner-visible && !root.reduced-motion) {"));
+        assert!(ui.contains("if (root.conflicting-apps-banner-visible && !root.reduced-motion) {"));
+        assert!(ui.contains("component TextAction inherits Rectangle {"));
+        // The conflict card grows with its message instead of a fixed worst case.
+        assert!(ui.contains(
+            "height: Math.max(72px, conflict-title.preferred-height + conflict-copy.preferred-height + 30px);"
+        ));
+        // A failed catalog is a card with a retry wired to the regular load.
+        assert!(ui.contains("if root.catalog-error != \"\": catalog-error-card := Rectangle {"));
+        assert!(ui.contains("activated => { root.retry-catalog(); }"));
+        assert!(ui.contains("visible: root.catalog-error == \"\";"));
+        assert!(rust.contains("ui.on_retry_catalog(move || {"));
+        // Connection module tones: busy is blue, a failed connect reads its reason in red.
+        assert!(ui.contains(": root.toggle-busy ? #4c9dff59\n                            : root.status-tone == \"success\" ? #3ccb7f59"));
+        assert!(ui.contains("source: root.toggle-busy ? @image-url(\"../assets/shield.svg\")"));
+        assert!(
+            ui.contains("color: root.status-tone == \"danger\" ? #f0a3a3 : Theme.text-secondary;")
+        );
+        assert!(ui.contains("opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;"));
     }
 
     #[test]

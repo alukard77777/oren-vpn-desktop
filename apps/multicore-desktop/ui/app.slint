@@ -277,6 +277,66 @@ component SmallAction inherits Rectangle {
     }
 }
 
+// Quiet text button for cards and popovers: blue when primary, secondary
+// text otherwise; a soft wash on hover, a focus ring for the keyboard.
+component TextAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    // Small filled blue button (toast primary action).
+    in property <bool> filled: false;
+    in property <bool> enabled: true;
+    callback activated();
+
+    min-width: text-action-label.preferred-width + (root.filled ? 20px : 12px);
+    preferred-width: text-action-label.preferred-width + (root.filled ? 20px : 12px);
+    horizontal-stretch: 0;
+    height: root.filled ? 28px : 32px;
+    border-radius: root.filled ? 7px : 6px;
+    background: root.filled
+        ? (text-action-touch.has-hover && root.enabled ? Theme.accent-blue-hover : Theme.accent-blue)
+        : text-action-touch.has-hover && root.enabled ? #ffffff0a : transparent;
+    border-color: Theme.focus;
+    border-width: text-action-focus.has-focus ? Theme.focus-width : 0px;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+    animate background { duration: 120ms; easing: ease-out; }
+
+    text-action-label := Text {
+        x: root.filled ? 10px : 6px;
+        width: parent.width - (root.filled ? 20px : 12px);
+        height: parent.height;
+        text: root.label;
+        color: root.filled ? #ffffff
+            : root.primary
+                ? (text-action-touch.has-hover && root.enabled ? Theme.accent-blue-hover : Theme.accent-blue)
+                : (text-action-touch.has-hover && root.enabled ? Theme.text-primary : Theme.text-secondary);
+        font-family: Theme.font-family;
+        font-size: root.filled ? 12px : 13px;
+        font-weight: root.primary || root.filled ? Theme.weight-semibold : Theme.weight-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+        animate color { duration: 120ms; easing: ease-out; }
+    }
+
+    text-action-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        text-action-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
 component DashboardAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
@@ -845,6 +905,9 @@ export component AppWindow inherits Window {
         : 0.5;
     // True for one frame when real routes replace the skeleton, so they fade in.
     private property <bool> routes-entering: false;
+    // One-frame flags so a banner that appears starts hidden and eases in.
+    private property <bool> update-banner-entering: false;
+    private property <bool> conflict-banner-entering: false;
     private property <bool> profile-menu-was-open: false;
     private property <bool> profile-menu-keyboard-open: false;
     private property <int> profile-shelf-focus-serial: 0;
@@ -880,6 +943,8 @@ export component AppWindow inherits Window {
     callback copy-diagnostics();
     in-out property <bool> diagnostics-copied: false;
     callback select-catalog-group(string);
+    // Reloads the route catalog after it failed to load.
+    callback retry-catalog();
     callback select-catalog-node(string);
     callback route-search-changed(string);
     // (group id, node id): selects a route in any group and closes search.
@@ -935,6 +1000,27 @@ export component AppWindow inherits Window {
     changed route-search-results-shown => {
         if (root.route-search-results-shown && !root.reduced-motion) {
             root.route-search-entering = true;
+        }
+    }
+
+    banner-enter := Timer {
+        interval: 16ms;
+        running: root.update-banner-entering || root.conflict-banner-entering;
+        triggered => {
+            root.update-banner-entering = false;
+            root.conflict-banner-entering = false;
+        }
+    }
+
+    changed update-banner-visible => {
+        if (root.update-banner-visible && !root.reduced-motion) {
+            root.update-banner-entering = true;
+        }
+    }
+
+    changed conflicting-apps-banner-visible => {
+        if (root.conflicting-apps-banner-visible && !root.reduced-motion) {
+            root.conflict-banner-entering = true;
         }
     }
 
@@ -1310,7 +1396,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             border-radius: 6px;
-                            background: root.announcement-open ? #ffffff12 : bell-touch.has-hover ? #ffffff0d : transparent;
+                            background: root.announcement-open ? #ffffff14 : bell-touch.has-hover ? #ffffff0d : transparent;
                             border-color: parent.has-focus ? Theme.focus : transparent;
                             border-width: parent.has-focus ? Theme.focus-width : 0px;
                             animate background { duration: 120ms; easing: ease-out; }
@@ -1473,14 +1559,15 @@ export component AppWindow inherits Window {
                                 : (root.import-error == "" ? 124px : 150px);
                         background: root.has-profile ? Theme.surface : #101721;
                         border-color: !root.has-profile ? #4c9dff55
+                            : root.toggle-busy ? #4c9dff59
                             : root.status-tone == "success" ? #3ccb7f59
-                            : root.status-tone == "danger" ? #f06a6a59
-                            : root.status-tone == "warning" && !root.toggle-busy ? #e7aa4559
+                            : root.status-tone == "danger" ? #f06a6a66
+                            : root.status-tone == "warning" ? #e7aa4566
                             : #ffffff0a;
                         border-width: 1px;
                         border-radius: 14px;
                         clip: true;
-                        animate border-color { duration: 180ms; easing: ease-in-out; }
+                        animate border-color { duration: 220ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
                         // Only the cell mesh reacts to hover. An outer halo would be clipped by
                         // the main-content plane and read as a rectangular light patch.
@@ -1575,8 +1662,9 @@ export component AppWindow inherits Window {
                                     y: (parent.height - self.height) / 2;
                                     width: 22px;
                                     height: 22px;
-                                    source: root.status-tone == "success" ? @image-url("../assets/shield-check.svg")
-                                        : root.status-tone == "danger" || (root.status-tone == "warning" && !root.toggle-busy) ? @image-url("../assets/shield-alert.svg")
+                                    source: root.toggle-busy ? @image-url("../assets/shield.svg")
+                                        : root.status-tone == "success" ? @image-url("../assets/shield-check.svg")
+                                        : root.status-tone == "danger" || root.status-tone == "warning" ? @image-url("../assets/shield-alert.svg")
                                         : @image-url("../assets/shield-off.svg");
                                     colorize: root.status-tone == "success" ? Theme.accent-green
                                         : root.status-tone == "danger" ? Theme.error
@@ -1637,7 +1725,8 @@ export component AppWindow inherits Window {
                                 }
                                 if !root.toggle-detail-is-exit: Text {
                                     text: root.supporting;
-                                    color: Theme.text-secondary;
+                                    // A failed connect reads its reason in a soft red.
+                                    color: root.status-tone == "danger" ? #f0a3a3 : Theme.text-secondary;
                                     font-size: Theme.type-metadata-size;
                                     overflow: elide;
                                 }
@@ -1680,11 +1769,11 @@ export component AppWindow inherits Window {
                                     border-radius: self.height / 2;
                                     background: root.toggle-busy ? #4c9dff59
                                         : root.toggle-on ? Theme.accent-green
-                                        : root.status-tone == "warning" ? #e7aa4566
                                         : Theme.line;
                                     border-color: Theme.focus;
                                     border-width: power-action.has-focus ? Theme.focus-width : 0px;
-                                    opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.45;
+                                    opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;
+                                    animate opacity { duration: 180ms; easing: ease-in-out; }
                                     animate background { duration: 180ms; easing: ease-in-out; }
 
                                     toggle-knob := Rectangle {
@@ -1697,7 +1786,8 @@ export component AppWindow inherits Window {
                                         drop-shadow-blur: 6px;
                                         drop-shadow-offset-y: 2px;
                                         drop-shadow-color: #00000059;
-                                        animate x, width { duration: 180ms; easing: ease-in-out; }
+                                        animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
+                                        animate width { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                                     }
                                 }
                             }
@@ -1720,107 +1810,67 @@ export component AppWindow inherits Window {
 
                     }
 
-                    if root.update-banner-visible: update-banner := Rectangle {
-                        height: 72px;
-                        background: #101721;
-                        border-color: #4c9dff55;
-                        border-width: 1px;
-                        border-radius: 14px;
-                        clip: true;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            padding-top: 14px;
-                            padding-bottom: 14px;
-                            spacing: 12px;
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 32px;
-                                    height: 32px;
-                                    border-radius: 8px;
-                                    background: #4c9dff18;
-                                    Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/refresh.svg"); image-fit: contain; accessible-role: none; }
-                                }
-                            }
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                alignment: center;
-                                spacing: 2px;
-                                Text { text: "Доступно обновление"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
-                                Text { text: root.update-status; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; }
-                            }
-                            SmallAction {
-                                min-width: 96px;
-                                label: root.update-action-label != "" ? root.update-action-label : "Подробнее";
-                                selected: true;
-                                enabled: !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
-                                    && (root.update-action-label == "" || !root.update-runtime-busy);
-                                activated => {
-                                    if (root.update-action-label != "") { root.update-action(); }
-                                    else { root.local-page = "settings"; root.settings-section = "updates"; }
-                                }
-                            }
-                            SmallAction {
-                                label: "Позже";
-                                enabled: !root.profile-menu-open;
-                                activated => { root.update-banner-dismissed-for = root.update-status; }
-                            }
-                        }
-                    }
-
+                    // An iOS-style card (surface, tinted hairline, icon tile, quiet text
+                    // actions). The outer rectangle is the layout slot; the card inside
+                    // eases in (fade + 6px rise) the moment the banner appears.
                     if root.conflicting-apps-banner-visible: conflicting-apps-banner := Rectangle {
-                        // Generous enough for a realistic worst case (two
-                        // conflicting apps plus the appended "couldn't fully
-                        // close it, it's a Windows service" note) at the
-                        // app's own minimum window width.
-                        height: 160px;
-                        background: #1a1215;
-                        border-color: #f06a6a55;
-                        border-width: 1px;
-                        border-radius: 14px;
-                        clip: true;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            padding-top: 14px;
-                            padding-bottom: 14px;
-                            spacing: 12px;
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 32px;
-                                    height: 32px;
-                                    border-radius: 8px;
-                                    background: #f06a6a18;
-                                    Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/announcement-danger.svg"); image-fit: contain; accessible-role: none; }
-                                }
-                            }
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                preferred-width: 0px;
-                                alignment: center;
-                                spacing: 2px;
-                                Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
-                                Text { text: root.conflicting-apps-message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; overflow: elide; }
-                            }
-                            // Centered vertically like the icon and text: the banner is
-                            // taller than the buttons, which otherwise sit at the top.
-                            VerticalLayout {
-                                alignment: center;
-                                HorizontalLayout {
-                                    spacing: 12px;
-                                    SmallAction {
-                                        min-width: 96px;
-                                        label: root.conflicting-apps-closing ? "Закрываем…" : "Закрыть";
-                                        selected: true;
-                                        enabled: !root.profile-menu-open && !root.conflicting-apps-closing;
-                                        activated => { root.close-conflicting-apps(); }
+                        // Grows with the message: a realistic worst case (two apps plus
+                        // the "it's a Windows service" note) wraps to several lines at
+                        // the minimum window width.
+                        height: Math.max(72px, conflict-title.preferred-height + conflict-copy.preferred-height + 30px);
+                        background: transparent;
+                        conflict-card := Rectangle {
+                            y: root.conflict-banner-entering ? 6px : 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            opacity: root.conflict-banner-entering ? 0 : 1;
+                            background: Theme.surface;
+                            border-color: #f06a6a59;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            clip: true;
+                            animate opacity { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            animate y { duration: 280ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 12px;
+                                padding-top: 14px;
+                                padding-bottom: 14px;
+                                spacing: 14px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 32px;
+                                        height: 32px;
+                                        border-radius: 9px;
+                                        background: Theme.elevated;
+                                        Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/octagon-alert.svg"); colorize: Theme.error; image-fit: contain; accessible-role: none; }
                                     }
-                                    SmallAction {
-                                        label: "Понятно";
-                                        enabled: !root.profile-menu-open;
-                                        activated => { root.dismiss-conflicting-apps-banner(); }
+                                }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    preferred-width: 0px;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    conflict-title := Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                                    conflict-copy := Text { text: root.conflicting-apps-message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                }
+                                // Centred vertically like the icon and text.
+                                VerticalLayout {
+                                    alignment: center;
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        TextAction {
+                                            primary: true;
+                                            label: root.conflicting-apps-closing ? "Закрываем…" : "Закрыть";
+                                            enabled: !root.profile-menu-open && !root.conflicting-apps-closing;
+                                            activated => { root.close-conflicting-apps(); }
+                                        }
+                                        TextAction {
+                                            label: "Понятно";
+                                            enabled: !root.profile-menu-open;
+                                            activated => { root.dismiss-conflicting-apps-banner(); }
+                                        }
                                     }
                                 }
                             }
@@ -2244,7 +2294,39 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.catalog-error != "" || root.latency-check-error != "": Text { min-height: 28px; text: root.catalog-error != "" ? root.catalog-error : root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            // A failed catalog load is a card with a retry, in place of the list.
+                            if root.catalog-error != "": catalog-error-card := Rectangle {
+                                height: Math.max(56px, catalog-error-copy.preferred-height + 28px);
+                                background: Theme.surface;
+                                border-color: #ffffff0a;
+                                border-width: 1px;
+                                border-radius: 14px;
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 10px;
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Image { width: 18px; height: 18px; source: @image-url("../assets/triangle-alert.svg"); colorize: Theme.error; image-fit: contain; accessible-role: none; }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        preferred-width: 0px;
+                                        alignment: center;
+                                        catalog-error-copy := Text { text: root.catalog-error; color: Theme.text-secondary; font-size: 13px; wrap: word-wrap; accessible-role: text; accessible-live-region: polite; }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        TextAction {
+                                            primary: true;
+                                            label: root.catalog-loading ? "Загружаем…" : "Повторить";
+                                            enabled: !root.catalog-loading && !root.profile-menu-open;
+                                            activated => { root.retry-catalog(); }
+                                        }
+                                    }
+                                }
+                            }
+                            if root.catalog-error == "" && root.latency-check-error != "": Text { min-height: 28px; text: root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                             if !root.route-search-results-shown: ScrollView {
                                 vertical-stretch: 1;
                                 VerticalLayout {
@@ -2253,7 +2335,9 @@ export component AppWindow inherits Window {
                                     alignment: start;
                                     // iOS-style inset grouped list: one card, hairlines between rows.
                                     route-list-card := Rectangle {
-                                    height: route-list.preferred-height;
+                                    // The failed-catalog card stands in for the list.
+                                    visible: root.catalog-error == "";
+                                    height: root.catalog-error == "" ? route-list.preferred-height : 0px;
                                     background: Theme.surface;
                                     border-color: #ffffff0a;
                                     border-width: 1px;
@@ -2876,6 +2960,76 @@ export component AppWindow inherits Window {
                 }
             }
 
+            // Update notice as a Sonner-style toast: bottom-right of the pane, it never
+            // pushes content. Always mounted so it can fade out after "Позже".
+            update-toast := Rectangle {
+                property <bool> shown: root.update-banner-visible;
+                property <length> motion: root.reduced-motion ? 0px
+                    : root.update-banner-entering ? 16px
+                    : self.shown ? 0px : 8px;
+                width: Math.min(356px, parent.width - 32px);
+                height: Math.max(60px, update-toast-title.preferred-height + update-toast-copy.preferred-height + 30px);
+                x: parent.width - self.width - 16px;
+                y: parent.height - self.height - 16px + self.motion;
+                opacity: self.shown && !root.update-banner-entering ? 1 : 0;
+                visible: self.opacity > 0;
+                background: Theme.elevated;
+                border-color: update-toast-hover.has-hover ? #3a414b : Theme.line;
+                border-width: 1px;
+                border-radius: 12px;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: #00000080;
+                animate opacity { duration: self.shown ? 320ms : 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                animate y { duration: self.shown ? 320ms : 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                animate border-color { duration: 140ms; easing: ease-out; }
+
+                // Behind the content: only tracks hover for the lift.
+                update-toast-hover := TouchArea { }
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: start;
+                        padding-top: 1px;
+                        Image { width: 18px; height: 18px; source: @image-url("../assets/download.svg"); colorize: Theme.accent-blue; image-fit: contain; accessible-role: none; }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        alignment: center;
+                        spacing: 2px;
+                        update-toast-title := Text { text: "Доступно обновление"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
+                        update-toast-copy := Text { text: root.update-status; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: 4px;
+                            TextAction {
+                                filled: true;
+                                label: root.update-action-label != "" ? root.update-action-label : "Подробнее";
+                                enabled: update-toast.shown && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
+                                    && (root.update-action-label == "" || !root.update-runtime-busy);
+                                activated => {
+                                    if (root.update-action-label != "") { root.update-action(); }
+                                    else { root.local-page = "settings"; root.settings-section = "updates"; }
+                                }
+                            }
+                            TextAction {
+                                label: "Позже";
+                                enabled: update-toast.shown && !root.profile-menu-open;
+                                activated => { root.update-banner-dismissed-for = root.update-status; }
+                            }
+                        }
+                    }
+                }
+            }
+
             if root.profile-menu-open: TouchArea {
                 x: 0;
                 y: 0;
@@ -3068,12 +3222,18 @@ export component AppWindow inherits Window {
 
             announcement-popover := Rectangle {
                 property <bool> shown: root.announcement-open && root.subscription-announcement-text != "";
+                property <color> tone-color: root.subscription-announcement-tone == "danger" ? Theme.error
+                    : root.subscription-announcement-tone == "success" ? Theme.accent-green
+                    : Theme.accent-blue;
                 x: -8px;
-                y: self.shown ? 8px : 0px;
+                y: self.shown ? 8px : 2px;
                 width: Math.min(420px, parent.width - 16px);
-                height: announcement-copy.preferred-height + 28px;
+                height: announcement-copy.preferred-height + 50px;
                 visible: self.opacity > 0;
                 opacity: self.shown ? 1 : 0;
+                // Grows out of the bell: a slight scale-up with the fade and slide.
+                transform-origin: { x: 0px, y: 0px };
+                transform-scale: self.shown ? 1 : 0.97;
                 background: Theme.elevated;
                 border-color: root.subscription-announcement-tone == "danger" ? #f06a6a66 : root.subscription-announcement-tone == "success" ? #3ccb7f66 : #4c9dff66;
                 border-width: 1px;
@@ -3081,8 +3241,9 @@ export component AppWindow inherits Window {
                 drop-shadow-blur: 24px;
                 drop-shadow-offset-y: 8px;
                 drop-shadow-color: #00000080;
-                animate opacity { duration: 160ms; easing: ease-out; }
-                animate y { duration: 160ms; easing: ease-out; }
+                animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                animate y { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                animate transform-scale { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
                 Image {
                     x: 14px;
@@ -3091,17 +3252,58 @@ export component AppWindow inherits Window {
                     height: 18px;
                     source: root.subscription-announcement-tone == "danger" ? @image-url("../assets/announcement-danger.svg")
                         : root.subscription-announcement-tone == "success" ? @image-url("../assets/announcement-success.svg")
-                        : @image-url("../assets/announcement-info.svg");
+                        : @image-url("../assets/info.svg");
+                    colorize: announcement-popover.tone-color;
                     image-fit: contain;
                     accessible-role: none;
                 }
-                announcement-copy := Text {
+                Text {
                     x: 42px;
                     y: 14px;
-                    width: parent.width - 56px;
+                    width: parent.width - 84px;
+                    height: 18px;
+                    text: "НОВОЕ ОТ ПРОВАЙДЕРА";
+                    color: announcement-popover.tone-color;
+                    font-size: 11px;
+                    font-weight: Theme.weight-semibold;
+                    letter-spacing: 0.6px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    accessible-role: none;
+                }
+                announcement-close := FocusScope {
+                    x: parent.width - self.width - 8px;
+                    y: 8px;
+                    width: 28px;
+                    height: 28px;
+                    focus-on-click: true;
+                    focus-on-tab-navigation: announcement-popover.shown;
+                    accessible-role: button;
+                    accessible-label: "Закрыть сообщение провайдера";
+                    accessible-action-default => { root.announcement-open = false; }
+                    key-pressed(event) => {
+                        if (event.text == " " || event.text == "\n") {
+                            root.announcement-open = false;
+                            return accept;
+                        }
+                        return reject;
+                    }
+                    Rectangle {
+                        border-radius: 6px;
+                        background: announcement-close-touch.has-hover ? #ffffff0d : transparent;
+                        border-color: Theme.focus;
+                        border-width: parent.has-focus ? Theme.focus-width : 0px;
+                        Image { x: 8px; y: 8px; width: 12px; height: 12px; source: @image-url("../assets/close.svg"); colorize: announcement-close-touch.has-hover ? Theme.text-primary : Theme.text-muted; image-fit: contain; accessible-role: none; }
+                    }
+                    announcement-close-touch := TouchArea { clicked => { root.announcement-open = false; } }
+                }
+                announcement-copy := Text {
+                    x: 42px;
+                    y: 38px;
+                    width: parent.width - 58px;
                     text: root.subscription-announcement-text;
                     color: Theme.text-secondary;
-                    font-size: Theme.type-metadata-size;
+                    font-size: 13px;
                     wrap: word-wrap;
                     accessible-role: text;
                     accessible-description: root.subscription-announcement-text;
