@@ -213,10 +213,36 @@ pub(crate) struct CatalogNodePresentation {
     pub(crate) latency_tone: String,
 }
 
+/// One group with all of its nodes, so route search can look across groups
+/// without another daemon round trip (`/v1/catalog` already returns them all).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CatalogSearchGroup {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) nodes: Vec<CatalogNodePresentation>,
+}
+
+/// A route matching the search query, with the match split out of the display
+/// label so the UI can emphasise it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RouteSearchHit {
+    pub(crate) group_id: String,
+    pub(crate) group_label: String,
+    pub(crate) node_id: String,
+    pub(crate) icon: String,
+    pub(crate) prefix: String,
+    pub(crate) matched: String,
+    pub(crate) suffix: String,
+    pub(crate) selected: bool,
+    pub(crate) latency_text: String,
+    pub(crate) latency_tone: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CatalogPresentation {
     pub(crate) revision: Option<u64>,
     pub(crate) groups: Vec<CatalogGroupPresentation>,
+    pub(crate) search_groups: Vec<CatalogSearchGroup>,
     pub(crate) selected_group_id: Option<String>,
     pub(crate) nodes: Vec<CatalogNodePresentation>,
     pub(crate) loading: bool,
@@ -2511,9 +2537,19 @@ impl DesktopViewModel {
             .and_then(|id| self.catalog_groups.iter().find(|group| group.id == id))
             .map(|group| group.nodes.clone())
             .unwrap_or_default();
+        let search_groups = self
+            .catalog_groups
+            .iter()
+            .map(|group| CatalogSearchGroup {
+                id: group.id.clone(),
+                label: group.label.clone(),
+                nodes: group.nodes.clone(),
+            })
+            .collect();
         CatalogPresentation {
             revision: self.catalog_revision,
             groups,
+            search_groups,
             selected_group_id: self.selected_catalog_group.clone(),
             nodes,
             loading: self.catalog_request_pending.is_some(),
@@ -3055,6 +3091,163 @@ fn russian_days(days: u64) -> &'static str {
         "дня"
     } else {
         "дней"
+    }
+}
+
+/// Most results a search shows; a catalog rarely has more, and the list stays light.
+pub(crate) const ROUTE_SEARCH_LIMIT: usize = 60;
+
+/// Case-insensitive route search over every group's nodes, in catalog order.
+/// Matches the display label (the leading emoji split off), so "ger" finds
+/// "🇩🇪 Germany". A blank query finds nothing: the normal list stays in view.
+pub(crate) fn search_routes(groups: &[CatalogSearchGroup], query: &str) -> Vec<RouteSearchHit> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for group in groups {
+        let group_label = derive_catalog_display(&group.label, CatalogDisplayKind::Group).label;
+        for node in &group.nodes {
+            let display = derive_catalog_display(&node.label, CatalogDisplayKind::Node);
+            let Some((prefix, matched, suffix)) = split_match(&display.label, query) else {
+                continue;
+            };
+            hits.push(RouteSearchHit {
+                group_id: group.id.clone(),
+                group_label: group_label.clone(),
+                node_id: node.id.clone(),
+                icon: display.icon.clone(),
+                prefix: prefix.to_owned(),
+                matched: matched.to_owned(),
+                suffix: suffix.to_owned(),
+                selected: node.selected,
+                latency_text: node.latency_text.clone(),
+                latency_tone: node.latency_tone.clone(),
+            });
+            if hits.len() == ROUTE_SEARCH_LIMIT {
+                return hits;
+            }
+        }
+    }
+    hits
+}
+
+/// Splits `label` around the first case-insensitive occurrence of `query`
+/// (trimmed). Compares lower-cased characters, so Cyrillic works too, and the
+/// returned slices always fall on character boundaries of the original label.
+pub(crate) fn split_match<'a>(label: &'a str, query: &str) -> Option<(&'a str, &'a str, &'a str)> {
+    let needle: Vec<char> = query.trim().chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let chars: Vec<(usize, char)> = label.char_indices().collect();
+    for start in 0..chars.len() {
+        let mut lowered = Vec::with_capacity(needle.len());
+        let mut end = start;
+        while lowered.len() < needle.len() && end < chars.len() {
+            lowered.extend(chars[end].1.to_lowercase());
+            end += 1;
+        }
+        if lowered == needle {
+            let from = chars[start].0;
+            let to = chars.get(end).map_or(label.len(), |(index, _)| *index);
+            return Some((&label[..from], &label[from..to], &label[to..]));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod route_search_tests {
+    use super::{CatalogNodePresentation, CatalogSearchGroup, search_routes, split_match};
+
+    fn node(id: &str, label: &str, selected: bool) -> CatalogNodePresentation {
+        CatalogNodePresentation {
+            id: id.into(),
+            label: label.into(),
+            selected,
+            delay_ms: None,
+            latency_text: "42 мс".into(),
+            latency_tone: "success".into(),
+        }
+    }
+
+    fn groups() -> Vec<CatalogSearchGroup> {
+        vec![
+            CatalogSearchGroup {
+                id: "g1".into(),
+                label: "🌍 Серверы".into(),
+                nodes: vec![
+                    node("n1", "🇩🇪 Germany", false),
+                    node("n2", "🇸🇪 Sweden", true),
+                ],
+            },
+            CatalogSearchGroup {
+                id: "g2".into(),
+                label: "🎮 Игры".into(),
+                nodes: vec![
+                    node("n3", "🇩🇪 Germany · Games", true),
+                    node("n4", "Москва", false),
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn split_match_is_case_insensitive_and_keeps_original_casing() {
+        assert_eq!(split_match("Germany", "ger"), Some(("", "Ger", "many")));
+        assert_eq!(
+            split_match("Netherlands", "LAND"),
+            Some(("Nether", "land", "s"))
+        );
+        assert_eq!(split_match("Москва", "СКВ"), Some(("Мо", "скв", "а")));
+        assert_eq!(split_match("Germany", "  man "), Some(("Ger", "man", "y")));
+        assert_eq!(split_match("Germany", "xyz"), None);
+        assert_eq!(split_match("Germany", "   "), None);
+        assert_eq!(split_match("Ger", "germany"), None);
+    }
+
+    #[test]
+    fn search_spans_every_group_and_uses_display_labels() {
+        let hits = search_routes(&groups(), "ger");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            (hits[0].group_id.as_str(), hits[0].node_id.as_str()),
+            ("g1", "n1")
+        );
+        assert_eq!(hits[0].group_label, "Серверы");
+        assert_eq!(hits[0].icon, "🇩🇪");
+        assert_eq!(
+            (
+                hits[0].prefix.as_str(),
+                hits[0].matched.as_str(),
+                hits[0].suffix.as_str()
+            ),
+            ("", "Ger", "many")
+        );
+        assert!(!hits[0].selected);
+        assert_eq!(hits[1].group_label, "Игры");
+        assert_eq!(hits[1].suffix, "many · Games");
+        assert!(hits[1].selected);
+        // The flag emoji is not searchable text.
+        assert!(search_routes(&groups(), "🇩🇪").is_empty());
+        assert!(search_routes(&groups(), "").is_empty());
+        assert_eq!(search_routes(&groups(), "москва")[0].matched, "Москва");
+    }
+
+    #[test]
+    fn search_results_are_capped() {
+        let many = vec![CatalogSearchGroup {
+            id: "g".into(),
+            label: "Серверы".into(),
+            nodes: (0..100)
+                .map(|i| node(&format!("n{i}"), &format!("Node {i}"), false))
+                .collect(),
+        }];
+        assert_eq!(
+            search_routes(&many, "node").len(),
+            super::ROUTE_SEARCH_LIMIT
+        );
     }
 }
 
@@ -6677,6 +6870,55 @@ mod tests {
     }
 
     #[test]
+    fn route_search_source_contract() {
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
+        let main = include_str!("main.rs").replace("\r\n", "\n");
+        // Entry points: a quiet icon in the routes header and Ctrl+F on either layout.
+        assert!(app.contains("route-search-toggle := FocusScope"));
+        assert!(app.contains("accessible-label: \"Поиск маршрутов\";"));
+        assert!(app.contains("event.modifiers.control && !event.modifiers.alt"));
+        assert!(app.contains("event.text == \"f\" || event.text == \"F\" || event.text == \"а\" || event.text == \"А\""));
+        // Esc closes search before it falls through to the panel/announcement handling.
+        let escape = app
+            .split("key-pressed(event) => {\n            if (event.text == Key.Escape) {")
+            .nth(1)
+            .expect("escape handler");
+        assert!(
+            escape.find("root.close-route-search();").unwrap()
+                < escape.find("root.announcement-open = false;").unwrap()
+        );
+        // Field: placeholder while empty, clear button once typed, blue Отмена.
+        assert!(app.contains("text: \"Поиск по маршрутам\";"));
+        assert!(
+            app.contains("if root.route-search-query != \"\": route-search-clear := TouchArea")
+        );
+        assert!(app.contains("route-search-cancel := FocusScope"));
+        assert!(app.contains("edited => { root.route-search-changed(self.text); }"));
+        // Heading and field cross-fade in one 36px slot.
+        assert!(app.contains("opacity: root.route-search-open ? 0 : 1;"));
+        assert!(app.contains("opacity: root.route-search-open ? 1 : 0;"));
+        assert!(app.contains("animate opacity, x { duration: 160ms; easing: ease-out; }"));
+        // Results replace the list; skeletons pulse only while loading and motion is allowed.
+        assert!(app.contains("if !root.route-search-results-shown: ScrollView {"));
+        assert!(
+            app.contains(
+                "if root.route-search-results-shown: route-search-results := ScrollView {"
+            )
+        );
+        assert!(app.contains("pulsing: !root.reduced-motion;"));
+        assert!(app.contains("property <float> phase: self.pulsing ? (1 + Math.sin(animation-tick() / 1200ms * 360deg)) / 2 : 0.5;"));
+        assert!(app.contains("if root.route-search-loading: route-search-skeleton := Rectangle {"));
+        assert!(app.contains("text: \"Ничего не найдено\";"));
+        assert!(app.contains("text: \"Попробуйте другое название страны или сервера\";"));
+        assert!(app.contains("\" · поиск по всем группам\""));
+        // Picking a result selects it in its own group and closes search.
+        assert!(app.contains("root.choose-route-search-hit(hit.group-id, hit.node-id);\n                                                    root.close-route-search();"));
+        assert!(main.contains("ui.on_route_search_changed(move |query| {"));
+        assert!(main.contains("ui.invoke_select_catalog_group(group_id);"));
+        assert!(main.contains("if ui.get_route_search_open() {\n        apply_route_search(ui, catalog, ui.get_route_search_query().as_str());"));
+    }
+
+    #[test]
     fn redesign_motion_is_lightweight_and_respects_reduced_motion() {
         // Checkouts may use CRLF; the multi-line contracts below are written with LF.
         let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
@@ -6863,7 +7105,9 @@ mod tests {
     #[test]
     fn desktop_control_center_source_contract() {
         let source = include_str!("../ui/app.slint");
-        let components = include_str!("../ui/components.slint");
+        // Checkouts may use CRLF; multi-line contracts below are written with LF.
+        let components = include_str!("../ui/components.slint").replace("\r\n", "\n");
+        let components = components.as_str();
         let main = include_str!("main.rs");
         let logo_cache = include_str!("logo_cache.rs");
 

@@ -243,6 +243,48 @@ fn events() -> ModelRc<UiEvent> {
     ModelRc::new(VecModel::from(rows))
 }
 
+/// Opens route search through the real filtering path (`apply_route_search`).
+fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
+    use crate::view_model::{CatalogNodePresentation, CatalogPresentation, CatalogSearchGroup};
+    let node = |id: &str, label: &str, selected: bool, latency: &str, tone: &str| {
+        CatalogNodePresentation {
+            id: id.into(),
+            label: label.into(),
+            selected,
+            delay_ms: None,
+            latency_text: latency.into(),
+            latency_tone: tone.into(),
+        }
+    };
+    let catalog = CatalogPresentation {
+        loading,
+        search_groups: if loading {
+            Vec::new()
+        } else {
+            vec![
+                CatalogSearchGroup {
+                    id: "g1".into(),
+                    label: "🌍 Серверы".into(),
+                    nodes: vec![
+                        node("n1", "🌍 Автовыбор", true, "42 мс", "success"),
+                        node("n2", "🇩🇪 Germany", false, "96 мс", "warning"),
+                        node("n3", "🇸🇪 Sweden", false, "42 мс", "success"),
+                    ],
+                },
+                CatalogSearchGroup {
+                    id: "g2".into(),
+                    label: "🎮 Игры".into(),
+                    nodes: vec![node("n4", "🇩🇪 Germany · Games", true, "38 мс", "success")],
+                },
+            ]
+        },
+        ..CatalogPresentation::default()
+    };
+    ui.set_route_search_open(true);
+    ui.set_route_search_query(query.into());
+    crate::apply_route_search(ui, &catalog, query);
+}
+
 fn mappings() -> ModelRc<UiProxyMapping> {
     let rows = [
         ("🇦🇱 Albania", "127.0.0.1:20801", "albania-reality"),
@@ -302,6 +344,22 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_subscription_announcement_text(s(
                 "Плановые работы сегодня в 23:00 по московскому времени. В это время возможны кратковременные отключения серверов в Германии и Нидерландах.",
             ));
+        }),
+        ("home-search", 840, 720, |ui| {
+            connected(ui);
+            open_route_search(ui, "ger", false);
+        }),
+        ("home-search-empty", 840, 720, |ui| {
+            connected(ui);
+            open_route_search(ui, "zzz", false);
+        }),
+        ("home-search-loading", 840, 720, |ui| {
+            connected(ui);
+            open_route_search(ui, "ger", true);
+        }),
+        ("home-search-idle", 840, 720, |ui| {
+            connected(ui);
+            open_route_search(ui, "", false);
         }),
         ("home-announcement-open", 840, 720, |ui| {
             ready(ui);

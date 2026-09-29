@@ -29,6 +29,20 @@ export struct UiCatalogNode {
     latency-tone: string,
 }
 
+export struct UiRouteSearchHit {
+    group-id: string,
+    group-label: string,
+    node-id: string,
+    icon: string,
+    icon-image: image,
+    prefix: string,
+    matched: string,
+    suffix: string,
+    selected: bool,
+    latency-text: string,
+    latency-tone: string,
+}
+
 export struct UiProxyMapping {
     // A leading emoji (usually a flag) split off the name and drawn as an image.
     icon-image: image,
@@ -537,6 +551,130 @@ component TitleBarButton inherits Rectangle {
     }
 }
 
+// Route search result: same row as the route list, the match emphasised, and the
+// group it lives in shown before the latency.
+component RouteSearchRow inherits Rectangle {
+    in property <string> icon;
+    in property <image> icon-image;
+    in property <string> prefix;
+    in property <string> matched;
+    in property <string> suffix;
+    in property <string> group-label;
+    in property <string> latency-text;
+    in property <string> latency-tone: "neutral";
+    in property <bool> selected;
+    in property <bool> show-separator;
+    in property <bool> enabled: true;
+    callback activated();
+
+    height: 48px;
+    background: root.selected ? Theme.elevated : result-touch.has-hover && root.enabled ? #ffffff06 : transparent;
+    border-color: Theme.focus;
+    border-width: result-focus.has-focus ? Theme.focus-width : 0px;
+    border-radius: result-focus.has-focus ? 10px : 0px;
+    clip: true;
+    accessible-role: button;
+    accessible-label: root.prefix + root.matched + root.suffix + ", " + root.group-label
+        + (root.latency-text == "" ? "" : ", " + root.latency-text)
+        + (root.selected ? ", выбрано" : "");
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+    animate background { duration: 140ms; easing: ease-out; }
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: 20px;
+        border-radius: 1.5px;
+        background: Theme.accent-blue;
+        opacity: root.selected ? 1 : 0;
+    }
+
+    Rectangle {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 30px;
+        height: 30px;
+        background: transparent;
+        if root.icon-image.width > 0: Image { x: 4px; y: 4px; width: 22px; height: 22px; source: root.icon-image; image-fit: contain; accessible-role: none; }
+        if root.icon-image.width == 0: Text { text: root.icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-value-size; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
+    }
+
+    HorizontalLayout {
+        x: 56px;
+        width: Math.max(0px, result-group.x - self.x - 16px);
+        height: parent.height;
+        alignment: start;
+        Text { text: root.prefix; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; vertical-alignment: center; accessible-role: none; }
+        Text { text: root.matched; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; vertical-alignment: center; accessible-role: none; }
+        Text { horizontal-stretch: 1; text: root.suffix; color: Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; vertical-alignment: center; overflow: elide; accessible-role: none; }
+    }
+
+    result-latency := Text {
+        x: parent.width - self.width - 20px;
+        width: self.preferred-width;
+        height: parent.height;
+        text: root.latency-text;
+        color: root.latency-tone == "success" ? Theme.accent-green
+            : root.latency-tone == "warning" ? Theme.warning
+            : root.latency-tone == "danger" ? Theme.error : Theme.text-muted;
+        font-size: Theme.type-metadata-size;
+        font-weight: Theme.weight-semibold;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    result-group := Text {
+        x: result-latency.x - self.width - (root.latency-text == "" ? 0px : 14px);
+        width: Math.min(self.preferred-width, 160px);
+        height: parent.height;
+        text: root.group-label;
+        color: Theme.text-muted;
+        font-size: Theme.type-metadata-size;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+
+    if root.show-separator: Rectangle {
+        x: 56px;
+        y: parent.height - 1px;
+        width: parent.width - 56px;
+        height: 1px;
+        background: #ffffff0f;
+    }
+
+    result-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        result-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
+// Placeholder row while route data loads: shapes only, a soft pulse while loading.
+component RouteSkeletonRow inherits Rectangle {
+    in property <length> label-width: 120px;
+    in property <bool> pulsing;
+    in property <bool> show-separator;
+    property <float> phase: self.pulsing ? (1 + Math.sin(animation-tick() / 1200ms * 360deg)) / 2 : 0.5;
+    height: 48px;
+    background: transparent;
+    accessible-role: none;
+    Rectangle { x: 16px; y: 13px; width: 22px; height: 22px; border-radius: 11px; background: #ffffff; opacity: 0.05 + 0.04 * root.phase; }
+    Rectangle { x: 56px; y: 19px; width: root.label-width; height: 10px; border-radius: 5px; background: #ffffff; opacity: 0.06 + 0.05 * root.phase; }
+    Rectangle { x: parent.width - self.width - 20px; y: 20px; width: 34px; height: 8px; border-radius: 4px; background: #ffffff; opacity: 0.05 + 0.04 * root.phase; }
+    if root.show-separator: Rectangle { x: 56px; y: parent.height - 1px; width: parent.width - 56px; height: 1px; background: #ffffff0f; }
+}
+
 export component AppWindow inherits Window {
     title: "MultiCore";
     icon: @image-url("../assets/app-icon.svg");
@@ -570,6 +708,15 @@ export component AppWindow inherits Window {
     in property <string> traffic-down;
     // Latency of the exit node, when the visible route list knows it.
     in property <string> node-latency;
+    // Route search on home: the routes header turns into a field; results span all groups.
+    in-out property <bool> route-search-open: false;
+    in-out property <string> route-search-query;
+    in property <[UiRouteSearchHit]> route-search-hits;
+    in property <bool> route-search-loading: false;
+    private property <int> route-search-focus-serial: 0;
+    private property <bool> route-search-results-shown: root.route-search-open && (root.route-search-query != "" || root.route-search-loading);
+    // One frame of "entering" so results fade in when they replace the list.
+    private property <bool> route-search-entering: false;
     in property <string> traffic-up;
     in property <bool> import-pending: false;
     in property <string> import-error;
@@ -709,6 +856,22 @@ export component AppWindow inherits Window {
     in-out property <bool> diagnostics-copied: false;
     callback select-catalog-group(string);
     callback select-catalog-node(string);
+    callback route-search-changed(string);
+    // (group id, node id): selects a route in any group and closes search.
+    callback choose-route-search-hit(string, string);
+
+    function open-route-search() {
+        root.route-search-open = true;
+        root.route-search-query = "";
+        root.route-search-changed("");
+        root.route-search-focus-serial += 1;
+    }
+
+    function close-route-search() {
+        root.route-search-open = false;
+        root.route-search-query = "";
+        root.route-search-changed("");
+    }
     callback set-launch-at-sign-in(bool);
     callback window-drag();
     callback window-resize(string);
@@ -724,6 +887,18 @@ export component AppWindow inherits Window {
     callback confirm-deep-link();
     callback cancel-deep-link();
 
+    route-search-enter := Timer {
+        interval: 16ms;
+        running: root.route-search-entering;
+        triggered => { root.route-search-entering = false; }
+    }
+
+    changed route-search-results-shown => {
+        if (root.route-search-results-shown && !root.reduced-motion) {
+            root.route-search-entering = true;
+        }
+    }
+
     page-enter := Timer {
         interval: 16ms;
         running: root.page-entering;
@@ -733,6 +908,10 @@ export component AppWindow inherits Window {
     changed visible-page => {
         if (!root.reduced-motion) {
             root.page-entering = true;
+        }
+        // Search belongs to home; leaving the page closes it.
+        if (root.visible-page != "home" && root.route-search-open) {
+            root.close-route-search();
         }
     }
 
@@ -825,6 +1004,8 @@ export component AppWindow inherits Window {
                     root.subscription-draft = "";
                     root.dismiss-first-run-import();
                     root.first-run-trigger-focus-serial += 1;
+                } else if (root.route-search-open) {
+                    root.close-route-search();
                 } else if (root.announcement-open) {
                     root.announcement-open = false;
                 } else if (root.profile-delete-confirm-id != "") {
@@ -835,6 +1016,13 @@ export component AppWindow inherits Window {
                     root.profile-edit-id = "";
                     root.profile-edit-draft = "";
                 } else { root.escape-pressed(); }
+                return accept;
+            }
+            // Ctrl+F (either keyboard layout) opens route search on home.
+            if (event.modifiers.control && !event.modifiers.alt
+                && (event.text == "f" || event.text == "F" || event.text == "а" || event.text == "А")
+                && root.visible-page == "home" && root.has-profile && !root.profile-menu-open) {
+                root.open-route-search();
                 return accept;
             }
             return reject;
@@ -1770,11 +1958,19 @@ export component AppWindow inherits Window {
                         background: transparent;
                         VerticalLayout {
                             spacing: 8px;
+                            routes-header := Rectangle {
+                            height: 36px;
+                            background: transparent;
                             routes-heading := HorizontalLayout {
-                                height: 28px;
+                                x: root.route-search-open ? -8px : 0px;
+                                width: parent.width;
+                                height: 36px;
                                 spacing: 8px;
+                                opacity: root.route-search-open ? 0 : 1;
+                                visible: self.opacity > 0;
+                                animate opacity, x { duration: 160ms; easing: ease-out; }
                                 routes-title := Text {
-                                    height: 28px;
+                                    height: 36px;
                                     horizontal-stretch: 0;
                                     text: "Маршруты";
                                     color: Theme.text-primary;
@@ -1783,7 +1979,7 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                                 route-updated-meta := Text {
-                                    height: 28px;
+                                    height: 36px;
                                     horizontal-stretch: 1;
                                     text: root.latency-check-loading ? "· Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? "· " + root.subscription-updated : "· Обновлено " + root.subscription-updated;
                                     color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
@@ -1794,6 +1990,160 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
+                                route-search-toggle := FocusScope {
+                                    width: 32px;
+                                    height: 36px;
+                                    enabled: !root.route-search-open && !root.profile-menu-open;
+                                    focus-on-click: true;
+                                    focus-on-tab-navigation: true;
+                                    accessible-role: button;
+                                    accessible-label: "Поиск маршрутов";
+                                    accessible-action-default => { root.open-route-search(); }
+                                    key-pressed(event) => {
+                                        if (event.text == " " || event.text == "\n") {
+                                            root.open-route-search();
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
+                                    Rectangle {
+                                        y: 2px;
+                                        height: 32px;
+                                        border-radius: 16px;
+                                        background: search-toggle-touch.has-hover ? #ffffff0d : transparent;
+                                        border-color: Theme.focus;
+                                        border-width: parent.has-focus ? Theme.focus-width : 0px;
+                                        animate background { duration: 120ms; easing: ease-out; }
+                                        Image {
+                                            x: 8px;
+                                            y: 8px;
+                                            width: 16px;
+                                            height: 16px;
+                                            source: @image-url("../assets/search.svg");
+                                            colorize: search-toggle-touch.has-hover ? Theme.text-secondary : Theme.text-muted;
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
+                                    }
+                                    search-toggle-touch := TouchArea { clicked => { root.open-route-search(); } }
+                                }
+                            }
+
+                            route-search-bar := Rectangle {
+                                x: root.route-search-open ? 0px : 12px;
+                                width: parent.width;
+                                height: 36px;
+                                opacity: root.route-search-open ? 1 : 0;
+                                visible: self.opacity > 0;
+                                animate opacity, x { duration: 160ms; easing: ease-out; }
+
+                                route-search-field := Rectangle {
+                                    x: 0;
+                                    width: parent.width - route-search-cancel.width - 12px;
+                                    height: 36px;
+                                    border-radius: 10px;
+                                    background: #15181d;
+                                    border-width: 1px;
+                                    border-color: route-search-input.has-focus ? #4c9dff99 : Theme.line;
+                                    animate border-color { duration: 140ms; easing: ease-out; }
+                                    Image {
+                                        x: 12px;
+                                        y: 10px;
+                                        width: 16px;
+                                        height: 16px;
+                                        source: @image-url("../assets/search.svg");
+                                        colorize: Theme.text-muted;
+                                        image-fit: contain;
+                                        accessible-role: none;
+                                    }
+                                    route-search-input := TextInput {
+                                        property <int> focus-serial: root.route-search-focus-serial;
+                                        x: 36px;
+                                        width: parent.width - 36px - 36px;
+                                        height: parent.height;
+                                        text <=> root.route-search-query;
+                                        single-line: true;
+                                        color: Theme.text-primary;
+                                        font-size: Theme.type-label-size;
+                                        vertical-alignment: center;
+                                        accessible-label: "Поиск по маршрутам";
+                                        changed focus-serial => { self.focus(); }
+                                        edited => { root.route-search-changed(self.text); }
+                                        accepted => {
+                                            if (root.route-search-hits.length > 0) {
+                                                root.choose-route-search-hit(root.route-search-hits[0].group-id, root.route-search-hits[0].node-id);
+                                                root.close-route-search();
+                                            }
+                                        }
+                                    }
+                                    if root.route-search-query == "": Text {
+                                        x: 36px;
+                                        width: parent.width - 48px;
+                                        height: parent.height;
+                                        text: "Поиск по маршрутам";
+                                        color: Theme.text-muted;
+                                        font-size: Theme.type-label-size;
+                                        vertical-alignment: center;
+                                        accessible-role: none;
+                                    }
+                                    if root.route-search-query != "": route-search-clear := TouchArea {
+                                        x: parent.width - 32px;
+                                        width: 28px;
+                                        height: parent.height;
+                                        clicked => {
+                                            root.route-search-query = "";
+                                            root.route-search-changed("");
+                                            root.route-search-focus-serial += 1;
+                                        }
+                                        Image {
+                                            x: 6px;
+                                            y: 10px;
+                                            width: 16px;
+                                            height: 16px;
+                                            source: @image-url("../assets/circle-x.svg");
+                                            colorize: route-search-clear.has-hover ? Theme.text-secondary : Theme.text-muted;
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
+                                    }
+                                }
+
+                                route-search-cancel := FocusScope {
+                                    x: parent.width - self.width;
+                                    width: 60px;
+                                    height: 36px;
+                                    enabled: root.route-search-open;
+                                    focus-on-click: true;
+                                    focus-on-tab-navigation: true;
+                                    accessible-role: button;
+                                    accessible-label: "Закрыть поиск";
+                                    accessible-action-default => { root.close-route-search(); }
+                                    key-pressed(event) => {
+                                        if (event.text == " " || event.text == "\n") {
+                                            root.close-route-search();
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
+                                    Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: "Отмена";
+                                        color: search-cancel-touch.has-hover ? Theme.accent-blue-hover : Theme.accent-blue;
+                                        font-size: Theme.type-metadata-size;
+                                        font-weight: Theme.weight-semibold;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    Rectangle {
+                                        border-radius: 6px;
+                                        background: transparent;
+                                        border-color: Theme.focus;
+                                        border-width: parent.has-focus ? Theme.focus-width : 0px;
+                                    }
+                                    search-cancel-touch := TouchArea { clicked => { root.close-route-search(); } }
+                                }
+                            }
                             }
                             // Segmented control: one dark track, the selected group is a raised pill.
                             route-group-track := Rectangle {
@@ -1821,7 +2171,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if root.catalog-error != "" || root.latency-check-error != "": Text { min-height: 28px; text: root.catalog-error != "" ? root.catalog-error : root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                            ScrollView {
+                            if !root.route-search-results-shown: ScrollView {
                                 vertical-stretch: 1;
                                 VerticalLayout {
                                     // Full width: the card lines up with the connect module and
@@ -1854,6 +2204,76 @@ export component AppWindow inherits Window {
                                     }
                                     if root.catalog-nodes.length == 0: Text { height: 52px; text: root.catalog-loading ? "Загружаем маршруты…" : "В этой группе нет доступных серверов"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                                     }
+                                    }
+                                }
+                            }
+                            if root.route-search-results-shown: route-search-results := ScrollView {
+                                vertical-stretch: 1;
+                                opacity: root.route-search-entering ? 0 : 1;
+                                animate opacity { duration: 160ms; easing: ease-out; }
+                                VerticalLayout {
+                                    alignment: start;
+                                    spacing: 8px;
+                                    if root.route-search-loading: route-search-skeleton := Rectangle {
+                                        height: 144px;
+                                        background: Theme.surface;
+                                        border-color: #ffffff0a;
+                                        border-width: 1px;
+                                        border-radius: 14px;
+                                        clip: true;
+                                        VerticalLayout {
+                                            RouteSkeletonRow { label-width: 124px; pulsing: !root.reduced-motion; show-separator: true; }
+                                            RouteSkeletonRow { label-width: 92px; pulsing: !root.reduced-motion; show-separator: true; }
+                                            RouteSkeletonRow { label-width: 148px; pulsing: !root.reduced-motion; }
+                                        }
+                                    }
+                                    if !root.route-search-loading && root.route-search-hits.length == 0: route-search-empty := VerticalLayout {
+                                        padding-top: 48px;
+                                        spacing: 6px;
+                                        HorizontalLayout {
+                                            alignment: center;
+                                            Image { width: 28px; height: 28px; source: @image-url("../assets/search.svg"); colorize: Theme.text-muted; image-fit: contain; accessible-role: none; }
+                                        }
+                                        Text { text: "Ничего не найдено"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                                        Text { text: "Попробуйте другое название страны или сервера"; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: center; }
+                                    }
+                                    if !root.route-search-loading && root.route-search-hits.length > 0: route-search-card := Rectangle {
+                                        height: route-search-list.preferred-height;
+                                        background: Theme.surface;
+                                        border-color: #ffffff0a;
+                                        border-width: 1px;
+                                        border-radius: 14px;
+                                        clip: true;
+                                        route-search-list := VerticalLayout {
+                                            spacing: 0px;
+                                            for hit[index] in root.route-search-hits: RouteSearchRow {
+                                                icon: hit.icon;
+                                                icon-image: hit.icon-image;
+                                                prefix: hit.prefix;
+                                                matched: hit.matched;
+                                                suffix: hit.suffix;
+                                                group-label: hit.group-label;
+                                                latency-text: hit.latency-text;
+                                                latency-tone: hit.latency-tone;
+                                                selected: hit.selected;
+                                                show-separator: index < root.route-search-hits.length - 1;
+                                                enabled: root.catalog-selection-enabled && !root.profile-menu-open;
+                                                activated => {
+                                                    root.choose-route-search-hit(hit.group-id, hit.node-id);
+                                                    root.close-route-search();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !root.route-search-loading && root.route-search-hits.length > 0: HorizontalLayout {
+                                        padding-left: 4px;
+                                        route-search-count := Text {
+                                            text: "Найдено " + root.route-search-hits.length + " · поиск по всем группам";
+                                            color: Theme.text-muted;
+                                            font-size: Theme.type-metadata-size;
+                                            accessible-role: text;
+                                            accessible-live-region: polite;
+                                        }
                                     }
                                 }
                             }

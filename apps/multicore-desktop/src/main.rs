@@ -51,7 +51,7 @@ use view_model::{
     NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
     SemanticTone, SessionLine, SessionTraffic, StatePresentation, SubscriptionPresentation,
     SubscriptionProfileOperation, SubscriptionProfilesPresentation, derive_catalog_display,
-    split_leading_symbol,
+    search_routes, split_leading_symbol,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -837,6 +837,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_copy_diagnostics(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
+    wire_route_search(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     let _session_stats_timer = wire_session_stats(&ui, model.clone());
     wire_conflicting_apps_banner(&ui, model.clone());
@@ -3020,6 +3021,59 @@ fn wire_catalog_node(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     });
 }
 
+/// Route search on home filters every group's nodes locally: `/v1/catalog` already
+/// carries them all, so typing never waits on the daemon.
+fn wire_route_search(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    let search_model = model.clone();
+    ui.on_route_search_changed(move |query| {
+        let catalog = search_model
+            .lock()
+            .expect("view model lock")
+            .catalog_presentation();
+        if let Some(ui) = weak.upgrade() {
+            apply_route_search(&ui, &catalog, query.as_str());
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_choose_route_search_hit(move |group_id, node_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        // Same path as the tray: switch the viewed group first, then pick the node there.
+        let selected_group = model
+            .lock()
+            .expect("view model lock")
+            .catalog_presentation()
+            .selected_group_id;
+        if selected_group.as_deref() != Some(group_id.as_str()) {
+            ui.invoke_select_catalog_group(group_id);
+        }
+        ui.invoke_select_catalog_node(node_id);
+    });
+}
+
+fn apply_route_search(ui: &AppWindow, catalog: &CatalogPresentation, query: &str) {
+    ui.set_route_search_loading(catalog.loading && catalog.search_groups.is_empty());
+    let hits = search_routes(&catalog.search_groups, query)
+        .into_iter()
+        .map(|hit| UiRouteSearchHit {
+            icon_image: emoji_images::image_for(&hit.icon),
+            icon: hit.icon.into(),
+            group_id: hit.group_id.into(),
+            group_label: hit.group_label.into(),
+            node_id: hit.node_id.into(),
+            prefix: hit.prefix.into(),
+            matched: hit.matched.into(),
+            suffix: hit.suffix.into(),
+            selected: hit.selected,
+            latency_text: hit.latency_text.into(),
+            latency_tone: hit.latency_tone.into(),
+        })
+        .collect::<Vec<_>>();
+    ui.set_route_search_hits(ModelRc::new(VecModel::from(hits)));
+}
+
 fn wire_automatic_latency(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
@@ -4311,6 +4365,10 @@ fn exit_latency(nodes: &[UiCatalogNode], exit_name: &str) -> String {
 }
 
 fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
+    // Keep open search results in step with catalog and latency updates.
+    if ui.get_route_search_open() {
+        apply_route_search(ui, catalog, ui.get_route_search_query().as_str());
+    }
     let groups = catalog
         .groups
         .iter()
@@ -4681,7 +4739,8 @@ mod window_tests {
         let routes_header = ui
             .split("inline-routes := Rectangle")
             .nth(1)
-            .and_then(|source| source.split("ScrollView {").next())
+            // The heading row only: the search field that shares its slot follows it.
+            .and_then(|source| source.split("route-search-toggle := FocusScope").next())
             .expect("routes header source");
         // The bare date ("29.09.2026") next to "Маршруты" read as unexplained.
         assert!(routes_header.contains(": \"· Обновлено \" + root.subscription-updated;"));
