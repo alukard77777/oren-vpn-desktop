@@ -2395,3 +2395,27 @@ async fn import_succeeds_even_when_connection_preparation_fails() {
         before + 1
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_store_work_runs_off_the_async_workers_on_the_production_runtime() {
+    // The daemon runs on the multi-threaded runtime, where store I/O goes
+    // through `block_in_place`; this exercises exactly that path (the other
+    // tests use the current-thread runtime, where it runs inline).
+    let root = tempfile::tempdir().unwrap();
+    let backend = profile_backend(root.path());
+    let id = backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://one.invalid/sub".into(),
+        })
+        .await
+        .unwrap()
+        .active_profile_id
+        .unwrap();
+    assert_eq!(backend.list_subscriptions().unwrap().len(), 1);
+    backend
+        .refresh_subscription_profile(&profile_id(&id))
+        .await
+        .unwrap();
+    backend.delete_subscription(&profile_id(&id)).await.unwrap();
+    assert!(backend.list_subscriptions().unwrap().is_empty());
+}

@@ -2141,7 +2141,7 @@ where
                 },
             );
             let (selections, explicit_selections) =
-                initial_and_explicit_selections(&store, &id, revision, &snapshot);
+                run_blocking(|| initial_and_explicit_selections(&store, &id, revision, &snapshot));
             inner.apply_snapshot_without_controller(
                 id,
                 snapshot,
@@ -2166,7 +2166,7 @@ where
     }
 
     pub fn list_subscriptions(&self) -> Result<Vec<ProfileSummary>, ProfileMutationError> {
-        self.store.list().map_err(map_profile_error)
+        run_blocking(|| self.store.list()).map_err(map_profile_error)
     }
 
     #[doc(hidden)]
@@ -2210,9 +2210,8 @@ where
     fn subscription_list_dto(&self) -> Result<SubscriptionListDto, ProfileMutationError> {
         let mut active_profile_id = None;
         let mut index = 0;
-        let profiles = self
-            .store
-            .map_loaded(|loaded| {
+        let profiles = run_blocking(|| {
+            self.store.map_loaded(|loaded| {
                 let profile_index = index;
                 index += 1;
                 if loaded.summary.active {
@@ -2243,7 +2242,8 @@ where
                     service_logo_path,
                 }
             })
-            .map_err(map_profile_error)?;
+        })
+        .map_err(map_profile_error)?;
         Ok(SubscriptionListDto {
             active_profile_id,
             profiles,
@@ -2323,7 +2323,7 @@ where
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
         let (mut revision, physical_generation, mut snapshot) =
-            match self.store.profile_snapshot_generation(id) {
+            match run_blocking(|| self.store.profile_snapshot_generation(id)) {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     return Err(self
@@ -2335,11 +2335,11 @@ where
         let prepared = self
             .prepare_controller_or_defer("activate_prepare_deferred", &snapshot)
             .await;
-        let maintenance_debt = match self.store.activate(id) {
+        let maintenance_debt = match run_blocking(|| self.store.activate(id)) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => {
                 let (active_id, active_revision, _, active_snapshot) =
-                    match self.store.active_snapshot_generation() {
+                    match run_blocking(|| self.store.active_snapshot_generation()) {
                         Ok(Some(loaded)) => loaded,
                         Ok(None) | Err(_) => {
                             self.reconcile_authoritative().await;
@@ -2361,7 +2361,7 @@ where
             }
         };
         let (selections, explicit_selections) =
-            initial_and_explicit_selections(&self.store, id, revision, &snapshot);
+            run_blocking(|| initial_and_explicit_selections(&self.store, id, revision, &snapshot));
         let controller = prepared.as_ref().map(PreparedController::controller);
         {
             let mut state = self.inner.write().await;
@@ -2442,7 +2442,7 @@ where
         } else {
             false
         };
-        let maintenance_debt = match self.store.delete(id) {
+        let maintenance_debt = match run_blocking(|| self.store.delete(id)) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => true,
             Err(error) => {
@@ -2459,7 +2459,7 @@ where
             self.reconcile_authoritative().await;
         }
         if maintenance_debt {
-            let _ = self.store.cleanup_unindexed_profile(id);
+            let _ = run_blocking(|| self.store.cleanup_unindexed_profile(id));
         }
         if maintenance_debt {
             self.record_maintenance_debt("profile_delete").await;
@@ -2594,7 +2594,9 @@ where
 
     async fn reconcile_authoritative(&self) {
         let authoritative_id = self.store.active_id();
-        let loaded = self.store.active_snapshot_generation().ok().flatten();
+        let loaded = run_blocking(|| self.store.active_snapshot_generation())
+            .ok()
+            .flatten();
         match (&authoritative_id, &loaded) {
             (_, Some((id, _, physical_generation, snapshot))) => {
                 self.retain_profile_logo(id, *physical_generation, snapshot);
@@ -2605,8 +2607,9 @@ where
         let mut state = self.inner.write().await;
         state.clear_for_active(authoritative_id);
         if let Some((id, revision, _, snapshot)) = loaded {
-            let (selections, explicit_selections) =
-                initial_and_explicit_selections(&self.store, &id, revision, &snapshot);
+            let (selections, explicit_selections) = run_blocking(|| {
+                initial_and_explicit_selections(&self.store, &id, revision, &snapshot)
+            });
             state.apply_snapshot_without_controller(
                 id,
                 snapshot,
@@ -2649,7 +2652,7 @@ where
             self.reconcile_authoritative_unreadable().await;
             return Err(ProfileMutationError::Committed);
         }
-        match self.store.profile_snapshot_generation(id) {
+        match run_blocking(|| self.store.profile_snapshot_generation(id)) {
             Ok(loaded) => Ok(loaded),
             Err(_) => {
                 self.remove_profile_logo(id);
@@ -2666,7 +2669,7 @@ where
     where
         C: 'static,
     {
-        let (_, previous) = match self.store.profile_snapshot(id) {
+        let (_, previous) = match run_blocking(|| self.store.profile_snapshot(id)) {
             Ok(loaded) => loaded,
             Err(error) => {
                 return Err(self
@@ -2693,7 +2696,7 @@ where
         if source_url.is_empty() {
             return Err(ProfileMutationError::Storage);
         }
-        let (previous_revision, previous) = match self.store.profile_snapshot(id) {
+        let (previous_revision, previous) = match run_blocking(|| self.store.profile_snapshot(id)) {
             Ok(loaded) => loaded,
             Err(error) => {
                 return Err(self
@@ -2719,14 +2722,13 @@ where
             false
         };
         let (revision, physical_generation, persisted, maintenance_debt) =
-            match self.store.replace_profile_loaded(id, snapshot.clone()) {
+            match run_blocking(|| self.store.replace_profile_loaded(id, snapshot.clone())) {
                 Ok((revision, physical_generation, persisted)) => {
                     (revision, physical_generation, persisted, false)
                 }
                 Err(error) if error.mutation_committed() => {
                     let (revision, physical_generation, persisted) = if connected {
-                        self.store
-                            .profile_snapshot_generation(id)
+                        run_blocking(|| self.store.profile_snapshot_generation(id))
                             .map_err(|_| ProfileMutationError::Committed)?
                     } else {
                         self.profile_snapshot_after_commit(id).await?
@@ -2742,14 +2744,16 @@ where
                     });
                 }
             };
-        carry_forward_selections(
-            &self.store,
-            id,
-            previous_revision,
-            &previous,
-            revision,
-            &persisted,
-        )
+        run_blocking(|| {
+            carry_forward_selections(
+                &self.store,
+                id,
+                previous_revision,
+                &previous,
+                revision,
+                &persisted,
+            )
+        })
         .map_err(|_| ProfileMutationError::Committed)?;
         if self.post_commit_load_fault.swap(false, Ordering::SeqCst) {
             if connected {
@@ -2780,7 +2784,7 @@ where
             return Ok(state.status());
         }
         let (selections, explicit_selections) =
-            initial_and_explicit_selections(&self.store, id, revision, &persisted);
+            run_blocking(|| initial_and_explicit_selections(&self.store, id, revision, &persisted));
         let controller = prepared.as_ref().map(PreparedController::controller);
         {
             let mut state = self.inner.write().await;
@@ -2897,7 +2901,7 @@ where
         let prepared = self
             .prepare_controller_or_defer("import_prepare_deferred", &snapshot)
             .await;
-        let existing = match self.store.find_exact_source(trimmed_url) {
+        let existing = match run_blocking(|| self.store.find_exact_source(trimmed_url)) {
             Ok(existing) => existing,
             Err(error) => {
                 return Err(self
@@ -2906,7 +2910,7 @@ where
             }
         };
         let (id, maintenance_debt, previous) = if let Some(id) = existing {
-            let previous = match self.store.profile_snapshot(&id) {
+            let previous = match run_blocking(|| self.store.profile_snapshot(&id)) {
                 Ok(previous) => previous,
                 Err(error) => {
                     return Err(self
@@ -2914,22 +2918,23 @@ where
                         .await);
                 }
             };
-            let replace_debt = match self.store.replace_profile_loaded(&id, snapshot.clone()) {
-                Ok(_) => false,
-                Err(error) if error.mutation_committed() => {
-                    self.profile_snapshot_after_commit(&id).await?;
-                    true
-                }
-                Err(error) => {
-                    self.log_mutation_storage_failure(
-                        "import_replace_failed",
-                        error_chain_text(&error),
-                    )
-                    .await;
-                    return Err(map_profile_error(error));
-                }
-            };
-            let activate_debt = match self.store.activate(&id) {
+            let replace_debt =
+                match run_blocking(|| self.store.replace_profile_loaded(&id, snapshot.clone())) {
+                    Ok(_) => false,
+                    Err(error) if error.mutation_committed() => {
+                        self.profile_snapshot_after_commit(&id).await?;
+                        true
+                    }
+                    Err(error) => {
+                        self.log_mutation_storage_failure(
+                            "import_replace_failed",
+                            error_chain_text(&error),
+                        )
+                        .await;
+                        return Err(map_profile_error(error));
+                    }
+                };
+            let activate_debt = match run_blocking(|| self.store.activate(&id)) {
                 Ok(_) => false,
                 Err(error) if error.mutation_committed() => true,
                 Err(error) => {
@@ -2944,7 +2949,7 @@ where
             };
             (id, replace_debt || activate_debt, Some(previous))
         } else {
-            match self.store.create_profile(snapshot.clone()) {
+            match run_blocking(|| self.store.create_profile(snapshot.clone())) {
                 Ok(id) => (id, false, None),
                 Err(error) if error.mutation_committed() => {
                     let Some(id) = self.store.active_id() else {
@@ -2971,19 +2976,22 @@ where
         let (revision, physical_generation, persisted) =
             self.profile_snapshot_after_commit(&id).await?;
         if let Some((previous_revision, previous)) = previous {
-            carry_forward_selections(
-                &self.store,
-                &id,
-                previous_revision,
-                &previous,
-                revision,
-                &persisted,
-            )
+            run_blocking(|| {
+                carry_forward_selections(
+                    &self.store,
+                    &id,
+                    previous_revision,
+                    &previous,
+                    revision,
+                    &persisted,
+                )
+            })
             .map_err(|_| ProfileMutationError::Committed)?;
         }
         self.retain_profile_logo(&id, physical_generation, &persisted);
-        let (selections, explicit_selections) =
-            initial_and_explicit_selections(&self.store, &id, revision, &persisted);
+        let (selections, explicit_selections) = run_blocking(|| {
+            initial_and_explicit_selections(&self.store, &id, revision, &persisted)
+        });
         let controller = prepared.as_ref().map(PreparedController::controller);
         {
             let mut state = self.inner.write().await;
@@ -3025,6 +3033,20 @@ where
             return Err(ProfileMutationError::Storage);
         }
         Ok(self.current_status().await)
+    }
+}
+
+/// Runs profile-store work (synchronous disk I/O, possibly waiting out a
+/// transient Windows file lock) without stalling a tokio worker: on the
+/// multi-threaded runtime the daemon uses, the worker is handed off via
+/// `block_in_place`; elsewhere (current-thread test runtimes, where
+/// `block_in_place` would panic) it simply runs inline.
+fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
     }
 }
 
@@ -3662,12 +3684,14 @@ where
             return Err(SelectionError::StaleRevision);
         }
         if maintenance_debt && pending_snapshot.is_none() {
-            let (selected_nodes, explicit_selected_nodes) = initial_and_explicit_selections(
-                &self.store,
-                &active_profile_id,
-                request.revision,
-                &snapshot,
-            );
+            let (selected_nodes, explicit_selected_nodes) = run_blocking(|| {
+                initial_and_explicit_selections(
+                    &self.store,
+                    &active_profile_id,
+                    request.revision,
+                    &snapshot,
+                )
+            });
             state.selected_nodes = selected_nodes;
             state.explicit_selected_nodes = explicit_selected_nodes;
             state.current_node = state.selected_nodes.first().cloned().flatten();
