@@ -652,6 +652,10 @@ export component AppWindow inherits Window {
     in-out property <bool> announcement-open: false;
     // Fingerprint of the notice last shown (persisted); see announcement_fingerprint.
     in-out property <string> announcement-seen;
+    // Window growth from the expanded rail (logical px; 0 = none), persisted so a
+    // collapse after a restart still shrinks the window back.
+    in-out property <int> rail-growth-delta: 0;
+    in-out property <int> rail-grown-width: 0;
     in property <bool> conflicting-apps-banner-visible: false;
     in property <string> conflicting-apps-message;
     in-out property <bool> update-confirm-open: false;

@@ -52,6 +52,17 @@ pub struct AppPreferences {
     /// TUN (all traffic) or, when off, the system proxy without an administrator prompt.
     /// Applies from the next connect.
     pub tun_enabled: bool,
+    /// How much the window grew when the rail was expanded (logical px), so a
+    /// collapse after a restart can still shrink it back.
+    pub rail_growth: Option<RailGrowthPreference>,
+}
+
+/// Window growth from the expanded rail, in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RailGrowthPreference {
+    pub delta: u32,
+    pub grown_width: u32,
 }
 
 impl Default for AppPreferences {
@@ -70,6 +81,7 @@ impl Default for AppPreferences {
             navigation_collapsed: true,
             announcement_seen: None,
             tun_enabled: true,
+            rail_growth: None,
         }
     }
 }
@@ -598,7 +610,8 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        AppPreferences, PREFERENCES_SCHEMA_VERSION, PreferenceStore, VisiblePage, WindowBounds,
+        AppPreferences, PREFERENCES_SCHEMA_VERSION, PreferenceStore, RailGrowthPreference,
+        VisiblePage, WindowBounds,
     };
 
     #[test]
@@ -639,6 +652,10 @@ mod tests {
             navigation_collapsed: false,
             announcement_seen: Some("9f2c1d0a44b1e3c7".into()),
             tun_enabled: false,
+            rail_growth: Some(RailGrowthPreference {
+                delta: 176,
+                grown_width: 1016,
+            }),
         };
 
         store.save(&expected).unwrap();
@@ -670,6 +687,7 @@ mod tests {
                 navigation_collapsed: true,
                 announcement_seen: None,
                 tun_enabled: true,
+                rail_growth: None,
             }
         );
     }

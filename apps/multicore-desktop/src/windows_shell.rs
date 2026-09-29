@@ -586,7 +586,9 @@ pub fn rail_shrink_width(
     current_inner_width: u32,
 ) -> Option<u32> {
     let growth = growth?;
-    if maximized || growth.delta == 0 || current_inner_width != growth.grown_width {
+    // A couple of pixels of slack absorb rounding when the growth was restored
+    // from logical pixels on another scale factor.
+    if maximized || growth.delta == 0 || current_inner_width.abs_diff(growth.grown_width) > 2 {
         return None;
     }
     Some(current_inner_width.saturating_sub(growth.delta))
@@ -668,6 +670,8 @@ mod tests {
         };
         assert_eq!(rail_shrink_width(Some(growth), false, 1200), None);
         assert_eq!(rail_shrink_width(None, false, 1016), None);
+        // Growth restored from preferences tolerates scale rounding.
+        assert_eq!(rail_shrink_width(Some(growth), false, 1017), Some(841));
         let nothing = RailGrowth {
             delta: 0,
             grown_width: 840,
