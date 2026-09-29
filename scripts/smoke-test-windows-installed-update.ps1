@@ -252,13 +252,43 @@ try {
 
     $helper = Join-Path $testRoot 'multicore-apply.exe'
     Copy-Item -LiteralPath (Join-Path $current 'runtime\multicore-updater.exe') -Destination $helper
-    # Keep updater failure recovery inert: the updater helper exits immediately when launched
-    # without an apply request, unlike the real desktop which could start packaged sidecars.
-    Copy-Item -LiteralPath $helper -Destination (Join-Path $current 'MultiCore.exe') -Force
+    # The real desktop would start packaged sidecars, so MultiCore.exe is replaced by an inert
+    # x64 client. The updater keeps the previous version unless the client it launches confirms
+    # its start (as the real desktop does via updates\started-ok), so the stand-in writes that
+    # confirmation when the smoke asks for it and stays alive briefly; otherwise it just exits.
+    # Compiled out of process with the .NET Framework compiler so no process keeps it loaded.
+    $fakeClient = Join-Path $testRoot 'fake-client.exe'
+    $fakeClientSource = Join-Path $testRoot 'fake-client.cs'
+    [IO.File]::WriteAllText($fakeClientSource, @'
+using System;
+using System.IO;
+using System.Threading;
+
+public static class MultiCoreSmokeClient
+{
+    public static int Main()
+    {
+        string directory = Environment.GetEnvironmentVariable("MULTICORE_SMOKE_CONFIRM_DIR");
+        string version = Environment.GetEnvironmentVariable("MULTICORE_SMOKE_CONFIRM_VERSION");
+        if (String.IsNullOrEmpty(directory) || String.IsNullOrEmpty(version)) { return 0; }
+        string temporary = Path.Combine(directory, "started-ok.tmp");
+        string marker = Path.Combine(directory, "started-ok");
+        File.WriteAllText(temporary, version);
+        if (File.Exists(marker)) { File.Delete(marker); }
+        File.Move(temporary, marker);
+        Thread.Sleep(3000);
+        return 0;
+    }
+}
+'@, [Text.UTF8Encoding]::new($false))
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    Assert-True (Test-Path -LiteralPath $csc -PathType Leaf) 'the .NET Framework C# compiler is required'
+    & $csc /nologo /platform:x64 /target:winexe "/out:$fakeClient" $fakeClientSource | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $fakeClient -PathType Leaf)) 'inert smoke client was not compiled'
+    Copy-Item -LiteralPath $fakeClient -Destination (Join-Path $current 'MultiCore.exe') -Force
     $updatePayload = Join-Path $testRoot 'update-payload'
     Copy-Item -LiteralPath $package -Destination $updatePayload -Recurse
-    Copy-Item -LiteralPath (Join-Path $updatePayload 'runtime\multicore-updater.exe') `
-        -Destination (Join-Path $updatePayload 'MultiCore.exe') -Force
+    Copy-Item -LiteralPath $fakeClient -Destination (Join-Path $updatePayload 'MultiCore.exe') -Force
     $sumPath = Join-Path $updatePayload 'SHA256SUMS.txt'
     $sumLines = Get-ChildItem -LiteralPath $updatePayload -File -Recurse |
         Where-Object { $_.FullName -cne $sumPath } |
@@ -394,6 +424,9 @@ try {
     $previousLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
     try {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $testLocalAppData, 'Process')
+        # The updater keeps its state beside the archive; the stand-in client confirms there.
+        [Environment]::SetEnvironmentVariable('MULTICORE_SMOKE_CONFIRM_DIR', (Split-Path -Parent $archive), 'Process')
+        [Environment]::SetEnvironmentVariable('MULTICORE_SMOKE_CONFIRM_VERSION', '0.1.1', 'Process')
         $apply = Start-Process -FilePath $helper `
             -ArgumentList @(
                 '--wait-pid', '4294967295',
@@ -407,8 +440,16 @@ try {
             -Wait -PassThru -WindowStyle Hidden
     } finally {
         [Environment]::SetEnvironmentVariable('LOCALAPPDATA', $previousLocalAppData, 'Process')
+        [Environment]::SetEnvironmentVariable('MULTICORE_SMOKE_CONFIRM_DIR', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('MULTICORE_SMOKE_CONFIRM_VERSION', $null, 'Process')
     }
     Assert-True ($apply.ExitCode -eq 0) "packaged updater exited with $($apply.ExitCode)"
+    # The confirmed stand-in client lingers briefly from the install directory; let it exit
+    # before later steps (uninstall) need that directory free.
+    $installedClient = [IO.Path]::GetFullPath((Join-Path $current 'MultiCore.exe'))
+    @(Get-Process -Name 'MultiCore' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and [IO.Path]::GetFullPath($_.Path) -ieq $installedClient }) |
+        Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
 
     $protectedManifestAfter = Get-FileHashManifest -Root $testLocalAppData
     Assert-FileHashManifestEqual -Expected $protectedManifestBefore -Actual $protectedManifestAfter
