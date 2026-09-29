@@ -3372,8 +3372,23 @@ pub(crate) fn exit_now_display(exit_now: &str, exit_name: &str) -> Option<(Strin
         return None;
     }
     let (icon, name) = split_leading_symbol(exit_now);
+    let name = strip_country_tag(&name).to_owned();
     let (_, exit) = split_leading_symbol(exit_name);
     (!name.is_empty() && name != exit).then_some((icon, name))
+}
+
+/// Drops a trailing provider tag like " [se]" (the flag already says it).
+fn strip_country_tag(name: &str) -> &str {
+    let trimmed = name.trim_end();
+    if let Some(open) = trimmed.rfind(" [")
+        && trimmed.ends_with(']')
+    {
+        let tag = &trimmed[open + 2..trimmed.len() - 1];
+        if (2..=3).contains(&tag.len()) && tag.chars().all(|c| c.is_ascii_alphabetic()) {
+            return trimmed[..open].trim_end();
+        }
+    }
+    trimmed
 }
 
 /// Turns successive `/v1/session` samples into uptime and current speed. Speed is the byte
@@ -4509,6 +4524,20 @@ mod tests {
             .expect("automatic selected-group latency");
         assert_eq!(request.catalog_revision, Some(91));
         assert_eq!(request.group_ids, vec!["opaque:selected"]);
+    }
+
+    #[test]
+    fn exit_node_drops_the_provider_country_tag() {
+        assert_eq!(
+            exit_now_display("🇸🇪 Sweden [se]", "Auto Sweden"),
+            Some(("🇸🇪".into(), "Sweden".into()))
+        );
+        // Only a short alphabetic tag is a country code; other brackets stay.
+        assert_eq!(super::strip_country_tag("Node [premium]"), "Node [premium]");
+        assert_eq!(super::strip_country_tag("Node [2]"), "Node [2]");
+        assert_eq!(super::strip_country_tag("Germany [de] "), "Germany");
+        // The real node equal to the exit group name adds nothing.
+        assert_eq!(exit_now_display("🇸🇪 Sweden [se]", "🇸🇪 Sweden"), None);
     }
 
     #[test]

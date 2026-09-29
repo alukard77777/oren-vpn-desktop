@@ -547,6 +547,8 @@ pub fn next_maximized(current: bool) -> bool {
 /// what the content loses; the window grows by the whole expanded rail so the
 /// content keeps its collapsed-layout width).
 pub const EXPANDED_RAIL_WIDTH: u32 = 176;
+/// Collapsed (icon-only) rail width; the window grows by the difference.
+pub const COLLAPSED_RAIL_WIDTH: u32 = 64;
 
 /// How much a window grew when the rail expanded, so collapsing can undo it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

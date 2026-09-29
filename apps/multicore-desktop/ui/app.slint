@@ -1088,6 +1088,8 @@ export component AppWindow inherits Window {
     // Window growth from the expanded rail (logical px; 0 = none), persisted so a
     // collapse after a restart still shrinks the window back.
     in-out property <int> rail-growth-delta: 0;
+    // Host-driven rail width while the window resizes with it (negative = not driven).
+    in property <length> rail-width-live: -1px;
     in-out property <int> rail-grown-width: 0;
     in property <bool> conflicting-apps-banner-visible: false;
     in property <string> conflicting-apps-message;
@@ -1676,11 +1678,12 @@ export component AppWindow inherits Window {
                 spacing: 0px;
 
         navigation-rail := Rectangle {
-            width: root.navigation-collapsed ? 64px : 176px;
+            width: root.rail-width-live >= 0px ? root.rail-width-live : root.navigation-collapsed ? 64px : 176px;
             background: #0a0c0f;
             border-color: Theme.line;
             border-width: 0px;
-            animate width { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+            // Host-driven frames are already eased; only animate on its own.
+            animate width { duration: root.rail-width-live >= 0px ? 0ms : 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
             Rectangle { x: parent.width - 1px; y: 0; width: 1px; height: parent.height; background: Theme.line; }
 
@@ -1942,7 +1945,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-primary;
                                         font-size: Theme.type-value-size;
                                         font-weight: Theme.weight-semibold;
-                                        vertical-alignment: bottom;
+                                        vertical-alignment: center;
                                         overflow: elide;
                                     }
                                     // Fixed slot: proportional digits would otherwise nudge the
@@ -1954,7 +1957,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-secondary;
                                         font-size: 13px;
                                         font-weight: Theme.weight-regular;
-                                        vertical-alignment: bottom;
+                                        vertical-alignment: center;
                                         accessible-label: "Время сессии " + root.session-uptime;
                                     }
                                 }
@@ -2026,10 +2029,12 @@ export component AppWindow inherits Window {
                                     height: parent.height;
                                     border-radius: self.height / 2;
                                     background: root.toggle-busy ? #4c9dff59
-                                        : root.toggle-on ? Theme.accent-green
-                                        : Theme.line;
-                                    border-color: Theme.focus;
-                                    border-width: power-action.has-focus ? Theme.focus-width : 0px;
+                                        : root.toggle-on ? (strip-glow-touch.has-hover ? #4ad98c : Theme.accent-green)
+                                        : (strip-glow-touch.has-hover ? #3a414b : Theme.line);
+                                    border-color: power-action.has-focus ? Theme.focus : #ffffff59;
+                                    border-width: power-action.has-focus ? Theme.focus-width
+                                        : strip-glow-touch.has-hover && root.primary-enabled ? 2px : 0px;
+                                    animate border-width { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                                     opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;
                                     animate opacity { duration: 180ms; easing: ease-in-out; }
                                     animate background { duration: 180ms; easing: ease-in-out; }
@@ -2037,9 +2042,9 @@ export component AppWindow inherits Window {
                                     toggle-knob := Rectangle {
                                         x: root.toggle-on ? parent.width - self.width - 4px : 4px;
                                         y: (parent.height - self.height) / 2;
-                                        width: strip-glow-touch.pressed ? 36px : 32px;
-                                        height: 32px;
-                                        border-radius: 16px;
+                                        width: strip-glow-touch.pressed ? 36px : strip-glow-touch.has-hover ? 33px : 32px;
+                                        height: strip-glow-touch.has-hover ? 33px : 32px;
+                                        border-radius: self.height / 2;
                                         background: #ffffff;
                                         drop-shadow-blur: 6px;
                                         drop-shadow-offset-y: 2px;
@@ -2054,6 +2059,7 @@ export component AppWindow inherits Window {
                         // This is the pill's only pointer surface. It sits above every visual
                         // child, so crossing the power icon never hands hover to another area.
                         strip-glow-touch := TouchArea {
+                            mouse-cursor: root.primary-enabled ? pointer : default;
                             x: 0;
                             y: 0;
                             width: root.has-profile ? parent.width : 0px;

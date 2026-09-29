@@ -732,6 +732,28 @@ fn render_ui_previews() {
         capture(&ui, name, width, height);
     }
 
+    // One window through expand → collapse, like a user toggling the rail while
+    // the window grows and shrinks with it: the list must reflow both ways.
+    let ui = AppWindow::new().expect("create app window");
+    connected(&ui);
+    ui.set_navigation_collapsed(false);
+    capture(&ui, "rail-sequence-1-expanded", 1016, 720);
+    ui.set_navigation_collapsed(true);
+    capture(&ui, "rail-sequence-2-collapsed", 840, 720);
+
+    // Real-world exit line (long node + group + speeds) at the minimum window size
+    // must elide inside the card instead of widening the layout past the window.
+    let ui = AppWindow::new().expect("create app window");
+    connected(&ui);
+    ui.set_node_name(s("Auto Sweden"));
+    ui.set_exit_now_name(s("Sweden [se]"));
+    ui.set_exit_now_icon_image(crate::emoji_images::image_for("🇸🇪"));
+    ui.set_node_latency(s("94 ms"));
+    ui.set_traffic_down(s("1016 Б/с"));
+    ui.set_traffic_up(s("0 Б/с"));
+    ui.set_session_uptime(s("00:00:32"));
+    capture(&ui, "home-long-exit-min", 700, 620);
+
     let (groups, nodes) = tray_rows();
     let popup = TrayPopup::new().expect("create tray popup");
     popup.set_status_text(s("Подключено · Автовыбор"));

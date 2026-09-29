@@ -57,11 +57,11 @@ use view_model::{
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
-    CloseDisposition, EXPANDED_RAIL_WIDTH, MinimizeDisposition, MonitorRect, MonitorSignature,
-    PhysicalPosition, RAIL_RESIZE_MS, RailGrowth, apply_tray_popup_native_rounding,
-    close_disposition, minimize_disposition, monitor_cap_changed, next_maximized,
-    parse_resize_edge, place_tray_popup, rail_grow_delta, rail_resize_frame, rail_shrink_width,
-    restore_placement,
+    COLLAPSED_RAIL_WIDTH, CloseDisposition, EXPANDED_RAIL_WIDTH, MinimizeDisposition, MonitorRect,
+    MonitorSignature, PhysicalPosition, RAIL_RESIZE_MS, RailGrowth,
+    apply_tray_popup_native_rounding, close_disposition, minimize_disposition, monitor_cap_changed,
+    next_maximized, parse_resize_edge, place_tray_popup, rail_grow_delta, rail_resize_frame,
+    rail_shrink_width, restore_placement,
 };
 
 slint::include_modules!();
@@ -1578,7 +1578,9 @@ fn resize_for_rail(
     else {
         return None;
     };
-    let wanted = (f64::from(EXPANDED_RAIL_WIDTH) * window.scale_factor()).round() as u32;
+    // Grow by exactly what the rail gains, so the content keeps its width.
+    let wanted = (f64::from(EXPANDED_RAIL_WIDTH - COLLAPSED_RAIL_WIDTH) * window.scale_factor())
+        .round() as u32;
     let delta = rail_grow_delta(
         maximized,
         outer_position.x,
@@ -1619,6 +1621,13 @@ fn animate_rail_resize(
         return;
     }
     animation.1.set(Some(to));
+    // The rail follows the same eased progress as the window, frame by frame.
+    let (rail_from, rail_to) = if to > from {
+        (COLLAPSED_RAIL_WIDTH, EXPANDED_RAIL_WIDTH)
+    } else {
+        (EXPANDED_RAIL_WIDTH, COLLAPSED_RAIL_WIDTH)
+    };
+    ui.set_rail_width_live(rail_from as f32);
     let started = std::time::Instant::now();
     let weak = ui.as_weak();
     let state = std::rc::Rc::downgrade(animation);
@@ -1633,6 +1642,10 @@ fn animate_rail_resize(
             if elapsed >= RAIL_RESIZE_MS {
                 state.0.stop();
                 state.1.set(None);
+                ui.set_rail_width_live(-1.0);
+            } else {
+                let rail = rail_resize_frame(rail_from, rail_to, elapsed, RAIL_RESIZE_MS);
+                ui.set_rail_width_live(rail as f32);
             }
         });
 }
@@ -2063,6 +2076,7 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
         // Land an in-flight animation first, so the new toggle measures real sizes.
         if let Some(target) = rail_animation.1.take() {
             rail_animation.0.stop();
+            ui.set_rail_width_live(-1.0);
             let _ = ui.window().with_winit_window(|window| {
                 let height = window.inner_size().height;
                 let _ = window.request_inner_size(slint::winit_030::winit::dpi::PhysicalSize::new(
