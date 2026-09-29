@@ -204,6 +204,16 @@ pub struct DiagnosticsDto {
     pub mappings: Vec<ProxyMappingDto>,
 }
 
+/// The live connection's session: when it started and Mihomo's cumulative byte counters,
+/// from which a client derives uptime and current speed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionDto {
+    pub connected_since_unix_ms: u64,
+    /// Absent when the Mihomo controller could not be read this time.
+    pub download_total: Option<u64>,
+    pub upload_total: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogDto {
     pub revision: u64,
@@ -364,6 +374,26 @@ impl fmt::Display for LatencyError {
 impl std::error::Error for LatencyError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionError {
+    NotConnected,
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("no live connection session")
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+/// Mihomo's cumulative traffic counters since its start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrafficTotals {
+    pub download: u64,
+    pub upload: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LatencyProbeError {
     Timeout,
     Unavailable,
@@ -409,6 +439,10 @@ pub trait MihomoSelector: Send + Sync + 'static {
 
     async fn probe_latency(&self, _raw_name: &str) -> Result<u64, LatencyProbeError> {
         Err(LatencyProbeError::Unavailable)
+    }
+
+    async fn traffic_totals(&self) -> Result<TrafficTotals, SelectorError> {
+        Err(SelectorError::new())
     }
 }
 
@@ -569,6 +603,45 @@ impl MihomoSelector for MihomoHttpSelector {
             .and_then(|value| value.get("delay").and_then(serde_json::Value::as_u64))
             .ok_or(LatencyProbeError::Unavailable)
     }
+
+    async fn traffic_totals(&self) -> Result<TrafficTotals, SelectorError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ConnectionsTotals {
+            download_total: u64,
+            upload_total: u64,
+        }
+
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| SelectorError::new())?
+            .push("connections");
+        let mut response = self
+            .client
+            .get(url)
+            .header(header::AUTHORIZATION, self.authorization.clone())
+            .send()
+            .await
+            .map_err(|_| SelectorError::new())?;
+        if response.status() != StatusCode::OK {
+            return Err(SelectorError::new());
+        }
+        // The body also lists every open connection; busy sessions reach a few MiB.
+        const MAX_CONNECTIONS_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| SelectorError::new())? {
+            if body.len().saturating_add(chunk.len()) > MAX_CONNECTIONS_RESPONSE_BYTES {
+                return Err(SelectorError::new());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let totals: ConnectionsTotals =
+            serde_json::from_slice(&body).map_err(|_| SelectorError::new())?;
+        Ok(TrafficTotals {
+            download: totals.download_total,
+            upload: totals.upload_total,
+        })
+    }
 }
 
 async fn probe_latency_target(
@@ -652,6 +725,9 @@ pub trait Backend: Send + Sync + 'static {
     async fn events_after(&self, after: u64) -> Result<Vec<EventDto>, BackendError>;
     async fn diagnostics(&self) -> Result<DiagnosticsDto, BackendError> {
         Ok(DiagnosticsDto::default())
+    }
+    async fn session(&self) -> Result<SessionDto, SessionError> {
+        Err(SessionError::NotConnected)
     }
 }
 
@@ -772,6 +848,7 @@ where
         .route("/events", get(events))
         .route("/diagnostics", get(diagnostics))
         .route("/dashboard-url", get(dashboard_url_handler))
+        .route("/session", get(session))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1371,6 +1448,22 @@ async fn dashboard_url_handler(
     }))
 }
 
+async fn session(State(state): State<AppState>, body: Bytes) -> Result<Json<SessionDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    state
+        .backend
+        .session()
+        .await
+        .map(Json)
+        .map_err(|SessionError::NotConnected| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "not_connected",
+                "Сначала установите подключение.",
+            )
+        })
+}
+
 fn reject_nonempty_body(body: &Bytes) -> Result<(), ApiError> {
     if body.is_empty() {
         Ok(())
@@ -1761,6 +1854,9 @@ struct CoreRuntime<P: ProcessController> {
     explicit_selected_nodes: Vec<Option<String>>,
     message: Option<String>,
     degraded: bool,
+    /// Set on every transition into Connected (the only one is `connect`); only read while
+    /// Connected, so a value left from an earlier session is never reported.
+    connected_since_unix_ms: u64,
     events: EventBuffer<Event>,
 }
 
@@ -1782,6 +1878,7 @@ impl<P: ProcessController> CoreRuntime<P> {
             explicit_selected_nodes: Vec::new(),
             message: None,
             degraded: false,
+            connected_since_unix_ms: 0,
             events: EventBuffer::default(),
         }
     }
@@ -3458,6 +3555,7 @@ where
                     .state
                     .transition(CoreConnectionState::Connected)
                     .map_err(|_| BackendError::new())?;
+                state.connected_since_unix_ms = unix_timestamp_ms();
                 state.message = None;
                 state.degraded = false;
                 state.push_event(
@@ -3729,6 +3827,22 @@ where
             );
         }
         Ok(state.catalog.clone())
+    }
+
+    async fn session(&self) -> Result<SessionDto, SessionError> {
+        let connected_since_unix_ms = {
+            let state = self.inner.read().await;
+            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+                return Err(SessionError::NotConnected);
+            }
+            state.connected_since_unix_ms
+        };
+        let totals = self.selector.traffic_totals().await.ok();
+        Ok(SessionDto {
+            connected_since_unix_ms,
+            download_total: totals.map(|totals| totals.download),
+            upload_total: totals.map(|totals| totals.upload),
+        })
     }
 
     async fn latencies(&self, request: LatencyRequest) -> Result<LatencyResponseDto, LatencyError> {
