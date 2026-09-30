@@ -2190,10 +2190,14 @@ impl DesktopViewModel {
         if self.latency_request_pending.is_some() {
             return None;
         }
-        self.begin_latency_request()
+        self.begin_latency_request_for(true)
     }
 
     pub(crate) fn begin_latency_request(&mut self) -> Option<LatencyRequest> {
+        self.begin_latency_request_for(false)
+    }
+
+    fn begin_latency_request_for(&mut self, all_groups: bool) -> Option<LatencyRequest> {
         self.latency_error = None;
         if self.latency_request_pending.is_some()
             || self.profile_mutation_pending()
@@ -2208,7 +2212,14 @@ impl DesktopViewModel {
             self.latency_queued = true;
             return None;
         }
-        let group_ids = vec![self.selected_catalog_group.clone()?];
+        let group_ids = if all_groups {
+            self.catalog_groups
+                .iter()
+                .map(|group| group.id.clone())
+                .collect()
+        } else {
+            vec![self.selected_catalog_group.clone()?]
+        };
         self.next_latency_generation = self.next_latency_generation.wrapping_add(1);
         let token = LatencyRequestToken(self.next_latency_generation);
         self.latency_request_pending = Some(token);
@@ -6299,7 +6310,8 @@ mod tests {
         let request = view_model
             .begin_forced_latency_request()
             .expect("forced request with warm cores");
-        assert_eq!(request.group_ids, vec!["opaque:selected"]);
+        // The manual speedtest covers every group, not only the visible one.
+        assert_eq!(request.group_ids, vec!["opaque:first", "opaque:selected"]);
         assert!(view_model.latency_presentation().loading);
         // Pressed again while loading: ignored, nothing queued for later.
         assert!(view_model.begin_forced_latency_request().is_none());

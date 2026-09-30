@@ -5185,6 +5185,11 @@ mod window_tests {
         // Latency progress is shown in place of the timestamp, not as extra chrome.
         assert!(routes_header.contains("root.latency-check-loading ? \"· Замеряем задержку…\""));
         assert!(!routes_header.contains("catalog-selection-queued"));
+        // Connection card lifts on hover and the mesh/rail decoration fades, not pops.
+        assert!(ui.contains("drop-shadow-blur: strip-glow-touch.has-hover ? 20px : 0px;"));
+        assert!(ui.contains("animate drop-shadow-blur, drop-shadow-offset-y, drop-shadow-color { duration: 180ms; easing: ease-out; }"));
+        assert!(ui.contains("animate opacity { duration: 260ms; easing: ease-out; }"));
+        assert!(ui.contains("animate opacity, background { duration: 260ms; easing: ease-out; }"));
         // Speedtest button beside search: same 32x36 hit area, accent ring only while loading.
         let speedtest = ui
             .split("latency-check-toggle := FocusScope")

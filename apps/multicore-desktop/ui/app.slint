@@ -1883,7 +1883,13 @@ export component AppWindow inherits Window {
                         border-width: 1px;
                         border-radius: 14px;
                         clip: true;
+                        // Lifts slightly under the pointer; nothing is drawn (blur 0, transparent)
+                        // at rest, and the software renderer simply ignores the shadow.
+                        drop-shadow-blur: strip-glow-touch.has-hover ? 20px : 0px;
+                        drop-shadow-offset-y: strip-glow-touch.has-hover ? 6px : 0px;
+                        drop-shadow-color: strip-glow-touch.has-hover ? #00000073 : #00000000;
                         animate border-color { duration: 220ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                        animate drop-shadow-blur, drop-shadow-offset-y, drop-shadow-color { duration: 180ms; easing: ease-out; }
 
                         // Only the cell mesh reacts to hover. An outer halo would be clipped by
                         // the main-content plane and read as a rectangular light patch.
@@ -1911,7 +1917,7 @@ export component AppWindow inherits Window {
                                     glow-soft 52%,
                                     #00000000 76%
                                 );
-                                animate opacity { duration: 160ms; easing: ease-out; }
+                                animate opacity { duration: 260ms; easing: ease-out; }
 
                                 for _[grid-x] in 120: Rectangle {
                                     x: grid-x * 8px;
@@ -2135,7 +2141,7 @@ export component AppWindow inherits Window {
                                             background: #ffffff;
                                             // Gloss only on the lit (green) rail; busy and off stay matte.
                                             opacity: root.shown-on && !root.shown-busy ? 0.14 : 0;
-                                            animate opacity { duration: 220ms; easing: ease-out; }
+                                            animate opacity { duration: 260ms; easing: ease-out; }
                                         }
                                         // Energy dots along the lit rail.
                                         for dot[i] in 2: Rectangle {
@@ -2146,7 +2152,7 @@ export component AppWindow inherits Window {
                                             border-radius: 2px;
                                             background: root.shown-busy ? Theme.accent-blue : #ffffff;
                                             opacity: root.shown-on || root.shown-busy ? 0.85 - i * 0.35 : 0;
-                                            animate opacity { duration: 220ms; easing: ease-out; }
+                                            animate opacity, background { duration: 260ms; easing: ease-out; }
                                         }
                                     }
 
