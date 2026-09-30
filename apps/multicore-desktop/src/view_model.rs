@@ -4953,7 +4953,18 @@ mod tests {
             .split("export component RouteNodeRow")
             .nth(1)
             .expect("route row source");
-        assert!(route_row.contains("x: parent.width - self.width - (root.pending ? 44px : 20px);"));
+        assert!(route_row.contains("property <length> trailing-inset: root.pending ? 44px : 20px;"));
+        assert!(route_row.contains("x: parent.width - self.width - root.trailing-inset;"));
+        // The latency column must track the window edge while it is dragged:
+        // animating x (rather than just the pending inset) lags behind every
+        // resize and freezes inside the Windows modal size loop.
+        let trailing_label = route_row
+            .split("trailing-label := Text {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .expect("trailing label source");
+        assert!(!trailing_label.contains("animate x"));
+        assert!(route_row.contains("animate trailing-inset {"));
         assert!(route_row.contains("parent.width - self.x - trailing-label.width - 36px"));
         assert!(!route_row.contains("trailing-label.width - (root.selected"));
         assert!(!route_row.contains("self.width - (root.selected"));

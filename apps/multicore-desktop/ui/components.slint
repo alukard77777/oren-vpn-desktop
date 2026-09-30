@@ -325,12 +325,20 @@ export component RouteNodeRow inherits Rectangle {
         accessible-role: none;
     }
 
+    // Only the shift that makes room for the pending "…" is animated, never x
+    // itself: x follows the window width, and an `animate x` would ease every
+    // resize step behind the edge. On Windows it froze outright while the edge
+    // was dragged, because Slint's animation clock only advances between
+    // winit event-loop iterations and the system's modal size loop runs none,
+    // so the column jumped into place only when the mouse was released.
+    property <length> trailing-inset: root.pending ? 44px : 20px;
+    animate trailing-inset { duration: 140ms; easing: ease-out; }
+
     trailing-label := Text {
-        x: parent.width - self.width - (root.pending ? 44px : 20px);
+        x: parent.width - self.width - root.trailing-inset;
         width: 76px;
         height: parent.height;
         text: root.trailing-text;
-        animate x { duration: 140ms; easing: ease-out; }
         color: root.trailing-tone == "success"
             ? Theme.accent-green
             : root.trailing-tone == "warning"
