@@ -1,5 +1,6 @@
 pub mod connection_mode;
 pub mod elevated_controller;
+pub mod service_client;
 pub mod system_proxy;
 
 use std::{
@@ -4342,6 +4343,7 @@ fn start_failure_message(
         Cause::ReadinessTimedOut => {
             format!("{core} не успел запуститься вовремя. Повторите попытку.")
         }
+        Cause::ServiceBusy => "MultiCore уже запущен у другого пользователя.".to_owned(),
         Cause::Unknown => {
             "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
         }
