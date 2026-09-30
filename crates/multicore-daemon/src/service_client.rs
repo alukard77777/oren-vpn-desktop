@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -183,22 +183,65 @@ pub trait ServiceConnector: Send + Sync + 'static {
     fn connect(&self) -> Result<Self::Transport, ServiceError>;
 }
 
-/// How long to wait for the service's answer to `command`.
+/// How long to wait for the service's answer to `command`. A timed-out exchange drops the
+/// channel (the framing is lost), and a dropped channel makes the service stop the cores, so
+/// even the read-only commands get a generous budget.
 #[must_use]
 pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
     match command {
         ServiceCommand::Prepare { .. } => CORE_READINESS_TIMEOUT * 2 + Duration::from_secs(10),
         ServiceCommand::SetTun { .. } => Duration::from_secs(25),
         ServiceCommand::Update { .. } => Duration::from_secs(15 * 60),
+        ServiceCommand::Status | ServiceCommand::Diagnostics => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     }
 }
+
+/// What a probe found: the service to use, nothing installed (or installed for another copy
+/// of MultiCore), or an installed service that cannot be reached right now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceMode {
+    Service,
+    Unavailable,
+    Absent,
+}
+
+impl ServiceMode {
+    #[must_use]
+    pub fn from_probe(result: Result<(), ServiceError>) -> Self {
+        match result {
+            // Busy: the service is there; Prepare reports the other user.
+            Ok(()) | Err(ServiceError::Busy) => Self::Service,
+            Err(
+                ServiceError::NotInstalled
+                | ServiceError::Rejected(BrokerErrorCode::AuthenticationFailed),
+            ) => Self::Absent,
+            Err(_) => Self::Unavailable,
+        }
+    }
+}
+
+/// What the daemon currently carries through the service: nothing, the system proxy on the
+/// service's mixed port (TUN off), or the tunnel.
+const IN_USE_NONE: u8 = 0;
+const IN_USE_PROXY: u8 = 1;
+const IN_USE_TUN: u8 = 2;
+
+/// Controller address, token and mixed port of a prepared generation.
+type Endpoint = (SocketAddr, Arc<str>, Option<u16>);
 
 pub struct ServiceSession<C: ServiceConnector> {
     connector: C,
     transport: Mutex<Option<C::Transport>>,
     prepared: Mutex<Option<u64>>,
+    /// The endpoint of the prepared generation, re-published when `Prepare` is a no-op.
+    endpoint: Mutex<Option<Endpoint>>,
+    /// The generation whose last `Prepare` the service rejected; it must be re-staged.
+    rejected: Mutex<Option<u64>>,
     healthy: AtomicBool,
+    tun_on: AtomicBool,
+    in_use: AtomicU8,
+    available: AtomicBool,
     controller: Arc<ControllerSlot>,
 }
 
@@ -208,7 +251,12 @@ impl<C: ServiceConnector> ServiceSession<C> {
             connector,
             transport: Mutex::new(None),
             prepared: Mutex::new(None),
+            endpoint: Mutex::new(None),
+            rejected: Mutex::new(None),
             healthy: AtomicBool::new(false),
+            tun_on: AtomicBool::new(false),
+            in_use: AtomicU8::new(IN_USE_NONE),
+            available: AtomicBool::new(false),
             controller,
         }
     }
@@ -222,15 +270,19 @@ impl<C: ServiceConnector> ServiceSession<C> {
             *prepared = None;
         }
         self.healthy.store(false, Ordering::Release);
+        self.tun_on.store(false, Ordering::Release);
     }
 
-    /// Sends `command`, connecting first when `connect` allows it. A failed exchange drops the
-    /// channel; the service then stops the cores, so the prepared generation is forgotten.
-    fn request(
+    /// Sends `command`, connecting first when `connect` allows it, and hands the answer to
+    /// `record` while the channel is still held, so readiness bookkeeping never interleaves
+    /// with another exchange. A failed exchange drops the channel; the service then stops the
+    /// cores, so the prepared generation is forgotten.
+    fn exchange<R>(
         &self,
         command: &ServiceCommand,
         connect: bool,
-    ) -> Result<ServiceResponse, ServiceError> {
+        record: impl FnOnce(&Self, &ServiceResponse) -> R,
+    ) -> Result<R, ServiceError> {
         let mut transport = self
             .transport
             .lock()
@@ -246,85 +298,200 @@ impl<C: ServiceConnector> ServiceSession<C> {
             .as_ref()
             .expect("service transport exists")
             .request(command);
-        if result.is_err() {
-            transport.take();
-            self.forget();
-        }
-        match result? {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                transport.take();
+                self.forget();
+                return Err(error);
+            }
+        };
+        match response {
             ServiceResponse::Busy => Err(ServiceError::Busy),
             ServiceResponse::Error { code } => Err(ServiceError::Rejected(code)),
-            response => Ok(response),
+            response => Ok(record(self, &response)),
         }
     }
 
+    fn request(
+        &self,
+        command: &ServiceCommand,
+        connect: bool,
+    ) -> Result<ServiceResponse, ServiceError> {
+        self.exchange(command, connect, |_, response| response.clone())
+    }
+
+    fn has_channel(&self) -> bool {
+        self.transport
+            .lock()
+            .map(|transport| transport.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn probe(&self) -> Result<(), ServiceError> {
-        match self.request(&ServiceCommand::Status, true)? {
+        let had_channel = self.has_channel();
+        let result = match self.request(&ServiceCommand::Status, true) {
+            // A channel that died since its last use says nothing about the service: retry on
+            // a fresh one.
+            Err(ServiceError::Disconnected | ServiceError::TimedOut) if had_channel => {
+                self.request(&ServiceCommand::Status, true)
+            }
+            result => result,
+        };
+        match result? {
             ServiceResponse::Status { .. } => Ok(()),
             _ => Err(ServiceError::Protocol),
         }
     }
 
+    /// Probes the service and remembers whether it can be used right now. Called on every
+    /// Connect and by the background watcher, so a service that starts after the app is
+    /// picked up without a restart.
+    pub fn probe_mode(&self) -> ServiceMode {
+        let mode = ServiceMode::from_probe(self.probe());
+        self.available
+            .store(mode == ServiceMode::Service, Ordering::Release);
+        mode
+    }
+
+    /// The last probe found the service usable.
+    #[must_use]
+    pub fn service_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, endpoint: &Endpoint) {
+        self.controller.set(endpoint.0, &endpoint.1, endpoint.2);
+    }
+
     pub fn prepare(&self, generation: u64) -> Result<(), ServiceError> {
         if self.prepared_generation() == Some(generation) && self.healthy.load(Ordering::Acquire) {
+            // The slot may have been pointed at an on-demand controller meanwhile.
+            if let Some(endpoint) = self.endpoint.lock().ok().and_then(|value| value.clone()) {
+                self.publish(&endpoint);
+            }
             return Ok(());
         }
-        match self.request(
+        let result = self.exchange(
             &ServiceCommand::Prepare {
                 generation_id: generation,
             },
             true,
-        )? {
-            ServiceResponse::Prepared {
-                generation_id,
-                controller,
-            } if generation_id == generation => {
-                self.controller.set(
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, controller.port)),
-                    &controller.secret,
-                    // 0 is a TUN-form generation: the service opened no mixed port.
-                    Some(controller.mixed_port).filter(|port| *port != 0),
-                );
-                if let Ok(mut prepared) = self.prepared.lock() {
-                    *prepared = Some(generation);
+            |session, response| match response {
+                ServiceResponse::Prepared {
+                    generation_id,
+                    controller,
+                } if *generation_id == generation => {
+                    let endpoint = (
+                        SocketAddr::from((Ipv4Addr::LOCALHOST, controller.port)),
+                        Arc::<str>::from(controller.secret.as_str()),
+                        // 0 is a TUN-form generation: the service opened no mixed port.
+                        Some(controller.mixed_port).filter(|port| *port != 0),
+                    );
+                    session.publish(&endpoint);
+                    if let Ok(mut stored) = session.endpoint.lock() {
+                        *stored = Some(endpoint);
+                    }
+                    if let Ok(mut prepared) = session.prepared.lock() {
+                        *prepared = Some(generation);
+                    }
+                    if let Ok(mut rejected) = session.rejected.lock() {
+                        *rejected = None;
+                    }
+                    session.healthy.store(true, Ordering::Release);
+                    Ok(())
                 }
-                self.healthy.store(true, Ordering::Release);
-                Ok(())
-            }
-            _ => Err(ServiceError::Protocol),
+                _ => Err(ServiceError::Protocol),
+            },
+        );
+        let result = result.and_then(|result| result);
+        if let Err(ServiceError::Rejected(_) | ServiceError::Protocol | ServiceError::TimedOut) =
+            result
+            && let Ok(mut rejected) = self.rejected.lock()
+        {
+            *rejected = Some(generation);
         }
+        result
+    }
+
+    /// The service rejected the last `Prepare` of `generation` (a port taken, a core that
+    /// failed to start): reusing it would fail the same way.
+    #[must_use]
+    pub fn prepare_failed(&self, generation: u64) -> bool {
+        self.rejected
+            .lock()
+            .map(|rejected| *rejected == Some(generation))
+            .unwrap_or(false)
     }
 
     pub fn set_tun(&self, on: bool) -> Result<(), ServiceError> {
-        match self.request(&ServiceCommand::SetTun { on }, false)? {
-            ServiceResponse::TunState { on: actual } if actual == on => Ok(()),
-            _ => Err(ServiceError::Protocol),
-        }
+        self.exchange(
+            &ServiceCommand::SetTun { on },
+            false,
+            |session, response| {
+                match response {
+                    ServiceResponse::TunState { on: actual } => {
+                        session.tun_on.store(*actual, Ordering::Release);
+                        if *actual == on {
+                            Ok(())
+                        } else if on {
+                            // The service rolled the tunnel back: the adapter never came up.
+                            Err(ServiceError::Rejected(BrokerErrorCode::TimedOut))
+                        } else {
+                            Err(ServiceError::Protocol)
+                        }
+                    }
+                    _ => Err(ServiceError::Protocol),
+                }
+            },
+        )?
     }
 
     /// Refreshes readiness from `Status` over an existing channel (never connects).
     pub fn poll(&self) {
-        let healthy = match self.request(&ServiceCommand::Status, false) {
-            Ok(ServiceResponse::Status {
+        let result = self.exchange(&ServiceCommand::Status, false, |session, response| {
+            if let ServiceResponse::Status {
                 generation_id,
                 xray,
                 mihomo,
+                tun_on,
                 failure,
-                ..
-            }) => {
-                failure.is_none()
-                    && xray == ElevatedRuntimeState::Ready
-                    && mihomo == ElevatedRuntimeState::Ready
+            } = response
+            {
+                session.tun_on.store(*tun_on, Ordering::Release);
+                let healthy = failure.is_none()
+                    && *xray == ElevatedRuntimeState::Ready
+                    && *mihomo == ElevatedRuntimeState::Ready
                     && generation_id.is_some()
-                    && generation_id == self.prepared_generation()
+                    && *generation_id == session.prepared_generation();
+                session.healthy.store(healthy, Ordering::Release);
+            } else {
+                session.healthy.store(false, Ordering::Release);
             }
-            _ => false,
-        };
-        self.healthy.store(healthy, Ordering::Release);
+        });
+        if result.is_err() {
+            self.healthy.store(false, Ordering::Release);
+        }
     }
 
     #[must_use]
     pub fn cores_ready(&self) -> bool {
         self.healthy.load(Ordering::Acquire) && self.prepared_generation().is_some()
+    }
+
+    fn set_in_use(&self, mode: u8) {
+        self.in_use.store(mode, Ordering::Release);
+    }
+
+    /// A connection carried by the service is gone: the cores stopped or the channel dropped
+    /// (proxy mode), or the tunnel went down as well (TUN mode).
+    #[must_use]
+    pub fn connection_lost(&self) -> bool {
+        match self.in_use.load(Ordering::Acquire) {
+            IN_USE_PROXY => !self.cores_ready(),
+            IN_USE_TUN => !self.cores_ready() || !self.tun_on.load(Ordering::Acquire),
+            _ => false,
+        }
     }
 
     pub fn shutdown(&self) {
@@ -333,6 +500,7 @@ impl<C: ServiceConnector> ServiceSession<C> {
         {
             let _ = transport.request(&ServiceCommand::Shutdown);
         }
+        self.set_in_use(IN_USE_NONE);
         self.forget();
     }
 
@@ -386,6 +554,18 @@ impl<C: ServiceConnector> crate::CoresReadiness for ServiceSession<C> {
     fn cores_ready(&self) -> bool {
         ServiceSession::cores_ready(self)
     }
+
+    fn service_available(&self) -> bool {
+        ServiceSession::service_available(self)
+    }
+
+    fn connection_lost(&self) -> bool {
+        ServiceSession::connection_lost(self)
+    }
+
+    fn release(&self) {
+        ServiceSession::shutdown(self);
+    }
 }
 
 fn check_state(state: ElevatedRuntimeState) -> RuntimeCheckState {
@@ -435,7 +615,11 @@ impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
         Box::pin(async move {
             blocking(&self.session, move |session| match engine {
                 Engine::Xray => session.prepare(generation),
-                Engine::Mihomo => session.set_tun(true),
+                Engine::Mihomo => {
+                    session.set_tun(true)?;
+                    session.set_in_use(IN_USE_TUN);
+                    Ok(())
+                }
             })
             .await?
         })
@@ -449,11 +633,18 @@ impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
             if engine == Engine::Xray {
                 return Ok(());
             }
-            match blocking(&self.session, |session| session.set_tun(false)).await? {
-                // A dropped channel already made the service stop the cores and the tunnel.
-                Ok(()) | Err(ServiceError::Disconnected) => Ok(()),
-                Err(error) => Err(error),
-            }
+            blocking(&self.session, |session| {
+                let result = session.set_tun(false);
+                session.set_in_use(IN_USE_NONE);
+                match result {
+                    // A dropped channel already made the service stop the cores and the
+                    // tunnel; with the cores gone there is no tunnel left to switch off.
+                    Ok(()) | Err(ServiceError::Disconnected) => Ok(()),
+                    Err(_) if !session.cores_ready() => Ok(()),
+                    Err(error) => Err(error),
+                }
+            })
+            .await?
         })
     }
 
@@ -499,6 +690,7 @@ impl<C: ServiceConnector> ProcessController for ServiceCoresController<C> {
                 session.prepare(generation)?;
                 if engine == Engine::Mihomo {
                     session.set_tun(false)?;
+                    session.set_in_use(IN_USE_PROXY);
                 }
                 Ok(())
             })
@@ -508,9 +700,14 @@ impl<C: ServiceConnector> ProcessController for ServiceCoresController<C> {
 
     fn stop<'a>(
         &'a self,
-        _engine: Engine,
+        engine: Engine,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            if engine == Engine::Mihomo {
+                self.session.set_in_use(IN_USE_NONE);
+            }
+            Ok(())
+        })
     }
 
     fn diagnostics<'a>(&'a self) -> Pin<Box<dyn Future<Output = ProcessDiagnostics> + Send + 'a>> {
@@ -542,6 +739,50 @@ pub fn warm_key(snapshot: &Snapshot, outbound_interface: &str) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// A runtime generation staged for the service: what it was staged from, its id and the
+/// loopback mixed port written into it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WarmStage {
+    pub key: [u8; 32],
+    pub generation: u64,
+    pub mixed_port: u16,
+}
+
+/// The daemon's cache of the staged service generation. A generation whose `Prepare` the
+/// service rejected is dropped, so the next attempt re-stages it (with a fresh mixed port)
+/// instead of failing the same way forever.
+#[derive(Default)]
+pub struct WarmStages {
+    current: Mutex<Option<WarmStage>>,
+}
+
+impl WarmStages {
+    /// The cached stage for `key`, unless the service rejected its last `Prepare`.
+    pub fn reusable<C: ServiceConnector>(
+        &self,
+        key: &[u8; 32],
+        session: &ServiceSession<C>,
+    ) -> Option<WarmStage> {
+        let mut current = self.current.lock().ok()?;
+        let cached = *current;
+        match cached {
+            Some(stage) if stage.key == *key && !session.prepare_failed(stage.generation) => {
+                Some(stage)
+            }
+            _ => {
+                *current = None;
+                None
+            }
+        }
+    }
+
+    pub fn remember(&self, stage: WarmStage) {
+        if let Ok(mut current) = self.current.lock() {
+            *current = Some(stage);
+        }
+    }
+}
+
 #[cfg(windows)]
 pub mod windows {
     use super::*;
@@ -571,7 +812,7 @@ pub mod windows {
             Services::{
                 CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
                 SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-                SERVICE_STATUS_PROCESS,
+                SERVICE_START_PENDING, SERVICE_STATUS_PROCESS,
             },
         },
     };
@@ -621,8 +862,30 @@ pub mod windows {
         }
     }
 
-    /// PID of the running `MultiCore` service as the SCM knows it.
+    /// How long a Connect or probe waits for a service that is still starting (logon, or
+    /// right after a self-update restart) before falling back.
+    const START_WAIT: Duration = Duration::from_secs(20);
+    const START_POLL: Duration = Duration::from_millis(500);
+
+    /// PID of the running `MultiCore` service as the SCM knows it, waiting up to
+    /// [`START_WAIT`] while the SCM reports it as starting.
     pub fn registered_service_pid() -> Result<u32, ServiceError> {
+        let deadline = std::time::Instant::now() + START_WAIT;
+        loop {
+            match query_service() {
+                Err(ServiceError::Unavailable) if std::time::Instant::now() < deadline => {
+                    // START_PENDING (or a transient SCM failure): the service is on its way.
+                }
+                Err(ServiceError::Rejected(_)) => return Err(ServiceError::Unavailable),
+                result => return result,
+            }
+            std::thread::sleep(START_POLL);
+        }
+    }
+
+    /// One SCM query: the PID when running, `Unavailable` while starting, `Rejected` when
+    /// stopped or stopping (no point in waiting).
+    fn query_service() -> Result<u32, ServiceError> {
         let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
         if manager.is_null() {
             return Err(ServiceError::Unavailable);
@@ -653,10 +916,14 @@ pub mod windows {
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
         }
-        if queried == 0 || status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId == 0 {
+        if queried == 0 {
             return Err(ServiceError::Unavailable);
         }
-        Ok(status.dwProcessId)
+        match status.dwCurrentState {
+            SERVICE_RUNNING if status.dwProcessId != 0 => Ok(status.dwProcessId),
+            SERVICE_START_PENDING | SERVICE_RUNNING => Err(ServiceError::Unavailable),
+            _ => Err(ServiceError::Rejected(BrokerErrorCode::NotReady)),
+        }
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -668,8 +935,14 @@ pub mod windows {
         fn connect(&self) -> Result<PipeTransport, ServiceError> {
             let service_pid = registered_service_pid()?;
             let name = wide(SERVICE_PIPE_NAME);
-            if unsafe { WaitNamedPipeW(name.as_ptr(), 2_000) } == 0 {
-                return Err(ServiceError::Unavailable);
+            // A service that just reached RUNNING may not have created its pipe yet, and
+            // `WaitNamedPipeW` fails at once for a pipe that does not exist.
+            let deadline = std::time::Instant::now() + START_WAIT;
+            while unsafe { WaitNamedPipeW(name.as_ptr(), 2_000) } == 0 {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ServiceError::Unavailable);
+                }
+                std::thread::sleep(START_POLL);
             }
             let pipe = OpenOptions::new()
                 .read(true)
@@ -714,6 +987,13 @@ pub mod unix {
 
     pub struct SocketTransport {
         stream: UnixStream,
+    }
+
+    impl SocketTransport {
+        #[cfg(test)]
+        pub(crate) fn for_test(stream: UnixStream) -> Self {
+            Self { stream }
+        }
     }
 
     impl ServiceTransport for SocketTransport {
@@ -774,3 +1054,48 @@ pub mod unix {
 pub type ProductionServiceConnector = windows::WindowsServiceConnector;
 #[cfg(unix)]
 pub type ProductionServiceConnector = unix::UnixServiceConnector;
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::{ServiceTransport, unix::SocketTransport};
+    use multicore_core::{
+        elevation_protocol::{ElevatedRuntimeState, read_stream_frame},
+        service_protocol::{
+            ServiceCommand, ServiceResponse, decode_service_command, write_service_frame,
+        },
+    };
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn the_socket_transport_frames_a_status_exchange() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let service = std::thread::spawn(move || {
+            let frame = read_stream_frame(&mut server).unwrap();
+            assert_eq!(
+                decode_service_command(&frame).unwrap(),
+                ServiceCommand::Status
+            );
+            write_service_frame(
+                &mut server,
+                &ServiceResponse::Status {
+                    generation_id: Some(7),
+                    xray: ElevatedRuntimeState::Ready,
+                    mihomo: ElevatedRuntimeState::Ready,
+                    tun_on: true,
+                    failure: None,
+                },
+            )
+            .unwrap();
+        });
+        let transport = SocketTransport::for_test(client);
+        assert!(matches!(
+            transport.request(&ServiceCommand::Status),
+            Ok(ServiceResponse::Status {
+                generation_id: Some(7),
+                tun_on: true,
+                ..
+            })
+        ));
+        service.join().unwrap();
+    }
+}

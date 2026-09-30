@@ -578,6 +578,13 @@ pub trait DaemonClient: Send + Sync {
     /// POST /v1/disconnect.
     fn disconnect(&self) -> Result<DaemonStatus, DaemonError>;
 
+    /// POST /v1/shutdown (Quit): the daemon disconnects and lets the always-ready service stop
+    /// the cores. Daemons without the route answer 404, which is fine: their cores stop with
+    /// the channel.
+    fn shutdown(&self) -> Result<(), DaemonError> {
+        Ok(())
+    }
+
     /// GET /v1/events?after=<u64>[&epoch=<known-epoch>].
     fn events(
         &self,
@@ -1130,6 +1137,23 @@ impl DaemonClient for HttpDaemonClient {
             self.http.get(self.endpoint("/v1/diagnostics")),
             DIAGNOSTICS_RESPONSE_LIMIT_BYTES,
         )
+    }
+
+    fn shutdown(&self) -> Result<(), DaemonError> {
+        let response = self
+            .http
+            .post(self.endpoint("/v1/shutdown"))
+            .timeout(DISCONNECT_REQUEST_TIMEOUT)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(map_error)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(DaemonError::definitive_http(
+                "Не удалось остановить ядра службы.",
+            ))
+        }
     }
 
     fn dashboard_url(&self) -> Result<String, DaemonError> {

@@ -102,8 +102,9 @@ impl Drop for Bootstrap {
     }
 }
 
-/// Ask an owned daemon to disconnect, waiting at most `timeout`. An external
-/// daemon is not ours to disconnect. Returns whether a disconnect succeeded.
+/// Ask an owned daemon to disconnect and then to let the always-ready service
+/// stop the cores (Quit), waiting at most `timeout`. An external daemon is not
+/// ours to disconnect. Returns whether the disconnect succeeded.
 fn disconnect_before_shutdown(
     owned: bool,
     client: Arc<dyn DaemonClient>,
@@ -116,7 +117,9 @@ fn disconnect_before_shutdown(
     let spawned = std::thread::Builder::new()
         .name("multicore-shutdown-disconnect".into())
         .spawn(move || {
-            let _ = sender.send(client.disconnect().is_ok());
+            let disconnected = client.disconnect().is_ok();
+            let _ = client.shutdown();
+            let _ = sender.send(disconnected);
         });
     spawned.is_ok() && receiver.recv_timeout(timeout).unwrap_or(false)
 }
@@ -1297,6 +1300,7 @@ mod tests {
     struct DisconnectProbe {
         delay: Duration,
         calls: std::sync::atomic::AtomicUsize,
+        shutdowns: std::sync::atomic::AtomicUsize,
     }
 
     impl DisconnectProbe {
@@ -1304,6 +1308,7 @@ mod tests {
             Arc::new(Self {
                 delay,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -1328,6 +1333,11 @@ mod tests {
         }
         fn connect(&self) -> Result<DaemonStatus, crate::daemon::DaemonError> {
             Self::unsupported()
+        }
+        fn shutdown(&self) -> Result<(), crate::daemon::DaemonError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
         fn disconnect(&self) -> Result<DaemonStatus, crate::daemon::DaemonError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1362,6 +1372,11 @@ mod tests {
         assert_eq!(probe.calls(), 0);
         disconnect_before_shutdown(true, probe.clone(), Duration::from_secs(1));
         assert_eq!(probe.calls(), 1);
+        assert_eq!(
+            probe.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Quit asks the daemon to release the service's cores after disconnecting"
+        );
 
         let external = DisconnectProbe::new(Duration::ZERO);
         drop(Bootstrap {

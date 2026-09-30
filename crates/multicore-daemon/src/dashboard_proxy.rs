@@ -39,6 +39,8 @@ pub const ALLOWED_API_PATHS: [&str; 5] = [
 const MAX_UPSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UPGRADE_HEAD_BYTES: usize = 8 * 1024;
 const MAX_STATIC_PATH_CHARS: usize = 256;
+/// Upper bound for reaching the upstream and reading its `101` head.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct ProxyState {
@@ -208,6 +210,10 @@ async fn api(State(state): State<ProxyState>, request: Request) -> Response {
     };
     let query = forwarded_query(request.uri());
     if is_websocket_upgrade(request.headers()) {
+        // Only the log stream is a WebSocket in the read-only dashboard.
+        if path != "/logs" {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         return websocket(request, target, &path, &query).await;
     }
     if path == "/logs" {
@@ -232,11 +238,20 @@ async fn api(State(state): State<ProxyState>, request: Request) -> Response {
     {
         return StatusCode::BAD_GATEWAY.into_response();
     }
-    let Ok(body) = response.bytes().await else {
-        return StatusCode::BAD_GATEWAY.into_response();
-    };
-    if body.len() > MAX_UPSTREAM_BODY_BYTES {
-        return StatusCode::BAD_GATEWAY.into_response();
+    // Read chunk by chunk: a chunked body has no length to check up front.
+    let mut response = response;
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_UPSTREAM_BODY_BYTES {
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        }
     }
     let mut out = Response::new(Body::from(body));
     *out.status_mut() = status;
@@ -260,33 +275,11 @@ async fn websocket(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(mut upstream) = TcpStream::connect(target.address).await else {
+    // A stalled upstream must not pin the handler.
+    let Ok(Some((mut upstream, buffer, header_end))) =
+        tokio::time::timeout(UPGRADE_TIMEOUT, open_upstream(&target, path, query, &key)).await
+    else {
         return StatusCode::BAD_GATEWAY.into_response();
-    };
-    let head = format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer {}\r\n\r\n",
-        target.address,
-        target.secret()
-    );
-    if upstream.write_all(head.as_bytes()).await.is_err() {
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    let header_end = loop {
-        let Ok(read) = upstream.read(&mut chunk).await else {
-            return StatusCode::BAD_GATEWAY.into_response();
-        };
-        if read == 0 {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position + 4;
-        }
-        if buffer.len() > MAX_UPGRADE_HEAD_BYTES {
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
     };
     let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
     if !head.starts_with("HTTP/1.1 101") {
@@ -323,4 +316,36 @@ async fn websocket(
         .header(header::SEC_WEBSOCKET_ACCEPT, accept)
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Connects to the upstream, sends the upgrade with the Mihomo secret and reads its answer
+/// head. Returns the stream, what was read and where the head ends.
+async fn open_upstream(
+    target: &ControllerTarget,
+    path: &str,
+    query: &str,
+    key: &str,
+) -> Option<(TcpStream, Vec<u8>, usize)> {
+    let mut upstream = TcpStream::connect(target.address).await.ok()?;
+    let head = format!(
+        "GET {path}{query} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer {}\r\n\r\n",
+        target.address,
+        target.secret()
+    );
+    upstream.write_all(head.as_bytes()).await.ok()?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = upstream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            return Some((upstream, buffer, position + 4));
+        }
+        if buffer.len() > MAX_UPGRADE_HEAD_BYTES {
+            return None;
+        }
+    }
 }

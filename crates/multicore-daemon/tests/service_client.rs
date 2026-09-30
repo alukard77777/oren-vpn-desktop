@@ -11,9 +11,11 @@ use multicore_core::{
     service_protocol::{ControllerEndpoint, ServiceCommand, ServiceResponse},
 };
 use multicore_daemon::MihomoSelector;
+use multicore_daemon::connection_mode::{ProxySwitch, SystemProxyController};
 use multicore_daemon::service_client::{
-    ControllerSlot, ServiceConnector, ServiceCoresController, ServiceError, ServiceSession,
-    ServiceTransport, ServiceTunController, SlotSelector, warm_key,
+    ControllerSlot, ServiceConnector, ServiceCoresController, ServiceError, ServiceMode,
+    ServiceSession, ServiceTransport, ServiceTunController, SlotSelector, WarmStage, WarmStages,
+    service_response_timeout, warm_key,
 };
 
 #[derive(Default)]
@@ -24,6 +26,12 @@ struct FakeService {
     status_failure: Option<BrokerErrorCode>,
     break_next: bool,
     tun_form: bool,
+    /// Errors the next connects fail with, in order.
+    connect_errors: Vec<ServiceError>,
+    reject_prepare: Option<BrokerErrorCode>,
+    /// `SetTun{on: true}` is rolled back: the adapter never came up.
+    tun_rollback: bool,
+    tun: bool,
 }
 
 #[derive(Clone, Default)]
@@ -33,7 +41,11 @@ struct FakeTransport(Arc<Mutex<FakeService>>);
 impl ServiceConnector for FakeConnector {
     type Transport = FakeTransport;
     fn connect(&self) -> Result<FakeTransport, ServiceError> {
-        self.0.lock().unwrap().connects += 1;
+        let mut service = self.0.lock().unwrap();
+        service.connects += 1;
+        if !service.connect_errors.is_empty() {
+            return Err(service.connect_errors.remove(0));
+        }
         Ok(FakeTransport(self.0.clone()))
     }
 }
@@ -48,6 +60,9 @@ impl ServiceTransport for FakeTransport {
         if service.busy {
             return Ok(ServiceResponse::Busy);
         }
+        if let (ServiceCommand::Prepare { .. }, Some(code)) = (command, service.reject_prepare) {
+            return Ok(ServiceResponse::Error { code });
+        }
         Ok(match command {
             ServiceCommand::Prepare { generation_id } => ServiceResponse::Prepared {
                 generation_id: *generation_id,
@@ -57,12 +72,15 @@ impl ServiceTransport for FakeTransport {
                     mixed_port: if service.tun_form { 0 } else { 28765 },
                 },
             },
-            ServiceCommand::SetTun { on } => ServiceResponse::TunState { on: *on },
+            ServiceCommand::SetTun { on } => {
+                service.tun = *on && !service.tun_rollback;
+                ServiceResponse::TunState { on: service.tun }
+            }
             ServiceCommand::Status => ServiceResponse::Status {
                 generation_id: Some(3),
                 xray: ElevatedRuntimeState::Ready,
                 mihomo: ElevatedRuntimeState::Ready,
-                tun_on: false,
+                tun_on: service.tun,
                 failure: service.status_failure,
             },
             ServiceCommand::Stop { engine } => ServiceResponse::Stopped { engine: *engine },
@@ -251,4 +269,165 @@ async fn the_slot_selector_follows_the_current_endpoint() {
         selector.proxy_now("Auto").await.unwrap().as_deref(),
         Some("node-b")
     );
+}
+
+#[test]
+fn a_rejected_generation_is_not_reused_and_a_good_one_is() {
+    let (session, connector, _) = session();
+    let stages = WarmStages::default();
+    let key = [7_u8; 32];
+    stages.remember(WarmStage {
+        key,
+        generation: 3,
+        mixed_port: 28765,
+    });
+    assert_eq!(
+        stages
+            .reusable(&key, &session)
+            .map(|stage| stage.generation),
+        Some(3)
+    );
+    connector.0.lock().unwrap().reject_prepare = Some(BrokerErrorCode::NotReady);
+    assert_eq!(
+        session.prepare(3),
+        Err(ServiceError::Rejected(BrokerErrorCode::NotReady))
+    );
+    assert!(session.prepare_failed(3));
+    assert_eq!(
+        stages.reusable(&key, &session),
+        None,
+        "re-stage with a fresh port"
+    );
+    assert_eq!(
+        stages.reusable(&key, &session),
+        None,
+        "the stale stage is gone"
+    );
+    connector.0.lock().unwrap().reject_prepare = None;
+    session.prepare(4).unwrap();
+    stages.remember(WarmStage {
+        key,
+        generation: 4,
+        mixed_port: 30001,
+    });
+    assert!(!session.prepare_failed(3));
+    assert_eq!(
+        stages
+            .reusable(&key, &session)
+            .map(|stage| stage.mixed_port),
+        Some(30001)
+    );
+    assert_eq!(
+        stages.reusable(&[8_u8; 32], &session),
+        None,
+        "another snapshot"
+    );
+}
+
+#[test]
+fn availability_is_rechecked_on_every_probe() {
+    let (session, connector, _) = session();
+    connector.0.lock().unwrap().connect_errors =
+        vec![ServiceError::Unavailable, ServiceError::NotInstalled];
+    assert_eq!(session.probe_mode(), ServiceMode::Unavailable);
+    assert!(!session.service_available());
+    assert_eq!(session.probe_mode(), ServiceMode::Absent);
+    assert!(!session.service_available());
+    // The service started after the app: the next probe picks it up.
+    assert_eq!(session.probe_mode(), ServiceMode::Service);
+    assert!(session.service_available());
+    // A channel that died meanwhile is not mistaken for a missing service.
+    connector.0.lock().unwrap().break_next = true;
+    assert_eq!(session.probe_mode(), ServiceMode::Service);
+    connector.0.lock().unwrap().busy = true;
+    assert_eq!(
+        session.probe_mode(),
+        ServiceMode::Service,
+        "Busy is reported by Prepare"
+    );
+}
+
+#[test]
+fn a_tunnel_the_service_rolled_back_is_an_adapter_failure() {
+    let (session, connector, _) = session();
+    session.prepare(3).unwrap();
+    connector.0.lock().unwrap().tun_rollback = true;
+    let error = session.set_tun(true).unwrap_err();
+    assert_eq!(error, ServiceError::Rejected(BrokerErrorCode::TimedOut));
+    assert_eq!(
+        error.start_failure_cause(),
+        StartFailureCause::ReadinessTimedOut
+    );
+}
+
+#[test]
+fn read_only_commands_get_a_generous_timeout() {
+    assert!(
+        service_response_timeout(&ServiceCommand::Status) >= std::time::Duration::from_secs(15)
+    );
+    assert!(
+        service_response_timeout(&ServiceCommand::Diagnostics)
+            >= std::time::Duration::from_secs(15)
+    );
+}
+
+#[tokio::test]
+async fn a_lost_tunnel_is_detected_while_connected() {
+    let (session, connector, _) = session();
+    let supervisor = Supervisor::new(Arc::new(ServiceTunController::new(session.clone(), 3)));
+    supervisor.connect().await.unwrap();
+    session.poll();
+    assert!(!session.connection_lost());
+    // The service switched the tunnel off (for example after a core crash).
+    connector.0.lock().unwrap().tun = false;
+    session.poll();
+    assert!(session.connection_lost());
+    // Tearing the connection down still succeeds and clears the flag.
+    connector.0.lock().unwrap().status_failure = Some(BrokerErrorCode::NotReady);
+    session.poll();
+    supervisor.disconnect().await.unwrap();
+    assert!(!session.connection_lost());
+}
+
+#[derive(Default)]
+struct FakeProxy {
+    applied: std::sync::atomic::AtomicUsize,
+    restored: std::sync::atomic::AtomicUsize,
+}
+
+impl ProxySwitch for FakeProxy {
+    fn apply(&self) -> std::io::Result<()> {
+        self.applied
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn restore(&self) -> std::io::Result<()> {
+        self.restored
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn proxy_mode_restores_the_system_proxy_when_the_service_channel_drops() {
+    let (session, connector, _) = session();
+    let proxy = Arc::new(FakeProxy::default());
+    let supervisor = Supervisor::new(Arc::new(SystemProxyController::new(
+        ServiceCoresController::new(session.clone(), 3),
+        proxy.clone(),
+    )));
+    supervisor.connect().await.unwrap();
+    assert_eq!(proxy.applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+    session.poll();
+    assert!(!session.connection_lost());
+    connector.0.lock().unwrap().break_next = true;
+    session.poll();
+    assert!(
+        session.connection_lost(),
+        "the mixed port is gone with the cores"
+    );
+    supervisor.disconnect().await.unwrap();
+    assert_eq!(proxy.restored.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!session.connection_lost());
 }

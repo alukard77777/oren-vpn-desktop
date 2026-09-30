@@ -92,7 +92,10 @@ async fn an_empty_connect_body_keeps_tun_mode() {
     assert_eq!(post_connect(&backend, "").await, StatusCode::OK);
     assert_eq!(
         *backend.connects.lock().unwrap(),
-        [ConnectOptions { tun: true }]
+        [ConnectOptions {
+            tun: true,
+            ..Default::default()
+        }]
     );
 }
 
@@ -111,9 +114,18 @@ async fn a_connect_body_selects_the_mode() {
     assert_eq!(
         *backend.connects.lock().unwrap(),
         [
-            ConnectOptions { tun: false },
-            ConnectOptions { tun: true },
-            ConnectOptions { tun: true },
+            ConnectOptions {
+                tun: false,
+                ..Default::default()
+            },
+            ConnectOptions {
+                tun: true,
+                ..Default::default()
+            },
+            ConnectOptions {
+                tun: true,
+                ..Default::default()
+            },
         ]
     );
 }

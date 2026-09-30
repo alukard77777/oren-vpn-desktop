@@ -300,3 +300,62 @@ async fn the_log_websocket_is_passed_through_with_the_mihomo_secret() {
     assert!(head.contains("Authorization: Bearer mihomo-secret\r\n"));
     assert!(!head.contains("dash-token"));
 }
+
+#[tokio::test]
+async fn only_the_log_stream_may_upgrade_to_a_websocket() {
+    let (address, seen) = fake_mihomo().await;
+    let root = tempfile::tempdir().unwrap();
+    let request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/version")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Body::empty())
+        .unwrap();
+    let response = router(Some(address), root.path())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_oversized_chunked_answer_is_not_buffered() {
+    // 9 MiB in 1 MiB chunks, without a Content-Length.
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await;
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..9 {
+            if stream.write_all(b"100000\r\n").await.is_err()
+                || stream.write_all(&chunk).await.is_err()
+                || stream.write_all(b"\r\n").await.is_err()
+            {
+                return;
+            }
+        }
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (status, _) = call(
+        router(Some(address), root.path()),
+        Method::GET,
+        "/rules",
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
