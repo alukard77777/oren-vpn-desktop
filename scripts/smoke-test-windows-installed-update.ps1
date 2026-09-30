@@ -231,7 +231,7 @@ try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     $install = Start-Process -FilePath $installer `
         -ArgumentList @(
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=""',
+            '/VERYSILENT', '/CURRENTUSER', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=""',
             ('/DIR=' + (ConvertTo-NativeQuotedArgument $installRoot))) `
         -Wait -PassThru -WindowStyle Hidden
     Assert-True ($install.ExitCode -eq 0) "installer exited with $($install.ExitCode)"
@@ -679,7 +679,7 @@ $signalTemporary = $SignalPath + '.tmp'
 
     $foreignInstall = Start-Process -FilePath $installer `
         -ArgumentList @(
-            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=""',
+            '/VERYSILENT', '/CURRENTUSER', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=""',
             ('/DIR=' + (ConvertTo-NativeQuotedArgument $foreignInstallRoot))) `
         -Wait -PassThru -WindowStyle Hidden
     Assert-True ($foreignInstall.ExitCode -eq 0) "second installer exited with $($foreignInstall.ExitCode)"
