@@ -4860,13 +4860,13 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode,
-        MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_FLUSH_RETRY_DELAYS, PREFERENCE_RETRY_DELAYS,
-        PREFERENCE_SAVE_ERROR_RU, PendingImportOutcome, PendingSubscriptionConsents,
-        PendingSubscriptionImports, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
-        ProfilePreferenceReconciler, UpdateConfirmPlan, UpdateInstallIntent, WindowObservation,
-        WriterCommand, WriterResult, activation_for_launch_arguments, ambient_motion_allowed,
-        delete_focus_plan, drain_latest_write, initial_window_visible, next_maximized,
-        parse_launch_arguments, preference_error_for_result, preference_failure_is_terminal,
+        MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_RETRY_DELAYS, PREFERENCE_SAVE_ERROR_RU,
+        PendingImportOutcome, PendingSubscriptionConsents, PendingSubscriptionImports,
+        PersistenceTracker, PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler,
+        UpdateConfirmPlan, UpdateInstallIntent, WindowObservation, WriterCommand, WriterResult,
+        activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
+        drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
+        preference_error_for_result, preference_failure_is_terminal,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
         startup_should_connect, update_check_due, update_confirm_plan, update_install_intent,
@@ -6160,7 +6160,10 @@ mod window_tests {
             .stop_and_flush(&AppPreferences::default())
             .unwrap_err();
         assert_eq!(failure.raw_os_error, Some(32));
-        assert_eq!(failure.attempts, PREFERENCE_FLUSH_RETRY_DELAYS.len() + 1);
+        assert_eq!(
+            failure.attempts,
+            super::PREFERENCE_FLUSH_RETRY_DELAYS.len() + 1
+        );
         let line = failure.log_line();
         assert!(line.contains("replace preferences: "), "{line}");
         assert!(line.contains("os=Some(32)"), "{line}");
