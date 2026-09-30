@@ -4953,7 +4953,9 @@ mod tests {
             .split("export component RouteNodeRow")
             .nth(1)
             .expect("route row source");
-        assert!(route_row.contains("property <length> trailing-inset: root.pending ? 44px : 20px;"));
+        assert!(
+            route_row.contains("property <length> trailing-inset: root.pending ? 44px : 20px;")
+        );
         assert!(route_row.contains("x: parent.width - self.width - root.trailing-inset;"));
         // The latency column must track the window edge while it is dragged:
         // animating x (rather than just the pending inset) lags behind every
