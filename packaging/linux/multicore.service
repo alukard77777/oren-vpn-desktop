@@ -10,7 +10,9 @@ User=root
 ExecStart=/usr/lib/multicore/runtime/multicore-core-host --service
 Restart=on-failure
 RestartSec=2
-KillMode=control-group
+# SIGTERM goes to the service only: it switches TUN off and stops Mihomo and Xray itself;
+# whatever is left after TimeoutStopSec is killed.
+KillMode=mixed
 TimeoutStopSec=15
 # /run/multicore/service.sock lives here; the socket itself is 0666, every peer is checked.
 RuntimeDirectory=multicore
@@ -24,7 +26,9 @@ PrivateTmp=yes
 NoNewPrivileges=yes
 # CAP_DAC_READ_SEARCH lets root read the user's 0700 ~/.local/share/multicore/runtime.
 # CAP_SYS_PTRACE lets root read a peer daemon's /proc/<pid>/exe and environ (ptrace read access).
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+# CAP_SETPCAP lets the service drop those two (and itself) before starting Mihomo and Xray,
+# which keep only CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SETPCAP
 
 [Install]
 WantedBy=multi-user.target

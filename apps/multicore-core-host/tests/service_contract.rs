@@ -1767,6 +1767,58 @@ mod unix_service {
         let _listener = bind(&path).unwrap();
         UnixStream::connect(&path).unwrap();
     }
+
+    fn exchange(client: &mut UnixStream, command: ServiceCommand) -> ServiceResponse {
+        write_service_frame(client, &command).unwrap();
+        decode_service_frame(&read_stream_frame(client).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn sigterm_switches_tun_off_stops_the_cores_and_removes_the_socket() {
+        use crate::service::unix_server::{on_termination_signal, shut_down};
+        let verifier = Arc::new(|_: &UnixStream| {
+            Ok::<_, IdentityError>(ClientIdentity {
+                user_key: "uid:1000".into(),
+                data_root: PathBuf::from("/home/alice/.local/share/multicore"),
+                uid: 1000,
+            })
+        });
+        let (_dir, path, service) = start_server(verifier);
+        let mut client = UnixStream::connect(&path).unwrap();
+        assert!(matches!(
+            exchange(&mut client, ServiceCommand::Prepare { generation_id: 4 }),
+            ServiceResponse::Prepared { .. }
+        ));
+        assert_eq!(
+            exchange(&mut client, ServiceCommand::SetTun { on: true }),
+            ServiceResponse::TunState { on: true }
+        );
+
+        let (done, stopped) = std::sync::mpsc::channel();
+        {
+            let (service, path) = (service.clone(), path.clone());
+            on_termination_signal(move || {
+                shut_down(&service, &path);
+                let _ = done.send(());
+            })
+            .unwrap();
+        }
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .unwrap();
+        stopped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("SIGTERM ran the shutdown");
+
+        let calls = service.lock().unwrap().cores_mut().calls.clone();
+        let tun_off = calls.iter().rposition(|call| call == "tun:false");
+        let stop = calls.iter().rposition(|call| call == "stop_all");
+        assert!(
+            matches!((tun_off, stop), (Some(off), Some(stop)) if off < stop),
+            "{calls:?}"
+        );
+        assert!(!path.exists(), "the socket must be removed");
+        assert!(service.lock().unwrap().owner_key().is_none());
+    }
 }
 
 #[test]
@@ -1782,8 +1834,9 @@ fn systemd_unit_carries_the_documented_hardening() {
         "ProtectHome=read-only",
         "ProtectSystem=strict",
         "NoNewPrivileges=yes",
-        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_PTRACE",
-        "KillMode=control-group",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_SETPCAP",
+        "KillMode=mixed",
+        "TimeoutStopSec=15",
         "WantedBy=multi-user.target",
     ] {
         assert!(

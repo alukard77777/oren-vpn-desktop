@@ -9,9 +9,14 @@ use std::{
     time::Duration,
 };
 
+use rustix::io::Errno;
 use rustix::process::{
-    Pid, Signal, WaitId, WaitIdOptions, getpid, getppid, kill_process_group,
+    Pid, Signal, WaitId, WaitIdOptions, geteuid, getpid, getppid, kill_process_group,
     set_parent_process_death_signal, waitid,
+};
+use rustix::thread::{
+    CapabilitySet, CapabilitySets, capabilities, clear_ambient_capability_set,
+    remove_capability_from_bounding_set, set_capabilities,
 };
 
 use crate::{
@@ -31,29 +36,42 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
     "SSL_CERT_DIR",
 ];
 
+/// What a core keeps when the launcher restricts capabilities (service mode): TUN, routes and
+/// nftables (`NET_ADMIN`), raw sockets (`NET_RAW`) and DNS on port 53 (`NET_BIND_SERVICE`).
+/// Everything else the service holds for itself (`CAP_SYS_PTRACE` for peer checks,
+/// `CAP_DAC_READ_SEARCH` for staged generations, `CAP_SETPCAP` for this drop) is removed.
+pub(crate) const CORE_CAPABILITIES: CapabilitySet = CapabilitySet::NET_ADMIN
+    .union(CapabilitySet::NET_BIND_SERVICE)
+    .union(CapabilitySet::NET_RAW);
+/// Capability numbers are below 64; numbers the kernel doesn't know fail with `EINVAL`.
+const CAPABILITY_NUMBERS: u32 = 64;
+
 type SpawnReply = tokio::sync::oneshot::Sender<io::Result<Child>>;
+type SpawnRequest = (CommandSpec, bool, SpawnReply);
 
 #[derive(Clone)]
 pub struct UnixGroupLauncher {
-    spawner: Arc<Mutex<mpsc::Sender<(CommandSpec, SpawnReply)>>>,
+    spawner: Arc<Mutex<mpsc::Sender<SpawnRequest>>>,
     logs: Arc<CoreLogBuffer>,
+    restrict_capabilities: bool,
     readiness: Option<TokioProcessLauncher>,
     readiness_timeout: Duration,
 }
 
 impl UnixGroupLauncher {
     pub fn new(logs: Arc<CoreLogBuffer>) -> io::Result<Self> {
-        let (sender, requests) = mpsc::channel::<(CommandSpec, SpawnReply)>();
+        let (sender, requests) = mpsc::channel::<SpawnRequest>();
         std::thread::Builder::new()
             .name("multicore-core-spawner".into())
             .spawn(move || {
-                for (command, reply) in requests {
-                    let _ = reply.send(spawn_core(&command));
+                for (command, restrict, reply) in requests {
+                    let _ = reply.send(spawn_core(&command, restrict));
                 }
             })?;
         Ok(Self {
             spawner: Arc::new(Mutex::new(sender)),
             logs,
+            restrict_capabilities: false,
             readiness: None,
             readiness_timeout: crate::CORE_READINESS_TIMEOUT,
         })
@@ -72,6 +90,15 @@ impl UnixGroupLauncher {
         Ok(launcher)
     }
 
+    /// Cores started by this launcher keep only `CORE_CAPABILITIES` (bounding, permitted,
+    /// effective, inheritable; ambient cleared). Used by the always-ready service, whose own
+    /// bounding set also holds capabilities that must never reach Mihomo or Xray.
+    #[must_use]
+    pub fn with_restricted_capabilities(mut self) -> Self {
+        self.restrict_capabilities = true;
+        self
+    }
+
     async fn launch_core(
         &self,
         command: CommandSpec,
@@ -81,7 +108,7 @@ impl UnixGroupLauncher {
         self.spawner
             .lock()
             .map_err(|_| ProcessError::LaunchFailed(engine))?
-            .send((command, reply))
+            .send((command, self.restrict_capabilities, reply))
             .map_err(|_| ProcessError::LaunchFailed(engine))?;
         let mut child = response
             .await
@@ -115,7 +142,45 @@ fn sanitized_environment(
         .collect()
 }
 
-fn spawn_core(command: &CommandSpec) -> io::Result<Child> {
+/// Runs in the forked child before `exec`: only raw syscalls, no allocation.
+///
+/// Root keeps its bounding set across `exec` (permitted = bounding for uid 0), so the bounding
+/// set is what must shrink; that needs `CAP_SETPCAP`, which is dropped last. An unprivileged
+/// process (no permitted capabilities, not root) cannot shrink it and has nothing to lose, so
+/// `EPERM` is accepted only there.
+fn restrict_core_capabilities() -> io::Result<()> {
+    let current = capabilities(None)?;
+    let privileged = !current.permitted.is_empty() || geteuid().is_root();
+    let drop_from_bounding_set = |capability: CapabilitySet| -> io::Result<()> {
+        match remove_capability_from_bounding_set(capability) {
+            Ok(()) | Err(Errno::INVAL) => Ok(()),
+            Err(Errno::PERM) if !privileged => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    };
+    for number in 0..CAPABILITY_NUMBERS {
+        let capability = CapabilitySet::from_bits_retain(1 << number);
+        if !CORE_CAPABILITIES.contains(capability) && capability != CapabilitySet::SETPCAP {
+            drop_from_bounding_set(capability)?;
+        }
+    }
+    drop_from_bounding_set(CapabilitySet::SETPCAP)?;
+    match clear_ambient_capability_set() {
+        Ok(()) | Err(Errno::INVAL) => {}
+        Err(error) => return Err(error.into()),
+    }
+    set_capabilities(
+        None,
+        CapabilitySets {
+            effective: current.effective & CORE_CAPABILITIES,
+            permitted: current.permitted & CORE_CAPABILITIES,
+            inheritable: current.inheritable & CORE_CAPABILITIES,
+        },
+    )?;
+    Ok(())
+}
+
+fn spawn_core(command: &CommandSpec, restrict_capabilities: bool) -> io::Result<Child> {
     let parent = getpid();
     let mut process = Command::new(&command.program);
     process
@@ -132,6 +197,9 @@ fn spawn_core(command: &CommandSpec) -> io::Result<Child> {
             set_parent_process_death_signal(Some(Signal::KILL))?;
             if getppid() != Some(parent) {
                 return Err(io::Error::other("core host exited before core start"));
+            }
+            if restrict_capabilities {
+                restrict_core_capabilities()?;
             }
             Ok(())
         });
@@ -421,5 +489,114 @@ mod tests {
                 (OsString::from("LANG"), OsString::from("C.UTF-8")),
             ]
         );
+    }
+
+    const PROBE_ENV: &str = "MULTICORE_CAPABILITY_PROBE";
+
+    /// `Cap*:` lines of `/proc/self/status` as seen by a core started through `launcher`.
+    async fn core_capabilities(launcher: &UnixGroupLauncher) -> Vec<(String, u64)> {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("caps");
+        let mut child = launcher
+            .launch(shell(
+                "grep '^Cap' /proc/self/status > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
+                &report,
+            ))
+            .await
+            .unwrap();
+        assert!(eventually(Duration::from_secs(5), || report.exists()));
+        child.stop().await.unwrap();
+        std::fs::read_to_string(&report)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (name, value) = line.split_once(':').unwrap();
+                (
+                    name.to_owned(),
+                    u64::from_str_radix(value.trim(), 16).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn set(capabilities: &[(String, u64)], name: &str) -> u64 {
+        capabilities
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| *value)
+            .unwrap_or_else(|| panic!("{name} missing"))
+    }
+
+    #[tokio::test]
+    async fn restricted_cores_hold_no_capability_beyond_the_network_ones() {
+        let launcher = UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default()))
+            .unwrap()
+            .with_restricted_capabilities();
+        let capabilities = core_capabilities(&launcher).await;
+        for name in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+            assert_eq!(
+                set(&capabilities, name) & !CORE_CAPABILITIES.bits(),
+                0,
+                "{name}: {capabilities:?}"
+            );
+        }
+    }
+
+    /// Re-runs `restricted_core_capabilities_as_namespace_root` as root of a new user
+    /// namespace, where the launcher holds `CAP_SETPCAP` like the systemd service does.
+    #[test]
+    fn restricted_cores_keep_only_the_network_capabilities_as_root() {
+        let namespaces = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "true"])
+            .status();
+        if !namespaces.is_ok_and(|status| status.success()) {
+            eprintln!("skipped: unprivileged user namespaces are unavailable");
+            return;
+        }
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix_group::tests::restricted_core_capabilities_as_namespace_root",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(PROBE_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run by restricted_cores_keep_only_the_network_capabilities_as_root"]
+    async fn restricted_core_capabilities_as_namespace_root() {
+        if std::env::var_os(PROBE_ENV).is_none() {
+            return;
+        }
+        assert!(geteuid().is_root());
+        let unrestricted =
+            core_capabilities(&UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default())).unwrap())
+                .await;
+        let ptrace = CapabilitySet::SYS_PTRACE.bits() | CapabilitySet::DAC_READ_SEARCH.bits();
+        assert_eq!(set(&unrestricted, "CapEff") & ptrace, ptrace, "control run");
+
+        let restricted = core_capabilities(
+            &UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default()))
+                .unwrap()
+                .with_restricted_capabilities(),
+        )
+        .await;
+        let core = CORE_CAPABILITIES.bits();
+        assert_eq!(set(&restricted, "CapBnd"), core, "{restricted:?}");
+        assert_eq!(set(&restricted, "CapPrm"), core, "{restricted:?}");
+        assert_eq!(set(&restricted, "CapEff"), core, "{restricted:?}");
+        assert_eq!(set(&restricted, "CapInh"), 0, "{restricted:?}");
+        assert_eq!(set(&restricted, "CapAmb"), 0, "{restricted:?}");
     }
 }

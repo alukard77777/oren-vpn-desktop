@@ -1,5 +1,6 @@
 //! `/run/multicore/service.sock`: one thread per connection, all sharing one service loop.
-//! systemd's `KillMode=control-group` stops the cores together with the service.
+//! `systemctl stop` sends SIGTERM to the service alone (`KillMode=mixed`): the service switches
+//! TUN off, stops Mihomo and Xray and removes its socket before it exits.
 
 use std::{
     fs, io,
@@ -108,12 +109,58 @@ fn handle_connection<C: Cores>(
         .client_gone(id);
 }
 
+/// The normal stop, as for a `Shutdown` from the owner: TUN off, then Mihomo, then Xray; then
+/// the socket goes away so no client connects to a service that is exiting.
+pub(crate) fn shut_down<C: Cores>(service: &Mutex<ServiceLoop<C>>, socket: &Path) {
+    service
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .stop_everything();
+    let _ = fs::remove_file(socket);
+}
+
+/// Replaces the default (die immediately) action of SIGTERM and SIGINT: the first one received
+/// runs `on_signal` on a dedicated thread. The handlers are registered before this returns.
+pub(crate) fn on_termination_signal(on_signal: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (mut terminate, mut interrupt) = {
+        let _context = runtime.enter();
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
+    thread::Builder::new()
+        .name("multicore-service-signals".into())
+        .spawn(move || {
+            runtime.block_on(async {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
+            });
+            on_signal();
+        })?;
+    Ok(())
+}
+
 pub(crate) fn run_service() -> Result<(), ()> {
     let directory = state_dir::service_directory().map_err(drop)?;
     state_dir::ensure_private_directory(&directory).map_err(drop)?;
     let service = Arc::new(Mutex::new(ServiceLoop::new(
         ProductionCores::new(directory).map_err(drop)?,
     )));
+    {
+        let service = service.clone();
+        on_termination_signal(move || {
+            shut_down(&service, Path::new(SOCKET_PATH));
+            std::process::exit(0);
+        })
+        .map_err(drop)?;
+    }
     {
         let service = service.clone();
         thread::Builder::new()

@@ -128,6 +128,15 @@ require_service_scriptlets() {
     echo "$label does not start the service on install" >&2
     exit 1
   }
+  # Enable only when the service was never installed, so an administrator's disable sticks.
+  grep -Fq 'if [ ! -d /var/lib/multicore ]; then' <<<"$install_text" || {
+    echo "$label re-enables the service on every upgrade" >&2
+    exit 1
+  }
+  grep -Fq 'systemctl is-enabled --quiet multicore.service' <<<"$install_text" || {
+    echo "$label starts the service even when it is disabled" >&2
+    exit 1
+  }
   grep -Fq 'systemctl disable --now multicore.service' <<<"$removal_text" || {
     echo "$label does not stop and disable the service on removal" >&2
     exit 1
