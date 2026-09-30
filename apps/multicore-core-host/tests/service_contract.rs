@@ -37,6 +37,8 @@ struct FakeCores {
     tun: bool,
     fail_tun: Option<BrokerErrorCode>,
     fail_tun_off: bool,
+    /// The switch-off takes effect but is still reported as failed (lost mixed port).
+    fail_after_tun_off: bool,
     fail_restart: bool,
 }
 
@@ -72,8 +74,15 @@ impl Cores for FakeCores {
         if !on && self.fail_tun_off {
             return Err(BrokerErrorCode::NotReady);
         }
+        if !on && self.fail_after_tun_off {
+            self.tun = false;
+            return Err(BrokerErrorCode::NotReady);
+        }
         self.tun = on;
         Ok(())
+    }
+    fn tun_is_on(&mut self) -> Option<bool> {
+        Some(self.tun)
     }
     fn health(&mut self) -> CoreHealth {
         CoreHealth {
@@ -1896,4 +1905,25 @@ fn the_mixed_port_recheck_sees_a_live_or_a_missing_listener() {
         std::time::Duration::from_millis(500)
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+/// Re-review 2 minor: when TUN did go off but the mixed-port recheck failed, the loop records
+/// the tunnel as off instead of over-reporting it until the next request.
+#[test]
+fn a_switch_off_that_took_effect_is_recorded_as_off_even_if_reported_failed() {
+    let mut service = ServiceLoop::new(FakeCores::default());
+    let alice = user("alice");
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    service.execute(A, &alice, ServiceCommand::SetTun { on: true });
+    service.cores_mut().fail_after_tun_off = true;
+    assert_eq!(
+        service.execute(A, &alice, ServiceCommand::SetTun { on: false }),
+        ServiceResponse::Error {
+            code: BrokerErrorCode::NotReady
+        }
+    );
+    assert!(matches!(
+        service.execute(A, &alice, ServiceCommand::Status),
+        ServiceResponse::Status { tun_on: false, .. }
+    ));
 }

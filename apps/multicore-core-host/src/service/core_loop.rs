@@ -44,6 +44,10 @@ pub(crate) trait Cores: Send {
     /// Restarts both cores of the current generation with TUN off.
     fn restart(&mut self) -> Result<(), BrokerErrorCode>;
     fn set_tun(&mut self, on: bool) -> Result<(), BrokerErrorCode>;
+    /// Whether TUN is actually on right now, when the cores can tell (`None`: unknown).
+    fn tun_is_on(&mut self) -> Option<bool> {
+        None
+    }
     fn health(&mut self) -> CoreHealth;
     fn stop_all(&mut self);
     fn diagnostics(&mut self) -> ServiceResponse;
@@ -281,8 +285,12 @@ impl<C: Cores> ServiceLoop<C> {
                     let _ = self.cores.set_tun(false);
                     self.tun_on = false;
                 }
-                // A failed switch-off may have left the tunnel up: `tun_on` stays true so the
+                // A failed switch-off may have left the tunnel up: unless the cores can confirm
+                // it is off (e.g. only the mixed-port recheck failed), `tun_on` stays true so the
                 // next `SetTun{on:false}` retries instead of short-circuiting.
+                if !on {
+                    self.tun_on = self.cores.tun_is_on().unwrap_or(true);
+                }
                 ServiceResponse::Error { code }
             }
         }

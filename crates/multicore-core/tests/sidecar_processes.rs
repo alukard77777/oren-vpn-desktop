@@ -583,7 +583,15 @@ fn service_mihomo_runs_in_its_own_home_directory() {
         vec![(OsString::from("SAFE_PATHS"), home.into_os_string())]
     );
     let xray = paths.command(Engine::Xray);
-    assert!(xray.env.is_empty());
+    assert_eq!(
+        xray.env,
+        vec![(
+            OsString::from("XRAY_LOCATION_ASSET"),
+            PathBuf::from(r"C:\ProgramData\MultiCore\service").into_os_string()
+        )]
+    );
+    let on_demand = self::paths().command(Engine::Xray);
+    assert!(on_demand.env.is_empty());
 }
 
 #[tokio::test]
