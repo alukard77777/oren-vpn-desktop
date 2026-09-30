@@ -1005,15 +1005,32 @@ mod tests {
         assert!(matches!(outcome, Finalization::Confirmed(Ok(()))));
     }
 
+    #[cfg(windows)]
+    const ARCHIVE_DIR: &str = r"C:\ProgramData\MultiCore\service\update";
+    #[cfg(not(windows))]
+    const ARCHIVE_DIR: &str = "/var/lib/multicore/service/update";
+    #[cfg(windows)]
+    const ARCHIVE: &str = r"C:\ProgramData\MultiCore\service\update\multicore-1.1.0.zip";
+    #[cfg(not(windows))]
+    const ARCHIVE: &str = "/var/lib/multicore/service/update/multicore-1.1.0.zip";
+    #[cfg(windows)]
+    const TARGET: &str = r"C:\Program Files\MultiCore\current";
+    #[cfg(not(windows))]
+    const TARGET: &str = "/opt/multicore/current";
+    #[cfg(windows)]
+    const USER_UPDATE_DIR: &str = r"C:\Users\me\AppData\Local\MultiCore\update";
+    #[cfg(not(windows))]
+    const USER_UPDATE_DIR: &str = "/home/me/.local/share/MultiCore/update";
+
     fn base_args() -> Vec<&'static str> {
         vec![
             "multicore-updater.exe",
             "--wait-pid",
             "42",
             "--archive",
-            r"C:\ProgramData\MultiCore\service\update\multicore-1.1.0.zip",
+            ARCHIVE,
             "--target",
-            r"C:\Program Files\MultiCore\current",
+            TARGET,
             "--size",
             "10",
             "--sha256",
@@ -1030,14 +1047,14 @@ mod tests {
             "--service-session",
             "1",
             "--user-update-dir",
-            r"C:\Users\me\AppData\Local\MultiCore\update",
+            USER_UPDATE_DIR,
         ]);
         let request = parse_args(args.iter().map(|arg| arg.to_string())).unwrap();
         let service = request.service.as_ref().unwrap();
         assert_eq!(service.session_id, 1);
         assert_eq!(
             update_state_dir(&request),
-            Some(PathBuf::from(r"C:\Users\me\AppData\Local\MultiCore\update"))
+            Some(PathBuf::from(USER_UPDATE_DIR))
         );
         let mut half = base_args();
         half.extend(["--service-session", "1"]);
@@ -1053,7 +1070,7 @@ mod tests {
         assert!(request.service.is_none());
         assert_eq!(
             update_state_dir(&request),
-            Some(PathBuf::from(r"C:\ProgramData\MultiCore\service\update"))
+            Some(PathBuf::from(ARCHIVE_DIR))
         );
     }
 
