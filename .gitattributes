@@ -1,0 +1,2 @@
+# Shipped dashboard scripts are hashed into SHA256SUMS: keep their bytes host-independent.
+packaging/dashboard/*.js text eol=lf

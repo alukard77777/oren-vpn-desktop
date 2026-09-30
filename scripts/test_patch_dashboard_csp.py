@@ -36,6 +36,16 @@ class PatchIndexTest(unittest.TestCase):
             self.assertIn(token, script)
         self.assertNotIn("fetch(", script)
         self.assertNotIn("XMLHttpRequest", script)
+        # The Logs page mutates constantly: DOM passes are coalesced per frame.
+        self.assertIn("requestAnimationFrame", script)
+        self.assertIn("new MutationObserver(scheduleHide)", script)
+
+    def test_readonly_script_bytes_do_not_depend_on_the_checkout(self):
+        path = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "packaging" / "dashboard" / "multicore-readonly.js"
+        )
+        self.assertNotIn(b"\r", path.read_bytes())
 
 
 if __name__ == "__main__":
