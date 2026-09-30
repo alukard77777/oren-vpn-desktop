@@ -834,20 +834,52 @@ impl<C: ServiceConnector> ProcessController for ServiceCoresController<C> {
     }
 }
 
-/// Identity of a warm generation: the subscription payloads and the physical interface Xray
-/// is bound to. A changed default interface (Wi-Fi ↔ Ethernet) must re-stage before Connect.
-#[must_use]
-pub fn warm_key(snapshot: &Snapshot, outbound_interface: &str) -> [u8; 32] {
+/// What a warm generation was staged from: the subscription payloads and the physical
+/// interface Xray is bound to. A changed default interface (Wi-Fi <-> Ethernet) must re-stage
+/// before Connect; kept apart so a miss can say which part differed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarmInputs {
+    snapshot: [u8; 32],
+    interface: String,
+}
+
+impl WarmInputs {
+    #[must_use]
+    pub fn new(snapshot: &Snapshot, outbound_interface: &str) -> Self {
+        Self {
+            snapshot: snapshot_digest(snapshot),
+            interface: outbound_interface.to_owned(),
+        }
+    }
+
+    /// The single identity of these inputs.
+    #[must_use]
+    pub fn key(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        for part in [self.snapshot.as_slice(), self.interface.as_bytes()] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        digest.finalize().into()
+    }
+}
+
+fn snapshot_digest(snapshot: &Snapshot) -> [u8; 32] {
     let mut digest = Sha256::new();
     for part in [
         snapshot.mihomo.raw_yaml().as_bytes(),
         snapshot.xray.raw_bytes(),
-        outbound_interface.as_bytes(),
     ] {
         digest.update((part.len() as u64).to_le_bytes());
         digest.update(part);
     }
     digest.finalize().into()
+}
+
+/// Identity of a warm generation for `snapshot` bound to `outbound_interface`.
+#[must_use]
+pub fn warm_key(snapshot: &Snapshot, outbound_interface: &str) -> [u8; 32] {
+    WarmInputs::new(snapshot, outbound_interface).key()
 }
 
 /// A runtime generation staged for the service: what it was staged from, its id and the
@@ -859,37 +891,78 @@ pub struct WarmStage {
     pub mixed_port: u16,
 }
 
+/// Why a Connect or warm-up could not reuse the warm generation and staged a new one. Carries
+/// no secrets: interface aliases ("Ethernet", "Wi-Fi") are the only text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WarmMiss {
+    /// Nothing was staged yet (first warm-up since the daemon started).
+    NothingStaged,
+    /// The subscription payloads differ from the staged ones.
+    SnapshotChanged,
+    /// The physical default interface differs from the one Xray was bound to.
+    InterfaceChanged { staged: String, now: String },
+    /// The service rejected the last `Prepare` of the staged generation.
+    PrepareRejected,
+}
+
+impl fmt::Display for WarmMiss {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NothingStaged => formatter.write_str("nothing_staged"),
+            Self::SnapshotChanged => formatter.write_str("snapshot_changed"),
+            Self::InterfaceChanged { staged, now } => {
+                write!(formatter, "interface_changed staged={staged:?} now={now:?}")
+            }
+            Self::PrepareRejected => formatter.write_str("prepare_rejected"),
+        }
+    }
+}
+
+struct Staged {
+    stage: WarmStage,
+    inputs: WarmInputs,
+}
+
 /// The daemon's cache of the staged service generation. A generation whose `Prepare` the
 /// service rejected is dropped, so the next attempt re-stages it (with a fresh mixed port)
 /// instead of failing the same way forever.
 #[derive(Default)]
 pub struct WarmStages {
-    current: Mutex<Option<WarmStage>>,
+    current: Mutex<Option<Staged>>,
 }
 
 impl WarmStages {
-    /// The cached stage for `key`, unless the service rejected its last `Prepare`.
+    /// The cached stage for `inputs`, or why there is none (the service rejected its last
+    /// `Prepare`, or what it was staged from differs). A miss drops the cached stage.
     pub fn reusable<C: ServiceConnector>(
         &self,
-        key: &[u8; 32],
+        inputs: &WarmInputs,
         session: &ServiceSession<C>,
-    ) -> Option<WarmStage> {
-        let mut current = self.current.lock().ok()?;
-        let cached = *current;
-        match cached {
-            Some(stage) if stage.key == *key && !session.prepare_failed(stage.generation) => {
-                Some(stage)
+    ) -> Result<WarmStage, WarmMiss> {
+        let Ok(mut current) = self.current.lock() else {
+            return Err(WarmMiss::NothingStaged);
+        };
+        let miss = match current.as_ref() {
+            None => WarmMiss::NothingStaged,
+            Some(staged) if session.prepare_failed(staged.stage.generation) => {
+                WarmMiss::PrepareRejected
             }
-            _ => {
-                *current = None;
-                None
+            Some(staged) if staged.inputs.snapshot != inputs.snapshot => WarmMiss::SnapshotChanged,
+            Some(staged) if staged.inputs.interface != inputs.interface => {
+                WarmMiss::InterfaceChanged {
+                    staged: staged.inputs.interface.clone(),
+                    now: inputs.interface.clone(),
+                }
             }
-        }
+            Some(staged) => return Ok(staged.stage),
+        };
+        *current = None;
+        Err(miss)
     }
 
-    pub fn remember(&self, stage: WarmStage) {
+    pub fn remember(&self, stage: WarmStage, inputs: WarmInputs) {
         if let Ok(mut current) = self.current.lock() {
-            *current = Some(stage);
+            *current = Some(Staged { stage, inputs });
         }
     }
 }

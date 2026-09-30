@@ -14,7 +14,8 @@ use multicore_daemon::MihomoSelector;
 use multicore_daemon::connection_mode::{ProxySwitch, SystemProxyController};
 use multicore_daemon::service_client::{
     ControllerSlot, ServiceConnector, ServiceCoresController, ServiceError, ServiceMode,
-    ServiceSession, ServiceTransport, ServiceTunController, SlotSelector, WarmStage, WarmStages,
+    ServiceSession, ServiceTransport, ServiceTunController, SlotSelector, WarmInputs, WarmMiss,
+    WarmStage, WarmStages,
     service_response_timeout, warm_key,
 };
 
@@ -327,21 +328,46 @@ async fn the_slot_selector_follows_the_current_endpoint() {
     );
 }
 
+fn parsed(yaml: &str) -> Snapshot {
+    Snapshot::parse(yaml.as_bytes(), multicore_core::IDLE_XRAY_CONFIG).unwrap()
+}
+
+const SNAPSHOT_A: &str =
+    "proxies:
+  - {name: a, type: socks5}
+proxy-groups:
+  - {name: g, type: select, proxies: [a]}
+";
+const SNAPSHOT_B: &str =
+    "proxies:
+  - {name: b, type: socks5}
+proxy-groups:
+  - {name: g, type: select, proxies: [b]}
+";
+
 #[test]
 fn a_rejected_generation_is_not_reused_and_a_good_one_is() {
     let (session, connector, _) = session();
     let stages = WarmStages::default();
-    let key = [7_u8; 32];
-    stages.remember(WarmStage {
-        key,
-        generation: 3,
-        mixed_port: 28765,
-    });
+    let snapshot = parsed(SNAPSHOT_A);
+    let inputs = WarmInputs::new(&snapshot, "Ethernet");
+    assert_eq!(
+        stages.reusable(&inputs, &session),
+        Err(WarmMiss::NothingStaged)
+    );
+    stages.remember(
+        WarmStage {
+            key: inputs.key(),
+            generation: 3,
+            mixed_port: 28765,
+        },
+        inputs.clone(),
+    );
     assert_eq!(
         stages
-            .reusable(&key, &session)
+            .reusable(&inputs, &session)
             .map(|stage| stage.generation),
-        Some(3)
+        Ok(3)
     );
     connector.0.lock().unwrap().reject_prepare = Some(BrokerErrorCode::NotReady);
     assert_eq!(
@@ -350,34 +376,69 @@ fn a_rejected_generation_is_not_reused_and_a_good_one_is() {
     );
     assert!(session.prepare_failed(3));
     assert_eq!(
-        stages.reusable(&key, &session),
-        None,
+        stages.reusable(&inputs, &session),
+        Err(WarmMiss::PrepareRejected),
         "re-stage with a fresh port"
     );
     assert_eq!(
-        stages.reusable(&key, &session),
-        None,
+        stages.reusable(&inputs, &session),
+        Err(WarmMiss::NothingStaged),
         "the stale stage is gone"
     );
     connector.0.lock().unwrap().reject_prepare = None;
     session.prepare(4).unwrap();
-    stages.remember(WarmStage {
-        key,
-        generation: 4,
-        mixed_port: 30001,
-    });
+    stages.remember(
+        WarmStage {
+            key: inputs.key(),
+            generation: 4,
+            mixed_port: 30001,
+        },
+        inputs.clone(),
+    );
     assert!(!session.prepare_failed(3));
     assert_eq!(
         stages
-            .reusable(&key, &session)
+            .reusable(&inputs, &session)
             .map(|stage| stage.mixed_port),
-        Some(30001)
+        Ok(30001)
     );
+}
+
+/// A miss names the staged input that differed, without any subscription content.
+#[test]
+fn a_warm_miss_names_which_input_differed() {
+    let (session, _, _) = session();
+    let stages = WarmStages::default();
+    let staged = WarmInputs::new(&parsed(SNAPSHOT_A), "Ethernet");
+    let remember = |generation| {
+        stages.remember(
+            WarmStage {
+                key: staged.key(),
+                generation,
+                mixed_port: 1,
+            },
+            staged.clone(),
+        );
+    };
+    remember(1);
     assert_eq!(
-        stages.reusable(&[8_u8; 32], &session),
-        None,
-        "another snapshot"
+        stages.reusable(&WarmInputs::new(&parsed(SNAPSHOT_B), "Ethernet"), &session),
+        Err(WarmMiss::SnapshotChanged)
     );
+    remember(2);
+    let miss = stages
+        .reusable(&WarmInputs::new(&parsed(SNAPSHOT_A), "Wi-Fi"), &session)
+        .unwrap_err();
+    assert_eq!(
+        miss,
+        WarmMiss::InterfaceChanged {
+            staged: "Ethernet".into(),
+            now: "Wi-Fi".into()
+        }
+    );
+    let text = miss.to_string();
+    assert!(text.contains("Ethernet") && text.contains("Wi-Fi"), "{text}");
+    assert!(!text.contains("socks5"), "{text}");
 }
 
 #[test]

@@ -40,7 +40,7 @@ use multicore_core::WindowsJobLauncher as PlatformLauncher;
 
 /// How long `SetTun{on:true}` waits for the `MultiCore` adapter and Mihomo to agree.
 pub(crate) const TUN_READY_TIMEOUT: Duration = Duration::from_secs(15);
-const TUN_POLL: Duration = Duration::from_millis(100);
+const TUN_POLL: Duration = Duration::from_millis(25);
 /// How long `SetTun{on:false}` waits for the loopback mixed port to accept connections again.
 pub(crate) const MIXED_PORT_RECHECK: Duration = Duration::from_secs(3);
 

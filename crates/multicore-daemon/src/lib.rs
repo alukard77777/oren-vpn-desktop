@@ -2039,6 +2039,8 @@ mod event_persistence_tests {
 pub struct PreparedController<P: ProcessController> {
     controller: Arc<P>,
     runtime: Option<StagedRuntime>,
+    /// Why a service generation was staged instead of reusing the warm one (no secrets).
+    restage_reason: Option<String>,
 }
 
 impl<P: ProcessController> PreparedController<P> {
@@ -2046,6 +2048,7 @@ impl<P: ProcessController> PreparedController<P> {
         Self {
             controller,
             runtime: Some(runtime),
+            restage_reason: None,
         }
     }
 
@@ -2053,7 +2056,15 @@ impl<P: ProcessController> PreparedController<P> {
         Self {
             controller,
             runtime: None,
+            restage_reason: None,
         }
+    }
+
+    /// Records why the warm generation could not be reused, for the Connect diagnostics.
+    #[must_use]
+    pub fn restaged_because(mut self, reason: impl Into<String>) -> Self {
+        self.restage_reason = Some(reason.into());
+        self
     }
 
     /// A controller whose runtime generation is already active (a warm service generation).
@@ -2874,15 +2885,20 @@ where
                     .map_err(|_| BackendError::new())?;
                 state.message = None;
                 state.degraded = false;
-                state.push_event_with_details(
+                let stopped_ms = started.elapsed().as_millis();
+                drop(state);
+                self.reconcile_authoritative().await;
+                self.inner.write().await.push_event_with_details(
                     Severity::Info,
                     Component::Core,
                     "disconnect",
                     "Подключение остановлено.",
-                    json!({ "total_ms": started.elapsed().as_millis() }),
+                    json!({
+                        "stop_ms": stopped_ms,
+                        "reconcile_ms": started.elapsed().as_millis().saturating_sub(stopped_ms),
+                        "total_ms": started.elapsed().as_millis(),
+                    }),
                 );
-                drop(state);
-                self.reconcile_authoritative().await;
                 Ok(self.current_status().await)
             }
             Err(_) => {
@@ -4191,7 +4207,20 @@ where
             }
         };
         let controller = prepared.controller();
+        let restage_reason = prepared.restage_reason.clone();
         let prepared_ms = started.elapsed().as_millis();
+        if let Some(reason) = &restage_reason {
+            // The warm generation was not reused, so this Connect staged and prepared again
+            // (restarting the cores): the reason names which staged input differed.
+            let mut state = self.inner.write().await;
+            state.push_event_with_details(
+                Severity::Debug,
+                Component::Core,
+                "connect",
+                "Прогретая конфигурация не подошла, запуск подготовлен заново.",
+                json!({ "reason": reason, "prepare_ms": prepared_ms }),
+            );
+        }
         if prepared.activate().is_err() {
             let mut state = self.inner.write().await;
             state.message = Some("Не удалось активировать конфигурацию запуска.".to_owned());
@@ -4283,6 +4312,7 @@ where
                     "Подключение установлено.",
                     json!({
                         "prepare_ms": prepared_ms,
+                        "restaged": restage_reason.is_some(),
                         "start_ms": started_ms.saturating_sub(prepared_ms),
                         "replay_ms": started.elapsed().as_millis().saturating_sub(started_ms),
                         "total_ms": started.elapsed().as_millis(),

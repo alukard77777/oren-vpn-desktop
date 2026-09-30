@@ -14,7 +14,7 @@ use multicore_daemon::connection_mode::{Backed, ModeController};
 use multicore_daemon::elevated_controller::{production_factory, runtime_generation_from_path};
 use multicore_daemon::service_client::{
     ControllerSlot, ProductionServiceConnector, ServiceMode, ServiceSession, ServiceTunController,
-    SlotSelector, WarmStage, WarmStages, warm_key,
+    SlotSelector, WarmInputs, WarmStage, WarmStages,
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, CoreBackend, PreparedController, bind_loopback,
@@ -151,16 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let controller = |generation, mixed_port| {
                     service_controller(&factory_service, generation, mixed_port, options)
                 };
-                let key = warm_key(snapshot, &interface);
+                let inputs = WarmInputs::new(snapshot, &interface);
+                let key = inputs.key();
                 let _staging = staging.lock().map_err(|_| BackendError::new())?;
                 // A generation the service rejected (for example its mixed port was taken)
                 // is dropped here and staged again with a fresh port.
-                if let Some(stage) = warm_stages.reusable(&key, &factory_service) {
-                    return Ok(PreparedController::reuse(controller(
-                        stage.generation,
-                        stage.mixed_port,
-                    )?));
-                }
+                let miss = match warm_stages.reusable(&inputs, &factory_service) {
+                    Ok(stage) => {
+                        return Ok(PreparedController::reuse(controller(
+                            stage.generation,
+                            stage.mixed_port,
+                        )?));
+                    }
+                    Err(miss) => miss,
+                };
                 let mixed_port = free_loopback_port().ok_or_else(BackendError::new)?;
                 let control = runtime_control
                     .clone()
@@ -171,15 +175,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|_| BackendError::new())?;
                 let generation = runtime_generation_from_path(&staged.paths().directory)
                     .map_err(|_| BackendError::new())?;
-                warm_stages.remember(WarmStage {
-                    key,
-                    generation,
-                    mixed_port,
-                });
+                warm_stages.remember(
+                    WarmStage {
+                        key,
+                        generation,
+                        mixed_port,
+                    },
+                    inputs,
+                );
                 return Ok(PreparedController::with_runtime(
                     controller(generation, mixed_port)?,
                     staged,
-                ));
+                )
+                .restaged_because(miss.to_string()));
             }
             let control = runtime_control
                 .clone()
@@ -617,8 +625,8 @@ mod tests {
         assert!(tun_path_compact.contains("SERVICE_UNAVAILABLE_NOTICE"));
         // Warm generations are keyed by the payloads and the physical interface; a rejected
         // one is re-staged.
-        assert!(tun_path_compact.contains("warm_key(snapshot,&interface)"));
-        assert!(tun_path_compact.contains("warm_stages.reusable(&key,&factory_service)"));
+        assert!(tun_path_compact.contains("WarmInputs::new(snapshot,&interface)"));
+        assert!(tun_path_compact.contains("warm_stages.reusable(&inputs,&factory_service)"));
         assert!(tun_path_compact.contains("PreparedController::reuse("));
         // The on-demand path is unchanged: elevated host per generation.
         assert!(tun_path.contains("elevated_factory"));

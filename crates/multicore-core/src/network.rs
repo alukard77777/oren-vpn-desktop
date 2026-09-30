@@ -20,7 +20,9 @@ fn select_default_route(
             candidate.prefix_length == 0
                 && candidate.connected
                 && !candidate.loopback
-                && candidate.alias != "MultiCore"
+                // Our own adapter, also under the numbered name Windows gives a second
+                // or lingering instance ("MultiCore 2").
+                && !candidate.alias.starts_with("MultiCore")
                 && !candidate.alias.is_empty()
                 && candidate.alias.len() <= 256
                 && !candidate.alias.chars().any(char::is_control)
@@ -252,6 +254,7 @@ mod tests {
         assert_eq!(
             select_default_route(vec![
                 candidate("MultiCore", 0, 0),
+                candidate("MultiCore 2", 0, 0),
                 disconnected,
                 specific,
                 loopback,

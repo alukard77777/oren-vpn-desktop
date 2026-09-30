@@ -47,6 +47,8 @@ pub struct Recording {
     /// The next factory call blocks here (a service probe stuck on a starting service).
     pub factory_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     pub factory_entered: AtomicBool,
+    /// When set, the factory reports that it staged anew instead of reusing the warm one.
+    pub restage_reason: Mutex<Option<String>>,
 }
 
 pub struct RecordingController(pub Arc<Recording>);
@@ -194,7 +196,11 @@ pub fn harness(profiles: &[&str]) -> Harness {
             } else {
                 "a"
             });
-        Ok(PreparedController::reuse(controller.clone()))
+        let prepared = PreparedController::reuse(controller.clone());
+        Ok(match controller.0.restage_reason.lock().unwrap().clone() {
+            Some(reason) => prepared.restaged_because(reason),
+            None => prepared,
+        })
     });
     let selector = Arc::new(QuietSelector::default());
     let backend = CoreBackend::new_with_connect_options(
@@ -274,6 +280,41 @@ async fn disconnect_keeps_the_cores_warm() {
     let status = h.backend.status().await.unwrap();
     assert_eq!(status.state, ConnectionState::Ready);
     assert!(status.cores_ready);
+}
+
+#[tokio::test]
+async fn a_connect_that_could_not_reuse_the_warm_generation_says_why() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    *h.recording.restage_reason.lock().unwrap() =
+        Some("interface_changed staged=\"Ethernet\" now=\"Wi-Fi\"".to_owned());
+    h.backend.connect().await.unwrap();
+    let events = h.backend.events_after(0).await.unwrap();
+    let miss = events
+        .iter()
+        .find(|event| event.level == "debug" && event.component == "core")
+        .expect("a diagnostic event names the miss");
+    let details = miss.details.as_ref().unwrap();
+    assert_eq!(
+        details["reason"],
+        "interface_changed staged=\"Ethernet\" now=\"Wi-Fi\""
+    );
+    let connected = events
+        .iter()
+        .find(|event| event.details.as_ref().is_some_and(|d| d.get("total_ms").is_some()))
+        .unwrap();
+    assert_eq!(connected.details.as_ref().unwrap()["restaged"], true);
+}
+
+#[tokio::test]
+async fn a_reused_warm_generation_leaves_no_miss_event() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let events = h.backend.events_after(0).await.unwrap();
+    assert!(events.iter().all(|event| event.level != "debug"));
 }
 
 #[tokio::test]
