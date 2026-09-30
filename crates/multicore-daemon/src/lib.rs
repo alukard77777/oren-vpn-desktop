@@ -883,6 +883,13 @@ struct AppState {
     /// live controller session exists. `AppState` deliberately has no `Debug` impl so this can
     /// never be leaked through an accidental `{:?}` format.
     dashboard_url: Option<Arc<str>>,
+    /// Present when updates go through the always-ready service (Windows service install).
+    service_updates: Option<Arc<dyn ServiceUpdates>>,
+}
+
+/// Updates performed by the always-ready service (see `service_client::ServiceSession`).
+pub trait ServiceUpdates: Send + Sync + 'static {
+    fn update(&self, version: &str) -> Result<(), service_client::ServiceError>;
 }
 
 #[derive(Clone)]
@@ -952,11 +959,13 @@ fn build_router_shared(
     bearer_token: impl AsRef<str>,
     event_epoch: impl Into<String>,
     dashboard_url: Option<Arc<str>>,
+    service_updates: Option<Arc<dyn ServiceUpdates>>,
 ) -> Router {
     let app_state = AppState {
         backend,
         event_epoch: Arc::from(event_epoch.into()),
         dashboard_url,
+        service_updates,
     };
     let auth_state = AuthState {
         token_hash: Sha256::digest(bearer_token.as_ref().as_bytes()).into(),
@@ -990,6 +999,7 @@ fn build_router_shared(
         .route("/diagnostics", get(diagnostics))
         .route("/dashboard-url", get(dashboard_url_handler))
         .route("/session", get(session))
+        .route("/service/update", post(service_update))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1008,7 +1018,13 @@ fn build_router<B>(
 where
     B: Backend,
 {
-    build_router_shared(Arc::new(backend), bearer_token, event_epoch, dashboard_url)
+    build_router_shared(
+        Arc::new(backend),
+        bearer_token,
+        event_epoch,
+        dashboard_url,
+        None,
+    )
 }
 
 /// Builds the API over a backend the caller keeps a handle to (warm-up, notices).
@@ -1016,12 +1032,14 @@ pub fn try_router_shared(
     backend: Arc<dyn Backend>,
     bearer_token: impl AsRef<str>,
     dashboard_url: Option<Arc<str>>,
+    service_updates: Option<Arc<dyn ServiceUpdates>>,
 ) -> Result<Router, getrandom::Error> {
     Ok(build_router_shared(
         backend,
         bearer_token,
         generate_event_epoch()?,
         dashboard_url,
+        service_updates,
     ))
 }
 
@@ -1646,6 +1664,56 @@ async fn session(State(state): State<AppState>, body: Bytes) -> Result<Json<Sess
                 "Сначала установите подключение.",
             )
         })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceUpdateRequest {
+    version: String,
+}
+
+/// The always-ready service downloads and verifies `version` (minutes, while the cores keep
+/// running), then stops the cores and hands over to its updater, which restarts the service
+/// and the desktop. Waits on a blocking thread and holds no daemon lock meanwhile.
+async fn service_update(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let Some(updates) = state.service_updates.clone() else {
+        return Err(service_unavailable());
+    };
+    let request: ServiceUpdateRequest = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("Некорректный запрос обновления."))?;
+    let result = tokio::task::spawn_blocking(move || updates.update(&request.version))
+        .await
+        .map_err(|_| ApiError::backend("Служба не ответила."))?;
+    match result {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(service_client::ServiceError::Busy) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "service_busy",
+            "MultiCore уже запущен у другого пользователя.",
+        )),
+        // No service to talk to (removed, or not running right now): nothing was attempted.
+        Err(
+            service_client::ServiceError::NotInstalled
+            | service_client::ServiceError::Unavailable
+            | service_client::ServiceError::Impostor,
+        ) => Err(service_unavailable()),
+        Err(_) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "service_update_failed",
+            "Служба не смогла загрузить или проверить обновление.",
+        )),
+    }
+}
+
+fn service_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "service_unavailable",
+        "Служба MultiCore недоступна.",
+    )
 }
 
 /// An empty body keeps the default (TUN); otherwise it must be exactly `ConnectOptions`.

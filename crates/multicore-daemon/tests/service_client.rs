@@ -32,6 +32,8 @@ struct FakeService {
     /// `SetTun{on: true}` is rolled back: the adapter never came up.
     tun_rollback: bool,
     tun: bool,
+    /// `Update` waits for this before answering: a download that takes a while.
+    update_gate: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +61,13 @@ impl ServiceTransport for FakeTransport {
         service.commands.push(command.clone());
         if service.busy {
             return Ok(ServiceResponse::Busy);
+        }
+        if let ServiceCommand::Update { .. } = command
+            && let Some(gate) = service.update_gate.take()
+        {
+            drop(service);
+            let _ = gate.recv();
+            return Ok(ServiceResponse::UpdateStarted);
         }
         if let (ServiceCommand::Prepare { .. }, Some(code)) = (command, service.reject_prepare) {
             return Ok(ServiceResponse::Error { code });
@@ -369,6 +378,49 @@ fn read_only_commands_get_a_generous_timeout() {
         service_response_timeout(&ServiceCommand::Diagnostics)
             >= std::time::Duration::from_secs(15)
     );
+}
+
+#[test]
+fn an_update_runs_on_its_own_channel_and_keeps_the_cores() {
+    let (session, connector, _) = session();
+    session.prepare(3).unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    connector.0.lock().unwrap().update_gate = Some(gate);
+    let updating = {
+        let session = session.clone();
+        thread::spawn(move || session.update("1.2.0"))
+    };
+    while !connector
+        .0
+        .lock()
+        .unwrap()
+        .commands
+        .contains(&ServiceCommand::Update {
+            version: "1.2.0".into(),
+        })
+    {
+        thread::yield_now();
+    }
+    // While the service downloads, the connection's own channel stays usable and the watcher
+    // does not ask for a Status the busy service could not answer in time.
+    session.poll();
+    assert!(session.cores_ready());
+    session.set_tun(false).unwrap();
+    release.send(()).unwrap();
+    updating.join().unwrap().unwrap();
+    let service = connector.0.lock().unwrap();
+    assert_eq!(service.connects, 2, "the update opened its own channel");
+    assert!(!service.commands.contains(&ServiceCommand::Status));
+}
+
+#[test]
+fn a_refused_update_is_reported() {
+    let (session, connector, _) = session();
+    connector.0.lock().unwrap().busy = true;
+    assert_eq!(session.update("1.2.0"), Err(ServiceError::Busy));
+    connector.0.lock().unwrap().busy = false;
+    connector.0.lock().unwrap().connect_errors = vec![ServiceError::NotInstalled];
+    assert_eq!(session.update("1.2.0"), Err(ServiceError::NotInstalled));
 }
 
 #[tokio::test]
