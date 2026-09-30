@@ -24,6 +24,8 @@ param(
     [switch]$Revert,
     [switch]$CleanDataTask,
     [switch]$WithDesktop,
+    # Re-run on a guest where MultiCore is still installed (e.g. after -Uninstall Skip).
+    [switch]$AllowExistingInstall,
     [string]$SubscriptionUrl,
     [string]$TrafficUrl = 'https://www.gstatic.com/generate_204',
     [string]$VMName = 'Win10-MultiCore-Test',
@@ -111,23 +113,40 @@ $orchestratorArguments = @(
 if ($SubscriptionUrl) { $orchestratorArguments += @('-SubscriptionUrl', $SubscriptionUrl) }
 if ($CleanDataTask) { $orchestratorArguments += '-CleanDataTask' }
 if ($WithDesktop) { $orchestratorArguments += '-WithDesktop' }
+if ($AllowExistingInstall) { $orchestratorArguments += '-AllowExistingInstall' }
 
 Write-Host "Running the orchestrator in $VMName ($Mode, uninstall $Uninstall)"
-$exitCode = Invoke-Command -VMName $VMName -Credential $credential -ArgumentList (, $orchestratorArguments) -ScriptBlock {
-    param($arguments)
-    & powershell.exe @arguments | ForEach-Object { Write-Host $_ }
-    $LASTEXITCODE
-}
-
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$collected = Invoke-Command -VMName $VMName -Credential $credential -ScriptBlock {
-    $work = Join-Path $env:ProgramData 'MultiCoreLiveTest'
-    foreach ($item in @(Get-ChildItem -LiteralPath $work -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.json', '.log', '.txt', '.done' })) {
-        [pscustomobject]@{ Name = $item.Name; Text = [IO.File]::ReadAllText($item.FullName) }
+$exitCode = 1
+try {
+    $exitCode = Invoke-Command -VMName $VMName -Credential $credential -ArgumentList (, $orchestratorArguments) -ScriptBlock {
+        param($arguments)
+        & powershell.exe @arguments | ForEach-Object { Write-Host $_ }
+        $LASTEXITCODE
     }
+} finally {
+    # Collect whatever the run left, even when the orchestrator failed. A daemon the driver
+    # could not stop keeps its stdout/stderr files open: stop it and read with shared access.
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    $collected = Invoke-Command -VMName $VMName -Credential $credential -ScriptBlock {
+        Get-Process -Name 'multicore-daemon' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $work = Join-Path $env:ProgramData 'MultiCoreLiveTest'
+        $files = @(Get-ChildItem -LiteralPath $work -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.json', '.log', '.txt', '.done' })
+        # Still installed (-Uninstall Skip, or a failed uninstall): the service's own logs too.
+        $files += @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'MultiCore\service\logs') -File -ErrorAction SilentlyContinue)
+        foreach ($item in $files) {
+            try {
+                $stream = [IO.File]::Open($item.FullName, 'Open', 'Read', 'ReadWrite, Delete')
+                try { $text = (New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $stream.Dispose() }
+                $name = if ($item.DirectoryName -like '*\service\logs') { 'service-installed-' + $item.Name } else { $item.Name }
+                [pscustomobject]@{ Name = $name; Text = $text }
+            } catch {
+                [pscustomobject]@{ Name = $item.Name + '.unreadable.txt'; Text = $_.Exception.Message }
+            }
+        }
+    }
+    foreach ($file in @($collected)) {
+        if ($file) { [IO.File]::WriteAllText((Join-Path $OutDir $file.Name), [string]$file.Text, [Text.UTF8Encoding]::new($false)) }
+    }
+    Write-Host "Guest exit code $exitCode; results in $OutDir"
 }
-foreach ($file in @($collected)) {
-    [IO.File]::WriteAllText((Join-Path $OutDir $file.Name), $file.Text, [Text.UTF8Encoding]::new($false))
-}
-Write-Host "Guest exit code $exitCode; results in $OutDir"
 exit ([int]$exitCode)

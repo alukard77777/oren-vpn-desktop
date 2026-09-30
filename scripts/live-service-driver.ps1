@@ -507,8 +507,10 @@ function Invoke-ServiceMode {
     Reset-Disconnected
     Check 'quit-stops-cores' {
         Save-DaemonEvidence 'service-first-daemon'
-        if (-not (Get-ServiceCorePids)) { throw 'cores were not running before quit' }
+        $warm = Get-ServiceCorePids
+        # Always quit: a daemon left running keeps its data-root lock and fails every later check.
         Stop-Daemon
+        if (-not $warm) { throw 'cores were not running before quit' }
         Wait-Until { -not (Get-ServiceCorePids) } 30 'service cores to stop' | Out-Null
         if ((Get-Service -Name 'MultiCore').Status -ne 'Running') { throw 'service stopped instead of idling' }
         'cores stopped, service idle'

@@ -301,6 +301,21 @@ function Invoke-PostDriverChecks {
     } | Out-Null
 }
 
+function Save-ServiceLogs {
+    # The uninstaller removes %ProgramData%\MultiCore: keep the service's own logs (why a Prepare
+    # was refused, the cores' output) with the results. Stop a leftover daemon first so nothing
+    # holds the files being copied.
+    Get-Process -Name 'multicore-daemon' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $logs = Join-Path $ProgramDataRoot 'service\logs'
+    foreach ($item in @(Get-ChildItem -LiteralPath $logs -File -ErrorAction SilentlyContinue)) {
+        try {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $WorkDir ('service-' + $item.BaseName + '.log')) -Force
+        } catch {
+            Write-Host "could not copy $($item.FullName): $($_.Exception.Message)"
+        }
+    }
+}
+
 function Invoke-Uninstall {
     $root = if ($Mode -eq 'Service') { $ServiceRoot } else { $PerUserRoot }
     $uninstaller = Join-Path $root 'unins000.exe'
@@ -422,6 +437,7 @@ try {
             Add-Result 'driver:task' $false $_.Exception.Message
         }
         Invoke-PostDriverChecks
+        if ($Mode -eq 'Service') { Save-ServiceLogs }
         if ($Uninstall -ne 'Skip') { Invoke-Uninstall }
     }
 } finally {
