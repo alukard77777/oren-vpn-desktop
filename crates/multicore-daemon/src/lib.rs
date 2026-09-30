@@ -1,5 +1,7 @@
 pub mod connection_mode;
+pub mod dashboard_proxy;
 pub mod elevated_controller;
+pub mod service_client;
 pub mod system_proxy;
 
 use std::{
@@ -30,7 +32,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use multicore_core::{
     AtomicSnapshot, AttemptOutcome, Component, ConnectionState as CoreConnectionState,
-    DiagnosticStream, Event, FetchDiagnostics, FetchError, HttpClient, MAX_PROFILES,
+    DiagnosticStream, Engine, Event, FetchDiagnostics, FetchError, HttpClient, MAX_PROFILES,
     ProcessController, ProcessDiagnostics, ProfileError, ProfileId, ProfileStore, ProfileSummary,
     RuntimeCheckState, ServiceLogoLease, Severity, Snapshot, SnapshotCommit, StagedRuntime,
     StateMachine, SubscriptionFetcher, Supervisor,
@@ -73,6 +75,14 @@ const CONNECTING_MESSAGE: &str = "Запускается подключение.
 #[cfg(not(windows))]
 const CONNECTING_MESSAGE: &str =
     "Запускается подключение. Подтвердите права администратора в системном окне.";
+const TUNNEL_ON_MESSAGE: &str = "Включается туннель…";
+const WARM_UP_FAILED_MESSAGE: &str =
+    "Ядра не удалось запустить заранее. Они запустятся при подключении.";
+
+/// Always-ready mode: whether the service's cores run for the generation it prepared.
+pub trait CoresReadiness: Send + Sync + 'static {
+    fn cores_ready(&self) -> bool;
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +105,12 @@ pub struct StatusDto {
     pub message: Option<String>,
     pub degraded: bool,
     pub subscription: Option<SubscriptionInfoDto>,
+    /// Mihomo and Xray are running (connected, or warm through the always-ready service).
+    #[serde(default)]
+    pub cores_ready: bool,
+    /// This daemon drives the always-ready MultiCore service.
+    #[serde(default)]
+    pub service_mode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -904,17 +920,14 @@ where
     build_router(backend, bearer_token, event_epoch, None)
 }
 
-fn build_router<B>(
-    backend: B,
+fn build_router_shared(
+    backend: Arc<dyn Backend>,
     bearer_token: impl AsRef<str>,
     event_epoch: impl Into<String>,
     dashboard_url: Option<Arc<str>>,
-) -> Router
-where
-    B: Backend,
-{
+) -> Router {
     let app_state = AppState {
-        backend: Arc::new(backend),
+        backend,
         event_epoch: Arc::from(event_epoch.into()),
         dashboard_url,
     };
@@ -956,6 +969,32 @@ where
         .with_state(app_state);
 
     Router::new().nest("/v1", v1)
+}
+
+fn build_router<B>(
+    backend: B,
+    bearer_token: impl AsRef<str>,
+    event_epoch: impl Into<String>,
+    dashboard_url: Option<Arc<str>>,
+) -> Router
+where
+    B: Backend,
+{
+    build_router_shared(Arc::new(backend), bearer_token, event_epoch, dashboard_url)
+}
+
+/// Builds the API over a backend the caller keeps a handle to (warm-up, notices).
+pub fn try_router_shared(
+    backend: Arc<dyn Backend>,
+    bearer_token: impl AsRef<str>,
+    dashboard_url: Option<Arc<str>>,
+) -> Result<Router, getrandom::Error> {
+    Ok(build_router_shared(
+        backend,
+        bearer_token,
+        generate_event_epoch()?,
+        dashboard_url,
+    ))
 }
 
 fn generate_event_epoch() -> Result<String, getrandom::Error> {
@@ -1543,7 +1582,7 @@ async fn dashboard_url_handler(
         .status()
         .await
         .map_err(|_| ApiError::backend("Не удалось получить состояние. Повторите попытку."))?;
-    if status.state != ConnectionState::Connected {
+    if status.state != ConnectionState::Connected && !status.cores_ready {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "not_connected",
@@ -1911,6 +1950,11 @@ impl<P: ProcessController> PreparedController<P> {
         }
     }
 
+    /// A controller whose runtime generation is already active (a warm service generation).
+    pub fn reuse(controller: Arc<P>) -> Self {
+        Self::plain(controller)
+    }
+
     fn controller(&self) -> Arc<P> {
         self.controller.clone()
     }
@@ -1966,6 +2010,7 @@ where
     /// Options of the latest connect; background preparation reuses them.
     connect_options: std::sync::Mutex<ConnectOptions>,
     post_commit_load_fault: AtomicBool,
+    warm_failure_reported: AtomicBool,
     list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
     profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
     inner: RwLock<CoreRuntime<P>>,
@@ -1988,6 +2033,9 @@ struct CoreRuntime<P: ProcessController> {
     /// Connected, so a value left from an earlier session is never reported.
     connected_since_unix_ms: u64,
     events: EventBuffer<Event>,
+    /// Catalog revision whose cores the always-ready service already runs while Ready.
+    warm_revision: Option<u64>,
+    readiness: Option<Arc<dyn CoresReadiness>>,
 }
 
 impl<P: ProcessController> CoreRuntime<P> {
@@ -2010,6 +2058,25 @@ impl<P: ProcessController> CoreRuntime<P> {
             degraded: false,
             connected_since_unix_ms: 0,
             events: EventBuffer::default(),
+            warm_revision: None,
+            readiness: None,
+        }
+    }
+
+    fn cores_live(&self) -> bool {
+        if self.degraded {
+            return false;
+        }
+        match self.state.current() {
+            CoreConnectionState::Connected => true,
+            CoreConnectionState::Ready => {
+                self.warm_revision == Some(self.catalog.revision)
+                    && self
+                        .readiness
+                        .as_ref()
+                        .is_some_and(|readiness| readiness.cores_ready())
+            }
+            _ => false,
         }
     }
 
@@ -2092,6 +2159,8 @@ impl<P: ProcessController> CoreRuntime<P> {
                             refresh_available: snapshot.subscription_source_url().is_some(),
                         })
                 }),
+            cores_ready: self.cores_live(),
+            service_mode: self.readiness.is_some(),
         }
     }
 
@@ -2196,6 +2265,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         self.explicit_selected_nodes.clear();
         self.message = None;
         self.degraded = false;
+        self.warm_revision = None;
     }
 
     fn mark_error(&mut self, message: &str, degraded: bool) {
@@ -2418,10 +2488,140 @@ where
             operation: tokio::sync::Mutex::new(()),
             connect_options: std::sync::Mutex::new(ConnectOptions::default()),
             post_commit_load_fault: AtomicBool::new(false),
+            warm_failure_reported: AtomicBool::new(false),
             list_logo_publish_hook: std::sync::Mutex::new(None),
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
             inner: RwLock::new(inner),
         })
+    }
+
+    /// Always-ready mode: from now on the cores are kept running while Ready.
+    pub async fn enable_always_ready(&self, readiness: Arc<dyn CoresReadiness>) {
+        self.inner.write().await.readiness = Some(readiness);
+    }
+
+    /// Starts the idle cores of the current snapshot (always-ready mode only; a no-op
+    /// otherwise, while connected, or without a profile).
+    pub async fn warm_up(&self) -> Result<(), BackendError> {
+        let _operation = self.operation.lock().await;
+        let (snapshot, revision) = {
+            let state = self.inner.read().await;
+            if state.readiness.is_none()
+                || state.degraded
+                || state.state.current() != CoreConnectionState::Ready
+            {
+                return Ok(());
+            }
+            let Some(snapshot) = state.snapshot.clone() else {
+                return Ok(());
+            };
+            (snapshot, state.catalog.revision)
+        };
+        let options = self
+            .connect_options
+            .lock()
+            .map(|options| *options)
+            .unwrap_or_default();
+        let result = match (self.controller_factory)(&snapshot, options) {
+            Ok(prepared) => {
+                let controller = prepared.controller();
+                match prepared.activate() {
+                    Ok(()) => controller
+                        .start(Engine::Xray)
+                        .await
+                        .map_err(|_| BackendError::new()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let mut state = self.inner.write().await;
+        match result {
+            Ok(()) => {
+                if state.catalog.revision == revision {
+                    state.warm_revision = Some(revision);
+                }
+                self.warm_failure_reported.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                state.warm_revision = None;
+                if !self.warm_failure_reported.swap(true, Ordering::SeqCst) {
+                    state.push_event(
+                        Severity::Warning,
+                        Component::Core,
+                        "warm_up",
+                        WARM_UP_FAILED_MESSAGE,
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// A one-time user-facing notice (for example the fallback to on-demand elevation).
+    pub async fn record_notice(&self, phase: &str, message: &str) {
+        let mut state = self.inner.write().await;
+        state.push_event(Severity::Warning, Component::Core, phase, message);
+        if state.message.is_none() {
+            state.message = Some(message.to_owned());
+        }
+    }
+
+    async fn rewarm_after<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
+        if result.is_ok() && self.inner.read().await.readiness.is_some() {
+            let _ = self.warm_up().await;
+        }
+        result
+    }
+
+    async fn disconnect_now(&self) -> Result<StatusDto, BackendError> {
+        let _operation = self.operation.lock().await;
+        let controller = {
+            let state = self.inner.read().await;
+            if matches!(
+                state.state.current(),
+                CoreConnectionState::Empty | CoreConnectionState::Ready
+            ) {
+                return Ok(state.status());
+            }
+            state.controller.clone().ok_or_else(BackendError::new)?
+        };
+
+        let result = Supervisor::new(controller).disconnect().await;
+        let mut state = self.inner.write().await;
+        match result {
+            Ok(()) => {
+                state
+                    .state
+                    .transition(CoreConnectionState::Ready)
+                    .map_err(|_| BackendError::new())?;
+                state.message = None;
+                state.degraded = false;
+                state.push_event(
+                    Severity::Info,
+                    Component::Core,
+                    "disconnect",
+                    "Подключение остановлено.",
+                );
+                drop(state);
+                self.reconcile_authoritative().await;
+                Ok(self.current_status().await)
+            }
+            Err(_) => {
+                state.mark_error(
+                    "Не удалось полностью остановить подключение. Повторите попытку.",
+                    true,
+                );
+                state.push_event(
+                    Severity::Error,
+                    Component::Core,
+                    "disconnect",
+                    "Остановка подключения завершилась ошибкой.",
+                );
+                Err(BackendError::new())
+            }
+        }
     }
 
     pub fn list_subscriptions(&self) -> Result<Vec<ProfileSummary>, ProfileMutationError> {
@@ -3533,27 +3733,32 @@ where
         &self,
         request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
-        let _operation = self.operation.lock().await;
-        self.import_profile_locked(&request.url)
-            .await
-            .map_err(BackendError::from_profile_mutation)
+        let result = {
+            let _operation = self.operation.lock().await;
+            self.import_profile_locked(&request.url)
+                .await
+                .map_err(BackendError::from_profile_mutation)
+        };
+        self.rewarm_after(result).await
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
         self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
-        let _operation = self.operation.lock().await;
-        self.require_refresh_delete_mutation()
-            .await
-            .map_err(BackendError::from_profile_mutation)?;
-        let id = self
-            .store
-            .active_id()
-            .ok_or_else(|| BackendError::from_profile_mutation(ProfileMutationError::NotFound))?;
-        self.refresh_profile_locked(&id)
-            .await
-            .map_err(BackendError::from_profile_mutation)
+        let result = {
+            let _operation = self.operation.lock().await;
+            self.require_refresh_delete_mutation()
+                .await
+                .map_err(BackendError::from_profile_mutation)?;
+            let id = self.store.active_id().ok_or_else(|| {
+                BackendError::from_profile_mutation(ProfileMutationError::NotFound)
+            })?;
+            self.refresh_profile_locked(&id)
+                .await
+                .map_err(BackendError::from_profile_mutation)
+        };
+        self.rewarm_after(result).await
     }
 
     async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
@@ -3564,9 +3769,11 @@ where
     async fn activate_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
         self.require_profile(&id)
             .map_err(BackendError::from_profile_mutation)?;
-        self.activate_subscription(&id)
+        let result = self
+            .activate_subscription(&id)
             .await
-            .map_err(BackendError::from_profile_mutation)
+            .map_err(BackendError::from_profile_mutation);
+        self.rewarm_after(result).await
     }
 
     async fn refresh_subscription_profile(
@@ -3578,15 +3785,18 @@ where
         self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
-        let _operation = self.operation.lock().await;
-        self.require_refresh_delete_mutation()
-            .await
-            .map_err(BackendError::from_profile_mutation)?;
-        self.refresh_profile_locked(&id)
-            .await
-            .map_err(BackendError::from_profile_mutation)?;
-        self.subscription_list_dto()
-            .map_err(BackendError::from_profile_mutation)
+        let result = {
+            let _operation = self.operation.lock().await;
+            self.require_refresh_delete_mutation()
+                .await
+                .map_err(BackendError::from_profile_mutation)?;
+            self.refresh_profile_locked(&id)
+                .await
+                .map_err(BackendError::from_profile_mutation)?;
+            self.subscription_list_dto()
+                .map_err(BackendError::from_profile_mutation)
+        };
+        self.rewarm_after(result).await
     }
 
     async fn replace_subscription_source(
@@ -3596,23 +3806,28 @@ where
     ) -> Result<SubscriptionListDto, BackendError> {
         self.require_profile(&id)
             .map_err(BackendError::from_profile_mutation)?;
-        let _operation = self.operation.lock().await;
-        self.require_disconnected_mutation()
-            .await
-            .map_err(BackendError::from_profile_mutation)?;
-        self.replace_profile_source_locked(&id, &request.url)
-            .await
-            .map_err(BackendError::from_profile_mutation)?;
-        self.subscription_list_dto()
-            .map_err(BackendError::from_profile_mutation)
+        let result = {
+            let _operation = self.operation.lock().await;
+            self.require_disconnected_mutation()
+                .await
+                .map_err(BackendError::from_profile_mutation)?;
+            self.replace_profile_source_locked(&id, &request.url)
+                .await
+                .map_err(BackendError::from_profile_mutation)?;
+            self.subscription_list_dto()
+                .map_err(BackendError::from_profile_mutation)
+        };
+        self.rewarm_after(result).await
     }
 
     async fn delete_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
         self.require_profile(&id)
             .map_err(BackendError::from_profile_mutation)?;
-        self.delete_subscription(&id)
+        let result = self
+            .delete_subscription(&id)
             .await
-            .map_err(BackendError::from_profile_mutation)
+            .map_err(BackendError::from_profile_mutation);
+        self.rewarm_after(result).await
     }
 
     async fn connect(&self) -> Result<StatusDto, BackendError> {
@@ -3677,7 +3892,14 @@ where
                 .state
                 .transition(CoreConnectionState::Connecting)
                 .map_err(|_| BackendError::new())?;
-            state.message = Some(CONNECTING_MESSAGE.to_owned());
+            state.message = Some(
+                if state.readiness.is_some() {
+                    TUNNEL_ON_MESSAGE
+                } else {
+                    CONNECTING_MESSAGE
+                }
+                .to_owned(),
+            );
             state.push_event(
                 Severity::Info,
                 Component::Core,
@@ -3794,51 +4016,11 @@ where
     }
 
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
-        let _operation = self.operation.lock().await;
-        let controller = {
-            let state = self.inner.read().await;
-            if matches!(
-                state.state.current(),
-                CoreConnectionState::Empty | CoreConnectionState::Ready
-            ) {
-                return Ok(state.status());
-            }
-            state.controller.clone().ok_or_else(BackendError::new)?
-        };
-
-        let result = Supervisor::new(controller).disconnect().await;
-        let mut state = self.inner.write().await;
+        let result = self.disconnect_now().await;
+        let result = self.rewarm_after(result).await;
         match result {
-            Ok(()) => {
-                state
-                    .state
-                    .transition(CoreConnectionState::Ready)
-                    .map_err(|_| BackendError::new())?;
-                state.message = None;
-                state.degraded = false;
-                state.push_event(
-                    Severity::Info,
-                    Component::Core,
-                    "disconnect",
-                    "Подключение остановлено.",
-                );
-                drop(state);
-                self.reconcile_authoritative().await;
-                Ok(self.current_status().await)
-            }
-            Err(_) => {
-                state.mark_error(
-                    "Не удалось полностью остановить подключение. Повторите попытку.",
-                    true,
-                );
-                state.push_event(
-                    Severity::Error,
-                    Component::Core,
-                    "disconnect",
-                    "Остановка подключения завершилась ошибкой.",
-                );
-                Err(BackendError::new())
-            }
+            Ok(_) => Ok(self.current_status().await),
+            Err(error) => Err(error),
         }
     }
 
@@ -3847,7 +4029,7 @@ where
         let (
             snapshot,
             active_profile_id,
-            connected,
+            live,
             group_index,
             raw_group,
             raw_node,
@@ -3870,7 +4052,9 @@ where
                 .active_profile_id
                 .clone()
                 .ok_or(SelectionError::UnknownGroup)?;
-            let connected = state.state.current() == CoreConnectionState::Connected;
+            // The selector is reachable while connected, or while the service keeps the cores
+            // of this catalog warm.
+            let live = state.cores_live();
             let groups = selectable_groups(&snapshot);
             let group_index = groups
                 .iter()
@@ -3895,7 +4079,7 @@ where
             (
                 snapshot,
                 active_profile_id,
-                connected,
+                live,
                 group_index,
                 raw_group,
                 raw_node,
@@ -3904,7 +4088,7 @@ where
             )
         };
 
-        if connected {
+        if live {
             self.selector
                 .select(&raw_group, &raw_node)
                 .await
@@ -3931,7 +4115,7 @@ where
             Ok(()) => false,
             Err(error) if error.mutation_committed() => true,
             Err(_) => {
-                if connected
+                if live
                     && let Some(previous_raw_node) = previous_raw_node
                     && self
                         .selector
@@ -4004,9 +4188,9 @@ where
     }
 
     async fn session(&self) -> Result<SessionDto, SessionError> {
-        let (connected_since_unix_ms, exit_start) = {
+        let (connected, connected_since_unix_ms, exit_start) = {
             let state = self.inner.read().await;
-            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+            if !state.cores_live() {
                 return Err(SessionError::NotConnected);
             }
             // The raw name behind the exit the status reports: the selected group's node.
@@ -4017,9 +4201,19 @@ where
                 .position(|group| group.selected)
                 .and_then(|index| state.selected_nodes.get(index).cloned().flatten())
                 .or_else(|| state.current_node.clone());
-            (state.connected_since_unix_ms, exit_start)
+            (
+                state.state.current() == CoreConnectionState::Connected,
+                state.connected_since_unix_ms,
+                exit_start,
+            )
         };
-        let totals = self.selector.traffic_totals().await.ok();
+        // Before connecting only the automatic exit is meaningful; counters and uptime belong
+        // to a live connection.
+        let totals = if connected {
+            self.selector.traffic_totals().await.ok()
+        } else {
+            None
+        };
         // At most one short Mihomo `now` walk per EXIT_NOW_TTL for an unchanged exit.
         let exit_now = match exit_start {
             Some(start) => {
@@ -4047,7 +4241,11 @@ where
             None => None,
         };
         Ok(SessionDto {
-            connected_since_unix_ms,
+            connected_since_unix_ms: if connected {
+                connected_since_unix_ms
+            } else {
+                0
+            },
             download_total: totals.map(|totals| totals.download),
             upload_total: totals.map(|totals| totals.upload),
             exit_now: exit_now.map(|raw| safe_catalog_label(&raw, "Узел", 0)),
@@ -4067,7 +4265,7 @@ where
 
         let mut targets = {
             let state = self.inner.read().await;
-            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+            if !state.cores_live() {
                 return Err(LatencyError::NotConnected);
             }
             if request
@@ -4342,6 +4540,7 @@ fn start_failure_message(
         Cause::ReadinessTimedOut => {
             format!("{core} не успел запуститься вовремя. Повторите попытку.")
         }
+        Cause::ServiceBusy => "MultiCore уже запущен у другого пользователя.".to_owned(),
         Cause::Unknown => {
             "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
         }
@@ -4793,6 +4992,8 @@ impl MemoryState {
             message: None,
             degraded: false,
             subscription: None,
+            cores_ready: false,
+            service_mode: false,
         }
     }
 

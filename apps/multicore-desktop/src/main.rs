@@ -79,6 +79,7 @@ struct UiSnapshot {
     diagnostics: DiagnosticsPresentation,
     latency: LatencyPresentation,
     conflicting_apps: ConflictingAppsPresentation,
+    cores_ready: bool,
 }
 
 const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
@@ -864,6 +865,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_route_search(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     let _session_stats_timer = wire_session_stats(&ui, model.clone());
+    let _cores_ready_timer = wire_cores_ready_watch(&ui, model.clone());
     wire_conflicting_apps_banner(&ui, model.clone());
     let _conflicting_apps_timer = wire_conflicting_apps_scan(&ui, model.clone());
     wire_windows_settings(&ui);
@@ -3372,12 +3374,11 @@ fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Ti
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let connected = model
-            .lock()
-            .expect("view model lock")
-            .presentation()
-            .is_connected;
-        if !connected {
+        let (connected, cores_ready) = {
+            let model = model.lock().expect("view model lock");
+            (model.presentation().is_connected, model.cores_ready())
+        };
+        if !connected && !cores_ready {
             traffic.lock().expect("session traffic lock").reset();
             apply_session_line(&ui, &SessionLine::default());
             return;
@@ -3414,18 +3415,62 @@ fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Ti
                 let Some(ui) = weak.upgrade() else {
                     return;
                 };
-                // The connection may have ended while the request was in flight.
-                let connected = model
-                    .lock()
-                    .expect("view model lock")
-                    .presentation()
-                    .is_connected;
+                // The connection may have ended while the request was in flight. Before
+                // connecting (warm service cores) only the exit is meaningful.
+                let (connected, cores_ready) = {
+                    let model = model.lock().expect("view model lock");
+                    (model.presentation().is_connected, model.cores_ready())
+                };
                 let line = if connected {
                     line
+                } else if cores_ready {
+                    SessionLine {
+                        exit_now: line.exit_now,
+                        ..SessionLine::default()
+                    }
                 } else {
                     SessionLine::default()
                 };
                 apply_session_line(&ui, &line);
+            });
+        });
+    });
+    timer
+}
+
+/// While the service warms the cores after start-up (or after a subscription change), polls
+/// `/v1/status` every two seconds so a waiting latency check starts as soon as they are up.
+fn wire_cores_ready_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    let in_flight = Arc::new(AtomicBool::new(false));
+    timer.start(TimerMode::Repeated, Duration::from_secs(2), move || {
+        let waiting = {
+            let model = model.lock().expect("view model lock");
+            model.service_mode()
+                && !model.cores_ready()
+                && !model.presentation().is_connected
+                && model.presentation().has_profile
+        };
+        if !waiting || in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let client = model.lock().expect("view model lock").daemon_client();
+        let (weak, model, in_flight) = (weak.clone(), model.clone(), in_flight.clone());
+        thread::spawn(move || {
+            let result = client.status();
+            let release = model
+                .lock()
+                .expect("view model lock")
+                .note_cores_ready_status(result);
+            in_flight.store(false, Ordering::Release);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_latest_snapshot(&ui, &model);
+                }
+                if release {
+                    begin_latency_check(weak, model);
+                }
             });
         });
     });
@@ -4380,6 +4425,7 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         diagnostics: model.diagnostics_presentation(),
         latency: model.latency_presentation(),
         conflicting_apps: model.conflicting_apps_presentation(),
+        cores_ready: model.cores_ready(),
     }
 }
 
@@ -4471,7 +4517,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
     ui.set_update_runtime_busy(presentation.is_busy);
-    ui.set_dashboard_available(presentation.is_connected);
+    ui.set_dashboard_available(presentation.is_connected || snapshot.cores_ready);
     ui.set_status_tone(
         match presentation.semantic_tone {
             SemanticTone::Neutral => "neutral",

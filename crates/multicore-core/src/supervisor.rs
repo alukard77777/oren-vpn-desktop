@@ -48,6 +48,8 @@ pub enum StartFailureCause {
     CoreFailed,
     /// The core stayed alive but did not become ready in time.
     ReadinessTimedOut,
+    /// The always-ready service is held by another interactive user's session.
+    ServiceBusy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

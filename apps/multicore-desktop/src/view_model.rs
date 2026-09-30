@@ -752,6 +752,9 @@ pub struct DesktopViewModel {
     latency_request_revision: Option<u64>,
     latency_request_group_ids: Vec<String>,
     latency_queued: bool,
+    /// The daemon reports running cores (connected, or warm through the service).
+    cores_ready: bool,
+    service_mode: bool,
     latency_error: Option<String>,
     conflicting_apps: Vec<&'static str>,
     conflicting_apps_dismissed_key: Option<String>,
@@ -828,6 +831,8 @@ impl DesktopViewModel {
             latency_request_revision: None,
             latency_request_group_ids: Vec::new(),
             latency_queued: false,
+            cores_ready: false,
+            service_mode: false,
             latency_error: None,
             conflicting_apps: Vec::new(),
             conflicting_apps_dismissed_key: None,
@@ -891,7 +896,33 @@ impl DesktopViewModel {
     fn apply_daemon_status(&mut self, status: DaemonStatus) -> UiState {
         self.set_authoritative_active_profile(status.active_profile_id.clone());
         self.subscription = status.subscription.clone();
+        self.cores_ready = status.cores_ready;
+        self.service_mode = status.service_mode;
         state_from_status(status)
+    }
+
+    pub(crate) fn cores_ready(&self) -> bool {
+        self.cores_ready
+    }
+
+    pub(crate) fn service_mode(&self) -> bool {
+        self.service_mode
+    }
+
+    /// A background status poll while waiting for the service's cores. Touches only the
+    /// readiness flags; returns true when the cores just became ready and a latency check
+    /// is waiting for them.
+    pub(crate) fn note_cores_ready_status(
+        &mut self,
+        result: Result<DaemonStatus, crate::daemon::DaemonError>,
+    ) -> bool {
+        let Ok(status) = result else {
+            return false;
+        };
+        let was_ready = self.cores_ready;
+        self.cores_ready = status.cores_ready;
+        self.service_mode = status.service_mode;
+        !was_ready && self.cores_ready && self.latency_queued
     }
 }
 
@@ -2147,10 +2178,9 @@ impl DesktopViewModel {
             self.latency_queued = true;
             return None;
         }
-        if !matches!(self.state, UiState::Connected { .. })
-            || self.catalog_revision.is_none()
-            || self.selected_catalog_group.is_none()
-        {
+        let cores_live = matches!(self.state, UiState::Connected { .. })
+            || (matches!(self.state, UiState::Ready { .. }) && self.cores_ready);
+        if !cores_live || self.catalog_revision.is_none() || self.selected_catalog_group.is_none() {
             self.latency_queued = true;
             return None;
         }
@@ -6128,6 +6158,47 @@ mod tests {
         let client = Arc::new(MockDaemonClient::ready());
         let view_model = DesktopViewModel::new(client);
         assert_eq!(view_model.diagnostics_export_text(), "Событий пока нет.");
+    }
+
+    #[test]
+    fn warm_service_cores_allow_latency_before_connecting() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        let mut status = MockDaemonClient::ready().status;
+        status.cores_ready = true;
+        status.service_mode = true;
+        view_model.finish_refresh(refresh, Ok(status));
+        let catalog = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(catalog.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+        let request = view_model
+            .begin_latency_request()
+            .expect("latency while disconnected with warm cores");
+        assert_eq!(request.group_ids, vec!["opaque:selected"]);
+    }
+
+    #[test]
+    fn cores_becoming_ready_releases_a_queued_latency_check() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        let mut status = MockDaemonClient::ready().status;
+        status.service_mode = true;
+        view_model.finish_refresh(refresh, Ok(status.clone()));
+        let catalog = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(catalog.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+        assert!(view_model.begin_latency_request().is_none());
+        assert!(view_model.latency_presentation().queued);
+        status.cores_ready = true;
+        assert!(view_model.note_cores_ready_status(Ok(status.clone())));
+        assert!(view_model.cores_ready());
+        assert!(
+            !view_model.note_cores_ready_status(Ok(status)),
+            "only the transition counts"
+        );
+        assert!(view_model.begin_latency_request().is_some());
     }
 
     fn catalog_fixture() -> DaemonCatalog {

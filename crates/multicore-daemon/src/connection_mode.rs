@@ -163,6 +163,77 @@ impl ProcessController for NoProxyController {
     }
 }
 
+/// A controller served by the always-ready service, or by the on-demand path (elevated host
+/// or the user's own cores).
+pub enum Backed<S, O> {
+    Service(S),
+    OnDemand(O),
+}
+
+#[derive(Debug)]
+pub enum BackedError<S, O> {
+    Service(S),
+    OnDemand(O),
+}
+
+impl<S: ProcessController, O: ProcessController> ProcessController for Backed<S, O> {
+    type Error = BackedError<S::Error, O::Error>;
+
+    fn start<'a>(
+        &'a self,
+        engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        match self {
+            Self::Service(controller) => {
+                Box::pin(
+                    async move { controller.start(engine).await.map_err(BackedError::Service) },
+                )
+            }
+            Self::OnDemand(controller) => Box::pin(async move {
+                controller
+                    .start(engine)
+                    .await
+                    .map_err(BackedError::OnDemand)
+            }),
+        }
+    }
+
+    fn stop<'a>(
+        &'a self,
+        engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        match self {
+            Self::Service(controller) => {
+                Box::pin(async move { controller.stop(engine).await.map_err(BackedError::Service) })
+            }
+            Self::OnDemand(controller) => {
+                Box::pin(
+                    async move { controller.stop(engine).await.map_err(BackedError::OnDemand) },
+                )
+            }
+        }
+    }
+
+    fn diagnostics<'a>(&'a self) -> Pin<Box<dyn Future<Output = ProcessDiagnostics> + Send + 'a>> {
+        match self {
+            Self::Service(controller) => controller.diagnostics(),
+            Self::OnDemand(controller) => controller.diagnostics(),
+        }
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
+        match (self, error) {
+            (Self::Service(controller), BackedError::Service(error)) => {
+                controller.start_failure_cause(error)
+            }
+            (Self::OnDemand(controller), BackedError::OnDemand(error)) => {
+                controller.start_failure_cause(error)
+            }
+            _ => StartFailureCause::Unknown,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -271,5 +342,70 @@ mod tests {
             ModeController::Proxy(controller(&recorder));
         mode.start(Engine::Mihomo).await.unwrap();
         assert_eq!(recorder.calls(), ["start Mihomo", "apply"]);
+    }
+}
+
+#[cfg(test)]
+mod backed_tests {
+    use super::{Backed, BackedError};
+    use multicore_core::{Engine, ProcessController, StartFailureCause};
+    use std::{future::Future, pin::Pin, sync::Mutex};
+
+    struct Named(&'static str, Mutex<Vec<String>>, StartFailureCause);
+
+    impl ProcessController for Named {
+        type Error = &'static str;
+        fn start<'a>(
+            &'a self,
+            engine: Engine,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            self.1
+                .lock()
+                .unwrap()
+                .push(format!("{}:start:{engine:?}", self.0));
+            Box::pin(async move { Err(self.0) })
+        }
+        fn stop<'a>(
+            &'a self,
+            engine: Engine,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+            self.1
+                .lock()
+                .unwrap()
+                .push(format!("{}:stop:{engine:?}", self.0));
+            Box::pin(async { Ok(()) })
+        }
+        fn start_failure_cause(&self, _: &Self::Error) -> StartFailureCause {
+            self.2
+        }
+    }
+
+    #[tokio::test]
+    async fn backed_forwards_to_the_active_side_and_keeps_its_failure_cause() {
+        let service: Backed<Named, Named> = Backed::Service(Named(
+            "service",
+            Mutex::default(),
+            StartFailureCause::ServiceBusy,
+        ));
+        let error = service.start(Engine::Xray).await.unwrap_err();
+        assert!(matches!(error, BackedError::Service("service")));
+        assert_eq!(
+            service.start_failure_cause(&error),
+            StartFailureCause::ServiceBusy
+        );
+        let on_demand: Backed<Named, Named> = Backed::OnDemand(Named(
+            "elevated",
+            Mutex::default(),
+            StartFailureCause::ElevationCancelled,
+        ));
+        let error = on_demand.start(Engine::Mihomo).await.unwrap_err();
+        assert_eq!(
+            on_demand.start_failure_cause(&error),
+            StartFailureCause::ElevationCancelled
+        );
+        assert_eq!(
+            service.start_failure_cause(&BackedError::OnDemand("x")),
+            StartFailureCause::Unknown
+        );
     }
 }
