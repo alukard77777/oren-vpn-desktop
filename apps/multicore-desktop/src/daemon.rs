@@ -165,6 +165,12 @@ pub struct DaemonStatus {
     pub degraded: bool,
     #[serde(default)]
     pub subscription: Option<DaemonSubscriptionInfo>,
+    /// The cores run (connected, or warm through the always-ready service).
+    #[serde(default)]
+    pub cores_ready: bool,
+    /// The daemon drives the always-ready MultiCore service.
+    #[serde(default)]
+    pub service_mode: bool,
 }
 
 /// Safe subscription collection returned by the daemon. Source URLs deliberately have no

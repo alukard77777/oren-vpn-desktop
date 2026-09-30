@@ -307,3 +307,68 @@ async fn a_shared_backend_serves_the_router() {
         .unwrap();
     assert_eq!(response.status(), 200);
 }
+
+#[tokio::test]
+async fn latency_session_and_selection_work_before_connecting_with_warm_cores() {
+    use multicore_daemon::LatencyRequest;
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    let latencies = h
+        .backend
+        .latencies(LatencyRequest {
+            revision: None,
+            group_ids: Vec::new(),
+            node_ids: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        latencies
+            .entries
+            .iter()
+            .all(|entry| entry.latency_ms == Some(42))
+    );
+    let session = h.backend.session().await.unwrap();
+    assert_eq!(
+        session.connected_since_unix_ms, 0,
+        "no uptime before connecting"
+    );
+    assert_eq!(
+        session.download_total, None,
+        "no counters before connecting"
+    );
+    let catalog = h.backend.catalog().await.unwrap();
+    let group = &catalog.groups[0];
+    h.backend
+        .select(multicore_daemon::SelectionRequest {
+            revision: catalog.revision,
+            group_id: group.id.clone(),
+            node_id: group.nodes[0].id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        *h.selector.selections.lock().unwrap(),
+        [("g".to_owned(), "node-a".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn without_warm_cores_latency_and_session_still_require_a_connection() {
+    let h = harness(&[PROFILE_A]);
+    assert!(matches!(
+        h.backend
+            .latencies(multicore_daemon::LatencyRequest {
+                revision: None,
+                group_ids: Vec::new(),
+                node_ids: Vec::new(),
+            })
+            .await,
+        Err(multicore_daemon::LatencyError::NotConnected)
+    ));
+    assert!(matches!(
+        h.backend.session().await,
+        Err(multicore_daemon::SessionError::NotConnected)
+    ));
+}

@@ -1581,7 +1581,7 @@ async fn dashboard_url_handler(
         .status()
         .await
         .map_err(|_| ApiError::backend("Не удалось получить состояние. Повторите попытку."))?;
-    if status.state != ConnectionState::Connected {
+    if status.state != ConnectionState::Connected && !status.cores_ready {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "not_connected",
@@ -4028,7 +4028,7 @@ where
         let (
             snapshot,
             active_profile_id,
-            connected,
+            live,
             group_index,
             raw_group,
             raw_node,
@@ -4051,7 +4051,9 @@ where
                 .active_profile_id
                 .clone()
                 .ok_or(SelectionError::UnknownGroup)?;
-            let connected = state.state.current() == CoreConnectionState::Connected;
+            // The selector is reachable while connected, or while the service keeps the cores
+            // of this catalog warm.
+            let live = state.cores_live();
             let groups = selectable_groups(&snapshot);
             let group_index = groups
                 .iter()
@@ -4076,7 +4078,7 @@ where
             (
                 snapshot,
                 active_profile_id,
-                connected,
+                live,
                 group_index,
                 raw_group,
                 raw_node,
@@ -4085,7 +4087,7 @@ where
             )
         };
 
-        if connected {
+        if live {
             self.selector
                 .select(&raw_group, &raw_node)
                 .await
@@ -4112,7 +4114,7 @@ where
             Ok(()) => false,
             Err(error) if error.mutation_committed() => true,
             Err(_) => {
-                if connected
+                if live
                     && let Some(previous_raw_node) = previous_raw_node
                     && self
                         .selector
@@ -4185,9 +4187,9 @@ where
     }
 
     async fn session(&self) -> Result<SessionDto, SessionError> {
-        let (connected_since_unix_ms, exit_start) = {
+        let (connected, connected_since_unix_ms, exit_start) = {
             let state = self.inner.read().await;
-            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+            if !state.cores_live() {
                 return Err(SessionError::NotConnected);
             }
             // The raw name behind the exit the status reports: the selected group's node.
@@ -4198,9 +4200,19 @@ where
                 .position(|group| group.selected)
                 .and_then(|index| state.selected_nodes.get(index).cloned().flatten())
                 .or_else(|| state.current_node.clone());
-            (state.connected_since_unix_ms, exit_start)
+            (
+                state.state.current() == CoreConnectionState::Connected,
+                state.connected_since_unix_ms,
+                exit_start,
+            )
         };
-        let totals = self.selector.traffic_totals().await.ok();
+        // Before connecting only the automatic exit is meaningful; counters and uptime belong
+        // to a live connection.
+        let totals = if connected {
+            self.selector.traffic_totals().await.ok()
+        } else {
+            None
+        };
         // At most one short Mihomo `now` walk per EXIT_NOW_TTL for an unchanged exit.
         let exit_now = match exit_start {
             Some(start) => {
@@ -4228,7 +4240,11 @@ where
             None => None,
         };
         Ok(SessionDto {
-            connected_since_unix_ms,
+            connected_since_unix_ms: if connected {
+                connected_since_unix_ms
+            } else {
+                0
+            },
             download_total: totals.map(|totals| totals.download),
             upload_total: totals.map(|totals| totals.upload),
             exit_now: exit_now.map(|raw| safe_catalog_label(&raw, "Узел", 0)),
@@ -4248,7 +4264,7 @@ where
 
         let mut targets = {
             let state = self.inner.read().await;
-            if state.state.current() != CoreConnectionState::Connected || state.degraded {
+            if !state.cores_live() {
                 return Err(LatencyError::NotConnected);
             }
             if request
