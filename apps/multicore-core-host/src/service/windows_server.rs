@@ -47,8 +47,11 @@ use super::windows_identity::{
     IdentityError, client_facts, expected_daemon_image, user_data_root, verify_client,
 };
 use crate::windows_pipe::{
-    IO_TIMEOUT, PendingIo, complete_pending, read_message_or_signal, write_frame,
+    IO_TIMEOUT, PendingIo, complete_pending, read_message, read_message_or_signal, write_frame,
 };
+
+/// How long a freshly connected client may take to send its first command.
+const FIRST_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MultiCore.Service.v2";
 /// What an interactive client may do with the pipe: `FILE_READ_DATA | FILE_WRITE_DATA |
@@ -211,6 +214,12 @@ fn handle_connection<C: Cores>(
     stop: Arc<OwnedHandle>,
 ) {
     let pipe = instance.as_raw_handle();
+    // The client is identified once it sent its first command: impersonating it (to bind the
+    // connection to its token) needs data read from the pipe. A silent client is dropped.
+    let Ok(first) = read_message(pipe, FIRST_COMMAND_TIMEOUT) else {
+        unsafe { DisconnectNamedPipe(pipe) };
+        return;
+    };
     let Ok(identity) = verifier(pipe) else {
         let _ = reply(
             pipe,
@@ -221,7 +230,11 @@ fn handle_connection<C: Cores>(
         unsafe { DisconnectNamedPipe(pipe) };
         return;
     };
-    while let Ok(frame) = read_message_or_signal(pipe, stop.as_raw_handle()) {
+    let mut pending = Some(first);
+    while let Some(frame) = pending
+        .take()
+        .or_else(|| read_message_or_signal(pipe, stop.as_raw_handle()).ok())
+    {
         let Ok(command) = decode_service_command(&frame) else {
             let _ = reply(
                 pipe,

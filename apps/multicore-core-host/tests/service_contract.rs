@@ -1339,7 +1339,15 @@ mod windows_pipe_server {
         let client_name = name.clone();
         let client = thread::spawn(move || connect(&client_name, Duration::from_secs(5)).unwrap());
         // A client may open a freshly created instance before ConnectNamedPipe is called.
-        let _client = client.join().unwrap();
+        let client = client.join().unwrap();
+        // The server identifies a client after its first message (impersonation needs data).
+        write_frame(
+            client.as_raw_handle(),
+            encode_service_frame(&ServiceCommand::Status).unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        read_message(server.as_raw_handle(), Duration::from_secs(5)).unwrap();
         let (facts, token) = client_facts(server.as_raw_handle()).unwrap();
         assert_eq!(
             normalized(&facts.image),
@@ -1418,9 +1426,8 @@ mod windows_pipe_server {
             thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
         };
         let intruder = connect_to_server(&name);
-        let frame = read_message(intruder.as_raw_handle(), Duration::from_secs(5)).unwrap();
         assert_eq!(
-            decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+            request(&intruder, &ServiceCommand::Prepare { generation_id: 1 }),
             ServiceResponse::Error {
                 code: BrokerErrorCode::AuthenticationFailed
             }
@@ -1435,6 +1442,40 @@ mod windows_pipe_server {
             "the pipe is closed after the refusal"
         );
         assert!(service.lock().unwrap().cores_mut().calls.is_empty());
+        unsafe { SetEvent(stop.as_raw_handle()) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_client_is_identified_only_after_its_first_command_and_a_silent_one_is_dropped() {
+        let name = unique_name();
+        let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let verifier = Arc::new(move |pipe: windows_sys::Win32::Foundation::HANDLE| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            alice_only(pipe)
+        });
+        let stop = manual_event();
+        let server = {
+            let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
+        };
+        let silent = connect_to_server(&name);
+        let started = Instant::now();
+        assert!(
+            read_message(silent.as_raw_handle(), Duration::from_secs(10)).is_err(),
+            "a client that never sends is disconnected"
+        );
+        assert!(started.elapsed() < Duration::from_secs(9));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "never identified");
+        let alice = connect_to_server(&name);
+        assert!(matches!(
+            request(&alice, &ServiceCommand::Status),
+            ServiceResponse::Status { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(alice);
         unsafe { SetEvent(stop.as_raw_handle()) };
         server.join().unwrap();
     }
