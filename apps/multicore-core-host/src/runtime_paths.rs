@@ -670,10 +670,10 @@ mod tests {
     /// administrator); anywhere else the check cannot be exercised and the test returns.
     #[test]
     fn service_reads_a_data_root_whose_dacl_leaves_out_the_service_account() {
-        if !token_holds_backup_privilege() {
+        let Some(already_enabled) = backup_privilege_in_token() else {
             eprintln!("skipped: SeBackupPrivilege is not held (run as SYSTEM or elevated)");
             return;
-        }
+        };
         let (_r, d, h) = fixture();
         // Everything below inherits: only the (fictitious) client may open the data root.
         set_dacl(&d, &format!("D:P(A;OICI;FA;;;{CLIENT})"));
@@ -687,10 +687,14 @@ mod tests {
             .map(|resolved| resolved.read_guarded(&resolved.paths.xray_config, 1024));
         // The fixture owner may always rewrite the DACL, so the directory can be removed.
         set_dacl(&d, "D:P(A;OICI;FA;;;WD)");
-        assert!(
-            matches!(refused, Err(ResolveError::Missing)),
-            "without the privilege the data root must stay unreadable"
-        );
+        // Some logons (an OpenSSH session of an administrator) have the privilege enabled for
+        // the whole process: then even the plain resolution reads through the DACL.
+        if !already_enabled {
+            assert!(
+                matches!(refused, Err(ResolveError::Missing)),
+                "without the privilege the data root must stay unreadable"
+            );
+        }
         assert!(resolved.is_ok(), "{:?}", resolved.err());
         assert!(matches!(unchanged, Ok(Ok(()))), "{unchanged:?}");
         assert!(
@@ -699,7 +703,8 @@ mod tests {
         );
     }
 
-    fn token_holds_backup_privilege() -> bool {
+    /// `None`: the process token does not hold SeBackupPrivilege; `Some(enabled)` otherwise.
+    fn backup_privilege_in_token() -> Option<bool> {
         use windows_sys::Win32::{
             Foundation::{CloseHandle, HANDLE, LUID},
             Security::{
@@ -713,11 +718,11 @@ mod tests {
             HighPart: 0,
         };
         if unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_BACKUP_NAME, &mut luid) } == 0 {
-            return false;
+            return None;
         }
         let mut token: HANDLE = std::ptr::null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return false;
+            return None;
         }
         let mut buffer = vec![0_u64; 1024];
         let mut length = 0;
@@ -732,7 +737,7 @@ mod tests {
         } != 0;
         unsafe { CloseHandle(token) };
         if !ok {
-            return false;
+            return None;
         }
         let privileges = unsafe { &*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>() };
         let entries: &[LUID_AND_ATTRIBUTES] = unsafe {
@@ -743,7 +748,10 @@ mod tests {
         };
         entries
             .iter()
-            .any(|entry| entry.Luid.LowPart == luid.LowPart && entry.Luid.HighPart == luid.HighPart)
+            .find(|entry| {
+                entry.Luid.LowPart == luid.LowPart && entry.Luid.HighPart == luid.HighPart
+            })
+            .map(|entry| entry.Attributes & windows_sys::Win32::Security::SE_PRIVILEGE_ENABLED != 0)
     }
 
     #[test]
