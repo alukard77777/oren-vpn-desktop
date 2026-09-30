@@ -6,6 +6,11 @@ use std::{
     path::{Path, PathBuf},
 };
 use windows_sys::Win32::{
+    Foundation::LocalFree,
+    Security::{
+        Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT},
+        OWNER_SECURITY_INFORMATION,
+    },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
@@ -24,6 +29,55 @@ pub(crate) enum ResolveError {
     Missing,
     InvalidPe,
     Io,
+    /// A user-side path is owned by someone other than the client (or SYSTEM/Administrators).
+    Owner,
+}
+
+const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// Who may own the client's data root and staged generation: the client itself, or SYSTEM /
+/// Administrators (who can write there anyway). Anyone else means the client pointed its
+/// known folder at another user's files.
+pub(crate) fn owner_is_acceptable(owner: &str, client_sid: &str) -> bool {
+    owner.eq_ignore_ascii_case(client_sid) || owner == SYSTEM_SID || owner == ADMINISTRATORS_SID
+}
+
+/// The owner SID of an open file or directory handle, as `S-1-…` text.
+pub(crate) fn handle_owner_sid(file: &File) -> Option<String> {
+    let mut owner = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let mut text = std::ptr::null_mut();
+    let converted = unsafe { ConvertSidToStringSidW(owner, &mut text) } != 0;
+    let sid = converted.then(|| {
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
+    });
+    unsafe {
+        if converted {
+            LocalFree(text.cast());
+        }
+        LocalFree(descriptor.cast());
+    }
+    sid
 }
 
 pub(crate) struct ResolvedRuntime {
@@ -50,6 +104,43 @@ struct FileIdentity {
 }
 
 impl ResolvedRuntime {
+    /// Service mode: every guarded directory and file at or below `data_root` (the data root,
+    /// `runtime`, the generation directory and its configs) must be owned by `client_sid`, or
+    /// by SYSTEM / Administrators. The data root comes from the client's own known folder,
+    /// which the client can redirect, so this is what binds the files to the client.
+    pub(crate) fn verify_owned_by(
+        &self,
+        data_root: &Path,
+        client_sid: &str,
+    ) -> Result<(), ResolveError> {
+        self.verify_owned_with(data_root, client_sid, |_, file| handle_owner_sid(file))
+    }
+
+    pub(crate) fn verify_owned_with(
+        &self,
+        data_root: &Path,
+        client_sid: &str,
+        owner_of: impl Fn(&Path, &File) -> Option<String>,
+    ) -> Result<(), ResolveError> {
+        let mut checked = 0;
+        for guard in self
+            .guards
+            .iter()
+            .filter(|guard| guard.path.starts_with(data_root))
+        {
+            let owner = owner_of(&guard.path, &guard.handle).ok_or(ResolveError::Owner)?;
+            if !owner_is_acceptable(&owner, client_sid) {
+                return Err(ResolveError::Owner);
+            }
+            checked += 1;
+        }
+        // The data root, runtime, the generation and both configs at least.
+        if checked < 5 {
+            return Err(ResolveError::Owner);
+        }
+        Ok(())
+    }
+
     pub(crate) fn verify_unchanged(&self) -> Result<(), ResolveError> {
         for guard in &self.guards {
             let reopened = open_guard(&guard.path, guard.directory)?;
@@ -434,6 +525,62 @@ mod tests {
         .unwrap();
         (root, data, host)
     }
+    const CLIENT: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER: &str = "S-1-5-21-1-2-3-1002";
+
+    #[test]
+    fn staged_files_of_another_user_are_refused() {
+        let (_r, d, h) = fixture();
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        assert!(
+            resolved
+                .verify_owned_with(&d, CLIENT, |_, _| Some(CLIENT.into()))
+                .is_ok()
+        );
+        assert!(
+            resolved
+                .verify_owned_with(&d, CLIENT, |_, _| Some("S-1-5-18".into()))
+                .is_ok(),
+            "SYSTEM-owned files are acceptable"
+        );
+        for foreign in ["runtime-00000000000000000007", "mihomo.yaml", "MultiCore"] {
+            let result = resolved.verify_owned_with(&d, CLIENT, |path, _| {
+                Some(
+                    if path.file_name().and_then(|n| n.to_str()) == Some(foreign) {
+                        OTHER.into()
+                    } else {
+                        CLIENT.into()
+                    },
+                )
+            });
+            assert!(matches!(result, Err(ResolveError::Owner)), "{foreign}");
+        }
+        assert!(matches!(
+            resolved.verify_owned_with(&d, CLIENT, |_, _| None),
+            Err(ResolveError::Owner)
+        ));
+    }
+
+    #[test]
+    fn real_owners_are_read_from_the_guarded_handles() {
+        let (_r, d, h) = fixture();
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        let data = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&d)
+            .unwrap();
+        let owner = handle_owner_sid(&data).expect("owner of a fresh directory");
+        assert!(owner.starts_with("S-1-5-"), "{owner}");
+        assert!(resolved.verify_owned_by(&d, &owner).is_ok());
+        if !owner_is_acceptable(&owner, OTHER) {
+            assert!(matches!(
+                resolved.verify_owned_by(&d, OTHER),
+                Err(ResolveError::Owner)
+            ));
+        }
+    }
+
     #[test]
     fn accepts_exact_layout() {
         let (_r, d, h) = fixture();

@@ -316,7 +316,19 @@ fn resolve_client(
     host: &Path,
     generation: u64,
 ) -> Result<ResolvedRuntime, ()> {
-    crate::runtime_paths::resolve_from(&client.data_root, host, generation).map_err(drop)
+    let sid = client
+        .user_key
+        .split_once(':')
+        .map(|(_, sid)| sid)
+        .ok_or(())?;
+    let resolved =
+        crate::runtime_paths::resolve_from(&client.data_root, host, generation).map_err(drop)?;
+    // The data root is the client's own (redirectable) LocalAppData: refuse files that belong
+    // to another user.
+    resolved
+        .verify_owned_by(&client.data_root, sid)
+        .map_err(drop)?;
+    Ok(resolved)
 }
 
 #[cfg(unix)]
