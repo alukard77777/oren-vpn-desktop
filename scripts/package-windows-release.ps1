@@ -433,7 +433,7 @@ function Expand-SafeZipToDirectory {
 }
 
 function Protect-DashboardIndexHtml {
-    param([string]$IndexHtmlPath, [string]$ExpectedOriginalSha256, [string]$ContentSecurityPolicy)
+    param([string]$IndexHtmlPath, [string]$ExpectedOriginalSha256, [string]$ContentSecurityPolicy, [string]$ReadonlyScriptSource)
     Assert-Hash $IndexHtmlPath $ExpectedOriginalSha256 'dashboard index.html (pre-patch)'
     $indexFull = Get-FullPath $IndexHtmlPath
     $utf8 = New-Object Text.UTF8Encoding($false)
@@ -468,10 +468,14 @@ function Protect-DashboardIndexHtml {
     $jsStream = [IO.File]::Open($themeScriptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $jsStream.Write($jsBytes, 0, $jsBytes.Length) } finally { $jsStream.Dispose() }
 
-    $patched = $patched.Substring(0, $startIndex) + '    <script src="./theme-favicon.js"></script>' + $patched.Substring($blockEnd)
+    $patched = $patched.Substring(0, $startIndex) + '    <script src="./theme-favicon.js"></script>' + "`n" + '    <script src="./multicore-readonly.js"></script>' + $patched.Substring($blockEnd)
 
     if ($patched.IndexOf($ContentSecurityPolicy, [StringComparison]::Ordinal) -lt 0) { throw 'Patched dashboard index.html unexpectedly does not carry the pinned Content-Security-Policy' }
     if ($patched.IndexOf('<script>', [StringComparison]::Ordinal) -ge 0) { throw 'Patched dashboard index.html unexpectedly still contains an inline <script> block' }
+
+    $readonlyScriptPath = Join-Path (Split-Path -Parent $indexFull) 'multicore-readonly.js'
+    if (Test-Path -LiteralPath $readonlyScriptPath) { throw "Refusing to overwrite an existing dashboard file: $readonlyScriptPath" }
+    [IO.File]::WriteAllBytes($readonlyScriptPath, [IO.File]::ReadAllBytes($ReadonlyScriptSource))
 
     $patchedBytes = $utf8.GetBytes($patched)
     [IO.File]::WriteAllBytes($indexFull, $patchedBytes)
@@ -705,8 +709,8 @@ try {
         $dashboardRelativeFiles = Expand-SafeZipToDirectory $dashboardArchive $dashboard.asset.rootPrefix $dashboardTarget ([int64]$dashboard.asset.maximumEntryBytes) ([int64]$dashboard.asset.maximumExpandedBytes) ([int]$dashboard.asset.maximumEntryCount)
         if (-not ($dashboardRelativeFiles -ccontains 'index.html')) { throw 'Dashboard archive does not contain an index.html at its root' }
         $dashboardIndex = Join-Path $dashboardTarget 'index.html'
-        Protect-DashboardIndexHtml $dashboardIndex $dashboard.asset.indexHtmlSha256 $dashboard.contentSecurityPolicy
-        $dashboardRelativeFiles = @($dashboardRelativeFiles + @('theme-favicon.js'))
+        Protect-DashboardIndexHtml $dashboardIndex $dashboard.asset.indexHtmlSha256 $dashboard.contentSecurityPolicy (Join-Path $RepositoryRoot 'packaging\dashboard\multicore-readonly.js')
+        $dashboardRelativeFiles = @($dashboardRelativeFiles + @('theme-favicon.js', 'multicore-readonly.js'))
 
         $dashboardLicenseTarget = Join-Path $stage ('licenses\' + $dashboard.licenseFile.name)
         Get-InputFile $dashboard.licenseFile.name $dashboard.licenseFile.url $dashboardLicenseTarget

@@ -39,8 +39,8 @@ Assert-True ($installedUpdateSmoke.IndexOf('reg.exe export') -lt $installedUpdat
 Assert-True (-not $definition.Contains('Verb: "runas"')) 'installer must not elevate desktop postinstall launch'
 
 foreach ($token in @(
-    'DefaultDirName={localappdata}\Programs\MultiCore',
-    'PrivilegesRequired=lowest',
+    'DefaultDirName={autopf}\MultiCore',
+    'PrivilegesRequired=admin',
     'ArchitecturesAllowed=x64compatible',
     'OutputBaseFilename=MultiCore-Setup-x64',
     'CloseApplications=yes',
@@ -160,6 +160,7 @@ try {
     try { & $BuilderPath -PackagePath $dashboardPayload -AppVersion '0.1.0' -ValidateOnly } catch { $failed = $true }
     Assert-True $failed 'dropping a required core file from the manifest must fail installer validation'
 
+    & (Join-Path $PSScriptRoot 'test-service-installer-contract.ps1')
     Write-Output 'PASS: Windows installer contract'
 } finally {
     $resolvedRoot = [IO.Path]::GetFullPath($testRoot)
