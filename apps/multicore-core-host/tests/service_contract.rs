@@ -1824,3 +1824,23 @@ async fn a_trickling_client_is_released_within_the_drain_deadline() {
     };
     assert!(closed, "the drain deadline must end the connection");
 }
+
+/// After `SetTun{off}` the service confirms the loopback mixed port is back (a Mihomo listener
+/// re-creation that loses it would leave the system proxy pointing at nothing).
+#[test]
+fn the_mixed_port_recheck_sees_a_live_or_a_missing_listener() {
+    use service::cores::mixed_port_listens;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(mixed_port_listens(
+        port,
+        std::time::Duration::from_millis(500)
+    ));
+    drop(listener);
+    let started = std::time::Instant::now();
+    assert!(!mixed_port_listens(
+        port,
+        std::time::Duration::from_millis(500)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
