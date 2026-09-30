@@ -60,6 +60,31 @@ impl ResolvedRuntime {
         }
         Ok(())
     }
+
+    /// Reads a guarded file (matched by file name, e.g. `mihomo.yaml`) through the handle opened
+    /// during resolution (reparse points refused, writers excluded by the share mode) instead of
+    /// re-opening its path. More than `limit` bytes is `Layout`.
+    pub(crate) fn read_guarded(&self, path: &Path, limit: u64) -> Result<Vec<u8>, ResolveError> {
+        let guard = self
+            .guards
+            .iter()
+            .rev()
+            .find(|guard| !guard.directory && guard.path.file_name() == path.file_name())
+            .ok_or(ResolveError::Missing)?;
+        let mut handle = &guard.handle;
+        handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| ResolveError::Io)?;
+        let mut bytes = Vec::new();
+        handle
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ResolveError::Io)?;
+        if bytes.len() as u64 > limit {
+            return Err(ResolveError::Layout);
+        }
+        Ok(bytes)
+    }
 }
 
 pub(crate) fn resolve_current(generation: u64) -> Result<ResolvedRuntime, ResolveError> {
@@ -418,6 +443,30 @@ mod tests {
         // already validated for `runtime/`, exposed so callers (the
         // persistent core log) don't need a second lookup.
         assert_eq!(resolved.data_root, fs::canonicalize(&d).unwrap());
+    }
+    #[test]
+    fn guarded_config_reads_go_through_the_resolved_handle() {
+        let (_r, d, h) = fixture();
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        assert_eq!(
+            resolved
+                .read_guarded(&resolved.paths.mihomo_config, 1024)
+                .unwrap(),
+            b"tun: {}"
+        );
+        assert_eq!(
+            resolved
+                .read_guarded(&resolved.paths.xray_config, 1024)
+                .unwrap(),
+            b"{}"
+        );
+        assert!(matches!(
+            resolved.read_guarded(&resolved.paths.mihomo_config, 3),
+            Err(ResolveError::Layout)
+        ));
+        // The guard's share mode keeps the staged file from being swapped while resolved.
+        let config = d.join("runtime/runtime-00000000000000000007/mihomo.yaml");
+        assert!(fs::rename(&config, config.with_extension("moved")).is_err());
     }
     #[test]
     fn resolves_an_optional_dashboard_sibling_of_cores() {

@@ -240,8 +240,10 @@ impl<C: Cores> ServiceLoop<C> {
             Err(code) => {
                 if on {
                     let _ = self.cores.set_tun(false);
+                    self.tun_on = false;
                 }
-                self.tun_on = false;
+                // A failed switch-off may have left the tunnel up: `tun_on` stays true so the
+                // next `SetTun{on:false}` retries instead of short-circuiting.
                 ServiceResponse::Error { code }
             }
         }

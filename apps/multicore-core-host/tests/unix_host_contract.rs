@@ -495,3 +495,47 @@ mod transport {
         assert!(main.contains("privileged broker stopped safely"));
     }
 }
+
+/// Review I4: the service reads staged configs through the handles opened (`O_NOFOLLOW`)
+/// during resolution, so a symlink renamed over a config afterwards is never followed.
+#[test]
+fn guarded_config_read_ignores_a_symlink_swapped_in_after_resolution() {
+    let fixture = fixture();
+    let config = fixture.generation.join("mihomo.yaml");
+    fs::write(&config, b"mixed-port: 1\n").unwrap();
+    let resolved = resolve(&fixture).unwrap();
+    let secret = fixture.data.join("secret.yaml");
+    fs::write(&secret, b"secret: stolen\n").unwrap();
+    let staged = fixture.generation.join("swap");
+    symlink(&secret, &staged).unwrap();
+    fs::rename(&staged, &config).unwrap();
+    assert_eq!(
+        resolved
+            .read_guarded(&resolved.paths.mihomo_config, 1024)
+            .unwrap(),
+        b"mixed-port: 1\n"
+    );
+    assert!(resolved.verify_unchanged().is_err());
+    assert_eq!(
+        resolved
+            .read_guarded(&resolved.paths.mihomo_config, 4)
+            .err(),
+        Some(ResolveError::Layout)
+    );
+}
+
+/// A FIFO planted in place of a config must be rejected, never block the privileged opener.
+#[test]
+fn a_fifo_config_is_rejected_without_blocking() {
+    let fixture = fixture();
+    let config = fixture.generation.join("xray.json");
+    fs::remove_file(&config).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&config)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(resolve(&fixture).is_err());
+}
