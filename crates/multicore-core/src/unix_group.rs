@@ -36,24 +36,49 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
     "SSL_CERT_DIR",
 ];
 
-/// What a core keeps when the launcher restricts capabilities (service mode): TUN, routes and
-/// nftables (`NET_ADMIN`), raw sockets (`NET_RAW`) and DNS on port 53 (`NET_BIND_SERVICE`).
-/// Everything else the service holds for itself (`CAP_SYS_PTRACE` for peer checks,
-/// `CAP_DAC_READ_SEARCH` for staged generations, `CAP_SETPCAP` for this drop) is removed.
-pub(crate) const CORE_CAPABILITIES: CapabilitySet = CapabilitySet::NET_ADMIN
+/// TUN, routes and nftables (`NET_ADMIN`), raw sockets (`NET_RAW`) and DNS on port 53
+/// (`NET_BIND_SERVICE`).
+const NETWORK_CAPABILITIES: CapabilitySet = CapabilitySet::NET_ADMIN
     .union(CapabilitySet::NET_BIND_SERVICE)
     .union(CapabilitySet::NET_RAW);
+
+/// The capabilities each core keeps when a launcher restricts them. Everything else is removed
+/// from the bounding, permitted, effective and inheritable sets, and ambient is cleared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoreCapabilities {
+    pub xray: CapabilitySet,
+    pub mihomo: CapabilitySet,
+}
+
+impl CoreCapabilities {
+    /// The always-ready service. Its own bounding set also holds `CAP_DAC_READ_SEARCH` (staged
+    /// generations) and `CAP_SETPCAP` (this drop), which no core gets. Xray only needs the
+    /// network capabilities. Mihomo also keeps `CAP_SYS_PTRACE`: `PROCESS-NAME`/`PROCESS-PATH`
+    /// rules map a connection to its process through other users' `/proc/<pid>/fd`, which
+    /// needs ptrace read access.
+    pub const SERVICE: Self = Self {
+        xray: NETWORK_CAPABILITIES,
+        mihomo: NETWORK_CAPABILITIES.union(CapabilitySet::SYS_PTRACE),
+    };
+
+    fn for_engine(self, engine: Engine) -> CapabilitySet {
+        match engine {
+            Engine::Xray => self.xray,
+            Engine::Mihomo => self.mihomo,
+        }
+    }
+}
 /// Capability numbers are below 64; numbers the kernel doesn't know fail with `EINVAL`.
 const CAPABILITY_NUMBERS: u32 = 64;
 
 type SpawnReply = tokio::sync::oneshot::Sender<io::Result<Child>>;
-type SpawnRequest = (CommandSpec, bool, SpawnReply);
+type SpawnRequest = (CommandSpec, Option<CapabilitySet>, SpawnReply);
 
 #[derive(Clone)]
 pub struct UnixGroupLauncher {
     spawner: Arc<Mutex<mpsc::Sender<SpawnRequest>>>,
     logs: Arc<CoreLogBuffer>,
-    restrict_capabilities: bool,
+    restrict_capabilities: Option<CoreCapabilities>,
     readiness: Option<TokioProcessLauncher>,
     readiness_timeout: Duration,
 }
@@ -64,14 +89,14 @@ impl UnixGroupLauncher {
         std::thread::Builder::new()
             .name("multicore-core-spawner".into())
             .spawn(move || {
-                for (command, restrict, reply) in requests {
-                    let _ = reply.send(spawn_core(&command, restrict));
+                for (command, keep, reply) in requests {
+                    let _ = reply.send(spawn_core(&command, keep));
                 }
             })?;
         Ok(Self {
             spawner: Arc::new(Mutex::new(sender)),
             logs,
-            restrict_capabilities: false,
+            restrict_capabilities: None,
             readiness: None,
             readiness_timeout: crate::CORE_READINESS_TIMEOUT,
         })
@@ -90,12 +115,12 @@ impl UnixGroupLauncher {
         Ok(launcher)
     }
 
-    /// Cores started by this launcher keep only `CORE_CAPABILITIES` (bounding, permitted,
+    /// Cores started by this launcher keep only their entry of `keep` (bounding, permitted,
     /// effective, inheritable; ambient cleared). Used by the always-ready service, whose own
-    /// bounding set also holds capabilities that must never reach Mihomo or Xray.
+    /// bounding set holds capabilities that must not reach Mihomo or Xray.
     #[must_use]
-    pub fn with_restricted_capabilities(mut self) -> Self {
-        self.restrict_capabilities = true;
+    pub fn with_restricted_capabilities(mut self, keep: CoreCapabilities) -> Self {
+        self.restrict_capabilities = Some(keep);
         self
     }
 
@@ -104,11 +129,14 @@ impl UnixGroupLauncher {
         command: CommandSpec,
     ) -> Result<UnixGroupManagedChild, ProcessError> {
         let engine = command.engine;
+        let keep = self
+            .restrict_capabilities
+            .map(|keep| keep.for_engine(engine));
         let (reply, response) = tokio::sync::oneshot::channel();
         self.spawner
             .lock()
             .map_err(|_| ProcessError::LaunchFailed(engine))?
-            .send((command, self.restrict_capabilities, reply))
+            .send((command, keep, reply))
             .map_err(|_| ProcessError::LaunchFailed(engine))?;
         let mut child = response
             .await
@@ -148,7 +176,7 @@ fn sanitized_environment(
 /// set is what must shrink; that needs `CAP_SETPCAP`, which is dropped last. An unprivileged
 /// process (no permitted capabilities, not root) cannot shrink it and has nothing to lose, so
 /// `EPERM` is accepted only there.
-fn restrict_core_capabilities() -> io::Result<()> {
+fn restrict_core_capabilities(keep: CapabilitySet) -> io::Result<()> {
     let current = capabilities(None)?;
     let privileged = !current.permitted.is_empty() || geteuid().is_root();
     let drop_from_bounding_set = |capability: CapabilitySet| -> io::Result<()> {
@@ -160,11 +188,13 @@ fn restrict_core_capabilities() -> io::Result<()> {
     };
     for number in 0..CAPABILITY_NUMBERS {
         let capability = CapabilitySet::from_bits_retain(1 << number);
-        if !CORE_CAPABILITIES.contains(capability) && capability != CapabilitySet::SETPCAP {
+        if !keep.contains(capability) && capability != CapabilitySet::SETPCAP {
             drop_from_bounding_set(capability)?;
         }
     }
-    drop_from_bounding_set(CapabilitySet::SETPCAP)?;
+    if !keep.contains(CapabilitySet::SETPCAP) {
+        drop_from_bounding_set(CapabilitySet::SETPCAP)?;
+    }
     match clear_ambient_capability_set() {
         Ok(()) | Err(Errno::INVAL) => {}
         Err(error) => return Err(error.into()),
@@ -172,15 +202,15 @@ fn restrict_core_capabilities() -> io::Result<()> {
     set_capabilities(
         None,
         CapabilitySets {
-            effective: current.effective & CORE_CAPABILITIES,
-            permitted: current.permitted & CORE_CAPABILITIES,
-            inheritable: current.inheritable & CORE_CAPABILITIES,
+            effective: current.effective & keep,
+            permitted: current.permitted & keep,
+            inheritable: current.inheritable & keep,
         },
     )?;
     Ok(())
 }
 
-fn spawn_core(command: &CommandSpec, restrict_capabilities: bool) -> io::Result<Child> {
+fn spawn_core(command: &CommandSpec, keep: Option<CapabilitySet>) -> io::Result<Child> {
     let parent = getpid();
     let mut process = Command::new(&command.program);
     process
@@ -198,8 +228,8 @@ fn spawn_core(command: &CommandSpec, restrict_capabilities: bool) -> io::Result<
             if getppid() != Some(parent) {
                 return Err(io::Error::other("core host exited before core start"));
             }
-            if restrict_capabilities {
-                restrict_core_capabilities()?;
+            if let Some(keep) = keep {
+                restrict_core_capabilities(keep)?;
             }
             Ok(())
         });
@@ -494,16 +524,15 @@ mod tests {
     const PROBE_ENV: &str = "MULTICORE_CAPABILITY_PROBE";
 
     /// `Cap*:` lines of `/proc/self/status` as seen by a core started through `launcher`.
-    async fn core_capabilities(launcher: &UnixGroupLauncher) -> Vec<(String, u64)> {
+    async fn core_capabilities(launcher: &UnixGroupLauncher, engine: Engine) -> Vec<(String, u64)> {
         let temp = tempfile::tempdir().unwrap();
         let report = temp.path().join("caps");
-        let mut child = launcher
-            .launch(shell(
-                "grep '^Cap' /proc/self/status > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
-                &report,
-            ))
-            .await
-            .unwrap();
+        let mut command = shell(
+            "grep '^Cap' /proc/self/status > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"",
+            &report,
+        );
+        command.engine = engine;
+        let mut child = launcher.launch(command).await.unwrap();
         assert!(eventually(Duration::from_secs(5), || report.exists()));
         child.stop().await.unwrap();
         std::fs::read_to_string(&report)
@@ -528,24 +557,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_cores_hold_no_capability_beyond_the_network_ones() {
+    async fn restricted_cores_hold_no_capability_beyond_their_own_set() {
         let launcher = UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default()))
             .unwrap()
-            .with_restricted_capabilities();
-        let capabilities = core_capabilities(&launcher).await;
-        for name in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
-            assert_eq!(
-                set(&capabilities, name) & !CORE_CAPABILITIES.bits(),
-                0,
-                "{name}: {capabilities:?}"
-            );
+            .with_restricted_capabilities(CoreCapabilities::SERVICE);
+        for (engine, keep) in [
+            (Engine::Xray, CoreCapabilities::SERVICE.xray),
+            (Engine::Mihomo, CoreCapabilities::SERVICE.mihomo),
+        ] {
+            let capabilities = core_capabilities(&launcher, engine).await;
+            for name in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+                assert_eq!(
+                    set(&capabilities, name) & !keep.bits(),
+                    0,
+                    "{engine:?} {name}: {capabilities:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_service_gives_xray_the_network_capabilities_and_mihomo_also_ptrace() {
+        let network =
+            CapabilitySet::NET_ADMIN | CapabilitySet::NET_BIND_SERVICE | CapabilitySet::NET_RAW;
+        assert_eq!(CoreCapabilities::SERVICE.xray, network);
+        assert_eq!(
+            CoreCapabilities::SERVICE.mihomo,
+            network | CapabilitySet::SYS_PTRACE
+        );
     }
 
     /// Re-runs `restricted_core_capabilities_as_namespace_root` as root of a new user
     /// namespace, where the launcher holds `CAP_SETPCAP` like the systemd service does.
     #[test]
-    fn restricted_cores_keep_only_the_network_capabilities_as_root() {
+    fn restricted_cores_keep_only_their_own_capabilities_as_root() {
         let namespaces = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "true"])
             .status();
@@ -574,29 +619,45 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "run by restricted_cores_keep_only_the_network_capabilities_as_root"]
+    #[ignore = "run by restricted_cores_keep_only_their_own_capabilities_as_root"]
     async fn restricted_core_capabilities_as_namespace_root() {
         if std::env::var_os(PROBE_ENV).is_none() {
             return;
         }
         assert!(geteuid().is_root());
-        let unrestricted =
-            core_capabilities(&UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default())).unwrap())
-                .await;
-        let ptrace = CapabilitySet::SYS_PTRACE.bits() | CapabilitySet::DAC_READ_SEARCH.bits();
-        assert_eq!(set(&unrestricted, "CapEff") & ptrace, ptrace, "control run");
-
-        let restricted = core_capabilities(
-            &UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default()))
-                .unwrap()
-                .with_restricted_capabilities(),
+        let unrestricted = core_capabilities(
+            &UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default())).unwrap(),
+            Engine::Mihomo,
         )
         .await;
-        let core = CORE_CAPABILITIES.bits();
-        assert_eq!(set(&restricted, "CapBnd"), core, "{restricted:?}");
-        assert_eq!(set(&restricted, "CapPrm"), core, "{restricted:?}");
-        assert_eq!(set(&restricted, "CapEff"), core, "{restricted:?}");
-        assert_eq!(set(&restricted, "CapInh"), 0, "{restricted:?}");
-        assert_eq!(set(&restricted, "CapAmb"), 0, "{restricted:?}");
+        let held = CapabilitySet::SYS_PTRACE.bits()
+            | CapabilitySet::DAC_READ_SEARCH.bits()
+            | CapabilitySet::SETPCAP.bits();
+        assert_eq!(set(&unrestricted, "CapEff") & held, held, "control run");
+
+        let launcher = UnixGroupLauncher::new(Arc::new(CoreLogBuffer::default()))
+            .unwrap()
+            .with_restricted_capabilities(CoreCapabilities::SERVICE);
+        for (engine, keep) in [
+            (Engine::Xray, CoreCapabilities::SERVICE.xray),
+            (Engine::Mihomo, CoreCapabilities::SERVICE.mihomo),
+        ] {
+            let restricted = core_capabilities(&launcher, engine).await;
+            let keep = keep.bits();
+            for name in ["CapBnd", "CapPrm", "CapEff"] {
+                assert_eq!(
+                    set(&restricted, name),
+                    keep,
+                    "{engine:?} {name}: {restricted:?}"
+                );
+            }
+            assert_eq!(set(&restricted, "CapInh"), 0, "{engine:?}: {restricted:?}");
+            assert_eq!(set(&restricted, "CapAmb"), 0, "{engine:?}: {restricted:?}");
+        }
+        let mihomo = core_capabilities(&launcher, Engine::Mihomo).await;
+        let effective = set(&mihomo, "CapEff");
+        assert_ne!(effective & CapabilitySet::SYS_PTRACE.bits(), 0);
+        assert_eq!(effective & CapabilitySet::DAC_READ_SEARCH.bits(), 0);
+        assert_eq!(effective & CapabilitySet::SETPCAP.bits(), 0);
     }
 }

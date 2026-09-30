@@ -142,7 +142,8 @@ impl ProductionCores {
         // The unit's CAP_SYS_PTRACE / CAP_DAC_READ_SEARCH / CAP_SETPCAP are for the service's
         // own peer checks and staged-generation reads; Mihomo and Xray keep only CAP_NET_*.
         #[cfg(unix)]
-        let launcher = launcher.with_restricted_capabilities();
+        let launcher =
+            launcher.with_restricted_capabilities(multicore_core::CoreCapabilities::SERVICE);
         let controller = SidecarProcessController::with_launcher(paths, launcher);
         for engine in [Engine::Xray, Engine::Mihomo] {
             if let Err(error) = self.runtime.block_on(controller.start(engine)) {

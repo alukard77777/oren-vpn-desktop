@@ -55,7 +55,7 @@ pub use snapshot::{
 pub use state::{ConnectionState, StateError, StateMachine};
 pub use supervisor::{Engine, ProcessController, StartFailureCause, Supervisor, SupervisorError};
 #[cfg(unix)]
-pub use unix_group::{UnixGroupLauncher, UnixGroupManagedChild};
+pub use unix_group::{CoreCapabilities, UnixGroupLauncher, UnixGroupManagedChild};
 #[cfg(windows)]
 pub use windows_job::{WindowsJobLauncher, WindowsJobManagedChild};
 
