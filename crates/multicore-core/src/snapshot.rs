@@ -1259,6 +1259,11 @@ pub fn stage_runtime_with_mihomo_control(
         YamlValue::String("device".to_owned()),
         YamlValue::String("MultiCore".to_owned()),
     );
+    // Mihomo v1.19.32 changed its implicit TUN stack from gvisor to the new
+    // `mips` stack. Keep the stack every earlier MultiCore release ran on
+    // unless the provider chose one explicitly.
+    tun.entry(YamlValue::String("stack".to_owned()))
+        .or_insert_with(|| YamlValue::String("gvisor".to_owned()));
     if let Some(port) = control.proxy_mixed_port {
         tun.insert(
             YamlValue::String("enable".to_owned()),

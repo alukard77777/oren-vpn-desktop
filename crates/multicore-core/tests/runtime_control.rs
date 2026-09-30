@@ -1230,3 +1230,39 @@ fn mihomo_only_runtime_keeps_native_proxies_and_an_idle_xray() {
     assert_eq!(mihomo["proxies"][0]["type"], Value::from("vless"));
     assert_eq!(mihomo["tun"]["enable"], Value::from(true));
 }
+
+#[test]
+fn runtime_overlay_pins_gvisor_unless_the_provider_chose_a_stack() {
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    for (yaml, expected) in [
+        (
+            "tun:
+  enable: true
+proxies: []
+",
+            "gvisor",
+        ),
+        (
+            "tun:
+  enable: true
+  stack: system
+proxies: []
+",
+            "system",
+        ),
+        (
+            "proxies: []
+",
+            "gvisor",
+        ),
+    ] {
+        let snapshot = Snapshot::parse(yaml.as_bytes(), b"{}").unwrap();
+        let directory = TempDirectory::new();
+        let published =
+            publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+        let mihomo: Value =
+            serde_yaml_ng::from_slice(&fs::read(&published.mihomo_config).unwrap()).unwrap();
+        assert_eq!(mihomo["tun"]["stack"], Value::from(expected), "{yaml}");
+    }
+}
