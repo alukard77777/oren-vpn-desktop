@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use super::controller_proxy::ControllerProxy;
 use super::core_loop::{ClientIdentity, CoreHealth, Cores};
-use super::{mihomo_rest, state_dir};
+use super::{mihomo_rest, service_log, state_dir};
 use crate::runtime_host::{broker_safe_log, state};
 
 #[cfg(windows)]
@@ -68,7 +68,51 @@ struct ActiveCores {
     controller_secret: Zeroizing<String>,
     _proxy: ControllerProxy,
     controller: SidecarProcessController<PlatformLauncher>,
-    _validated: ResolvedRuntime,
+}
+
+/// What `Prepare` takes from the client's staged generation.
+#[derive(Debug)]
+pub(crate) struct ClientGeneration {
+    pub(crate) mihomo: Vec<u8>,
+    pub(crate) xray: Vec<u8>,
+    pub(crate) xray_binary: PathBuf,
+    pub(crate) mihomo_binary: PathBuf,
+}
+
+/// Why [`read_client_generation`] refused: the code for the daemon, the step and the detail
+/// for `logs/service.log`.
+pub(crate) type Refusal = (BrokerErrorCode, &'static str, String);
+
+/// Resolves `generation` of `client`, runs `verify_cores` and reads both configs through the
+/// resolver's guarded handles.
+///
+/// The guards are released before this returns. They hold the client's data root, `runtime`,
+/// the generation and their ancestors open sharing reads only; kept for as long as the cores
+/// ran, they made every rename into `runtime` fail with os error 32, so the daemon could never
+/// publish the next generation (a refresh or a new subscription failed until the daemon quit).
+/// The cores run from the service's sanitised copies and never need the client's files again.
+pub(crate) fn read_client_generation(
+    client: &ClientIdentity,
+    host_executable: &Path,
+    generation: u64,
+    verify_cores: impl FnOnce() -> Result<(), super::core_hashes::CoreHashError>,
+) -> Result<ClientGeneration, Refusal> {
+    use BrokerErrorCode::NotReady;
+    let resolved = resolve_client(client, host_executable, generation)
+        .map_err(|error| (NotReady, "resolve client runtime", format!("{error:?}")))?;
+    verify_cores().map_err(|error| (NotReady, "verify core hashes", format!("{error:?}")))?;
+    verify_unchanged(&resolved)
+        .map_err(|error| (NotReady, "staged files changed", format!("{error:?}")))?;
+    let mihomo = read_guarded(&resolved, &resolved.paths.mihomo_config)
+        .map_err(|(code, error)| (code, "read mihomo.yaml", format!("{error:?}")))?;
+    let xray = read_guarded(&resolved, &resolved.paths.xray_config)
+        .map_err(|(code, error)| (code, "read xray.json", format!("{error:?}")))?;
+    Ok(ClientGeneration {
+        mihomo,
+        xray,
+        xray_binary: resolved.paths.xray_binary.clone(),
+        mihomo_binary: resolved.paths.mihomo_binary.clone(),
+    })
 }
 
 pub(crate) struct ProductionCores {
@@ -96,39 +140,49 @@ impl ProductionCores {
         client: &ClientIdentity,
         generation: u64,
     ) -> Result<ControllerEndpoint, BrokerErrorCode> {
-        let resolved = resolve_client(client, &self.host_executable, generation)
-            .map_err(|()| BrokerErrorCode::NotReady)?;
-        self.verify_cores()?;
-        resolved
-            .verify_unchanged()
-            .map_err(|_| BrokerErrorCode::NotReady)?;
-        let mihomo_source = read_guarded(&resolved, &resolved.paths.mihomo_config)?;
-        let xray_source = read_guarded(&resolved, &resolved.paths.xray_config)?;
+        use BrokerErrorCode::{InvalidRequest, NotReady};
+        let log = self.service_directory.clone();
+        let refuse = |code: BrokerErrorCode, stage: &str, error: &dyn std::fmt::Debug| {
+            service_log::append(
+                &log,
+                &format!(
+                    "prepare generation {generation} refused ({code:?}) at {stage}: {error:?}"
+                ),
+            );
+            code
+        };
+        let staged = read_client_generation(client, &self.host_executable, generation, || {
+            self.verify_cores()
+        })
+        .map_err(|(code, stage, detail)| refuse(code, stage, &format_args!("{detail}")))?;
         let home = client_home(&self.service_directory, client);
-        fs::create_dir_all(&home).map_err(|_| BrokerErrorCode::NotReady)?;
-        let controller_port = free_loopback_port().ok_or(BrokerErrorCode::NotReady)?;
-        let controller_secret = random_secret().map_err(|_| BrokerErrorCode::NotReady)?;
+        fs::create_dir_all(&home).map_err(|error| refuse(NotReady, "user home", &error))?;
+        let controller_port = free_loopback_port()
+            .ok_or_else(|| refuse(NotReady, "controller port", &"no free loopback port"))?;
+        let controller_secret =
+            random_secret().map_err(|error| refuse(NotReady, "controller secret", &error))?;
         let mihomo = sanitize_mihomo(
-            &mihomo_source,
+            &staged.mihomo,
             &MihomoServicePolicy {
                 service_directory: &home,
                 controller_port,
                 controller_secret: &controller_secret,
             },
         )
-        .map_err(|_| BrokerErrorCode::InvalidRequest)?;
-        let xray = sanitize_xray(&xray_source).map_err(|_| BrokerErrorCode::InvalidRequest)?;
+        .map_err(|error| refuse(InvalidRequest, "sanitise mihomo.yaml", &error))?;
+        let xray = sanitize_xray(&staged.xray)
+            .map_err(|error| refuse(InvalidRequest, "sanitise xray.json", &error))?;
         let directory = state_dir::fresh_generation_directory(&self.service_directory, generation)
-            .map_err(|_| BrokerErrorCode::NotReady)?;
+            .map_err(|error| refuse(NotReady, "generation directory", &error))?;
         fs::create_dir_all(home.join("providers"))
             .and_then(|()| fs::create_dir_all(self.service_directory.join("logs")))
-            .map_err(|_| BrokerErrorCode::NotReady)?;
+            .map_err(|error| refuse(NotReady, "providers directory", &error))?;
         fs::write(directory.join("mihomo.yaml"), &mihomo.yaml)
             .and_then(|()| fs::write(directory.join("xray.json"), &xray))
-            .map_err(|_| BrokerErrorCode::NotReady)?;
+            .map_err(|error| refuse(NotReady, "write sanitised configs", &error))?;
         let paths = RuntimePaths {
-            xray_binary: resolved.paths.xray_binary.clone(),
-            mihomo_binary: resolved.paths.mihomo_binary.clone(),
+            xray_binary: staged.xray_binary,
+            mihomo_binary: staged.mihomo_binary,
             xray_config: directory.join("xray.json"),
             mihomo_config: directory.join("mihomo.yaml"),
             dashboard_directory: None,
@@ -138,7 +192,7 @@ impl ProductionCores {
             self.service_directory.join("logs").join("latest-core.log"),
         ));
         let launcher = PlatformLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
-            .map_err(|_| BrokerErrorCode::NotReady)?;
+            .map_err(|error| refuse(NotReady, "core launcher", &error))?;
         // The unit's CAP_SYS_PTRACE / CAP_DAC_READ_SEARCH / CAP_SETPCAP are for the service's
         // own peer checks and staged-generation reads; Mihomo and Xray keep only CAP_NET_*.
         #[cfg(unix)]
@@ -148,14 +202,14 @@ impl ProductionCores {
         for engine in [Engine::Xray, Engine::Mihomo] {
             if let Err(error) = self.runtime.block_on(controller.start(engine)) {
                 self.stop_processes(&controller);
-                return Err(start_error(error));
+                return Err(refuse(start_error(&error), "start core", &error));
             }
         }
         let token = match random_secret() {
             Ok(token) => token,
-            Err(_) => {
+            Err(error) => {
                 self.stop_processes(&controller);
-                return Err(BrokerErrorCode::NotReady);
+                return Err(refuse(NotReady, "proxy token", &error));
             }
         };
         let proxy = match self.runtime.block_on(ControllerProxy::start(
@@ -164,9 +218,9 @@ impl ProductionCores {
             token.as_str().to_owned(),
         )) {
             Ok(proxy) => proxy,
-            Err(_) => {
+            Err(error) => {
                 self.stop_processes(&controller);
-                return Err(BrokerErrorCode::NotReady);
+                return Err(refuse(NotReady, "controller proxy", &error));
             }
         };
         let endpoint = ControllerEndpoint {
@@ -180,26 +234,24 @@ impl ProductionCores {
             controller_secret,
             _proxy: proxy,
             controller,
-            _validated: resolved,
         });
         Ok(endpoint)
     }
 
     /// Windows: refuses cores that no longer match the package's `SHA256SUMS.txt` (for example
     /// after a Mihomo self-upgrade). Linux cores come from the root-owned `/usr/lib/multicore`.
-    fn verify_cores(&self) -> Result<(), BrokerErrorCode> {
+    fn verify_cores(&self) -> Result<(), super::core_hashes::CoreHashError> {
         #[cfg(windows)]
         {
             let package = self
                 .host_executable
                 .parent()
                 .and_then(Path::parent)
-                .ok_or(BrokerErrorCode::NotReady)?;
+                .ok_or(super::core_hashes::CoreHashError::Manifest)?;
             super::core_hashes::verify_core_hashes(
                 package,
                 &["cores/xray.exe", "cores/mihomo.exe"],
-            )
-            .map_err(|_| BrokerErrorCode::NotReady)?;
+            )?;
         }
         Ok(())
     }
@@ -223,11 +275,21 @@ impl Cores for ProductionCores {
     fn restart(&mut self) -> Result<(), BrokerErrorCode> {
         let active = self.active.as_ref().ok_or(BrokerErrorCode::NotReady)?;
         self.stop_processes(&active.controller);
-        self.verify_cores()?;
+        if let Err(error) = self.verify_cores() {
+            service_log::append(
+                &self.service_directory,
+                &format!("restart refused at verify core hashes: {error:?}"),
+            );
+            return Err(BrokerErrorCode::NotReady);
+        }
         for engine in [Engine::Xray, Engine::Mihomo] {
-            self.runtime
-                .block_on(active.controller.start(engine))
-                .map_err(start_error)?;
+            if let Err(error) = self.runtime.block_on(active.controller.start(engine)) {
+                service_log::append(
+                    &self.service_directory,
+                    &format!("restart failed at start core: {error:?}"),
+                );
+                return Err(start_error(&error));
+            }
         }
         Ok(())
     }
@@ -350,20 +412,33 @@ fn resolve_client(
     client: &ClientIdentity,
     host: &Path,
     generation: u64,
-) -> Result<ResolvedRuntime, ()> {
+) -> Result<ResolvedRuntime, ResolveError> {
     let sid = client
         .user_key
         .split_once(':')
         .map(|(_, sid)| sid)
-        .ok_or(())?;
-    let resolved =
-        crate::runtime_paths::resolve_from(&client.data_root, host, generation).map_err(drop)?;
+        .ok_or(ResolveError::Owner)?;
+    // The daemon keeps its data root owner-only, so SYSTEM reads it with SeBackupPrivilege
+    // (the Linux unit's CAP_DAC_READ_SEARCH); the resolver's checks decide what is accepted.
+    let resolved = crate::runtime_paths::with_backup_privilege(|| {
+        crate::runtime_paths::resolve_from(&client.data_root, host, generation)
+    })?;
     // The data root is the client's own (redirectable) LocalAppData: refuse files that belong
     // to another user.
-    resolved
-        .verify_owned_by(&client.data_root, sid)
-        .map_err(drop)?;
+    resolved.verify_owned_by(&client.data_root, sid)?;
     Ok(resolved)
+}
+
+/// Re-opens every guarded path (with the same access as [`resolve_client`]) and compares
+/// identities.
+#[cfg(windows)]
+fn verify_unchanged(resolved: &ResolvedRuntime) -> Result<(), ResolveError> {
+    crate::runtime_paths::with_backup_privilege(|| resolved.verify_unchanged())
+}
+
+#[cfg(unix)]
+fn verify_unchanged(resolved: &ResolvedRuntime) -> Result<(), ResolveError> {
+    resolved.verify_unchanged()
 }
 
 #[cfg(unix)]
@@ -371,18 +446,20 @@ fn resolve_client(
     client: &ClientIdentity,
     host: &Path,
     generation: u64,
-) -> Result<ResolvedRuntime, ()> {
+) -> Result<ResolvedRuntime, ResolveError> {
     crate::unix_runtime_paths::resolve_from(&client.data_root, host, generation, client.uid)
-        .map_err(drop)
 }
 
 /// Reads a staged config through the resolver's verified handle, never by re-opening its path.
-fn read_guarded(resolved: &ResolvedRuntime, path: &Path) -> Result<Vec<u8>, BrokerErrorCode> {
+fn read_guarded(
+    resolved: &ResolvedRuntime,
+    path: &Path,
+) -> Result<Vec<u8>, (BrokerErrorCode, ResolveError)> {
     resolved
         .read_guarded(path, MAX_CONFIG_BYTES as u64)
         .map_err(|error| match error {
-            ResolveError::Layout => BrokerErrorCode::InvalidRequest,
-            _ => BrokerErrorCode::NotReady,
+            ResolveError::Layout => (BrokerErrorCode::InvalidRequest, error),
+            _ => (BrokerErrorCode::NotReady, error),
         })
 }
 
@@ -428,7 +505,7 @@ fn random_secret() -> Result<Zeroizing<String>, getrandom::Error> {
     ))
 }
 
-fn start_error(error: ProcessError) -> BrokerErrorCode {
+fn start_error(error: &ProcessError) -> BrokerErrorCode {
     match error {
         ProcessError::ReadinessTimedOut(_) => BrokerErrorCode::TimedOut,
         _ => BrokerErrorCode::NotReady,

@@ -365,6 +365,94 @@ fn launchable_program_path(canonical: PathBuf) -> PathBuf {
     }
 }
 
+/// Runs `body` with SeBackupPrivilege enabled on this thread only.
+///
+/// The daemon keeps `%LOCALAPPDATA%\MultiCore` owner-only (a protected DACL with a single ACE
+/// for the user), so the always-ready service, running as SYSTEM, is refused when it opens the
+/// client's data root to resolve a staged generation. With the privilege enabled, the
+/// resolver's opens (`FILE_FLAG_BACKUP_SEMANTICS`, read-only) pass the DACL: the Windows
+/// counterpart of the Linux unit's `CAP_DAC_READ_SEARCH`. The resolver's own checks (reparse
+/// points, containment, ownership by the client) still decide what is accepted.
+///
+/// `ImpersonateSelf` gives the thread its own copy of the process token and the privilege is
+/// enabled only there, so the process token, which the cores inherit, never has it enabled.
+/// Handles opened inside `body` stay usable afterwards. A token that does not hold the
+/// privilege (a test run by a standard user) runs `body` with its ordinary access.
+pub(crate) fn with_backup_privilege<T>(body: impl FnOnce() -> T) -> T {
+    let _privilege = BackupPrivilege::enable();
+    body()
+}
+
+/// SeBackupPrivilege enabled in this thread's impersonation token; dropping it reverts.
+struct BackupPrivilege;
+
+impl BackupPrivilege {
+    fn enable() -> Option<Self> {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, LUID},
+            Security::{
+                AdjustTokenPrivileges, ImpersonateSelf, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+                SE_BACKUP_NAME, SE_PRIVILEGE_ENABLED, SecurityImpersonation,
+                TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+            },
+            System::Threading::{GetCurrentThread, OpenThreadToken},
+        };
+        let mut luid = LUID {
+            LowPart: 0,
+            HighPart: 0,
+        };
+        if unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_BACKUP_NAME, &mut luid) } == 0 {
+            return None;
+        }
+        if unsafe { ImpersonateSelf(SecurityImpersonation) } == 0 {
+            return None;
+        }
+        // From here on, dropping `impersonation` reverts to the process token.
+        let impersonation = Self;
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                1,
+                &mut token,
+            )
+        } == 0
+        {
+            return None;
+        }
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let enabled = unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &privileges,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0
+            && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED;
+        unsafe { CloseHandle(token) };
+        enabled.then_some(impersonation)
+    }
+}
+
+impl Drop for BackupPrivilege {
+    fn drop(&mut self) {
+        // A thread left impersonating would keep the privilege for whatever it runs next.
+        if unsafe { windows_sys::Win32::Security::RevertToSelf() } == 0 {
+            std::process::abort();
+        }
+    }
+}
+
 fn canonical_contained(root: &Path, target: &Path) -> Result<(), ResolveError> {
     let root = fs::canonicalize(root).map_err(|_| ResolveError::Missing)?;
     let target = fs::canonicalize(target).map_err(|_| ResolveError::Missing)?;
@@ -400,17 +488,13 @@ fn guard_lexical_chain(
 }
 
 fn open_guard(path: &Path, directory: bool) -> Result<GuardedPath, ResolveError> {
+    // FILE_FLAG_BACKUP_SEMANTICS (needed for directories anyway) lets the always-ready service
+    // read files as well as directories under `with_backup_privilege`; without the privilege
+    // enabled it changes nothing for a file.
     let handle = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ)
-        .custom_flags(
-            FILE_FLAG_OPEN_REPARSE_POINT
-                | if directory {
-                    FILE_FLAG_BACKUP_SEMANTICS
-                } else {
-                    0
-                },
-        )
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|_| ResolveError::Missing)?;
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -527,6 +611,140 @@ mod tests {
     }
     const CLIENT: &str = "S-1-5-21-1-2-3-1001";
     const OTHER: &str = "S-1-5-21-1-2-3-1002";
+
+    /// Replaces the DACL of `path` (and, through inheritance, of everything below it).
+    fn set_dacl(path: &Path, sddl: &str) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                SetNamedSecurityInfoW,
+            },
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let sddl = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut descriptor = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let (mut present, mut defaulted, mut dacl) = (0, 0, std::ptr::null_mut());
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        let mut wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        unsafe { LocalFree(descriptor.cast()) };
+        assert_eq!(status, 0, "SetNamedSecurityInfoW({})", path.display());
+    }
+
+    /// The daemon keeps `%LOCALAPPDATA%\MultiCore` owner-only (protected DACL, one ACE for the
+    /// user), so the always-ready service, running as SYSTEM, is not in the DACL of the data
+    /// root it must read. Like the Linux unit's CAP_DAC_READ_SEARCH, the service reads it with
+    /// SeBackupPrivilege. Needs a token that holds the privilege (SYSTEM or an elevated
+    /// administrator); anywhere else the check cannot be exercised and the test returns.
+    #[test]
+    fn service_reads_a_data_root_whose_dacl_leaves_out_the_service_account() {
+        if !token_holds_backup_privilege() {
+            eprintln!("skipped: SeBackupPrivilege is not held (run as SYSTEM or elevated)");
+            return;
+        }
+        let (_r, d, h) = fixture();
+        // Everything below inherits: only the (fictitious) client may open the data root.
+        set_dacl(&d, &format!("D:P(A;OICI;FA;;;{CLIENT})"));
+        let refused = resolve_from(&d, &h, 7);
+        let resolved = with_backup_privilege(|| resolve_from(&d, &h, 7));
+        let unchanged = resolved
+            .as_ref()
+            .map(|resolved| with_backup_privilege(|| resolved.verify_unchanged()));
+        let config = resolved
+            .as_ref()
+            .map(|resolved| resolved.read_guarded(&resolved.paths.xray_config, 1024));
+        // The fixture owner may always rewrite the DACL, so the directory can be removed.
+        set_dacl(&d, "D:P(A;OICI;FA;;;WD)");
+        assert!(
+            matches!(refused, Err(ResolveError::Missing)),
+            "without the privilege the data root must stay unreadable"
+        );
+        assert!(resolved.is_ok(), "{:?}", resolved.err());
+        assert!(matches!(unchanged, Ok(Ok(()))), "{unchanged:?}");
+        assert!(
+            matches!(config, Ok(Ok(ref bytes)) if bytes == b"{}"),
+            "{config:?}"
+        );
+    }
+
+    fn token_holds_backup_privilege() -> bool {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE, LUID},
+            Security::{
+                GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_BACKUP_NAME,
+                TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrivileges,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+        let mut luid = LUID {
+            LowPart: 0,
+            HighPart: 0,
+        };
+        if unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_BACKUP_NAME, &mut luid) } == 0 {
+            return false;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return false;
+        }
+        let mut buffer = vec![0_u64; 1024];
+        let mut length = 0;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenPrivileges,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut length,
+            )
+        } != 0;
+        unsafe { CloseHandle(token) };
+        if !ok {
+            return false;
+        }
+        let privileges = unsafe { &*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+        let entries: &[LUID_AND_ATTRIBUTES] = unsafe {
+            std::slice::from_raw_parts(
+                privileges.Privileges.as_ptr(),
+                privileges.PrivilegeCount as usize,
+            )
+        };
+        entries
+            .iter()
+            .any(|entry| entry.Luid.LowPart == luid.LowPart && entry.Luid.HighPart == luid.HighPart)
+    }
 
     #[test]
     fn staged_files_of_another_user_are_refused() {

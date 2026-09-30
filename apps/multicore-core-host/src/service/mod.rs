@@ -7,6 +7,7 @@ pub(crate) mod core_hashes;
 pub(crate) mod core_loop;
 pub(crate) mod cores;
 pub(crate) mod mihomo_rest;
+pub(crate) mod service_log;
 pub(crate) mod state_dir;
 #[cfg(unix)]
 pub(crate) mod unix_identity;

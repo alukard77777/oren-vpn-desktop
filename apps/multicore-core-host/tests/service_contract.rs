@@ -374,6 +374,73 @@ fn each_account_gets_its_own_mihomo_home() {
     assert_eq!(alice_home, client_home(root, &alice_again));
 }
 
+/// Live on Windows 10: after the service had prepared a generation, every refresh failed with
+/// "Подготовка конфигурации перед подключением завершилась ошибкой" because the service kept
+/// the resolver's guards (sharing reads only) on the client's `runtime` for as long as the
+/// cores ran, and publishing the next generation renames into `runtime` (os error 32). Reading
+/// a generation must leave the client free to publish the next one and delete the old one.
+#[cfg(windows)]
+#[test]
+fn reading_a_client_generation_leaves_its_runtime_free_for_the_next_one() {
+    use service::cores::read_client_generation;
+    use std::fs;
+    fn pe(path: &std::path::Path) {
+        let mut bytes = vec![0_u8; 0x100];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+        bytes[0x96..0x98].copy_from_slice(&0x0002_u16.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&0x20b_u16.to_le_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+    let root = tempfile::tempdir().unwrap();
+    let package = root
+        .path()
+        .join("Program Files")
+        .join("MultiCore")
+        .join("current");
+    fs::create_dir_all(package.join("runtime")).unwrap();
+    fs::create_dir_all(package.join("cores")).unwrap();
+    let host = package.join("runtime").join("multicore-core-host.exe");
+    fs::write(&host, b"host").unwrap();
+    pe(&package.join("cores").join("xray.exe"));
+    pe(&package.join("cores").join("mihomo.exe"));
+    let data = root.path().join("Local").join("MultiCore");
+    let runtime = data.join("runtime");
+    let staged = runtime.join("runtime-00000000000000000007");
+    fs::create_dir_all(&staged).unwrap();
+    fs::write(staged.join("xray.json"), b"{}").unwrap();
+    fs::write(staged.join("mihomo.yaml"), b"mode: rule\n").unwrap();
+    // Files this process creates are owned by its user (or Administrators when elevated).
+    let owner = runtime_paths::handle_owner_sid(
+        &std::os::windows::fs::OpenOptionsExt::custom_flags(
+            fs::OpenOptions::new().read(true),
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .open(&data)
+        .unwrap(),
+    )
+    .unwrap();
+    let client = ClientIdentity {
+        user_key: format!("1:{owner}"),
+        data_root: data.clone(),
+        uid: 0,
+    };
+
+    let generation = read_client_generation(&client, &host, 7, || Ok(())).unwrap();
+    assert_eq!(generation.xray, b"{}");
+    assert_eq!(generation.mihomo, b"mode: rule\n");
+
+    // The daemon's publish: stage beside the old generation, rename into `runtime`, prune.
+    let next = runtime.join(".runtime-00000000000000000008.staging-1");
+    fs::create_dir(&next).unwrap();
+    fs::write(next.join("xray.json"), b"{}").unwrap();
+    fs::rename(&next, runtime.join("runtime-00000000000000000008"))
+        .expect("publishing the next generation into runtime");
+    fs::remove_dir_all(&staged).expect("pruning the generation the service read");
+}
+
 #[test]
 fn shutdown_stops_and_releases() {
     let mut service = ServiceLoop::new(FakeCores::default());
