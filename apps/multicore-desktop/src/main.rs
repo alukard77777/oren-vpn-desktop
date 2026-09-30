@@ -15,6 +15,7 @@ mod preferences;
 #[cfg(all(test, feature = "preview-render"))]
 mod preview_render;
 mod renderer_fallback;
+mod service_install;
 mod service_logo;
 mod single_instance;
 mod tray;
@@ -707,7 +708,7 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 
 fn main() -> Result<(), slint::PlatformError> {
     let software_renderer = renderer_fallback::software_renderer_requested();
-    match run_desktop(software_renderer) {
+    let result = match run_desktop(software_renderer) {
         // Everything run_desktop held (single-instance guard, owned daemon,
         // tray) is released by now, so the restarted instance starts clean.
         Err(error) if !software_renderer && renderer_fallback::is_gpu_renderer_failure(&error) => {
@@ -716,7 +717,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 .map_err(|_| error)
         }
         result => result,
-    }
+    };
+    // The daemon and every file lock are gone now, so the service installer
+    // can remove this per-user copy.
+    service_install::launch_pending_installer();
+    result
 }
 
 fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
@@ -796,6 +801,9 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_tun_enabled(loaded_preferences.tun_enabled);
     // The TUN-off (system proxy) mode exists on Windows only.
     ui.set_tun_toggle_available(cfg!(windows));
+    ui.set_service_card_visible(service_install::card_visible(
+        service_install::service_installed(),
+    ));
     if let Some(growth) = loaded_preferences.rail_growth {
         ui.set_rail_growth_delta(i32::try_from(growth.delta).unwrap_or(0));
         ui.set_rail_grown_width(i32::try_from(growth.grown_width).unwrap_or(0));
@@ -847,6 +855,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         startup_connect_pending.clone(),
     );
     wire_dashboard_action(&ui, model.clone());
+    wire_service_install(&ui);
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_copy_diagnostics(&ui, model.clone());
@@ -3142,6 +3151,40 @@ fn wire_primary_action(
             }
             Some((PrimaryAction::None, _)) | None => {}
         }
+    });
+}
+
+/// "Установить службу": download and verify the installer in the background, then quit.
+/// `main` starts the installer only after the event loop, tray and owned daemon are gone,
+/// because its migration step uninstalls this per-user copy.
+fn wire_service_install(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_install_service(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_service_install_busy() {
+            return;
+        }
+        ui.set_service_install_busy(true);
+        ui.set_service_install_error("".into());
+        let weak = weak.clone();
+        thread::spawn(move || {
+            let result = service_install::download_installer();
+            let _ = slint::invoke_from_event_loop(move || match result {
+                Ok(installer) => {
+                    service_install::launch_after_exit(installer);
+                    let _keep_window_alive = weak;
+                    let _ = slint::quit_event_loop();
+                }
+                Err(error) => {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.set_service_install_busy(false);
+                        ui.set_service_install_error(error.into());
+                    }
+                }
+            });
+        });
     });
 }
 

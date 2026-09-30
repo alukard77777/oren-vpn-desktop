@@ -1,4 +1,6 @@
-use multicore_release::{GitHubRelease, ReleaseDecision, Repository, Version};
+use multicore_release::{
+    GitHubRelease, ReleaseDecision, Repository, Version, WINDOWS_INSTALLER_ASSET_NAME,
+};
 
 #[test]
 fn repository_accepts_one_owner_and_repository() {
@@ -126,4 +128,31 @@ fn appimage_release_rejects_missing_or_foreign_assets() {
     );
     let other = Repository::parse("someone/else").unwrap();
     assert!(GitHubRelease::parse_appimage_for_repository(&other, MIXED_RELEASE).is_err());
+}
+
+#[test]
+fn the_installer_asset_is_parsed_from_the_pinned_repository() {
+    assert_eq!(WINDOWS_INSTALLER_ASSET_NAME, "MultiCore-Setup-x64.exe");
+    let repository = Repository::parse("fatyzzz/multicore-releases").unwrap();
+    let digest = "a".repeat(64);
+    let body = format!(
+        r#"{{"tag_name":"v1.1.0","html_url":"https://github.com/fatyzzz/multicore-releases/releases/tag/v1.1.0",
+            "assets":[{{"name":"MultiCore-Setup-x64.exe","size":1000,
+            "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v1.1.0/MultiCore-Setup-x64.exe",
+            "digest":"sha256:{digest}"}}]}}"#
+    );
+    let release =
+        GitHubRelease::parse_installer_for_repository(&repository, body.as_bytes()).unwrap();
+    assert!(
+        release
+            .asset()
+            .download_url()
+            .ends_with("/MultiCore-Setup-x64.exe")
+    );
+    assert_eq!(release.asset().sha256_hex(), digest);
+    let other = Repository::parse("someone/else").unwrap();
+    assert!(GitHubRelease::parse_installer_for_repository(&other, body.as_bytes()).is_err());
+    // The portable-zip parser must not pick the installer up, and vice versa.
+    assert!(GitHubRelease::parse_for_repository(&repository, body.as_bytes()).is_err());
+    assert!(GitHubRelease::parse_installer_for_repository(&repository, MIXED_RELEASE).is_err());
 }

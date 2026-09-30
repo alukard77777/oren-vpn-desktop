@@ -667,6 +667,26 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_tun_toggle_available(true);
             ui.set_tun_enabled(false);
         }),
+        ("settings-service-card", 840, 720, |ui| {
+            ready(ui);
+            ui.set_local_page(s("settings"));
+            ui.set_tun_toggle_available(true);
+            ui.set_service_card_visible(true);
+        }),
+        ("settings-service-card-error-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_local_page(s("settings"));
+            ui.set_tun_toggle_available(true);
+            ui.set_service_card_visible(true);
+            ui.set_service_install_error(s("Установщик не прошёл SHA-256 проверку"));
+        }),
+        ("settings-service-card-busy", 840, 720, |ui| {
+            ready(ui);
+            ui.set_local_page(s("settings"));
+            ui.set_tun_toggle_available(true);
+            ui.set_service_card_visible(true);
+            ui.set_service_install_busy(true);
+        }),
         ("settings-updates", 840, 720, |ui| {
             ready(ui);
             ui.set_local_page(s("settings"));

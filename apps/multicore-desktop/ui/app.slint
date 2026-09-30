@@ -1055,6 +1055,10 @@ export component AppWindow inherits Window {
     // TUN (all traffic) vs the system proxy without an administrator prompt; next connect.
     in-out property <bool> tun-enabled: true;
     in property <bool> tun-toggle-available: false;
+    // Windows per-user install without the MultiCore service: offer the service installer.
+    in property <bool> service-card-visible: false;
+    in property <bool> service-install-busy: false;
+    in property <string> service-install-error;
     in property <string> preference-error;
     in-out property <bool> ambient-background-enabled: true;
     // Icon-only navigation rail; collapsed on first run, remembered after.
@@ -1184,6 +1188,7 @@ export component AppWindow inherits Window {
         root.primary-action();
     }
     callback open-dashboard();
+    callback install-service();
     callback open-panel(string);
     callback close-panel();
     callback escape-pressed();
@@ -3100,6 +3105,45 @@ export component AppWindow inherits Window {
                             padding-left: 4px;
                             padding-top: 6px;
                             Footnote { text: "Без TUN трафик идёт через системный прокси — без запроса прав администратора"; }
+                        }
+                        if root.service-card-visible: Rectangle { height: 12px; background: transparent; }
+                        if root.service-card-visible: Rectangle {
+                            opacity: root.page-entering ? 0 : 1;
+                            animate opacity { duration: 280ms; delay: 36ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            height: Math.max(60px, service-row.preferred-height);
+                            background: Theme.surface;
+                            border-color: #4c9dff55;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            service-row := HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 10px;
+                                padding-top: 11px;
+                                padding-bottom: 11px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text { text: "Мгновенное подключение — установить службу"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; wrap: word-wrap; }
+                                    Text {
+                                        text: root.service-install-error != ""
+                                            ? root.service-install-error
+                                            : "Один запрос прав сейчас — дальше без запросов. Подписки сохранятся.";
+                                        color: root.service-install-error != "" ? Theme.error : Theme.text-muted;
+                                        font-size: Theme.type-metadata-size;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    TextAction {
+                                        label: root.service-install-busy ? "Загружаем…" : "Установить";
+                                        enabled: !root.service-install-busy && !root.profile-menu-open;
+                                        activated => { root.install-service(); }
+                                    }
+                                }
+                            }
                         }
                         Rectangle { height: 18px; background: transparent; }
 

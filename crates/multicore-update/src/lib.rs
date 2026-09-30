@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const WINDOWS_ASSET_NAME: &str = "multicore-windows-x64.zip";
+/// The Inno Setup installer; per-user installs run it to migrate to the service.
+pub const WINDOWS_INSTALLER_ASSET_NAME: &str = "MultiCore-Setup-x64.exe";
 
 pub fn appimage_asset_name(version: &Version) -> String {
     format!("MultiCore-{version}-x86_64.AppImage")
@@ -244,6 +246,16 @@ impl GitHubRelease {
         body: &[u8],
     ) -> Result<Self, UpdateError> {
         Self::pinned_to(repository, Self::parse_appimage(body)?)
+    }
+
+    pub fn parse_installer_for_repository(
+        repository: &Repository,
+        body: &[u8],
+    ) -> Result<Self, UpdateError> {
+        Self::pinned_to(
+            repository,
+            Self::parse_named(body, |_| WINDOWS_INSTALLER_ASSET_NAME.to_owned())?,
+        )
     }
 
     fn pinned_to(repository: &Repository, release: Self) -> Result<Self, UpdateError> {

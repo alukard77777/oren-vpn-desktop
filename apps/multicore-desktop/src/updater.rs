@@ -173,6 +173,22 @@ pub(crate) fn configured_repository() -> Result<Option<Repository>, String> {
 pub(crate) fn check_latest() -> Result<UpdateState, String> {
     let repository =
         configured_repository()?.ok_or_else(|| "Канал обновлений не настроен".to_owned())?;
+    let body = fetch_latest_release_body(&repository)?;
+    #[cfg(not(target_os = "linux"))]
+    let release = GitHubRelease::parse_for_repository(&repository, &body);
+    #[cfg(target_os = "linux")]
+    let release = GitHubRelease::parse_appimage_for_repository(&repository, &body);
+    let release = release.map_err(|_| "Релиз не соответствует контракту MultiCore".to_owned())?;
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|_| "Версия клиента собрана неверно".to_owned())?;
+    Ok(match release.decision(&current) {
+        ReleaseDecision::Current => UpdateState::Current,
+        ReleaseDecision::UpdateAvailable => available_state(release),
+    })
+}
+
+/// The latest-release JSON of the pinned repository, bounded in size.
+pub(crate) fn fetch_latest_release_body(repository: &Repository) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(12))
@@ -207,17 +223,7 @@ pub(crate) fn check_latest() -> Result<UpdateState, String> {
     if body.len() > RELEASE_BODY_LIMIT {
         return Err("Ответ GitHub слишком большой".into());
     }
-    #[cfg(not(target_os = "linux"))]
-    let release = GitHubRelease::parse_for_repository(&repository, &body);
-    #[cfg(target_os = "linux")]
-    let release = GitHubRelease::parse_appimage_for_repository(&repository, &body);
-    let release = release.map_err(|_| "Релиз не соответствует контракту MultiCore".to_owned())?;
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| "Версия клиента собрана неверно".to_owned())?;
-    Ok(match release.decision(&current) {
-        ReleaseDecision::Current => UpdateState::Current,
-        ReleaseDecision::UpdateAvailable => available_state(release),
-    })
+    Ok(body)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -288,7 +294,7 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
     if staged.exists() {
         fs::remove_file(&staged).map_err(|_| "Не удалось очистить прошлую загрузку".to_owned())?;
     }
-    download_release(release, &staged)?;
+    download_release_to(release, &staged)?;
     if verify_archive_file(
         &staged,
         release.asset().size(),
@@ -330,7 +336,7 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
         }
     }
 
-    download_release(release, &partial)?;
+    download_release_to(release, &partial)?;
     verify_archive_file(
         &partial,
         release.asset().size(),
@@ -483,7 +489,10 @@ fn merge_install_failure(state: UpdateState, pending: &mut Option<InstallFailure
     }
 }
 
-fn download_release(release: &GitHubRelease, destination: &Path) -> Result<(), String> {
+pub(crate) fn download_release_to(
+    release: &GitHubRelease,
+    destination: &Path,
+) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(180))
@@ -552,7 +561,7 @@ fn download_release(release: &GitHubRelease, destination: &Path) -> Result<(), S
 }
 
 #[cfg(not(target_os = "linux"))]
-fn update_directory() -> Result<PathBuf, String> {
+pub(crate) fn update_directory() -> Result<PathBuf, String> {
     multicore_platform::dirs::user_data_root()
         .map(|root| root.join("updates"))
         .map_err(|_| "Каталог данных MultiCore недоступен".to_owned())
