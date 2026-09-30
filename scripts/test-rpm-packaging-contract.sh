@@ -44,8 +44,30 @@ for macro in debug_package __brp_strip __brp_strip_static_archive __brp_strip_co
     grep -Eq "^%global $macro[[:space:]]+%\{nil\}$" "$spec"
 done
 grep -qx '%global _build_id_links none' "$spec"
-if grep -Eq '^%(pre|preun|pretrans|post|postun|posttrans|trigger[a-z]*|filetrigger[a-z]*|transfiletrigger[a-z]*)([[:space:]]|$)|^AutoReq(Prov)?:[[:space:]]*(no|0)|^%global (__os_install_post|__spec_install_post)' "$spec"; then
-    echo 'FAIL: RPM must retain normal dependency/metadata processing and contain no scriptlets' >&2
+if grep -Eq '^%(pre|pretrans|posttrans|trigger[a-z]*|filetrigger[a-z]*|transfiletrigger[a-z]*)([[:space:]]|$)|^AutoReq(Prov)?:[[:space:]]*(no|0)|^%global (__os_install_post|__spec_install_post)' "$spec"; then
+    echo 'FAIL: RPM must retain normal dependency/metadata processing and ship no scriptlets other than the service %post/%preun/%postun' >&2
+    exit 1
+fi
+# Exactly the always-ready service scriptlets: one each of %post, %preun, %postun.
+for scriptlet in post preun postun; do
+    [[ "$(grep -Ec "^%${scriptlet}([[:space:]]|\$)" "$spec")" == 1 ]] || {
+        echo "FAIL: RPM spec must ship exactly one %${scriptlet} scriptlet for multicore.service" >&2
+        exit 1
+    }
+done
+for dep in systemd 'Requires(post): systemd' 'Requires(preun): systemd' 'Requires(postun): systemd'; do
+    grep -Fxq "Requires:       $dep" "$spec" || grep -Fxq "$dep" "$spec" || {
+        echo "FAIL: RPM spec must declare $dep" >&2
+        exit 1
+    }
+done
+# Scriptlets must not fail the transaction where systemd is not PID 1 (containers).
+[[ "$(grep -Fc '[ -d /run/systemd/system ]' "$spec")" -ge 3 ]] || {
+    echo 'FAIL: RPM scriptlets must guard systemctl on /run/systemd/system' >&2
+    exit 1
+}
+if grep -E '^[[:space:]]+systemctl ' "$spec" | grep -Fv '|| :' | grep -q .; then
+    echo 'FAIL: every systemctl call in the RPM scriptlets must tolerate failure (|| :)' >&2
     exit 1
 fi
 
