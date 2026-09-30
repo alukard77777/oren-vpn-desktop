@@ -1189,6 +1189,9 @@ export component AppWindow inherits Window {
     }
     callback open-dashboard();
     callback install-service();
+    // "Удалить все данные": the first click arms, the second deletes; leaving the page disarms.
+    in-out property <bool> reset-data-armed: false;
+    callback reset-all-data();
     callback open-panel(string);
     callback close-panel();
     callback escape-pressed();
@@ -1311,6 +1314,8 @@ export component AppWindow inherits Window {
         if (root.visible-page != "home" && root.route-search-open) {
             root.close-route-search();
         }
+        // An armed "Удалить все данные" never survives leaving Settings.
+        root.reset-data-armed = false;
     }
 
     wave-step-timer := Timer {
@@ -3176,7 +3181,35 @@ export component AppWindow inherits Window {
                                     // switch must not look on/enabled while the text says it's off.
                                     checked: root.ambient-background-enabled && !root.reduced-motion;
                                     enabled: !root.profile-menu-open && !root.reduced-motion;
+                                    show-separator: true;
                                     toggled(value) => { root.ambient-background-enabled = value; }
+                                }
+                                HorizontalLayout {
+                                    height: 48px;
+                                    spacing: 12px;
+                                    Text {
+                                        text: root.reset-data-armed ? "Все подписки и настройки будут удалены" : "Удалить все данные";
+                                        color: root.reset-data-armed ? Theme.error : Theme.text-primary;
+                                        font-size: Theme.type-label-size;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        TextAction {
+                                            label: root.reset-data-armed ? "Удалить" : "Удалить…";
+                                            tone: "danger";
+                                            enabled: !root.profile-menu-open;
+                                            activated => {
+                                                if (root.reset-data-armed) {
+                                                    root.reset-all-data();
+                                                } else {
+                                                    root.reset-data-armed = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

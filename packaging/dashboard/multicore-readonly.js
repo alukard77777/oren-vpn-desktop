@@ -36,8 +36,21 @@
     enforceRoute();
     hideForbidden();
   });
+  // Logs stream constantly: hide at most once per frame, not once per mutation batch.
+  var pending = false;
+  function scheduleHide() {
+    if (pending) {
+      return;
+    }
+    pending = true;
+    window.requestAnimationFrame(function () {
+      pending = false;
+      hideForbidden();
+    });
+  }
+
   enforceRoute();
-  new MutationObserver(hideForbidden).observe(document.documentElement, {
+  new MutationObserver(scheduleHide).observe(document.documentElement, {
     childList: true,
     subtree: true,
   });

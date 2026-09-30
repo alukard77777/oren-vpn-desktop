@@ -5,6 +5,7 @@ mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
 mod daemon;
+mod data_reset;
 mod emoji_images;
 #[cfg(target_os = "linux")]
 mod linux_display;
@@ -79,6 +80,8 @@ struct UiSnapshot {
     diagnostics: DiagnosticsPresentation,
     latency: LatencyPresentation,
     conflicting_apps: ConflictingAppsPresentation,
+    cores_ready: bool,
+    service_mode: bool,
 }
 
 const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
@@ -707,6 +710,11 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Before the single-instance guard: the resetting process waits for the old instance to
+    // exit, deletes the data directory and starts a clean app itself.
+    if data_reset::run_pending_reset(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        return Ok(());
+    }
     let software_renderer = renderer_fallback::software_renderer_requested();
     let result = match run_desktop(software_renderer) {
         // Everything run_desktop held (single-instance guard, owned daemon,
@@ -801,9 +809,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_tun_enabled(loaded_preferences.tun_enabled);
     // The TUN-off (system proxy) mode exists on Windows only.
     ui.set_tun_toggle_available(cfg!(windows));
-    ui.set_service_card_visible(service_install::card_visible(
-        service_install::service_installed(),
-    ));
     if let Some(growth) = loaded_preferences.rail_growth {
         ui.set_rail_growth_delta(i32::try_from(growth.delta).unwrap_or(0));
         ui.set_rail_grown_width(i32::try_from(growth.grown_width).unwrap_or(0));
@@ -856,6 +861,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     );
     wire_dashboard_action(&ui, model.clone());
     wire_service_install(&ui);
+    wire_data_reset(&ui);
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_copy_diagnostics(&ui, model.clone());
@@ -864,6 +870,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_route_search(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
     let _session_stats_timer = wire_session_stats(&ui, model.clone());
+    let _cores_ready_timer = wire_cores_ready_watch(&ui, model.clone());
     wire_conflicting_apps_banner(&ui, model.clone());
     let _conflicting_apps_timer = wire_conflicting_apps_scan(&ui, model.clone());
     wire_windows_settings(&ui);
@@ -3188,6 +3195,24 @@ fn wire_service_install(ui: &AppWindow) {
     });
 }
 
+/// "Удалить все данные" (second click): start the resetting process, then quit. Leaving
+/// `run_desktop` drops the bootstrap (disconnect, stop and reap the owned daemon) and then the
+/// single-instance guard, which is what the resetting process waits for.
+fn wire_data_reset(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_reset_all_data(move || match data_reset::schedule_reset_and_relaunch() {
+        Ok(()) => {
+            let _ = slint::quit_event_loop();
+        }
+        Err(error) => {
+            eprintln!("data reset could not be started: {error}");
+            if let Some(ui) = weak.upgrade() {
+                ui.set_reset_data_armed(false);
+            }
+        }
+    });
+}
+
 /// Opens the local Mihomo dashboard in the system's default browser. The button that triggers
 /// this is only enabled while `dashboard_available` (a live, authenticated controller session)
 /// is true, but the daemon re-checks that itself: a race between disconnect and a stale click
@@ -3372,12 +3397,11 @@ fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Ti
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let connected = model
-            .lock()
-            .expect("view model lock")
-            .presentation()
-            .is_connected;
-        if !connected {
+        let (connected, cores_ready) = {
+            let model = model.lock().expect("view model lock");
+            (model.presentation().is_connected, model.cores_ready())
+        };
+        if !connected && !cores_ready {
             traffic.lock().expect("session traffic lock").reset();
             apply_session_line(&ui, &SessionLine::default());
             return;
@@ -3414,18 +3438,62 @@ fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Ti
                 let Some(ui) = weak.upgrade() else {
                     return;
                 };
-                // The connection may have ended while the request was in flight.
-                let connected = model
-                    .lock()
-                    .expect("view model lock")
-                    .presentation()
-                    .is_connected;
+                // The connection may have ended while the request was in flight. Before
+                // connecting (warm service cores) only the exit is meaningful.
+                let (connected, cores_ready) = {
+                    let model = model.lock().expect("view model lock");
+                    (model.presentation().is_connected, model.cores_ready())
+                };
                 let line = if connected {
                     line
+                } else if cores_ready {
+                    SessionLine {
+                        exit_now: line.exit_now,
+                        ..SessionLine::default()
+                    }
                 } else {
                     SessionLine::default()
                 };
                 apply_session_line(&ui, &line);
+            });
+        });
+    });
+    timer
+}
+
+/// While the service warms the cores after start-up (or after a subscription change), polls
+/// `/v1/status` every two seconds so a waiting latency check starts as soon as they are up.
+fn wire_cores_ready_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    let in_flight = Arc::new(AtomicBool::new(false));
+    timer.start(TimerMode::Repeated, Duration::from_secs(2), move || {
+        let waiting = {
+            let model = model.lock().expect("view model lock");
+            model.service_mode()
+                && !model.cores_ready()
+                && !model.presentation().is_connected
+                && model.presentation().has_profile
+        };
+        if !waiting || in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let client = model.lock().expect("view model lock").daemon_client();
+        let (weak, model, in_flight) = (weak.clone(), model.clone(), in_flight.clone());
+        thread::spawn(move || {
+            let result = client.status();
+            let release = model
+                .lock()
+                .expect("view model lock")
+                .note_cores_ready_status(result);
+            in_flight.store(false, Ordering::Release);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_latest_snapshot(&ui, &model);
+                }
+                if release {
+                    begin_latency_check(weak, model);
+                }
             });
         });
     });
@@ -4380,6 +4448,8 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         diagnostics: model.diagnostics_presentation(),
         latency: model.latency_presentation(),
         conflicting_apps: model.conflicting_apps_presentation(),
+        cores_ready: model.cores_ready(),
+        service_mode: model.service_mode(),
     }
 }
 
@@ -4471,7 +4541,11 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
     ui.set_update_runtime_busy(presentation.is_busy);
-    ui.set_dashboard_available(presentation.is_connected);
+    ui.set_dashboard_available(presentation.is_connected || snapshot.cores_ready);
+    // Never offer the service while the daemon already runs on it (or it is registered).
+    ui.set_service_card_visible(service_install::card_visible(
+        snapshot.service_mode || service_install::service_installed(),
+    ));
     ui.set_status_tone(
         match presentation.semantic_tone {
             SemanticTone::Neutral => "neutral",

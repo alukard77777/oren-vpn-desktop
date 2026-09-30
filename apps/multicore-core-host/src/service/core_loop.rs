@@ -92,6 +92,8 @@ impl<C: Cores> ServiceLoop<C> {
         }
     }
 
+    /// Windows only: Linux packages are updated by the package manager.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn with_updater(mut self, updater: Box<dyn ServiceUpdater>) -> Self {
         self.updater = Some(updater);
         self

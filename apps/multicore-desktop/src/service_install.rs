@@ -4,7 +4,7 @@
 //! its files (see `launch_pending_installer`, called by `main` after the event loop ends).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// The verified installer to start once the app has fully shut down.
 static PENDING_INSTALLER: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -19,18 +19,30 @@ fn card_visible_on(windows: bool, per_user_install: bool, service_mode: bool) ->
 }
 
 /// The card shows on Windows for a per-user install while no service drives the daemon.
+/// `service_mode` is true when the daemon reports it runs on the service or the service is
+/// registered at all. Called on every snapshot, so the install location is read once.
 pub(crate) fn card_visible(service_mode: bool) -> bool {
-    let per_user_install = match (std::env::current_exe(), std::env::var_os("LOCALAPPDATA")) {
-        (Ok(executable), Some(local)) => is_per_user_install(&executable, Path::new(&local)),
-        _ => false,
-    };
+    static PER_USER_INSTALL: OnceLock<bool> = OnceLock::new();
+    let per_user_install = *PER_USER_INSTALL.get_or_init(|| {
+        match (std::env::current_exe(), std::env::var_os("LOCALAPPDATA")) {
+            (Ok(executable), Some(local)) => is_per_user_install(&executable, Path::new(&local)),
+            _ => false,
+        }
+    });
     card_visible_on(cfg!(windows), per_user_install, service_mode)
 }
 
-/// Whether the MultiCore service is registered. An unreadable service manager counts as
-/// "present", so the card never offers an install that cannot be checked.
-#[cfg(windows)]
+/// Whether the MultiCore service is registered, asked of the service manager once per run:
+/// installing it restarts the app anyway.
 pub(crate) fn service_installed() -> bool {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    *INSTALLED.get_or_init(query_service_installed)
+}
+
+/// An unreadable service manager counts as "present", so the card never offers an install
+/// that cannot be checked.
+#[cfg(windows)]
+fn query_service_installed() -> bool {
     use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, GetLastError};
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
@@ -55,7 +67,7 @@ pub(crate) fn service_installed() -> bool {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn service_installed() -> bool {
+fn query_service_installed() -> bool {
     false
 }
 
@@ -168,6 +180,21 @@ mod tests {
         assert!(!card_visible_on(true, true, true));
         assert!(!card_visible_on(true, false, false));
         assert!(!card_visible_on(false, true, false));
+    }
+
+    #[test]
+    fn every_snapshot_hides_the_card_while_the_daemon_runs_on_the_service() {
+        let main = include_str!("main.rs");
+        let apply: String = main
+            .split("fn apply_snapshot(ui: &AppWindow")
+            .nth(1)
+            .expect("apply_snapshot source")
+            .split_whitespace()
+            .collect();
+        assert!(apply.contains(
+            "service_install::card_visible(snapshot.service_mode||service_install::service_installed(),"
+        ));
+        assert!(main.contains("service_mode: model.service_mode(),"));
     }
 
     #[test]

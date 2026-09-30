@@ -205,6 +205,9 @@ fn apply_update(request: &ApplyRequest) -> Result<(), Box<dyn std::error::Error>
         },
         STARTUP_CONFIRM_TIMEOUT,
         std::thread::sleep,
+        // In service mode the new service runs from `current`; it must be stopped (and its
+        // processes gone) before `current` can be renamed away.
+        || stop_service(request, &target),
     );
     if outcome.is_err() {
         // Rolled back to the previous version (or left as is): bring its service back.
@@ -241,6 +244,8 @@ const STARTED_MARKER: &str = "started-ok";
 const INSTALL_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(60);
 const STARTUP_POLL: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn marker_confirms(marker: &Path, version: &str) -> bool {
     fs::read_to_string(marker).is_ok_and(|content| content.trim() == version)
@@ -308,6 +313,7 @@ fn launch_and_finalize(
     confirmed: impl Fn() -> bool,
     timeout: Duration,
     mut sleep: impl FnMut(Duration),
+    before_rollback: impl FnOnce(),
 ) -> Result<Finalization, String> {
     let executable = target.join("MultiCore.exe");
     let failure = match launch(&executable) {
@@ -333,6 +339,7 @@ fn launch_and_finalize(
             }
         }
     };
+    before_rollback();
     rollback_after_launch_failure(target, backup).map_err(|rollback_error| {
         format!(
             "{failure}; rollback failed: {rollback_error}; previous version preserved at {}",
@@ -386,6 +393,30 @@ fn start_service(request: &ApplyRequest) {
 
 #[cfg(not(windows))]
 fn start_service(_request: &ApplyRequest) {}
+
+/// In service mode, stops the MultiCore service and waits until nothing runs from `install`;
+/// a no-op otherwise.
+#[cfg(windows)]
+fn stop_service(request: &ApplyRequest, install: &Path) {
+    if request.service.is_some() {
+        if let Err(error) = session::stop_service(SERVICE_STOP_TIMEOUT) {
+            write_log(
+                request,
+                &format!("service did not stop before rollback: {error}"),
+            );
+        }
+        let lingering = wait_for_install_processes(install, INSTALL_PROCESS_TIMEOUT);
+        if !lingering.is_empty() {
+            write_log(
+                request,
+                &format!("processes still running before rollback: {lingering:?}"),
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn stop_service(_request: &ApplyRequest, _install: &Path) {}
 
 /// Runs `work` as the logged-on user in service mode, directly otherwise, so SYSTEM never
 /// touches a user-controlled path with its own rights.
@@ -602,8 +633,8 @@ fn write_log(request: &ApplyRequest, message: &str) {
     let Some(directory) = update_state_dir(request) else {
         return;
     };
-    as_user(request, || {
-        let _ = fs::create_dir_all(&directory);
+    let append = |directory: &Path| {
+        let _ = fs::create_dir_all(directory);
         if let Ok(mut log) = OpenOptions::new()
             .create(true)
             .append(true)
@@ -611,7 +642,14 @@ fn write_log(request: &ApplyRequest, message: &str) {
         {
             let _ = writeln!(log, "v{}: {message}", request.version);
         }
-    });
+    };
+    if as_user(request, || append(&directory)).is_none() {
+        // Impersonation failed (the user logged off?): keep a trace in the service's own,
+        // SYSTEM-owned update directory next to the archive.
+        if let Some(own) = request.archive.parent() {
+            append(own);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +770,7 @@ mod tests {
             },
             Duration::from_secs(60),
             |_| {},
+            || {},
         )
         .unwrap();
         assert!(matches!(outcome, Finalization::Confirmed(Ok(()))));
@@ -750,6 +789,7 @@ mod tests {
             || false,
             Duration::from_secs(60),
             |_| {},
+            || {},
         )
         .unwrap_err();
         assert!(error.contains("exited before confirming"), "{error}");
@@ -769,6 +809,7 @@ mod tests {
             || false,
             Duration::from_secs(1),
             |_| {},
+            || {},
         )
         .unwrap();
         assert!(matches!(outcome, Finalization::Unconfirmed));
@@ -787,6 +828,7 @@ mod tests {
             || false,
             Duration::from_secs(60),
             |_| {},
+            || {},
         )
         .unwrap_err();
         assert!(error.contains("could not start"));
@@ -808,6 +850,7 @@ mod tests {
             || false,
             Duration::from_secs(60),
             |_| {},
+            || {},
         )
         .unwrap_err();
         assert!(error.contains("rollback failed"), "{error}");
@@ -917,6 +960,51 @@ mod tests {
         assert!(!super::processes_under(exe.parent().unwrap()).contains(&std::process::id()));
     }
 
+    #[test]
+    fn service_is_stopped_before_the_rollback_renames_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, backup) = install_fixture(temp.path());
+        let hook_ran = Cell::new(false);
+        let error = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Ok(running(Some(1))),
+            || false,
+            Duration::from_secs(60),
+            |_| {},
+            || {
+                // Still the failed new version: the rollback has not renamed anything yet.
+                assert!(target.join("new.exe").is_file());
+                assert!(backup.join("old.exe").is_file());
+                hook_ran.set(true);
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("exited before confirming"), "{error}");
+        assert!(
+            hook_ran.get(),
+            "the service must be stopped before the rollback"
+        );
+        assert_eq!(std::fs::read(target.join("old.exe")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn confirmed_start_does_not_stop_the_service() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, backup) = install_fixture(temp.path());
+        let outcome = launch_and_finalize(
+            &target,
+            &backup,
+            |_| Ok(running(None)),
+            || true,
+            Duration::from_secs(60),
+            |_| {},
+            || panic!("no rollback, so the service keeps running"),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Finalization::Confirmed(Ok(()))));
+    }
+
     fn base_args() -> Vec<&'static str> {
         vec![
             "multicore-updater.exe",
@@ -981,6 +1069,8 @@ mod tests {
             "ImpersonateLoggedOnUser",
             "RevertToSelf",
             "StartServiceW",
+            "SERVICE_CONTROL_STOP",
+            "SERVICE_STOPPED",
         ] {
             assert!(source.contains(token), "{token}");
         }

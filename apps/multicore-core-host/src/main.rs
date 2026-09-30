@@ -2,10 +2,8 @@
 mod runtime_host;
 #[cfg(windows)]
 mod runtime_paths;
-/// `multicore-core-host --service`. The Unix server arrives with the Linux service (Task 8);
-/// until then the Unix build only compiles the platform-neutral parts.
+/// `multicore-core-host --service`: the always-ready Windows service / systemd unit.
 #[cfg(any(windows, unix))]
-#[cfg_attr(unix, allow(dead_code))]
 mod service;
 #[cfg(unix)]
 mod unix_runtime_paths;
@@ -18,8 +16,7 @@ mod wintun_cleanup;
 
 #[cfg(any(windows, unix))]
 fn main() {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if service::wants_service_mode(&arguments) {
+    if service::wants_service_mode(&service::process_arguments()) {
         if service::run().is_err() {
             eprintln!("MultiCore core host: service stopped safely.");
             std::process::exit(1);

@@ -31,6 +31,8 @@ Requires:       fontconfig%{?_isa}
 Requires:       libglvnd-glx%{?_isa}
 Requires:       libglvnd-egl%{?_isa}
 Requires:       hicolor-icon-theme
+# The always-ready service unit (/usr/lib/systemd/system/multicore.service).
+Requires:       systemd
 
 %description
 MultiCore starts Mihomo and Xray behind one desktop interface. Mihomo owns
@@ -70,6 +72,7 @@ chmod 0755 "%{buildroot}/usr/lib/multicore/multicore" \
 /usr/share/applications/multicore.desktop
 /usr/share/icons/hicolor/scalable/apps/multicore.svg
 /usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy
+/usr/lib/systemd/system/multicore.service
 # The vendored dashboard (packaging/linux/versions.json "dashboard" component) is a bare
 # directory path (no %dir, no per-file listing): rpmbuild packages it and everything beneath
 # it recursively. Its filenames are content-hashed by the upstream build and change on every
@@ -82,3 +85,26 @@ chmod 0755 "%{buildroot}/usr/lib/multicore/multicore" \
 %license /usr/share/licenses/multicore/Xray-core-MPL-2.0.txt
 %license /usr/share/licenses/multicore/mihomo-GPL-3.0.txt
 %license /usr/share/licenses/multicore/zashboard-MIT.txt
+
+%post
+# Enable and (re)start the always-ready service on install and upgrade.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+    systemctl enable multicore.service >/dev/null 2>&1 || :
+    systemctl restart multicore.service >/dev/null 2>&1 || :
+fi
+
+%preun
+# Final removal only ($1 == 0): stop and disable the service before its files go away.
+if [ $1 -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now multicore.service >/dev/null 2>&1 || :
+fi
+
+%postun
+# rpm has no purge: final removal also deletes the service's own state directory.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi
+if [ $1 -eq 0 ]; then
+    rm -rf /var/lib/multicore
+fi

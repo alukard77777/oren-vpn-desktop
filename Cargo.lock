@@ -3428,6 +3428,8 @@ dependencies = [
  "embed-resource",
  "getrandom 0.4.3",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "multicore-core",
  "multicore-platform",
  "reqwest 0.13.5",

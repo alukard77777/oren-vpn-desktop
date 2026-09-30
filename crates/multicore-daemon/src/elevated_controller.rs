@@ -908,7 +908,7 @@ pub mod windows {
         Ok(())
     }
 
-    fn read_message(
+    pub(crate) fn read_message(
         handle: HANDLE,
         timeout: Duration,
         cancelled: &AtomicBool,
@@ -955,7 +955,7 @@ pub mod windows {
         write_raw_message(handle, frame, timeout, cancelled)
     }
 
-    fn write_raw_message(
+    pub(crate) fn write_raw_message(
         handle: HANDLE,
         frame: Vec<u8>,
         timeout: Duration,
