@@ -351,6 +351,7 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-latency-loading", 840, 720, |ui| {
             ready(ui);
+            ui.set_latency_check_available(true);
             ui.set_latency_check_loading(true);
             ui.set_subscription_updated_stale(true);
         }),

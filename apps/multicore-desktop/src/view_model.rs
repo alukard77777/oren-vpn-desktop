@@ -148,6 +148,8 @@ pub(crate) struct LatencyRequest {
 pub(crate) struct LatencyPresentation {
     pub(crate) loading: bool,
     pub(crate) queued: bool,
+    /// Cores are live and a catalog group is selected, so a check can start now.
+    pub(crate) available: bool,
     pub(crate) error: Option<String>,
 }
 
@@ -2096,6 +2098,7 @@ impl DesktopViewModel {
         LatencyPresentation {
             loading: self.latency_request_pending.is_some(),
             queued: self.latency_queued,
+            available: self.latency_available(),
             error: self.latency_error.clone(),
         }
     }
@@ -2173,6 +2176,21 @@ impl DesktopViewModel {
                 &self.conflicting_apps_close_note,
             ),
         }
+    }
+
+    fn latency_available(&self) -> bool {
+        let cores_live = matches!(self.state, UiState::Connected { .. })
+            || (matches!(self.state, UiState::Ready { .. }) && self.cores_ready);
+        cores_live && self.catalog_revision.is_some() && self.selected_catalog_group.is_some()
+    }
+
+    /// Latency check requested by the user: starts at once (no timer), but a press while
+    /// a request is in flight is ignored instead of queueing another run.
+    pub(crate) fn begin_forced_latency_request(&mut self) -> Option<LatencyRequest> {
+        if self.latency_request_pending.is_some() {
+            return None;
+        }
+        self.begin_latency_request()
     }
 
     pub(crate) fn begin_latency_request(&mut self) -> Option<LatencyRequest> {
@@ -2388,19 +2406,29 @@ impl DesktopViewModel {
         None
     }
 
-    pub(crate) fn begin_node_selection(&mut self, node_id: &str) -> Option<NodeSelectionRequest> {
-        if self.active_selection.is_some()
-            || self.catalog_request_pending.is_some()
-            || self.profile_mutation_pending()
-            || self.profile_reconciliation_required()
-            || self.active_mutation.is_some()
-            || self.import_pending
-            || self.catalog_reconciliation_required
-            || !matches!(
+    /// A selection tap is accepted locally (and queued) while only background work runs:
+    /// a status refresh or a catalog reload never locks the list in the warm (`Ready`)
+    /// state, because nothing is sent to the daemon until connect.
+    fn selection_accepts_taps(&self) -> bool {
+        let background_only = matches!(self.state, UiState::Ready { .. })
+            && self
+                .active_mutation
+                .is_none_or(|active| active.kind == MutationKind::Refresh);
+        self.active_selection.is_none()
+            && !self.profile_mutation_pending()
+            && !self.profile_reconciliation_required()
+            && !self.import_pending
+            && !self.catalog_reconciliation_required
+            && matches!(
                 self.state,
                 UiState::Connected { .. } | UiState::Ready { .. }
             )
-        {
+            && (background_only
+                || (self.catalog_request_pending.is_none() && self.active_mutation.is_none()))
+    }
+
+    pub(crate) fn begin_node_selection(&mut self, node_id: &str) -> Option<NodeSelectionRequest> {
+        if !self.selection_accepts_taps() {
             return None;
         }
         let revision = self.catalog_revision?;
@@ -2614,15 +2642,7 @@ impl DesktopViewModel {
             loading: self.catalog_request_pending.is_some(),
             group_navigation_enabled: !self.catalog_groups.is_empty()
                 && self.catalog_request_pending.is_none(),
-            selection_enabled: matches!(
-                self.state,
-                UiState::Connected { .. } | UiState::Ready { .. }
-            ) && self.catalog_revision.is_some()
-                && self.catalog_request_pending.is_none()
-                && self.active_selection.is_none()
-                && self.active_mutation.is_none()
-                && !self.import_pending
-                && !self.catalog_reconciliation_required,
+            selection_enabled: self.catalog_revision.is_some() && self.selection_accepts_taps(),
             selection_pending: self.active_selection.is_some(),
             selection_queued: !self.queued_selections.is_empty(),
             error: self.catalog_error.clone(),
@@ -2664,12 +2684,23 @@ impl DesktopViewModel {
     fn replace_catalog(&mut self, catalog: DaemonCatalog) {
         let previous_groups =
             (self.catalog_revision == Some(catalog.revision)).then(|| self.catalog_groups.clone());
-        let preserve_queued = self
-            .queued_selections
-            .iter()
-            .all(|queued| queued.revision == catalog.revision);
-        if !preserve_queued {
-            self.queued_selections.clear();
+        // A queued choice survives a newer revision when its node still exists (ids are
+        // opaque and stable); otherwise it is dropped with a notice.
+        let before = self.queued_selections.len();
+        self.queued_selections.retain(|queued| {
+            queued.revision == catalog.revision
+                || catalog
+                    .groups
+                    .iter()
+                    .find(|group| group.id == queued.group_id)
+                    .is_some_and(|group| group.nodes.iter().any(|node| node.id == queued.node_id))
+        });
+        if self.queued_selections.len() != before && self.catalog_notice_after_refresh.is_none() {
+            self.catalog_notice_after_refresh =
+                Some("Каталог маршрутов обновлён. Повторите выбор.".into());
+        }
+        for queued in &mut self.queued_selections {
+            queued.revision = catalog.revision;
         }
         self.catalog_revision = Some(catalog.revision);
         let primary_group_id = catalog
@@ -2736,26 +2767,24 @@ impl DesktopViewModel {
             self.latency_queued = true;
         }
         self.apply_restored_route_preferences();
-        if preserve_queued {
-            for queued in &self.queued_selections {
-                if let Some(group) = self
-                    .catalog_groups
-                    .iter_mut()
-                    .find(|group| group.id == queued.group_id)
-                    && let Some(target_index) = group
-                        .nodes
-                        .iter()
-                        .position(|node| node.id == queued.node_id)
+        for queued in &self.queued_selections {
+            if let Some(group) = self
+                .catalog_groups
+                .iter_mut()
+                .find(|group| group.id == queued.group_id)
+                && let Some(target_index) = group
+                    .nodes
+                    .iter()
+                    .position(|node| node.id == queued.node_id)
+            {
+                for node in &mut group.nodes {
+                    node.selected = false;
+                }
+                group.nodes[target_index].selected = true;
+                if group.is_primary
+                    && let UiState::Ready { node, .. } = &mut self.state
                 {
-                    for node in &mut group.nodes {
-                        node.selected = false;
-                    }
-                    group.nodes[target_index].selected = true;
-                    if group.is_primary
-                        && let UiState::Ready { node, .. } = &mut self.state
-                    {
-                        *node = group.nodes[target_index].label.clone();
-                    }
+                    *node = group.nodes[target_index].label.clone();
                 }
             }
         }
@@ -3424,6 +3453,24 @@ pub(crate) struct SessionLine {
     pub(crate) exit_now: String,
 }
 
+impl SessionLine {
+    /// What may be shown for the current state: everything while connected; only the exit
+    /// (the node behind an automatic group) before connecting with warm service cores;
+    /// nothing otherwise.
+    pub(crate) fn for_state(self, connected: bool, cores_ready: bool) -> Self {
+        if connected {
+            self
+        } else if cores_ready {
+            Self {
+                exit_now: self.exit_now,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 /// The real node to show behind the exit, split into (icon, name) like node names; `None`
 /// when there is none or it is the exit itself (nothing extra to say).
 pub(crate) fn exit_now_display(exit_now: &str, exit_name: &str) -> Option<(String, String)> {
@@ -3584,6 +3631,26 @@ mod session_traffic_tests {
         // The exit already is that node: nothing extra.
         assert_eq!(exit_now_display("🇸🇪 Sweden", "🇸🇪 Sweden"), None);
         assert_eq!(exit_now_display("🇸🇪 Sweden", "Sweden"), None);
+    }
+
+    #[test]
+    fn exit_now_shows_while_disconnected_with_warm_cores() {
+        let line = SessionLine {
+            uptime: "0:05".into(),
+            down: "1 KB/s".into(),
+            up: "1 KB/s".into(),
+            exit_now: "🇸🇪 Sweden".into(),
+        };
+        let warm = line.clone().for_state(false, true);
+        assert_eq!(warm.exit_now, "🇸🇪 Sweden");
+        assert!(warm.uptime.is_empty() && warm.down.is_empty() && warm.up.is_empty());
+        assert_eq!(line.clone().for_state(true, true), line);
+        assert_eq!(line.clone().for_state(true, false), line);
+        assert_eq!(line.for_state(false, false), SessionLine::default());
+        assert_eq!(
+            exit_now_display(&warm.exit_now, "⚡ Автовыбор"),
+            Some(("🇸🇪".to_owned(), "Sweden".to_owned()))
+        );
     }
 
     #[test]
@@ -4955,7 +5022,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_catalog_revision_discards_queued_choice() {
+    fn changed_catalog_revision_keeps_queued_choice_when_the_node_still_exists() {
         let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
         let refresh = view_model.begin_refresh();
         view_model.finish_refresh(refresh, Ok(MockDaemonClient::ready().status));
@@ -4972,9 +5039,11 @@ mod tests {
             .finish_catalog(reload.token, Ok(changed))
             .expect("changed catalog completion");
 
-        assert!(view_model.queued_node_selections().is_empty());
-        assert!(!view_model.catalog_presentation().selection_queued);
-        assert!(view_model.catalog_presentation().nodes[0].selected);
+        let queued = view_model.queued_node_selections();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].revision, 92);
+        assert!(view_model.catalog_presentation().selection_queued);
+        assert!(view_model.catalog_presentation().nodes[1].selected);
     }
 
     #[test]
@@ -6203,6 +6272,118 @@ mod tests {
             .begin_latency_request()
             .expect("latency while disconnected with warm cores");
         assert_eq!(request.group_ids, vec!["opaque:selected"]);
+    }
+
+    fn warm_view_model_with_catalog(cores_ready: bool) -> DesktopViewModel {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        let mut status = MockDaemonClient::ready().status;
+        status.cores_ready = cores_ready;
+        status.service_mode = true;
+        view_model.finish_refresh(refresh, Ok(status));
+        let catalog = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(catalog.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+        view_model
+    }
+
+    #[test]
+    fn forced_latency_request_runs_at_once_but_ignores_presses_in_flight_or_unavailable() {
+        // Cores not warm: unavailable, and pressing neither starts nor changes state.
+        let mut cold = warm_view_model_with_catalog(false);
+        assert!(!cold.latency_presentation().available);
+
+        let mut view_model = warm_view_model_with_catalog(true);
+        assert!(view_model.latency_presentation().available);
+        let request = view_model
+            .begin_forced_latency_request()
+            .expect("forced request with warm cores");
+        assert_eq!(request.group_ids, vec!["opaque:selected"]);
+        assert!(view_model.latency_presentation().loading);
+        // Pressed again while loading: ignored, nothing queued for later.
+        assert!(view_model.begin_forced_latency_request().is_none());
+        assert!(!view_model.latency_presentation().queued);
+        assert!(
+            view_model
+                .finish_latencies(request.token, Ok(DaemonLatencies::default()))
+                .is_some()
+        );
+        assert!(!view_model.latency_presentation().loading);
+        assert!(view_model.begin_forced_latency_request().is_some());
+        let _ = cold.begin_forced_latency_request();
+    }
+
+    #[test]
+    fn selection_is_accepted_during_launch_refresh_and_warm_up() {
+        // Warm-up: service cores are not ready yet, the catalog is already shown.
+        let mut warming = warm_view_model_with_catalog(false);
+        assert!(warming.catalog_presentation().selection_enabled);
+        assert!(warming.begin_node_selection("opaque:node-c").is_none());
+        assert!(warming.catalog_presentation().selection_queued);
+
+        // Launch refresh: a status refresh and a catalog reload are in flight.
+        let mut view_model = warm_view_model_with_catalog(true);
+        let _refresh = view_model.begin_refresh();
+        let reload = view_model.begin_catalog_request().expect("reload");
+        let presentation = view_model.catalog_presentation();
+        assert!(presentation.loading);
+        assert!(presentation.selection_enabled);
+        assert!(view_model.begin_node_selection("opaque:node-c").is_none());
+        let shown = view_model.catalog_presentation();
+        assert!(
+            shown
+                .nodes
+                .iter()
+                .find(|n| n.id == "opaque:node-c")
+                .unwrap()
+                .selected
+        );
+        assert!(shown.selection_queued);
+
+        // The reloaded catalog (same revision) keeps the queued choice selected.
+        view_model.finish_catalog(reload.token, Ok(catalog_fixture()));
+        let after = view_model.catalog_presentation();
+        assert!(
+            after
+                .nodes
+                .iter()
+                .find(|n| n.id == "opaque:node-c")
+                .unwrap()
+                .selected
+        );
+        assert_eq!(view_model.queued_node_selections().len(), 1);
+    }
+
+    #[test]
+    fn queued_selection_survives_a_newer_revision_or_is_dropped_with_a_notice() {
+        let mut view_model = warm_view_model_with_catalog(true);
+        assert!(view_model.begin_node_selection("opaque:node-c").is_none());
+        let reload = view_model.begin_catalog_request().expect("reload");
+        let mut newer = catalog_fixture();
+        newer.revision = 92;
+        view_model.finish_catalog(reload.token, Ok(newer));
+        let queued = view_model.queued_node_selections();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].revision, 92);
+        assert_eq!(queued[0].node_id, "opaque:node-c");
+
+        let reload = view_model.begin_catalog_request().expect("reload");
+        let mut gone = catalog_fixture();
+        gone.revision = 93;
+        gone.groups[1]
+            .nodes
+            .retain(|node| node.id != "opaque:node-c");
+        view_model.finish_catalog(reload.token, Ok(gone));
+        assert!(view_model.queued_node_selections().is_empty());
+        assert!(view_model.catalog_presentation().error.is_some());
+    }
+
+    #[test]
+    fn real_mutations_still_lock_selection() {
+        let mut view_model = warm_view_model_with_catalog(true);
+        let _switch = view_model.begin_primary_action().expect("connect mutation");
+        assert!(!view_model.catalog_presentation().selection_enabled);
     }
 
     #[test]

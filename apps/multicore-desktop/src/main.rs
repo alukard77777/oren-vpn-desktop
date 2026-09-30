@@ -869,6 +869,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_catalog_node(&ui, model.clone());
     wire_route_search(&ui, model.clone());
     let _latency_timer = wire_automatic_latency(&ui, model.clone());
+    wire_manual_latency(&ui, model.clone());
     let _session_stats_timer = wire_session_stats(&ui, model.clone());
     let _cores_ready_timer = wire_cores_ready_watch(&ui, model.clone());
     wire_conflicting_apps_banner(&ui, model.clone());
@@ -3400,6 +3401,24 @@ fn apply_route_search(ui: &AppWindow, catalog: &CatalogPresentation, query: &str
     ui.set_route_search_hits(ModelRc::new(VecModel::from(hits)));
 }
 
+/// The speedtest button: checks latency now, bypassing the 60 s timer.
+fn wire_manual_latency(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let weak = ui.as_weak();
+    ui.on_check_latency(move || {
+        let (request, current) = {
+            let mut model = model.lock().expect("view model lock");
+            let request = model.begin_forced_latency_request();
+            (request, snapshot(&model))
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        if let Some(request) = request {
+            run_latency_check(weak.clone(), model.clone(), request);
+        }
+    });
+}
+
 fn wire_automatic_latency(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
     let timer = Timer::default();
     let weak = ui.as_weak();
@@ -3470,16 +3489,7 @@ fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Ti
                     let model = model.lock().expect("view model lock");
                     (model.presentation().is_connected, model.cores_ready())
                 };
-                let line = if connected {
-                    line
-                } else if cores_ready {
-                    SessionLine {
-                        exit_now: line.exit_now,
-                        ..SessionLine::default()
-                    }
-                } else {
-                    SessionLine::default()
-                };
+                let line = line.for_state(connected, cores_ready);
                 apply_session_line(&ui, &line);
             });
         });
@@ -4724,6 +4734,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_diagnostics_tun_tone(snapshot.diagnostics.tun.tone.clone().into());
     ui.set_diagnostics_loading(snapshot.diagnostics.loading);
     ui.set_latency_check_loading(snapshot.latency.loading);
+    ui.set_latency_check_available(snapshot.latency.available);
     ui.set_latency_check_error(snapshot.latency.error.clone().unwrap_or_default().into());
     ui.set_diagnostic_mappings(ModelRc::new(VecModel::from(
         snapshot
@@ -5174,6 +5185,20 @@ mod window_tests {
         // Latency progress is shown in place of the timestamp, not as extra chrome.
         assert!(routes_header.contains("root.latency-check-loading ? \"· Замеряем задержку…\""));
         assert!(!routes_header.contains("catalog-selection-queued"));
+        // Speedtest button beside search: same 32x36 hit area, accent ring only while loading.
+        let speedtest = ui
+            .split("latency-check-toggle := FocusScope")
+            .nth(1)
+            .and_then(|source| source.split("route-search-bar := Rectangle").next())
+            .expect("speedtest button source");
+        assert!(speedtest.contains("width: 32px;") && speedtest.contains("height: 36px;"));
+        assert!(speedtest.contains("accessible-label: \"Проверить пинг\";"));
+        assert!(speedtest.contains("../assets/gauge.svg"));
+        assert!(speedtest.contains("if root.latency-check-loading: latency-check-ring := Path"));
+        assert!(speedtest.contains("stroke: #4c9dff;"));
+        assert!(speedtest.contains("root.check-latency()"));
+        assert!(speedtest.contains("!root.reduced-motion"));
+        assert!(rust.contains("ui.on_check_latency("));
         assert!(rust.contains("presentation.has_profile && !presentation.is_busy"));
         assert!(rust.contains("ui.set_subscription_management_enabled("));
     }

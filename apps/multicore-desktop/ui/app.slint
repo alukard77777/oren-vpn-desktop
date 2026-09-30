@@ -1039,6 +1039,8 @@ export component AppWindow inherits Window {
     in property <bool> catalog-selection-pending: false;
     in property <string> catalog-error;
     in property <bool> latency-check-loading: false;
+    // False until the cores can measure (per-user mode not connected, no catalog yet).
+    in property <bool> latency-check-available: false;
     in property <string> latency-check-error;
     in property <string> diagnostics-xray-value: "Остановлен";
     in property <string> diagnostics-xray-tone: "neutral";
@@ -1203,6 +1205,8 @@ export component AppWindow inherits Window {
     callback retry-catalog();
     callback select-catalog-node(string);
     callback route-search-changed(string);
+    // Runs a latency check right now instead of waiting for the 60 s timer.
+    callback check-latency();
     // (group id, node id): selects a route in any group and closes search.
     callback choose-route-search-hit(string, string);
 
@@ -2540,6 +2544,65 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     search-toggle-touch := TouchArea { clicked => { root.open-route-search(); } }
+                                }
+                                latency-check-toggle := FocusScope {
+                                    width: 32px;
+                                    height: 36px;
+                                    enabled: root.latency-check-available && !root.latency-check-loading && !root.route-search-open && !root.profile-menu-open;
+                                    focus-on-click: true;
+                                    focus-on-tab-navigation: true;
+                                    accessible-role: button;
+                                    accessible-label: "Проверить пинг";
+                                    accessible-action-default => { root.check-latency(); }
+                                    key-pressed(event) => {
+                                        if (event.text == " " || event.text == "\n") {
+                                            root.check-latency();
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
+                                    Rectangle {
+                                        y: 2px;
+                                        height: 32px;
+                                        border-radius: 16px;
+                                        background: latency-check-touch.has-hover && root.latency-check-available ? #ffffff0d : transparent;
+                                        border-color: Theme.focus;
+                                        border-width: parent.has-focus ? Theme.focus-width : 0px;
+                                        animate background { duration: 120ms; easing: ease-out; }
+                                        Image {
+                                            x: 8px;
+                                            y: 8px;
+                                            width: 16px;
+                                            height: 16px;
+                                            source: @image-url("../assets/gauge.svg");
+                                            colorize: root.latency-check-loading ? Theme.accent-blue
+                                                : latency-check-touch.has-hover ? Theme.text-secondary : Theme.text-muted;
+                                            opacity: root.latency-check-available || root.latency-check-loading ? 1 : 0.45;
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
+                                        // Thin ring while measuring; the only animated element here.
+                                        if root.latency-check-loading: latency-check-ring := Path {
+                                            x: 0px;
+                                            y: 0px;
+                                            width: 32px;
+                                            height: 32px;
+                                            viewbox-width: 32;
+                                            viewbox-height: 32;
+                                            commands: "M 16 2 A 14 14 0 0 1 30 16";
+                                            stroke: #4c9dff;
+                                            stroke-width: 2px;
+                                            stroke-line-cap: round;
+                                            fill: transparent;
+                                            transform-rotation: !root.reduced-motion
+                                                ? Math.mod(animation-tick() / 1ms, 1000) / 1000 * 360deg
+                                                : 0deg;
+                                        }
+                                    }
+                                    latency-check-touch := TouchArea {
+                                        enabled: parent.enabled;
+                                        clicked => { root.check-latency(); }
+                                    }
                                 }
                             }
 
