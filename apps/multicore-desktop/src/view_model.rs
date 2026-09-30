@@ -245,6 +245,9 @@ pub(crate) struct CatalogPresentation {
     pub(crate) search_groups: Vec<CatalogSearchGroup>,
     pub(crate) selected_group_id: Option<String>,
     pub(crate) nodes: Vec<CatalogNodePresentation>,
+    /// Latency of the primary group's selected node, the route the connect
+    /// card names. Independent of which group the route list is showing.
+    pub(crate) exit_latency_text: String,
     pub(crate) loading: bool,
     pub(crate) group_navigation_enabled: bool,
     pub(crate) selection_enabled: bool,
@@ -2564,6 +2567,14 @@ impl DesktopViewModel {
             search_groups,
             selected_group_id: self.selected_catalog_group.clone(),
             nodes,
+            exit_latency_text: self
+                .catalog_groups
+                .iter()
+                .find(|group| group.is_primary)
+                .and_then(|group| group.nodes.iter().find(|node| node.selected))
+                .map(|node| node.latency_text.clone())
+                .filter(|latency| latency.chars().any(|c| c.is_ascii_digit()))
+                .unwrap_or_default(),
             loading: self.catalog_request_pending.is_some(),
             group_navigation_enabled: !self.catalog_groups.is_empty()
                 && self.catalog_request_pending.is_none(),
@@ -6473,6 +6484,22 @@ mod tests {
             primary_summary,
             "a secondary selector must not replace the primary server summary"
         );
+    }
+
+    #[test]
+    fn exit_latency_follows_the_primary_route_while_browsing_other_groups() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(refresh, Ok(MockDaemonClient::ready().status));
+        let catalog = view_model.begin_catalog_request().expect("catalog request");
+        view_model.finish_catalog(catalog.token, Ok(catalog_fixture()));
+        let primary = view_model.catalog_presentation().exit_latency_text;
+        assert!(primary.starts_with("37"), "{primary}");
+
+        assert!(view_model.select_catalog_group("opaque:first"));
+        let browsing = view_model.catalog_presentation();
+        assert_eq!(browsing.nodes[0].id, "opaque:node-a");
+        assert_eq!(browsing.exit_latency_text, primary);
     }
 
     #[test]

@@ -4604,15 +4604,6 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
 
 /// Latency of the exit shown on the home toggle, when the visible catalog holds
 /// it as the selected node; empty otherwise (never a placeholder like "—").
-fn exit_latency(nodes: &[UiCatalogNode], exit_name: &str) -> String {
-    nodes
-        .iter()
-        .find(|node| node.selected && node.label.as_str() == exit_name)
-        .map(|node| node.latency_text.to_string())
-        .filter(|latency| latency.chars().any(|c| c.is_ascii_digit()))
-        .unwrap_or_default()
-}
-
 fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
     // Keep open search results in step with catalog and latency updates.
     if ui.get_route_search_open() {
@@ -4648,7 +4639,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
             }
         })
         .collect::<Vec<_>>();
-    ui.set_node_latency(exit_latency(&nodes, ui.get_node_name().as_str()).into());
+    ui.set_node_latency(catalog.exit_latency_text.clone().into());
     ui.set_catalog_groups(ModelRc::new(VecModel::from(groups)));
     ui.set_catalog_nodes(ModelRc::new(VecModel::from(nodes)));
     ui.set_catalog_loading(catalog.loading);
@@ -6569,30 +6560,6 @@ mod window_tests {
         assert!(app.contains("exit-now-enter := Timer {\n        interval: 16ms;\n        running: root.exit-now-entering;"));
         assert!(app.contains("if (root.exit-now-name != \"\" && !root.reduced-motion) {"));
         assert!(main.contains("exit_now_display(&line.exit_now, ui.get_node_name().as_str())"));
-    }
-
-    #[test]
-    fn exit_latency_comes_only_from_the_selected_matching_node() {
-        let node = |label: &str, selected: bool, latency: &str| super::UiCatalogNode {
-            label: label.into(),
-            selected,
-            latency_text: latency.into(),
-            ..Default::default()
-        };
-        let nodes = [
-            node("Автовыбор", true, "42 мс"),
-            node("Sweden", false, "40 мс"),
-        ];
-        assert_eq!(super::exit_latency(&nodes, "Автовыбор"), "42 мс");
-        assert_eq!(super::exit_latency(&nodes, "Sweden"), "");
-        assert_eq!(
-            super::exit_latency(&[node("Автовыбор", true, "—")], "Автовыбор"),
-            ""
-        );
-        assert_eq!(
-            super::exit_latency(&[node("Автовыбор", true, "Тайм-аут")], "Автовыбор"),
-            ""
-        );
     }
 
     #[test]

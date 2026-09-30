@@ -261,6 +261,11 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
     };
     let catalog = CatalogPresentation {
         loading,
+        exit_latency_text: if loading {
+            String::new()
+        } else {
+            "42 мс".into()
+        },
         search_groups: if loading {
             Vec::new()
         } else {
