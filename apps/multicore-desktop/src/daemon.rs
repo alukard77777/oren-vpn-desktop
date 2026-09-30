@@ -610,6 +610,11 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Данные сессии недоступны."))
     }
 
+    /// POST /v1/service/update: the always-ready service downloads and installs `version`.
+    fn update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
+        Err(DaemonError::new("Служба MultiCore недоступна."))
+    }
+
     /// GET /v1/catalog. IDs are opaque daemon values; labels are presentation data.
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError>;
 
@@ -1004,6 +1009,9 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         }
         "not_connected" => "Подключитесь, чтобы открыть панель Mihomo.",
         "dashboard_unavailable" => "Панель Mihomo недоступна в этой сборке.",
+        "service_busy" => "MultiCore уже запущен у другого пользователя.",
+        "service_update_failed" => "Служба не смогла загрузить или проверить обновление.",
+        "service_unavailable" => "Служба MultiCore недоступна.",
         _ => return None,
     })
 }
@@ -1196,6 +1204,29 @@ impl DaemonClient for HttpDaemonClient {
             );
         }
         decode_bounded_json(response, SESSION_RESPONSE_LIMIT_BYTES)
+    }
+
+    fn update_via_service(&self, version: &str) -> Result<(), DaemonError> {
+        #[derive(serde::Serialize)]
+        struct UpdateRequest<'a> {
+            version: &'a str,
+        }
+        let response = self
+            .http
+            .post(self.endpoint("/v1/service/update"))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15 * 60))
+            .json(&UpdateRequest { version })
+            .send()
+            .map_err(map_error)?;
+        if response.status().as_u16() == 202 {
+            return Ok(());
+        }
+        let code = error_code(response);
+        Err(
+            DaemonError::definitive_http("Служба не смогла установить обновление.")
+                .with_known_code(&code),
+        )
     }
 
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError> {
@@ -1468,6 +1499,50 @@ mod http_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn service_updates_are_posted_and_busy_is_explained() {
+        for (status, body, expected) in [
+            ("202 Accepted", "", None),
+            (
+                "409 Conflict",
+                r#"{"code":"service_busy","message":"x"}"#,
+                Some("MultiCore уже запущен у другого пользователя."),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind update server");
+            let address = listener.local_addr().expect("update server address");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept update request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !String::from_utf8_lossy(&request).contains("\"version\"") {
+                    let read = stream.read(&mut buffer).expect("read update request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write update response");
+                String::from_utf8_lossy(&request).into_owned()
+            });
+            let client = HttpDaemonClient::new(format!("http://{address}"), "token")
+                .expect("loopback client");
+            let result = client.update_via_service("1.2.0");
+            let request = server.join().expect("update server");
+            assert!(request.starts_with("POST /v1/service/update "), "{request}");
+            assert!(request.contains(r#"{"version":"1.2.0"}"#));
+            match expected {
+                None => assert!(result.is_ok()),
+                Some(message) => assert_eq!(result.unwrap_err().to_string(), message),
+            }
+        }
+    }
 
     #[test]
     fn subscription_info_deserializes_legacy_payload_with_safe_defaults() {

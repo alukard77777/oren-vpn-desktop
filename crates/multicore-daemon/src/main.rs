@@ -242,7 +242,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shared: Arc<dyn Backend> = backend.clone();
-    let app = try_router_shared(shared, token, dashboard_url)?;
+    // Service updates are Windows only (Linux packages are updated by the package manager).
+    // The route asks the service on every call, so a service that started after the daemon
+    // is used too; without one it answers `service_unavailable`.
+    let service_updates =
+        cfg!(windows).then(|| service.clone() as Arc<dyn multicore_daemon::ServiceUpdates>);
+    let app = try_router_shared(shared, token, dashboard_url, service_updates)?;
     let listener = bind_loopback(address).await?;
     let resolved_address = listener.local_addr()?;
     {

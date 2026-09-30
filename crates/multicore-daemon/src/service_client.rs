@@ -567,14 +567,20 @@ impl<C: ServiceConnector> ServiceSession<C> {
         self.forget();
     }
 
+    /// Asks the service to download, verify and install `version`. The exchange can take
+    /// minutes, so it runs on a channel of its own: the connection's channel (selection,
+    /// latency, disconnect) stays free, and a failed download leaves the cores running. The
+    /// service downloads outside its loop lock and keeps answering `Status`, `SetTun` and
+    /// `Diagnostics` on that channel meanwhile, so the watcher keeps polling as usual and a
+    /// core crash during the download is still noticed.
     pub fn update(&self, version: &str) -> Result<(), ServiceError> {
-        match self.request(
-            &ServiceCommand::Update {
-                version: version.to_owned(),
-            },
-            true,
-        )? {
+        let transport = self.connector.connect()?;
+        match transport.request(&ServiceCommand::Update {
+            version: version.to_owned(),
+        })? {
             ServiceResponse::UpdateStarted => Ok(()),
+            ServiceResponse::Busy => Err(ServiceError::Busy),
+            ServiceResponse::Error { code } => Err(ServiceError::Rejected(code)),
             _ => Err(ServiceError::Protocol),
         }
     }
@@ -628,6 +634,12 @@ impl<C: ServiceConnector> crate::CoresReadiness for ServiceSession<C> {
 
     fn release(&self) {
         ServiceSession::shutdown(self);
+    }
+}
+
+impl<C: ServiceConnector> crate::ServiceUpdates for ServiceSession<C> {
+    fn update(&self, version: &str) -> Result<(), ServiceError> {
+        ServiceSession::update(self, version)
     }
 }
 

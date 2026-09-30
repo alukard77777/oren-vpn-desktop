@@ -348,7 +348,7 @@ async fn a_shared_backend_serves_the_router() {
     use tower::ServiceExt;
     let h = harness(&[PROFILE_A]);
     let backend: Arc<dyn Backend> = h.backend.clone();
-    let app = multicore_daemon::try_router_shared(backend, "shared-token", None).unwrap();
+    let app = multicore_daemon::try_router_shared(backend, "shared-token", None, None).unwrap();
     let response = app
         .oneshot(
             Request::get("/v1/status")
@@ -619,6 +619,79 @@ async fn quit_disconnects_releases_the_cores_and_stops_warming() {
         calls,
         "never warmed again"
     );
+}
+
+struct RecordingUpdates(
+    Mutex<Vec<String>>,
+    Option<multicore_daemon::service_client::ServiceError>,
+);
+
+impl multicore_daemon::ServiceUpdates for RecordingUpdates {
+    fn update(&self, version: &str) -> Result<(), multicore_daemon::service_client::ServiceError> {
+        self.0.lock().unwrap().push(version.to_owned());
+        self.1.map_or(Ok(()), Err)
+    }
+}
+
+async fn post_update(
+    updates: Option<Arc<RecordingUpdates>>,
+    body: &'static str,
+) -> axum::http::StatusCode {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let h = harness(&[PROFILE_A]);
+    let backend: Arc<dyn Backend> = h.backend.clone();
+    let updates = updates.map(|updates| updates as Arc<dyn multicore_daemon::ServiceUpdates>);
+    let app = multicore_daemon::try_router_shared(backend, "t", None, updates).unwrap();
+    app.oneshot(
+        Request::post("/v1/service/update")
+            .header("authorization", "Bearer t")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+#[tokio::test]
+async fn service_updates_are_routed_to_the_service() {
+    let updates = Arc::new(RecordingUpdates(Mutex::default(), None));
+    assert_eq!(
+        post_update(Some(updates.clone()), r#"{"version":"1.2.0"}"#).await,
+        202
+    );
+    assert_eq!(*updates.0.lock().unwrap(), ["1.2.0"]);
+    assert_eq!(
+        post_update(Some(updates.clone()), r#"{"version":"1.2.0","x":1}"#).await,
+        400
+    );
+    assert_eq!(post_update(None, r#"{"version":"1.2.0"}"#).await, 404);
+    let busy = Arc::new(RecordingUpdates(
+        Mutex::default(),
+        Some(multicore_daemon::service_client::ServiceError::Busy),
+    ));
+    assert_eq!(post_update(Some(busy), r#"{"version":"1.2.0"}"#).await, 409);
+}
+
+#[tokio::test]
+async fn a_missing_service_and_a_failed_download_are_told_apart() {
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_daemon::service_client::ServiceError;
+    for (error, status) in [
+        (ServiceError::NotInstalled, 404),
+        (ServiceError::Unavailable, 404),
+        (ServiceError::Rejected(BrokerErrorCode::NotReady), 502),
+        (ServiceError::TimedOut, 502),
+    ] {
+        let updates = Arc::new(RecordingUpdates(Mutex::default(), Some(error)));
+        assert_eq!(
+            post_update(Some(updates), r#"{"version":"1.2.0"}"#).await,
+            status,
+            "{error:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

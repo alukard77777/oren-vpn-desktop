@@ -1889,7 +1889,7 @@ fn wire_updater(
             ),
             UpdateAction::Install => match update_install_intent(runtime_idle) {
                 UpdateInstallIntent::InstallNow => {
-                    start_update_install(weak.clone(), action_state.clone());
+                    start_update_install(weak.clone(), action_model.clone(), action_state.clone());
                 }
                 UpdateInstallIntent::ConfirmRestart => {
                     if let Some(ui) = weak.upgrade() {
@@ -1924,7 +1924,7 @@ fn wire_updater(
         };
         let started = match (plan, action) {
             (UpdateConfirmPlan::InstallNow, _) => {
-                start_update_install(weak.clone(), state.clone());
+                start_update_install(weak.clone(), model.clone(), state.clone());
                 true
             }
             (
@@ -1990,7 +1990,18 @@ fn wire_periodic_update_check(
     timer
 }
 
-fn start_update_install(weak: slint::Weak<AppWindow>, state: Arc<Mutex<UpdateState>>) {
+/// Whether an update is installed by the always-ready service instead of this process: the
+/// service install lives in Program Files, which the desktop cannot write. Windows only;
+/// Linux packages are updated by the package manager.
+fn update_through_service(service_mode: bool) -> bool {
+    cfg!(windows) && service_mode
+}
+
+fn start_update_install(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    state: Arc<Mutex<UpdateState>>,
+) {
     let release = state.lock().expect("update state lock").available_release();
     let Some(release) = release else {
         return;
@@ -2002,24 +2013,39 @@ fn start_update_install(weak: slint::Weak<AppWindow>, state: Arc<Mutex<UpdateSta
             apply_update_state(&ui, &current, true);
         }
     }
-    thread::spawn(move || match updater::download_and_start_apply(&release) {
-        Ok(()) => {
-            let _ = slint::invoke_from_event_loop(move || {
-                let _keep_state_alive = state;
-                let _keep_window_alive = weak;
-                let _ = slint::quit_event_loop();
-            });
-        }
-        Err(error) => {
-            let _ = slint::invoke_from_event_loop(move || {
-                let mut current = state.lock().expect("update state lock");
-                // Keep the release so the home banner stays with the reason
-                // and a retry, instead of vanishing as a check error would.
-                *current = UpdateState::InstallFailed(release, error);
-                if let Some(ui) = weak.upgrade() {
-                    apply_update_state(&ui, &current, true);
-                }
-            });
+    let (service_mode, client) = {
+        let model = model.lock().expect("view model lock");
+        (model.service_mode(), model.daemon_client())
+    };
+    thread::spawn(move || {
+        // Through the service, the daemon waits while the service downloads and verifies the
+        // release; on success the service's updater closes this client and relaunches it.
+        let result = if update_through_service(service_mode) {
+            client
+                .update_via_service(&release.version().to_string())
+                .map_err(|error| error.to_string())
+        } else {
+            updater::download_and_start_apply(&release)
+        };
+        match result {
+            Ok(()) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    let _keep_state_alive = state;
+                    let _keep_window_alive = weak;
+                    let _ = slint::quit_event_loop();
+                });
+            }
+            Err(error) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    let mut current = state.lock().expect("update state lock");
+                    // Keep the release so the home banner stays with the reason
+                    // and a retry, instead of vanishing as a check error would.
+                    *current = UpdateState::InstallFailed(release, error);
+                    if let Some(ui) = weak.upgrade() {
+                        apply_update_state(&ui, &current, true);
+                    }
+                });
+            }
         }
     });
 }
@@ -4210,7 +4236,7 @@ fn apply_disconnect_snapshot_from_worker(
         };
         let runtime_idle = runtime_allows_update(&current.presentation);
         if runtime_idle && let Some(update_state) = update_state {
-            start_update_install(weak, update_state);
+            start_update_install(weak, model, update_state);
         } else if current.presentation.has_profile {
             load_catalog(weak, model);
         }
@@ -4786,7 +4812,7 @@ mod window_tests {
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
         startup_should_connect, update_check_due, update_confirm_plan, update_install_intent,
-        visible_page_from_name, visible_page_name,
+        update_through_service, visible_page_from_name, visible_page_name,
     };
     use crate::daemon::test_support::MockDaemonClient;
     use crate::daemon::{
@@ -5609,6 +5635,30 @@ mod window_tests {
             .and_then(|source| source.split("fn run_update_check").next())
             .expect("updater wiring");
         assert!(updater_exit.contains("slint::quit_event_loop()"));
+    }
+
+    #[test]
+    fn a_service_install_is_updated_by_the_service() {
+        assert_eq!(update_through_service(true), cfg!(windows));
+        assert!(!update_through_service(false));
+        let rust = include_str!("main.rs");
+        let install = rust
+            .split("fn start_update_install(")
+            .nth(1)
+            .and_then(|source| source.split("\nfn ").next())
+            .expect("update install");
+        for required in [
+            "model.service_mode()",
+            "update_through_service(service_mode)",
+            "client\n                .update_via_service(",
+            "updater::download_and_start_apply(&release)",
+            "UpdateState::InstallFailed(release, error)",
+        ] {
+            assert!(
+                install.replace("\r\n", "\n").contains(required),
+                "missing: {required}"
+            );
+        }
     }
 
     #[test]
