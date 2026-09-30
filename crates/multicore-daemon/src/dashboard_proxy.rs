@@ -1,7 +1,8 @@
 //! The read-only dashboard: static Zashboard files and a filtering reverse proxy to the current
 //! Mihomo controller, on a loopback port the daemon owns. The browser only ever sees this
-//! module's per-session token; the Mihomo secret is added here. Only `GET` (and the WebSocket
-//! upgrade of `/logs`) on [`ALLOWED_API_PATHS`] passes; everything else is 403.
+//! module's per-session token; the Mihomo secret is added here. Only `GET` on
+//! [`ALLOWED_API_PATHS`] (and the WebSocket upgrade of the [`STREAM_PATHS`]) passes; everything
+//! else is 403, including `DELETE /connections` and `DELETE /connections/{id}`.
 //!
 //! With the always-ready service the upstream is the service's filtered controller proxy (its
 //! address and token come from `Prepared`); this allow-list narrows it further. Without the
@@ -29,13 +30,22 @@ use tokio::{
 
 use crate::service_client::{ControllerSlot, ControllerTarget};
 
-pub const ALLOWED_API_PATHS: [&str; 5] = [
+pub const ALLOWED_API_PATHS: [&str; 8] = [
     "/version",
     "/logs",
     "/rules",
     "/providers/rules",
     "/configs",
+    "/connections",
+    "/traffic",
+    "/memory",
 ];
+/// Routes Zashboard reads over a WebSocket: the Logs and Connections pages and the status bar
+/// (traffic, memory, connection count) shown on every page.
+pub const STREAM_PATHS: [&str; 4] = ["/logs", "/connections", "/traffic", "/memory"];
+/// Streams Mihomo also serves as never-ending plain HTTP; Zashboard always uses the WebSocket.
+/// (A plain `GET /connections` is a finite snapshot and is forwarded.)
+const WEBSOCKET_ONLY_PATHS: [&str; 3] = ["/logs", "/traffic", "/memory"];
 const MAX_UPSTREAM_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UPGRADE_HEAD_BYTES: usize = 8 * 1024;
 const MAX_STATIC_PATH_CHARS: usize = 256;
@@ -210,14 +220,13 @@ async fn api(State(state): State<ProxyState>, request: Request) -> Response {
     };
     let query = forwarded_query(request.uri());
     if is_websocket_upgrade(request.headers()) {
-        // Only the log stream is a WebSocket in the read-only dashboard.
-        if path != "/logs" {
+        if !STREAM_PATHS.contains(&path.as_str()) {
             return StatusCode::FORBIDDEN.into_response();
         }
         return websocket(request, target, &path, &query).await;
     }
-    if path == "/logs" {
-        // Mihomo streams plain-HTTP logs forever; Zashboard always uses the WebSocket.
+    if WEBSOCKET_ONLY_PATHS.contains(&path.as_str()) {
+        // Mihomo streams these forever over plain HTTP; Zashboard always uses the WebSocket.
         return StatusCode::BAD_REQUEST.into_response();
     }
     let url = format!("http://{}{path}{query}", target.address);

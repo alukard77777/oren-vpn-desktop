@@ -27,13 +27,20 @@ class PatchIndexTest(unittest.TestCase):
         )
         self.assertIn("document.title", theme)
 
-    def test_readonly_script_hides_everything_but_logs_and_rules(self):
+    def test_readonly_script_hides_everything_but_logs_rules_and_connections(self):
         script = (
             pathlib.Path(__file__).resolve().parent.parent
             / "packaging" / "dashboard" / "multicore-readonly.js"
         ).read_text(encoding="utf-8")
-        for token in ["'#/logs'", "'#/rules'", "'#/setup'", "location.replace('#/logs')", "hashchange"]:
+        for token in ["'#/logs'", "'#/rules'", "'#/connections'", "'#/setup'", "location.replace('#/logs')", "hashchange"]:
             self.assertIn(token, script)
+        # Connections stay viewable, but the close / close-all / block buttons are hidden
+        # (Heroicon x-mark and no-symbol inside an unlabeled btn-circle; clear buttons (p-0)
+        # and labeled dialog closes (btn-ghost, aria-label) stay visible).
+        self.assertIn("M6 18 18 6M6 6l12 12", script)
+        self.assertIn("M18.364 18.364A9 9 0 0 0 5.636 5.636", script)
+        self.assertIn(":not(.p-0)", script)
+        self.assertIn("#/connections') === 0", script)
         self.assertNotIn("fetch(", script)
         self.assertNotIn("XMLHttpRequest", script)
         # The Logs page mutates constantly: DOM passes are coalesced per frame.

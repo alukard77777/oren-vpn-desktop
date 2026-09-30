@@ -81,6 +81,9 @@ fn only_reads_of_the_documented_routes_are_allowed() {
         "/rules",
         "/providers/rules",
         "/configs",
+        "/connections",
+        "/traffic",
+        "/memory",
     ] {
         assert!(is_allowed(&Method::GET, path), "{path}");
     }
@@ -91,7 +94,14 @@ fn only_reads_of_the_documented_routes_are_allowed() {
         (Method::GET, "/proxies"),
         (Method::PUT, "/proxies/GLOBAL"),
         (Method::DELETE, "/connections"),
-        (Method::GET, "/connections"),
+        (Method::DELETE, "/connections/abc"),
+        (Method::GET, "/connections/abc"),
+        (Method::DELETE, "/connections/smart/abc"),
+        (Method::PUT, "/connections"),
+        (Method::POST, "/connections"),
+        (Method::PATCH, "/connections"),
+        (Method::DELETE, "/traffic"),
+        (Method::POST, "/memory"),
         (Method::POST, "/upgrade"),
         (Method::POST, "/upgrade/ui"),
         (Method::PATCH, "/rules/disable"),
@@ -135,11 +145,20 @@ async fn allowed_reads_are_forwarded_with_the_mihomo_secret() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        router(Some(address), root.path()),
+        Method::GET,
+        "/connections",
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
         *seen.lock().unwrap(),
         [
             "GET /version Bearer mihomo-secret".to_owned(),
             "GET /rules?x=1 Bearer mihomo-secret".to_owned(),
+            "GET /connections Bearer mihomo-secret".to_owned(),
         ]
     );
 }
@@ -153,6 +172,8 @@ async fn writes_and_other_routes_are_forbidden_without_reaching_mihomo() {
         (Method::PATCH, "/configs"),
         (Method::GET, "/proxies"),
         (Method::DELETE, "/connections"),
+        (Method::DELETE, "/connections/abc"),
+        (Method::DELETE, "/connections?token=dash-token"),
         (Method::POST, "/upgrade"),
         (Method::PATCH, "/rules/disable"),
     ] {
@@ -225,22 +246,42 @@ async fn static_files_are_served_without_escaping_the_directory() {
 }
 
 #[tokio::test]
-async fn plain_log_requests_without_an_upgrade_are_rejected() {
+async fn plain_stream_requests_without_an_upgrade_are_rejected() {
     let (address, seen) = fake_mihomo().await;
     let root = tempfile::tempdir().unwrap();
-    let (status, _) = call(
-        router(Some(address), root.path()),
-        Method::GET,
-        "/logs",
-        Some(TOKEN),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for path in ["/logs", "/traffic", "/memory"] {
+        let (status, _) = call(
+            router(Some(address), root.path()),
+            Method::GET,
+            path,
+            Some(TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
     assert!(seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn the_log_websocket_is_passed_through_with_the_mihomo_secret() {
+    assert_websocket_passes_through("/logs?level=info", "/logs?level=info").await;
+}
+
+#[tokio::test]
+async fn the_connections_websocket_is_passed_through_with_the_mihomo_secret() {
+    assert_websocket_passes_through("/connections?interval=1000", "/connections?interval=1000")
+        .await;
+}
+
+#[tokio::test]
+async fn the_status_bar_websockets_are_passed_through_with_the_mihomo_secret() {
+    assert_websocket_passes_through("/traffic", "/traffic").await;
+    assert_websocket_passes_through("/memory", "/memory").await;
+}
+
+/// Opens `client_path` (plus the dashboard token) as a WebSocket through the proxy and checks
+/// that the upstream saw `upstream_path` with the Mihomo secret and without the token.
+async fn assert_websocket_passes_through(client_path: &str, upstream_path: &str) {
     // Upstream: accepts one upgrade, reports its request head, says hello and echoes.
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
@@ -271,7 +312,11 @@ async fn the_log_websocket_is_passed_through_with_the_mihomo_secret() {
     let mut client = TcpStream::connect(proxy_address).await.unwrap();
     client
         .write_all(
-            b"GET /logs?level=info&token=dash-token HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            format!(
+                "GET {client_path}{}token=dash-token HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                if client_path.contains('?') { '&' } else { '?' }
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -294,7 +339,7 @@ async fn the_log_websocket_is_passed_through_with_the_mihomo_secret() {
     assert_eq!(&echo, b"ping");
     let head = head_receiver.await.unwrap();
     assert!(
-        head.starts_with("GET /logs?level=info HTTP/1.1\r\n"),
+        head.starts_with(&format!("GET {upstream_path} HTTP/1.1\r\n")),
         "{head}"
     );
     assert!(head.contains("Authorization: Bearer mihomo-secret\r\n"));
@@ -302,7 +347,7 @@ async fn the_log_websocket_is_passed_through_with_the_mihomo_secret() {
 }
 
 #[tokio::test]
-async fn only_the_log_stream_may_upgrade_to_a_websocket() {
+async fn only_the_streams_may_upgrade_to_a_websocket() {
     let (address, seen) = fake_mihomo().await;
     let root = tempfile::tempdir().unwrap();
     let request = axum::http::Request::builder()
