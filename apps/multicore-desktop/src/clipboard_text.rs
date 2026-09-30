@@ -19,7 +19,19 @@ impl ClipboardTextError {
     }
 }
 
-pub(crate) fn read_subscription_text() -> Result<String, ClipboardTextError> {
+/// Reads the clipboard the way the window's own text fields do. On a Wayland
+/// session `ClipboardContext` only sees the XWayland selection, which is stale
+/// or empty while a native Wayland window is focused, so the window's Wayland
+/// display is used first and X11 stays the fallback.
+pub(crate) fn read_subscription_text(window: &slint::Window) -> Result<String, ClipboardTextError> {
+    #[cfg(target_os = "linux")]
+    if let Some(contents) = wayland::with_clipboard(window, |clipboard| clipboard.get_contents()) {
+        return normalize_subscription_text(
+            &contents.map_err(|_| ClipboardTextError::Unavailable)?,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = window;
     let mut clipboard = ClipboardContext::new().map_err(|_| ClipboardTextError::Unavailable)?;
     let contents = clipboard
         .get_contents()
@@ -30,11 +42,67 @@ pub(crate) fn read_subscription_text() -> Result<String, ClipboardTextError> {
 /// Used by the "copy diagnostics" action: the caller is responsible for
 /// only ever passing already-redacted text (see
 /// `DesktopViewModel::diagnostics_export_text`).
-pub(crate) fn write_clipboard_text(text: String) -> Result<(), ClipboardTextError> {
+pub(crate) fn write_clipboard_text(
+    window: &slint::Window,
+    text: String,
+) -> Result<(), ClipboardTextError> {
+    #[cfg(target_os = "linux")]
+    let text =
+        match wayland::with_clipboard(window, |clipboard| clipboard.set_contents(text.clone())) {
+            Some(result) => return result.map_err(|_| ClipboardTextError::Unavailable),
+            None => text,
+        };
+    #[cfg(not(target_os = "linux"))]
+    let _ = window;
     let mut clipboard = ClipboardContext::new().map_err(|_| ClipboardTextError::Unavailable)?;
     clipboard
         .set_contents(text)
         .map_err(|_| ClipboardTextError::Unavailable)
+}
+
+#[cfg(target_os = "linux")]
+mod wayland {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    use copypasta::wayland_clipboard::{Clipboard, create_clipboards_from_external};
+    use slint::winit_030::WinitWindowAccessor;
+    use slint::winit_030::winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+
+    thread_local! {
+        // One clipboard per Wayland connection: creating it spawns a worker
+        // thread, so it is kept for the process instead of per paste.
+        static CLIPBOARD: RefCell<Option<(usize, Clipboard)>> = const { RefCell::new(None) };
+    }
+
+    /// `None` when the window is not on Wayland (X11 session, or no window yet).
+    pub(super) fn with_clipboard<R>(
+        window: &slint::Window,
+        action: impl FnOnce(&mut Clipboard) -> R,
+    ) -> Option<R> {
+        let display = window
+            .with_winit_window(|window| match window.display_handle().ok()?.as_raw() {
+                RawDisplayHandle::Wayland(handle) => Some(handle.display.as_ptr()),
+                _ => None,
+            })
+            .flatten()?;
+        CLIPBOARD.with_borrow_mut(|slot| {
+            if slot
+                .as_ref()
+                .is_none_or(|(current, _)| *current != display as usize)
+            {
+                *slot = Some((display as usize, open(display)));
+            }
+            slot.as_mut().map(|(_, clipboard)| action(clipboard))
+        })
+    }
+
+    fn open(display: *mut c_void) -> Clipboard {
+        // SAFETY: the pointer is the live wl_display of winit's event loop,
+        // which Slint keeps open for the rest of the process.
+        let (_primary, clipboard) = unsafe { create_clipboards_from_external(display) };
+        clipboard
+    }
 }
 
 fn normalize_subscription_text(contents: &str) -> Result<String, ClipboardTextError> {
