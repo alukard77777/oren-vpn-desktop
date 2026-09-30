@@ -15,8 +15,7 @@ use multicore_daemon::connection_mode::{ProxySwitch, SystemProxyController};
 use multicore_daemon::service_client::{
     ControllerSlot, ServiceConnector, ServiceCoresController, ServiceError, ServiceMode,
     ServiceSession, ServiceTransport, ServiceTunController, SlotSelector, WarmInputs, WarmMiss,
-    WarmStage, WarmStages,
-    service_response_timeout, warm_key,
+    WarmStage, WarmStages, service_response_timeout, warm_key,
 };
 
 #[derive(Default)]
@@ -332,14 +331,12 @@ fn parsed(yaml: &str) -> Snapshot {
     Snapshot::parse(yaml.as_bytes(), multicore_core::IDLE_XRAY_CONFIG).unwrap()
 }
 
-const SNAPSHOT_A: &str =
-    "proxies:
+const SNAPSHOT_A: &str = "proxies:
   - {name: a, type: socks5}
 proxy-groups:
   - {name: g, type: select, proxies: [a]}
 ";
-const SNAPSHOT_B: &str =
-    "proxies:
+const SNAPSHOT_B: &str = "proxies:
   - {name: b, type: socks5}
 proxy-groups:
   - {name: g, type: select, proxies: [b]}
@@ -437,7 +434,10 @@ fn a_warm_miss_names_which_input_differed() {
         }
     );
     let text = miss.to_string();
-    assert!(text.contains("Ethernet") && text.contains("Wi-Fi"), "{text}");
+    assert!(
+        text.contains("Ethernet") && text.contains("Wi-Fi"),
+        "{text}"
+    );
     assert!(!text.contains("socks5"), "{text}");
 }
 

@@ -302,7 +302,12 @@ async fn a_connect_that_could_not_reuse_the_warm_generation_says_why() {
     );
     let connected = events
         .iter()
-        .find(|event| event.details.as_ref().is_some_and(|d| d.get("total_ms").is_some()))
+        .find(|event| {
+            event
+                .details
+                .as_ref()
+                .is_some_and(|d| d.get("total_ms").is_some())
+        })
         .unwrap();
     assert_eq!(connected.details.as_ref().unwrap()["restaged"], true);
 }
