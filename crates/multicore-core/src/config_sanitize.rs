@@ -656,12 +656,19 @@ fn shape_inbounds(value: &mut Json) -> Result<(), SanitizeError> {
         }
         if let Some(sniffing) = inbound.get_mut("sniffing") {
             let sniffing = sniffing.as_object_mut().ok_or(SanitizeError::Malformed)?;
-            only_known(
-                sniffing,
-                ALLOWED_XRAY_SNIFFING_KEYS,
-                &format!("{at}.sniffing"),
-            )?;
-            for (name, value) in sniffing.iter() {
+            // Unknown sniffing flags are harmless client knobs: dropped, not refused.
+            keep_known(sniffing, ALLOWED_XRAY_SNIFFING_KEYS);
+            for (name, value) in sniffing.iter_mut() {
+                // Xray's `StringList` also takes one comma-separated string.
+                if let Json::String(text) = value {
+                    *value = Json::Array(
+                        text.split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(|item| Json::String(item.to_owned()))
+                            .collect(),
+                    );
+                }
                 let fits = match name.as_str() {
                     "enabled" | "metadataOnly" | "routeOnly" => value.is_boolean(),
                     _ => value
@@ -682,7 +689,9 @@ fn shape_socks_settings(settings: &mut Json, at: &str) -> Result<(), SanitizeErr
         return Ok(());
     }
     let settings = settings.as_object_mut().ok_or(SanitizeError::Malformed)?;
-    only_known(settings, ALLOWED_XRAY_SOCKS_SETTINGS, at)?;
+    // Unknown SOCKS server keys (e.g. v2rayN's `allowTransparent`) are dropped, not refused;
+    // server-side features are refused anywhere by `reject_xray_references`.
+    keep_known(settings, ALLOWED_XRAY_SOCKS_SETTINGS);
     for (name, value) in settings.iter_mut() {
         match name.as_str() {
             "auth" => {
@@ -703,13 +712,9 @@ fn shape_socks_settings(settings: &mut Json, at: &str) -> Result<(), SanitizeErr
                     continue;
                 }
                 let accounts = value.as_array_mut().ok_or(SanitizeError::Malformed)?;
-                for (index, account) in accounts.iter_mut().enumerate() {
+                for account in accounts.iter_mut() {
                     let account = account.as_object_mut().ok_or(SanitizeError::Malformed)?;
-                    only_known(
-                        account,
-                        ALLOWED_XRAY_SOCKS_ACCOUNT_KEYS,
-                        &format!("{at}.{name}[{index}]"),
-                    )?;
+                    keep_known(account, ALLOWED_XRAY_SOCKS_ACCOUNT_KEYS);
                     if !account.values().all(Json::is_string) {
                         return Err(SanitizeError::Malformed);
                     }
@@ -835,7 +840,7 @@ fn is_external_geodata(text: &str) -> bool {
 
 /// A value that points at a local socket or file instead of a network host: an absolute or
 /// `@abstract` unix socket path (Xray's own rule), a Windows path (drive or `\`), a `file:` or
-/// `unix:`/`+unix:` URL, or anything with a NUL.
+/// `unix:`/`+unix:` URL, an `env:` indirection, or anything with a NUL.
 fn is_local_endpoint(text: &str) -> bool {
     let trimmed = text.trim_start();
     let bytes = trimmed.as_bytes();
@@ -843,6 +848,7 @@ fn is_local_endpoint(text: &str) -> bool {
     text.contains('\0')
         || matches!(bytes.first(), Some(b'/' | b'@' | b'\\'))
         || lower.starts_with("file:")
+        || lower.starts_with("env:")
         || lower.contains("unix:")
         || (bytes.len() >= 2
             && bytes[0].is_ascii_alphabetic()

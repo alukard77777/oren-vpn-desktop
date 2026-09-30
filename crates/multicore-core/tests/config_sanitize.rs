@@ -982,30 +982,14 @@ fn inbounds_must_be_exactly_a_loopback_socks_bridge() {
     let settings =
         |name: &str| SanitizeError::ForbiddenField(format!("inbounds[0].settings.{name}"));
     assert_eq!(
-        refused(&format!(r#"{{{base},"settings":{{"clients":[]}}}}"#)),
-        settings("clients")
-    );
-    assert_eq!(
         refused(&format!(
             r#"{{{base},"settings":{{"auth":"certificate"}}}}"#
         )),
         settings("auth")
     );
     assert_eq!(
-        refused(&format!(
-            r#"{{{base},"settings":{{"accounts":[{{"user":"u","pass":"p","level":1}}]}}}}"#
-        )),
-        settings("accounts[0].level")
-    );
-    assert_eq!(
         refused(&format!(r#"{{{base},"settings":{{"ip":"0.0.0.0"}}}}"#)),
         SanitizeError::NonLoopbackListener("inbounds[0].settings.ip".into())
-    );
-    assert_eq!(
-        refused(&format!(
-            r#"{{{base},"sniffing":{{"enabled":true,"future":1}}}}"#
-        )),
-        field("sniffing.future")
     );
     // One fixed port.
     for port in [r#""1000-2000""#, "0", "70000", r#""env:PORT""#, "null"] {
@@ -1034,6 +1018,46 @@ fn inbounds_must_be_exactly_a_loopback_socks_bridge() {
     );
 }
 
+/// Re-review 4 N4-1: harmless unknown keys inside a socks inbound's `settings`/`sniffing`
+/// (v2rayN writes `allowTransparent`) are dropped, and a comma-separated `destOverride` string
+/// becomes a list; the inbound's own shape (no streamSettings etc.) is still enforced.
+#[test]
+fn socks_inbound_settings_tolerate_harmless_client_keys() {
+    let out = sanitize_xray(
+        br#"{"inbounds":[{"tag":"socks","listen":"127.0.0.1","port":10808,"protocol":"socks",
+            "settings":{"auth":"noauth","udp":true,"allowTransparent":false,"clients":[],
+              "accounts":[{"user":"u","pass":"p","level":1}]},
+            "sniffing":{"enabled":true,"destOverride":"http, tls,quic","future":1,
+              "domainsExcluded":"a.example"}}]}"#,
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        doc["inbounds"][0],
+        serde_json::json!({"tag":"socks","listen":"127.0.0.1","port":10808,"protocol":"socks",
+            "settings":{"auth":"noauth","udp":true,"accounts":[{"user":"u","pass":"p"}]},
+            "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],
+              "domainsExcluded":["a.example"]}})
+    );
+    // Server-side features stay refused inside settings, and the inbound shape is unchanged.
+    assert_eq!(
+        sanitize_xray(
+            br#"{"inbounds":[{"port":1,"protocol":"socks","settings":{"fallbacks":[{"dest":80}]}}]}"#
+        ),
+        Err(SanitizeError::ForbiddenField(
+            "$.inbounds[0].settings.fallbacks".into()
+        ))
+    );
+    assert_eq!(
+        sanitize_xray(br#"{"inbounds":[{"port":1,"protocol":"socks","allocate":{}}]}"#),
+        Err(SanitizeError::ForbiddenField("inbounds[0].allocate".into()))
+    );
+    assert_eq!(
+        sanitize_xray(br#"{"inbounds":[{"port":1,"protocol":"socks","sniffing":{"enabled":1}}]}"#),
+        Err(SanitizeError::Malformed)
+    );
+}
+
 /// Lane H1 round 4: no endpoint anywhere may be a local socket or file, whatever section or
 /// protocol carries it. HTTP paths (`/ws`, gRPC and xhttp paths) are not endpoints.
 #[test]
@@ -1048,6 +1072,8 @@ fn endpoints_never_name_a_local_socket_or_file() {
         "unix:/run/x.sock",
         "UNIX:///run/x.sock",
         "file:///etc/shadow",
+        "env:DOCKER_HOST",
+        "ENV:x",
         "http+unix://%2Frun%2Fx/",
         " /run/x.sock",
         "a\u{0}b",
