@@ -152,40 +152,49 @@ impl PreferenceStore {
         }
     }
 
+    /// A failure names the step that failed (see [`SaveStepError`]) so the low-level log can
+    /// say why settings were not saved; the OS error code stays reachable through
+    /// [`raw_os_error`].
     pub fn save(&self, value: &AppPreferences) -> io::Result<()> {
-        reject_parent_components(&self.path)?;
+        reject_parent_components(&self.path).map_err(at_step("check path"))?;
         if value.schema_version != PREFERENCES_SCHEMA_VERSION {
-            return Err(io::Error::new(
+            return Err(at_step("check schema")(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unsupported preferences schema",
-            ));
+            )));
         }
         let parent = self.path.parent().ok_or_else(|| {
-            io::Error::new(
+            at_step("check path")(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "preferences path has no parent directory",
-            )
+            ))
         })?;
-        let _anchors = prepare_and_anchor_directory_tree(parent)?;
-        secure_directory(parent)?;
-        reject_existing_reparse(&self.path, false)?;
-        let encoded = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+        let _anchors =
+            prepare_and_anchor_directory_tree(parent).map_err(at_step("open data directory"))?;
+        secure_directory(parent).map_err(at_step("protect data directory"))?;
+        reject_existing_reparse(&self.path, false).map_err(at_step("open current preferences"))?;
+        let encoded = serde_json::to_vec_pretty(value)
+            .map_err(io::Error::other)
+            .map_err(at_step("encode"))?;
         if encoded.len() as u64 + 1 > MAX_PREFERENCES_BYTES {
-            return Err(io::Error::new(
+            return Err(at_step("encode")(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "preferences exceed the size limit",
-            ));
+            )));
         }
-        let (temp, mut file) = create_temporary_file(parent)?;
+        let (temp, mut file) =
+            create_temporary_file(parent).map_err(at_step("create temporary file"))?;
         let result = (|| {
-            file.write_all(&encoded)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
+            file.write_all(&encoded)
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.sync_all())
+                .map_err(at_step("write temporary file"))?;
             drop(file);
-            atomic_replace(&temp, &self.path)?;
-            let published = open_secure_file(&self.path, false)?;
-            published.sync_all()?;
-            sync_directory(parent)
+            atomic_replace(&temp, &self.path).map_err(at_step("replace preferences"))?;
+            let published =
+                open_secure_file(&self.path, false).map_err(at_step("reopen preferences"))?;
+            published.sync_all().map_err(at_step("flush preferences"))?;
+            sync_directory(parent).map_err(at_step("flush data directory"))
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
@@ -199,6 +208,41 @@ impl PreferenceStore {
         atomic_replace(&self.path, &quarantine)?;
         sync_directory(parent)
     }
+}
+
+/// The step of [`PreferenceStore::save`] that failed, wrapping the original error. Its text
+/// carries no path, only the step and the OS message and code, so it can go to the low-level
+/// log as is.
+#[derive(Debug)]
+pub struct SaveStepError {
+    step: &'static str,
+    source: io::Error,
+}
+
+impl std::fmt::Display for SaveStepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.step, self.source)
+    }
+}
+
+impl std::error::Error for SaveStepError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn at_step(step: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+    move |source| io::Error::new(source.kind(), SaveStepError { step, source })
+}
+
+/// The OS error code of a save failure, also when it is wrapped in a [`SaveStepError`].
+pub fn raw_os_error(error: &io::Error) -> Option<i32> {
+    error.raw_os_error().or_else(|| {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<SaveStepError>())
+            .and_then(|step| step.source.raw_os_error())
+    })
 }
 
 fn create_temporary_file(directory: &Path) -> io::Result<(PathBuf, fs::File)> {
@@ -757,6 +801,56 @@ mod tests {
 
         assert_eq!(store.load().unwrap(), value);
         assert!(!root.path().join("preferences.json.tmp").exists());
+    }
+
+    /// The real failure behind "Не удалось сохранить настройки": MultiCore's core host held
+    /// the data directory open sharing reads only, which refuses the rename into it. The
+    /// error must name the step and keep the OS code for the low-level log, and the last good
+    /// preferences must survive without a leftover temporary file.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_blocked_by_a_held_data_directory_names_the_step_and_os_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let store = PreferenceStore::at(root.path().join("preferences.json"));
+        store.save(&AppPreferences::default()).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root.path())
+            .unwrap();
+
+        let error = store
+            .save(&AppPreferences {
+                visible_page: VisiblePage::Settings,
+                ..AppPreferences::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(super::raw_os_error(&error), Some(32));
+        let text = error.to_string();
+        assert!(text.starts_with("replace preferences: "), "{text}");
+        assert!(text.contains("os error 32"), "{text}");
+        assert!(!text.contains(&*root.path().to_string_lossy()), "{text}");
+        drop(held);
+        assert_eq!(store.load().unwrap(), AppPreferences::default());
+        let leftovers = fs::read_dir(root.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

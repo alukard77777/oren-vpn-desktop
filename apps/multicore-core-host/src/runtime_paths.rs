@@ -14,7 +14,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        GetFileInformationByHandle,
+        FILE_SHARE_WRITE, GetFileInformationByHandle,
     },
     System::Com::CoTaskMemFree,
     UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
@@ -491,9 +491,21 @@ fn open_guard(path: &Path, directory: bool) -> Result<GuardedPath, ResolveError>
     // FILE_FLAG_BACKUP_SEMANTICS (needed for directories anyway) lets the always-ready service
     // read files as well as directories under `with_backup_privilege`; without the privilege
     // enabled it changes nothing for a file.
+    //
+    // Nothing guarded may be deleted or renamed (no FILE_SHARE_DELETE) and no guarded file may
+    // be written. A directory guard does share writes: for a directory that only admits the
+    // target-directory open every rename into it performs. Without it the per-user broker,
+    // which keeps these guards for a whole connection, made every atomic replace inside
+    // `%LOCALAPPDATA%\MultiCore` (the desktop's preferences) and in every ancestor up to
+    // `C:\Users` fail with os error 32, and the service did the same while it read a generation.
+    let share = if directory {
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    } else {
+        FILE_SHARE_READ
+    };
     let handle = OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(share)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .map_err(|_| ResolveError::Missing)?;
@@ -840,6 +852,35 @@ mod tests {
         // The guard's share mode keeps the staged file from being swapped while resolved.
         let config = d.join("runtime/runtime-00000000000000000007/mihomo.yaml");
         assert!(fs::rename(&config, config.with_extension("moved")).is_err());
+    }
+    /// The per-user broker keeps these guards for a whole connection. Held sharing reads only,
+    /// every directory guard refused the target-directory open a rename performs, so nothing
+    /// could be atomically replaced inside `%LOCALAPPDATA%\MultiCore` (the desktop's
+    /// `preferences.json`) or anywhere up to `C:\Users` while connected: os error 32. The
+    /// guarded directories themselves must still stay pinned.
+    #[test]
+    fn renames_into_guarded_directories_succeed_while_the_guards_stay_pinned() {
+        let (r, d, h) = fixture();
+        let resolved = resolve_from(&d, &h, 7).unwrap();
+        let generation = d.join("runtime/runtime-00000000000000000007");
+        for directory in [
+            r.path().to_path_buf(),
+            d.clone(),
+            d.join("runtime"),
+            generation,
+        ] {
+            let target = directory.join("preferences.json");
+            fs::write(&target, b"old").unwrap();
+            let temporary = directory.join(".preferences.tmp");
+            fs::write(&temporary, b"new").unwrap();
+            fs::rename(&temporary, &target)
+                .unwrap_or_else(|error| panic!("rename into {}: {error}", directory.display()));
+            assert_eq!(fs::read(&target).unwrap(), b"new");
+            fs::remove_file(&target).unwrap();
+        }
+        assert!(fs::rename(&d, append_suffix(&d, "-moved")).is_err());
+        assert!(fs::rename(d.join("runtime"), d.join("runtime-moved")).is_err());
+        drop(resolved);
     }
     #[test]
     fn resolves_an_optional_dashboard_sibling_of_cores() {

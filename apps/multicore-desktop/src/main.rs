@@ -548,12 +548,37 @@ enum WriterResult {
     Failed(PreferenceWriteFailure),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PreferenceWriteFailure {
     kind: io::ErrorKind,
     raw_os_error: Option<i32>,
     attempts: usize,
+    /// The failed step and the OS message (no paths), for the low-level log.
+    detail: String,
 }
+
+impl PreferenceWriteFailure {
+    fn from_error(error: &io::Error, attempts: usize) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: preferences::raw_os_error(error),
+            attempts,
+            detail: error.to_string(),
+        }
+    }
+
+    fn log_line(&self) -> String {
+        format!(
+            "failed after {} attempt(s): {} (kind={:?}, os={:?})",
+            self.attempts, self.detail, self.kind, self.raw_os_error
+        )
+    }
+}
+
+/// The exit flush gets no background retries, so it rides out a short sharing violation (a
+/// core host reading the staged generation holds the data directory for a moment) itself.
+const PREFERENCE_FLUSH_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(150), Duration::from_millis(350)];
 
 struct PreferenceWriter {
     command_tx: Sender<WriterCommand>,
@@ -592,11 +617,26 @@ impl PreferenceWriter {
         }
     }
 
-    fn stop_and_flush(&mut self, preferences: &AppPreferences) -> bool {
+    fn stop_and_flush(
+        &mut self,
+        preferences: &AppPreferences,
+    ) -> Result<(), PreferenceWriteFailure> {
         self.stop();
-        self.store
-            .as_ref()
-            .is_some_and(|store| store.save(preferences).is_ok())
+        let Some(store) = self.store.as_ref() else {
+            let error = io::Error::new(io::ErrorKind::NotFound, "preference store unavailable");
+            return Err(PreferenceWriteFailure::from_error(&error, 1));
+        };
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let Err(error) = store.save(preferences) else {
+                return Ok(());
+            };
+            match PREFERENCE_FLUSH_RETRY_DELAYS.get(attempt - 1) {
+                Some(delay) => thread::sleep(*delay),
+                None => return Err(PreferenceWriteFailure::from_error(&error, attempt)),
+            }
+        }
     }
 }
 
@@ -637,11 +677,9 @@ fn preference_writer_loop(
             }
             if preference_failure_is_terminal(attempt, stop_after_write) {
                 let error = save_result.expect_err("failed preference write has an error");
-                let _ = results.send(WriterResult::Failed(PreferenceWriteFailure {
-                    kind: error.kind(),
-                    raw_os_error: error.raw_os_error(),
-                    attempts: attempt,
-                }));
+                let _ = results.send(WriterResult::Failed(PreferenceWriteFailure::from_error(
+                    &error, attempt,
+                )));
                 if stop_after_write {
                     return;
                 }
@@ -1760,10 +1798,11 @@ fn process_writer_results(
                     .mark_persisted(preferences);
             }
             WriterResult::Failed(failure) => {
-                eprintln!(
-                    "preferences save failed after {} attempts: kind={:?}, os={:?}",
-                    failure.attempts, failure.kind, failure.raw_os_error
-                );
+                // The GUI process has no console: the low-level log ("Копировать лог") is
+                // the only place this reason can be read from later.
+                let line = failure.log_line();
+                eprintln!("preferences save {line}");
+                daemon::record_low_level("preferences_save_failed", line);
             }
         }
     }
@@ -1801,15 +1840,20 @@ fn flush_preferences(
         .lock()
         .expect("preference writer lock")
         .stop_and_flush(&preferences);
-    if saved {
-        tracker
-            .lock()
-            .expect("preference tracker lock")
-            .mark_persisted(preferences);
-        ui.set_preference_error("".into());
-    } else {
-        ui.set_preference_error(PREFERENCE_SAVE_ERROR_RU.into());
-        eprintln!("preferences save failed");
+    match saved {
+        Ok(()) => {
+            tracker
+                .lock()
+                .expect("preference tracker lock")
+                .mark_persisted(preferences);
+            ui.set_preference_error("".into());
+        }
+        Err(failure) => {
+            ui.set_preference_error(PREFERENCE_SAVE_ERROR_RU.into());
+            let line = failure.log_line();
+            eprintln!("preferences flush {line}");
+            daemon::record_low_level("preferences_flush_failed", line);
+        }
     }
 }
 
@@ -4816,13 +4860,13 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode,
-        MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_RETRY_DELAYS, PREFERENCE_SAVE_ERROR_RU,
-        PendingImportOutcome, PendingSubscriptionConsents, PendingSubscriptionImports,
-        PersistenceTracker, PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler,
-        UpdateConfirmPlan, UpdateInstallIntent, WindowObservation, WriterCommand, WriterResult,
-        activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
-        drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
-        preference_error_for_result, preference_failure_is_terminal,
+        MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_FLUSH_RETRY_DELAYS, PREFERENCE_RETRY_DELAYS,
+        PREFERENCE_SAVE_ERROR_RU, PendingImportOutcome, PendingSubscriptionConsents,
+        PendingSubscriptionImports, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
+        ProfilePreferenceReconciler, UpdateConfirmPlan, UpdateInstallIntent, WindowObservation,
+        WriterCommand, WriterResult, activation_for_launch_arguments, ambient_motion_allowed,
+        delete_focus_plan, drain_latest_write, initial_window_visible, next_maximized,
+        parse_launch_arguments, preference_error_for_result, preference_failure_is_terminal,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
         startup_should_connect, update_check_due, update_confirm_plan, update_install_intent,
@@ -5744,14 +5788,14 @@ mod window_tests {
         let store = PreferenceStore::at(root.path().join("preferences.json"));
         let mut writer = PreferenceWriter::start(Some(store.clone()));
         let tray_snapshot = AppPreferences::default();
-        assert!(writer.stop_and_flush(&tray_snapshot));
+        assert!(writer.stop_and_flush(&tray_snapshot).is_ok());
 
         let final_snapshot = AppPreferences {
             ambient_background: false,
             visible_page: VisiblePage::Settings,
             ..tray_snapshot
         };
-        assert!(writer.stop_and_flush(&final_snapshot));
+        assert!(writer.stop_and_flush(&final_snapshot).is_ok());
         assert_eq!(store.load().unwrap(), final_snapshot);
     }
 
@@ -6056,11 +6100,10 @@ mod window_tests {
 
     #[test]
     fn writer_results_expose_only_bounded_safe_russian_error_and_success_clears_it() {
-        let failure = PreferenceWriteFailure {
-            kind: std::io::ErrorKind::PermissionDenied,
-            raw_os_error: Some(5),
-            attempts: PREFERENCE_RETRY_DELAYS.len() + 1,
-        };
+        let failure = PreferenceWriteFailure::from_error(
+            &std::io::Error::from_raw_os_error(5),
+            PREFERENCE_RETRY_DELAYS.len() + 1,
+        );
         assert_eq!(
             preference_error_for_result(&WriterResult::Failed(failure)),
             PREFERENCE_SAVE_ERROR_RU
@@ -6073,6 +6116,55 @@ mod window_tests {
         assert!(PREFERENCE_SAVE_ERROR_RU.chars().count() < 64);
         assert!(!PREFERENCE_SAVE_ERROR_RU.contains("http"));
         assert!(!PREFERENCE_SAVE_ERROR_RU.contains(":\\"));
+    }
+
+    /// A core host that briefly holds the data directory sharing reads only (the service
+    /// reading a staged generation) must not cost the exit flush its save; a hold that
+    /// outlasts the retries is reported with the failed step and OS code for the log.
+    #[cfg(windows)]
+    #[test]
+    fn exit_flush_rides_out_a_brief_directory_hold_and_reports_a_lasting_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
+        };
+        let hold = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = PreferenceStore::at(root.path().join("preferences.json"));
+        store.save(&AppPreferences::default()).unwrap();
+        let settings = AppPreferences {
+            visible_page: VisiblePage::Settings,
+            ..AppPreferences::default()
+        };
+
+        let held = hold(root.path());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+        let mut writer = PreferenceWriter::start(Some(store.clone()));
+        assert_eq!(writer.stop_and_flush(&settings), Ok(()));
+        release.join().unwrap();
+        assert_eq!(store.load().unwrap(), settings);
+
+        let _held = hold(root.path());
+        let mut writer = PreferenceWriter::start(Some(store.clone()));
+        let failure = writer
+            .stop_and_flush(&AppPreferences::default())
+            .unwrap_err();
+        assert_eq!(failure.raw_os_error, Some(32));
+        assert_eq!(failure.attempts, PREFERENCE_FLUSH_RETRY_DELAYS.len() + 1);
+        let line = failure.log_line();
+        assert!(line.contains("replace preferences: "), "{line}");
+        assert!(line.contains("os=Some(32)"), "{line}");
+        assert!(!line.contains(&*root.path().to_string_lossy()), "{line}");
     }
 
     #[test]

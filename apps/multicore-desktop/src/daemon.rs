@@ -44,7 +44,7 @@ fn low_level_data_root() -> Option<std::path::PathBuf> {
     Some(std::env::temp_dir().join(format!("multicore-desktop-test-{}", std::process::id())))
 }
 
-fn record_low_level(context: &str, detail: impl fmt::Display) {
+pub(crate) fn record_low_level(context: &str, detail: impl fmt::Display) {
     static LAST_ENTRY: std::sync::Mutex<Option<(String, std::time::Instant)>> =
         std::sync::Mutex::new(None);
     let entry = format!("{context}\t{detail}");
