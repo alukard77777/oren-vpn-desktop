@@ -2,7 +2,9 @@
 """Patches a vendored zashboard index.html in place for Linux packaging: inserts the pinned
 Content-Security-Policy <meta> tag (read from packaging/linux/versions.json) and externalizes
 the inline theme/favicon script into a sibling theme-favicon.js, so the shipped dashboard never
-needs 'unsafe-inline' in script-src.
+needs 'unsafe-inline' in script-src. It also copies packaging/dashboard/multicore-readonly.js next
+to index.html and references it right after the theme script: MultiCore's dashboard is read-only
+(Logs and Rules only).
 
 This is the Linux-packaging counterpart of the Protect-DashboardIndexHtml PowerShell function
 used by scripts/package-windows-release.ps1; both read the same "dashboard" component from their
@@ -22,6 +24,50 @@ import sys
 def fail(message: str) -> "None":
     print(f"patch_dashboard_csp: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+READONLY_SCRIPT_NAME = "multicore-readonly.js"
+READONLY_SCRIPT_SOURCE = (
+    pathlib.Path(__file__).resolve().parent.parent / "packaging" / "dashboard" / READONLY_SCRIPT_NAME
+)
+
+
+def patch_index(original: str, csp: str) -> "tuple[str, str]":
+    """Returns (patched index.html, externalised theme script). Raises ValueError on drift."""
+    charset_marker = '<meta charset="UTF-8" />\n'
+    if original.count(charset_marker) != 1:
+        raise ValueError("expected exactly one charset marker; upstream layout may have changed")
+    csp_meta_line = f'    <meta http-equiv="Content-Security-Policy" content="{csp}" />\n'
+    patched = original.replace(charset_marker, charset_marker + csp_meta_line, 1)
+
+    script_start = "    <script>\n      ;(function () {"
+    script_end = "    </script>\n  </body>"
+    start = patched.find(script_start)
+    if start < 0:
+        raise ValueError("expected inline theme script not found; upstream layout may have changed")
+    end = patched.find(script_end, start)
+    if end < 0:
+        raise ValueError("inline theme script is not closed as expected")
+    block_end = end + len("    </script>")
+    block = patched[start:block_end]
+    inline_open, inline_close = "    <script>\n", "\n    </script>"
+    if not (block.startswith(inline_open) and block.endswith(inline_close)):
+        raise ValueError("inline theme script markers are inconsistent")
+    inline_js = block[len(inline_open):-len(inline_close)]
+    theme = "\n".join(
+        line[6:] if line.startswith(" " * 6) else line for line in inline_js.split("\n")
+    ).strip("\n") + "\n"
+    patched = (
+        patched[:start]
+        + '    <script src="./theme-favicon.js"></script>\n'
+        + f'    <script src="./{READONLY_SCRIPT_NAME}"></script>'
+        + patched[block_end:]
+    )
+    if csp not in patched:
+        raise ValueError("patched index.html unexpectedly does not carry the pinned CSP")
+    if "<script>" in patched:
+        raise ValueError("patched index.html unexpectedly still contains an inline <script> block")
+    return patched, theme
 
 
 def main() -> None:
@@ -44,42 +90,17 @@ def main() -> None:
         )
     original = original_bytes.decode("utf-8")
 
-    charset_marker = '<meta charset="UTF-8" />\n'
-    if original.count(charset_marker) != 1:
-        fail("expected exactly one charset marker; upstream layout may have changed")
-    csp_meta_line = f'    <meta http-equiv="Content-Security-Policy" content="{csp}" />\n'
-    patched = original.replace(charset_marker, charset_marker + csp_meta_line, 1)
-
-    script_start = "    <script>\n      ;(function () {"
-    script_end = "    </script>\n  </body>"
-    start = patched.find(script_start)
-    if start < 0:
-        fail("expected inline theme script not found; upstream layout may have changed")
-    end = patched.find(script_end, start)
-    if end < 0:
-        fail("inline theme script is not closed as expected")
-    block_end = end + len("    </script>")
-    block = patched[start:block_end]
-    inline_open, inline_close = "    <script>\n", "\n    </script>"
-    if not (block.startswith(inline_open) and block.endswith(inline_close)):
-        fail("inline theme script markers are inconsistent")
-    inline_js = block[len(inline_open):-len(inline_close)]
-    dedented = "\n".join(
-        line[6:] if line.startswith(" " * 6) else line for line in inline_js.split("\n")
-    ).strip("\n") + "\n"
-
+    try:
+        patched, theme = patch_index(original, csp)
+    except ValueError as error:
+        fail(str(error))
     theme_script = index_file.parent / "theme-favicon.js"
-    if theme_script.exists():
-        fail(f"refusing to overwrite an existing {theme_script}")
-    theme_script.write_text(dedented, encoding="utf-8", newline="\n")
-
-    patched = patched[:start] + '    <script src="./theme-favicon.js"></script>' + patched[block_end:]
-
-    if csp not in patched:
-        fail("patched index.html unexpectedly does not carry the pinned CSP")
-    if "<script>" in patched:
-        fail("patched index.html unexpectedly still contains an inline <script> block")
-
+    readonly_script = index_file.parent / READONLY_SCRIPT_NAME
+    for target in (theme_script, readonly_script):
+        if target.exists():
+            fail(f"refusing to overwrite an existing {target}")
+    theme_script.write_text(theme, encoding="utf-8", newline="\n")
+    readonly_script.write_bytes(READONLY_SCRIPT_SOURCE.read_bytes())
     index_file.write_text(patched, encoding="utf-8", newline="\n")
     print(f"patch_dashboard_csp: patched {index_path}")
 

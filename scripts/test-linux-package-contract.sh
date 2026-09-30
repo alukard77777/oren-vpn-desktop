@@ -72,6 +72,14 @@ if [[ -d "$dashboard_dir" ]]; then
     echo 'Staged dashboard is missing the externalized theme-favicon.js' >&2
     exit 1
   }
+  cmp -s "$ROOT/packaging/dashboard/multicore-readonly.js" "$dashboard_dir/multicore-readonly.js" || {
+    echo 'Staged dashboard must carry packaging/dashboard/multicore-readonly.js unchanged' >&2
+    exit 1
+  }
+  grep -Fq '<script src="./multicore-readonly.js"></script>' "$dashboard_dir/index.html" || {
+    echo 'Staged dashboard index.html must load the read-only script' >&2
+    exit 1
+  }
   find "$dashboard_dir" -type l | grep -q . && {
     echo 'Staged dashboard must not contain symlinks' >&2
     exit 1

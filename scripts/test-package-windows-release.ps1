@@ -493,7 +493,7 @@ try {
 
     [string[]]$expectedDashboardFiles = @('MultiCore.exe', 'README.md', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.md',
         'cores/mihomo.exe', 'cores/xray.exe',
-        'dashboard/assets/app.js', 'dashboard/index.html', 'dashboard/theme-favicon.js',
+        'dashboard/assets/app.js', 'dashboard/index.html', 'dashboard/multicore-readonly.js', 'dashboard/theme-favicon.js',
         'licenses/Xray-core-MPL-2.0.txt', 'licenses/dashboard-fixture-LICENSE.txt', 'licenses/mihomo-GPL-3.0.txt',
         'runtime/multicore-core-host.exe', 'runtime/multicore-daemon.exe', 'runtime/multicore-updater.exe', 'versions.json')
     [Array]::Sort($expectedDashboardFiles, [StringComparer]::Ordinal)
@@ -513,6 +513,8 @@ try {
     Assert-True ($dashboardPatchedIndex.Contains("default-src 'self'; script-src 'self'")) 'staged dashboard index.html must carry the exact pinned CSP'
     Assert-True (-not $dashboardPatchedIndex.Contains('<script>')) 'staged dashboard index.html must not retain an inline <script> block'
     Assert-True ($dashboardPatchedIndex.Contains('<script src="./theme-favicon.js"></script>')) 'staged dashboard index.html must reference the externalized theme script'
+    Assert-True ($dashboardPatchedIndex.Contains("<script src=`"./theme-favicon.js`"></script>`n    <script src=`"./multicore-readonly.js`"></script>")) 'staged dashboard index.html must load the read-only script right after the theme script'
+    Assert-True ((Get-Sha256 (Join-Path $dashboardOut1 'dashboard\multicore-readonly.js')) -eq (Get-Sha256 (Join-Path $RepositoryRoot 'packaging\dashboard\multicore-readonly.js'))) 'staged read-only dashboard script must be byte-identical to packaging/dashboard/multicore-readonly.js'
     $themeScript = Get-Content -Raw -LiteralPath (Join-Path $dashboardOut1 'dashboard\theme-favicon.js')
     Assert-True ($themeScript.Contains("console.log('fixture-theme')")) 'externalized theme script must keep the original inline script body'
 
@@ -521,7 +523,7 @@ try {
     Assert-True ((Get-Sha256 (Join-Path $dashboardOut1 'licenses\dashboard-fixture-LICENSE.txt')) -eq (Get-Sha256 (Join-Path $DashboardBaseInput 'dashboard-fixture-LICENSE.txt'))) 'dashboard license must be staged unmodified'
 
     $sumLines = Get-Content -LiteralPath (Join-Path $dashboardOut1 'SHA256SUMS.txt')
-    Assert-True ($sumLines.Count -eq 15) 'SHA256SUMS must cover every staged file when the dashboard is enabled'
+    Assert-True ($sumLines.Count -eq 16) 'SHA256SUMS must cover every staged file when the dashboard is enabled'
     Assert-True (($sumLines -match [regex]::Escape('dashboard/index.html')).Count -eq 1) 'SHA256SUMS must record the patched dashboard index.html'
 
     # Negative: archive checksum mismatch.
