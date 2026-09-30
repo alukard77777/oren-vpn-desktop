@@ -1006,6 +1006,8 @@ export component AppWindow inherits Window {
     in property <bool> import-pending: false;
     in property <string> import-error;
     in property <string> subscription-title: "Подписка";
+    // First letter of the subscription name, for the chip avatar without a logo.
+    in property <string> subscription-initial: "П";
     in property <string> subscription-usage: "Нет данных";
     in property <string> subscription-expiry: "Добавьте ссылку";
     in property <string> subscription-updated: "Не обновлялась";
@@ -1472,15 +1474,16 @@ export component AppWindow inherits Window {
                 // Active subscription lives in the window title: name + expiry opens the
                 // profile menu, then refresh and the provider-notice bell.
                 if root.has-profile: title-subscription := Rectangle {
-                    property <length> logo-space: root.has-service-logo ? 22px : 0px;
+                    // Pill chip (approved Superdesign "Refined Title Bar"): avatar or logo,
+                    // name, a hairline divider, expiry and the menu chevron.
                     property <length> chip-width: Math.min(
-                        self.width - 72px,
-                        10px + self.logo-space + chip-title.preferred-width + 6px + chip-meta.preferred-width + 8px + 12px + 8px);
+                        self.width - 76px,
+                        5px + 20px + 8px + chip-title.preferred-width + 10px + 1px + 10px + chip-meta.preferred-width + 8px + 12px + 9px);
                     // Clears the expanded rail's brand divider (176px) by 8px.
                     x: root.navigation-collapsed ? 56px : 184px;
-                    y: 8px;
+                    y: 7px;
                     width: Math.max(0px, parent.width - self.x - 148px);
-                    height: 28px;
+                    height: 30px;
                     animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
                     subscription-chip := Rectangle {
@@ -1488,45 +1491,70 @@ export component AppWindow inherits Window {
                         y: 0;
                         width: parent.chip-width;
                         height: parent.height;
-                        border-radius: 6px;
-                        background: root.profile-menu-open ? #ffffff12 : chip-touch.has-hover ? #ffffff0a : transparent;
-                        border-color: shelf-open-focus.has-focus ? Theme.focus : transparent;
-                        border-width: shelf-open-focus.has-focus ? Theme.focus-width : 0px;
-                        animate background { duration: 120ms; easing: ease-out; }
+                        border-radius: 8px;
+                        background: root.profile-menu-open ? Theme.elevated : chip-touch.has-hover ? #181c21 : Theme.surface;
+                        border-color: shelf-open-focus.has-focus ? Theme.focus : chip-touch.has-hover || root.profile-menu-open ? #ffffff1a : #ffffff0f;
+                        border-width: shelf-open-focus.has-focus ? Theme.focus-width : 1px;
+                        animate background, border-color { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
-                        if root.has-service-logo: Image {
-                            x: 8px;
-                            y: 6px;
-                            width: 16px;
-                            height: 16px;
-                            source: root.service-logo;
-                            image-fit: contain;
-                            accessible-role: none;
+                        chip-avatar := Rectangle {
+                            x: 5px;
+                            y: (parent.height - self.height) / 2;
+                            width: 20px;
+                            height: 20px;
+                            border-radius: 5px;
+                            background: Theme.elevated;
+                            clip: true;
+                            if root.has-service-logo: Image {
+                                x: 2px;
+                                y: 2px;
+                                width: 16px;
+                                height: 16px;
+                                source: root.service-logo;
+                                image-fit: contain;
+                                accessible-role: none;
+                            }
+                            if !root.has-service-logo: Text {
+                                text: root.subscription-initial;
+                                color: Theme.accent-blue;
+                                font-size: 11px;
+                                font-weight: Theme.weight-semibold;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                accessible-role: none;
+                            }
                         }
                         chip-title := Text {
-                            x: 10px + title-subscription.logo-space;
-                            width: Math.min(self.preferred-width, Math.max(24px, parent.width - self.x - chip-meta.preferred-width - 34px));
+                            x: 33px;
+                            width: Math.min(self.preferred-width, Math.max(24px, parent.width - self.x - chip-meta.preferred-width - 50px));
                             height: parent.height;
                             text: root.subscription-title;
                             color: Theme.text-primary;
-                            font-size: Theme.type-metadata-size;
+                            font-size: 13px;
                             font-weight: Theme.weight-semibold;
                             vertical-alignment: center;
                             overflow: elide;
                         }
+                        chip-divider := Rectangle {
+                            x: chip-title.x + chip-title.width + 10px;
+                            y: (parent.height - self.height) / 2;
+                            width: 1px;
+                            height: 14px;
+                            background: Theme.line;
+                        }
                         chip-meta := Text {
-                            x: chip-title.x + chip-title.width + 6px;
-                            width: Math.max(0px, Math.min(self.preferred-width, parent.width - self.x - 28px));
+                            x: chip-divider.x + 11px;
+                            width: Math.max(0px, Math.min(self.preferred-width, parent.width - self.x - 29px));
                             height: parent.height;
-                            text: root.subscription-refresh-error != "" ? "Не удалось обновить" : "· " + root.subscription-expiry;
+                            text: root.subscription-refresh-error != "" ? "Не удалось обновить" : root.subscription-expiry;
                             color: root.subscription-refresh-error != "" ? Theme.error : Theme.text-muted;
-                            font-size: Theme.type-metadata-size;
+                            font-size: 13px;
                             vertical-alignment: center;
                             overflow: elide;
                         }
                         chip-chevron := Path {
-                            x: parent.width - 20px;
-                            y: 10px;
+                            x: parent.width - 21px;
+                            y: 11px;
                             width: 12px;
                             height: 8px;
                             viewbox-width: 12;
@@ -1574,8 +1602,8 @@ export component AppWindow inherits Window {
                         // user set the active subscription's URL instead of showing a
                         // dead button.
                         property <bool> source-mode: !root.subscription-refresh-available;
-                        x: parent.chip-width + 4px;
-                        y: 0;
+                        x: parent.chip-width + 6px;
+                        y: 1px;
                         width: 28px;
                         height: 28px;
                         enabled: self.source-mode
@@ -1635,8 +1663,8 @@ export component AppWindow inherits Window {
                     }
 
                     if root.subscription-announcement-text != "": announcement-bell := FocusScope {
-                        x: parent.chip-width + 36px;
-                        y: 0;
+                        x: parent.chip-width + 38px;
+                        y: 1px;
                         width: 28px;
                         height: 28px;
                         focus-on-click: true;
@@ -1987,18 +2015,18 @@ export component AppWindow inherits Window {
                                 if root.toggle-detail-is-exit: HorizontalLayout {
                                     spacing: 6px;
                                     alignment: start;
-                                    Text { text: "Выход"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
-                                    // A leading emoji is drawn as an embedded image (colour in
-                                    // every renderer); other symbols use the emoji font, as the
-                                    // UI font renders regional-indicator flags as letters ("SE").
-                                    // Behind an automatic group, the real node leads (flag + name) and the
-                                    // group follows muted: "Выход 🇸🇪 Sweden · Автовыбор".
+                                    // The selected group leads; behind an automatic group an arrow
+                                    // points at the node it actually uses: "Автовыбор → 🇸🇪 Sweden".
+                                    // A leading emoji is drawn as an embedded image (colour in every
+                                    // renderer); other symbols use the emoji font, as the UI font
+                                    // renders regional-indicator flags as letters ("SE").
+                                    if root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
+                                    if root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
+                                    Text { horizontal-stretch: 0; max-width: 200px; text: root.node-name; color: root.exit-now-name != "" ? Theme.text-muted : Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
+                                    if root.exit-now-name != "": Text { text: "→"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.exit-now-name != "" && root.exit-now-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.exit-now-icon-image; image-fit: contain; accessible-role: none; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } }
                                     if root.exit-now-name != "" && root.exit-now-icon != "" && root.exit-now-icon-image.width == 0: Text { text: root.exit-now-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
                                     if root.exit-now-name != "": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } accessible-label: "Текущий узел " + root.exit-now-name; }
-                                    if root.exit-now-name == "" && root.node-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.node-icon-image; image-fit: contain; accessible-role: none; }
-                                    if root.exit-now-name == "" && root.node-icon != "" && root.node-icon-image.width == 0: Text { text: root.node-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
-                                    Text { horizontal-stretch: 0; max-width: 220px; text: root.exit-now-name != "" ? "· " + root.node-name : root.node-name; color: root.exit-now-name != "" ? Theme.text-muted : Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; }
                                     if root.node-latency != "": Text { text: "· " + root.node-latency; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
                                     // Live speed follows the exit inline; each arrow only shows with a value.
                                     if root.traffic-down != "": Text { text: "·  ↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
@@ -2352,26 +2380,34 @@ export component AppWindow inherits Window {
                                 opacity: root.route-search-open ? 0 : 1;
                                 visible: self.opacity > 0;
                                 animate opacity, x { duration: root.route-search-open ? 160ms : 280ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                                routes-title := Text {
-                                    height: 36px;
+                                // Title and meta are top-aligned in the 36px row; the smaller meta
+                                // drops by the size gap so both sit on one baseline.
+                                VerticalLayout {
                                     horizontal-stretch: 0;
+                                    padding-top: 9px;
+                                    alignment: start;
+                                routes-title := Text {
                                     text: "Маршруты";
                                     color: Theme.text-primary;
                                     font-size: Theme.type-label-size;
                                     font-weight: Theme.weight-semibold;
-                                    vertical-alignment: center;
+                                    vertical-alignment: top;
                                 }
-                                route-updated-meta := Text {
-                                    height: 36px;
+                                }
+                                VerticalLayout {
                                     horizontal-stretch: 1;
+                                    padding-top: 9px + (Theme.type-label-size - Theme.type-metadata-size) * 1.05;
+                                    alignment: start;
+                                route-updated-meta := Text {
                                     text: root.latency-check-loading ? "· Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? "· " + root.subscription-updated : "· Обновлено " + root.subscription-updated;
                                     color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
                                     horizontal-alignment: left;
                                     accessible-role: text;
                                     accessible-live-region: polite;
-                                    vertical-alignment: center;
+                                    vertical-alignment: top;
                                     overflow: elide;
+                                }
                                 }
                                 route-search-toggle := FocusScope {
                                     width: 32px;

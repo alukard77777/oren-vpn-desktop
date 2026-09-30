@@ -4302,6 +4302,14 @@ fn toggle_presentation(presentation: &StatePresentation) -> TogglePresentation {
     }
 }
 
+/// First letter or digit of a subscription name, upper-cased, for the chip avatar.
+fn subscription_initial(name: &str) -> String {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "П".into())
+}
+
 /// Stable 64-bit FNV-1a fingerprint of a provider notice (`None` when there is
 /// none). Stable across Rust versions, unlike `DefaultHasher`.
 fn announcement_fingerprint(text: &str) -> Option<String> {
@@ -4360,6 +4368,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_import_pending(snapshot.import_pending);
     ui.set_import_error(snapshot.import_error.clone().into());
     ui.set_subscription_title(snapshot.subscription.display_name.clone().into());
+    ui.set_subscription_initial(subscription_initial(&snapshot.subscription.display_name).into());
     ui.set_subscription_usage(snapshot.subscription.usage.clone().into());
     ui.set_subscription_expiry(snapshot.subscription.expiry.clone().into());
     ui.set_subscription_updated(snapshot.subscription.updated.clone().into());
@@ -4873,8 +4882,8 @@ mod window_tests {
             .and_then(|source| source.split("announcement-bell := FocusScope").next())
             .expect("subscription refresh action source");
         for unchanged in [
-            "x: parent.chip-width + 4px;",
-            "y: 0;",
+            "x: parent.chip-width + 6px;",
+            "y: 1px;",
             "width: 28px;",
             "height: 28px;",
             "@image-url(\"../assets/title-refresh.svg\")",
@@ -5291,9 +5300,14 @@ mod window_tests {
                     .next()
             })
             .expect("title subscription switcher source");
+        // A bordered pill: surface at rest, lifted on hover, elevated while open.
         assert!(switcher.contains(
-            "background: root.profile-menu-open ? #ffffff12 : chip-touch.has-hover ? #ffffff0a : transparent;"
+            "background: root.profile-menu-open ? Theme.elevated : chip-touch.has-hover ? #181c21 : Theme.surface;"
         ));
+        assert!(switcher.contains("border-radius: 8px;"));
+        assert!(switcher.contains("chip-avatar := Rectangle"));
+        assert!(switcher.contains("text: root.subscription-initial;"));
+        assert!(switcher.contains("chip-divider := Rectangle"));
         assert!(switcher.contains("function toggle-menu(keyboard: bool)"));
         assert!(switcher.contains("root.profile-menu-keyboard-open = keyboard;"));
 
@@ -6392,14 +6406,19 @@ mod window_tests {
         ] {
             assert!(app.contains(property), "{property}");
         }
-        // Real node first, the group follows muted; plain node exits stay as before.
-        assert!(app.contains("if root.exit-now-name != \"\": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name;"));
-        assert!(app.contains(
-            "text: root.exit-now-name != \"\" ? \"· \" + root.node-name : root.node-name;"
-        ));
-        assert!(
-            app.contains("if root.exit-now-name == \"\" && root.node-icon-image.width > 0: Image")
-        );
+        // "Group → real node": the selected group leads (muted when a real node
+        // follows), an arrow points at the node the group is actually using.
+        let group = app
+            .find("text: root.node-name; color: root.exit-now-name != \"\" ? Theme.text-muted")
+            .expect("group");
+        let arrow = app
+            .find("if root.exit-now-name != \"\": Text { text: \"→\";")
+            .expect("arrow");
+        let node = app
+            .find("if root.exit-now-name != \"\": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name;")
+            .expect("real node");
+        assert!(group < arrow && arrow < node);
+        assert!(!app.contains("text: \"Выход\";"));
         // The name crossfades in on change via a one-frame flag, gated by reduced motion.
         assert!(app.contains("exit-now-enter := Timer {\n        interval: 16ms;\n        running: root.exit-now-entering;"));
         assert!(app.contains("if (root.exit-now-name != \"\" && !root.reduced-motion) {"));
@@ -6428,6 +6447,13 @@ mod window_tests {
             super::exit_latency(&[node("Автовыбор", true, "Тайм-аут")], "Автовыбор"),
             ""
         );
+    }
+
+    #[test]
+    fn chip_avatar_uses_the_first_letter_of_the_subscription() {
+        assert_eq!(super::subscription_initial("Fjord VPN"), "F");
+        assert_eq!(super::subscription_initial("🌍 мой сервер"), "М");
+        assert_eq!(super::subscription_initial("  "), "П");
     }
 
     #[test]
