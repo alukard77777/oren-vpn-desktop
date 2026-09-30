@@ -1,4 +1,5 @@
 pub mod connection_mode;
+pub mod dashboard_proxy;
 pub mod elevated_controller;
 pub mod service_client;
 pub mod system_proxy;

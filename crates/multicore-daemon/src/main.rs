@@ -103,35 +103,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let use_service = service_mode == ServiceMode::Service;
+    // Without the service the dashboard proxy and the selector talk to the daemon's own
+    // on-demand Mihomo; with it, to the service's filtered controller proxy (set on `Prepare`).
     if !use_service {
         controller_slot.set(mihomo_controller_address, &mihomo_controller_secret, None);
     }
+    drop(mihomo_controller_secret);
     let selector = Arc::new(SlotSelector::new(controller_slot.clone()));
 
     // The vendored zashboard build ships as a `dashboard/` sibling of `cores/` and `runtime/`
-    // at the package root (see packaging/*/versions.json). `dashboard_url` embeds the
-    // per-process controller secret and must never be logged.
+    // at the package root (see packaging/*/versions.json). Mihomo never serves it (no
+    // `external-ui`): the daemon's read-only dashboard proxy does, see `dashboard_proxy`.
     let dashboard_directory = env::current_exe().ok().and_then(|executable| {
         dashboard_directory_for(&executable).map(|package_root| package_root.join("dashboard"))
     });
-    let runtime_control = match &dashboard_directory {
-        Some(directory) if !use_service => runtime_control
-            .clone()
-            .with_external_ui_directory(directory)
-            .unwrap_or(runtime_control),
-        _ => runtime_control,
-    };
-    let dashboard_url: Option<Arc<str>> = dashboard_directory
-        .as_deref()
-        .filter(|directory| !use_service && directory.join("index.html").is_file())
-        .map(|_| {
-            Arc::from(format!(
-                "http://{mihomo_controller_address}/ui/#/setup?hostname={}&port={}&secret={mihomo_controller_secret}",
-                mihomo_controller_address.ip(),
-                mihomo_controller_address.port(),
-            ))
-        });
-    drop(mihomo_controller_secret);
 
     let store = ProfileStore::open(
         data_directory.join("profiles"),
@@ -153,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         package_root: env::current_exe()
             .ok()
             .and_then(|executable| dashboard_directory_for(&executable)),
-        dashboard_directory: dashboard_directory.clone().filter(|_| !use_service),
+        dashboard_directory: None,
         log_path: data_directory.join("logs").join("latest-core.log"),
         marker_path: system_proxy_marker,
     };
@@ -260,6 +245,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ServiceMode::Absent => {}
     }
 
+    // Read-only dashboard on its own loopback port with its own per-session token. The URL
+    // embeds that token and must never be logged; it only leaves this process through the
+    // authenticated `/v1/dashboard-url` route.
+    let dashboard_url: Option<Arc<str>> = match dashboard_directory
+        .as_ref()
+        .filter(|directory| directory.join("index.html").is_file())
+    {
+        Some(directory) => {
+            let token = random_hex(32)?;
+            let listener = bind_loopback("127.0.0.1:0".parse()?).await?;
+            let port = listener.local_addr()?.port();
+            let router = multicore_daemon::dashboard_proxy::dashboard_router(
+                directory.clone(),
+                Arc::from(token.as_str()),
+                controller_slot.clone(),
+            );
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            Some(Arc::from(multicore_daemon::dashboard_proxy::dashboard_url(
+                port, &token,
+            )))
+        }
+        None => None,
+    };
+
     let shared: Arc<dyn Backend> = backend.clone();
     let app = try_router_shared(shared, token, dashboard_url)?;
     let listener = bind_loopback(address).await?;
@@ -341,6 +352,12 @@ fn service_controller(
     } else {
         Ok(proxy_mode.service_controller(service, generation, mixed_port))
     }
+}
+
+fn random_hex(bytes: usize) -> Result<String, getrandom::Error> {
+    let mut buffer = vec![0_u8; bytes];
+    getrandom::fill(&mut buffer)?;
+    Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// A loopback port free right now; Mihomo binds it moments later. A port taken in between
@@ -513,6 +530,16 @@ mod tests {
         let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
         assert!(!production.contains("to_socket_addrs"));
         assert!(!production.contains("with_xray_resolved_hosts"));
+    }
+
+    #[test]
+    fn the_daemon_serves_the_read_only_dashboard_and_mihomo_serves_no_ui() {
+        let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("with_external_ui_directory"));
+        assert!(!production.contains("/ui/#/setup"));
+        assert!(production.contains("dashboard_proxy::dashboard_router("));
+        assert!(production.contains("controller_slot.clone(),"));
+        assert!(production.contains("dashboard_directory: None,"));
     }
 
     #[cfg(windows)]
