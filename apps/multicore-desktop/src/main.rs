@@ -2743,35 +2743,56 @@ fn wire_automatic_subscription_refresh(
 ) -> Timer {
     const RETRY_BACKOFF_SECS: u64 = 15 * 60;
 
+    // Ticks every 2 s: the first ticks wait for the app to be ready and refresh once on
+    // launch; after that the provider-interval check runs every 30 ticks (once a minute).
+    const TICK_SECS: u64 = 2;
+    const INTERVAL_CHECK_TICKS: u64 = 30;
+
     let timer = Timer::default();
     let weak = ui.as_weak();
     let retry_after = Rc::new(Cell::new(0_u64));
-    timer.start(TimerMode::Repeated, Duration::from_secs(60), move || {
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let (mutation, client, current) = {
-            let mut model = model.lock().expect("view model lock");
-            let due = now_unix >= retry_after.get()
-                && model.automatic_subscription_refresh_due_at(now_unix);
-            let mutation = due.then(|| model.begin_subscription_refresh()).flatten();
-            (mutation, model.daemon_client(), snapshot(&model))
-        };
-        if let Some(ui) = weak.upgrade() {
-            apply_snapshot(&ui, &current);
-        }
-        if let Some(mutation) = mutation {
-            retry_after.set(now_unix.saturating_add(RETRY_BACKOFF_SECS));
-            run_subscription_refresh(
-                weak.clone(),
-                model.clone(),
-                client,
-                mutation,
-                profile_preferences.clone(),
-            );
-        }
-    });
+    let launch_refresh_pending = Rc::new(Cell::new(true));
+    let ticks = Rc::new(Cell::new(0_u64));
+    timer.start(
+        TimerMode::Repeated,
+        Duration::from_secs(TICK_SECS),
+        move || {
+            ticks.set(ticks.get() + 1);
+            let launch = launch_refresh_pending.get();
+            if !launch && !ticks.get().is_multiple_of(INTERVAL_CHECK_TICKS) {
+                return;
+            }
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let (mutation, client, current) = {
+                let mut model = model.lock().expect("view model lock");
+                let due = if launch {
+                    model.launch_subscription_refresh_ready()
+                } else {
+                    now_unix >= retry_after.get()
+                        && model.automatic_subscription_refresh_due_at(now_unix)
+                };
+                let mutation = due.then(|| model.begin_subscription_refresh()).flatten();
+                (mutation, model.daemon_client(), snapshot(&model))
+            };
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            if let Some(mutation) = mutation {
+                launch_refresh_pending.set(false);
+                retry_after.set(now_unix.saturating_add(RETRY_BACKOFF_SECS));
+                run_subscription_refresh(
+                    weak.clone(),
+                    model.clone(),
+                    client,
+                    mutation,
+                    profile_preferences.clone(),
+                );
+            }
+        },
+    );
     timer
 }
 

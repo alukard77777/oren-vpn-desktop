@@ -2052,8 +2052,8 @@ export component AppWindow inherits Window {
                                 property <int> focus-epoch: root.power-action-focus-serial;
                                 x: parent.width - self.width - 20px;
                                 y: (parent.height - self.height) / 2;
-                                width: 72px;
-                                height: 40px;
+                                width: 76px;
+                                height: 42px;
                                 enabled: root.primary-enabled && !root.profile-menu-open;
                                 focus-on-click: true;
                                 focus-on-tab-navigation: true;
@@ -2078,7 +2078,9 @@ export component AppWindow inherits Window {
                                     return reject;
                                 }
 
-                                // The switch track; its knob slides between off (left) and on (right).
+                                // "Energy rail + power orb" (approved Superdesign "Green Shield Orb Energy
+                                // Rail"): a slim rail that fills green, and a larger orb carrying the shield
+                                // that rides over the rail's end; lit green when on, blue while busy.
                                 power-button := Rectangle {
                                     // Pointer over the switch (plus a small margin), not just the card.
                                     property <bool> hovered: strip-glow-touch.has-hover
@@ -2088,30 +2090,104 @@ export component AppWindow inherits Window {
                                         && strip-glow-touch.mouse-y <= power-action.y + power-action.height + 6px;
                                     width: parent.width;
                                     height: parent.height;
-                                    border-radius: self.height / 2;
-                                    background: root.shown-busy ? #4c9dff59
-                                        : root.shown-on ? (self.hovered ? #4ad98c : Theme.accent-green)
-                                        : (self.hovered ? #3a414b : Theme.line);
-                                    border-color: power-action.has-focus ? Theme.focus : #ffffff59;
-                                    border-width: power-action.has-focus ? Theme.focus-width
-                                        : self.hovered && root.primary-enabled ? 2px : 0px;
-                                    animate border-width { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                                    background: transparent;
                                     opacity: root.primary-enabled || root.shown-busy ? 1 : 0.4;
                                     animate opacity { duration: 180ms; easing: ease-in-out; }
-                                    animate background { duration: 180ms; easing: ease-in-out; }
+
+                                    toggle-rail := Rectangle {
+                                        x: 6px;
+                                        y: (parent.height - self.height) / 2;
+                                        width: parent.width - 12px;
+                                        height: 28px;
+                                        border-radius: self.height / 2;
+                                        background: root.shown-busy ? #2a6fd0
+                                            : root.shown-on ? #28a863
+                                            : (power-button.hovered ? #232830 : #1a1e24);
+                                        animate background { duration: 220ms; easing: ease-out; }
+                                        border-color: power-action.has-focus ? Theme.focus
+                                            : root.shown-on || root.shown-busy ? #ffffff26
+                                            : (power-button.hovered ? #4a525e : #2a3038);
+                                        border-width: power-action.has-focus ? Theme.focus-width : 1px;
+                                        drop-shadow-blur: root.shown-on && !root.shown-busy ? (power-button.hovered ? 16px : 10px) : 0px;
+                                        drop-shadow-color: #3ccb7f55;
+                                        animate border-color, drop-shadow-blur { duration: 220ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+
+                                        // Sheen on the upper half of the lit rail.
+                                        Rectangle {
+                                            x: 2px;
+                                            y: 2px;
+                                            width: parent.width - 4px;
+                                            height: parent.height / 2 - 2px;
+                                            border-radius: self.height / 2;
+                                            background: #ffffff;
+                                            opacity: root.shown-on || root.shown-busy ? 0.14 : 0.03;
+                                            animate opacity { duration: 220ms; easing: ease-out; }
+                                        }
+                                        // Energy dots along the lit rail.
+                                        for dot[i] in 2: Rectangle {
+                                            x: 12px + i * 14px;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 4px;
+                                            height: 4px;
+                                            border-radius: 2px;
+                                            background: #ffffff;
+                                            opacity: root.shown-on || root.shown-busy ? 0.85 - i * 0.35 : 0;
+                                            animate opacity { duration: 220ms; easing: ease-out; }
+                                        }
+                                    }
 
                                     toggle-knob := Rectangle {
-                                        x: root.shown-on ? parent.width - self.width - 4px : 4px;
+                                        property <length> size: strip-glow-touch.pressed ? 35px : power-button.hovered ? 39px : 38px;
+                                        x: root.shown-on ? parent.width - self.width : 0px;
                                         y: (parent.height - self.height) / 2;
-                                        width: strip-glow-touch.pressed ? 36px : power-button.hovered ? 33px : 32px;
-                                        height: power-button.hovered ? 33px : 32px;
+                                        width: self.size;
+                                        height: self.size;
                                         border-radius: self.height / 2;
-                                        background: #ffffff;
-                                        drop-shadow-blur: 6px;
+                                        // Solid fill: gradients ignore border-radius in the software renderer.
+                                        background: root.shown-busy ? #2f7de0 : root.shown-on ? #2fbf73 : #1e2229;
+                                        border-color: root.shown-on || root.shown-busy ? #ffffff4d : #ffffff14;
+                                        border-width: 1px;
+                                        drop-shadow-blur: root.shown-on || root.shown-busy ? 12px : 6px;
                                         drop-shadow-offset-y: 2px;
-                                        drop-shadow-color: #00000059;
+                                        drop-shadow-color: root.shown-busy ? #2f7de066 : root.shown-on ? #1e8f5380 : #00000080;
                                         animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
-                                        animate width { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                                        animate width, height { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                                        animate background, border-color { duration: 220ms; easing: ease-out; }
+
+                                        // Glossy top half of the orb.
+                                        Rectangle {
+                                            x: 3px;
+                                            y: 2px;
+                                            width: parent.width - 6px;
+                                            height: parent.height / 2 - 1px;
+                                            border-radius: self.width / 2;
+                                            background: root.shown-on || root.shown-busy ? #ffffff2e : #ffffff0d;
+                                        }
+                                        // Faint ring around the lit orb.
+                                        Rectangle {
+                                            x: -3px;
+                                            y: -3px;
+                                            width: parent.width + 6px;
+                                            height: parent.height + 6px;
+                                            border-radius: self.height / 2;
+                                            border-width: 1px;
+                                            border-color: root.shown-busy ? #4c9dff59 : #3ccb7f66;
+                                            background: transparent;
+                                            opacity: root.shown-on || root.shown-busy ? 1 : 0;
+                                            animate opacity { duration: 220ms; easing: ease-out; }
+                                        }
+                                        Image {
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 18px;
+                                            height: 18px;
+                                            source: root.shown-busy ? @image-url("../assets/shield.svg")
+                                                : root.shown-on ? @image-url("../assets/shield-check.svg")
+                                                : @image-url("../assets/shield-off.svg");
+                                            colorize: root.shown-on || root.shown-busy ? #ffffff : Theme.text-muted;
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
                                     }
                                 }
                             }

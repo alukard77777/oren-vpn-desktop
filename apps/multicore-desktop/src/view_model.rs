@@ -1524,6 +1524,18 @@ impl DesktopViewModel {
         }
     }
 
+    /// The one refresh on app launch: as soon as a refreshable subscription is loaded
+    /// and the app is idle (ready or connected), regardless of the provider interval.
+    pub(crate) fn launch_subscription_refresh_ready(&self) -> bool {
+        matches!(
+            self.state,
+            UiState::Ready { .. } | UiState::Connected { .. }
+        ) && self
+            .subscription
+            .as_ref()
+            .is_some_and(|info| info.refresh_available)
+    }
+
     pub(crate) fn automatic_subscription_refresh_due_at(&self, now_unix: u64) -> bool {
         let Some(info) = self.subscription.as_ref() else {
             return false;
@@ -5139,6 +5151,29 @@ mod tests {
     }
 
     #[test]
+    fn launch_refresh_ignores_the_provider_interval_once_the_app_is_ready() {
+        let mut client = MockDaemonClient::ready();
+        client.status.subscription = Some(DaemonSubscriptionInfo {
+            updated_at_unix: 10_000,
+            refresh_interval_secs: Some(3_600),
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+        let mut model = DesktopViewModel::new(Arc::new(client));
+        // Nothing loaded yet: no launch refresh.
+        assert!(!model.launch_subscription_refresh_ready());
+        let refresh = model.begin_refresh();
+        let status = model.daemon_client().status().expect("status");
+        model.finish_refresh(refresh, Ok(status));
+        // Fresh subscription (interval not due) still refreshes on launch.
+        assert!(!model.automatic_subscription_refresh_due_at(10_001));
+        assert!(model.launch_subscription_refresh_ready());
+        // A subscription without a refreshable source never does.
+        model.subscription.as_mut().unwrap().refresh_available = false;
+        assert!(!model.launch_subscription_refresh_ready());
+    }
+
+    #[test]
     fn automatic_subscription_refresh_uses_provider_interval_or_safe_default() {
         let mut client = MockDaemonClient::ready();
         client.status.subscription = Some(DaemonSubscriptionInfo {
@@ -7431,12 +7466,13 @@ mod tests {
         assert!(toggle_module.contains("text: root.shown-title;"));
         assert!(toggle_module.contains("if root.toggle-detail-is-exit: HorizontalLayout"));
         assert!(toggle_module.contains("alignment: start;"));
-        assert!(toggle_module.contains("width: 72px;"));
-        assert!(toggle_module.contains("height: 40px;"));
+        // Energy rail + power orb: a slim rail and a shield orb riding over its end.
+        assert!(toggle_module.contains("width: 76px;"));
+        assert!(toggle_module.contains("height: 42px;"));
+        assert!(toggle_module.contains("toggle-rail := Rectangle"));
         assert!(toggle_module.contains("toggle-knob := Rectangle"));
-        assert!(
-            toggle_module.contains("x: root.shown-on ? parent.width - self.width - 4px : 4px;")
-        );
+        assert!(toggle_module.contains("x: root.shown-on ? parent.width - self.width : 0px;"));
+        assert!(toggle_module.contains("@image-url(\"../assets/shield-off.svg\")"));
         assert!(
             toggle_module.contains(
                 "animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }"
