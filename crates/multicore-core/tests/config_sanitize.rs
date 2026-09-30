@@ -48,7 +48,7 @@ rule-providers:
 proxy-providers:
   subscription: {type: http, url: 'https://example.invalid/p', path: ../../evil.yaml}
 proxies:
-  - {name: wg, type: wireguard, private-key: aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8gd28=}
+  - {name: wg, type: wireguard, private-key: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY=}
 "#;
 
 /// Listener keys that A6 removes in TUN mode (and, except `mixed-port`, in proxy mode too).
@@ -505,4 +505,102 @@ fn xray_keys_are_matched_case_insensitively() {
         sanitize_xray(br#"{"log":{"loglevel":"none"},"Log":{"access":"C:/x"}}"#),
         Err(SanitizeError::Malformed)
     );
+}
+
+/// Re-review C2/I1: Go folds `ſ` (U+017F) to `s` and the Kelvin sign (U+212A) to `k`, so any
+/// non-ASCII Xray key is refused (confirmed live against Xray 26.9.9 by the reviewer).
+#[test]
+fn xray_keys_with_unicode_fold_aliases_are_refused() {
+    for input in [
+        "{\"api\":{\"li\u{17f}ten\":\"0.0.0.0:10085\",\"services\":[\"HandlerService\"]}}",
+        "{\"metrics\":{\"li\u{17f}ten\":\"0.0.0.0:11111\"}}",
+        "{\"metric\u{17f}\":{\"listen\":\"0.0.0.0:11111\"}}",
+        "{\"inbound\u{17f}\":[{\"listen\":\"0.0.0.0\",\"port\":1}]}",
+        "{\"inbounds\":[{\"li\u{17f}ten\":\"0.0.0.0\",\"port\":1}]}",
+        "{\"outbounds\":[{\"x\":{\"\u{212a}eyFile\":\"C:/k.pem\"}}]}",
+        "{\"log\":{\"acce\u{17f}\u{17f}\":\"C:/Windows/evil.txt\"}}",
+        "{\"routing\":{\"rules\":[{\"é\":1}]}}",
+    ] {
+        assert_eq!(
+            sanitize_xray(input.as_bytes()),
+            Err(SanitizeError::Malformed),
+            "{input}"
+        );
+    }
+    // Non-ASCII *values* stay allowed (e.g. remarks, IDN domains).
+    sanitize_xray("{\"outbounds\":[{\"tag\":\"узел\",\"protocol\":\"freedom\"}]}".as_bytes())
+        .unwrap();
+}
+
+/// Mihomo's `structure` decoder accepts `_` for `-` in proxy fields, and field names are ASCII.
+#[test]
+fn mihomo_field_aliases_and_non_ascii_keys_are_handled() {
+    let underscore = "mixed-port: 1\nproxies:\n  - {name: s, type: ssh, server: a, port: 22, private_key: /etc/shadow}\n";
+    assert_eq!(
+        sanitize_mihomo(underscore.as_bytes(), &policy()),
+        Err(SanitizeError::FileReference(
+            "proxies[0].private_key".into()
+        ))
+    );
+    let mixed_case = "mixed-port: 1\nproxies:\n  - {name: v, type: vless, server: a, port: 1, Certificate: /etc/ssl/c.pem}\n";
+    assert_eq!(
+        sanitize_mihomo(mixed_case.as_bytes(), &policy()),
+        Err(SanitizeError::FileReference(
+            "proxies[0].Certificate".into()
+        ))
+    );
+    for input in [
+        "mixed-port: 1\nproxies:\n  - {name: s, type: ssh, server: a, port: 22, \"private-\u{212a}ey\": /etc/shadow}\n",
+        "mixed-port: 1\nrule-providers:\n  a: {type: http, behavior: domain, url: 'https://x', \"pa\u{17f}h\": /etc/x}\n",
+    ] {
+        assert_eq!(
+            sanitize_mihomo(input.as_bytes(), &policy()),
+            Err(SanitizeError::Malformed),
+            "{input}"
+        );
+    }
+}
+
+/// Re-review N1: `private-key` is PEM or a strict 32-byte base64 key, never a path.
+#[test]
+fn private_key_paths_are_refused_for_every_type() {
+    for (kind, key) in [
+        ("ssh", "/etc/shadow"),
+        ("ssh", "/etc/sudoers"),
+        ("wireguard", "/etc/gshadow"),
+        ("wireguard", "YWJjZA=="),
+        ("ssh", "C:\\Windows\\System32\\config\\SAM"),
+        ("vless", "key.pem"),
+        ("vless", "keys/client"),
+    ] {
+        let input = format!(
+            "mixed-port: 1\nproxies:\n  - {{name: p, type: {kind}, server: a, port: 1, private-key: '{key}'}}\n"
+        );
+        assert_eq!(
+            sanitize_mihomo(input.as_bytes(), &policy()),
+            Err(SanitizeError::FileReference(
+                "proxies[0].private-key".into()
+            )),
+            "{kind} {key}"
+        );
+    }
+    let wireguard = "mixed-port: 1\nproxies:\n  - {name: w, type: wireguard, server: a, port: 1, private-key: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWY=}\n";
+    assert!(sanitize_mihomo(wireguard.as_bytes(), &policy()).is_ok());
+    // Empty credential fields mean "absent".
+    let empty = "mixed-port: 1\nproxies:\n  - {name: h, type: hysteria2, server: a, port: 1, ca: '', certificate: '', private-key: ''}\n";
+    assert!(sanitize_mihomo(empty.as_bytes(), &policy()).is_ok());
+}
+
+#[test]
+fn tun_routing_table_and_descriptor_overrides_are_dropped() {
+    let input = "mixed-port: 1\ntun: {enable: true, stack: system, iproute2-table-index: 254, iproute2-rule-index: 0, file-descriptor: 3}\n";
+    let doc = yaml(&sanitize_mihomo(input.as_bytes(), &policy()).unwrap().yaml);
+    for dropped in [
+        "iproute2-table-index",
+        "iproute2-rule-index",
+        "file-descriptor",
+    ] {
+        assert!(doc["tun"].get(dropped).is_none(), "{dropped}");
+    }
+    assert_eq!(doc["tun"]["stack"].as_str(), Some("system"));
 }

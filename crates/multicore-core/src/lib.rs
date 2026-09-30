@@ -42,9 +42,9 @@ pub use service_logo::{
 };
 pub use sidecar::{
     CORE_READINESS_TIMEOUT, CommandSpec, CoreLogBuffer, CoreLogRecord, DiagnosticStream,
-    ManagedChild, ProcessDiagnostics, ProcessError, ProcessLauncher, RuntimeCheckState,
-    RuntimePaths, SidecarProcessController, TokioManagedChild, TokioProcessLauncher,
-    multicore_tun_is_up,
+    MAX_PERSISTENT_LOG_BYTES, ManagedChild, ProcessDiagnostics, ProcessError, ProcessLauncher,
+    RuntimeCheckState, RuntimePaths, SidecarProcessController, TokioManagedChild,
+    TokioProcessLauncher, multicore_tun_is_up, rotated_log_path,
 };
 pub use snapshot::{
     AtomicSnapshot, MihomoRuntimeControl, PersistenceError, PersistentSnapshotStore,

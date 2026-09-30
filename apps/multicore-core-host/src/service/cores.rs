@@ -41,11 +41,28 @@ use multicore_core::WindowsJobLauncher as PlatformLauncher;
 /// How long `SetTun{on:true}` waits for the `MultiCore` adapter and Mihomo to agree.
 pub(crate) const TUN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_POLL: Duration = Duration::from_millis(100);
+/// How long `SetTun{on:false}` waits for the loopback mixed port to accept connections again.
+pub(crate) const MIXED_PORT_RECHECK: Duration = Duration::from_secs(3);
+
+/// Whether something accepts TCP connections on `127.0.0.1:<port>` within `within`.
+pub(crate) fn mixed_port_listens(port: u16, within: Duration) -> bool {
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let deadline = Instant::now() + within;
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(TUN_POLL);
+    }
+}
 
 struct ActiveCores {
     /// What the daemon gets: the proxy's port and session token, and the mixed port (0 for a
     /// TUN generation, which opens none).
-    _endpoint: ControllerEndpoint,
+    endpoint: ControllerEndpoint,
     /// Mihomo's own controller; never leaves the service.
     controller_port: u16,
     controller_secret: Zeroizing<String>,
@@ -153,7 +170,7 @@ impl ProductionCores {
             mixed_port: mihomo.mixed_port.unwrap_or(0),
         };
         self.active = Some(ActiveCores {
-            _endpoint: endpoint.clone(),
+            endpoint: endpoint.clone(),
             controller_port,
             controller_secret,
             _proxy: proxy,
@@ -222,6 +239,12 @@ impl Cores for ProductionCores {
         let (port, secret) = (active.controller_port, active.controller_secret.as_str());
         mihomo_rest::set_tun_enabled(port, secret, on).map_err(|_| BrokerErrorCode::NotReady)?;
         if !on {
+            // Switching TUN off re-creates Mihomo's listeners; a proxy-mode generation must come
+            // back with its loopback mixed port, or the system proxy points at nothing.
+            let mixed_port = active.endpoint.mixed_port;
+            if mixed_port != 0 && !mixed_port_listens(mixed_port, MIXED_PORT_RECHECK) {
+                return Err(BrokerErrorCode::NotReady);
+            }
             return Ok(());
         }
         let deadline = Instant::now() + TUN_READY_TIMEOUT;

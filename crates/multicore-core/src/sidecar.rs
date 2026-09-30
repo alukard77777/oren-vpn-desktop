@@ -74,10 +74,20 @@ pub struct CoreLogBuffer {
     max_chars: usize,
 }
 
-const MAX_PERSISTENT_LOG_BYTES: u64 = 1_048_576;
+/// Size at which the persistent core log rotates. At most two files exist: the log itself and
+/// one rotated predecessor (`<name>.1`), so the log never uses more than twice this on disk.
+pub const MAX_PERSISTENT_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// The rotated predecessor of a persistent core log: `latest-core.log` -> `latest-core.log.1`.
+pub fn rotated_log_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
+}
 
 #[derive(Debug)]
 struct PersistentLogSink {
+    path: PathBuf,
     file: File,
     bytes_written: u64,
     disabled: bool,
@@ -97,10 +107,28 @@ impl PersistentLogSink {
             .truncate(true)
             .open(path)?;
         Ok(Self {
+            path: path.to_path_buf(),
             file,
             bytes_written: 0,
             disabled: false,
         })
+    }
+
+    /// Moves the full log to `<name>.1` (replacing the previous one) and starts an empty log;
+    /// if the rename is impossible the log is truncated in place instead.
+    fn rotate(&mut self) -> std::io::Result<()> {
+        if fs::rename(&self.path, rotated_log_path(&self.path)).is_ok() {
+            self.file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
+        } else {
+            self.file.set_len(0)?;
+            self.file.seek(SeekFrom::Start(0))?;
+        }
+        self.bytes_written = 0;
+        Ok(())
     }
 
     fn write(&mut self, record: &CoreLogRecord) {
@@ -127,9 +155,7 @@ impl PersistentLogSink {
         let bytes = line.as_bytes();
         let result = (|| -> std::io::Result<()> {
             if self.bytes_written.saturating_add(bytes.len() as u64) > MAX_PERSISTENT_LOG_BYTES {
-                self.file.set_len(0)?;
-                self.file.seek(SeekFrom::Start(0))?;
-                self.bytes_written = 0;
+                self.rotate()?;
             }
             self.file.write_all(bytes)?;
             self.file.flush()?;

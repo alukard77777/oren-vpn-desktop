@@ -539,3 +539,33 @@ fn a_fifo_config_is_rejected_without_blocking() {
     );
     assert!(resolve(&fixture).is_err());
 }
+
+/// Review (c): with CAP_DAC_READ_SEARCH the service must never follow a symlink in *any*
+/// component of the staged path, including intermediate directories above the generation.
+#[test]
+fn a_symlinked_intermediate_directory_is_never_followed() {
+    for victim in ["runtime", "multicore"] {
+        let fixture = fixture();
+        let path = match victim {
+            "runtime" => fixture.data.join("runtime"),
+            _ => fixture.data.clone(),
+        };
+        replace_with_symlink(&path);
+        assert_eq!(
+            resolve(&fixture).err(),
+            Some(ResolveError::Symlink),
+            "{victim}"
+        );
+    }
+}
+
+/// Dot components are refused outright instead of being resolved by the kernel.
+#[test]
+fn dot_components_in_the_data_root_are_refused() {
+    let fixture = fixture();
+    let dotted = fixture.data.join("..").join("multicore");
+    assert_eq!(
+        resolve_from(&dotted, &fixture.host, 42, uid()).err(),
+        Some(ResolveError::Layout)
+    );
+}
