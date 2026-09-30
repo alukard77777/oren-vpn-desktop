@@ -12,6 +12,13 @@
 //! refused, and only the top-level keys in [`ALLOWED_MIHOMO_KEYS`] survive. Xray keys are matched
 //! with ASCII case folding, as Go's `encoding/json` does, and an object with two keys that fold
 //! to the same name is refused.
+//!
+//! Xray is shaped, not deny-listed: only [`ALLOWED_XRAY_SECTIONS`] survive; every inbound must
+//! be exactly a loopback SOCKS bridge ([`ALLOWED_XRAY_INBOUND_KEYS`], no `streamSettings`);
+//! routing rules keep only matchers and targets ([`ALLOWED_XRAY_RULE_KEYS`], so no `webhook`);
+//! outbounds keep only their documented fields and a known protocol. At any depth, server-only
+//! features ([`XRAY_FORBIDDEN_KEYS`]) and file reads are refused, and no endpoint value
+//! ([`XRAY_ENDPOINT_KEYS`]) may name a local socket or file.
 
 use std::{net::IpAddr, path::Path};
 
@@ -33,6 +40,10 @@ pub enum SanitizeError {
     ServiceDirectory,
     #[error("config uses a protocol the service does not run through {0}")]
     ForbiddenProtocol(String),
+    #[error("config uses a field the service does not run through {0}")]
+    ForbiddenField(String),
+    #[error("config points an endpoint at a local socket or file through {0}")]
+    LocalEndpoint(String),
 }
 
 pub struct MihomoServicePolicy<'a> {
@@ -393,12 +404,39 @@ fn is_wireguard_key(text: &str) -> bool {
 }
 
 type JsonMap = serde_json::Map<String, serde_json::Value>;
+type Json = serde_json::Value;
+
+fn is_named(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|known| name.eq_ignore_ascii_case(known))
+}
 
 /// Case-folded field lookup, as Go's `encoding/json` matches struct fields.
-fn field<'a>(map: &'a JsonMap, name: &str) -> Option<&'a serde_json::Value> {
+fn field<'a>(map: &'a JsonMap, name: &str) -> Option<&'a Json> {
     map.iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value)
+}
+
+/// Keeps only the fields in `allowed` (ASCII-folded) and renames them to their canonical
+/// spelling. Folded duplicates were refused before, so no two keys collide.
+fn keep_known(map: &mut JsonMap, allowed: &[&str]) {
+    for (name, value) in std::mem::take(map) {
+        if let Some(canonical) = allowed
+            .iter()
+            .find(|known| name.eq_ignore_ascii_case(known))
+        {
+            map.insert((*canonical).to_owned(), value);
+        }
+    }
+}
+
+/// Like [`keep_known`], but an unknown field refuses the whole config.
+fn only_known(map: &mut JsonMap, allowed: &[&str], at: &str) -> Result<(), SanitizeError> {
+    if let Some(name) = map.keys().find(|name| !is_named(name, allowed)) {
+        return Err(SanitizeError::ForbiddenField(format!("{at}.{name}")));
+    }
+    keep_known(map, allowed);
+    Ok(())
 }
 
 /// Xray `log` fields kept; `access`/`error` (file outputs) and anything else are dropped.
@@ -426,66 +464,320 @@ pub const ALLOWED_XRAY_SECTIONS: &[&str] = &[
 /// every server protocol are refused.
 pub const ALLOWED_XRAY_INBOUND_PROTOCOLS: &[&str] = &["socks"];
 
+/// The exact shape of an inbound: a loopback SOCKS bridge (`InboundDetourConfig`, v26.9.9).
+/// Anything else refuses the config: `streamSettings` (so no TLS/REALITY `target`, no hysteria
+/// `masquerade`, no transport listeners), `allocate`, and any field a later Xray adds.
+pub const ALLOWED_XRAY_INBOUND_KEYS: &[&str] =
+    &["tag", "listen", "port", "protocol", "settings", "sniffing"];
+/// `SocksServerConfig` fields. `ip` is the UDP relay address and must be a loopback IP.
+const ALLOWED_XRAY_SOCKS_SETTINGS: &[&str] =
+    &["auth", "udp", "ip", "accounts", "users", "userLevel"];
+const ALLOWED_XRAY_SOCKS_ACCOUNT_KEYS: &[&str] = &["user", "pass"];
+const ALLOWED_XRAY_SOCKS_AUTH: &[&str] = &["noauth", "password"];
+/// `SniffingConfig` fields; flags and plain matcher lists only.
+const ALLOWED_XRAY_SNIFFING_KEYS: &[&str] = &[
+    "enabled",
+    "destOverride",
+    "domainsExcluded",
+    "ipsExcluded",
+    "metadataOnly",
+    "routeOnly",
+];
+
+/// Outbound protocols of the pinned Xray (its whole client loader list); an unknown protocol is
+/// refused. `wireguard` always runs with `noKernelTun: true` (a kernel TUN as root would
+/// create an interface, routes and rules and zero the host's `rp_filter`).
+pub const ALLOWED_XRAY_OUTBOUND_PROTOCOLS: &[&str] = &[
+    "blackhole",
+    "block",
+    "dns",
+    "direct",
+    "freedom",
+    "http",
+    "hysteria",
+    "loopback",
+    "shadowsocks",
+    "socks",
+    "trojan",
+    "vless",
+    "vmess",
+    "wireguard",
+];
+/// `OutboundDetourConfig` fields; anything else is dropped.
+const ALLOWED_XRAY_OUTBOUND_KEYS: &[&str] = &[
+    "protocol",
+    "sendThrough",
+    "tag",
+    "settings",
+    "streamSettings",
+    "proxySettings",
+    "mux",
+    "targetStrategy",
+];
+
+/// `RouterConfig` fields.
+const ALLOWED_XRAY_ROUTING_KEYS: &[&str] = &["rules", "domainStrategy", "balancers"];
+/// Routing rule fields of the pinned Xray (`RawFieldRule` in `infra/conf/router.go`): matchers
+/// and a target only. Everything else is dropped, notably `webhook`, whose notifier POSTs to a
+/// URL (or an absolute/`@` unix socket) with the core's own privileges.
+pub const ALLOWED_XRAY_RULE_KEYS: &[&str] = &[
+    "type",
+    "ruleTag",
+    "outboundTag",
+    "balancerTag",
+    "domain",
+    "domains",
+    "ip",
+    "port",
+    "network",
+    "sourceIP",
+    "source",
+    "sourcePort",
+    "user",
+    "vlessRoute",
+    "inboundTag",
+    "protocol",
+    "attrs",
+    "localIP",
+    "localPort",
+    "process",
+    "localOS",
+];
+const ALLOWED_XRAY_BALANCER_KEYS: &[&str] = &["tag", "selector", "strategy", "fallbackTag"];
+const ALLOWED_XRAY_STRATEGY_KEYS: &[&str] = &["type", "settings"];
+
+/// Keys (ASCII-folded, at any depth) whose string value, or string list items, name a network
+/// endpoint the core dials, resolves, relays to or posts to. Such a value may not be a local
+/// socket or file ([`is_local_endpoint`]): Xray treats an absolute path or `@name` there as a
+/// unix socket (REALITY `target`/`dest`, fallbacks, webhook `url`), and a root core would reach
+/// sockets its user cannot. HTTP request paths (`path`, e.g. `/ws`, xhttp and gRPC paths) are
+/// deliberately not in this list.
+pub const XRAY_ENDPOINT_KEYS: &[&str] = &[
+    "address",
+    "server",
+    "servers",
+    "target",
+    "dest",
+    "destination",
+    "url",
+    "host",
+    "endpoint",
+    "redirect",
+    "sendThrough",
+    "rewriteAddress",
+    "probeURL",
+    "connectivity",
+    "stunServers",
+    "resolvers",
+];
+
+/// Keys refused wherever they appear (ASCII-folded): server-side features a client bridge never
+/// needs (`masquerade` file server/proxy, `fallbacks`, `decryption`, `echServerKeys`) and raw
+/// socket powers of the privileged core (`customSockopt` = arbitrary `setsockopt`).
+pub const XRAY_FORBIDDEN_KEYS: &[&str] = &[
+    "masquerade",
+    "fallbacks",
+    "decryption",
+    "echServerKeys",
+    "customSockopt",
+];
+
 pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
-    let mut document: serde_json::Value =
-        serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
+    let mut document: Json = serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
     reject_ambiguous_keys(&document)?;
     let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
-    root.retain(|name, _| {
-        ALLOWED_XRAY_SECTIONS
-            .iter()
-            .any(|allowed| name.eq_ignore_ascii_case(allowed))
-    });
+    root.retain(|name, _| is_named(name, ALLOWED_XRAY_SECTIONS));
     for (name, value) in root.iter_mut() {
-        if !name.eq_ignore_ascii_case("log") {
-            continue;
-        }
-        let log = value.as_object_mut().ok_or(SanitizeError::Malformed)?;
-        log.retain(|key, _| {
-            ALLOWED_XRAY_LOG_KEYS
-                .iter()
-                .any(|allowed| key.eq_ignore_ascii_case(allowed))
-        });
-    }
-    for (name, value) in root.iter_mut() {
-        if !name.eq_ignore_ascii_case("inbounds") {
-            continue;
-        }
-        let inbounds = value.as_array_mut().ok_or(SanitizeError::Malformed)?;
-        for (index, inbound) in inbounds.iter_mut().enumerate() {
-            let inbound = inbound.as_object_mut().ok_or(SanitizeError::Malformed)?;
-            match field(inbound, "listen") {
-                None => {
-                    inbound.insert("listen".to_owned(), "127.0.0.1".into());
-                }
-                Some(serde_json::Value::String(listen))
-                    if listen
-                        .parse::<IpAddr>()
-                        .is_ok_and(|address| address.is_loopback()) => {}
-                Some(_) => {
-                    return Err(SanitizeError::NonLoopbackListener(format!(
-                        "inbounds[{index}].listen"
-                    )));
-                }
-            }
-            // Xray lower-cases the protocol name before looking up its loader.
-            let allowed = field(inbound, "protocol")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|protocol| {
-                    ALLOWED_XRAY_INBOUND_PROTOCOLS
-                        .iter()
-                        .any(|allowed| protocol.eq_ignore_ascii_case(allowed))
-                });
-            if !allowed {
-                return Err(SanitizeError::ForbiddenProtocol(format!(
-                    "inbounds[{index}].protocol"
-                )));
-            }
+        if name.eq_ignore_ascii_case("log") {
+            let log = value.as_object_mut().ok_or(SanitizeError::Malformed)?;
+            log.retain(|key, _| is_named(key, ALLOWED_XRAY_LOG_KEYS));
         }
     }
+    reject_xray_references(&document, "$")?;
     strip_output_files(&mut document);
-    reject_xray_file_references(&document, "$")?;
+    let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
+    for (name, value) in root.iter_mut() {
+        if name.eq_ignore_ascii_case("inbounds") {
+            shape_inbounds(value)?;
+        } else if name.eq_ignore_ascii_case("outbounds") {
+            shape_outbounds(value)?;
+        } else if name.eq_ignore_ascii_case("routing") {
+            shape_routing(value)?;
+        }
+    }
     serde_json::to_vec(&document).map_err(|_| SanitizeError::Malformed)
+}
+
+fn is_loopback_ip(value: &Json) -> bool {
+    value
+        .as_str()
+        .and_then(|text| text.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+}
+
+fn shape_inbounds(value: &mut Json) -> Result<(), SanitizeError> {
+    let inbounds = value.as_array_mut().ok_or(SanitizeError::Malformed)?;
+    for (index, inbound) in inbounds.iter_mut().enumerate() {
+        let at = format!("inbounds[{index}]");
+        let inbound = inbound.as_object_mut().ok_or(SanitizeError::Malformed)?;
+        match field(inbound, "listen") {
+            None => {
+                inbound.insert("listen".to_owned(), "127.0.0.1".into());
+            }
+            Some(listen) if is_loopback_ip(listen) => {}
+            Some(_) => return Err(SanitizeError::NonLoopbackListener(format!("{at}.listen"))),
+        }
+        // Xray lower-cases the protocol name before looking up its loader.
+        let allowed = field(inbound, "protocol")
+            .and_then(Json::as_str)
+            .is_some_and(|protocol| is_named(protocol, ALLOWED_XRAY_INBOUND_PROTOCOLS));
+        if !allowed {
+            return Err(SanitizeError::ForbiddenProtocol(format!("{at}.protocol")));
+        }
+        only_known(inbound, ALLOWED_XRAY_INBOUND_KEYS, &at)?;
+        inbound.insert("protocol".to_owned(), "socks".into());
+        // One fixed port, as a number (the service's readiness check reads it as one).
+        let port = match inbound.get("port") {
+            Some(Json::Number(number)) => number.as_u64(),
+            Some(Json::String(text)) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
+                text.parse().ok()
+            }
+            _ => None,
+        }
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| SanitizeError::ForbiddenField(format!("{at}.port")))?;
+        inbound.insert("port".to_owned(), port.into());
+        if inbound.get("tag").is_some_and(|tag| !tag.is_string()) {
+            return Err(SanitizeError::Malformed);
+        }
+        if let Some(settings) = inbound.get_mut("settings") {
+            shape_socks_settings(settings, &format!("{at}.settings"))?;
+        }
+        if let Some(sniffing) = inbound.get_mut("sniffing") {
+            let sniffing = sniffing.as_object_mut().ok_or(SanitizeError::Malformed)?;
+            only_known(
+                sniffing,
+                ALLOWED_XRAY_SNIFFING_KEYS,
+                &format!("{at}.sniffing"),
+            )?;
+            for (name, value) in sniffing.iter() {
+                let fits = match name.as_str() {
+                    "enabled" | "metadataOnly" | "routeOnly" => value.is_boolean(),
+                    _ => value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Json::is_string)),
+                };
+                if !fits {
+                    return Err(SanitizeError::Malformed);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn shape_socks_settings(settings: &mut Json, at: &str) -> Result<(), SanitizeError> {
+    if settings.is_null() {
+        return Ok(());
+    }
+    let settings = settings.as_object_mut().ok_or(SanitizeError::Malformed)?;
+    only_known(settings, ALLOWED_XRAY_SOCKS_SETTINGS, at)?;
+    for (name, value) in settings.iter_mut() {
+        match name.as_str() {
+            "auth" => {
+                if !value
+                    .as_str()
+                    .is_some_and(|auth| ALLOWED_XRAY_SOCKS_AUTH.contains(&auth))
+                {
+                    return Err(SanitizeError::ForbiddenField(format!("{at}.auth")));
+                }
+            }
+            "udp" if !value.is_boolean() => return Err(SanitizeError::Malformed),
+            "userLevel" if !value.is_u64() => return Err(SanitizeError::Malformed),
+            "ip" if !is_loopback_ip(value) => {
+                return Err(SanitizeError::NonLoopbackListener(format!("{at}.ip")));
+            }
+            "accounts" | "users" => {
+                if value.is_null() {
+                    continue;
+                }
+                let accounts = value.as_array_mut().ok_or(SanitizeError::Malformed)?;
+                for (index, account) in accounts.iter_mut().enumerate() {
+                    let account = account.as_object_mut().ok_or(SanitizeError::Malformed)?;
+                    only_known(
+                        account,
+                        ALLOWED_XRAY_SOCKS_ACCOUNT_KEYS,
+                        &format!("{at}.{name}[{index}]"),
+                    )?;
+                    if !account.values().all(Json::is_string) {
+                        return Err(SanitizeError::Malformed);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn shape_outbounds(value: &mut Json) -> Result<(), SanitizeError> {
+    let outbounds = value.as_array_mut().ok_or(SanitizeError::Malformed)?;
+    for (index, outbound) in outbounds.iter_mut().enumerate() {
+        let outbound = outbound.as_object_mut().ok_or(SanitizeError::Malformed)?;
+        keep_known(outbound, ALLOWED_XRAY_OUTBOUND_KEYS);
+        let protocol = outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .filter(|protocol| is_named(protocol, ALLOWED_XRAY_OUTBOUND_PROTOCOLS))
+            .ok_or_else(|| {
+                SanitizeError::ForbiddenProtocol(format!("outbounds[{index}].protocol"))
+            })?;
+        if protocol.eq_ignore_ascii_case("wireguard") {
+            let settings = outbound
+                .entry("settings")
+                .or_insert_with(|| Json::Object(JsonMap::new()));
+            if settings.is_null() {
+                *settings = Json::Object(JsonMap::new());
+            }
+            let settings = settings.as_object_mut().ok_or(SanitizeError::Malformed)?;
+            settings.retain(|name, _| !name.eq_ignore_ascii_case("noKernelTun"));
+            settings.insert("noKernelTun".to_owned(), true.into());
+        }
+    }
+    Ok(())
+}
+
+fn shape_routing(value: &mut Json) -> Result<(), SanitizeError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let routing = value.as_object_mut().ok_or(SanitizeError::Malformed)?;
+    keep_known(routing, ALLOWED_XRAY_ROUTING_KEYS);
+    if let Some(rules) = routing.get_mut("rules").filter(|rules| !rules.is_null()) {
+        for rule in rules.as_array_mut().ok_or(SanitizeError::Malformed)? {
+            keep_known(
+                rule.as_object_mut().ok_or(SanitizeError::Malformed)?,
+                ALLOWED_XRAY_RULE_KEYS,
+            );
+        }
+    }
+    if let Some(balancers) = routing.get_mut("balancers").filter(|list| !list.is_null()) {
+        for balancer in balancers.as_array_mut().ok_or(SanitizeError::Malformed)? {
+            let balancer = balancer.as_object_mut().ok_or(SanitizeError::Malformed)?;
+            keep_known(balancer, ALLOWED_XRAY_BALANCER_KEYS);
+            if let Some(strategy) = balancer
+                .get_mut("strategy")
+                .filter(|value| !value.is_null())
+            {
+                keep_known(
+                    strategy.as_object_mut().ok_or(SanitizeError::Malformed)?,
+                    ALLOWED_XRAY_STRATEGY_KEYS,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Xray fields that make the (privileged) core create or append to a file: TLS/REALITY
@@ -494,19 +786,15 @@ pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
 /// the file-reading fields (`certificateFile`, `keyFile`, `ext:`) are refused below.
 const XRAY_OUTPUT_FILE_KEYS: &[&str] = &["masterKeyLog"];
 
-fn strip_output_files(value: &mut serde_json::Value) {
+fn strip_output_files(value: &mut Json) {
     match value {
-        serde_json::Value::Object(map) => {
-            map.retain(|name, _| {
-                !XRAY_OUTPUT_FILE_KEYS
-                    .iter()
-                    .any(|output| name.eq_ignore_ascii_case(output))
-            });
+        Json::Object(map) => {
+            map.retain(|name, _| !is_named(name, XRAY_OUTPUT_FILE_KEYS));
             for child in map.values_mut() {
                 strip_output_files(child);
             }
         }
-        serde_json::Value::Array(items) => {
+        Json::Array(items) => {
             for item in items {
                 strip_output_files(item);
             }
@@ -519,9 +807,9 @@ fn strip_output_files(value: &mut serde_json::Value) {
 /// is `listen` and `KeyFile` with a Kelvin sign (U+212A) is `keyFile`. Every Xray field name is
 /// ASCII, so any non-ASCII key anywhere is refused; the remaining ASCII keys are then compared
 /// with ASCII folding, and two keys that fold together are refused (Go would pick one).
-fn reject_ambiguous_keys(value: &serde_json::Value) -> Result<(), SanitizeError> {
+fn reject_ambiguous_keys(value: &Json) -> Result<(), SanitizeError> {
     match value {
-        serde_json::Value::Object(map) => {
+        Json::Object(map) => {
             let mut seen = std::collections::HashSet::new();
             for (name, child) in map {
                 if !name.is_ascii() || !seen.insert(name.to_ascii_lowercase()) {
@@ -530,7 +818,7 @@ fn reject_ambiguous_keys(value: &serde_json::Value) -> Result<(), SanitizeError>
                 reject_ambiguous_keys(child)?;
             }
         }
-        serde_json::Value::Array(items) => {
+        Json::Array(items) => {
             for item in items {
                 reject_ambiguous_keys(item)?;
             }
@@ -545,27 +833,79 @@ fn is_external_geodata(text: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ext:"))
 }
 
-fn reject_xray_file_references(value: &serde_json::Value, at: &str) -> Result<(), SanitizeError> {
+/// A value that points at a local socket or file instead of a network host: an absolute or
+/// `@abstract` unix socket path (Xray's own rule), a Windows path (drive or `\`), a `file:` or
+/// `unix:`/`+unix:` URL, or anything with a NUL.
+fn is_local_endpoint(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let bytes = trimmed.as_bytes();
+    let lower = trimmed.to_ascii_lowercase();
+    text.contains('\0')
+        || matches!(bytes.first(), Some(b'/' | b'@' | b'\\'))
+        || lower.starts_with("file:")
+        || lower.contains("unix:")
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|byte| matches!(byte, b'/' | b'\\')))
+}
+
+/// The refusals that apply at any depth of the kept sections: file reads (`certificateFile`,
+/// `keyFile`, `ext:`), [`XRAY_FORBIDDEN_KEYS`], a socket `tproxy` mode, a `unix` socket `type`
+/// or `network`, and a local socket or file in any [`XRAY_ENDPOINT_KEYS`] value.
+fn reject_xray_references(value: &Json, at: &str) -> Result<(), SanitizeError> {
     match value {
-        serde_json::Value::Object(map) => {
+        Json::Object(map) => {
             for (name, child) in map {
                 let here = format!("{at}.{name}");
-                if name.eq_ignore_ascii_case("certificateFile")
-                    || name.eq_ignore_ascii_case("keyFile")
+                if is_named(name, &["certificateFile", "keyFile"])
                     // `dns.hosts` keys are domain rules too.
                     || is_external_geodata(name)
                 {
                     return Err(SanitizeError::FileReference(here));
                 }
-                reject_xray_file_references(child, &here)?;
+                if is_named(name, XRAY_FORBIDDEN_KEYS)
+                    || (name.eq_ignore_ascii_case("tproxy")
+                        && !child.as_str().is_some_and(|mode| {
+                            mode.is_empty() || mode.eq_ignore_ascii_case("off")
+                        }))
+                {
+                    return Err(SanitizeError::ForbiddenField(here));
+                }
+                if is_named(name, &["type", "network"])
+                    && child
+                        .as_str()
+                        .is_some_and(|kind| kind.to_ascii_lowercase().contains("unix"))
+                {
+                    return Err(SanitizeError::LocalEndpoint(here));
+                }
+                if is_named(name, XRAY_ENDPOINT_KEYS) {
+                    match child {
+                        Json::String(text) if is_local_endpoint(text) => {
+                            return Err(SanitizeError::LocalEndpoint(here));
+                        }
+                        Json::Array(items) => {
+                            if let Some(index) = items
+                                .iter()
+                                .position(|item| item.as_str().is_some_and(is_local_endpoint))
+                            {
+                                return Err(SanitizeError::LocalEndpoint(format!(
+                                    "{here}[{index}]"
+                                )));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                reject_xray_references(child, &here)?;
             }
         }
-        serde_json::Value::Array(items) => {
+        Json::Array(items) => {
             for (index, child) in items.iter().enumerate() {
-                reject_xray_file_references(child, &format!("{at}[{index}]"))?;
+                reject_xray_references(child, &format!("{at}[{index}]"))?;
             }
         }
-        serde_json::Value::String(text) if is_external_geodata(text) => {
+        Json::String(text) if is_external_geodata(text) => {
             return Err(SanitizeError::FileReference(at.to_owned()));
         }
         _ => {}
