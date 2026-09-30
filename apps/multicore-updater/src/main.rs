@@ -12,7 +12,19 @@ use multicore_release::{
 };
 use serde::Serialize;
 
+#[cfg(windows)]
+mod session;
+
 const WAIT_TIMEOUT_MS: u32 = 120_000;
+
+/// Service mode: the updater runs as SYSTEM on behalf of the user logged on to `session_id`,
+/// whose update results live in `user_update_dir`.
+#[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct ServiceLaunch {
+    session_id: u32,
+    user_update_dir: PathBuf,
+}
 
 #[derive(Debug)]
 struct ApplyRequest {
@@ -22,6 +34,7 @@ struct ApplyRequest {
     expected_size: u64,
     expected_sha256: String,
     version: Version,
+    service: Option<ServiceLaunch>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ApplyRequest, String> {
@@ -31,7 +44,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ApplyRequest, St
     while let Some(key) = args.next() {
         if !matches!(
             key.as_str(),
-            "--wait-pid" | "--archive" | "--target" | "--size" | "--sha256" | "--version"
+            "--wait-pid"
+                | "--archive"
+                | "--target"
+                | "--size"
+                | "--sha256"
+                | "--version"
+                | "--service-session"
+                | "--user-update-dir"
         ) {
             return Err(format!("unknown argument: {key}"));
         }
@@ -42,7 +62,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ApplyRequest, St
             return Err(format!("duplicate argument: {key}"));
         }
     }
-    if values.len() != 6 {
+    let service_keys = ["--service-session", "--user-update-dir"]
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    if values.len() != 6 + service_keys || service_keys == 1 {
         return Err("incomplete apply request".into());
     }
 
@@ -62,6 +86,21 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ApplyRequest, St
         .parse::<u64>()
         .map_err(|_| "invalid archive size")?;
     let version = Version::parse(&take("--version")?).map_err(|error| error.to_string())?;
+    let service = if service_keys == 2 {
+        let session_id = take("--service-session")?
+            .parse::<u32>()
+            .map_err(|_| "invalid service session")?;
+        let user_update_dir = PathBuf::from(take("--user-update-dir")?);
+        if !user_update_dir.is_absolute() {
+            return Err("user update directory must be absolute".into());
+        }
+        Some(ServiceLaunch {
+            session_id,
+            user_update_dir,
+        })
+    } else {
+        None
+    };
 
     Ok(ApplyRequest {
         wait_pid,
@@ -70,6 +109,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ApplyRequest, St
         expected_size,
         expected_sha256: take("--sha256")?,
         version,
+        service,
     })
 }
 
@@ -144,27 +184,33 @@ fn apply_update(request: &ApplyRequest) -> Result<(), Box<dyn std::error::Error>
     write_result(request, true, "Обновление установлено");
     let marker = update_state_dir(request).map(|directory| directory.join(STARTED_MARKER));
     if let Some(marker) = &marker {
-        let _ = fs::remove_file(marker);
+        as_user(request, || {
+            let _ = fs::remove_file(marker);
+        });
     }
     let version = request.version.to_string();
+    // The new service must be running before the new daemon looks for it.
+    start_service(request);
     let outcome = launch_and_finalize(
         &target,
         &backup,
-        |executable| {
-            Command::new(executable)
-                .current_dir(&target)
-                .spawn()
-                .map(|child| Box::new(child) as Box<dyn LaunchedClient>)
-        },
+        |executable| launch_client(request, executable, &target),
         || {
-            marker
-                .as_deref()
-                .is_some_and(|marker| marker_confirms(marker, &version))
+            as_user(request, || {
+                marker
+                    .as_deref()
+                    .is_some_and(|marker| marker_confirms(marker, &version))
+            })
+            .unwrap_or(false)
         },
         STARTUP_CONFIRM_TIMEOUT,
         std::thread::sleep,
-    )
-    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    );
+    if outcome.is_err() {
+        // Rolled back to the previous version (or left as is): bring its service back.
+        start_service(request);
+    }
+    let outcome = outcome.map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     match outcome {
         Finalization::Confirmed(Ok(())) => write_log(request, "installed and launched"),
@@ -236,7 +282,7 @@ fn discard_backup(backup: &Path) -> io::Result<()> {
     remove_scoped_directory(backup, BACKUP_PREFIX)
 }
 
-trait LaunchedClient {
+pub(crate) trait LaunchedClient {
     fn has_exited(&mut self) -> bool;
 }
 
@@ -297,6 +343,7 @@ fn launch_and_finalize(
 }
 
 fn relaunch_current_client(request: &ApplyRequest) -> io::Result<()> {
+    start_service(request);
     let executable = request.target.join("MultiCore.exe");
     if !executable.is_file() {
         return Err(io::Error::new(
@@ -304,10 +351,54 @@ fn relaunch_current_client(request: &ApplyRequest) -> io::Result<()> {
             "current MultiCore executable is unavailable",
         ));
     }
-    Command::new(executable)
-        .current_dir(&request.target)
-        .spawn()
-        .map(|_| ())
+    launch_client(request, &executable, &request.target).map(|_| ())
+}
+
+/// Starts the desktop: directly without the service, in the user's session in service mode.
+fn launch_client(
+    request: &ApplyRequest,
+    executable: &Path,
+    directory: &Path,
+) -> io::Result<Box<dyn LaunchedClient>> {
+    match &request.service {
+        None => Command::new(executable)
+            .current_dir(directory)
+            .spawn()
+            .map(|child| Box::new(child) as Box<dyn LaunchedClient>),
+        #[cfg(windows)]
+        Some(service) => {
+            let token = session::user_token(service.session_id)?;
+            session::launch(&token, executable, directory)
+                .map(|client| Box::new(client) as Box<dyn LaunchedClient>)
+        }
+        #[cfg(not(windows))]
+        Some(_) => Err(io::Error::other("service mode is Windows-only")),
+    }
+}
+
+/// In service mode, (re)starts the MultiCore service; a no-op otherwise.
+#[cfg(windows)]
+fn start_service(request: &ApplyRequest) {
+    if request.service.is_some() {
+        let _ = session::start_service();
+    }
+}
+
+#[cfg(not(windows))]
+fn start_service(_request: &ApplyRequest) {}
+
+/// Runs `work` as the logged-on user in service mode, directly otherwise, so SYSTEM never
+/// touches a user-controlled path with its own rights.
+fn as_user<T>(request: &ApplyRequest, work: impl FnOnce() -> T) -> Option<T> {
+    match &request.service {
+        None => Some(work()),
+        #[cfg(windows)]
+        Some(service) => session::user_token(service.session_id)
+            .and_then(|token| session::impersonating(&token, work))
+            .ok(),
+        #[cfg(not(windows))]
+        Some(_) => None,
+    }
 }
 
 fn rollback_after_launch_failure(target: &Path, backup: &Path) -> io::Result<()> {
@@ -474,8 +565,13 @@ struct UpdateResult<'a> {
     timestamp_unix: u64,
 }
 
+/// Where the result, log and start marker live: the user's update directory in service mode,
+/// the archive's directory otherwise.
 fn update_state_dir(request: &ApplyRequest) -> Option<PathBuf> {
-    request.archive.parent().map(PathBuf::from)
+    match &request.service {
+        Some(service) => Some(service.user_update_dir.clone()),
+        None => request.archive.parent().map(PathBuf::from),
+    }
 }
 
 fn write_result(request: &ApplyRequest, success: bool, message: &str) {
@@ -491,33 +587,39 @@ fn write_result(request: &ApplyRequest, success: bool, message: &str) {
             .unwrap_or_default()
             .as_secs(),
     };
-    if let Ok(bytes) = serde_json::to_vec(&result) {
+    let Ok(bytes) = serde_json::to_vec(&result) else {
+        return;
+    };
+    as_user(request, || {
         let temporary = directory.join("result.json.tmp");
         if fs::write(&temporary, bytes).is_ok() {
             let _ = fs::rename(temporary, directory.join("result.json"));
         }
-    }
+    });
 }
 
 fn write_log(request: &ApplyRequest, message: &str) {
     let Some(directory) = update_state_dir(request) else {
         return;
     };
-    let _ = fs::create_dir_all(&directory);
-    if let Ok(mut log) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("updater.log"))
-    {
-        let _ = writeln!(log, "v{}: {message}", request.version);
-    }
+    as_user(request, || {
+        let _ = fs::create_dir_all(&directory);
+        if let Ok(mut log) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("updater.log"))
+        {
+            let _ = writeln!(log, "v{}: {message}", request.version);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Finalization, LaunchedClient, discard_backup, image_is_within, launch_and_finalize,
-        marker_confirms, parse_args, remove_stale_work_directories, wait_until_clear,
+        marker_confirms, parse_args, remove_stale_work_directories, update_state_dir,
+        wait_until_clear,
     };
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
@@ -813,5 +915,74 @@ mod tests {
         assert!(found.contains(&child.id()), "{found:?}");
         // The test binary itself is excluded because it is the calling process.
         assert!(!super::processes_under(exe.parent().unwrap()).contains(&std::process::id()));
+    }
+
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "multicore-updater.exe",
+            "--wait-pid",
+            "42",
+            "--archive",
+            r"C:\ProgramData\MultiCore\service\update\multicore-1.1.0.zip",
+            "--target",
+            r"C:\Program Files\MultiCore\current",
+            "--size",
+            "10",
+            "--sha256",
+            "00",
+            "--version",
+            "1.1.0",
+        ]
+    }
+
+    #[test]
+    fn service_mode_needs_both_session_arguments() {
+        let mut args = base_args();
+        args.extend([
+            "--service-session",
+            "1",
+            "--user-update-dir",
+            r"C:\Users\me\AppData\Local\MultiCore\update",
+        ]);
+        let request = parse_args(args.iter().map(|arg| arg.to_string())).unwrap();
+        let service = request.service.as_ref().unwrap();
+        assert_eq!(service.session_id, 1);
+        assert_eq!(
+            update_state_dir(&request),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Local\MultiCore\update"))
+        );
+        let mut half = base_args();
+        half.extend(["--service-session", "1"]);
+        assert!(parse_args(half.iter().map(|arg| arg.to_string())).is_err());
+        let mut relative = base_args();
+        relative.extend(["--service-session", "1", "--user-update-dir", r"update"]);
+        assert!(parse_args(relative.iter().map(|arg| arg.to_string())).is_err());
+    }
+
+    #[test]
+    fn without_the_service_results_stay_next_to_the_archive() {
+        let request = parse_args(base_args().iter().map(|arg| arg.to_string())).unwrap();
+        assert!(request.service.is_none());
+        assert_eq!(
+            update_state_dir(&request),
+            Some(PathBuf::from(r"C:\ProgramData\MultiCore\service\update"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_mode_relaunches_in_the_user_session_and_restarts_the_service() {
+        let source = include_str!("session.rs");
+        for token in [
+            "WTSQueryUserToken",
+            "CreateProcessAsUserW",
+            "winsta0\\\\default",
+            "CreateEnvironmentBlock",
+            "ImpersonateLoggedOnUser",
+            "RevertToSelf",
+            "StartServiceW",
+        ] {
+            assert!(source.contains(token), "{token}");
+        }
     }
 }
