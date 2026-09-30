@@ -1257,6 +1257,9 @@ impl LaunchArguments {
 }
 
 const INSTALL_SUBSCRIPTION_ROUTE: &str = "multicore://install-sub";
+/// Happ-style form used by panel subscription pages (Remnawave's
+/// `{{SUBSCRIPTION_LINK}}`): the subscription URL follows verbatim.
+const ADD_SUBSCRIPTION_ROUTE: &str = "multicore://add/";
 
 fn parse_launch_arguments(
     args: impl IntoIterator<Item = OsString>,
@@ -1275,6 +1278,22 @@ fn parse_launch_arguments(
             let argument = argument
                 .to_str()
                 .ok_or("launch argument must be valid Unicode")?;
+            if let Some(prefix) = argument.get(..ADD_SUBSCRIPTION_ROUTE.len())
+                && prefix.eq_ignore_ascii_case(ADD_SUBSCRIPTION_ROUTE)
+            {
+                let target = &argument[ADD_SUBSCRIPTION_ROUTE.len()..];
+                let is_raw = ["http://", "https://"].iter().any(|scheme| {
+                    target
+                        .get(..scheme.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+                });
+                let subscription_url = if is_raw {
+                    target.to_owned()
+                } else {
+                    decode_percent_encoded_url(target)?
+                };
+                return deep_link_subscription(subscription_url);
+            }
             let (route, query) = argument
                 .split_once('?')
                 .ok_or("unsupported launch argument")?;
@@ -1290,27 +1309,32 @@ fn parse_launch_arguments(
             let encoded = query
                 .strip_prefix("url=")
                 .ok_or("installer URI must contain one subscription URL")?;
-            let subscription_url = decode_percent_encoded_url(encoded)?;
-            if subscription_url.len() > view_model::MAX_SUBSCRIPTION_URL_BYTES
-                || subscription_url.bytes().any(|byte| byte.is_ascii_control())
-            {
-                return Err("subscription URL contains invalid bytes or is too long");
-            }
-            let parsed = reqwest::Url::parse(&subscription_url)
-                .map_err(|_| "subscription URL is malformed")?;
-            if !matches!(parsed.scheme(), "http" | "https")
-                || parsed.host_str().is_none()
-                || parsed.fragment().is_some()
-            {
-                return Err("subscription URL must use HTTP or HTTPS");
-            }
-            Ok(LaunchArguments {
-                mode: LaunchMode::Foreground,
-                subscription_url: Some(subscription_url),
-            })
+            deep_link_subscription(decode_percent_encoded_url(encoded)?)
         }
         _ => Err("background mode and installer URI cannot be combined"),
     }
+}
+
+fn deep_link_subscription(subscription_url: String) -> Result<LaunchArguments, &'static str> {
+    if subscription_url.len() > view_model::MAX_SUBSCRIPTION_URL_BYTES
+        || subscription_url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err("subscription URL contains invalid bytes or is too long");
+    }
+    let parsed =
+        reqwest::Url::parse(&subscription_url).map_err(|_| "subscription URL is malformed")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.fragment().is_some()
+    {
+        return Err("subscription URL must use HTTP or HTTPS");
+    }
+    Ok(LaunchArguments {
+        mode: LaunchMode::Foreground,
+        subscription_url: Some(subscription_url),
+    })
 }
 
 fn decode_percent_encoded_url(encoded: &str) -> Result<String, &'static str> {
@@ -2670,7 +2694,7 @@ fn wire_clipboard_import(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        match clipboard_text::read_subscription_text() {
+        match clipboard_text::read_subscription_text(ui.window()) {
             Ok(url) => {
                 ui.set_subscription_draft(url.clone().into());
                 ui.invoke_import_url(url.into());
@@ -3553,12 +3577,12 @@ fn copy_diagnostics_now(weak: &slint::Weak<AppWindow>, model: &Arc<Mutex<Desktop
         text.push_str("\n\n--- low-level ---\n");
         text.push_str(&low_level);
     }
-    if clipboard_text::write_clipboard_text(text).is_err() {
-        return;
-    }
     let Some(ui) = weak.upgrade() else {
         return;
     };
+    if clipboard_text::write_clipboard_text(ui.window(), text).is_err() {
+        return;
+    }
     ui.set_diagnostics_copied(true);
     let reset_weak = weak.clone();
     Timer::single_shot(Duration::from_secs(2), move || {
@@ -6238,6 +6262,49 @@ mod window_tests {
     }
 
     #[test]
+    fn add_uri_takes_a_raw_subscription_link_like_panel_pages_send() {
+        for (argument, expected) in [
+            (
+                "multicore://add/https://sub.example.com/api/sub/AbC123",
+                "https://sub.example.com/api/sub/AbC123",
+            ),
+            (
+                "MULTICORE://ADD/https://sub.example.com/sub?token=a%2Fb&next=1",
+                "https://sub.example.com/sub?token=a%2Fb&next=1",
+            ),
+            (
+                "multicore://add/https%3A%2F%2Fsub.example.com%2Fsub",
+                "https://sub.example.com/sub",
+            ),
+        ] {
+            let parsed = parse_launch_arguments([argument.into()]).unwrap();
+            assert_eq!(parsed.mode, LaunchMode::Foreground);
+            assert_eq!(
+                parsed.subscription_url.as_deref(),
+                Some(expected),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_uri_rejects_non_http_fragments_and_blank_targets() {
+        for argument in [
+            "multicore://add/",
+            "multicore://add/ftp://example.com/sub",
+            "multicore://add/https://example.com/sub#frag",
+            "multicore://add/https://",
+            "multicore://add/https://example.com/a b",
+            "multicore://add/javascript:alert(1)",
+        ] {
+            assert!(
+                parse_launch_arguments([argument.into()]).is_err(),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
     fn installer_uri_rejects_extra_route_components_in_shell_form() {
         for argument in [
             "multicore://install-sub//?url=https%3A%2F%2Fexample.com",
@@ -6920,7 +6987,7 @@ mod window_tests {
         for required in [
             "ui.on_paste_subscription",
             "ui.on_dismiss_first_run_import",
-            "clipboard_text::read_subscription_text()",
+            "clipboard_text::read_subscription_text(ui.window())",
             "ui.set_subscription_draft",
             "ui.invoke_import_url",
             "model.set_import_error_message(error.user_message())",
