@@ -27,9 +27,21 @@ const LOW_LEVEL_LOG_FILE_NAME: &str = "client-errors.log";
 const MAX_LOW_LEVEL_LOG_BYTES: u64 = 262_144;
 
 fn low_level_log_path() -> Option<std::path::PathBuf> {
-    multicore_platform::dirs::user_data_root()
-        .ok()
-        .map(|root| root.join("logs").join(LOW_LEVEL_LOG_FILE_NAME))
+    low_level_data_root().map(|root| root.join("logs").join(LOW_LEVEL_LOG_FILE_NAME))
+}
+
+/// The data root the log lives under. Unit tests replay failing daemon exchanges (forbidden
+/// subscriptions, malformed bodies, private-node markers) through the very code that records
+/// them, so under `cfg(test)` the log goes to a per-process directory in the OS temp
+/// directory and never reaches the real user's diagnostics.
+#[cfg(not(test))]
+fn low_level_data_root() -> Option<std::path::PathBuf> {
+    multicore_platform::dirs::user_data_root().ok()
+}
+
+#[cfg(test)]
+fn low_level_data_root() -> Option<std::path::PathBuf> {
+    Some(std::env::temp_dir().join(format!("multicore-desktop-test-{}", std::process::id())))
 }
 
 fn record_low_level(context: &str, detail: impl fmt::Display) {
@@ -2709,6 +2721,20 @@ mod http_tests {
         server.join().unwrap();
         assert!(SUBSCRIPTION_MUTATION_TIMEOUT > REQUEST_TIMEOUT);
         assert!(SUBSCRIPTION_MUTATION_TIMEOUT >= Duration::from_secs(150));
+    }
+
+    #[test]
+    fn tests_never_write_the_real_user_low_level_log() {
+        let path = low_level_log_path().expect("test log path");
+        if let Ok(real_root) = multicore_platform::dirs::user_data_root() {
+            assert!(
+                !path.starts_with(&real_root),
+                "{path:?} is inside the real data directory {real_root:?}"
+            );
+        }
+        assert!(path.starts_with(std::env::temp_dir()));
+        record_low_level("isolation_probe", "test only");
+        assert!(read_low_level_log().is_some_and(|log| log.contains("isolation_probe")));
     }
 
     #[test]
