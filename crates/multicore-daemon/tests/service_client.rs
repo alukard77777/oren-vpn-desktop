@@ -327,6 +327,55 @@ async fn the_slot_selector_follows_the_current_endpoint() {
     );
 }
 
+/// Mimics the service's filtered controller proxy: one request per connection, `Connection:
+/// close`, the real path forwarded, and a 403 for any name other than the known group.
+fn fake_filtered_controller(group_path: &'static str, now: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let target = head.split(' ').nth(1).unwrap_or_default().to_owned();
+            let authorised = head.contains("Bearer proxy-token");
+            let (status, body) = if authorised && target == group_path {
+                ("200 OK", format!("{{\"now\":\"{now}\"}}"))
+            } else {
+                ("403 Forbidden", "Forbidden".to_owned())
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    address
+}
+
+#[tokio::test]
+async fn exit_now_resolves_through_a_filtered_proxy_with_an_emoji_group() {
+    let address = fake_filtered_controller(
+        "/proxies/%E2%9A%A1%20%D0%90%D0%B2%D1%82%D0%BE%D0%B2%D1%8B%D0%B1%D0%BE%D1%80",
+        "\u{1f1f8}\u{1f1ea} Sweden [se]",
+    );
+    let slot = Arc::new(ControllerSlot::default());
+    slot.set(address, "proxy-token", None);
+    let selector = SlotSelector::new(slot);
+    // Several walks in a row: the proxy closes every connection, the client must not reuse one.
+    for _ in 0..3 {
+        assert_eq!(
+            multicore_daemon::resolve_exit_now(&selector, "\u{26a1} Автовыбор")
+                .await
+                .as_deref(),
+            Some("\u{1f1f8}\u{1f1ea} Sweden [se]"),
+            "the leaf lookup is refused (403) yet the node is still the exit"
+        );
+    }
+}
+
 fn parsed(yaml: &str) -> Snapshot {
     Snapshot::parse(yaml.as_bytes(), multicore_core::IDLE_XRAY_CONFIG).unwrap()
 }

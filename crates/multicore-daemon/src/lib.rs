@@ -530,7 +530,15 @@ pub async fn resolve_exit_now(selector: &dyn MihomoSelector, start: &str) -> Opt
     let mut visited = HashSet::from([start.to_owned()]);
     let mut current = start.to_owned();
     for _ in 0..MAX_EXIT_NOW_DEPTH {
-        match selector.proxy_now(&current).await.ok()? {
+        // A node that cannot be read (not a group, or the service's filtered controller
+        // refused its name) ends the walk: what was reached so far is the exit. Only a
+        // failure on the very first lookup means the controller itself is unreadable.
+        let looked_up = match selector.proxy_now(&current).await {
+            Ok(now) => now,
+            Err(_) if current != start => None,
+            Err(_) => return None,
+        };
+        match looked_up {
             Some(next) if !next.is_empty() => {
                 if !visited.insert(next.clone()) {
                     return None;

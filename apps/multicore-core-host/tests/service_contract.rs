@@ -938,6 +938,34 @@ mod controller_proxy {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn percent_encoded_and_bracketed_proxy_names_are_forwarded_verbatim() {
+        let mihomo = fake_mihomo(OK).await;
+        let proxy = proxy_for(&mihomo).await;
+        // The group "⚡ Автовыбор" as reqwest encodes it, and a node "🇸🇪 Sweden [se]|x" whose
+        // brackets and pipe clients leave raw.
+        let targets = [
+            "/proxies/%E2%9A%A1%20%D0%90%D0%B2%D1%82%D0%BE%D0%B2%D1%8B%D0%B1%D0%BE%D1%80",
+            "/proxies/%F0%9F%87%B8%F0%9F%87%AA%20Sweden%20[se]|x",
+            "/proxies/%F0%9F%87%B8%F0%9F%87%AA%20Sweden%20%5Bse%5D/delay?timeout=5000",
+        ];
+        for target in targets {
+            let response = exchange(&proxy, &authorised(&format!("GET {target}"), "")).await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{target}: {response}"
+            );
+        }
+        let seen = mihomo.seen();
+        assert_eq!(seen.len(), targets.len(), "{seen:?}");
+        for (target, seen) in targets.iter().zip(&seen) {
+            assert!(
+                seen.starts_with(&format!("GET {target} HTTP/1.1\r\n")),
+                "{target}: {seen}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn latency_reads_and_connection_close_are_forwarded() {
         let mihomo = fake_mihomo(OK).await;
         let proxy = proxy_for(&mihomo).await;

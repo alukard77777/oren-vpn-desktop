@@ -290,8 +290,16 @@ async fn exit_now_gives_up_on_cycles_and_unreadable_proxies() {
     let cycle = now_controller(&[("A", Some("B")), ("B", Some("A"))]);
     assert_eq!(resolve_exit_now(&cycle, "A").await, None);
 
-    let missing = now_controller(&[("Автовыбор", Some("gone"))]);
-    assert_eq!(resolve_exit_now(&missing, "Автовыбор").await, None);
+    // A node the controller will not describe (a leaf whose name the filtered proxy refuses)
+    // is still the exit; only an unreadable starting point gives up.
+    let leaf_unreadable = now_controller(&[("Автовыбор", Some("gone"))]);
+    assert_eq!(
+        resolve_exit_now(&leaf_unreadable, "Автовыбор")
+            .await
+            .as_deref(),
+        Some("gone")
+    );
+    assert_eq!(resolve_exit_now(&leaf_unreadable, "unknown").await, None);
 
     let chain: Vec<(&'static str, Option<&'static str>)> = vec![
         ("g0", Some("g1")),

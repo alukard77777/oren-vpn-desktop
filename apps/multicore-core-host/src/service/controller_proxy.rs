@@ -451,7 +451,9 @@ fn decode_segment(raw: &str) -> Option<String> {
             index += 3;
             continue;
         }
-        if !(byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&byte)) {
+        // Raw printable ASCII other than separators: HTTP clients leave `[ ] | ^ "` unescaped in
+        // paths and proxy/node names carry them ("Sweden [se]").
+        if !(0x21..=0x7e).contains(&byte) || matches!(byte, b'/' | b'\\' | b'?' | b'#') {
             return None;
         }
         decoded.push(byte);
