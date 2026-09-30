@@ -640,3 +640,26 @@ async fn service_mihomo_without_ports_is_ready_once_its_controller_listens() {
     drop(controller);
     assert!(!service.current_ready(Engine::Mihomo).await);
 }
+
+/// The persistent core log rotates at a fixed size and keeps exactly one predecessor, so a
+/// chatty core can never fill the disk (a long-running service writes it for days).
+#[test]
+fn persistent_log_rotates_and_keeps_at_most_two_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("latest-core.log");
+    let line = "x".repeat(2_000);
+    let logs = CoreLogBuffer::persistent(&path).unwrap();
+    let lines = (2 * multicore_core::MAX_PERSISTENT_LOG_BYTES / 2_000 + 500) as usize;
+    for _ in 0..lines {
+        logs.push(Engine::Mihomo, DiagnosticStream::Stdout, &line);
+    }
+    let rotated = multicore_core::rotated_log_path(&path);
+    assert_eq!(rotated, root.path().join("latest-core.log.1"));
+    let current = std::fs::metadata(&path).unwrap().len();
+    let previous = std::fs::metadata(&rotated).unwrap().len();
+    assert!(current > 0 && current <= multicore_core::MAX_PERSISTENT_LOG_BYTES);
+    assert!(previous > multicore_core::MAX_PERSISTENT_LOG_BYTES / 2);
+    assert!(previous <= multicore_core::MAX_PERSISTENT_LOG_BYTES);
+    let files = std::fs::read_dir(root.path()).unwrap().count();
+    assert_eq!(files, 2, "only the log and one rotated predecessor");
+}

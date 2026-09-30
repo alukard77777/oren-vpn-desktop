@@ -34,6 +34,11 @@ struct FakeService {
     tun: bool,
     /// `Update` waits for this before answering: a download that takes a while.
     update_gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// The next `Prepare` waits here (outside the service lock) until released.
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+    gate_entered: bool,
+    /// The generation the fake runs (the last one prepared).
+    generation: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -54,6 +59,15 @@ impl ServiceConnector for FakeConnector {
 
 impl ServiceTransport for FakeTransport {
     fn request(&self, command: &ServiceCommand) -> Result<ServiceResponse, ServiceError> {
+        let gate = if matches!(command, ServiceCommand::Prepare { .. }) {
+            self.0.lock().unwrap().gate.take()
+        } else {
+            None
+        };
+        if let Some(gate) = gate {
+            self.0.lock().unwrap().gate_entered = true;
+            let _ = gate.recv();
+        }
         let mut service = self.0.lock().unwrap();
         if std::mem::take(&mut service.break_next) {
             return Err(ServiceError::Disconnected);
@@ -73,20 +87,23 @@ impl ServiceTransport for FakeTransport {
             return Ok(ServiceResponse::Error { code });
         }
         Ok(match command {
-            ServiceCommand::Prepare { generation_id } => ServiceResponse::Prepared {
-                generation_id: *generation_id,
-                controller: ControllerEndpoint {
-                    port: 40123,
-                    secret: "svc".into(),
-                    mixed_port: if service.tun_form { 0 } else { 28765 },
-                },
-            },
+            ServiceCommand::Prepare { generation_id } => {
+                service.generation = Some(*generation_id);
+                ServiceResponse::Prepared {
+                    generation_id: *generation_id,
+                    controller: ControllerEndpoint {
+                        port: 40123,
+                        secret: "svc".into(),
+                        mixed_port: if service.tun_form { 0 } else { 28765 },
+                    },
+                }
+            }
             ServiceCommand::SetTun { on } => {
                 service.tun = *on && !service.tun_rollback;
                 ServiceResponse::TunState { on: service.tun }
             }
             ServiceCommand::Status => ServiceResponse::Status {
-                generation_id: Some(3),
+                generation_id: service.generation,
                 xray: ElevatedRuntimeState::Ready,
                 mihomo: ElevatedRuntimeState::Ready,
                 tun_on: service.tun,
@@ -479,6 +496,107 @@ async fn proxy_mode_restores_the_system_proxy_when_the_service_channel_drops() {
         session.connection_lost(),
         "the mixed port is gone with the cores"
     );
+    supervisor.disconnect().await.unwrap();
+    assert_eq!(proxy.restored.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!session.connection_lost());
+}
+
+fn proxy_connection(
+    session: &Arc<ServiceSession<FakeConnector>>,
+    generation: u64,
+    proxy: Arc<FakeProxy>,
+) -> Supervisor<SystemProxyController<ServiceCoresController<FakeConnector>>> {
+    Supervisor::new(Arc::new(SystemProxyController::new(
+        ServiceCoresController::new(session.clone(), generation),
+        proxy,
+    )))
+}
+
+#[tokio::test]
+async fn a_warm_up_never_prepares_over_a_connection() {
+    let (session, connector, _) = session();
+    let proxy = Arc::new(FakeProxy::default());
+    let supervisor = proxy_connection(&session, 2, proxy.clone());
+    supervisor.connect().await.unwrap();
+    // A warm-up that lost the race for a superseded generation arrives now.
+    assert_eq!(session.prepare_idle(1), Err(ServiceError::InUse));
+    assert!(
+        !connector
+            .0
+            .lock()
+            .unwrap()
+            .commands
+            .contains(&ServiceCommand::Prepare { generation_id: 1 }),
+        "the service never sees the stale Prepare"
+    );
+    session.poll();
+    assert!(!session.connection_lost());
+    // The connection's own generation stays fine to warm.
+    assert_eq!(session.prepare_idle(2), Ok(()));
+    supervisor.disconnect().await.unwrap();
+    assert_eq!(
+        session.prepare_idle(1),
+        Ok(()),
+        "free again after the disconnect"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connect_waits_for_a_warm_up_prepare_in_flight_and_wins() {
+    let (session, connector, _) = session();
+    let (release, gate) = std::sync::mpsc::channel();
+    connector.0.lock().unwrap().gate = Some(gate);
+    let warming = {
+        let session = session.clone();
+        std::thread::spawn(move || session.prepare_idle(1))
+    };
+    while !connector.0.lock().unwrap().gate_entered {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let proxy = Arc::new(FakeProxy::default());
+    let connecting = {
+        let supervisor = proxy_connection(&session, 2, proxy.clone());
+        tokio::spawn(async move {
+            let result = supervisor.connect().await;
+            (supervisor, result)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !connecting.is_finished(),
+        "the Connect waits for the channel"
+    );
+    release.send(()).unwrap();
+    assert_eq!(warming.join().unwrap(), Ok(()));
+    let (supervisor, result) = connecting.await.unwrap();
+    result.unwrap();
+    assert_eq!(
+        connector.0.lock().unwrap().commands,
+        [
+            ServiceCommand::Prepare { generation_id: 1 },
+            ServiceCommand::Prepare { generation_id: 2 },
+            ServiceCommand::SetTun { on: false },
+        ]
+    );
+    session.poll();
+    assert!(
+        !session.connection_lost(),
+        "the connection's generation runs"
+    );
+    supervisor.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_generation_replaced_under_a_proxy_connection_is_a_lost_connection() {
+    let (session, _, _) = session();
+    let proxy = Arc::new(FakeProxy::default());
+    let supervisor = proxy_connection(&session, 2, proxy.clone());
+    supervisor.connect().await.unwrap();
+    // Something else prepared another generation: the mixed port the system proxy points at
+    // is gone.
+    session.prepare(1).unwrap();
+    session.poll();
+    assert!(session.connection_lost());
     supervisor.disconnect().await.unwrap();
     assert_eq!(proxy.restored.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(!session.connection_lost());

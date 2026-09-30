@@ -1055,7 +1055,14 @@ impl DaemonClient for HttpDaemonClient {
     fn activate_subscription(&self, profile_id: &str) -> Result<DaemonStatus, DaemonError> {
         let endpoint =
             self.endpoint_with_segment("/v1/subscriptions/", profile_id, Some("activate"))?;
-        self.send_profile_json(self.http.put(endpoint), STATUS_RESPONSE_LIMIT_BYTES)
+        // With the always-ready service a switch while connected includes a disconnect and a
+        // full reconnect on the new generation.
+        self.send_profile_json(
+            self.http
+                .put(endpoint)
+                .timeout(self.subscription_mutation_timeout),
+            STATUS_RESPONSE_LIMIT_BYTES,
+        )
     }
 
     fn refresh_subscription_by_id(
@@ -2617,7 +2624,7 @@ mod http_tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed subscription server");
         let address = listener.local_addr().expect("delayed server address");
         let handle = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept delayed request");
                 let mut buffer = [0_u8; 2048];
                 let length = stream.read(&mut buffer).expect("read delayed request");
@@ -2698,6 +2705,7 @@ mod http_tests {
         assert!(client.refresh_subscription().is_ok());
         assert!(client.refresh_subscription_by_id("profile-a").is_ok());
         assert!(client.delete_subscription("profile-a").is_ok());
+        assert!(client.activate_subscription("profile-a").is_ok());
         server.join().unwrap();
         assert!(SUBSCRIPTION_MUTATION_TIMEOUT > REQUEST_TIMEOUT);
         assert!(SUBSCRIPTION_MUTATION_TIMEOUT >= Duration::from_secs(150));

@@ -148,6 +148,8 @@ pub enum ServiceError {
     Impostor,
     /// Another interactive user's session holds the cores.
     Busy,
+    /// A connection owns the service's cores: a warm-up must not replace its generation.
+    InUse,
     Disconnected,
     TimedOut,
     Protocol,
@@ -241,6 +243,9 @@ pub struct ServiceSession<C: ServiceConnector> {
     healthy: AtomicBool,
     tun_on: AtomicBool,
     in_use: AtomicU8,
+    /// The generation a Connect claimed before its `Prepare`; a warm-up never prepares while
+    /// it is set. Changed only under the transport lock.
+    owner: Mutex<Option<u64>>,
     available: AtomicBool,
     /// `Update` exchanges in flight. The service answers nothing else until the download is
     /// done, so the watcher's `Status` and `Diagnostics` would time out and drop the
@@ -276,6 +281,7 @@ impl<C: ServiceConnector> ServiceSession<C> {
             healthy: AtomicBool::new(false),
             tun_on: AtomicBool::new(false),
             in_use: AtomicU8::new(IN_USE_NONE),
+            owner: Mutex::new(None),
             available: AtomicBool::new(false),
             updating: AtomicUsize::new(0),
             controller,
@@ -304,10 +310,22 @@ impl<C: ServiceConnector> ServiceSession<C> {
         connect: bool,
         record: impl FnOnce(&Self, &ServiceResponse) -> R,
     ) -> Result<R, ServiceError> {
+        self.exchange_if(command, connect, |_| Ok(()), record)
+    }
+
+    /// `exchange`, sent only when `allowed` passes with the channel held.
+    fn exchange_if<R>(
+        &self,
+        command: &ServiceCommand,
+        connect: bool,
+        allowed: impl FnOnce(&Self) -> Result<(), ServiceError>,
+        record: impl FnOnce(&Self, &ServiceResponse) -> R,
+    ) -> Result<R, ServiceError> {
         let mut transport = self
             .transport
             .lock()
             .map_err(|_| ServiceError::Disconnected)?;
+        allowed(self)?;
         if transport.is_none() {
             if !connect {
                 return Err(ServiceError::Disconnected);
@@ -394,6 +412,38 @@ impl<C: ServiceConnector> ServiceSession<C> {
     }
 
     pub fn prepare(&self, generation: u64) -> Result<(), ServiceError> {
+        self.prepare_if(generation, false)
+    }
+
+    /// The warm-up's `Prepare`: refused with `InUse` while a connection owns the session, so
+    /// a warm-up that lost a race with a Connect never replaces the connection's generation.
+    pub fn prepare_idle(&self, generation: u64) -> Result<(), ServiceError> {
+        self.prepare_if(generation, true)
+    }
+
+    fn owner(&self) -> Option<u64> {
+        self.owner.lock().ok().and_then(|owner| *owner)
+    }
+
+    /// A Connect takes the session for `generation` before its `Prepare`. Taken under the
+    /// transport lock, so it is ordered against a warm-up `Prepare` in flight.
+    fn claim(&self, generation: u64) {
+        let _channel = self.transport.lock();
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = Some(generation);
+        }
+    }
+
+    fn release_claim(&self) {
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = None;
+        }
+    }
+
+    fn prepare_if(&self, generation: u64, idle: bool) -> Result<(), ServiceError> {
+        if idle && self.owner().is_some_and(|owner| owner != generation) {
+            return Err(ServiceError::InUse);
+        }
         if self.prepared_generation() == Some(generation) && self.healthy.load(Ordering::Acquire) {
             // The slot may have been pointed at an on-demand controller meanwhile.
             if let Some(endpoint) = self.endpoint.lock().ok().and_then(|value| value.clone()) {
@@ -401,11 +451,18 @@ impl<C: ServiceConnector> ServiceSession<C> {
             }
             return Ok(());
         }
-        let result = self.exchange(
+        let result = self.exchange_if(
             &ServiceCommand::Prepare {
                 generation_id: generation,
             },
             true,
+            |session| {
+                if idle && session.owner().is_some_and(|owner| owner != generation) {
+                    Err(ServiceError::InUse)
+                } else {
+                    Ok(())
+                }
+            },
             |session, response| match response {
                 ServiceResponse::Prepared {
                     generation_id,
@@ -520,9 +577,15 @@ impl<C: ServiceConnector> ServiceSession<C> {
     /// (proxy mode), or the tunnel went down as well (TUN mode).
     #[must_use]
     pub fn connection_lost(&self) -> bool {
+        // The service runs another generation than the one the connection was made on (its
+        // mixed port, and its tunnel, are gone).
+        let replaced = || {
+            self.owner()
+                .is_some_and(|owner| self.prepared_generation() != Some(owner))
+        };
         match self.in_use.load(Ordering::Acquire) {
-            IN_USE_PROXY => !self.cores_ready(),
-            IN_USE_TUN => !self.cores_ready() || !self.tun_on.load(Ordering::Acquire),
+            IN_USE_PROXY => !self.cores_ready() || replaced(),
+            IN_USE_TUN => !self.cores_ready() || replaced() || !self.tun_on.load(Ordering::Acquire),
             _ => false,
         }
     }
@@ -639,6 +702,7 @@ async fn blocking<C: ServiceConnector, T: Send + 'static>(
 pub struct ServiceTunController<C: ServiceConnector> {
     session: Arc<ServiceSession<C>>,
     generation: u64,
+    warm_up: bool,
 }
 
 impl<C: ServiceConnector> ServiceTunController<C> {
@@ -646,8 +710,32 @@ impl<C: ServiceConnector> ServiceTunController<C> {
         Self {
             session,
             generation,
+            warm_up: false,
         }
     }
+
+    /// The warm-up's controller: `start(Xray)` prepares only while no connection owns the
+    /// session (`InUse` otherwise) and claims nothing.
+    pub fn for_warm_up(session: Arc<ServiceSession<C>>, generation: u64) -> Self {
+        Self {
+            session,
+            generation,
+            warm_up: true,
+        }
+    }
+}
+
+/// A Connect's `start(Xray)`: claim the session for `generation`, then prepare it.
+fn claim_and_prepare<C: ServiceConnector>(
+    session: &ServiceSession<C>,
+    generation: u64,
+) -> Result<(), ServiceError> {
+    session.claim(generation);
+    let result = session.prepare(generation);
+    if result.is_err() {
+        session.release_claim();
+    }
+    result
 }
 
 impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
@@ -658,9 +746,11 @@ impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
         engine: Engine,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         let generation = self.generation;
+        let warm_up = self.warm_up;
         Box::pin(async move {
             blocking(&self.session, move |session| match engine {
-                Engine::Xray => session.prepare(generation),
+                Engine::Xray if warm_up => session.prepare_idle(generation),
+                Engine::Xray => claim_and_prepare(session, generation),
                 Engine::Mihomo => {
                     session.set_tun(true)?;
                     session.set_in_use(IN_USE_TUN);
@@ -677,11 +767,15 @@ impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         Box::pin(async move {
             if engine == Engine::Xray {
+                if !self.warm_up {
+                    self.session.release_claim();
+                }
                 return Ok(());
             }
             blocking(&self.session, |session| {
                 let result = session.set_tun(false);
                 session.set_in_use(IN_USE_NONE);
+                session.release_claim();
                 match result {
                     // A dropped channel already made the service stop the cores and the
                     // tunnel; with the cores gone there is no tunnel left to switch off.
@@ -733,7 +827,11 @@ impl<C: ServiceConnector> ProcessController for ServiceCoresController<C> {
         let generation = self.generation;
         Box::pin(async move {
             blocking(&self.session, move |session| {
-                session.prepare(generation)?;
+                if engine == Engine::Xray {
+                    claim_and_prepare(session, generation)?;
+                } else {
+                    session.prepare(generation)?;
+                }
                 if engine == Engine::Mihomo {
                     session.set_tun(false)?;
                     session.set_in_use(IN_USE_PROXY);
@@ -752,6 +850,7 @@ impl<C: ServiceConnector> ProcessController for ServiceCoresController<C> {
             if engine == Engine::Mihomo {
                 self.session.set_in_use(IN_USE_NONE);
             }
+            self.session.release_claim();
             Ok(())
         })
     }
@@ -865,6 +964,27 @@ pub mod windows {
 
     pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MultiCore.Service.v2";
     pub const SERVICE_NAME: &str = "MultiCore";
+    /// Exactly what the service's pipe DACL grants INTERACTIVE users (core-host
+    /// `windows_server::CLIENT_PIPE_ACCESS`): `FILE_READ_DATA | FILE_WRITE_DATA |
+    /// FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE`. `GENERIC_WRITE` would include
+    /// `FILE_APPEND_DATA` (= create pipe instance), which the service does not grant.
+    pub const SERVICE_PIPE_ACCESS: u32 = 0x0010_0183;
+
+    /// Opens a service pipe with [`SERVICE_PIPE_ACCESS`], identification-level SQOS (the
+    /// server can check but never act as this user) and message read mode.
+    pub fn open_service_pipe(name: &str) -> std::io::Result<std::fs::File> {
+        let pipe = OpenOptions::new()
+            .access_mode(SERVICE_PIPE_ACCESS)
+            .custom_flags(FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+            .open(name)?;
+        let mode = PIPE_READMODE_MESSAGE;
+        if unsafe { SetNamedPipeHandleState(pipe.as_raw_handle(), &mode, ptr::null(), ptr::null()) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pipe)
+    }
 
     fn wide(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
@@ -990,21 +1110,8 @@ pub mod windows {
                 }
                 std::thread::sleep(START_POLL);
             }
-            let pipe = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(
-                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                )
-                .open(SERVICE_PIPE_NAME)
-                .map_err(|_| ServiceError::Unavailable)?;
-            let mode = PIPE_READMODE_MESSAGE;
-            if unsafe {
-                SetNamedPipeHandleState(pipe.as_raw_handle(), &mode, ptr::null(), ptr::null())
-            } == 0
-            {
-                return Err(ServiceError::Unavailable);
-            }
+            let pipe =
+                open_service_pipe(SERVICE_PIPE_NAME).map_err(|_| ServiceError::Unavailable)?;
             let mut server_pid = 0;
             if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut server_pid) } == 0
                 || server_pid != service_pid
@@ -1013,6 +1120,89 @@ pub mod windows {
             }
             Ok(PipeTransport { pipe })
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_pipe_access_tests {
+    use super::windows::{SERVICE_PIPE_ACCESS, open_service_pipe};
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
+        Security::{
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+        System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+            PIPE_WAIT,
+        },
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// A pipe whose DACL grants everyone (standing in for INTERACTIVE) exactly the service's
+    /// client rights.
+    fn restricted_pipe(name: &str) -> HANDLE {
+        let sddl = wide(&format!(
+            "D:P(A;;GA;;;SY)(A;;{SERVICE_PIPE_ACCESS:#010x};;;WD)"
+        ));
+        let mut descriptor = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let security = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let name = wide(name);
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                2,
+                4096,
+                4096,
+                0,
+                &security,
+            )
+        };
+        unsafe { LocalFree(descriptor.cast()) };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        handle
+    }
+
+    #[test]
+    fn the_daemon_opens_the_service_pipe_with_only_the_granted_rights() {
+        assert_eq!(SERVICE_PIPE_ACCESS, 0x0010_0183);
+        assert_eq!(SERVICE_PIPE_ACCESS & 0x4, 0, "no FILE_CREATE_PIPE_INSTANCE");
+        let name = format!(
+            r"\\.\pipe\MultiCore.Service.daemon-test.{}",
+            std::process::id()
+        );
+        let server = restricted_pipe(&name);
+        let generic = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap_err();
+        assert_eq!(generic.raw_os_error(), Some(5), "{generic}");
+        let pipe = open_service_pipe(&name).expect("open with the service client rights");
+        drop(pipe);
+        unsafe { CloseHandle(server) };
     }
 }
 

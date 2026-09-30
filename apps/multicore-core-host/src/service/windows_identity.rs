@@ -17,16 +17,16 @@ use windows_sys::Win32::{
     Foundation::{HANDLE, LocalFree},
     Security::{
         Authorization::ConvertSidToStringSidW, CreateWellKnownSid, EqualSid, GetTokenInformation,
-        SECURITY_MAX_SID_SIZE, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
+        RevertToSelf, SECURITY_MAX_SID_SIZE, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
         TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenSessionId, TokenUser,
         WinInteractiveSid,
     },
     System::{
         Com::CoTaskMemFree,
-        Pipes::GetNamedPipeClientProcessId,
+        Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient},
         Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-            QueryFullProcessImageNameW,
+            GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
     },
     UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
@@ -148,6 +148,12 @@ pub(crate) fn client_facts(pipe: HANDLE) -> Result<(ClientFacts, OwnedHandle), I
     let session_id = token_session(token.as_raw_handle())?;
     let user_sid = token_user_sid(token.as_raw_handle())?;
     let interactive = token_is_interactive(token.as_raw_handle())?;
+    // The PID may have been recycled since the client connected: the process we opened must
+    // run as the same user, in the same session, as the token the client connected with.
+    let (connected_sid, connected_session) = connection_token_facts(pipe)?;
+    if !connected_sid.eq_ignore_ascii_case(&user_sid) || connected_session != session_id {
+        return Err(IdentityError::Unavailable);
+    }
     Ok((
         ClientFacts {
             process_id,
@@ -157,6 +163,28 @@ pub(crate) fn client_facts(pipe: HANDLE) -> Result<(ClientFacts, OwnedHandle), I
             interactive,
         },
         token,
+    ))
+}
+
+/// User SID and session of the token the client connected with (identification level is
+/// enough to query it). Requires that a message was already read from the pipe.
+fn connection_token_facts(pipe: HANDLE) -> Result<(String, u32), IdentityError> {
+    if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+        return Err(IdentityError::Unavailable);
+    }
+    let mut token = ptr::null_mut();
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    if unsafe { RevertToSelf() } == 0 {
+        // Never keep running under the client's identity.
+        std::process::abort();
+    }
+    if opened == 0 {
+        return Err(IdentityError::Unavailable);
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    Ok((
+        token_user_sid(token.as_raw_handle())?,
+        token_session(token.as_raw_handle())?,
     ))
 }
 
