@@ -91,9 +91,10 @@ fn dechunk(mut body: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
-/// `PATCH /configs {"tun":{"enable":<on>}}`. Verified against Mihomo v1.19.30: only `enable`
-/// changes (other TUN fields come from the loaded config) and the reply is 204 even if the
-/// adapter failed, so callers confirm with [`tun_enabled`] and the adapter probe.
+/// `PATCH /configs {"tun":{"enable":<on>}}`. Verified against Mihomo v1.19.30 (source unchanged
+/// in v1.19.32): only `enable` changes (other TUN fields come from the loaded config) and the
+/// reply is 204 even if the adapter failed, so callers confirm with [`tun_enabled`] and the
+/// adapter probe.
 pub(crate) fn set_tun_enabled(port: u16, secret: &str, on: bool) -> io::Result<()> {
     let body = if on {
         r#"{"tun":{"enable":true}}"#

@@ -10,30 +10,30 @@
   "components": {
     "xray": {
       "project": "XTLS/Xray-core",
-      "version": "v26.9.9",
-      "commit": "52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120",
+      "version": "v26.9.30",
+      "commit": "b26a91de4f3294e26a0ad0a970b81a386a41f789",
       "license": "MPL-2.0",
       "asset": {
         "name": "Xray-linux-64.zip",
-        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip",
-        "sha256": "1eb9175d0f0a8f8149c9230a7fc5ae66ce332ed20a53155ce61fe62e3f58b7df",
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-linux-64.zip",
+        "sha256": "f851110beaff16e78d643f0ccfd9524b4a44dfd59bae3e34bb52bba378f7690e",
         "format": "zip",
         "entry": "xray",
-        "executableSha256": "c4ae6798c38e0e5343b192406746333cd0ba7ff3eb984f8c4b9939dcb68c3f8a"
+        "executableSha256": "96efb28b8b2086275598dc46e73b5dc340da948b4e1ccc4f1719f83f67b793a7"
       }
     },
     "mihomo": {
       "project": "MetaCubeX/mihomo",
-      "version": "v1.19.30",
-      "commit": "ac017cdd246ce8bd547653d927e7bf77d7ee73d5",
+      "version": "v1.19.32",
+      "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
       "license": "GPL-3.0-only",
       "asset": {
-        "name": "mihomo-linux-amd64-compatible-v1.19.30.gz",
-        "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-amd64-compatible-v1.19.30.gz",
-        "sha256": "db214c7a2517e63c150d123178d16d102e03a241ccdae4e5e07ffbe9cf56c6f9",
+        "name": "mihomo-linux-amd64-compatible-v1.19.32.gz",
+        "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-compatible-v1.19.32.gz",
+        "sha256": "ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20",
         "format": "gzip",
         "entry": "mihomo",
-        "executableSha256": "8ad44e28fe72be4640254b96741b677f4074991b99186cc4486a1c28ded02b1a"
+        "executableSha256": "7a0d59da2e678d56c899a3db996a2ad8963286c4f3634b0451435db248f13fa1"
       }
     },
     "dashboard": {

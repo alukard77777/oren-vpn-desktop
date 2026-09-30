@@ -179,12 +179,12 @@ fn live_dns_refreshes_after_ttl_without_core_restart_or_blocked_fallback() {
     #[cfg(windows)]
     assert_eq!(
         format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
-        "0d0fc0ea2b05641acb78c01fc36ad694e7b029861b2d5eb93da0e3e9fda9a98f"
+        "43fa465275a8a64ddce4a27c3317ae3e99f0c264fec1962e04c3fadda83adc79"
     );
     #[cfg(not(windows))]
     assert_eq!(
         format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
-        "c4ae6798c38e0e5343b192406746333cd0ba7ff3eb984f8c4b9939dcb68c3f8a"
+        "96efb28b8b2086275598dc46e73b5dc340da948b4e1ccc4f1719f83f67b793a7"
     );
     let mut fixture = Fixture::new();
     let phase = Arc::new(AtomicU8::new(0));
@@ -397,12 +397,12 @@ async fn readiness_gate_waits_for_a_real_dns_resolve_then_dial_before_reporting_
     #[cfg(windows)]
     assert_eq!(
         format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
-        "0d0fc0ea2b05641acb78c01fc36ad694e7b029861b2d5eb93da0e3e9fda9a98f"
+        "43fa465275a8a64ddce4a27c3317ae3e99f0c264fec1962e04c3fadda83adc79"
     );
     #[cfg(not(windows))]
     assert_eq!(
         format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())),
-        "c4ae6798c38e0e5343b192406746333cd0ba7ff3eb984f8c4b9939dcb68c3f8a"
+        "96efb28b8b2086275598dc46e73b5dc340da948b4e1ccc4f1719f83f67b793a7"
     );
 
     let mut fixture = Fixture::new();

@@ -268,24 +268,24 @@ function Assert-ExactProductionPin {
     param([string]$Name, [object]$Component)
     $pins = @{
         xray = @(
-            'XTLS/Xray-core', 'v26.9.9', '52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120', 'MPL-2.0',
-            'Xray-windows-64.zip', 'https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-windows-64.zip',
-            '244deaba2098c2964e49bba90df3707777e5f5f428a82d2f29604015f24beec2', 'xray.exe',
-            '0d0fc0ea2b05641acb78c01fc36ad694e7b029861b2d5eb93da0e3e9fda9a98f', '268435456',
-            'Xray-core-MPL-2.0.txt', 'https://raw.githubusercontent.com/XTLS/Xray-core/52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120/LICENSE',
+            'XTLS/Xray-core', 'v26.9.30', 'b26a91de4f3294e26a0ad0a970b81a386a41f789', 'MPL-2.0',
+            'Xray-windows-64.zip', 'https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-windows-64.zip',
+            'b17a619343c11b89d8faf36278298856749b15c52277d875d32051b33dcda617', 'xray.exe',
+            '43fa465275a8a64ddce4a27c3317ae3e99f0c264fec1962e04c3fadda83adc79', '268435456',
+            'Xray-core-MPL-2.0.txt', 'https://raw.githubusercontent.com/XTLS/Xray-core/b26a91de4f3294e26a0ad0a970b81a386a41f789/LICENSE',
             '1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5',
-            'https://github.com/XTLS/Xray-core/archive/52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120.zip',
-            '0159e934d908cd176fed51dc61209e546046351928af685b143cad2ebe704831'
+            'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
+            'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
         )
         mihomo = @(
-            'MetaCubeX/mihomo', 'v1.19.30', 'ac017cdd246ce8bd547653d927e7bf77d7ee73d5', 'GPL-3.0-only',
-            'mihomo-windows-amd64-compatible-v1.19.30.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-windows-amd64-compatible-v1.19.30.zip',
-            '289fde5e29d37a5b3326480590d8b3551c5bf7f8737290355c19bce74d57a563', 'mihomo-windows-amd64-compatible.exe',
-            '6ac25fcb26afe8e1bea24b6e6e80805bf884a33232d12e2d78dfa0b6c529ac14', '268435456',
-            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/ac017cdd246ce8bd547653d927e7bf77d7ee73d5/LICENSE',
+            'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
+            'mihomo-windows-amd64-compatible-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-amd64-compatible-v1.19.32.zip',
+            '974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0', 'mihomo-windows-amd64-compatible.exe',
+            '04f8d7fc2b314771e1ecbf15951d59f0e1cb7914503c88cfb6972ff6a824e314', '268435456',
+            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
             '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
-            'https://github.com/MetaCubeX/mihomo/archive/ac017cdd246ce8bd547653d927e7bf77d7ee73d5.zip',
-            'd26880078fae7755c7ee9ce718ef6de5806d76c8d289237ec926b6a2f35d69be'
+            'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
+            '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
         )
     }
     $actual = @(

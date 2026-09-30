@@ -60,7 +60,7 @@ pub struct SanitizedMihomo {
     pub mixed_port: Option<u16>,
 }
 
-/// Top-level Mihomo keys a provider config may keep (pinned Mihomo v1.19.30). Everything else is
+/// Top-level Mihomo keys a provider config may keep (pinned Mihomo v1.19.32). Everything else is
 /// dropped: listeners and their options (`port`, `socks-port`, `redir-port`, `tproxy-port`,
 /// `listeners`, `tunnels`, `*-config`, `tuic-server`, `authentication`, `lan-*`), controller and
 /// UI settings (`external-*`, `secret`, `tls`; the service writes its own controller and the
@@ -315,7 +315,9 @@ fn reject_merge_keys_and_tags(value: &Value) -> Result<(), SanitizeError> {
 fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
     if let Some(proxies) = mapping.get(key("proxies")).and_then(Value::as_sequence) {
         for (index, proxy) in proxies.iter().enumerate() {
-            reject_credential_paths_in(proxy, &format!("proxies[{index}]"))?;
+            let at = format!("proxies[{index}]");
+            reject_credential_paths_in(proxy, &at)?;
+            reject_overlay_listeners(proxy, &at)?;
         }
     }
     if let Some(providers) = mapping
@@ -338,12 +340,53 @@ fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
             });
             if let Some(payload) = payload.and_then(Value::as_sequence) {
                 for (index, proxy) in payload.iter().enumerate() {
-                    reject_credential_paths_in(
-                        proxy,
-                        &format!("proxy-providers.{name}.payload[{index}]"),
-                    )?;
+                    let at = format!("proxy-providers.{name}.payload[{index}]");
+                    reject_credential_paths_in(proxy, &at)?;
+                    reject_overlay_listeners(proxy, &at)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// EasyTier proxy fields (Mihomo v1.19.32) that turn an outbound into a server reachable from
+/// other machines: peer `listeners` (e.g. `tcp://0.0.0.0:11010`, or the default one that
+/// `no-listener: false` opens), `mapped-listeners`, and `enable-exit-node`/`proxy-networks`,
+/// which let overlay peers route through this host and its networks. A privileged core keeps
+/// every listener on loopback, so such a proxy is refused in inline proxies and inline provider
+/// payloads (remote provider content is fetched by Mihomo itself and is not seen here).
+fn reject_overlay_listeners(proxy: &Value, at: &str) -> Result<(), SanitizeError> {
+    let Some(proxy) = proxy.as_mapping() else {
+        return Ok(());
+    };
+    let mut fields = Vec::with_capacity(proxy.len());
+    for (name, value) in proxy {
+        fields.push((mihomo_field_name(name.as_str().unwrap_or(""))?, name, value));
+    }
+    let is_easytier = fields.iter().any(|(field, _, value)| {
+        field == "type"
+            && value
+                .as_str()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("easytier"))
+    });
+    if !is_easytier {
+        return Ok(());
+    }
+    for (field, name, value) in fields {
+        let serving = match field.as_str() {
+            "listeners" | "mapped-listeners" | "proxy-networks" => {
+                !value.is_null() && value.as_sequence().is_none_or(|items| !items.is_empty())
+            }
+            "no-listener" => value.as_bool() != Some(true),
+            "enable-exit-node" => value.as_bool() != Some(false),
+            _ => false,
+        };
+        if serving {
+            return Err(SanitizeError::NonLoopbackListener(format!(
+                "{at}.{}",
+                name.as_str().unwrap_or("")
+            )));
         }
     }
     Ok(())
@@ -442,7 +485,7 @@ fn only_known(map: &mut JsonMap, allowed: &[&str], at: &str) -> Result<(), Sanit
 /// Xray `log` fields kept; `access`/`error` (file outputs) and anything else are dropped.
 const ALLOWED_XRAY_LOG_KEYS: &[&str] = &["loglevel", "dnslog", "maskaddress"];
 
-/// Top-level Xray sections a provider bridge config may keep (pinned Xray v26.9.9). Everything
+/// Top-level Xray sections a provider bridge config may keep (pinned Xray v26.9.30). Everything
 /// else is dropped: `api` and `metrics` (their own listeners), `stats`, `reverse`, `transport`,
 /// `geodata` (scheduled downloads that rename files inside the asset directory), and anything a
 /// later Xray adds. `fakedns` stays because `dns` may reference it; it is an in-memory pool.
@@ -464,7 +507,7 @@ pub const ALLOWED_XRAY_SECTIONS: &[&str] = &[
 /// every server protocol are refused.
 pub const ALLOWED_XRAY_INBOUND_PROTOCOLS: &[&str] = &["socks"];
 
-/// The exact shape of an inbound: a loopback SOCKS bridge (`InboundDetourConfig`, v26.9.9).
+/// The exact shape of an inbound: a loopback SOCKS bridge (`InboundDetourConfig`, v26.9.30).
 /// Anything else refuses the config: `streamSettings` (so no TLS/REALITY `target`, no hysteria
 /// `masquerade`, no transport listeners), `allocate`, and any field a later Xray adds.
 pub const ALLOWED_XRAY_INBOUND_KEYS: &[&str] =
@@ -485,7 +528,7 @@ const ALLOWED_XRAY_SNIFFING_KEYS: &[&str] = &[
 ];
 
 /// Outbound protocols of the pinned Xray (its whole client loader list); an unknown protocol is
-/// refused. `wireguard` always runs with `noKernelTun: true` (a kernel TUN as root would
+/// refused. `masque` (v26.9.30) is a MASQUE CONNECT-IP client over a userspace netstack. `wireguard` always runs with `noKernelTun: true` (a kernel TUN as root would
 /// create an interface, routes and rules and zero the host's `rp_filter`).
 pub const ALLOWED_XRAY_OUTBOUND_PROTOCOLS: &[&str] = &[
     "blackhole",
@@ -496,6 +539,7 @@ pub const ALLOWED_XRAY_OUTBOUND_PROTOCOLS: &[&str] = &[
     "http",
     "hysteria",
     "loopback",
+    "masque",
     "shadowsocks",
     "socks",
     "trojan",
@@ -569,18 +613,26 @@ pub const XRAY_ENDPOINT_KEYS: &[&str] = &[
     "connectivity",
     "stunServers",
     "resolvers",
+    "addr",
 ];
 
 /// Keys refused wherever they appear (ASCII-folded): server-side features a client bridge never
-/// needs (`masquerade` file server/proxy, `fallbacks`, `decryption`, `echServerKeys`) and raw
-/// socket powers of the privileged core (`customSockopt` = arbitrary `setsockopt`).
+/// needs (`masquerade` file server/proxy, `fallbacks`, `decryption`, `echServerKeys`), raw
+/// socket powers of the privileged core (`customSockopt` = arbitrary `setsockopt`), and the
+/// v26.9.30 `xdrive` transport (`xdriveSettings`): its `local` service creates, reads and deletes
+/// files under any `remoteFolder`, and its `template` service sends HTTP requests to any URL,
+/// both with the core's own privileges.
 pub const XRAY_FORBIDDEN_KEYS: &[&str] = &[
     "masquerade",
     "fallbacks",
     "decryption",
     "echServerKeys",
     "customSockopt",
+    "xdriveSettings",
 ];
+
+/// Stream transports refused as a `network` (or its alias `method`) value, ASCII-folded.
+const XRAY_FORBIDDEN_TRANSPORTS: &[&str] = &["xdrive"];
 
 pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     let mut document: Json = serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
@@ -857,7 +909,7 @@ fn is_local_endpoint(text: &str) -> bool {
 }
 
 /// The refusals that apply at any depth of the kept sections: file reads (`certificateFile`,
-/// `keyFile`, `ext:`), [`XRAY_FORBIDDEN_KEYS`], a socket `tproxy` mode, a `unix` socket `type`
+/// `keyFile`, `ext:`), [`XRAY_FORBIDDEN_KEYS`], an `xdrive` transport, a socket `tproxy` mode, a `unix` socket `type`
 /// or `network`, and a local socket or file in any [`XRAY_ENDPOINT_KEYS`] value.
 fn reject_xray_references(value: &Json, at: &str) -> Result<(), SanitizeError> {
     match value {
@@ -871,6 +923,10 @@ fn reject_xray_references(value: &Json, at: &str) -> Result<(), SanitizeError> {
                     return Err(SanitizeError::FileReference(here));
                 }
                 if is_named(name, XRAY_FORBIDDEN_KEYS)
+                    || (is_named(name, &["network", "method"])
+                        && child
+                            .as_str()
+                            .is_some_and(|kind| is_named(kind.trim(), XRAY_FORBIDDEN_TRANSPORTS)))
                     || (name.eq_ignore_ascii_case("tproxy")
                         && !child.as_str().is_some_and(|mode| {
                             mode.is_empty() || mode.eq_ignore_ascii_case("off")

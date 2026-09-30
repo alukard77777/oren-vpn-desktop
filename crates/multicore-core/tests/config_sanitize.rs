@@ -1232,6 +1232,134 @@ fn server_only_features_are_refused_everywhere() {
     }
 }
 
+/// Xray v26.9.30 `xdrive` transport: the `local` service creates, reads and deletes files under
+/// any `remoteFolder` and `template` sends HTTP requests anywhere, as the privileged core.
+#[test]
+fn xdrive_transport_is_refused() {
+    for (input, at) in [
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"network":"xdrive","xdriveSettings":{"service":"local","remoteFolder":"/etc"}}}]}"#,
+            "$.outbounds[0].streamSettings.network",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"XDriveSettings":{"service":"template","template":{}}}}]}"#,
+            "$.outbounds[0].streamSettings.XDriveSettings",
+        ),
+        (
+            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"method":" XDrive "}}]}"#,
+            "$.outbounds[0].streamSettings.method",
+        ),
+    ] {
+        assert_eq!(
+            sanitize_xray(input.as_bytes()),
+            Err(SanitizeError::ForbiddenField(at.to_owned())),
+            "{input}"
+        );
+    }
+    // A shadowsocks `method` (cipher) is not a transport.
+    sanitize_xray(
+        br#"{"outbounds":[{"protocol":"shadowsocks","settings":{"servers":[{"address":"a.example","port":1,"method":"aes-128-gcm","password":"x"}]}}]}"#,
+    )
+    .unwrap();
+}
+
+/// Xray v26.9.30 client additions: the `masque` outbound is kept, and the new object form of
+/// finalmask `xdns` resolvers (`addr`) may not name a local socket or file.
+#[test]
+fn masque_outbounds_are_kept_and_xdns_resolvers_are_endpoints() {
+    let out = sanitize_xray(MASQUE_XRAY.as_bytes()).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(doc["outbounds"][0]["protocol"], "masque");
+    assert_eq!(
+        doc["outbounds"][0]["streamSettings"]["masqueSettings"]["path"],
+        "/.well-known/masque/ip/{target}/{ipproto}/"
+    );
+    assert_eq!(
+        sanitize_xray(
+            br#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":{"resolvers":[{"type":"tcp","settings":{"addr":"/run/x.sock"}}]}}]}}}]}"#,
+        ),
+        Err(SanitizeError::LocalEndpoint(
+            "$.outbounds[0].streamSettings.finalmask.udp[0].settings.resolvers[0].settings.addr"
+                .into()
+        ))
+    );
+    sanitize_xray(
+        br#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}}]}}}]}"#,
+    )
+    .unwrap();
+}
+
+const MASQUE_XRAY: &str = r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":18120}],
+ "outbounds":[{"protocol":"masque","tag":"m",
+   "settings":{"address":"m.example.com","port":443,"remoteDNS":["1.1.1.1","2606:4700:4700::1111"]},
+   "streamSettings":{"network":"masque","security":"tls",
+     "tlsSettings":{"serverName":"m.example.com","alpn":["h3"]},
+     "masqueSettings":{"host":"m.example.com","path":"/.well-known/masque/ip/{target}/{ipproto}/",
+       "user":"u","pass":"p"}}}]}"#;
+
+/// Mihomo v1.19.32 EasyTier proxies can listen for peers on every interface and serve as an
+/// exit node for the overlay; the privileged core refuses both.
+#[test]
+fn easytier_proxies_cannot_listen_or_serve_as_exit_nodes() {
+    for (proxy, at) in [
+        (
+            "{name: e, type: easytier, network-name: n, listeners: ['tcp://0.0.0.0:11010']}",
+            "proxies[0].listeners",
+        ),
+        (
+            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], no_listener: false}",
+            "proxies[0].no_listener",
+        ),
+        (
+            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], mapped-listeners: ['tcp://1.2.3.4:1']}",
+            "proxies[0].mapped-listeners",
+        ),
+        (
+            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], enable-exit-node: true}",
+            "proxies[0].enable-exit-node",
+        ),
+        (
+            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], Proxy-Networks: ['10.0.0.0/24']}",
+            "proxies[0].Proxy-Networks",
+        ),
+    ] {
+        let input = format!("mixed-port: 1\nproxies:\n  - {proxy}\n");
+        assert_eq!(
+            sanitize_mihomo(input.as_bytes(), &policy()),
+            Err(SanitizeError::NonLoopbackListener(at.into())),
+            "{input}"
+        );
+    }
+    assert_eq!(
+        sanitize_mihomo(
+            b"mixed-port: 1\nproxy-providers:\n  p: {type: inline, payload: [{name: e, type: easytier, network-name: n, listeners: ['udp://0.0.0.0:1']}]}\n",
+            &policy()
+        ),
+        Err(SanitizeError::NonLoopbackListener(
+            "proxy-providers.p.payload[0].listeners".into()
+        ))
+    );
+    // A plain client: peers only, explicitly no listener and no exit node.
+    sanitize_mihomo(
+        b"mixed-port: 1\nproxies:\n  - {name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], no-listener: true, enable-exit-node: false, listeners: [], exit-nodes: ['10.144.0.1']}\n",
+        &policy(),
+    )
+    .unwrap();
+    // Other proxy types keep their own `listeners`-free fields untouched.
+    sanitize_mihomo(
+        b"mixed-port: 1\nproxies:\n  - {name: s, type: ss, server: a, port: 1, cipher: aes-128-gcm, password: x}\n",
+        &policy(),
+    )
+    .unwrap();
+}
+
+/// Live check: the pinned Xray accepts a sanitised MASQUE (CONNECT-IP) client outbound.
+#[test]
+#[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
+fn live_pinned_xray_accepts_a_sanitised_masque_outbound() {
+    assert_pinned_xray_accepts(&sanitize_xray(MASQUE_XRAY.as_bytes()).unwrap());
+}
+
 /// Live check against the pinned Xray (run on the build host):
 /// `MULTICORE_LIVE_XRAY=/path/to/xray cargo test -p multicore-core --test config_sanitize -- --ignored`.
 /// The pinned core must accept the sanitised adversarial config as-is, with nothing left of

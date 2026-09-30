@@ -6,26 +6,26 @@ projects. MultiCore does not claim ownership of either project or its marks.
 ## Xray-core
 
 - Project: XTLS/Xray-core
-- Version/tag: v26.9.9
-- Commit: `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
+- Version/tag: v26.9.30
+- Commit: `b26a91de4f3294e26a0ad0a970b81a386a41f789`
 - License: Mozilla Public License 2.0 (included as
   `licenses/Xray-core-MPL-2.0.txt`)
 - Pinned source snapshot:
-  `https://github.com/XTLS/Xray-core/archive/52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120.zip`
+  `https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip`
 - Observed source snapshot SHA-256:
-  `0159e934d908cd176fed51dc61209e546046351928af685b143cad2ebe704831`
+  `eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b`
 
 ## mihomo
 
 - Project: MetaCubeX/mihomo
-- Version/tag: v1.19.30
-- Commit: `ac017cdd246ce8bd547653d927e7bf77d7ee73d5`
+- Version/tag: v1.19.32
+- Commit: `88dcbf7f1614a67c3b36b848ee3592dfa92ada36`
 - License: GNU General Public License version 3 only (included as
   `licenses/mihomo-GPL-3.0.txt`)
 - Pinned source snapshot:
-  `https://github.com/MetaCubeX/mihomo/archive/ac017cdd246ce8bd547653d927e7bf77d7ee73d5.zip`
+  `https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip`
 - Observed source snapshot SHA-256:
-  `d26880078fae7755c7ee9ce718ef6de5806d76c8d289237ec926b6a2f35d69be`
+  `63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30`
 
 ## Twemoji Mozilla font
 
