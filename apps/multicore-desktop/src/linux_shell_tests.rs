@@ -274,6 +274,96 @@ fn wayland_close_without_tray_exits() {
     ui.hide().unwrap();
 }
 
+/// Another Wayland client (`wl-copy`) owns the selection, as a browser does
+/// when the user copies a subscription link. Needs a compositor that focuses
+/// new windows (a real session or WSLg); headless weston has no seat.
+#[test]
+#[ignore = "requires a focused native Wayland session and MULTICORE_CLIPBOARD_EXPECT"]
+fn wayland_paste_reads_text_copied_by_another_client() {
+    let expected = std::env::var("MULTICORE_CLIPBOARD_EXPECT").unwrap();
+    let ui = wayland_window(false);
+    let weak = ui.as_weak();
+    let attempts = Rc::new(Cell::new(0));
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+        let ui = weak.upgrade().unwrap();
+        attempts.set(attempts.get() + 1);
+        let read = clipboard_text::read_subscription_text(ui.window());
+        eprintln!("attempt {}: wayland-aware read = {read:?}", attempts.get());
+        if read.as_deref() == Ok(expected.as_str()) {
+            slint::quit_event_loop().unwrap();
+        } else if attempts.get() == 20 {
+            panic!("the Wayland selection never reached the paste action");
+        }
+    });
+    slint::run_event_loop_until_quit().unwrap();
+    use copypasta::ClipboardProvider;
+    let x11 = copypasta::ClipboardContext::new().and_then(|mut context| context.get_contents());
+    eprintln!("X11-only read (the old path) = {x11:?}");
+    ui.hide().unwrap();
+}
+
+/// "Copy diagnostics": the copied text must still be there when another
+/// client pastes it later (`wl-paste` on Wayland, `xclip` on X11).
+#[test]
+#[ignore = "requires a focused native Wayland or X11 session with wl-paste/xclip"]
+fn copied_text_is_pasted_by_another_client_after_the_copy_returns() {
+    let expected = std::env::var("MULTICORE_CLIPBOARD_EXPECT").unwrap();
+    let x11 = std::env::var("MULTICORE_CLIPBOARD_X11").as_deref() == Ok("1");
+    let ui = if x11 {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder =
+            winit::event_loop::EventLoop::<slint::winit_030::SlintEvent>::with_user_event();
+        builder.with_x11();
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .with_winit_event_loop_builder(builder)
+            .select()
+            .unwrap();
+        let ui = AppWindow::new().unwrap();
+        ui.set_ambient_background_enabled(false);
+        ui.show().unwrap();
+        ui
+    } else {
+        wayland_window(false)
+    };
+    let weak = ui.as_weak();
+    let attempts = Rc::new(Cell::new(0));
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
+        let ui = weak.upgrade().unwrap();
+        attempts.set(attempts.get() + 1);
+        clipboard_text::write_clipboard_text(ui.window(), expected.clone()).unwrap();
+        let (program, args): (&str, &[&str]) = if x11 {
+            ("xclip", &["-o", "-selection", "clipboard"])
+        } else {
+            ("wl-paste", &["--no-newline"])
+        };
+        // Read from a separate process while the event loop keeps running.
+        let expected = expected.clone();
+        let quit = weak.clone();
+        let attempt = attempts.get();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let output = std::process::Command::new(program)
+                .args(args)
+                .output()
+                .unwrap();
+            let pasted = String::from_utf8_lossy(&output.stdout).into_owned();
+            eprintln!("attempt {attempt}: {program} pasted {pasted:?}");
+            if pasted == expected {
+                let _ = quit.upgrade_in_event_loop(|_| slint::quit_event_loop().unwrap());
+            }
+        });
+        assert!(
+            attempts.get() < 12,
+            "no other client ever pasted the copied text"
+        );
+    });
+    slint::run_event_loop_until_quit().unwrap();
+    ui.hide().unwrap();
+}
+
 #[test]
 #[ignore = "requires isolated Wayland and SNI menu host from test-linux-shell.sh"]
 fn wayland_native_tray_menu_restores_and_exits() {

@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use copypasta::{ClipboardContext, ClipboardProvider};
 
 use crate::view_model::MAX_SUBSCRIPTION_URL_BYTES;
@@ -32,11 +34,9 @@ pub(crate) fn read_subscription_text(window: &slint::Window) -> Result<String, C
     }
     #[cfg(not(target_os = "linux"))]
     let _ = window;
-    let mut clipboard = ClipboardContext::new().map_err(|_| ClipboardTextError::Unavailable)?;
-    let contents = clipboard
-        .get_contents()
-        .map_err(|_| ClipboardTextError::Unavailable)?;
-    normalize_subscription_text(&contents)
+    normalize_subscription_text(&with_native_clipboard(|clipboard| {
+        clipboard.get_contents()
+    })?)
 }
 
 /// Used by the "copy diagnostics" action: the caller is responsible for
@@ -54,10 +54,28 @@ pub(crate) fn write_clipboard_text(
         };
     #[cfg(not(target_os = "linux"))]
     let _ = window;
-    let mut clipboard = ClipboardContext::new().map_err(|_| ClipboardTextError::Unavailable)?;
-    clipboard
-        .set_contents(text)
-        .map_err(|_| ClipboardTextError::Unavailable)
+    with_native_clipboard(|clipboard| clipboard.set_contents(text))
+}
+
+thread_local! {
+    // On X11 the copying process itself serves the selection for as long as
+    // its context lives: a context dropped right after `set_contents` takes
+    // the copied text with it. Keep one for the process, like Wayland's.
+    static NATIVE_CLIPBOARD: RefCell<Option<ClipboardContext>> = const { RefCell::new(None) };
+}
+
+fn with_native_clipboard<R>(
+    action: impl FnOnce(
+        &mut ClipboardContext,
+    ) -> Result<R, Box<dyn std::error::Error + Send + Sync + 'static>>,
+) -> Result<R, ClipboardTextError> {
+    NATIVE_CLIPBOARD.with_borrow_mut(|slot| {
+        if slot.is_none() {
+            *slot = Some(ClipboardContext::new().map_err(|_| ClipboardTextError::Unavailable)?);
+        }
+        let clipboard = slot.as_mut().ok_or(ClipboardTextError::Unavailable)?;
+        action(clipboard).map_err(|_| ClipboardTextError::Unavailable)
+    })
 }
 
 #[cfg(target_os = "linux")]
