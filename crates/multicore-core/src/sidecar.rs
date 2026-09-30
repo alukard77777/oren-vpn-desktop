@@ -274,12 +274,17 @@ impl RuntimePaths {
                     .chain(self.mihomo_home_directory.iter())
                     .cloned()
                     .collect::<Vec<_>>();
-                let env = if safe_paths.is_empty() {
-                    Vec::new()
-                } else {
-                    std::env::join_paths(safe_paths)
+                // A single entry is passed verbatim; only several need the OS list separator
+                // (and one containing it cannot be listed, which leaves Mihomo fail-closed).
+                let env = match safe_paths.as_slice() {
+                    [] => Vec::new(),
+                    [single] => vec![(
+                        OsString::from("SAFE_PATHS"),
+                        single.clone().into_os_string(),
+                    )],
+                    _ => std::env::join_paths(safe_paths)
                         .map(|joined| vec![(OsString::from("SAFE_PATHS"), joined)])
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
                 };
                 CommandSpec {
                     engine,

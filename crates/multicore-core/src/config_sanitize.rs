@@ -6,6 +6,12 @@
 //! explicitly `false`, as `MihomoRuntimeControl::with_proxy_mode` writes it) keeps exactly one
 //! loopback `mixed-port`; any other generation is a TUN generation and keeps no inbound port at
 //! all. In proxy mode that one loopback port is reachable by every local user while it is open.
+//!
+//! Mihomo input is normalised before any rule is applied: YAML merge keys (`<<`) are resolved and
+//! aliases expanded (the output is plain YAML without `<<`, anchors or aliases), custom tags are
+//! refused, and only the top-level keys in [`ALLOWED_MIHOMO_KEYS`] survive. Xray keys are matched
+//! with ASCII case folding, as Go's `encoding/json` does, and an object with two keys that fold
+//! to the same name is refused.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -44,32 +50,54 @@ pub struct SanitizedMihomo {
     pub mixed_port: Option<u16>,
 }
 
-/// Keys that open extra listeners, name files, run privileged network setup, or expose the
-/// controller elsewhere. `external-ui*` is handled separately (prefix match; the daemon serves
-/// the dashboard itself, plan amendment A4). `mixed-port` is handled by mode.
-const REMOVED_MIHOMO_KEYS: &[&str] = &[
-    "external-controller-unix",
-    "external-controller-pipe",
-    "external-controller-tls",
-    "external-controller-cors",
-    "external-controller-routing-mark",
-    "external-doh-server",
-    "tls",
-    "secret",
-    "listeners",
-    "tunnels",
-    "tuic-server",
-    "ss-config",
-    "vmess-config",
-    "tcptun-config",
-    "udptun-config",
-    "iptables",
-    "ebpf",
-    "port",
-    "socks-port",
-    "redir-port",
-    "tproxy-port",
+/// Top-level Mihomo keys a provider config may keep (pinned Mihomo v1.19.30). Everything else is
+/// dropped: listeners and their options (`port`, `socks-port`, `redir-port`, `tproxy-port`,
+/// `listeners`, `tunnels`, `*-config`, `tuic-server`, `authentication`, `lan-*`), controller and
+/// UI settings (`external-*`, `secret`, `tls`; the service writes its own controller and the
+/// daemon serves the dashboard, amendment A4), privileged host setup (`iptables`, `ebpf`) and
+/// anything a later Mihomo adds. `mixed-port` is kept only for a proxy-mode generation, and
+/// `external-controller`, `secret`, `bind-address` and `allow-lan` are always forced.
+///
+/// Geodata keys stay: downloads land in the client's own Mihomo home (the service keeps one
+/// per user), so a user can only steer their own routing.
+pub const ALLOWED_MIHOMO_KEYS: &[&str] = &[
+    "mode",
+    "log-level",
+    "ipv6",
+    "unified-delay",
+    "tcp-concurrent",
+    "find-process-mode",
+    "global-client-fingerprint",
+    "global-ua",
+    "etag-support",
+    "keep-alive-idle",
+    "keep-alive-interval",
+    "disable-keep-alive",
+    "interface-name",
+    "routing-mark",
+    "geodata-mode",
+    "geodata-loader",
+    "geosite-matcher",
+    "geo-auto-update",
+    "geo-update-interval",
+    "geox-url",
+    "hosts",
+    "dns",
+    "ntp",
+    "tun",
+    "sniffer",
+    "profile",
+    "proxies",
+    "proxy-groups",
+    "proxy-providers",
+    "rule-providers",
+    "rules",
+    "sub-rules",
+    "mixed-port",
 ];
+
+/// `profile` keys kept (no paths, no shared state beyond the client's own home).
+const ALLOWED_PROFILE_KEYS: &[&str] = &["store-selected", "store-fake-ip"];
 
 fn key(name: &str) -> Value {
     Value::String(name.to_owned())
@@ -88,20 +116,34 @@ pub fn sanitize_mihomo(
         .ok_or(SanitizeError::ServiceDirectory)?;
     let mut document: Value =
         serde_yaml_ng::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
+    // Aliases are already expanded by the parser; merge keys are not, and Mihomo's own decoder
+    // would re-apply them and bring back every key removed below.
+    document
+        .apply_merge()
+        .map_err(|_| SanitizeError::Malformed)?;
+    reject_merge_keys_and_tags(&document)?;
     let mapping = document.as_mapping_mut().ok_or(SanitizeError::Malformed)?;
-    for name in REMOVED_MIHOMO_KEYS {
-        mapping.remove(key(name));
+    mapping.retain(|name, _| {
+        name.as_str()
+            .is_some_and(|name| ALLOWED_MIHOMO_KEYS.contains(&name))
+    });
+    if let Some(profile) = mapping.get_mut(key("profile")) {
+        match profile.as_mapping_mut() {
+            Some(profile) => profile.retain(|name, _| {
+                name.as_str()
+                    .is_some_and(|name| ALLOWED_PROFILE_KEYS.contains(&name))
+            }),
+            None => *profile = Value::Mapping(Mapping::new()),
+        }
     }
-    let external_ui = mapping
-        .keys()
-        .filter(|name| {
-            name.as_str()
-                .is_some_and(|name| name.starts_with("external-ui"))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for name in external_ui {
-        mapping.remove(&name);
+    // Mihomo runs as SYSTEM/root: it must never set the machine clock.
+    if let Some(ntp) = mapping.get_mut(key("ntp")) {
+        match ntp.as_mapping_mut() {
+            Some(ntp) => {
+                ntp.insert(key("write-to-system"), Value::Bool(false));
+            }
+            None => *ntp = Value::Mapping(Mapping::new()),
+        }
     }
     mapping.insert(
         key("external-controller"),
@@ -148,6 +190,7 @@ pub fn sanitize_mihomo(
     rewrite_provider_paths(mapping, "rule-providers", "rule", service_directory)?;
     rewrite_provider_paths(mapping, "proxy-providers", "proxy", service_directory)?;
     reject_credential_files(mapping)?;
+    reject_merge_keys_and_tags(&document)?;
     let yaml = serde_yaml_ng::to_string(&document)
         .map_err(|_| SanitizeError::Malformed)?
         .into_bytes();
@@ -210,55 +253,139 @@ fn rewrite_provider_paths(
     Ok(())
 }
 
-/// Proxy fields Mihomo reads from disk when they are not inline PEM.
-fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
-    let Some(proxies) = mapping.get(key("proxies")).and_then(Value::as_sequence) else {
-        return Ok(());
-    };
-    for (index, proxy) in proxies.iter().enumerate() {
-        let Some(proxy) = proxy.as_mapping() else {
-            continue;
-        };
-        let ssh = proxy.get(key("type")).and_then(Value::as_str) == Some("ssh");
-        for field in ["certificate", "private-key", "ca"] {
-            if field == "private-key" && !ssh {
-                // WireGuard and others carry an inline base64 key here.
-                continue;
+/// Refuses anything the YAML emitter would write back as a merge key or a tag.
+fn reject_merge_keys_and_tags(value: &Value) -> Result<(), SanitizeError> {
+    match value {
+        Value::Mapping(mapping) => {
+            for (name, child) in mapping {
+                if name.as_str() == Some("<<") || !matches!(name, Value::String(_)) {
+                    return Err(SanitizeError::Malformed);
+                }
+                reject_merge_keys_and_tags(child)?;
             }
-            if let Some(value) = proxy.get(key(field)).and_then(Value::as_str)
-                && !value.trim_start().starts_with("-----BEGIN")
-            {
-                return Err(SanitizeError::FileReference(format!(
-                    "proxies[{index}].{field}"
-                )));
+        }
+        Value::Sequence(items) => {
+            for item in items {
+                reject_merge_keys_and_tags(item)?;
+            }
+        }
+        Value::Tagged(_) => return Err(SanitizeError::Malformed),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Proxy fields Mihomo reads from disk unless they hold the material inline: `certificate` and
+/// `ca` must be inline PEM, `private-key` inline PEM or a short base64 key (WireGuard). Checked
+/// for every proxy type, in nested options (`plugin-opts`, …), and in inline provider payloads.
+/// Remote provider content is fetched by Mihomo itself and relies on its `SAFE_PATHS` check,
+/// which is the client's own home in service mode.
+fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
+    if let Some(proxies) = mapping.get(key("proxies")).and_then(Value::as_sequence) {
+        for (index, proxy) in proxies.iter().enumerate() {
+            reject_credential_paths_in(proxy, &format!("proxies[{index}]"))?;
+        }
+    }
+    if let Some(providers) = mapping
+        .get(key("proxy-providers"))
+        .and_then(Value::as_mapping)
+    {
+        for (name, provider) in providers {
+            let name = name.as_str().unwrap_or("");
+            if let Some(payload) = provider.get("payload").and_then(Value::as_sequence) {
+                for (index, proxy) in payload.iter().enumerate() {
+                    reject_credential_paths_in(
+                        proxy,
+                        &format!("proxy-providers.{name}.payload[{index}]"),
+                    )?;
+                }
             }
         }
     }
     Ok(())
 }
 
+fn reject_credential_paths_in(value: &Value, at: &str) -> Result<(), SanitizeError> {
+    match value {
+        Value::Mapping(mapping) => {
+            for (name, child) in mapping {
+                let name = name.as_str().unwrap_or("");
+                let here = format!("{at}.{name}");
+                if let Some(text) = child.as_str() {
+                    let inline = match name {
+                        "certificate" | "ca" => is_pem(text),
+                        "private-key" => is_pem(text) || is_short_base64(text),
+                        _ => true,
+                    };
+                    if !inline {
+                        return Err(SanitizeError::FileReference(here));
+                    }
+                }
+                reject_credential_paths_in(child, &here)?;
+            }
+        }
+        Value::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                reject_credential_paths_in(item, &format!("{at}[{index}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_pem(text: &str) -> bool {
+    text.trim_start().starts_with("-----BEGIN")
+}
+
+fn is_short_base64(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+/// Case-folded field lookup, as Go's `encoding/json` matches struct fields.
+fn field<'a>(map: &'a JsonMap, name: &str) -> Option<&'a serde_json::Value> {
+    map.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
+/// Xray `log` fields kept; `access`/`error` (file outputs) and anything else are dropped.
+const ALLOWED_XRAY_LOG_KEYS: &[&str] = &["loglevel", "dnslog", "maskaddress"];
+
 pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     let mut document: serde_json::Value =
         serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
+    reject_folded_duplicates(&document)?;
     let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
-    if let Some(log) = root
-        .get_mut("log")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        log.remove("access");
-        log.remove("error");
+    for (name, value) in root.iter_mut() {
+        if !name.eq_ignore_ascii_case("log") {
+            continue;
+        }
+        let log = value.as_object_mut().ok_or(SanitizeError::Malformed)?;
+        log.retain(|key, _| {
+            ALLOWED_XRAY_LOG_KEYS
+                .iter()
+                .any(|allowed| key.eq_ignore_ascii_case(allowed))
+        });
     }
-    if let Some(inbounds) = root
-        .get_mut("inbounds")
-        .and_then(serde_json::Value::as_array_mut)
-    {
+    for (name, value) in root.iter_mut() {
+        if !name.eq_ignore_ascii_case("inbounds") {
+            continue;
+        }
+        let inbounds = value.as_array_mut().ok_or(SanitizeError::Malformed)?;
         for (index, inbound) in inbounds.iter_mut().enumerate() {
             let inbound = inbound.as_object_mut().ok_or(SanitizeError::Malformed)?;
-            match inbound.get("listen").and_then(serde_json::Value::as_str) {
+            match field(inbound, "listen") {
                 None => {
                     inbound.insert("listen".to_owned(), "127.0.0.1".into());
                 }
-                Some(listen)
+                Some(serde_json::Value::String(listen))
                     if listen
                         .parse::<IpAddr>()
                         .is_ok_and(|address| address.is_loopback()) => {}
@@ -270,19 +397,53 @@ pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
             }
         }
     }
-    // Xray's gRPC API can listen by itself (`api.listen`), outside `inbounds`.
-    if let Some(listen) = root
-        .get("api")
-        .and_then(|api| api.get("listen"))
-        .and_then(serde_json::Value::as_str)
-        && !listen
-            .parse::<SocketAddr>()
-            .is_ok_and(|address| address.ip().is_loopback())
-    {
-        return Err(SanitizeError::NonLoopbackListener("api.listen".to_owned()));
+    // Xray's gRPC API and its metrics/pprof HTTP server listen by themselves, outside `inbounds`.
+    for section in ["api", "metrics"] {
+        let Some(object) = field(root, section) else {
+            continue;
+        };
+        let object = object.as_object().ok_or(SanitizeError::Malformed)?;
+        if let Some(listen) = field(object, "listen") {
+            let loopback = listen
+                .as_str()
+                .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                .is_some_and(|address| address.ip().is_loopback());
+            if !loopback {
+                return Err(SanitizeError::NonLoopbackListener(format!(
+                    "{section}.listen"
+                )));
+            }
+        }
     }
     reject_xray_file_references(&document, "$")?;
     serde_json::to_vec(&document).map_err(|_| SanitizeError::Malformed)
+}
+
+/// Go would silently pick one of two keys that differ only in case; refuse the ambiguity.
+fn reject_folded_duplicates(value: &serde_json::Value) -> Result<(), SanitizeError> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut seen = std::collections::HashSet::new();
+            for (name, child) in map {
+                if !seen.insert(name.to_ascii_lowercase()) {
+                    return Err(SanitizeError::Malformed);
+                }
+                reject_folded_duplicates(child)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                reject_folded_duplicates(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_external_geodata(text: &str) -> bool {
+    text.get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ext:"))
 }
 
 fn reject_xray_file_references(value: &serde_json::Value, at: &str) -> Result<(), SanitizeError> {
@@ -290,7 +451,11 @@ fn reject_xray_file_references(value: &serde_json::Value, at: &str) -> Result<()
         serde_json::Value::Object(map) => {
             for (name, child) in map {
                 let here = format!("{at}.{name}");
-                if matches!(name.as_str(), "certificateFile" | "keyFile") {
+                if name.eq_ignore_ascii_case("certificateFile")
+                    || name.eq_ignore_ascii_case("keyFile")
+                    // `dns.hosts` keys are domain rules too.
+                    || is_external_geodata(name)
+                {
                     return Err(SanitizeError::FileReference(here));
                 }
                 reject_xray_file_references(child, &here)?;
@@ -301,7 +466,7 @@ fn reject_xray_file_references(value: &serde_json::Value, at: &str) -> Result<()
                 reject_xray_file_references(child, &format!("{at}[{index}]"))?;
             }
         }
-        serde_json::Value::String(text) if text.starts_with("ext:") => {
+        serde_json::Value::String(text) if is_external_geodata(text) => {
             return Err(SanitizeError::FileReference(at.to_owned()));
         }
         _ => {}

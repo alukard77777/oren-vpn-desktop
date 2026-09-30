@@ -57,6 +57,38 @@ impl ResolvedRuntime {
         }
         Ok(())
     }
+
+    /// Reads a guarded file (matched by file name, e.g. `mihomo.yaml`) through the handle opened
+    /// with `O_NOFOLLOW` during resolution, never by re-opening its path: a symlink or FIFO
+    /// renamed over it afterwards is not followed. More than `limit` bytes is `Layout`.
+    pub(crate) fn read_guarded(&self, path: &Path, limit: u64) -> Result<Vec<u8>, ResolveError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let guard = self
+            .guards
+            .iter()
+            .rev()
+            .find(|guard| {
+                guard.path.file_name() == path.file_name()
+                    && guard
+                        .handle
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.is_file())
+            })
+            .ok_or(ResolveError::Missing)?;
+        let mut handle = &guard.handle;
+        handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| ResolveError::Io)?;
+        let mut bytes = Vec::new();
+        handle
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ResolveError::Io)?;
+        if bytes.len() as u64 > limit {
+            return Err(ResolveError::Layout);
+        }
+        Ok(bytes)
+    }
 }
 
 pub(crate) fn install_context(context: UserContext) -> Result<(), ResolveError> {
@@ -235,7 +267,10 @@ fn open_guard(
     final_component: bool,
     owner_uid: u32,
 ) -> Result<GuardedPath, ResolveError> {
+    // `NONBLOCK`: a FIFO planted in the user-owned tree must not block the privileged opener
+    // (it is then rejected as not a regular file below).
     let flags = rustix::fs::OFlags::NOFOLLOW.bits() as i32
+        | rustix::fs::OFlags::NONBLOCK.bits() as i32
         | if directory {
             rustix::fs::OFlags::DIRECTORY.bits() as i32
         } else {

@@ -30,9 +30,9 @@ use super::{mihomo_rest, state_dir};
 use crate::runtime_host::{broker_safe_log, state};
 
 #[cfg(windows)]
-use crate::runtime_paths::ResolvedRuntime;
+use crate::runtime_paths::{ResolveError, ResolvedRuntime};
 #[cfg(unix)]
-use crate::unix_runtime_paths::ResolvedRuntime;
+use crate::unix_runtime_paths::{ResolveError, ResolvedRuntime};
 #[cfg(unix)]
 use multicore_core::UnixGroupLauncher as PlatformLauncher;
 #[cfg(windows)]
@@ -81,30 +81,20 @@ impl ProductionCores {
     ) -> Result<ControllerEndpoint, BrokerErrorCode> {
         let resolved = resolve_client(client, &self.host_executable, generation)
             .map_err(|()| BrokerErrorCode::NotReady)?;
-        #[cfg(windows)]
-        {
-            let package = self
-                .host_executable
-                .parent()
-                .and_then(Path::parent)
-                .ok_or(BrokerErrorCode::NotReady)?;
-            super::core_hashes::verify_core_hashes(
-                package,
-                &["cores/xray.exe", "cores/mihomo.exe"],
-            )
-            .map_err(|_| BrokerErrorCode::NotReady)?;
-        }
+        self.verify_cores()?;
         resolved
             .verify_unchanged()
             .map_err(|_| BrokerErrorCode::NotReady)?;
-        let mihomo_source = read_bounded(&resolved.paths.mihomo_config)?;
-        let xray_source = read_bounded(&resolved.paths.xray_config)?;
+        let mihomo_source = read_guarded(&resolved, &resolved.paths.mihomo_config)?;
+        let xray_source = read_guarded(&resolved, &resolved.paths.xray_config)?;
+        let home = client_home(&self.service_directory, client);
+        fs::create_dir_all(&home).map_err(|_| BrokerErrorCode::NotReady)?;
         let controller_port = free_loopback_port().ok_or(BrokerErrorCode::NotReady)?;
         let controller_secret = random_secret().map_err(|_| BrokerErrorCode::NotReady)?;
         let mihomo = sanitize_mihomo(
             &mihomo_source,
             &MihomoServicePolicy {
-                service_directory: &self.service_directory,
+                service_directory: &home,
                 controller_port,
                 controller_secret: &controller_secret,
             },
@@ -113,10 +103,9 @@ impl ProductionCores {
         let xray = sanitize_xray(&xray_source).map_err(|_| BrokerErrorCode::InvalidRequest)?;
         let directory = state_dir::fresh_generation_directory(&self.service_directory, generation)
             .map_err(|_| BrokerErrorCode::NotReady)?;
-        for sub in ["providers", "logs"] {
-            fs::create_dir_all(self.service_directory.join(sub))
-                .map_err(|_| BrokerErrorCode::NotReady)?;
-        }
+        fs::create_dir_all(home.join("providers"))
+            .and_then(|()| fs::create_dir_all(self.service_directory.join("logs")))
+            .map_err(|_| BrokerErrorCode::NotReady)?;
         fs::write(directory.join("mihomo.yaml"), &mihomo.yaml)
             .and_then(|()| fs::write(directory.join("xray.json"), &xray))
             .map_err(|_| BrokerErrorCode::NotReady)?;
@@ -126,7 +115,7 @@ impl ProductionCores {
             xray_config: directory.join("xray.json"),
             mihomo_config: directory.join("mihomo.yaml"),
             dashboard_directory: None,
-            mihomo_home_directory: Some(self.service_directory.clone()),
+            mihomo_home_directory: Some(home),
         };
         let logs = Arc::new(CoreLogBuffer::persistent_or_memory(
             self.service_directory.join("logs").join("latest-core.log"),
@@ -174,6 +163,25 @@ impl ProductionCores {
         Ok(endpoint)
     }
 
+    /// Windows: refuses cores that no longer match the package's `SHA256SUMS.txt` (for example
+    /// after a Mihomo self-upgrade). Linux cores come from the root-owned `/usr/lib/multicore`.
+    fn verify_cores(&self) -> Result<(), BrokerErrorCode> {
+        #[cfg(windows)]
+        {
+            let package = self
+                .host_executable
+                .parent()
+                .and_then(Path::parent)
+                .ok_or(BrokerErrorCode::NotReady)?;
+            super::core_hashes::verify_core_hashes(
+                package,
+                &["cores/xray.exe", "cores/mihomo.exe"],
+            )
+            .map_err(|_| BrokerErrorCode::NotReady)?;
+        }
+        Ok(())
+    }
+
     fn stop_processes(&self, controller: &SidecarProcessController<PlatformLauncher>) {
         let _ = self.runtime.block_on(controller.stop(Engine::Mihomo));
         let _ = self.runtime.block_on(controller.stop(Engine::Xray));
@@ -193,6 +201,7 @@ impl Cores for ProductionCores {
     fn restart(&mut self) -> Result<(), BrokerErrorCode> {
         let active = self.active.as_ref().ok_or(BrokerErrorCode::NotReady)?;
         self.stop_processes(&active.controller);
+        self.verify_cores()?;
         for engine in [Engine::Xray, Engine::Mihomo] {
             self.runtime
                 .block_on(active.controller.start(engine))
@@ -320,17 +329,40 @@ fn resolve_client(
         .map_err(drop)
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, BrokerErrorCode> {
-    use std::io::Read;
-    let limit = MAX_CONFIG_BYTES as u64;
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
-        .map_err(|_| BrokerErrorCode::NotReady)?;
-    if bytes.len() as u64 > limit {
-        return Err(BrokerErrorCode::InvalidRequest);
+/// Reads a staged config through the resolver's verified handle, never by re-opening its path.
+fn read_guarded(resolved: &ResolvedRuntime, path: &Path) -> Result<Vec<u8>, BrokerErrorCode> {
+    resolved
+        .read_guarded(path, MAX_CONFIG_BYTES as u64)
+        .map_err(|error| match error {
+            ResolveError::Layout => BrokerErrorCode::InvalidRequest,
+            _ => BrokerErrorCode::NotReady,
+        })
+}
+
+/// The client's own Mihomo home (`-d`, `SAFE_PATHS`): provider caches, `cache.db` and geodata
+/// are never shared between users. Keyed by the stable account identity (Windows SID, Unix uid),
+/// not the logon session, so a user keeps their caches across logons.
+pub(crate) fn client_home(service_directory: &Path, client: &ClientIdentity) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(stable_identity(client).as_bytes());
+    let name = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    service_directory.join("users").join(name)
+}
+
+/// Windows `user_key` is `"<session>:<sid>"`: the SID part. Unix: the uid.
+pub(crate) fn stable_identity(client: &ClientIdentity) -> String {
+    if cfg!(windows) {
+        let sid = client
+            .user_key
+            .split_once(':')
+            .map_or(client.user_key.as_str(), |(_, sid)| sid);
+        format!("sid:{sid}")
+    } else {
+        format!("uid:{}", client.uid)
     }
-    Ok(bytes)
 }
 
 fn free_loopback_port() -> Option<u16> {

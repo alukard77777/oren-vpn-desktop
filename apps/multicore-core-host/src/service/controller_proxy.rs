@@ -195,14 +195,18 @@ async fn serve(mut client: TcpStream, settings: &Settings) {
 /// that could discard the response before the client read it.
 async fn finish(client: &mut TcpStream) {
     let _ = client.shutdown().await;
-    let mut sink = [0_u8; 4096];
-    let mut drained = 0_usize;
-    while drained < MAX_BODY_BYTES {
-        match timeout(DRAIN_TIMEOUT, client.read(&mut sink)).await {
-            Ok(Ok(read)) if read > 0 => drained += read,
-            _ => break,
+    // One overall deadline: a client trickling bytes cannot hold a connection slot for long.
+    let _ = timeout(DRAIN_TIMEOUT, async {
+        let mut sink = [0_u8; 4096];
+        let mut drained = 0_usize;
+        while drained < MAX_BODY_BYTES {
+            match client.read(&mut sink).await {
+                Ok(read) if read > 0 => drained += read,
+                _ => break,
+            }
         }
-    }
+    })
+    .await;
 }
 
 /// `Err(None)`: the connection is unusable, close silently. `Err(Some(_))`: answer and close.

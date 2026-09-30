@@ -304,3 +304,205 @@ fn a_daemon_staged_tun_mode_generation_is_accepted_without_ports() {
     assert!(doc.get("mixed-port").is_none());
     assert_eq!(doc["tun"]["enable"].as_bool(), Some(false));
 }
+
+/// Review C1: merge keys and aliases are resolved before any rule runs, so nothing removed can
+/// come back through Mihomo's own merge handling, and the output has no `<<`, anchors or aliases.
+#[test]
+fn merge_keys_and_aliases_cannot_smuggle_removed_keys_back() {
+    let top = r#"
+mixed-port: 1
+experimental: &smuggled {external-controller-unix: /tmp/x.sock}
+tun: {enable: false}
+<<: [*smuggled, {listeners: [{name: x, type: mixed, port: 7000, listen: 0.0.0.0}], external-controller-pipe: '\.\pipe\x', port: 7890, external-ui: C:\ui}]
+dns: {enable: true, <<: {listen: 0.0.0.0:53}}
+"#;
+    let out = sanitize_mihomo(top.as_bytes(), &policy()).unwrap();
+    let text = String::from_utf8(out.yaml.clone()).unwrap();
+    for forbidden in [
+        "<<",
+        "&smuggled",
+        "*smuggled",
+        "listeners",
+        "external-controller-unix",
+        "external-controller-pipe",
+        "external-ui",
+        "7890",
+        "0.0.0.0:53",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden} survived:\n{text}");
+    }
+    let doc = yaml(&out.yaml);
+    assert!(doc["dns"].get("listen").is_none());
+    assert_eq!(doc["dns"]["enable"].as_bool(), Some(true));
+
+    let provider = "mixed-port: 1\nrule-providers:\n  a: {<<: {type: file}, behavior: domain, path: /etc/shadow}\n";
+    assert_eq!(
+        sanitize_mihomo(provider.as_bytes(), &policy()),
+        Err(SanitizeError::FileReference("rule-providers.a.path".into()))
+    );
+    let proxy = "mixed-port: 1\nproxies:\n  - {<<: {type: ssh, private-key: C:/Windows/System32/config/SAM}, name: s, server: a, port: 22}\n";
+    assert_eq!(
+        sanitize_mihomo(proxy.as_bytes(), &policy()),
+        Err(SanitizeError::FileReference(
+            "proxies[0].private-key".into()
+        ))
+    );
+    for malformed in [
+        "mixed-port: 1\n<<: 1\n",
+        "mixed-port: 1\ntun: !custom {enable: true}\n",
+        "mixed-port: 1\ndns: {enable: !custom true}\n",
+    ] {
+        assert_eq!(
+            sanitize_mihomo(malformed.as_bytes(), &policy()),
+            Err(SanitizeError::Malformed),
+            "{malformed}"
+        );
+    }
+}
+
+/// Review I3: only allowlisted top-level keys survive.
+#[test]
+fn only_allowlisted_top_level_keys_survive() {
+    let input = "mode: rule\nlog-level: info\nexperimental: {x: 1}\nauthentication: [\"u:p\"]\nfuture-listener-config: {listen: 0.0.0.0}\nskip-auth-prefixes: [0.0.0.0/0]\nprofile: {store-selected: true, cache-path: /etc/x}\nrules: [MATCH,DIRECT]\n";
+    let doc = yaml(&sanitize_mihomo(input.as_bytes(), &policy()).unwrap().yaml);
+    for kept in [
+        "mode",
+        "log-level",
+        "rules",
+        "profile",
+        "tun",
+        "external-controller",
+        "secret",
+    ] {
+        assert!(doc.get(kept).is_some(), "{kept} must stay");
+    }
+    for dropped in [
+        "experimental",
+        "authentication",
+        "future-listener-config",
+        "skip-auth-prefixes",
+    ] {
+        assert!(doc.get(dropped).is_none(), "{dropped} must be dropped");
+    }
+    assert!(doc["profile"].get("cache-path").is_none());
+    assert_eq!(doc["profile"]["store-selected"].as_bool(), Some(true));
+    for name in doc.as_mapping().unwrap().keys() {
+        let name = name.as_str().unwrap();
+        assert!(
+            multicore_core::ALLOWED_MIHOMO_KEYS.contains(&name)
+                || ["external-controller", "secret", "bind-address", "allow-lan"].contains(&name),
+            "{name}"
+        );
+    }
+}
+
+/// Review I2: SYSTEM/root Mihomo never writes the system clock.
+#[test]
+fn ntp_never_writes_the_system_clock() {
+    let input = "mixed-port: 1\nntp: {enable: true, write-to-system: true, server: time.example, port: 123}\n";
+    let doc = yaml(&sanitize_mihomo(input.as_bytes(), &policy()).unwrap().yaml);
+    assert_eq!(doc["ntp"]["write-to-system"].as_bool(), Some(false));
+    assert_eq!(doc["ntp"]["enable"].as_bool(), Some(true));
+    let scalar = yaml(
+        &sanitize_mihomo(b"mixed-port: 1\nntp: yes\n", &policy())
+            .unwrap()
+            .yaml,
+    );
+    assert!(scalar["ntp"].get("write-to-system").is_none());
+    assert!(scalar["ntp"].as_mapping().unwrap().is_empty());
+}
+
+/// Review M6: credential paths are refused for every type, nested options and inline payloads.
+#[test]
+fn credential_paths_are_refused_everywhere() {
+    for (input, at) in [
+        (
+            "mixed-port: 1\nproxies:\n  - {name: v, type: vless, server: a, port: 1, private-key: C:/k.pem, certificate: \"-----BEGIN CERTIFICATE-----\"}\n",
+            "proxies[0].private-key",
+        ),
+        (
+            "mixed-port: 1\nproxies:\n  - {name: s, type: ss, server: a, port: 1, plugin: shadow-tls, plugin-opts: {certificate: /etc/ssl/c.pem}}\n",
+            "proxies[0].plugin-opts.certificate",
+        ),
+        (
+            "mixed-port: 1\nproxy-providers:\n  p: {type: inline, payload: [{name: h, type: hysteria2, server: a, port: 1, ca: /etc/shadow}]}\n",
+            "proxy-providers.p.payload[0].ca",
+        ),
+    ] {
+        assert_eq!(
+            sanitize_mihomo(input.as_bytes(), &policy()),
+            Err(SanitizeError::FileReference(at.into())),
+            "{input}"
+        );
+    }
+}
+
+/// Review C2/I1/M7: Xray matches keys case-insensitively, so the sanitiser does too.
+#[test]
+fn xray_keys_are_matched_case_insensitively() {
+    let out = sanitize_xray(
+        br#"{"LOG":{"Access":"C:/Windows/evil.txt","ERROR":"C:/e","LogLevel":"warning","dnsLog":true}}"#,
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let log = doc["LOG"].as_object().unwrap();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert!(log.contains_key("LogLevel") && log.contains_key("dnsLog"));
+    for (input, at) in [
+        (
+            &br#"{"api":{"Listen":"0.0.0.0:10085","services":["HandlerService"]}}"#[..],
+            "api.listen",
+        ),
+        (br#"{"API":{"LISTEN":"192.168.1.2:10085"}}"#, "api.listen"),
+        (
+            br#"{"metrics":{"tag":"m","listen":"0.0.0.0:11111"}}"#,
+            "metrics.listen",
+        ),
+        (br#"{"Metrics":{"Listen":"[::]:11111"}}"#, "metrics.listen"),
+        (
+            br#"{"Inbounds":[{"Listen":"0.0.0.0","port":1}]}"#,
+            "inbounds[0].listen",
+        ),
+    ] {
+        assert_eq!(
+            sanitize_xray(input),
+            Err(SanitizeError::NonLoopbackListener(at.into())),
+            "{}",
+            String::from_utf8_lossy(input)
+        );
+    }
+    sanitize_xray(br#"{"metrics":{"tag":"m","listen":"127.0.0.1:11111"}}"#).unwrap();
+    assert_eq!(
+        sanitize_xray(br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"CertificateFile":"C:/k.pem"}]}}}]}"#),
+        Err(SanitizeError::FileReference(
+            "$.outbounds[0].streamSettings.tlsSettings.certificates[0].CertificateFile".into()
+        ))
+    );
+    assert_eq!(
+        sanitize_xray(br#"{"outbounds":[{"x":{"KEYFILE":"C:/k.pem"}}]}"#),
+        Err(SanitizeError::FileReference(
+            "$.outbounds[0].x.KEYFILE".into()
+        ))
+    );
+    assert_eq!(
+        sanitize_xray(br#"{"dns":{"hosts":{"ext:C:/SAM:x":"1.1.1.1"}}}"#),
+        Err(SanitizeError::FileReference(
+            "$.dns.hosts.ext:C:/SAM:x".into()
+        ))
+    );
+    assert_eq!(
+        sanitize_xray(br#"{"routing":{"rules":[{"ip":["EXT:C:/SAM:x"]}]}}"#),
+        Err(SanitizeError::FileReference(
+            "$.routing.rules[0].ip[0]".into()
+        ))
+    );
+    // Two keys that fold to the same name are ambiguous for Go: refused.
+    assert_eq!(
+        sanitize_xray(br#"{"inbounds":[{"listen":"127.0.0.1","Listen":"0.0.0.0"}]}"#),
+        Err(SanitizeError::Malformed)
+    );
+    assert_eq!(
+        sanitize_xray(br#"{"log":{"loglevel":"none"},"Log":{"access":"C:/x"}}"#),
+        Err(SanitizeError::Malformed)
+    );
+}

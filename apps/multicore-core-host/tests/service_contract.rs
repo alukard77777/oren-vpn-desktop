@@ -36,6 +36,7 @@ struct FakeCores {
     running: bool,
     tun: bool,
     fail_tun: Option<BrokerErrorCode>,
+    fail_tun_off: bool,
     fail_restart: bool,
 }
 
@@ -67,6 +68,9 @@ impl Cores for FakeCores {
         self.calls.push(format!("tun:{on}"));
         if on && let Some(code) = self.fail_tun {
             return Err(code);
+        }
+        if !on && self.fail_tun_off {
+            return Err(BrokerErrorCode::NotReady);
         }
         self.tun = on;
         Ok(())
@@ -302,6 +306,63 @@ fn a_failed_crash_restart_is_reported_and_stops_the_cores() {
             code: BrokerErrorCode::NotReady
         }
     ));
+}
+
+/// Review M5: a failed switch-off is not recorded as off, so the next request retries it.
+#[test]
+fn a_failed_tun_switch_off_is_retried() {
+    let mut service = ServiceLoop::new(FakeCores::default());
+    let alice = user("alice");
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    service.execute(A, &alice, ServiceCommand::SetTun { on: true });
+    service.cores_mut().fail_tun_off = true;
+    assert_eq!(
+        service.execute(A, &alice, ServiceCommand::SetTun { on: false }),
+        ServiceResponse::Error {
+            code: BrokerErrorCode::NotReady
+        }
+    );
+    assert!(matches!(
+        service.execute(A, &alice, ServiceCommand::Status),
+        ServiceResponse::Status { tun_on: true, .. }
+    ));
+    service.cores_mut().fail_tun_off = false;
+    assert_eq!(
+        service.execute(A, &alice, ServiceCommand::SetTun { on: false }),
+        ServiceResponse::TunState { on: false }
+    );
+    assert_eq!(
+        service.cores_mut().calls,
+        ["prepare:1", "tun:true", "tun:false", "tun:false"]
+    );
+}
+
+/// Review I5: provider caches, cache.db and geodata live in a per-account Mihomo home.
+#[test]
+fn each_account_gets_its_own_mihomo_home() {
+    use service::cores::client_home;
+    let root = std::path::Path::new("/var/lib/multicore");
+    let (alice, bob) = (
+        ClientIdentity {
+            user_key: "1:S-1-5-21-1-2-3-1001".into(),
+            data_root: PathBuf::from("/a"),
+            uid: 1001,
+        },
+        ClientIdentity {
+            user_key: "2:S-1-5-21-1-2-3-1002".into(),
+            data_root: PathBuf::from("/b"),
+            uid: 1002,
+        },
+    );
+    let alice_home = client_home(root, &alice);
+    assert!(alice_home.starts_with(root.join("users")));
+    assert_ne!(alice_home, client_home(root, &bob));
+    // The same account in a later logon session keeps its caches.
+    let alice_again = ClientIdentity {
+        user_key: "7:S-1-5-21-1-2-3-1001".into(),
+        ..alice.clone()
+    };
+    assert_eq!(alice_home, client_home(root, &alice_again));
 }
 
 #[test]
@@ -1168,4 +1229,36 @@ fn systemd_unit_carries_the_documented_hardening() {
             "unit lacks the line {required}"
         );
     }
+}
+
+/// Review M3: an unauthenticated client trickling bytes is cut off after one overall deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trickling_client_is_released_within_the_drain_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let proxy = service::controller_proxy::ControllerProxy::start(1, "s".into(), "t".into())
+        .await
+        .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port()))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /proxies HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut response = vec![0_u8; 64];
+    let read = stream.read(&mut response).await.unwrap();
+    assert!(String::from_utf8_lossy(&response[..read]).starts_with("HTTP/1.1 401 "));
+    // Our read side already saw the proxy's FIN; keep trickling a byte every 200 ms. Once the
+    // proxy drops the socket, a write fails (RST). It must do so well before 3 s.
+    let closed = loop {
+        if stream.write_all(b"x").await.is_err() {
+            break true;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(3) {
+            break false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert!(closed, "the drain deadline must end the connection");
 }
