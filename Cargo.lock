@@ -3403,10 +3403,13 @@ name = "multicore-core-host"
 version = "0.1.0"
 dependencies = [
  "embed-resource",
+ "getrandom 0.4.3",
  "multicore-core",
  "multicore-platform",
  "rustix 1.1.4",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",

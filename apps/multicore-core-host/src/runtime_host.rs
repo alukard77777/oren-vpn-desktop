@@ -322,7 +322,7 @@ fn from_engine(v: Engine) -> ElevatedEngine {
         Engine::Mihomo => ElevatedEngine::Mihomo,
     }
 }
-fn state(v: RuntimeCheckState) -> ElevatedRuntimeState {
+pub(crate) fn state(v: RuntimeCheckState) -> ElevatedRuntimeState {
     match v {
         RuntimeCheckState::Stopped => ElevatedRuntimeState::Stopped,
         RuntimeCheckState::Starting => ElevatedRuntimeState::Starting,
@@ -335,7 +335,7 @@ fn state(v: RuntimeCheckState) -> ElevatedRuntimeState {
     }
 }
 
-fn broker_safe_log(message: &str) -> String {
+pub(crate) fn broker_safe_log(message: &str) -> String {
     let trimmed = message.trim_start();
     let lower = trimmed.to_ascii_lowercase();
     if message.contains(":\\")

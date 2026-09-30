@@ -477,6 +477,7 @@ async fn readiness_gate_waits_for_a_real_dns_resolve_then_dial_before_reporting_
         xray_config: xray_config.clone(),
         mihomo_config: xray_config.clone(),
         dashboard_directory: None,
+        mihomo_home_directory: None,
     };
     let command = CommandSpec {
         engine: Engine::Xray,

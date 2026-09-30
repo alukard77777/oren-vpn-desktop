@@ -1,3 +1,4 @@
+mod config_sanitize;
 mod device_identity;
 pub mod elevation_protocol;
 mod event;
@@ -17,6 +18,9 @@ mod unix_group;
 #[cfg(windows)]
 mod windows_job;
 
+pub use config_sanitize::{
+    MihomoServicePolicy, SanitizeError, SanitizedMihomo, sanitize_mihomo, sanitize_xray,
+};
 pub use device_identity::{DeviceIdentity, DeviceIdentityError, derive_incy_hwid, is_valid_hwid};
 pub use event::{Component, Event, Severity};
 pub use fetch::{
@@ -39,6 +43,7 @@ pub use sidecar::{
     CORE_READINESS_TIMEOUT, CommandSpec, CoreLogBuffer, CoreLogRecord, DiagnosticStream,
     ManagedChild, ProcessDiagnostics, ProcessError, ProcessLauncher, RuntimeCheckState,
     RuntimePaths, SidecarProcessController, TokioManagedChild, TokioProcessLauncher,
+    multicore_tun_is_up,
 };
 pub use snapshot::{
     AtomicSnapshot, MihomoRuntimeControl, PersistenceError, PersistentSnapshotStore,
