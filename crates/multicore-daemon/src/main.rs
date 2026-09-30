@@ -292,9 +292,15 @@ where
                 backend
                     .notice("service_unavailable", SERVICE_UNAVAILABLE_NOTICE)
                     .await;
+            } else if mode == ServiceMode::Service && noticed {
+                // The service is back: the elevation warning no longer applies.
+                noticed = false;
+                backend.clear_notice(SERVICE_UNAVAILABLE_NOTICE).await;
             }
             let healthy = backend.tick().await && mode == ServiceMode::Service;
-            delay = if healthy {
+            // A live connection is always checked at the short interval, whatever the
+            // backoff, so a lost one is noticed within seconds.
+            delay = if healthy || backend.connected().await {
                 WATCH_INTERVAL
             } else {
                 (delay * 2).clamp(WATCH_INTERVAL, WATCH_BACKOFF_MAX)
@@ -308,6 +314,8 @@ trait ServiceWatch {
     fn warm_signal(&self) -> Arc<tokio::sync::Notify>;
     fn tick(&self) -> impl std::future::Future<Output = bool> + Send;
     fn notice(&self, phase: &str, message: &str) -> impl std::future::Future<Output = ()> + Send;
+    fn clear_notice(&self, message: &str) -> impl std::future::Future<Output = ()> + Send;
+    fn connected(&self) -> impl std::future::Future<Output = bool> + Send;
 }
 
 impl<C, P, F> ServiceWatch for CoreBackend<C, P, F>
@@ -327,6 +335,14 @@ where
     async fn notice(&self, phase: &str, message: &str) {
         self.record_notice(phase, message).await;
     }
+
+    async fn clear_notice(&self, message: &str) {
+        CoreBackend::clear_notice(self, message).await;
+    }
+
+    async fn connected(&self) -> bool {
+        self.is_connected().await
+    }
 }
 
 #[cfg(not(windows))]
@@ -334,10 +350,14 @@ fn service_controller(
     service: &Arc<Session>,
     generation: u64,
     _mixed_port: u16,
-    _options: ConnectOptions,
+    options: ConnectOptions,
 ) -> Result<Arc<Controller>, BackendError> {
     Ok(Arc::new(ModeController::Tun(Backed::Service(
-        ServiceTunController::new(service.clone(), generation),
+        if options.warm_up {
+            ServiceTunController::for_warm_up(service.clone(), generation)
+        } else {
+            ServiceTunController::new(service.clone(), generation)
+        },
     ))))
 }
 
@@ -349,7 +369,12 @@ fn service_controller(
     mixed_port: u16,
     options: ConnectOptions,
 ) -> Result<Arc<Controller>, BackendError> {
-    if options.tun {
+    if options.warm_up {
+        // Warming only prepares, and never over a connection that owns the service.
+        Ok(Arc::new(ModeController::Tun(Backed::Service(
+            ServiceTunController::for_warm_up(service.clone(), generation),
+        ))))
+    } else if options.tun {
         Ok(Arc::new(ModeController::Tun(Backed::Service(
             ServiceTunController::new(service.clone(), generation),
         ))))
