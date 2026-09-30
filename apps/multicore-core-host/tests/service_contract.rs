@@ -985,6 +985,568 @@ mod controller_proxy {
     }
 }
 
+#[cfg(windows)]
+mod windows_identity_checks {
+    use super::service::windows_identity::{
+        ClientFacts, IdentityError, expected_daemon_image, verify_client,
+    };
+    use std::path::{Path, PathBuf};
+
+    const HOST: &str = r"C:\Program Files\MultiCore\current\runtime\multicore-core-host.exe";
+    const DAEMON: &str = r"C:\Program Files\MultiCore\current\runtime\multicore-daemon.exe";
+
+    fn facts(image: &str, session: u32, interactive: bool) -> ClientFacts {
+        ClientFacts {
+            process_id: 4242,
+            image: PathBuf::from(image),
+            session_id: session,
+            user_sid: "S-1-5-21-1-2-3-1001".into(),
+            interactive,
+        }
+    }
+
+    #[test]
+    fn the_expected_daemon_sits_next_to_the_service_in_the_install_directory() {
+        assert_eq!(
+            expected_daemon_image(Path::new(HOST)).unwrap(),
+            PathBuf::from(DAEMON)
+        );
+        assert_eq!(
+            expected_daemon_image(Path::new(
+                r"D:\Apps\MultiCore\Current\Runtime\multicore-core-host.exe"
+            ))
+            .unwrap(),
+            PathBuf::from(r"D:\Apps\MultiCore\current\runtime\multicore-daemon.exe")
+        );
+        for outside in [
+            r"C:\src\multi-core\target\debug\multicore-core-host.exe",
+            r"C:\Program Files\MultiCore\.multicore-previous-1.2.0-7\runtime\multicore-core-host.exe",
+            r"C:\Program Files\MultiCore\current\multicore-core-host.exe",
+            r"multicore-core-host.exe",
+        ] {
+            assert_eq!(expected_daemon_image(Path::new(outside)), None, "{outside}");
+        }
+    }
+
+    #[test]
+    fn only_the_installed_daemon_in_an_interactive_logon_is_accepted() {
+        let expected = expected_daemon_image(Path::new(HOST)).unwrap();
+        assert_eq!(verify_client(&facts(DAEMON, 1, true), &expected), Ok(()));
+        assert_eq!(
+            verify_client(&facts(DAEMON, 3, true), &expected),
+            Ok(()),
+            "an RDP session is interactive too"
+        );
+        assert_eq!(
+            verify_client(
+                &facts(
+                    r"\\?\c:\program files\multicore\CURRENT\runtime\multicore-daemon.exe",
+                    1,
+                    true
+                ),
+                &expected
+            ),
+            Ok(())
+        );
+        for wrong in [
+            r"C:\Users\me\AppData\Local\Programs\MultiCore\current\runtime\multicore-daemon.exe",
+            r"C:\Program Files\MultiCore\current\runtime\multicore-core-host.exe",
+            r"C:\Program Files\MultiCore\current\runtime\..\runtime\multicore-daemon.exe",
+            r"C:\Windows\System32\cmd.exe",
+        ] {
+            assert_eq!(
+                verify_client(&facts(wrong, 1, true), &expected),
+                Err(IdentityError::WrongImage),
+                "{wrong}"
+            );
+        }
+        assert_eq!(
+            verify_client(&facts(DAEMON, 1, false), &expected),
+            Err(IdentityError::WrongSession),
+            "network / service logons (SSH, PowerShell Direct) lack the INTERACTIVE group"
+        );
+        assert_eq!(
+            verify_client(&facts(DAEMON, 0, true), &expected),
+            Err(IdentityError::WrongSession),
+            "session 0 never hosts a user desktop"
+        );
+    }
+}
+
+#[cfg(windows)]
+mod windows_pipe_server {
+    use super::FakeCores;
+    use super::service::core_loop::{ClientIdentity, ServiceLoop};
+    use super::service::windows_identity::{
+        IdentityError, client_facts, normalized, user_data_root,
+    };
+    use super::service::windows_server::{PIPE_SDDL, create_instance, serve};
+    use super::windows_pipe::{connect, read_message, write_frame};
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_core::service_protocol::{
+        ServiceCommand, ServiceResponse, decode_service_frame, encode_service_frame,
+    };
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+                SE_KERNEL_OBJECT,
+            },
+            DACL_SECURITY_INFORMATION,
+        },
+        System::{
+            RemoteDesktop::ProcessIdToSessionId,
+            Threading::{CreateEventW, SetEvent},
+        },
+    };
+
+    fn unique_name() -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        format!(
+            r"\\.\pipe\MultiCore.Service.test.{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn request(pipe: &std::fs::File, command: &ServiceCommand) -> ServiceResponse {
+        write_frame(
+            pipe.as_raw_handle(),
+            encode_service_frame(command).unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let frame = read_message(pipe.as_raw_handle(), Duration::from_secs(5)).unwrap();
+        decode_service_frame(&frame).unwrap()
+    }
+
+    /// The server thread may not have created the pipe yet; `WaitNamedPipeW` fails at once
+    /// for a missing name, so retry until it exists.
+    fn connect_to_server(name: &str) -> std::fs::File {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match connect(name, Duration::from_secs(1)) {
+                Ok(pipe) => return pipe,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "server never listened: {error:?}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn manual_event() -> Arc<OwnedHandle> {
+        Arc::new(unsafe {
+            OwnedHandle::from_raw_handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))
+        })
+    }
+
+    fn alice_only(
+        _pipe: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<ClientIdentity, IdentityError> {
+        Ok(ClientIdentity {
+            user_key: "1:alice".into(),
+            data_root: PathBuf::from(r"C:\Users\alice\AppData\Local\MultiCore"),
+            uid: 0,
+        })
+    }
+
+    fn wait_for_stop_all(service: &Mutex<ServiceLoop<FakeCores>>, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !service
+            .lock()
+            .unwrap()
+            .cores_mut()
+            .calls
+            .iter()
+            .any(|call| call == "stop_all")
+        {
+            assert!(Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn pipe_dacl_is_the_documented_one_and_squatting_is_refused() {
+        let name = unique_name();
+        let first = create_instance(&name, true).unwrap();
+        let mut descriptor = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    first.as_raw_handle(),
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let mut text = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let sddl = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        unsafe {
+            LocalFree(text.cast());
+            LocalFree(descriptor.cast());
+        }
+        assert!(sddl.starts_with("D:P"), "{sddl}");
+        for trustee in [";;;SY)", ";;;BA)", ";;;IU)"] {
+            assert!(sddl.contains(trustee), "{sddl} lacks {trustee}");
+        }
+        assert!(
+            !sddl.contains(";;;WD)") && !sddl.contains(";;;AN)") && !sddl.contains(";;;NU)"),
+            "{sddl}"
+        );
+        assert!(PIPE_SDDL.contains("IU"));
+        assert!(
+            create_instance(&name, true).is_err(),
+            "a second first-instance of an existing name must fail"
+        );
+    }
+
+    #[test]
+    fn client_facts_name_this_test_process_from_its_token() {
+        let name = unique_name();
+        let server = create_instance(&name, true).unwrap();
+        let client_name = name.clone();
+        let client = thread::spawn(move || connect(&client_name, Duration::from_secs(5)).unwrap());
+        // A client may open a freshly created instance before ConnectNamedPipe is called.
+        let _client = client.join().unwrap();
+        let (facts, token) = client_facts(server.as_raw_handle()).unwrap();
+        assert_eq!(
+            normalized(&facts.image),
+            normalized(&std::env::current_exe().unwrap())
+        );
+        assert_eq!(facts.process_id, std::process::id());
+        let mut session = u32::MAX;
+        assert_ne!(
+            unsafe { ProcessIdToSessionId(std::process::id(), &mut session) },
+            0
+        );
+        assert_eq!(facts.session_id, session, "token session of the client");
+        assert!(facts.user_sid.starts_with("S-1-5-"));
+        assert!(
+            facts.interactive || std::env::var_os("SSH_CONNECTION").is_some(),
+            "a desktop test run carries the INTERACTIVE group"
+        );
+        let data_root = user_data_root(token.as_raw_handle()).unwrap();
+        let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("MultiCore");
+        assert_eq!(normalized(&data_root), normalized(&local));
+    }
+
+    #[test]
+    fn served_connections_share_one_loop_and_a_drop_stops_the_cores() {
+        let name = unique_name();
+        let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let verifier = Arc::new(move |_pipe: windows_sys::Win32::Foundation::HANDLE| {
+            let call = counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, IdentityError>(ClientIdentity {
+                user_key: if call == 0 {
+                    "1:alice".into()
+                } else {
+                    "2:bob".into()
+                },
+                data_root: PathBuf::from(r"C:\Users\alice\AppData\Local\MultiCore"),
+                uid: 0,
+            })
+        });
+        let stop = manual_event();
+        let server = {
+            let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
+            thread::spawn(move || serve(&name, service, verifier, stop).unwrap())
+        };
+        let alice = connect_to_server(&name);
+        assert!(matches!(
+            request(&alice, &ServiceCommand::Prepare { generation_id: 5 }),
+            ServiceResponse::Prepared {
+                generation_id: 5,
+                ..
+            }
+        ));
+        let bob = connect_to_server(&name);
+        assert_eq!(
+            request(&bob, &ServiceCommand::Status),
+            ServiceResponse::Busy
+        );
+        drop(alice);
+        wait_for_stop_all(&service, "owner drop did not stop the cores");
+        drop(bob);
+        unsafe { SetEvent(stop.as_raw_handle()) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_rejected_client_is_told_and_never_reaches_the_loop() {
+        let name = unique_name();
+        let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
+        let verifier = Arc::new(|_pipe: windows_sys::Win32::Foundation::HANDLE| {
+            Err::<ClientIdentity, _>(IdentityError::WrongImage)
+        });
+        let stop = manual_event();
+        let server = {
+            let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
+            thread::spawn(move || serve(&name, service, verifier, stop).unwrap())
+        };
+        let intruder = connect_to_server(&name);
+        let frame = read_message(intruder.as_raw_handle(), Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::AuthenticationFailed
+            }
+        );
+        let _ = write_frame(
+            intruder.as_raw_handle(),
+            encode_service_frame(&ServiceCommand::Prepare { generation_id: 1 }).unwrap(),
+            Duration::from_secs(1),
+        );
+        assert!(
+            read_message(intruder.as_raw_handle(), Duration::from_secs(2)).is_err(),
+            "the pipe is closed after the refusal"
+        );
+        assert!(service.lock().unwrap().cores_mut().calls.is_empty());
+        unsafe { SetEvent(stop.as_raw_handle()) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_stop_signal_ends_open_connections_and_releases_the_owner() {
+        let name = unique_name();
+        let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
+        let stop = manual_event();
+        let server = {
+            let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
+            thread::spawn(move || serve(&name, service, Arc::new(alice_only), stop).unwrap())
+        };
+        let alice = connect_to_server(&name);
+        assert!(matches!(
+            request(&alice, &ServiceCommand::Prepare { generation_id: 2 }),
+            ServiceResponse::Prepared { .. }
+        ));
+        unsafe { SetEvent(stop.as_raw_handle()) };
+        server.join().unwrap();
+        wait_for_stop_all(&service, "stop did not release the owner");
+        assert!(
+            read_message(alice.as_raw_handle(), Duration::from_secs(5)).is_err(),
+            "the connection thread closed its end"
+        );
+    }
+}
+
+#[test]
+fn only_the_exact_service_flag_selects_service_mode() {
+    use std::ffi::OsString;
+    assert!(service::wants_service_mode(&[OsString::from("--service")]));
+    for other in [
+        vec![],
+        vec![OsString::from("--service"), OsString::from("x")],
+        vec![OsString::from("--pipe")],
+        vec![OsString::from("--SERVICE")],
+    ] {
+        assert!(!service::wants_service_mode(&other), "{other:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_service_accepts_stop_and_shutdown_only_while_running() {
+    use crate::service::windows_scm::{SERVICE_NAME, accepted_controls};
+    use windows_sys::Win32::System::Services::{
+        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
+        SERVICE_STOP_PENDING,
+    };
+    assert_eq!(SERVICE_NAME, "MultiCore");
+    assert_eq!(
+        accepted_controls(SERVICE_RUNNING),
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+    );
+    assert_eq!(accepted_controls(SERVICE_START_PENDING), 0);
+    assert_eq!(accepted_controls(SERVICE_STOP_PENDING), 0);
+}
+
+mod updates {
+    use super::{FakeCores, user};
+    use crate::service::core_loop::{ClientIdentity, ConnectionId, ServiceLoop, ServiceUpdater};
+    use crate::service::update::{plan_update, session_of};
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse};
+    use std::sync::{Arc, Mutex};
+
+    struct FakeUpdater(Arc<Mutex<Vec<String>>>);
+
+    impl ServiceUpdater for FakeUpdater {
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    /// Download or verification fails before anything is stopped.
+    struct FailingDownload(Arc<Mutex<Vec<String>>>);
+
+    impl ServiceUpdater for FailingDownload {
+        fn prepare(
+            &mut self,
+            _client: &ClientIdentity,
+            _version: &str,
+        ) -> Result<(), BrokerErrorCode> {
+            Err(BrokerErrorCode::InvalidRequest)
+        }
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    fn update(version: &str) -> ServiceCommand {
+        ServiceCommand::Update {
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn only_newer_release_versions_are_accepted() {
+        assert_eq!(plan_update("1.1.0", "1.1.1"), Ok(()));
+        assert_eq!(plan_update("1.1.0", "2.0.0"), Ok(()));
+        assert_eq!(
+            plan_update("1.1.0", "1.1.0"),
+            Err(BrokerErrorCode::InvalidRequest)
+        );
+        assert_eq!(
+            plan_update("1.1.0", "1.0.9"),
+            Err(BrokerErrorCode::InvalidRequest)
+        );
+        assert_eq!(
+            plan_update("1.1.0", "x"),
+            Err(BrokerErrorCode::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn the_session_comes_from_the_windows_user_key() {
+        assert_eq!(session_of(&user("3:S-1-5-21-1")), Some(3));
+        assert_eq!(session_of(&user("uid:1000")), None);
+    }
+
+    #[test]
+    fn update_stops_the_cores_then_hands_over_to_the_updater() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FakeUpdater(started.clone())));
+        let alice = user("1:alice");
+        service.execute(
+            ConnectionId(1),
+            &alice,
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        service.execute(ConnectionId(1), &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(ConnectionId(1), &alice, update("1.2.0")),
+            ServiceResponse::UpdateStarted
+        );
+        assert!(!service.cores_mut().running);
+        assert_eq!(*started.lock().unwrap(), ["1:alice@1.2.0"]);
+        assert_eq!(
+            service.execute(ConnectionId(2), &user("2:bob"), update("1.2.0")),
+            ServiceResponse::UpdateStarted,
+            "after the owner's update the service is released"
+        );
+    }
+
+    #[test]
+    fn a_failed_download_leaves_the_tunnel_running() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FailingDownload(started.clone())));
+        let alice = user("1:alice");
+        service.execute(
+            ConnectionId(1),
+            &alice,
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        service.execute(ConnectionId(1), &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(ConnectionId(1), &alice, update("1.2.0")),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest
+            }
+        );
+        assert!(service.cores_mut().running && service.cores_mut().tun);
+        assert!(started.lock().unwrap().is_empty());
+        assert_eq!(service.owner_key(), Some("1:alice"));
+    }
+
+    #[test]
+    fn another_users_update_is_busy_while_the_owner_holds_the_cores() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FakeUpdater(started.clone())));
+        service.execute(
+            ConnectionId(1),
+            &user("1:alice"),
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        assert_eq!(
+            service.execute(ConnectionId(2), &user("2:bob"), update("1.2.0")),
+            ServiceResponse::Busy
+        );
+        assert!(service.cores_mut().running);
+        assert!(started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn without_an_updater_updates_are_unsupported() {
+        let mut service = ServiceLoop::new(FakeCores::default());
+        assert_eq!(
+            service.execute(ConnectionId(1), &user("1:alice"), update("1.2.0")),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::Unsupported
+            }
+        );
+    }
+}
+
 #[cfg(unix)]
 mod unix_service {
     use super::FakeCores;

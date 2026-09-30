@@ -3406,6 +3406,8 @@ dependencies = [
  "getrandom 0.4.3",
  "multicore-core",
  "multicore-platform",
+ "multicore-release",
+ "reqwest 0.13.5",
  "rustix 1.1.4",
  "serde",
  "serde_json",

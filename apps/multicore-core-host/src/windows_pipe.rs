@@ -40,7 +40,7 @@ use windows_sys::Win32::{
 use zeroize::Zeroizing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(crate) enum HostError {
@@ -125,7 +125,7 @@ fn is_generated_pipe_name(name: &str) -> bool {
     suffix.len() == 48 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn connect(name: &str, timeout: Duration) -> Result<std::fs::File, HostError> {
+pub(crate) fn connect(name: &str, timeout: Duration) -> Result<std::fs::File, HostError> {
     let wide = OsStr::new(name)
         .encode_wide()
         .chain(Some(0))
@@ -160,7 +160,10 @@ fn verify_server_pid(pipe: &std::fs::File, expected: u32) -> Result<(), HostErro
     Ok(())
 }
 
-fn read_message(handle: HANDLE, timeout: Duration) -> Result<Zeroizing<Vec<u8>>, HostError> {
+pub(crate) fn read_message(
+    handle: HANDLE,
+    timeout: Duration,
+) -> Result<Zeroizing<Vec<u8>>, HostError> {
     let mut pending = PendingIo::with_buffer(vec![0_u8; MAX_ELEVATION_FRAME_BYTES])?;
     let mut transferred = 0;
     let started = unsafe {
@@ -198,6 +201,15 @@ fn read_message_until_peer_exit(
         return Err(HostError::PeerPidMismatch);
     }
     let server = unsafe { OwnedHandle::from_raw_handle(server) };
+    read_message_or_signal(handle, server.as_raw_handle())
+}
+
+/// Reads one message, waiting indefinitely, but returns `Disconnected` as soon as `signal`
+/// (a process or event handle) is signalled.
+pub(crate) fn read_message_or_signal(
+    handle: HANDLE,
+    signal: HANDLE,
+) -> Result<Zeroizing<Vec<u8>>, HostError> {
     let mut pending = PendingIo::with_buffer(vec![0_u8; MAX_ELEVATION_FRAME_BYTES])?;
     let mut transferred = 0;
     let started = unsafe {
@@ -215,7 +227,7 @@ fn read_message_until_peer_exit(
             ERROR_MORE_DATA => return Err(HostError::Protocol),
             ERROR_BROKEN_PIPE | ERROR_NO_DATA => return Err(HostError::Disconnected),
             ERROR_IO_PENDING => {
-                let handles = [pending.event_handle(), server.as_raw_handle()];
+                let handles = [pending.event_handle(), signal];
                 match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
                     WAIT_OBJECT_0 => {
                         transferred = complete_pending(handle, &mut pending)?;
@@ -241,7 +253,7 @@ fn read_message_until_peer_exit(
     Ok(buffer)
 }
 
-fn complete_pending(handle: HANDLE, pending: &mut PendingIo) -> Result<u32, HostError> {
+pub(crate) fn complete_pending(handle: HANDLE, pending: &mut PendingIo) -> Result<u32, HostError> {
     let mut transferred = 0;
     if unsafe { GetOverlappedResult(handle, pending.overlapped_mut(), &mut transferred, 0) } == 0 {
         let error = unsafe { GetLastError() };
@@ -261,6 +273,15 @@ fn write_message<T: serde::Serialize>(
     timeout: Duration,
 ) -> Result<(), HostError> {
     let frame = encode_frame(value).map_err(|_| HostError::Protocol)?;
+    write_frame(handle, frame, timeout)
+}
+
+/// Writes one already-encoded frame as a single pipe message.
+pub(crate) fn write_frame(
+    handle: HANDLE,
+    frame: Vec<u8>,
+    timeout: Duration,
+) -> Result<(), HostError> {
     let frame_len = frame.len();
     let mut pending = PendingIo::with_buffer(frame)?;
     let mut transferred = 0;
@@ -306,14 +327,14 @@ fn wait_pending(
     }
 }
 
-struct PendingIo {
+pub(crate) struct PendingIo {
     overlapped: Option<Box<OVERLAPPED>>,
     event: Option<OwnedHandle>,
     buffer: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl PendingIo {
-    fn with_buffer(buffer: Vec<u8>) -> Result<Self, HostError> {
+    pub(crate) fn with_buffer(buffer: Vec<u8>) -> Result<Self, HostError> {
         let buffer = Zeroizing::new(buffer);
         let handle = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
         if handle.is_null() {
@@ -329,11 +350,11 @@ impl PendingIo {
         })
     }
 
-    fn overlapped_mut(&mut self) -> &mut OVERLAPPED {
+    pub(crate) fn overlapped_mut(&mut self) -> &mut OVERLAPPED {
         self.overlapped.as_deref_mut().expect("pending I/O is live")
     }
 
-    fn event_handle(&self) -> HANDLE {
+    pub(crate) fn event_handle(&self) -> HANDLE {
         self.event
             .as_ref()
             .expect("pending I/O event is live")
@@ -354,7 +375,7 @@ impl PendingIo {
         self.buffer.take().expect("pending I/O buffer is live")
     }
 
-    fn cancel_and_drain(&mut self, handle: HANDLE) {
+    pub(crate) fn cancel_and_drain(&mut self, handle: HANDLE) {
         unsafe { CancelIoEx(handle, self.overlapped_mut()) };
         let drained = unsafe { WaitForSingleObject(self.event_handle(), 1_000) } == WAIT_OBJECT_0;
         if drained {
