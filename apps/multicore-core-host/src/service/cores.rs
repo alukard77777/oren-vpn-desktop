@@ -256,59 +256,6 @@ impl ProductionCores {
         Ok(())
     }
 
-    fn stop_processes(&self, controller: &SidecarProcessController<PlatformLauncher>) {
-        let _ = self.runtime.block_on(controller.stop(Engine::Mihomo));
-        let _ = self.runtime.block_on(controller.stop(Engine::Xray));
-    }
-}
-
-impl Cores for ProductionCores {
-    fn prepare(
-        &mut self,
-        client: &ClientIdentity,
-        generation: u64,
-    ) -> Result<ControllerEndpoint, BrokerErrorCode> {
-        self.stop_all();
-        self.launch(client, generation)
-    }
-
-    fn restart(&mut self) -> Result<(), BrokerErrorCode> {
-        let active = self.active.as_ref().ok_or(BrokerErrorCode::NotReady)?;
-        self.stop_processes(&active.controller);
-        if let Err(error) = self.verify_cores() {
-            service_log::append(
-                &self.service_directory,
-                &format!("restart refused at verify core hashes: {error:?}"),
-            );
-            return Err(BrokerErrorCode::NotReady);
-        }
-        for engine in [Engine::Xray, Engine::Mihomo] {
-            if let Err(error) = self.runtime.block_on(active.controller.start(engine)) {
-                service_log::append(
-                    &self.service_directory,
-                    &format!("restart failed at start core: {error:?}"),
-                );
-                return Err(start_error(&error));
-            }
-        }
-        Ok(())
-    }
-
-    fn set_tun(&mut self, on: bool) -> Result<(), BrokerErrorCode> {
-        let started = Instant::now();
-        let result = self.set_tun_timed(on, started);
-        service_log::append(
-            &self.service_directory,
-            &format!(
-                "set_tun {} {} in {} ms",
-                if on { "on" } else { "off" },
-                if result.is_ok() { "ok" } else { "failed" },
-                started.elapsed().as_millis()
-            ),
-        );
-        result
-    }
-
     /// Logs each phase of a switch (phantom cleanup, Mihomo's answer, the adapter coming up),
     /// so a slow Connect on real hardware shows where the time goes.
     fn set_tun_timed(&mut self, on: bool, started: Instant) -> Result<(), BrokerErrorCode> {
@@ -363,6 +310,59 @@ impl Cores for ProductionCores {
             }
             std::thread::sleep(TUN_POLL);
         }
+    }
+
+    fn stop_processes(&self, controller: &SidecarProcessController<PlatformLauncher>) {
+        let _ = self.runtime.block_on(controller.stop(Engine::Mihomo));
+        let _ = self.runtime.block_on(controller.stop(Engine::Xray));
+    }
+}
+
+impl Cores for ProductionCores {
+    fn prepare(
+        &mut self,
+        client: &ClientIdentity,
+        generation: u64,
+    ) -> Result<ControllerEndpoint, BrokerErrorCode> {
+        self.stop_all();
+        self.launch(client, generation)
+    }
+
+    fn restart(&mut self) -> Result<(), BrokerErrorCode> {
+        let active = self.active.as_ref().ok_or(BrokerErrorCode::NotReady)?;
+        self.stop_processes(&active.controller);
+        if let Err(error) = self.verify_cores() {
+            service_log::append(
+                &self.service_directory,
+                &format!("restart refused at verify core hashes: {error:?}"),
+            );
+            return Err(BrokerErrorCode::NotReady);
+        }
+        for engine in [Engine::Xray, Engine::Mihomo] {
+            if let Err(error) = self.runtime.block_on(active.controller.start(engine)) {
+                service_log::append(
+                    &self.service_directory,
+                    &format!("restart failed at start core: {error:?}"),
+                );
+                return Err(start_error(&error));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_tun(&mut self, on: bool) -> Result<(), BrokerErrorCode> {
+        let started = Instant::now();
+        let result = self.set_tun_timed(on, started);
+        service_log::append(
+            &self.service_directory,
+            &format!(
+                "set_tun {} {} in {} ms",
+                if on { "on" } else { "off" },
+                if result.is_ok() { "ok" } else { "failed" },
+                started.elapsed().as_millis()
+            ),
+        );
+        result
     }
 
     fn tun_is_on(&mut self) -> Option<bool> {
