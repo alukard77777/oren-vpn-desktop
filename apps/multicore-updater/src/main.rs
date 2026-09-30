@@ -1068,10 +1068,7 @@ mod tests {
     fn without_the_service_results_stay_next_to_the_archive() {
         let request = parse_args(base_args().iter().map(|arg| arg.to_string())).unwrap();
         assert!(request.service.is_none());
-        assert_eq!(
-            update_state_dir(&request),
-            Some(PathBuf::from(ARCHIVE_DIR))
-        );
+        assert_eq!(update_state_dir(&request), Some(PathBuf::from(ARCHIVE_DIR)));
     }
 
     #[cfg(windows)]
