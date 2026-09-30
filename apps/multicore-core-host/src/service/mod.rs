@@ -6,6 +6,7 @@ pub(crate) mod core_loop;
 pub(crate) mod cores;
 pub(crate) mod mihomo_rest;
 pub(crate) mod state_dir;
+pub(crate) mod update;
 #[cfg(windows)]
 pub(crate) mod windows_identity;
 #[cfg(windows)]

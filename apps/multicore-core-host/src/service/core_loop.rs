@@ -49,6 +49,18 @@ pub(crate) trait Cores: Send {
     fn diagnostics(&mut self) -> ServiceResponse;
 }
 
+/// Service-side update: download and verify, then hand over to the updater and stop the service.
+pub(crate) trait ServiceUpdater: Send {
+    /// Downloads and verifies `version` while the cores keep running; a failure here leaves
+    /// the tunnel untouched.
+    fn prepare(&mut self, _client: &ClientIdentity, _version: &str) -> Result<(), BrokerErrorCode> {
+        Ok(())
+    }
+    /// Starts the updater for the prepared `version` (the cores are already stopped) and
+    /// arranges for the service to exit so the updater can replace `current`.
+    fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode>;
+}
+
 struct Owner {
     user_key: String,
     connection: ConnectionId,
@@ -64,6 +76,7 @@ pub(crate) struct ServiceLoop<C: Cores> {
     tun_on: bool,
     crash_restarts: u8,
     failure: Option<BrokerErrorCode>,
+    updater: Option<Box<dyn ServiceUpdater>>,
 }
 
 impl<C: Cores> ServiceLoop<C> {
@@ -75,7 +88,13 @@ impl<C: Cores> ServiceLoop<C> {
             tun_on: false,
             crash_restarts: 0,
             failure: None,
+            updater: None,
         }
+    }
+
+    pub(crate) fn with_updater(mut self, updater: Box<dyn ServiceUpdater>) -> Self {
+        self.updater = Some(updater);
+        self
     }
 
     #[allow(dead_code, reason = "inspected by the service tests")]
@@ -121,9 +140,7 @@ impl<C: Cores> ServiceLoop<C> {
                 self.stop_everything();
                 ServiceResponse::ShuttingDown
             }
-            ServiceCommand::Update { .. } => ServiceResponse::Error {
-                code: BrokerErrorCode::Unsupported,
-            },
+            ServiceCommand::Update { version } => self.update(client, &version),
         }
     }
 
@@ -176,6 +193,24 @@ impl<C: Cores> ServiceLoop<C> {
     pub(crate) fn stop_everything(&mut self) {
         self.stop_cores();
         self.owner = None;
+    }
+
+    fn update(&mut self, client: &ClientIdentity, version: &str) -> ServiceResponse {
+        let Some(mut updater) = self.updater.take() else {
+            return ServiceResponse::Error {
+                code: BrokerErrorCode::Unsupported,
+            };
+        };
+        let result = updater.prepare(client, version).and_then(|()| {
+            // Nothing may run from the install directory while the updater swaps it.
+            self.stop_everything();
+            updater.begin(client, version)
+        });
+        self.updater = Some(updater);
+        match result {
+            Ok(()) => ServiceResponse::UpdateStarted,
+            Err(code) => ServiceResponse::Error { code },
+        }
     }
 
     fn claim(&mut self, connection: ConnectionId, client: &ClientIdentity) {

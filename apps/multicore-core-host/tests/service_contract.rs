@@ -1337,3 +1337,151 @@ fn the_service_accepts_stop_and_shutdown_only_while_running() {
     assert_eq!(accepted_controls(SERVICE_START_PENDING), 0);
     assert_eq!(accepted_controls(SERVICE_STOP_PENDING), 0);
 }
+
+mod updates {
+    use super::{FakeCores, user};
+    use crate::service::core_loop::{ClientIdentity, ConnectionId, ServiceLoop, ServiceUpdater};
+    use crate::service::update::{plan_update, session_of};
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse};
+    use std::sync::{Arc, Mutex};
+
+    struct FakeUpdater(Arc<Mutex<Vec<String>>>);
+
+    impl ServiceUpdater for FakeUpdater {
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    /// Download or verification fails before anything is stopped.
+    struct FailingDownload(Arc<Mutex<Vec<String>>>);
+
+    impl ServiceUpdater for FailingDownload {
+        fn prepare(
+            &mut self,
+            _client: &ClientIdentity,
+            _version: &str,
+        ) -> Result<(), BrokerErrorCode> {
+            Err(BrokerErrorCode::InvalidRequest)
+        }
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    fn update(version: &str) -> ServiceCommand {
+        ServiceCommand::Update {
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn only_newer_release_versions_are_accepted() {
+        assert_eq!(plan_update("1.1.0", "1.1.1"), Ok(()));
+        assert_eq!(plan_update("1.1.0", "2.0.0"), Ok(()));
+        assert_eq!(
+            plan_update("1.1.0", "1.1.0"),
+            Err(BrokerErrorCode::InvalidRequest)
+        );
+        assert_eq!(
+            plan_update("1.1.0", "1.0.9"),
+            Err(BrokerErrorCode::InvalidRequest)
+        );
+        assert_eq!(
+            plan_update("1.1.0", "x"),
+            Err(BrokerErrorCode::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn the_session_comes_from_the_windows_user_key() {
+        assert_eq!(session_of(&user("3:S-1-5-21-1")), Some(3));
+        assert_eq!(session_of(&user("uid:1000")), None);
+    }
+
+    #[test]
+    fn update_stops_the_cores_then_hands_over_to_the_updater() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FakeUpdater(started.clone())));
+        let alice = user("1:alice");
+        service.execute(
+            ConnectionId(1),
+            &alice,
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        service.execute(ConnectionId(1), &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(ConnectionId(1), &alice, update("1.2.0")),
+            ServiceResponse::UpdateStarted
+        );
+        assert!(!service.cores_mut().running);
+        assert_eq!(*started.lock().unwrap(), ["1:alice@1.2.0"]);
+        assert_eq!(
+            service.execute(ConnectionId(2), &user("2:bob"), update("1.2.0")),
+            ServiceResponse::UpdateStarted,
+            "after the owner's update the service is released"
+        );
+    }
+
+    #[test]
+    fn a_failed_download_leaves_the_tunnel_running() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FailingDownload(started.clone())));
+        let alice = user("1:alice");
+        service.execute(
+            ConnectionId(1),
+            &alice,
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        service.execute(ConnectionId(1), &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(ConnectionId(1), &alice, update("1.2.0")),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest
+            }
+        );
+        assert!(service.cores_mut().running && service.cores_mut().tun);
+        assert!(started.lock().unwrap().is_empty());
+        assert_eq!(service.owner_key(), Some("1:alice"));
+    }
+
+    #[test]
+    fn another_users_update_is_busy_while_the_owner_holds_the_cores() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FakeUpdater(started.clone())));
+        service.execute(
+            ConnectionId(1),
+            &user("1:alice"),
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        assert_eq!(
+            service.execute(ConnectionId(2), &user("2:bob"), update("1.2.0")),
+            ServiceResponse::Busy
+        );
+        assert!(service.cores_mut().running);
+        assert!(started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn without_an_updater_updates_are_unsupported() {
+        let mut service = ServiceLoop::new(FakeCores::default());
+        assert_eq!(
+            service.execute(ConnectionId(1), &user("1:alice"), update("1.2.0")),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::Unsupported
+            }
+        );
+    }
+}

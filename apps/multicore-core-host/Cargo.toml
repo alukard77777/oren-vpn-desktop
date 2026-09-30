@@ -14,6 +14,7 @@ bench = false
 
 [dependencies]
 multicore-core = { path = "../../crates/multicore-core" }
+multicore-release = { path = "../../crates/multicore-update" }
 getrandom = "0.4"
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +27,7 @@ multicore-platform = { path = "../../crates/multicore-platform" }
 rustix = { version = "1.1", features = ["fs", "net", "process"] }
 
 [target.'cfg(windows)'.dependencies]
+reqwest.workspace = true
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Foundation",

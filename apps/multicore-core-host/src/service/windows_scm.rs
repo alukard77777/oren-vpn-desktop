@@ -35,6 +35,7 @@ use windows_sys::{
 use super::core_loop::ServiceLoop;
 use super::cores::ProductionCores;
 use super::state_dir;
+use super::update::ProductionUpdater;
 use super::windows_server::{SERVICE_PIPE_NAME, production_verifier, serve};
 
 pub(crate) const SERVICE_NAME: &str = "MultiCore";
@@ -131,9 +132,17 @@ fn run_body() -> io::Result<()> {
     let _ = STOP_EVENT.set(stop.clone());
     let directory = state_dir::service_directory()?;
     state_dir::ensure_private_directory(&directory)?;
-    let service = Arc::new(Mutex::new(ServiceLoop::new(ProductionCores::new(
-        directory,
-    )?)));
+    // `<install>\current`: the updater's `--target`, whose `runtime` holds this binary.
+    let package_root = std::env::current_exe()?
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("service executable has no package root"))?;
+    let service = Arc::new(Mutex::new(
+        ServiceLoop::new(ProductionCores::new(directory.clone())?).with_updater(Box::new(
+            ProductionUpdater::new(directory, package_root, stop.clone()),
+        )),
+    ));
     let ticker = {
         let (service, stop) = (service.clone(), stop.clone());
         thread::Builder::new()
