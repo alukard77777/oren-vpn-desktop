@@ -63,7 +63,8 @@ PACKAGE_ROOT="$OUTPUT/usr/lib/multicore"
 STAGE_CORES="$PACKAGE_ROOT/cores"
 install -d -m 0755 "$PACKAGE_ROOT/runtime" "$STAGE_CORES" "$OUTPUT/usr/bin" \
     "$OUTPUT/usr/share/applications" "$OUTPUT/usr/share/icons/hicolor/scalable/apps" \
-    "$OUTPUT/usr/share/polkit-1/actions" "$OUTPUT/usr/share/licenses/multicore"
+    "$OUTPUT/usr/share/polkit-1/actions" "$OUTPUT/usr/share/licenses/multicore" \
+    "$OUTPUT/usr/lib/systemd/system"
 
 # The vendored dashboard is optional so manifests that predate it keep staging unchanged; a real
 # production manifest always carries it (see packaging/linux/versions.json). Its filenames are
@@ -146,6 +147,9 @@ install -m 0644 "$ROOT/apps/multicore-desktop/assets/app-icon.svg" \
     "$OUTPUT/usr/share/icons/hicolor/scalable/apps/multicore.svg"
 install -m 0644 "$ROOT/packaging/linux/io.github.fatyzzz.multicore.core-host.policy" \
     "$OUTPUT/usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy"
+# The always-ready service unit. deb/rpm/Arch enable it; the AppImage build removes it again
+# (the AppImage keeps the on-demand pkexec host).
+install -m 0644 "$ROOT/packaging/linux/multicore.service" "$OUTPUT/usr/lib/systemd/system/multicore.service"
 install -m 0644 "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/packaging/linux/THIRD_PARTY_NOTICES.md" \
     "$ROOT/packaging/windows-x64/licenses/Xray-core-MPL-2.0.txt" \
     "$ROOT/packaging/windows-x64/licenses/mihomo-GPL-3.0.txt" \

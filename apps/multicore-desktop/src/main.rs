@@ -5,6 +5,7 @@ mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
 mod daemon;
+mod data_reset;
 mod emoji_images;
 #[cfg(target_os = "linux")]
 mod linux_display;
@@ -709,6 +710,11 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Before the single-instance guard: the resetting process waits for the old instance to
+    // exit, deletes the data directory and starts a clean app itself.
+    if data_reset::run_pending_reset(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        return Ok(());
+    }
     let software_renderer = renderer_fallback::software_renderer_requested();
     let result = match run_desktop(software_renderer) {
         // Everything run_desktop held (single-instance guard, owned daemon,
@@ -855,6 +861,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     );
     wire_dashboard_action(&ui, model.clone());
     wire_service_install(&ui);
+    wire_data_reset(&ui);
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_copy_diagnostics(&ui, model.clone());
@@ -3185,6 +3192,24 @@ fn wire_service_install(ui: &AppWindow) {
                 }
             });
         });
+    });
+}
+
+/// "Удалить все данные" (second click): start the resetting process, then quit. Leaving
+/// `run_desktop` drops the bootstrap (disconnect, stop and reap the owned daemon) and then the
+/// single-instance guard, which is what the resetting process waits for.
+fn wire_data_reset(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_reset_all_data(move || match data_reset::schedule_reset_and_relaunch() {
+        Ok(()) => {
+            let _ = slint::quit_event_loop();
+        }
+        Err(error) => {
+            eprintln!("data reset could not be started: {error}");
+            if let Some(ui) = weak.upgrade() {
+                ui.set_reset_data_armed(false);
+            }
+        }
     });
 }
 

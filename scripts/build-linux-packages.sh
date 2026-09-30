@@ -37,6 +37,7 @@ build_arch() {
     local sha
     sha="$(sha256sum "$work/multicore-$VERSION-stage.tar.zst" | cut -d' ' -f1)"
     sed -e "s/@VERSION@/$VERSION/" -e "s/@SHA256@/$sha/" "$ROOT/packaging/linux/arch/PKGBUILD" > "$work/PKGBUILD"
+    cp "$ROOT/packaging/linux/arch/multicore.install" "$work/"
     (cd "$work" && PKGDEST="$OUTPUT" makepkg --force --nodeps --noconfirm)
 }
 
@@ -48,6 +49,8 @@ build_deb() {
     size="$(du -sk --exclude=DEBIAN "$work" | cut -f1)"
     sed -e "s/@VERSION@/$VERSION/" "$ROOT/packaging/linux/deb/control" > "$work/DEBIAN/control"
     echo "Installed-Size: $size" >> "$work/DEBIAN/control"
+    install -m 0755 "$ROOT/packaging/linux/deb/postinst" "$ROOT/packaging/linux/deb/prerm" \
+        "$ROOT/packaging/linux/deb/postrm" "$work/DEBIAN/"
     dpkg-deb --root-owner-group -Zxz --build "$work" "$OUTPUT/multicore_${VERSION}_amd64.deb"
 }
 
@@ -71,6 +74,8 @@ build_appimage() {
     local appdir="$WORK/MultiCore.AppDir"
     mkdir -p "$appdir"
     cp -a "$STAGE/." "$appdir/"
+    # The AppImage keeps the on-demand pkexec host and never installs the system service.
+    rm -rf "$appdir/usr/lib/systemd"
     install -m 0755 "$ROOT/packaging/linux/appimage/AppRun" "$appdir/AppRun"
     cp "$STAGE/usr/share/applications/multicore.desktop" "$appdir/multicore.desktop"
     cp "$STAGE/usr/share/icons/hicolor/scalable/apps/multicore.svg" "$appdir/multicore.svg"

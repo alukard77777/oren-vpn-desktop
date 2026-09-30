@@ -923,3 +923,249 @@ mod controller_proxy {
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
     }
 }
+
+#[cfg(unix)]
+mod unix_service {
+    use super::FakeCores;
+    use crate::service::core_loop::{ClientIdentity, ServiceLoop};
+    use crate::service::unix_identity::{
+        IdentityError, PeerFacts, logind_user_state, peer_facts, verify_peer,
+    };
+    use crate::service::unix_server::{bind, serve};
+    use multicore_core::elevation_protocol::{BrokerErrorCode, read_stream_frame};
+    use multicore_core::service_protocol::{
+        ServiceCommand, ServiceResponse, decode_service_frame, write_service_frame,
+    };
+    use std::{
+        os::unix::{fs::PermissionsExt, net::UnixStream},
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const DAEMON: &str = "/usr/lib/multicore/runtime/multicore-daemon";
+
+    fn facts(executable: &str) -> PeerFacts {
+        PeerFacts {
+            pid: 4242,
+            uid: 1000,
+            executable: PathBuf::from(executable),
+        }
+    }
+
+    #[test]
+    fn only_the_packaged_daemon_of_a_logged_in_user_is_accepted() {
+        let expected = Path::new(DAEMON);
+        for state in ["active", "online"] {
+            assert_eq!(
+                verify_peer(&facts(DAEMON), expected, Some(state)),
+                Ok(()),
+                "{state}"
+            );
+        }
+        for wrong in [
+            "/tmp/.mount_MultiCxyz/usr/lib/multicore/runtime/multicore-daemon",
+            "/usr/lib/multicore/runtime/multicore-daemon (deleted)",
+            "/usr/bin/python3",
+        ] {
+            assert_eq!(
+                verify_peer(&facts(wrong), expected, Some("active")),
+                Err(IdentityError::WrongExecutable),
+                "{wrong}"
+            );
+        }
+        for state in [
+            None,
+            Some("offline"),
+            Some("lingering"),
+            Some("closing"),
+            Some("Active"),
+        ] {
+            assert_eq!(
+                verify_peer(&facts(DAEMON), expected, state),
+                Err(IdentityError::NoActiveSession),
+                "{state:?}"
+            );
+        }
+    }
+
+    fn write_session(run: &Path, id: &str, uid: u32, state: &str) {
+        let sessions = run.join("systemd/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(id),
+            format!(
+                "# This is private data. Do not parse.\nUID={uid}\nUSER=u{uid}\nACTIVE=0\nSTATE={state}\nREMOTE=0\nTYPE=wayland\nCLASS=user\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_session_in_state_active_or_online_counts_for_its_owner() {
+        let run = tempfile::tempdir().unwrap();
+        write_session(run.path(), "c1", 1000, "closing");
+        write_session(run.path(), "c2", 1000, "online");
+        write_session(run.path(), "5", 1001, "active");
+        write_session(run.path(), "6", 10000, "active");
+        assert_eq!(
+            logind_user_state(run.path(), 1000).as_deref(),
+            Some("online")
+        );
+        write_session(run.path(), "c3", 1000, "active");
+        assert_eq!(
+            logind_user_state(run.path(), 1000).as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            logind_user_state(run.path(), 1001).as_deref(),
+            Some("active")
+        );
+        assert_eq!(logind_user_state(run.path(), 100), None);
+        assert_eq!(logind_user_state(run.path(), 1002), None);
+    }
+
+    #[test]
+    fn without_session_records_the_user_record_state_is_used() {
+        let run = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(run.path().join("systemd/users")).unwrap();
+        std::fs::write(
+            run.path().join("systemd/users/1000"),
+            "# This is private data. Do not parse.\nNAME=alice\nSTATE=active\nSESSIONS=2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            logind_user_state(run.path(), 1000).as_deref(),
+            Some("active")
+        );
+        assert_eq!(logind_user_state(run.path(), 1001), None);
+        write_session(run.path(), "c9", 1000, "closing");
+        assert_eq!(
+            logind_user_state(run.path(), 1000).as_deref(),
+            Some("active"),
+            "a closing session must not hide the user record"
+        );
+    }
+
+    #[test]
+    fn peer_facts_name_this_test_process() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        let facts = peer_facts(&left).unwrap();
+        assert_eq!(facts.pid, std::process::id());
+        assert_eq!(facts.uid, rustix::process::getuid().as_raw());
+        assert_eq!(facts.executable, std::env::current_exe().unwrap());
+    }
+
+    fn start_server(
+        verifier: Arc<crate::service::unix_server::Verifier>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<Mutex<ServiceLoop<FakeCores>>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.sock");
+        let listener = bind(&path).unwrap();
+        let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
+        {
+            let service = service.clone();
+            thread::spawn(move || serve(listener, service, verifier));
+        }
+        (dir, path, service)
+    }
+
+    #[test]
+    fn socket_is_world_connectable_and_a_drop_stops_the_cores() {
+        let verifier = Arc::new(|_: &UnixStream| {
+            Ok::<_, IdentityError>(ClientIdentity {
+                user_key: "uid:1000".into(),
+                data_root: PathBuf::from("/home/alice/.local/share/multicore"),
+                uid: 1000,
+            })
+        });
+        let (_dir, path, service) = start_server(verifier);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666);
+        let mut client = UnixStream::connect(&path).unwrap();
+        write_service_frame(&mut client, &ServiceCommand::Prepare { generation_id: 3 }).unwrap();
+        let response: ServiceResponse =
+            decode_service_frame(&read_stream_frame(&mut client).unwrap()).unwrap();
+        assert!(matches!(
+            response,
+            ServiceResponse::Prepared {
+                generation_id: 3,
+                ..
+            }
+        ));
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !service
+            .lock()
+            .unwrap()
+            .cores_mut()
+            .calls
+            .iter()
+            .any(|call| call == "stop_all")
+        {
+            assert!(Instant::now() < deadline, "drop did not stop the cores");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_rejected_peer_is_answered_authentication_failed_and_starts_nothing() {
+        let verifier =
+            Arc::new(|_: &UnixStream| Err::<ClientIdentity, _>(IdentityError::NoActiveSession));
+        let (_dir, path, service) = start_server(verifier);
+        let mut client = UnixStream::connect(&path).unwrap();
+        write_service_frame(&mut client, &ServiceCommand::Prepare { generation_id: 3 }).unwrap();
+        let response: ServiceResponse =
+            decode_service_frame(&read_stream_frame(&mut client).unwrap()).unwrap();
+        assert_eq!(
+            response,
+            ServiceResponse::Error {
+                code: BrokerErrorCode::AuthenticationFailed
+            }
+        );
+        assert!(
+            read_stream_frame(&mut client).is_err(),
+            "connection stays open"
+        );
+        assert!(service.lock().unwrap().cores_mut().calls.is_empty());
+    }
+
+    #[test]
+    fn binding_replaces_a_stale_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.sock");
+        drop(bind(&path).unwrap());
+        assert!(path.exists());
+        let _listener = bind(&path).unwrap();
+        UnixStream::connect(&path).unwrap();
+    }
+}
+
+#[test]
+fn systemd_unit_carries_the_documented_hardening() {
+    let unit = include_str!("../../../packaging/linux/multicore.service");
+    for required in [
+        "ExecStart=/usr/lib/multicore/runtime/multicore-core-host --service",
+        "User=root",
+        "RuntimeDirectory=multicore",
+        "RuntimeDirectoryMode=0755",
+        "StateDirectory=multicore",
+        "StateDirectoryMode=0700",
+        "ProtectHome=read-only",
+        "ProtectSystem=strict",
+        "NoNewPrivileges=yes",
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_SYS_PTRACE",
+        "KillMode=control-group",
+        "WantedBy=multi-user.target",
+    ] {
+        assert!(
+            unit.lines().any(|line| line.trim_end() == required),
+            "unit lacks the line {required}"
+        );
+    }
+}

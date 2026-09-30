@@ -1,0 +1,24 @@
+# pacman install hooks: enable the always-ready MultiCore service on install, restart it on
+# upgrade, stop and disable it on removal. pacman has no purge, so removal also deletes the
+# service's own state directory /var/lib/multicore (the user's data stays in their home).
+
+post_install() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable multicore.service >/dev/null 2>&1 || true
+    systemctl restart multicore.service >/dev/null 2>&1 || true
+}
+
+post_upgrade() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable multicore.service >/dev/null 2>&1 || true
+    systemctl restart multicore.service >/dev/null 2>&1 || true
+}
+
+pre_remove() {
+    systemctl disable --now multicore.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -rf /var/lib/multicore
+}
