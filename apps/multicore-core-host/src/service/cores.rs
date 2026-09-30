@@ -295,6 +295,23 @@ impl Cores for ProductionCores {
     }
 
     fn set_tun(&mut self, on: bool) -> Result<(), BrokerErrorCode> {
+        let started = Instant::now();
+        let result = self.set_tun_timed(on, started);
+        service_log::append(
+            &self.service_directory,
+            &format!(
+                "set_tun {} {} in {} ms",
+                if on { "on" } else { "off" },
+                if result.is_ok() { "ok" } else { "failed" },
+                started.elapsed().as_millis()
+            ),
+        );
+        result
+    }
+
+    /// Logs each phase of a switch (phantom cleanup, Mihomo's answer, the adapter coming up),
+    /// so a slow Connect on real hardware shows where the time goes.
+    fn set_tun_timed(&mut self, on: bool, started: Instant) -> Result<(), BrokerErrorCode> {
         let active = self.active.as_ref().ok_or(BrokerErrorCode::NotReady)?;
         #[cfg(windows)]
         if on
@@ -303,8 +320,10 @@ impl Cores for ProductionCores {
         {
             eprintln!("stale TUN adapter could not be removed (CONFIGRET {code})");
         }
+        let cleaned = started.elapsed();
         let (port, secret) = (active.controller_port, active.controller_secret.as_str());
         mihomo_rest::set_tun_enabled(port, secret, on).map_err(|_| BrokerErrorCode::NotReady)?;
+        let patched = started.elapsed();
         if !on {
             // Switching TUN off re-creates Mihomo's listeners; a proxy-mode generation must come
             // back with its loopback mixed port, or the system proxy points at nothing.
@@ -312,6 +331,15 @@ impl Cores for ProductionCores {
             if mixed_port != 0 && !mixed_port_listens(mixed_port, MIXED_PORT_RECHECK) {
                 return Err(BrokerErrorCode::NotReady);
             }
+            service_log::append(
+                &self.service_directory,
+                &format!(
+                    "set_tun off phases: cleanup {} ms, patch {} ms, mixed port {} ms",
+                    cleaned.as_millis(),
+                    (patched - cleaned).as_millis(),
+                    (started.elapsed() - patched).as_millis()
+                ),
+            );
             return Ok(());
         }
         let deadline = Instant::now() + TUN_READY_TIMEOUT;
@@ -319,6 +347,15 @@ impl Cores for ProductionCores {
             if self.runtime.block_on(multicore_core::multicore_tun_is_up())
                 && mihomo_rest::tun_enabled(port, secret).unwrap_or(false)
             {
+                service_log::append(
+                    &self.service_directory,
+                    &format!(
+                        "set_tun on phases: cleanup {} ms, patch {} ms, adapter up {} ms",
+                        cleaned.as_millis(),
+                        (patched - cleaned).as_millis(),
+                        (started.elapsed() - patched).as_millis()
+                    ),
+                );
                 return Ok(());
             }
             if Instant::now() >= deadline {

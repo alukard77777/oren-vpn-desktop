@@ -2852,6 +2852,7 @@ where
 
     async fn disconnect_now(&self) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
+        let started = std::time::Instant::now();
         let controller = {
             let state = self.inner.read().await;
             if matches!(
@@ -2873,11 +2874,12 @@ where
                     .map_err(|_| BackendError::new())?;
                 state.message = None;
                 state.degraded = false;
-                state.push_event(
+                state.push_event_with_details(
                     Severity::Info,
                     Component::Core,
                     "disconnect",
                     "Подключение остановлено.",
+                    json!({ "total_ms": started.elapsed().as_millis() }),
                 );
                 drop(state);
                 self.reconcile_authoritative().await;
@@ -4150,6 +4152,7 @@ where
 
     async fn connect_with(&self, options: ConnectOptions) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
+        let started = std::time::Instant::now();
         if let Ok(mut current) = self.connect_options.lock() {
             *current = options;
         }
@@ -4188,6 +4191,7 @@ where
             }
         };
         let controller = prepared.controller();
+        let prepared_ms = started.elapsed().as_millis();
         if prepared.activate().is_err() {
             let mut state = self.inner.write().await;
             state.message = Some("Не удалось активировать конфигурацию запуска.".to_owned());
@@ -4225,6 +4229,7 @@ where
         let mut abandoned = AbandonedConnectGuard::new(&self.inner);
 
         let result = Supervisor::new(controller.clone()).connect().await;
+        let started_ms = started.elapsed().as_millis();
         if result.is_ok() {
             for (group, node) in queued_selections {
                 if self.selector.select(&group, &node).await.is_err() {
@@ -4268,11 +4273,20 @@ where
                 state.connected_since_unix_ms = unix_timestamp_ms();
                 state.message = None;
                 state.degraded = false;
-                state.push_event(
+                // Where a slow Connect spends its time: the factory (staging or reusing the
+                // warm generation), the cores' start (the service's tunnel switch) and the
+                // selection replay.
+                state.push_event_with_details(
                     Severity::Info,
                     Component::Core,
                     "connect",
                     "Подключение установлено.",
+                    json!({
+                        "prepare_ms": prepared_ms,
+                        "start_ms": started_ms.saturating_sub(prepared_ms),
+                        "replay_ms": started.elapsed().as_millis().saturating_sub(started_ms),
+                        "total_ms": started.elapsed().as_millis(),
+                    }),
                 );
                 // The watcher checks the new connection right away and keeps its short interval.
                 self.request_warm();

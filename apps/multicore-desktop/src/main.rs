@@ -4167,6 +4167,7 @@ fn run_disconnect_with_update(
 ) {
     thread::spawn(move || {
         let result = client.disconnect();
+        let disconnected = result.is_ok();
         let (reconciliation, current) = {
             let mut model = model.lock().expect("view model lock");
             let reconcile_status = model.finish_disconnect(mutation, result);
@@ -4181,7 +4182,9 @@ fn run_disconnect_with_update(
                 update_state.clone(),
             );
         } else {
-            apply_snapshot_from_worker(weak.clone(), current, model.clone(), false, false);
+            // A disconnect clears the catalog revision: reload it, or (with the service's warm
+            // cores) latency checks would never run again.
+            apply_snapshot_from_worker(weak.clone(), current, model.clone(), disconnected, false);
         }
         if let Some(reconciliation) = reconciliation {
             run_disconnect_reconciliation_with_update(

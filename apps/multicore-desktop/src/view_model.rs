@@ -1894,6 +1894,11 @@ impl DesktopViewModel {
         if succeeded || reconcile_status {
             self.catalog_revision = None;
         }
+        if succeeded && self.cores_ready {
+            // The always-ready service keeps the cores (and latency checks) alive after a
+            // disconnect: the reloaded catalog starts the next check right away.
+            self.latency_queued = true;
+        }
         self.active_mutation = None;
         reconcile_status
     }
@@ -6198,6 +6203,49 @@ mod tests {
             .begin_latency_request()
             .expect("latency while disconnected with warm cores");
         assert_eq!(request.group_ids, vec!["opaque:selected"]);
+    }
+
+    #[test]
+    fn disconnect_with_warm_service_cores_keeps_latency_checks_running() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        let mut status = MockDaemonClient::ready().status;
+        status.cores_ready = true;
+        status.service_mode = true;
+        view_model.finish_refresh(refresh, Ok(status.clone()));
+        let catalog = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(catalog.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+
+        // The disconnect answer says the service still runs the cores.
+        let token = view_model.next_mutation(MutationKind::Disconnect);
+        assert!(!view_model.finish_disconnect(token, Ok(status)));
+        assert!(view_model.cores_ready());
+        assert!(
+            view_model.latency_presentation().queued,
+            "the next check waits for the reloaded catalog"
+        );
+        // The worker reloads the catalog (run_disconnect passes `disconnected`), which
+        // releases the queued check.
+        let catalog = view_model.begin_catalog_request().expect("catalog reload");
+        view_model
+            .finish_catalog(catalog.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+        assert!(view_model.begin_latency_request().is_some());
+
+        let main = include_str!("main.rs");
+        let worker = main
+            .split("fn run_disconnect_with_update(")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("fn run_disconnect_reconciliation_with_update(")
+                    .next()
+            })
+            .expect("disconnect worker source");
+        assert!(worker.contains("let disconnected = result.is_ok();"));
+        assert!(worker.contains("model.clone(), disconnected, false"));
     }
 
     #[test]

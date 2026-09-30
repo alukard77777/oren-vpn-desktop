@@ -181,6 +181,36 @@ async fn the_tun_controller_maps_connect_and_disconnect_to_the_service() {
 }
 
 #[tokio::test]
+async fn connect_and_disconnect_after_a_warm_up_only_switch_the_tunnel() {
+    let (session, connector, _) = session();
+    // The warm-up stages the generation once.
+    let warm = ServiceTunController::for_warm_up(session.clone(), 3);
+    warm.start(Engine::Xray).await.unwrap();
+    let controller = Arc::new(ServiceTunController::new(session.clone(), 3));
+    let supervisor = Supervisor::new(controller);
+    for _ in 0..2 {
+        supervisor.connect().await.unwrap();
+        supervisor.disconnect().await.unwrap();
+        // The cores stay warm after the disconnect, so latency checks keep working.
+        session.poll();
+        assert!(session.cores_ready());
+    }
+    assert_eq!(
+        connector.0.lock().unwrap().commands,
+        [
+            ServiceCommand::Prepare { generation_id: 3 },
+            ServiceCommand::SetTun { on: true },
+            ServiceCommand::SetTun { on: false },
+            ServiceCommand::Status,
+            ServiceCommand::SetTun { on: true },
+            ServiceCommand::SetTun { on: false },
+            ServiceCommand::Status,
+        ],
+        "a connect never prepares again and a disconnect never stops the cores"
+    );
+}
+
+#[tokio::test]
 async fn the_proxy_mode_controller_keeps_tun_off_and_never_stops_cores() {
     let (session, connector, _) = session();
     let controller = ServiceCoresController::new(session.clone(), 3);

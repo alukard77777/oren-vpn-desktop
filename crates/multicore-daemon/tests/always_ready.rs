@@ -408,6 +408,42 @@ async fn latency_session_and_selection_work_before_connecting_with_warm_cores() 
 }
 
 #[tokio::test]
+async fn latency_selection_and_catalog_keep_working_after_a_disconnect() {
+    use multicore_daemon::LatencyRequest;
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let catalog = h.backend.catalog().await.unwrap();
+    let status = h.backend.disconnect().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert!(
+        status.cores_ready,
+        "the disconnect answer says the cores stay warm"
+    );
+    assert_eq!(
+        h.backend.catalog().await.unwrap().revision,
+        catalog.revision,
+        "the catalog revision survives the disconnect"
+    );
+    let latencies = h
+        .backend
+        .latencies(LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: Vec::new(),
+            node_ids: Vec::new(),
+        })
+        .await
+        .expect("latency after a disconnect with warm cores");
+    assert!(
+        latencies
+            .entries
+            .iter()
+            .all(|entry| entry.latency_ms == Some(42))
+    );
+}
+
+#[tokio::test]
 async fn without_warm_cores_latency_and_session_still_require_a_connection() {
     let h = harness(&[PROFILE_A]);
     assert!(matches!(

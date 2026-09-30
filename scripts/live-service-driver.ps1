@@ -430,12 +430,13 @@ function Invoke-ServiceMode {
     $connected = Check 'connect-tun-without-uac' {
         $watch = [Diagnostics.Stopwatch]::StartNew()
         [void](Api POST '/v1/connect' '{"tun":true}')
+        $postMs = $watch.ElapsedMilliseconds
         $status = Wait-Until { $s = Get-Status; if ($s.state -eq 'connected') { $s } } 60 'state=connected'
         $watch.Stop()
         if (@(Get-Process -Name 'consent' -ErrorAction SilentlyContinue).Count) { throw 'a UAC consent prompt is open' }
         $elevatedHost = @(Get-Process -Name 'multicore-core-host' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -ne 0 })
         if ($elevatedHost.Count) { throw 'an on-demand elevated core host was started (fallback instead of the service)' }
-        "connected in $($watch.ElapsedMilliseconds) ms, node=$($status.current_node)"
+        "connected in $($watch.ElapsedMilliseconds) ms (POST /v1/connect returned after $postMs ms), node=$($status.current_node)"
     }
     if ($connected) {
         Check 'connect-reuses-warm-cores' {
@@ -455,15 +456,37 @@ function Invoke-ServiceMode {
             } | Out-Null
         }
         Check 'disconnect-keeps-cores' {
+            $disconnectWatch = [Diagnostics.Stopwatch]::StartNew()
             [void](Api POST '/v1/disconnect')
+            $script:disconnectMs = $disconnectWatch.ElapsedMilliseconds
             $status = Wait-Until { $s = Get-Status; if ($s.state -ne 'connected' -and $s.state -ne 'connecting' -and $s.cores_ready) { $s } } 30 'disconnected and cores_ready'
             $now = Get-ServiceCorePids
             if ($now -ne $script:warmPids) { throw "cores changed on disconnect: $script:warmPids -> $now" }
-            "state=$($status.state) cores $now"
+            "state=$($status.state) cores $now, POST /v1/disconnect returned after $script:disconnectMs ms"
+        } | Out-Null
+        Check 'latency-after-disconnect' {
+            $response = Api POST '/v1/latencies' '{}'
+            $entries = @($response.entries)
+            if ($entries.Count -lt 1) { throw 'no latency entries after the disconnect' }
+            if ((Get-Status).state -eq 'connected') { throw 'latency probe connected the tunnel' }
+            ($entries | ForEach-Object { "$($_.status):$($_.latency_ms)" }) -join ' '
         } | Out-Null
         Check 'adapter-down-after-disconnect' {
             Wait-Until { (Get-AdapterStatus) -ne 'Up' } 30 'MultiCore adapter not Up' | Out-Null
             Get-AdapterStatus
+        } | Out-Null
+        # The second Connect re-creates the adapter Windows left as a phantom node: the time a
+        # user sees on every Connect after the first.
+        Check 'second-connect-timing' {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            [void](Api POST '/v1/connect' '{"tun":true}')
+            $postMs = $watch.ElapsedMilliseconds
+            Wait-Until { (Get-Status).state -eq 'connected' } 60 'state=connected' | Out-Null
+            $now = Get-ServiceCorePids
+            if ($now -ne $script:warmPids) { throw "cores restarted on the second connect: $script:warmPids -> $now" }
+            [void](Api POST '/v1/disconnect')
+            Wait-Until { $s = Get-Status; $s.state -ne 'connected' -and $s.cores_ready } 30 'disconnected and warm' | Out-Null
+            "POST /v1/connect returned after $postMs ms"
         } | Out-Null
     }
 
