@@ -143,6 +143,69 @@ require_service_scriptlets() {
   }
 }
 
+# Runs the package's own scriptlets through install, upgrade, administrator disable, removal
+# and reinstall against a fake systemctl and a relocated /var/lib/multicore and
+# /run/systemd/system. `$2` is a function taking one phase: install (fresh), upgrade, remove.
+# The fake `restart` creates the state directory, as systemd's StateDirectory= does.
+SIM=""
+sim_run() {
+  # sim_run <shell> <scriptlet text> [args...]
+  local shell="$1" text="$2"
+  shift 2
+  local file
+  file="$(mktemp "$SIM/scriptlet.XXXXXX")"
+  sed -e "s#/var/lib/multicore#$SIM/var/lib/multicore#g" \
+      -e "s#/run/systemd/system#$SIM/run/systemd/system#g" <<<"$text" > "$file"
+  PATH="$SIM/bin:$PATH" SIM_STATE="$SIM/state" SIM_VAR="$SIM/var/lib/multicore" "$shell" "$file" "$@"
+}
+
+expect_service() {
+  local label="$1" step="$2" enabled="$3" running="$4" actual_enabled=no actual_running=no
+  [[ -e "$SIM/state/enabled" ]] && actual_enabled=yes
+  [[ -e "$SIM/state/running" ]] && actual_running=yes
+  [[ "$actual_enabled/$actual_running" == "$enabled/$running" ]] || {
+    echo "$label, $step: service enabled/running is $actual_enabled/$actual_running, expected $enabled/$running" >&2
+    exit 1
+  }
+}
+
+simulate_service_lifecycle() {
+  local label="$1" runner="$2"
+  SIM="$(mktemp -d)"
+  mkdir -p "$SIM/bin" "$SIM/state" "$SIM/run/systemd/system"
+  cat > "$SIM/bin/systemctl" <<'FAKE'
+#!/bin/sh
+case "$1" in
+  daemon-reload) ;;
+  enable) touch "$SIM_STATE/enabled" ;;
+  disable) rm -f "$SIM_STATE/enabled"; if [ "$2" = "--now" ]; then rm -f "$SIM_STATE/running"; fi ;;
+  restart) touch "$SIM_STATE/running"; mkdir -p "$SIM_VAR" ;;
+  stop) rm -f "$SIM_STATE/running" ;;
+  is-enabled) [ -e "$SIM_STATE/enabled" ] ;;
+  *) echo "unexpected systemctl $*" >&2; exit 1 ;;
+esac
+FAKE
+  chmod 0755 "$SIM/bin/systemctl"
+  "$runner" install
+  expect_service "$label" 'fresh install' yes yes
+  "$runner" upgrade
+  expect_service "$label" 'upgrade' yes yes
+  PATH="$SIM/bin:$PATH" SIM_STATE="$SIM/state" SIM_VAR="$SIM/var/lib/multicore" \
+    systemctl disable --now multicore.service
+  "$runner" upgrade
+  expect_service "$label" 'upgrade after an administrator disabled it' no no
+  "$runner" remove
+  expect_service "$label" 'removal' no no
+  [[ ! -e "$SIM/var/lib/multicore" ]] || { echo "$label: removal keeps /var/lib/multicore" >&2; exit 1; }
+  "$runner" install
+  expect_service "$label" 'reinstall after removal' yes yes
+  "$runner" remove
+  "$runner" upgrade
+  expect_service "$label" 'upgrade from a version without the service' yes yes
+  rm -rf "$SIM"
+  echo "$label: service lifecycle (install, upgrade, admin disable, remove, reinstall) OK"
+}
+
 [[ -L "$STAGE/usr/bin/multicore" ]] || { echo "Missing /usr/bin/multicore symlink" >&2; exit 1; }
 [[ "$(readlink "$STAGE/usr/bin/multicore")" == "../lib/multicore/multicore" ]] || {
   echo "Incorrect /usr/bin/multicore symlink" >&2
@@ -267,6 +330,17 @@ check_rpm() (
     scriptlets="$(rpm -qp "$query" "$package")"
     [[ -z "$scriptlets" ]] || { echo 'RPM must not ship trigger scriptlets' >&2; exit 1; }
   done
+  RPM_POSTIN="$(rpm -qp --queryformat '%{POSTIN}' "$package")"
+  RPM_PREUN="$(rpm -qp --queryformat '%{PREUN}' "$package")"
+  RPM_POSTUN="$(rpm -qp --queryformat '%{POSTUN}' "$package")"
+  rpm_phase() {
+    case "$1" in
+      install) sim_run sh "$RPM_POSTIN" 1 ;;
+      upgrade) sim_run sh "$RPM_POSTIN" 2; sim_run sh "$RPM_PREUN" 1; sim_run sh "$RPM_POSTUN" 1 ;;
+      remove) sim_run sh "$RPM_PREUN" 0; sim_run sh "$RPM_POSTUN" 0 ;;
+    esac
+  }
+  simulate_service_lifecycle RPM rpm_phase
 
   local work
   work="$(mktemp -d)"
@@ -318,6 +392,21 @@ for format in "${requested_formats[@]}"; do
         echo 'Debian purge keeps /var/lib/multicore' >&2
         exit 1
       }
+      DEB_POSTINST="$(cat "$deb_control/DEBIAN/postinst")"
+      DEB_PRERM="$(cat "$deb_control/DEBIAN/prerm")"
+      DEB_POSTRM="$(cat "$deb_control/DEBIAN/postrm")"
+      deb_phase() {
+        case "$1" in
+          install) sim_run sh "$DEB_POSTINST" configure ;;
+          upgrade)
+            sim_run sh "$DEB_PRERM" upgrade "$VERSION"
+            sim_run sh "$DEB_POSTRM" upgrade "$VERSION"
+            sim_run sh "$DEB_POSTINST" configure "$VERSION"
+            ;;
+          remove) sim_run sh "$DEB_PRERM" remove; sim_run sh "$DEB_POSTRM" remove ;;
+        esac
+      }
+      simulate_service_lifecycle 'Debian package' deb_phase
       rm -rf "$deb_control"
       ;;
     appimage)
@@ -352,6 +441,14 @@ for format in "${requested_formats[@]}"; do
         echo 'Arch removal keeps /var/lib/multicore' >&2
         exit 1
       }
+      arch_phase() {
+        case "$1" in
+          install) sim_run bash "$arch_install"$'\n'post_install ;;
+          upgrade) sim_run bash "$arch_install"$'\n'post_upgrade ;;
+          remove) sim_run bash "$arch_install"$'\n'pre_remove$'\n'post_remove ;;
+        esac
+      }
+      simulate_service_lifecycle 'Arch package' arch_phase
       ;;
     rpm)
       check_rpm

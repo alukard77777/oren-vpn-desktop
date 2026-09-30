@@ -106,14 +106,18 @@ fn handle_connection<C: Cores>(
         .client_gone(id);
 }
 
-/// The normal stop, as for a `Shutdown` from the owner: TUN off, then Mihomo, then Xray; then
-/// the socket goes away so no client connects to a service that is exiting.
-pub(crate) fn shut_down<C: Cores>(service: &Mutex<ServiceLoop<C>>, socket: &Path) {
-    service
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .stop_everything();
+/// The normal stop, as for a `Shutdown` from the owner, for a service that is exiting: the
+/// socket goes away first, then TUN off, Mihomo, Xray. `then` (the process exit) runs while
+/// the loop lock is still held, so no connected client can `Prepare` again in between.
+pub(crate) fn shut_down<C: Cores>(
+    service: &Mutex<ServiceLoop<C>>,
+    socket: &Path,
+    then: impl FnOnce(),
+) {
+    let mut service = service.lock().unwrap_or_else(PoisonError::into_inner);
     let _ = fs::remove_file(socket);
+    service.stop_everything();
+    then();
 }
 
 /// Replaces the default (die immediately) action of SIGTERM and SIGINT: the first one received
@@ -153,8 +157,7 @@ pub(crate) fn run_service() -> Result<(), ()> {
     {
         let service = service.clone();
         on_termination_signal(move || {
-            shut_down(&service, Path::new(SOCKET_PATH));
-            std::process::exit(0);
+            shut_down(&service, Path::new(SOCKET_PATH), || std::process::exit(0));
         })
         .map_err(drop)?;
     }

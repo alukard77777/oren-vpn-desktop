@@ -1945,16 +1945,27 @@ mod unix_service {
         {
             let (service, path) = (service.clone(), path.clone());
             on_termination_signal(move || {
-                shut_down(&service, &path);
-                let _ = done.send(());
+                let during_exit = service.clone();
+                let socket = path.clone();
+                shut_down(&service, &path, move || {
+                    // The process exits here: the socket is gone and the loop is still
+                    // locked, so no client can Prepare between the stop and the exit.
+                    let locked = matches!(
+                        during_exit.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    );
+                    let _ = done.send((locked, socket.exists()));
+                });
             })
             .unwrap();
         }
         rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
             .unwrap();
-        stopped
+        let (locked_at_exit, socket_at_exit) = stopped
             .recv_timeout(Duration::from_secs(5))
             .expect("SIGTERM ran the shutdown");
+        assert!(locked_at_exit, "the exit must run under the loop lock");
+        assert!(!socket_at_exit, "the socket must be gone before the exit");
 
         let calls = service.lock().unwrap().cores_mut().calls.clone();
         let tun_off = calls.iter().rposition(|call| call == "tun:false");
