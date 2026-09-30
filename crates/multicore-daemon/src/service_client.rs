@@ -381,6 +381,12 @@ impl<C: ServiceConnector> ServiceSession<C> {
     }
 }
 
+impl<C: ServiceConnector> crate::CoresReadiness for ServiceSession<C> {
+    fn cores_ready(&self) -> bool {
+        ServiceSession::cores_ready(self)
+    }
+}
+
 fn check_state(state: ElevatedRuntimeState) -> RuntimeCheckState {
     match state {
         ElevatedRuntimeState::Stopped => RuntimeCheckState::Stopped,

@@ -27,6 +27,8 @@ fn status() -> StatusDto {
         message: None,
         degraded: false,
         subscription: None,
+        cores_ready: false,
+        service_mode: false,
     }
 }
 
