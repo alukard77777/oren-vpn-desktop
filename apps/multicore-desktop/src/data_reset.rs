@@ -80,13 +80,26 @@ pub(crate) fn schedule_reset_and_relaunch() -> io::Result<()> {
     Command::new(launcher()?).arg(RESET_FLAG).spawn().map(drop)
 }
 
-/// Handles `--reset-data` before anything else runs. Returns true when it was requested; the
-/// caller then exits without starting the UI (this function already started the clean app).
-pub(crate) fn run_pending_reset(arguments: &[OsString]) -> bool {
-    if !arguments.iter().any(|argument| argument == RESET_FLAG) {
+/// Only the exact command line `<app> --reset-data` is a reset request; the flag next to any
+/// other argument (a deep link, `--background`) is not.
+pub(crate) fn is_reset_request(arguments: &[OsString]) -> bool {
+    matches!(arguments, [only] if only == RESET_FLAG)
+}
+
+/// Runs `remove` only while `guard` (the old instance's single-instance guard, now ours) is
+/// held. Without it the old instance is still running: nothing is deleted. Returns whether the
+/// data was reset, i.e. whether a clean app should be started.
+fn reset_while_holding<G>(guard: Option<G>, remove: impl FnOnce()) -> bool {
+    let Some(guard) = guard else {
+        eprintln!("MultiCore is still running; data was not removed");
         return false;
-    }
-    let guard = wait_for_the_old_instance();
+    };
+    remove();
+    drop(guard);
+    true
+}
+
+fn remove_data_directory() {
     match multicore_platform::dirs::user_data_root() {
         Ok(root) if is_multicore_data_root(&root) => {
             if let Err(error) = remove_with_retry(&root, RESET_ATTEMPTS, RESET_DELAY, |path| {
@@ -98,17 +111,26 @@ pub(crate) fn run_pending_reset(arguments: &[OsString]) -> bool {
         Ok(_) => eprintln!("MultiCore data directory has an unexpected name; nothing removed"),
         Err(error) => eprintln!("MultiCore data directory unavailable: {error}"),
     }
-    drop(guard);
-    // Start the real app without the flag, so launch-argument parsing never sees it.
-    if let Err(error) = launcher().and_then(|program| Command::new(program).spawn()) {
-        eprintln!("MultiCore could not be started again: {error}");
+}
+
+/// Handles `--reset-data` before anything else runs. Returns true when it was requested; the
+/// caller then exits without starting the UI (this function already started the clean app).
+pub(crate) fn run_pending_reset(arguments: &[OsString]) -> bool {
+    if !is_reset_request(arguments) {
+        return false;
+    }
+    if reset_while_holding(wait_for_the_old_instance(), remove_data_directory) {
+        // Start the real app without the flag, so launch-argument parsing never sees it.
+        if let Err(error) = launcher().and_then(|program| Command::new(program).spawn()) {
+            eprintln!("MultiCore could not be started again: {error}");
+        }
     }
     true
 }
 
 /// Holds the single-instance guard once the old instance has let go of it. `Background` is the
-/// only activation a still-running old instance ignores. `None` after the timeout: the removal
-/// then still runs, and the retry loop copes with files the old process keeps open.
+/// only activation a still-running old instance ignores. `None` after the timeout: then nothing
+/// is removed.
 fn wait_for_the_old_instance() -> Option<Claim> {
     let deadline = Instant::now() + TAKEOVER_TIMEOUT;
     loop {
@@ -124,8 +146,43 @@ fn wait_for_the_old_instance() -> Option<Claim> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RESET_FLAG, is_multicore_data_root, launcher_from, remove_with_retry};
-    use std::{cell::Cell, ffi::OsStr, io, path::Path, path::PathBuf, time::Duration};
+    use super::{
+        RESET_FLAG, is_multicore_data_root, is_reset_request, launcher_from, remove_with_retry,
+        reset_while_holding,
+    };
+    use std::{
+        cell::Cell,
+        ffi::{OsStr, OsString},
+        io,
+        path::Path,
+        path::PathBuf,
+        time::Duration,
+    };
+
+    #[test]
+    fn only_the_bare_reset_flag_requests_a_reset() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_reset_request(&args(&[RESET_FLAG])));
+        for other in [
+            args(&[]),
+            args(&["--reset-data=1"]),
+            args(&["--RESET-DATA"]),
+            args(&["multicore://install?url=x", RESET_FLAG]),
+            args(&[RESET_FLAG, "--background"]),
+            args(&[RESET_FLAG, RESET_FLAG]),
+        ] {
+            assert!(!is_reset_request(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_removed_while_the_old_instance_keeps_its_guard() {
+        let removed = Cell::new(false);
+        assert!(!reset_while_holding(None::<()>, || removed.set(true)));
+        assert!(!removed.get());
+        assert!(reset_while_holding(Some(()), || removed.set(true)));
+        assert!(removed.get());
+    }
 
     #[test]
     fn only_multicore_data_directories_may_be_deleted() {

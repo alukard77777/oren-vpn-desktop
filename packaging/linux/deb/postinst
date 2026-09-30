@@ -1,12 +1,19 @@
 #!/bin/sh
-# Enable and (re)start the always-ready MultiCore service on install and upgrade.
+# Enable the always-ready MultiCore service the first time it is installed (its state
+# directory /var/lib/multicore does not exist yet: a fresh install, or an upgrade from a
+# version without the service) and (re)start it whenever it is enabled. An administrator's
+# `systemctl disable multicore` survives upgrades.
 set -e
 case "$1" in
     configure|abort-upgrade|abort-remove|abort-deconfigure)
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
-            systemctl enable multicore.service >/dev/null 2>&1 || true
-            systemctl restart multicore.service >/dev/null 2>&1 || true
+            if [ ! -d /var/lib/multicore ]; then
+                systemctl enable multicore.service >/dev/null 2>&1 || true
+            fi
+            if systemctl is-enabled --quiet multicore.service 2>/dev/null; then
+                systemctl restart multicore.service >/dev/null 2>&1 || true
+            fi
         fi
         ;;
 esac

@@ -187,6 +187,15 @@ pub fn sanitize_mihomo(
     let tun = tun.as_mapping_mut().ok_or(SanitizeError::Malformed)?;
     tun.insert(key("enable"), Value::Bool(false));
     tun.insert(key("device"), Value::String("MultiCore".to_owned()));
+    // Host routing tables/rules and inherited descriptors stay Mihomo's defaults: a user must
+    // not aim the privileged TUN at, say, the main routing table (254).
+    for pinned in [
+        "iproute2-table-index",
+        "iproute2-rule-index",
+        "file-descriptor",
+    ] {
+        tun.remove(key(pinned));
+    }
     rewrite_provider_paths(mapping, "rule-providers", "rule", service_directory)?;
     rewrite_provider_paths(mapping, "proxy-providers", "proxy", service_directory)?;
     reject_credential_files(mapping)?;
@@ -210,6 +219,9 @@ fn rewrite_provider_paths(
     for (name, provider) in providers.iter_mut() {
         let name = name.as_str().ok_or(SanitizeError::Malformed)?;
         let provider = provider.as_mapping_mut().ok_or(SanitizeError::Malformed)?;
+        for field in provider.keys() {
+            mihomo_field_name(field.as_str().unwrap_or(""))?;
+        }
         let kind = provider
             .get(key("type"))
             .and_then(Value::as_str)
@@ -305,16 +317,28 @@ fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
     Ok(())
 }
 
+/// Mihomo decodes proxies and providers with its `structure` decoder, which looks keys up
+/// exactly and, with `KeyReplace`, also accepts `_` for `-` (`private_key` = `private-key`).
+/// Names are therefore compared ASCII-lowercased with `_` folded to `-`, and a non-ASCII key
+/// (never part of a Mihomo field name) is refused outright.
+fn mihomo_field_name(name: &str) -> Result<String, SanitizeError> {
+    if !name.is_ascii() {
+        return Err(SanitizeError::Malformed);
+    }
+    Ok(name.to_ascii_lowercase().replace('_', "-"))
+}
+
 fn reject_credential_paths_in(value: &Value, at: &str) -> Result<(), SanitizeError> {
     match value {
         Value::Mapping(mapping) => {
             for (name, child) in mapping {
                 let name = name.as_str().unwrap_or("");
                 let here = format!("{at}.{name}");
-                if let Some(text) = child.as_str() {
-                    let inline = match name {
+                let field = mihomo_field_name(name)?;
+                if let Some(text) = child.as_str().filter(|text| !text.trim().is_empty()) {
+                    let inline = match field.as_str() {
                         "certificate" | "ca" => is_pem(text),
-                        "private-key" => is_pem(text) || is_short_base64(text),
+                        "private-key" => is_pem(text) || is_wireguard_key(text),
                         _ => true,
                     };
                     if !inline {
@@ -338,12 +362,13 @@ fn is_pem(text: &str) -> bool {
     text.trim_start().starts_with("-----BEGIN")
 }
 
-fn is_short_base64(text: &str) -> bool {
-    !text.is_empty()
-        && text.len() <= 64
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+/// The only non-PEM `private-key` form accepted: strict standard base64 of exactly 32 bytes
+/// (a WireGuard / X25519 key). Anything path-like (`/etc/shadow`, `C:\...`, `key.pem`) fails.
+fn is_wireguard_key(text: &str) -> bool {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .is_ok_and(|bytes| bytes.len() == 32)
 }
 
 type JsonMap = serde_json::Map<String, serde_json::Value>;
@@ -361,7 +386,7 @@ const ALLOWED_XRAY_LOG_KEYS: &[&str] = &["loglevel", "dnslog", "maskaddress"];
 pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     let mut document: serde_json::Value =
         serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
-    reject_folded_duplicates(&document)?;
+    reject_ambiguous_keys(&document)?;
     let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
     for (name, value) in root.iter_mut() {
         if !name.eq_ignore_ascii_case("log") {
@@ -419,21 +444,24 @@ pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     serde_json::to_vec(&document).map_err(|_| SanitizeError::Malformed)
 }
 
-/// Go would silently pick one of two keys that differ only in case; refuse the ambiguity.
-fn reject_folded_duplicates(value: &serde_json::Value) -> Result<(), SanitizeError> {
+/// Go's `encoding/json` matches keys with Unicode simple case folding, so `liſten` (U+017F)
+/// is `listen` and `KeyFile` with a Kelvin sign (U+212A) is `keyFile`. Every Xray field name is
+/// ASCII, so any non-ASCII key anywhere is refused; the remaining ASCII keys are then compared
+/// with ASCII folding, and two keys that fold together are refused (Go would pick one).
+fn reject_ambiguous_keys(value: &serde_json::Value) -> Result<(), SanitizeError> {
     match value {
         serde_json::Value::Object(map) => {
             let mut seen = std::collections::HashSet::new();
             for (name, child) in map {
-                if !seen.insert(name.to_ascii_lowercase()) {
+                if !name.is_ascii() || !seen.insert(name.to_ascii_lowercase()) {
                     return Err(SanitizeError::Malformed);
                 }
-                reject_folded_duplicates(child)?;
+                reject_ambiguous_keys(child)?;
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                reject_folded_duplicates(item)?;
+                reject_ambiguous_keys(item)?;
             }
         }
         _ => {}

@@ -1,8 +1,8 @@
 use multicore_core::RuntimePaths;
 use std::{
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    fs::{self, File},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -175,10 +175,10 @@ pub(crate) fn resolve_from(
         runtime_dir,
         &cores,
     ] {
-        guard_chain(directory, true, owner_uid, &mut guards)?;
+        guard_chain(directory, true, owner_uid, false, &mut guards)?;
     }
     if dashboard_present {
-        guard_chain(&dashboard, true, owner_uid, &mut guards)?;
+        guard_chain(&dashboard, true, owner_uid, false, &mut guards)?;
     }
     for file in [
         host_executable,
@@ -187,7 +187,8 @@ pub(crate) fn resolve_from(
         &xray_config,
         &mihomo_config,
     ] {
-        guard_chain(file, false, owner_uid, &mut guards)?;
+        let staged_config = *file == xray_config || *file == mihomo_config;
+        guard_chain(file, false, owner_uid, staged_config, &mut guards)?;
     }
 
     let canonical = |path: &Path| fs::canonicalize(path).map_err(|_| ResolveError::Missing);
@@ -239,51 +240,86 @@ pub(crate) fn resolve_from(
     })
 }
 
+/// Guards every component of `path`, opening each one with `openat` relative to its
+/// already-opened parent and `O_NOFOLLOW`, so no symbolic link is followed anywhere in the chain
+/// (an intermediate directory swapped for a symlink mid-walk is refused, not traversed). With
+/// `owned_by_client`, the final component must belong to `owner_uid` itself (not root): the
+/// staged configs the privileged reader consumes.
 fn guard_chain(
     path: &Path,
     target_directory: bool,
     owner_uid: u32,
+    owned_by_client: bool,
     guards: &mut Vec<GuardedPath>,
 ) -> Result<(), ResolveError> {
-    if !path.is_absolute() {
+    use std::path::Component;
+    if !path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+    {
         return Err(ResolveError::Layout);
     }
     let mut ancestors = path.ancestors().collect::<Vec<_>>();
     ancestors.reverse();
+    let mut parent: Option<File> = None;
     for ancestor in ancestors {
-        if ancestor.parent().is_none() || guards.iter().any(|guard| guard.path == ancestor) {
+        if ancestor.parent().is_none() {
+            let root = rustix::fs::open(
+                ancestor,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| ResolveError::Io)?;
+            parent = Some(File::from(root));
+            continue;
+        }
+        if let Some(existing) = guards.iter().find(|guard| guard.path == ancestor) {
+            parent = Some(existing.handle.try_clone().map_err(|_| ResolveError::Io)?);
             continue;
         }
         let final_component = ancestor == path;
         let directory = !final_component || target_directory;
-        guards.push(open_guard(ancestor, directory, final_component, owner_uid)?);
+        let guard = open_guard(
+            parent.as_ref().ok_or(ResolveError::Layout)?,
+            ancestor,
+            directory,
+            final_component,
+            owner_uid,
+            final_component && owned_by_client,
+        )?;
+        parent = Some(guard.handle.try_clone().map_err(|_| ResolveError::Io)?);
+        guards.push(guard);
     }
     Ok(())
 }
 
 fn open_guard(
+    parent: &File,
     path: &Path,
     directory: bool,
     final_component: bool,
     owner_uid: u32,
+    owned_by_client: bool,
 ) -> Result<GuardedPath, ResolveError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    let name = path.file_name().ok_or(ResolveError::Layout)?;
     // `NONBLOCK`: a FIFO planted in the user-owned tree must not block the privileged opener
     // (it is then rejected as not a regular file below).
-    let flags = rustix::fs::OFlags::NOFOLLOW.bits() as i32
-        | rustix::fs::OFlags::NONBLOCK.bits() as i32
-        | if directory {
-            rustix::fs::OFlags::DIRECTORY.bits() as i32
-        } else {
-            0
-        };
-    let handle = OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let handle = rustix::fs::openat(parent, name, flags, Mode::empty())
+        .map(File::from)
         .map_err(|error| {
-            if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            let symlink = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink);
+            if symlink {
                 ResolveError::Symlink
-            } else if error.kind() == std::io::ErrorKind::NotFound {
+            } else if error == rustix::io::Errno::NOENT {
                 ResolveError::Missing
             } else {
                 ResolveError::Layout
@@ -293,7 +329,7 @@ fn open_guard(
     if metadata.is_dir() != directory || (!directory && !metadata.is_file()) {
         return Err(ResolveError::Layout);
     }
-    if metadata.uid() != 0 && metadata.uid() != owner_uid {
+    if (metadata.uid() != 0 || owned_by_client) && metadata.uid() != owner_uid {
         return Err(ResolveError::Ownership);
     }
     let mode = metadata.mode();

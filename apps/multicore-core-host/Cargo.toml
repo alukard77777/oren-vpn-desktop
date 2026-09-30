@@ -19,7 +19,7 @@ getrandom = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "signal", "time"] }
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
