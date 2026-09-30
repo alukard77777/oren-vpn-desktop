@@ -1080,8 +1080,10 @@ mod windows_pipe_server {
     use super::service::windows_identity::{
         IdentityError, client_facts, normalized, user_data_root,
     };
-    use super::service::windows_server::{PIPE_SDDL, create_instance, serve};
-    use super::windows_pipe::{connect, read_message, write_frame};
+    use super::service::windows_server::{
+        CLIENT_PIPE_ACCESS, PIPE_SDDL, create_instance, create_instance_with, serve_with,
+    };
+    use super::windows_pipe::{read_message, write_frame};
     use multicore_core::elevation_protocol::BrokerErrorCode;
     use multicore_core::service_protocol::{
         ServiceCommand, ServiceResponse, decode_service_frame, encode_service_frame,
@@ -1110,6 +1112,40 @@ mod windows_pipe_server {
             Threading::{CreateEventW, SetEvent},
         },
     };
+
+    /// Opens a service pipe the way the daemon does: exactly the INTERACTIVE rights,
+    /// identification-level SQOS, message read mode.
+    fn connect(name: &str, _timeout: Duration) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Storage::FileSystem::{
+                FILE_FLAG_OVERLAPPED, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+            },
+            System::Pipes::{PIPE_READMODE_MESSAGE, SetNamedPipeHandleState},
+        };
+        let pipe = std::fs::OpenOptions::new()
+            .access_mode(CLIENT_PIPE_ACCESS)
+            .custom_flags(FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+            .open(name)?;
+        let mode = PIPE_READMODE_MESSAGE;
+        if unsafe {
+            SetNamedPipeHandleState(
+                pipe.as_raw_handle(),
+                &mode,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pipe)
+    }
+
+    /// The service DACL, plus instance creation for the pipe's owner (this test process, a
+    /// standard user); clients still get only the INTERACTIVE rights.
+    const TEST_SDDL: &str =
+        "D:P(A;;0x0012019f;;;SY)(A;;0x0012019f;;;BA)(A;;0x0012019f;;;OW)(A;;0x00100183;;;IU)";
 
     fn unique_name() -> String {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1231,10 +1267,69 @@ mod windows_pipe_server {
             "{sddl}"
         );
         assert!(PIPE_SDDL.contains("IU"));
+        let interactive = sddl
+            .split('(')
+            .find(|ace| ace.ends_with(";;;IU)"))
+            .expect("an INTERACTIVE ace");
+        assert_eq!(interactive, "A;;0x100183;;;IU)", "{sddl}");
+        assert_eq!(CLIENT_PIPE_ACCESS & 0x4, 0, "no FILE_CREATE_PIPE_INSTANCE");
         assert!(
             create_instance(&name, true).is_err(),
             "a second first-instance of an existing name must fail"
         );
+    }
+
+    #[test]
+    fn clients_with_the_interactive_rights_cannot_add_server_instances() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Storage::FileSystem::FILE_FLAG_OVERLAPPED,
+            System::Pipes::{PIPE_READMODE_MESSAGE, SetNamedPipeHandleState},
+        };
+        // The service DACL with Everyone standing in for INTERACTIVE (so the test also runs
+        // over SSH) and SYSTEM as the only instance creator.
+        let name = unique_name();
+        let restricted = format!("D:P(A;;GA;;;SY)(A;;{CLIENT_PIPE_ACCESS:#010x};;;WD)");
+        let _server = create_instance_with(&name, true, &restricted).unwrap();
+        let squatter = create_instance_with(&name, false, &restricted).unwrap_err();
+        assert_eq!(
+            squatter.raw_os_error(),
+            Some(5),
+            "ERROR_ACCESS_DENIED: {squatter}"
+        );
+        let generic = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap_err();
+        assert_eq!(
+            generic.raw_os_error(),
+            Some(5),
+            "GENERIC_WRITE includes FILE_APPEND_DATA and is refused: {generic}"
+        );
+        let client = std::fs::OpenOptions::new()
+            .access_mode(CLIENT_PIPE_ACCESS)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(&name)
+            .unwrap();
+        let mode = PIPE_READMODE_MESSAGE;
+        assert_ne!(
+            unsafe {
+                SetNamedPipeHandleState(
+                    client.as_raw_handle(),
+                    &mode,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        write_frame(
+            client.as_raw_handle(),
+            encode_service_frame(&ServiceCommand::Status).unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1288,7 +1383,7 @@ mod windows_pipe_server {
         let stop = manual_event();
         let server = {
             let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
-            thread::spawn(move || serve(&name, service, verifier, stop).unwrap())
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
         };
         let alice = connect_to_server(&name);
         assert!(matches!(
@@ -1320,7 +1415,7 @@ mod windows_pipe_server {
         let stop = manual_event();
         let server = {
             let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
-            thread::spawn(move || serve(&name, service, verifier, stop).unwrap())
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
         };
         let intruder = connect_to_server(&name);
         let frame = read_message(intruder.as_raw_handle(), Duration::from_secs(5)).unwrap();
@@ -1351,7 +1446,9 @@ mod windows_pipe_server {
         let stop = manual_event();
         let server = {
             let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
-            thread::spawn(move || serve(&name, service, Arc::new(alice_only), stop).unwrap())
+            thread::spawn(move || {
+                serve_with(&name, TEST_SDDL, service, Arc::new(alice_only), stop).unwrap()
+            })
         };
         let alice = connect_to_server(&name);
         assert!(matches!(

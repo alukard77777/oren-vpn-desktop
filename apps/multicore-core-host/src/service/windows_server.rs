@@ -51,17 +51,34 @@ use crate::windows_pipe::{
 };
 
 pub(crate) const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MultiCore.Service.v2";
-/// Protected DACL: FILE_GENERIC_READ | FILE_GENERIC_WRITE for SYSTEM, Administrators and
-/// interactive users (INTERACTIVE, `S-1-5-4`). No Everyone, Anonymous or Network entry.
+/// What an interactive client may do with the pipe: `FILE_READ_DATA | FILE_WRITE_DATA |
+/// FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE`. Deliberately without
+/// `FILE_APPEND_DATA` (= `FILE_CREATE_PIPE_INSTANCE`), so no user can add server instances of
+/// the service pipe and catch other users' daemons. `FILE_WRITE_ATTRIBUTES` is what
+/// `SetNamedPipeHandleState` needs. The daemon opens the pipe with exactly these rights.
+#[allow(
+    dead_code,
+    reason = "pinned by the tests; the daemon opens with the same rights"
+)]
+pub(crate) const CLIENT_PIPE_ACCESS: u32 = 0x0010_0183;
+/// Protected DACL: FILE_GENERIC_READ | FILE_GENERIC_WRITE for SYSTEM and Administrators,
+/// [`CLIENT_PIPE_ACCESS`] for interactive users (INTERACTIVE, `S-1-5-4`). No Everyone,
+/// Anonymous or Network entry.
 pub(crate) const PIPE_SDDL: &str =
-    "D:P(A;;0x0012019f;;;SY)(A;;0x0012019f;;;BA)(A;;0x0012019f;;;IU)";
+    "D:P(A;;0x0012019f;;;SY)(A;;0x0012019f;;;BA)(A;;0x00100183;;;IU)";
 
 pub(crate) type Verifier = dyn Fn(HANDLE) -> Result<ClientIdentity, IdentityError> + Send + Sync;
 
 /// One server instance of `name`. `first` adds `FILE_FLAG_FIRST_PIPE_INSTANCE`, so the service
 /// refuses to start when someone else already owns the name.
+#[allow(dead_code, reason = "the tests pin the production DACL through it")]
 pub(crate) fn create_instance(name: &str, first: bool) -> io::Result<OwnedHandle> {
-    let sddl = OsStr::new(PIPE_SDDL)
+    create_instance_with(name, first, PIPE_SDDL)
+}
+
+/// [`create_instance`] with an explicit security descriptor (tests use narrower ones).
+pub(crate) fn create_instance_with(name: &str, first: bool, sddl: &str) -> io::Result<OwnedHandle> {
+    let sddl = OsStr::new(sddl)
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
@@ -149,10 +166,22 @@ pub(crate) fn serve<C: Cores + 'static>(
     verifier: Arc<Verifier>,
     stop: Arc<OwnedHandle>,
 ) -> io::Result<()> {
+    serve_with(name, PIPE_SDDL, service, verifier, stop)
+}
+
+/// [`serve`] with an explicit pipe DACL. The service DACL lets only SYSTEM and Administrators
+/// create instances, so tests running as a standard user pass one that includes them.
+pub(crate) fn serve_with<C: Cores + 'static>(
+    name: &str,
+    sddl: &str,
+    service: Arc<Mutex<ServiceLoop<C>>>,
+    verifier: Arc<Verifier>,
+    stop: Arc<OwnedHandle>,
+) -> io::Result<()> {
     let next = AtomicU64::new(1);
     let mut first = true;
     loop {
-        let instance = create_instance(name, first)?;
+        let instance = create_instance_with(name, first, sddl)?;
         first = false;
         match wait_connect(instance.as_raw_handle(), stop.as_raw_handle()) {
             Ok(Accepted::Stopped) => return Ok(()),
