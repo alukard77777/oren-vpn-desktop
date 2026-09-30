@@ -24,6 +24,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=commandline dialog
 ; Always ask: an existing per-user 1.0.x install must not silently pin the choice to "Без службы".
+; Known limit: reinstalling over a service install and choosing "Без службы" leaves two installs.
 UsePreviousPrivileges=no
 UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
@@ -93,6 +94,9 @@ Type: filesandordirs; Name: "{app}\.multicore-stage-*"
 [Code]
 const
   ServiceName = 'MultiCore';
+  { FILE_ATTRIBUTE_REPARSE_POINT }
+  ReparsePointAttribute = $400;
+  PerUserProcessWaitSeconds = 30;
 
 function RunTool(const Tool, Params: String): Integer;
 var
@@ -106,11 +110,40 @@ end;
 function RunSc(const Params: String): Integer;
 begin
   Result := RunTool(ExpandConstant('{sys}\sc.exe'), Params);
+  if Result <> 0 then
+    Log('sc ' + Params + ' exited with ' + IntToStr(Result));
 end;
 
 function ServiceBinaryPath: String;
 begin
   Result := ExpandConstant('{app}\current\runtime\multicore-core-host.exe');
+end;
+
+{ Service mode installs only here: the SYSTEM service must never run from a user-writable folder. }
+function ServiceInstallDir: String;
+begin
+  Result := ExpandConstant('{commonpf64}\MultiCore');
+end;
+
+function PerUserInstallDir: String;
+begin
+  Result := ExpandConstant('{localappdata}\Programs\MultiCore');
+end;
+
+{ Deletes a data folder, but never through a junction or symbolic link planted at its path. }
+procedure SafeDelTree(const Path: String);
+var
+  FindRec: TFindRec;
+  IsReparsePoint: Boolean;
+begin
+  if not FindFirst(Path, FindRec) then
+    exit;
+  IsReparsePoint := (FindRec.Attributes and ReparsePointAttribute) <> 0;
+  FindClose(FindRec);
+  if IsReparsePoint then
+    Log('Refusing to delete a reparse point: ' + Path)
+  else
+    DelTree(Path, True, True, True);
 end;
 
 procedure StopService;
@@ -120,45 +153,106 @@ begin
 end;
 
 procedure RegisterService;
+var
+  Registered: Integer;
 begin
   if RunSc('query ' + ServiceName) = 0 then
-    RunSc('config ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem')
+    Registered := RunSc('config ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem')
   else
-    RunSc('create ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem DisplayName= "MultiCore"');
+    Registered := RunSc('create ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem DisplayName= "MultiCore"');
+  if Registered <> 0 then
+  begin
+    { 1072: the old service is still marked for deletion until a reboot. }
+    SuppressibleMsgBox('Не удалось зарегистрировать службу MultiCore (код ' + IntToStr(Registered) + '). '
+      + 'Приложение будет работать без службы и запрашивать права для TUN. '
+      + 'Перезагрузите компьютер и запустите установку снова.', mbError, MB_OK, IDOK);
+    exit;
+  end;
   RunSc('description ' + ServiceName + ' "MultiCore: ядра Mihomo и Xray для мгновенного подключения"');
-  RunSc('failure ' + ServiceName + ' reset= 86400 actions= restart/5000/restart/5000//');
+  RunSc('failure ' + ServiceName + ' reset= 86400 actions= restart/5000/restart/5000');
   RunSc('start ' + ServiceName);
+end;
+
+{ True while any process runs from the per-user install (desktop, daemon, core host, cores). }
+function PerUserCopyRunning: Boolean;
+var
+  Prefix: String;
+begin
+  Prefix := AddBackslash(PerUserInstallDir);
+  StringChangeEx(Prefix, '''', '''''', True);
+  { Runs elevated on purpose: the per-user copy may own an elevated core host. }
+  Result := RunTool(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "'
+    + 'if (Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith(''' + Prefix + ''', [StringComparison]::OrdinalIgnoreCase) }) { exit 1 } else { exit 0 }"') = 1;
+end;
+
+function WaitForPerUserCopyToExit: Boolean;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  Result := not PerUserCopyRunning;
+  while (not Result) and (Waited < PerUserProcessWaitSeconds) do
+  begin
+    { The Settings card starts this installer and then quits the app; give it time. }
+    Sleep(1000);
+    Waited := Waited + 1;
+    Result := not PerUserCopyRunning;
+  end;
 end;
 
 procedure RemovePerUserCopy;
 var
   Uninstaller: String;
+  ResultCode: Integer;
 begin
-  { Migration from a per-user install: its data in %LOCALAPPDATA%\MultiCore stays. }
-  Uninstaller := ExpandConstant('{localappdata}\Programs\MultiCore\unins000.exe');
-  if FileExists(Uninstaller) then
-    RunTool(Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART');
+  { Migration from a per-user install: its data in %LOCALAPPDATA%\MultiCore stays.
+    The uninstaller lives in a user-writable folder, so it never runs elevated. }
+  Uninstaller := PerUserInstallDir + '\unins000.exe';
+  if not FileExists(Uninstaller) then
+    exit;
+  if not ExecAsOriginalUser(Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := -1;
+  if ResultCode <> 0 then
+    Log('Per-user MultiCore uninstaller exited with ' + IntToStr(ResultCode));
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  { Service mode has exactly one allowed location. }
+  Result := (PageID = wpSelectDir) and IsAdminInstallMode;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  { The running service holds files in the current folder; stop it before Setup checks for files in use. }
-  if IsAdminInstallMode then
-    StopService;
   Result := '';
+  if not IsAdminInstallMode then
+    exit;
+  if CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')), ServiceInstallDir) <> 0 then
+  begin
+    Result := 'Со службой MultiCore устанавливается только в ' + ServiceInstallDir + '.';
+    exit;
+  end;
+  if DirExists(PerUserInstallDir) and not WaitForPerUserCopyToExit then
+  begin
+    Result := 'MultiCore ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    exit;
+  end;
+  { The running service holds files in the current folder; stop it before Setup checks for files in use. }
+  StopService;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
   begin
-    if WizardIsTaskSelected('cleandata') then
-      DelTree(ExpandConstant('{localappdata}\MultiCore'), True, True, True);
     if IsAdminInstallMode then
     begin
       StopService;
       RemovePerUserCopy;
     end;
+    if WizardIsTaskSelected('cleandata') then
+      SafeDelTree(ExpandConstant('{localappdata}\MultiCore'));
   end;
   if (CurStep = ssPostInstall) and IsAdminInstallMode then
     RegisterService;
@@ -184,9 +278,9 @@ begin
       RunSc('delete ' + ServiceName);
     end;
     if (not UninstallSilent) and
-       (MsgBox('Удалить подписки и настройки?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES) then
-      DelTree(ExpandConstant('{localappdata}\MultiCore'), True, True, True);
+       (SuppressibleMsgBox('Удалить подписки и настройки?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES) then
+      SafeDelTree(ExpandConstant('{localappdata}\MultiCore'));
   end;
   if (CurUninstallStep = usPostUninstall) and IsAdminInstallMode then
-    DelTree(ExpandConstant('{commonappdata}\MultiCore'), True, True, True);
+    SafeDelTree(ExpandConstant('{commonappdata}\MultiCore'));
 end;
