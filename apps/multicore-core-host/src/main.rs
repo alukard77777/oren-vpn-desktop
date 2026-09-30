@@ -2,6 +2,10 @@
 mod runtime_host;
 #[cfg(windows)]
 mod runtime_paths;
+/// Wired into `main` by the `--service` dispatch (Task 7); until then only tests reach it.
+#[cfg(any(windows, unix))]
+#[allow(dead_code)]
+mod service;
 #[cfg(unix)]
 mod unix_runtime_paths;
 #[cfg(unix)]
