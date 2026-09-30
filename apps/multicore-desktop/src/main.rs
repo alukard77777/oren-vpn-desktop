@@ -80,6 +80,7 @@ struct UiSnapshot {
     latency: LatencyPresentation,
     conflicting_apps: ConflictingAppsPresentation,
     cores_ready: bool,
+    service_mode: bool,
 }
 
 const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
@@ -802,9 +803,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_tun_enabled(loaded_preferences.tun_enabled);
     // The TUN-off (system proxy) mode exists on Windows only.
     ui.set_tun_toggle_available(cfg!(windows));
-    ui.set_service_card_visible(service_install::card_visible(
-        service_install::service_installed(),
-    ));
     if let Some(growth) = loaded_preferences.rail_growth {
         ui.set_rail_growth_delta(i32::try_from(growth.delta).unwrap_or(0));
         ui.set_rail_grown_width(i32::try_from(growth.grown_width).unwrap_or(0));
@@ -4426,6 +4424,7 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         latency: model.latency_presentation(),
         conflicting_apps: model.conflicting_apps_presentation(),
         cores_ready: model.cores_ready(),
+        service_mode: model.service_mode(),
     }
 }
 
@@ -4518,6 +4517,10 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_primary_enabled(presentation.primary_enabled);
     ui.set_update_runtime_busy(presentation.is_busy);
     ui.set_dashboard_available(presentation.is_connected || snapshot.cores_ready);
+    // Never offer the service while the daemon already runs on it (or it is registered).
+    ui.set_service_card_visible(service_install::card_visible(
+        snapshot.service_mode || service_install::service_installed(),
+    ));
     ui.set_status_tone(
         match presentation.semantic_tone {
             SemanticTone::Neutral => "neutral",

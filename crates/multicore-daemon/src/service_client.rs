@@ -281,7 +281,8 @@ impl<C: ServiceConnector> ServiceSession<C> {
                 self.controller.set(
                     SocketAddr::from((Ipv4Addr::LOCALHOST, controller.port)),
                     &controller.secret,
-                    Some(controller.mixed_port),
+                    // 0 is a TUN-form generation: the service opened no mixed port.
+                    Some(controller.mixed_port).filter(|port| *port != 0),
                 );
                 if let Ok(mut prepared) = self.prepared.lock() {
                     *prepared = Some(generation);

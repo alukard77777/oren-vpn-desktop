@@ -23,6 +23,7 @@ struct FakeService {
     busy: bool,
     status_failure: Option<BrokerErrorCode>,
     break_next: bool,
+    tun_form: bool,
 }
 
 #[derive(Clone, Default)]
@@ -53,7 +54,7 @@ impl ServiceTransport for FakeTransport {
                 controller: ControllerEndpoint {
                     port: 40123,
                     secret: "svc".into(),
-                    mixed_port: 28765,
+                    mixed_port: if service.tun_form { 0 } else { 28765 },
                 },
             },
             ServiceCommand::SetTun { on } => ServiceResponse::TunState { on: *on },
@@ -108,6 +109,14 @@ fn prepare_publishes_the_endpoint_and_is_idempotent() {
     );
     assert_eq!(service.connects, 1);
     assert!(!format!("{target:?}").contains("svc"));
+}
+
+#[test]
+fn a_tun_form_generation_publishes_no_mixed_port() {
+    let (session, connector, slot) = session();
+    connector.0.lock().unwrap().tun_form = true;
+    session.prepare(3).unwrap();
+    assert_eq!(slot.get().unwrap().mixed_port, None);
 }
 
 #[tokio::test]
