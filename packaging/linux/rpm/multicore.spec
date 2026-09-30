@@ -31,8 +31,12 @@ Requires:       fontconfig%{?_isa}
 Requires:       libglvnd-glx%{?_isa}
 Requires:       libglvnd-egl%{?_isa}
 Requires:       hicolor-icon-theme
-# The always-ready service unit (/usr/lib/systemd/system/multicore.service).
+# The always-ready service unit (/usr/lib/systemd/system/multicore.service); the scriptlets
+# run systemctl, so systemd must be installed before them.
 Requires:       systemd
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
 
 %description
 MultiCore starts Mihomo and Xray behind one desktop interface. Mihomo owns
@@ -87,11 +91,17 @@ chmod 0755 "%{buildroot}/usr/lib/multicore/multicore" \
 %license /usr/share/licenses/multicore/zashboard-MIT.txt
 
 %post
-# Enable and (re)start the always-ready service on install and upgrade.
+# Enable the service the first time it is installed (/var/lib/multicore does not exist yet:
+# a fresh install, or an upgrade from a version without the service) and (re)start it
+# whenever it is enabled. An administrator's `systemctl disable multicore` survives upgrades.
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || :
-    systemctl enable multicore.service >/dev/null 2>&1 || :
-    systemctl restart multicore.service >/dev/null 2>&1 || :
+    if [ ! -d /var/lib/multicore ]; then
+        systemctl enable multicore.service >/dev/null 2>&1 || :
+    fi
+    if systemctl is-enabled --quiet multicore.service 2>/dev/null; then
+        systemctl restart multicore.service >/dev/null 2>&1 || :
+    fi
 fi
 
 %preun
