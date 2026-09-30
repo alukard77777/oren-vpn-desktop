@@ -140,6 +140,17 @@ begin
     RunTool(Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART');
 end;
 
+procedure LaunchAfterSilentMigration;
+var
+  ResultCode: Integer;
+begin
+  { The Settings card runs Setup with /SILENT /LAUNCH=1 after quitting MultiCore; the
+    postinstall [Run] entry is skipped when silent, so start the app once the service runs. }
+  if WizardSilent and (ExpandConstant('{param:LAUNCH|0}') = '1') then
+    ExecAsOriginalUser(ExpandConstant('{app}\current\{#AppExeName}'), '',
+      ExpandConstant('{app}\current'), SW_SHOWNORMAL, ewNoWait, ResultCode);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   { The running service holds files in the current folder; stop it before Setup checks for files in use. }
@@ -162,6 +173,8 @@ begin
   end;
   if (CurStep = ssPostInstall) and IsAdminInstallMode then
     RegisterService;
+  if CurStep = ssPostInstall then
+    LaunchAfterSilentMigration;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

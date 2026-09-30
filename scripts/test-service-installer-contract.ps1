@@ -34,7 +34,11 @@ foreach ($token in @(
     # A per-user 1.0.x install must not silently pin the choice to "Без службы".
     'UsePreviousPrivileges=no',
     # The service holds files in {app}\current; stop it before the files-in-use check.
-    'function PrepareToInstall(var NeedsRestart: Boolean): String;'
+    'function PrepareToInstall(var NeedsRestart: Boolean): String;',
+    # The Settings card runs /ALLUSERS /SILENT /LAUNCH=1 after quitting; relaunch as the user.
+    "WizardSilent and (ExpandConstant('{param:LAUNCH|0}') = '1')",
+    'ExecAsOriginalUser(',
+    'LaunchAfterSilentMigration;'
 )) {
     Assert-Contains $token
 }
