@@ -3448,7 +3448,7 @@ dependencies = [
 
 [[package]]
 name = "multicore-desktop"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "copypasta",
  "embed-resource",
