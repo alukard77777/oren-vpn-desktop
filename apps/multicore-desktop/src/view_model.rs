@@ -935,12 +935,13 @@ impl DesktopViewModel {
             loading: self.profile_list_request_pending.is_some(),
             error: self.profile_list_error.clone(),
             mutation_error: self.profile_error.clone(),
+            // With the always-ready service the daemon moves a live connection to the new
+            // subscription; without it switching still needs a disconnect.
             switch_locked: matches!(
                 self.state,
-                UiState::Connected { .. }
-                    | UiState::Connecting { .. }
-                    | UiState::Disconnecting { .. }
-            ),
+                UiState::Connecting { .. } | UiState::Disconnecting { .. }
+            ) || (matches!(self.state, UiState::Connected { .. })
+                && !self.service_mode),
             pending_operation: self
                 .active_profile_mutation
                 .as_ref()
@@ -998,7 +999,7 @@ impl DesktopViewModel {
         &mut self,
         profile_id: &str,
     ) -> Option<ProfileRequestToken> {
-        if !self.profile_mutation_preflight(profile_id, false, false) {
+        if !self.profile_mutation_preflight(profile_id, false, self.service_mode) {
             return None;
         }
         if self.active_profile_id.as_deref() == Some(profile_id) {
@@ -4298,6 +4299,27 @@ mod tests {
             presentation.mutation_error.as_deref(),
             Some("Отключитесь перед изменением подписки.")
         );
+    }
+
+    #[test]
+    fn with_the_service_switching_while_connected_is_allowed() {
+        let mut model = model_with_profiles();
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some("profile-a".into()),
+                profile: Some("Alpha".into()),
+                service_mode: true,
+                cores_ready: true,
+                ..DaemonStatus::default()
+            }),
+        );
+
+        assert!(!model.profile_presentation().switch_locked);
+        assert!(model.begin_profile_activation("profile-b").is_some());
+        assert_eq!(model.profile_presentation().mutation_error, None);
     }
 
     #[test]

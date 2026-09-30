@@ -2594,7 +2594,7 @@ where
             .map(|options| *options)
             .unwrap_or_default();
         options.warm_up = true;
-        let result = match (self.controller_factory)(&snapshot, options) {
+        let result = match run_blocking(|| (self.controller_factory)(&snapshot, options)) {
             Ok(prepared) => {
                 let controller = prepared.controller();
                 match prepared.activate() {
@@ -2617,7 +2617,14 @@ where
                 Ok(())
             }
             Err(error) => {
-                state.warm_revision = None;
+                if state.state.current() != CoreConnectionState::Ready {
+                    // A Connect took the session meanwhile (the warm-up was refused): not a
+                    // warm-up failure.
+                    return Err(error);
+                }
+                if state.warm_revision == Some(revision) {
+                    state.warm_revision = None;
+                }
                 if !self.warm_failure_reported.swap(true, Ordering::SeqCst) {
                     state.push_event(
                         Severity::Warning,
@@ -2683,18 +2690,21 @@ where
         };
         let result = Supervisor::new(controller).disconnect().await;
         let mut state = self.inner.write().await;
-        match result {
-            Ok(()) => {
-                let _ = state.state.transition(CoreConnectionState::Ready);
-                state.message = Some(CORES_LOST_MESSAGE.to_owned());
-                state.degraded = false;
-            }
-            Err(_) => {
-                state.mark_error(
-                    "Не удалось полностью остановить подключение. Повторите попытку.",
-                    true,
-                );
-            }
+        let stopped = result.is_ok();
+        if stopped {
+            let _ = state.state.transition(CoreConnectionState::Ready);
+            state.degraded = false;
+            state.warm_revision = None;
+            drop(state);
+            // Like a disconnect: drop the controller and apply a snapshot left pending.
+            self.reconcile_authoritative().await;
+            state = self.inner.write().await;
+            state.message = Some(CORES_LOST_MESSAGE.to_owned());
+        } else {
+            state.mark_error(
+                "Не удалось полностью остановить подключение. Повторите попытку.",
+                true,
+            );
         }
         state.push_event(
             Severity::Error,
@@ -2722,6 +2732,20 @@ where
         state.push_event(Severity::Warning, Component::Core, phase, message);
         if state.message.is_none() {
             state.message = Some(message.to_owned());
+        }
+    }
+
+    /// A connection is up (the watcher keeps its short interval then).
+    pub async fn is_connected(&self) -> bool {
+        self.inner.read().await.state.current() == CoreConnectionState::Connected
+    }
+
+    /// Clears a notice from `record_notice` once it no longer applies (for example the
+    /// service became available).
+    pub async fn clear_notice(&self, message: &str) {
+        let mut state = self.inner.write().await;
+        if state.message.as_deref() == Some(message) {
+            state.message = None;
         }
     }
 
@@ -3489,7 +3513,7 @@ where
             .lock()
             .map(|options| *options)
             .unwrap_or_default();
-        match (self.controller_factory)(snapshot, options) {
+        match run_blocking(|| (self.controller_factory)(snapshot, options)) {
             Ok(prepared) => Some(prepared),
             Err(_) => {
                 self.inner.write().await.push_event_with_details(
@@ -4080,7 +4104,7 @@ where
                 .collect::<Vec<_>>();
             (snapshot, queued_selections)
         };
-        let prepared = match (self.controller_factory)(&snapshot, options) {
+        let prepared = match run_blocking(|| (self.controller_factory)(&snapshot, options)) {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut state = self.inner.write().await;
@@ -4182,6 +4206,8 @@ where
                     "connect",
                     "Подключение установлено.",
                 );
+                // The watcher checks the new connection right away and keeps its short interval.
+                self.request_warm();
                 Ok(state.status())
             }
             Err(multicore_core::SupervisorError::StartFailed {

@@ -44,6 +44,9 @@ pub struct Recording {
     pub fail_xray: AtomicBool,
     /// `start(Xray)` never finishes: a `Prepare` stuck on a slow service.
     pub hang_xray: AtomicBool,
+    /// The next factory call blocks here (a service probe stuck on a starting service).
+    pub factory_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    pub factory_entered: AtomicBool,
 }
 
 pub struct RecordingController(pub Arc<Recording>);
@@ -178,6 +181,11 @@ pub fn harness(profiles: &[&str]) -> Harness {
     let controller = Arc::new(RecordingController(recording.clone()));
     let factory_seen = seen.clone();
     let factory: FactoryFn = Box::new(move |snapshot: &Snapshot, _options: ConnectOptions| {
+        let gate = controller.0.factory_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            controller.0.factory_entered.store(true, Ordering::SeqCst);
+            let _ = gate.recv();
+        }
         factory_seen
             .lock()
             .unwrap()
@@ -611,4 +619,60 @@ async fn quit_disconnects_releases_the_cores_and_stops_warming() {
         calls,
         "never warmed again"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn status_answers_while_the_controller_factory_blocks() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    let (release, gate) = std::sync::mpsc::channel();
+    *h.recording.factory_gate.lock().unwrap() = Some(gate);
+    let connecting = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.connect().await })
+    };
+    while !h.recording.factory_entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The only worker is inside the blocked factory; a status request must still run.
+    let status = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.status().await })
+    };
+    tokio::time::timeout(PROMPT, status)
+        .await
+        .expect("status does not wait for the blocked factory")
+        .unwrap()
+        .unwrap();
+    release.send(()).unwrap();
+    connecting.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_new_connection_is_checked_by_the_watcher_at_once() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    let warm = h.backend.warm_requests();
+    let _ = tokio::time::timeout(Duration::from_millis(50), warm.notified()).await;
+    h.backend.connect().await.unwrap();
+    tokio::time::timeout(PROMPT, warm.notified())
+        .await
+        .expect("a connect wakes the watcher");
+    assert!(h.backend.is_connected().await);
+}
+
+#[tokio::test]
+async fn the_unavailable_notice_is_cleared_once_the_service_is_back() {
+    let h = harness(&[PROFILE_A]);
+    h.backend
+        .record_notice("service_unavailable", "Служба MultiCore недоступна.")
+        .await;
+    h.backend.clear_notice("другое сообщение").await;
+    assert_eq!(
+        h.backend.status().await.unwrap().message.as_deref(),
+        Some("Служба MultiCore недоступна.")
+    );
+    h.backend.clear_notice("Служба MultiCore недоступна.").await;
+    assert_eq!(h.backend.status().await.unwrap().message, None);
 }
