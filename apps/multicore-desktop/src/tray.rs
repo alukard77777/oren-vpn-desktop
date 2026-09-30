@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TrayCommand {
     ShowWindow,
@@ -15,6 +13,8 @@ pub(crate) struct TrayGroup {
     pub(crate) label: String,
     pub(crate) icon: String,
     pub(crate) selected_node_label: String,
+    /// The group the popup shows (the one selected on the home screen).
+    pub(crate) selected: bool,
     pub(crate) nodes: Vec<TrayNode>,
 }
 
@@ -24,6 +24,9 @@ pub(crate) struct TrayNode {
     pub(crate) label: String,
     pub(crate) icon: String,
     pub(crate) selected: bool,
+    pub(crate) latency_text: String,
+    /// "success" | "warning" | "danger" | "neutral", as on the home route list.
+    pub(crate) latency_tone: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +44,11 @@ pub(crate) struct TrayInput {
 pub(crate) struct TrayMenuEntry {
     pub(crate) icon: String,
     pub(crate) label: String,
+    /// Groups: the selected node's label. Nodes: the latency text.
     pub(crate) detail: String,
+    /// Nodes: the latency tone; groups: empty.
+    pub(crate) tone: String,
+    /// Groups: shown in the popup. Nodes: the selected route.
     pub(crate) checked: bool,
     pub(crate) enabled: bool,
     pub(crate) command: TrayCommand,
@@ -74,32 +81,6 @@ impl TrayPopupModelCache {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TrayAccordionState {
-    expanded_group_ids: BTreeSet<String>,
-}
-
-impl TrayAccordionState {
-    pub(crate) fn toggle(&mut self, group_id: &str) -> bool {
-        if self.expanded_group_ids.remove(group_id) {
-            false
-        } else {
-            self.expanded_group_ids.insert(group_id.to_owned());
-            true
-        }
-    }
-
-    pub(crate) fn is_expanded(&self, group_id: &str) -> bool {
-        self.expanded_group_ids.contains(group_id)
-    }
-
-    pub(crate) fn retain_available<'a>(&mut self, group_ids: impl Iterator<Item = &'a str>) {
-        let available = group_ids.collect::<BTreeSet<_>>();
-        self.expanded_group_ids
-            .retain(|group_id| available.contains(group_id.as_str()));
-    }
-}
-
 pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
     let mut nodes = Vec::new();
     let groups = input
@@ -110,7 +91,8 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
             nodes.extend(group.nodes.into_iter().map(|node| TrayMenuEntry {
                 icon: node.icon,
                 label: node.label,
-                detail: String::new(),
+                detail: node.latency_text,
+                tone: node.latency_tone,
                 checked: node.selected,
                 enabled: input.route_selection_enabled,
                 command: TrayCommand::SelectNode {
@@ -122,7 +104,8 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
                 icon: group.icon,
                 label: group.label,
                 detail: group.selected_node_label,
-                checked: false,
+                tone: String::new(),
+                checked: group.selected,
                 enabled: input.route_selection_enabled,
                 command: TrayCommand::SelectGroup { group_id },
             }
@@ -283,9 +266,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        TrayAccordionState, TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayNode,
-        TrayPointerButton, TrayPointerState, TrayPopupModelCache, build_menu_model,
-        pointer_interaction,
+        TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayNode, TrayPointerButton,
+        TrayPointerState, TrayPopupModelCache, build_menu_model, pointer_interaction,
     };
 
     #[test]
@@ -302,11 +284,14 @@ mod tests {
                     label: "Сервер".into(),
                     icon: "🌍".into(),
                     selected_node_label: "Швеция".into(),
+                    selected: true,
                     nodes: vec![TrayNode {
                         id: "node:a".into(),
                         label: "Швеция".into(),
                         icon: "🇸🇪".into(),
                         selected: true,
+                        latency_text: "42 ms".into(),
+                        latency_tone: "success".into(),
                     }],
                 },
                 TrayGroup {
@@ -314,11 +299,14 @@ mod tests {
                     label: "Игры".into(),
                     icon: "🎮".into(),
                     selected_node_label: "Direct".into(),
+                    selected: false,
                     nodes: vec![TrayNode {
                         id: "node:b".into(),
                         label: "Direct".into(),
                         icon: "↗".into(),
                         selected: true,
+                        latency_text: String::new(),
+                        latency_tone: "neutral".into(),
                     }],
                 },
             ],
@@ -334,6 +322,11 @@ mod tests {
         assert_eq!(model.groups[0].icon, "🌍");
         assert_eq!(model.nodes.len(), 2);
         assert_eq!(model.nodes[0].icon, "🇸🇪");
+        // The shown group and each node's latency (text + tone) reach the popup.
+        assert!(model.groups[0].checked);
+        assert!(!model.groups[1].checked);
+        assert_eq!(model.nodes[0].detail, "42 ms");
+        assert_eq!(model.nodes[0].tone, "success");
         assert_eq!(
             model.nodes[0].command,
             TrayCommand::SelectNode {
@@ -364,23 +357,6 @@ mod tests {
 
         assert!(model.nodes.is_empty());
         assert!(!model.connection_enabled);
-    }
-
-    #[test]
-    fn accordion_expands_multiple_route_groups_independently() {
-        let mut accordion = TrayAccordionState::default();
-
-        assert!(accordion.toggle("server"));
-        assert!(accordion.toggle("games"));
-        assert!(accordion.is_expanded("server"));
-        assert!(accordion.is_expanded("games"));
-
-        assert!(!accordion.toggle("server"));
-        assert!(!accordion.is_expanded("server"));
-        assert!(accordion.is_expanded("games"));
-
-        accordion.retain_available(["server"].into_iter());
-        assert!(!accordion.is_expanded("games"));
     }
 
     #[test]

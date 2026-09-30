@@ -684,42 +684,61 @@ fn scenarios() -> Vec<Scenario> {
 }
 
 fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
-    let group =
-        |id: &str, icon: &str, label: &str, detail: &str, expanded: bool, count: i32| TrayMenuRow {
+    let group = |id: &str, label: &str, selected: bool| TrayMenuRow {
+        id: s(id),
+        group_id: s(""),
+        icon: s(""),
+        icon_image: Default::default(),
+        label: s(label),
+        detail: s(""),
+        tone: s(""),
+        selected,
+        enabled: true,
+    };
+    let node = |id: &str, icon: &str, label: &str, latency: &str, tone: &str, selected: bool| {
+        TrayMenuRow {
             id: s(id),
-            group_id: s(""),
+            group_id: s("g1"),
             icon: s(icon),
             icon_image: crate::emoji_images::image_for(icon),
             label: s(label),
-            detail: s(detail),
-            selected: false,
+            detail: s(latency),
+            tone: s(tone),
+            selected,
             enabled: true,
-            expanded,
-            node_count: count,
-        };
-    let node = |id: &str, group_id: &str, icon: &str, label: &str, selected: bool| TrayMenuRow {
-        id: s(id),
-        group_id: s(group_id),
-        icon: s(icon),
-        icon_image: crate::emoji_images::image_for(icon),
-        label: s(label),
-        detail: s(""),
-        selected,
-        enabled: true,
-        expanded: false,
-        node_count: 0,
+        }
     };
     (
         ModelRc::new(VecModel::from(vec![
-            group("g1", "🌍", "Сервер", "Автовыбор", true, 3),
-            group("g2", "🎮", "Игры", "Germany", false, 0),
+            group("g1", "Серверы", true),
+            group("g2", "Игры", false),
+            group("g3", "Медиа", false),
         ])),
         ModelRc::new(VecModel::from(vec![
-            node("n1", "g1", "🌍", "Автовыбор", true),
-            node("n2", "g1", "🇦🇱", "Albania", false),
-            node("n3", "g1", "🇩🇪", "Germany", false),
+            node("n1", "🌍", "Автовыбор", "42 мс", "success", true),
+            node("n2", "🇸🇪", "Sweden", "42 мс", "success", false),
+            node("n3", "🇩🇪", "Germany", "96 мс", "warning", false),
+            node("n4", "🇦🇱", "Albania", "Тайм-аут", "danger", false),
         ])),
     )
+}
+
+fn tray_connected(popup: &TrayPopup) {
+    let (groups, nodes) = tray_rows();
+    popup.set_status_text(s("В сети · Автовыбор"));
+    popup.set_connection_label(s("Отключиться"));
+    popup.set_connected(true);
+    popup.set_group_rows(groups);
+    popup.set_node_rows(nodes);
+    popup.set_subscription_title(s("Fjord VPN"));
+    popup.set_subscription_expiry(s("Бессрочно"));
+    popup.set_toggle_title(s("Защита включена"));
+    popup.set_toggle_on(true);
+    popup.set_status_tone(s("success"));
+    popup.set_exit_name(s("Sweden"));
+    popup.set_exit_icon_image(crate::emoji_images::image_for("🇸🇪"));
+    popup.set_exit_latency(s("42 мс"));
+    popup.set_session_uptime(s("00:12:43"));
 }
 
 #[test]
@@ -754,14 +773,39 @@ fn render_ui_previews() {
     ui.set_session_uptime(s("00:00:32"));
     capture(&ui, "home-long-exit-min", 700, 620);
 
-    let (groups, nodes) = tray_rows();
     let popup = TrayPopup::new().expect("create tray popup");
-    popup.set_status_text(s("Подключено · Автовыбор"));
-    popup.set_connection_label(s("Отключиться"));
-    popup.set_connected(true);
-    popup.set_group_rows(groups.clone());
-    popup.set_node_rows(nodes.clone());
+    tray_connected(&popup);
     capture(&popup, "tray-connected", 304, 460);
+
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_toggle_title(s("Подключение…"));
+    popup.set_toggle_busy(true);
+    popup.set_status_tone(s("neutral"));
+    popup.set_session_uptime(s(""));
+    popup.set_reduced_motion(true);
+    capture(&popup, "tray-connecting", 304, 460);
+
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_toggle_title(s("Защита выключена"));
+    popup.set_toggle_on(false);
+    popup.set_status_tone(s("neutral"));
+    popup.set_session_uptime(s(""));
+    popup.set_exit_name(s("Автовыбор"));
+    popup.set_exit_icon_image(crate::emoji_images::image_for("🌍"));
+    popup.set_connection_label(s("Подключиться"));
+    capture(&popup, "tray-off", 304, 460);
+
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_toggle_title(s("Не удалось подключиться"));
+    popup.set_toggle_on(false);
+    popup.set_status_tone(s("danger"));
+    popup.set_toggle_detail_is_exit(false);
+    popup.set_supporting(s("Сервер не ответил за 15 с"));
+    popup.set_subscription_failed(true);
+    capture(&popup, "tray-error", 304, 460);
 
     let popup = TrayPopup::new().expect("create tray popup");
     popup.set_status_text(s("Профиль не добавлен"));

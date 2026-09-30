@@ -7103,11 +7103,7 @@ mod tests {
 
     #[test]
     fn connect_switch_reflects_intent_immediately() {
-        let app = include_str!("../ui/app.slint").replace(
-            "
-", "
-",
-        );
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // A press records the intent before the daemon answers…
         assert!(app.contains("root.toggle-intent = root.toggle-on ? \"off\" : \"on\";"));
         assert!(app.contains(": root.toggle-intent == \"on\" ? \"Подключение…\""));
@@ -7174,11 +7170,7 @@ mod tests {
 
     #[test]
     fn tabs_use_inset_grouped_cards_with_attached_editors() {
-        let app = include_str!("../ui/app.slint").replace(
-            "
-", "
-",
-        );
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // Status: captioned cards; the log is one card of rows, not boxed cards.
         for caption in ["text: \"ЯДРА\";", "text: \"МАППИНГ\";", "text: \"ЖУРНАЛ\";"]
         {
