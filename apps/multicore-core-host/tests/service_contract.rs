@@ -1306,3 +1306,34 @@ mod windows_pipe_server {
         );
     }
 }
+
+#[test]
+fn only_the_exact_service_flag_selects_service_mode() {
+    use std::ffi::OsString;
+    assert!(service::wants_service_mode(&[OsString::from("--service")]));
+    for other in [
+        vec![],
+        vec![OsString::from("--service"), OsString::from("x")],
+        vec![OsString::from("--pipe")],
+        vec![OsString::from("--SERVICE")],
+    ] {
+        assert!(!service::wants_service_mode(&other), "{other:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_service_accepts_stop_and_shutdown_only_while_running() {
+    use crate::service::windows_scm::{SERVICE_NAME, accepted_controls};
+    use windows_sys::Win32::System::Services::{
+        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
+        SERVICE_STOP_PENDING,
+    };
+    assert_eq!(SERVICE_NAME, "MultiCore");
+    assert_eq!(
+        accepted_controls(SERVICE_RUNNING),
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+    );
+    assert_eq!(accepted_controls(SERVICE_START_PENDING), 0);
+    assert_eq!(accepted_controls(SERVICE_STOP_PENDING), 0);
+}

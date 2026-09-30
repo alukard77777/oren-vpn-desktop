@@ -78,10 +78,12 @@ impl<C: Cores> ServiceLoop<C> {
         }
     }
 
+    #[allow(dead_code, reason = "inspected by the service tests")]
     pub(crate) fn cores_mut(&mut self) -> &mut C {
         &mut self.cores
     }
 
+    #[allow(dead_code, reason = "inspected by the service tests")]
     pub(crate) fn owner_key(&self) -> Option<&str> {
         self.owner.as_ref().map(|owner| owner.user_key.as_str())
     }

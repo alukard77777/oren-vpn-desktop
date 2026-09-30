@@ -45,6 +45,7 @@ pub(crate) enum IdentityError {
 
 #[derive(Debug)]
 pub(crate) struct ClientFacts {
+    #[allow(dead_code, reason = "kept for diagnostics and pinned by the tests")]
     pub(crate) process_id: u32,
     pub(crate) image: PathBuf,
     /// `TokenSessionId` of the client's primary token.

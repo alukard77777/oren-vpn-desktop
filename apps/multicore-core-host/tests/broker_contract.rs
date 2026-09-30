@@ -54,3 +54,11 @@ fn windows_transport_is_bounded_overlapped_and_peer_authenticated() {
     assert!(!WINDOWS_PIPE.contains("Box::leak"));
     assert!(!WINDOWS_PIPE.contains("Err(HostError::TimedOut) => continue"));
 }
+
+#[test]
+fn service_mode_is_dispatched_before_the_on_demand_broker() {
+    let service_branch = HOST_MAIN.find("service::wants_service_mode").unwrap();
+    let broker_branch = HOST_MAIN.find("windows_pipe::run()").unwrap();
+    assert!(service_branch < broker_branch);
+    assert!(HOST_MAIN.contains("service stopped safely"));
+}

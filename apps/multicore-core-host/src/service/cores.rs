@@ -45,7 +45,7 @@ const TUN_POLL: Duration = Duration::from_millis(100);
 struct ActiveCores {
     /// What the daemon gets: the proxy's port and session token, and the mixed port (0 for a
     /// TUN generation, which opens none).
-    endpoint: ControllerEndpoint,
+    _endpoint: ControllerEndpoint,
     /// Mihomo's own controller; never leaves the service.
     controller_port: u16,
     controller_secret: Zeroizing<String>,
@@ -164,7 +164,7 @@ impl ProductionCores {
             mixed_port: mihomo.mixed_port.unwrap_or(0),
         };
         self.active = Some(ActiveCores {
-            endpoint: endpoint.clone(),
+            _endpoint: endpoint.clone(),
             controller_port,
             controller_secret,
             _proxy: proxy,
