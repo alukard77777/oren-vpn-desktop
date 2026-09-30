@@ -1,7 +1,10 @@
 //! Platform-neutral lifecycle of the always-ready service. The platform server resolves who is
 //! on each connection; this loop decides what that client may do and drives the cores.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Mutex, PoisonError},
+};
 
 use multicore_core::elevation_protocol::{BrokerErrorCode, ElevatedRuntimeState};
 use multicore_core::service_protocol::{ControllerEndpoint, ServiceCommand, ServiceResponse};
@@ -77,6 +80,14 @@ pub(crate) struct ServiceLoop<C: Cores> {
     crash_restarts: u8,
     failure: Option<BrokerErrorCode>,
     updater: Option<Box<dyn ServiceUpdater>>,
+    /// An `Update` is downloading outside the lock; its updater is taken out meanwhile.
+    updating: bool,
+}
+
+/// An `Update` that passed the ownership check and holds the updater while it downloads
+/// without the service-loop lock.
+pub(crate) struct PendingUpdate {
+    updater: Box<dyn ServiceUpdater>,
 }
 
 impl<C: Cores> ServiceLoop<C> {
@@ -89,6 +100,7 @@ impl<C: Cores> ServiceLoop<C> {
             crash_restarts: 0,
             failure: None,
             updater: None,
+            updating: false,
         }
     }
 
@@ -197,22 +209,65 @@ impl<C: Cores> ServiceLoop<C> {
         self.owner = None;
     }
 
-    fn update(&mut self, client: &ClientIdentity, version: &str) -> ServiceResponse {
-        let Some(mut updater) = self.updater.take() else {
-            return ServiceResponse::Error {
-                code: BrokerErrorCode::Unsupported,
-            };
-        };
-        let result = updater.prepare(client, version).and_then(|()| {
+    /// Phase 1 of `Update`, under the lock: another user's cores → `Busy`, no updater →
+    /// `Unsupported`, an update already downloading → `Busy`. Otherwise the updater is taken
+    /// out for the download.
+    pub(crate) fn start_update(
+        &mut self,
+        client: &ClientIdentity,
+    ) -> Result<PendingUpdate, ServiceResponse> {
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.user_key != client.user_key)
+            || self.updating
+        {
+            return Err(ServiceResponse::Busy);
+        }
+        let updater = self.updater.take().ok_or(ServiceResponse::Error {
+            code: BrokerErrorCode::Unsupported,
+        })?;
+        self.updating = true;
+        Ok(PendingUpdate { updater })
+    }
+
+    /// Phase 3 of `Update`, under the lock again: after a successful download (`prepared`),
+    /// stop the cores and start the updater, unless another user claimed the cores meanwhile.
+    pub(crate) fn finish_update(
+        &mut self,
+        client: &ClientIdentity,
+        version: &str,
+        mut pending: PendingUpdate,
+        prepared: Result<(), BrokerErrorCode>,
+    ) -> ServiceResponse {
+        self.updating = false;
+        let response = if let Err(code) = prepared {
+            ServiceResponse::Error { code }
+        } else if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.user_key != client.user_key)
+        {
+            ServiceResponse::Busy
+        } else {
             // Nothing may run from the install directory while the updater swaps it.
             self.stop_everything();
-            updater.begin(client, version)
-        });
-        self.updater = Some(updater);
-        match result {
-            Ok(()) => ServiceResponse::UpdateStarted,
-            Err(code) => ServiceResponse::Error { code },
-        }
+            match pending.updater.begin(client, version) {
+                Ok(()) => ServiceResponse::UpdateStarted,
+                Err(code) => ServiceResponse::Error { code },
+            }
+        };
+        self.updater = Some(pending.updater);
+        response
+    }
+
+    fn update(&mut self, client: &ClientIdentity, version: &str) -> ServiceResponse {
+        let mut pending = match self.start_update(client) {
+            Ok(pending) => pending,
+            Err(response) => return response,
+        };
+        let prepared = pending.updater.prepare(client, version);
+        self.finish_update(client, version, pending, prepared)
     }
 
     fn claim(&mut self, connection: ConnectionId, client: &ClientIdentity) {
@@ -320,4 +375,25 @@ impl<C: Cores> ServiceLoop<C> {
         self.crash_restarts = 0;
         self.failure = None;
     }
+}
+
+/// Runs one command for a server connection thread. `Update` downloads and verifies without
+/// holding the lock, so the owner's `Status`/`SetTun`, crash restarts, a dropped owner and a
+/// service stop are all served meanwhile; every other command runs under the lock.
+pub(crate) fn execute_shared<C: Cores>(
+    service: &Mutex<ServiceLoop<C>>,
+    connection: ConnectionId,
+    client: &ClientIdentity,
+    command: ServiceCommand,
+) -> ServiceResponse {
+    let lock = || service.lock().unwrap_or_else(PoisonError::into_inner);
+    let ServiceCommand::Update { version } = command else {
+        return lock().execute(connection, client, command);
+    };
+    let mut pending = match lock().start_update(client) {
+        Ok(pending) => pending,
+        Err(response) => return response,
+    };
+    let prepared = pending.updater.prepare(client, &version);
+    lock().finish_update(client, &version, pending, prepared)
 }

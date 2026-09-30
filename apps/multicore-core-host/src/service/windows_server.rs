@@ -42,7 +42,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop};
+use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop, execute_shared};
 use super::windows_identity::{
     IdentityError, client_facts, expected_daemon_image, user_data_root, verify_client,
 };
@@ -203,10 +203,7 @@ fn handle_connection<C: Cores>(
             break;
         };
         let shutdown = command == ServiceCommand::Shutdown;
-        let response = service
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .execute(id, &identity, command);
+        let response = execute_shared(&service, id, &identity, command);
         if !reply(pipe, &response) || shutdown {
             break;
         }

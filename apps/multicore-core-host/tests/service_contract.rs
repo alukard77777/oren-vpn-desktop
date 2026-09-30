@@ -1824,3 +1824,185 @@ async fn a_trickling_client_is_released_within_the_drain_deadline() {
     };
     assert!(closed, "the drain deadline must end the connection");
 }
+
+mod update_outside_the_lock {
+    use super::{FakeCores, user};
+    use crate::service::core_loop::{
+        ClientIdentity, ConnectionId, ServiceLoop, ServiceUpdater, execute_shared,
+    };
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse};
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    /// `prepare` reports that the download started, then blocks until released.
+    struct BlockingDownload {
+        started: Sender<()>,
+        release: Mutex<Receiver<Result<(), BrokerErrorCode>>>,
+        begun: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ServiceUpdater for BlockingDownload {
+        fn prepare(
+            &mut self,
+            _client: &ClientIdentity,
+            _version: &str,
+        ) -> Result<(), BrokerErrorCode> {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap()
+        }
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.begun
+                .lock()
+                .unwrap()
+                .push(format!("{}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    fn update() -> ServiceCommand {
+        ServiceCommand::Update {
+            version: "1.2.0".into(),
+        }
+    }
+
+    struct Harness {
+        service: Arc<Mutex<ServiceLoop<FakeCores>>>,
+        started: Receiver<()>,
+        release: Sender<Result<(), BrokerErrorCode>>,
+        begun: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn harness() -> Harness {
+        let (started_tx, started) = channel();
+        let (release, release_rx) = channel();
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let service = Arc::new(Mutex::new(
+            ServiceLoop::new(FakeCores::default()).with_updater(Box::new(BlockingDownload {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+                begun: begun.clone(),
+            })),
+        ));
+        Harness {
+            service,
+            started,
+            release,
+            begun,
+        }
+    }
+
+    fn run(
+        service: &Arc<Mutex<ServiceLoop<FakeCores>>>,
+        connection: u64,
+        key: &str,
+        command: ServiceCommand,
+    ) -> ServiceResponse {
+        execute_shared(service, ConnectionId(connection), &user(key), command)
+    }
+
+    fn spawn_update(
+        service: &Arc<Mutex<ServiceLoop<FakeCores>>>,
+        key: &'static str,
+    ) -> thread::JoinHandle<ServiceResponse> {
+        let service = service.clone();
+        thread::spawn(move || run(&service, 9, key, update()))
+    }
+
+    #[test]
+    fn the_owner_is_served_while_an_update_downloads() {
+        let h = harness();
+        assert!(matches!(
+            run(
+                &h.service,
+                1,
+                "1:alice",
+                ServiceCommand::Prepare { generation_id: 1 }
+            ),
+            ServiceResponse::Prepared { .. }
+        ));
+        let updating = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The download blocks, yet the loop answers at once: no lock is held.
+        assert!(
+            h.service.try_lock().is_ok(),
+            "the download must not hold the lock"
+        );
+        assert_eq!(
+            run(
+                &h.service,
+                1,
+                "1:alice",
+                ServiceCommand::SetTun { on: true }
+            ),
+            ServiceResponse::TunState { on: true }
+        );
+        assert!(matches!(
+            run(&h.service, 1, "1:alice", ServiceCommand::Status),
+            ServiceResponse::Status { tun_on: true, .. }
+        ));
+        h.service.lock().unwrap().tick();
+        assert_eq!(
+            run(&h.service, 2, "1:alice", update()),
+            ServiceResponse::Busy,
+            "a second update while one downloads"
+        );
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(updating.join().unwrap(), ServiceResponse::UpdateStarted);
+        assert!(!h.service.lock().unwrap().cores_mut().running);
+        assert_eq!(*h.begun.lock().unwrap(), ["1:alice@1.2.0"]);
+    }
+
+    #[test]
+    fn a_failed_download_releases_the_update_slot_and_keeps_the_cores() {
+        let h = harness();
+        run(
+            &h.service,
+            1,
+            "1:alice",
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        let updating = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.release
+            .send(Err(BrokerErrorCode::InvalidRequest))
+            .unwrap();
+        assert_eq!(
+            updating.join().unwrap(),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest
+            }
+        );
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        let again = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(again.join().unwrap(), ServiceResponse::UpdateStarted);
+    }
+
+    #[test]
+    fn a_user_who_claimed_the_cores_during_the_download_keeps_them() {
+        let h = harness();
+        let updating = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            run(
+                &h.service,
+                3,
+                "2:bob",
+                ServiceCommand::Prepare { generation_id: 4 }
+            ),
+            ServiceResponse::Prepared { .. }
+        ));
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(updating.join().unwrap(), ServiceResponse::Busy);
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        assert!(h.begun.lock().unwrap().is_empty());
+        assert_eq!(h.service.lock().unwrap().owner_key(), Some("2:bob"));
+    }
+}

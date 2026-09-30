@@ -23,7 +23,7 @@ use multicore_core::{
     },
 };
 
-use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop};
+use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop, execute_shared};
 use super::cores::ProductionCores;
 use super::state_dir;
 use super::unix_identity::{IdentityError, production_identity};
@@ -94,10 +94,7 @@ fn handle_connection<C: Cores>(
             break;
         };
         let shutdown = command == ServiceCommand::Shutdown;
-        let response = service
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .execute(id, &identity, command);
+        let response = execute_shared(&service, id, &identity, command);
         if write_service_frame(&mut stream, &response).is_err() || shutdown {
             break;
         }
