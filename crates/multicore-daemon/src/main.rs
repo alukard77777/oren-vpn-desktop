@@ -177,14 +177,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if use_service {
                 let key = warm_key(snapshot, &interface);
                 let mut warm = warm_stage.lock().map_err(|_| BackendError::new())?;
+                #[cfg(windows)]
+                let controller = |generation, mixed_port| {
+                    service_controller(
+                        &proxy_mode,
+                        &factory_service,
+                        generation,
+                        mixed_port,
+                        options,
+                    )
+                };
+                #[cfg(not(windows))]
+                let controller = |generation, mixed_port| {
+                    service_controller(&factory_service, generation, mixed_port, options)
+                };
                 if let Some(stage) = warm.as_ref()
                     && stage.key == key
                 {
-                    return Ok(PreparedController::reuse(service_controller(
-                        &factory_service,
+                    return Ok(PreparedController::reuse(controller(
                         stage.generation,
                         stage.mixed_port,
-                        options,
                     )?));
                 }
                 let mixed_port = free_loopback_port().ok_or_else(BackendError::new)?;
@@ -203,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mixed_port,
                 });
                 return Ok(PreparedController::with_runtime(
-                    service_controller(&factory_service, generation, mixed_port, options)?,
+                    controller(generation, mixed_port)?,
                     staged,
                 ));
             }
@@ -316,14 +328,19 @@ fn service_controller(
 
 #[cfg(windows)]
 fn service_controller(
+    proxy_mode: &proxy_mode::ProxyMode,
     service: &Arc<Session>,
     generation: u64,
-    _mixed_port: u16,
-    _options: ConnectOptions,
+    mixed_port: u16,
+    options: ConnectOptions,
 ) -> Result<Arc<Controller>, BackendError> {
-    Ok(Arc::new(ModeController::Tun(Backed::Service(
-        ServiceTunController::new(service.clone(), generation),
-    ))))
+    if options.tun {
+        Ok(Arc::new(ModeController::Tun(Backed::Service(
+            ServiceTunController::new(service.clone(), generation),
+        ))))
+    } else {
+        Ok(proxy_mode.service_controller(service, generation, mixed_port))
+    }
 }
 
 /// A loopback port free right now; Mihomo binds it moments later. A port taken in between
@@ -353,15 +370,20 @@ mod proxy_mode {
         BackendError, PreparedController,
         connection_mode::{Backed, ModeController, SystemProxyController},
         elevated_controller::ProductionElevatedController,
-        service_client::{ProductionServiceConnector, ServiceTunController},
+        service_client::{
+            ProductionServiceConnector, ServiceCoresController, ServiceSession,
+            ServiceTunController,
+        },
         system_proxy::{SystemProxy, WinInetSettings},
     };
 
     pub(crate) type LocalController =
         SystemProxyController<SidecarProcessController<WindowsJobLauncher>>;
+    pub(crate) type ServiceProxyController =
+        SystemProxyController<ServiceCoresController<ProductionServiceConnector>>;
     pub(crate) type Controller = ModeController<
         Backed<ServiceTunController<ProductionServiceConnector>, ProductionElevatedController>,
-        LocalController,
+        Backed<ServiceProxyController, LocalController>,
     >;
 
     pub(crate) struct ProxyMode {
@@ -372,6 +394,27 @@ mod proxy_mode {
     }
 
     impl ProxyMode {
+        /// Proxy mode on top of the service's always-running Mihomo: the daemon only points
+        /// the user's proxy settings at its loopback mixed port.
+        pub(crate) fn service_controller(
+            &self,
+            service: &Arc<ServiceSession<ProductionServiceConnector>>,
+            generation: u64,
+            mixed_port: u16,
+        ) -> Arc<Controller> {
+            let proxy = SystemProxy::new(
+                Box::new(WinInetSettings),
+                self.marker_path.clone(),
+                mixed_port,
+            );
+            Arc::new(ModeController::Proxy(Backed::Service(
+                SystemProxyController::new(
+                    ServiceCoresController::new(service.clone(), generation),
+                    Arc::new(proxy),
+                ),
+            )))
+        }
+
         pub(crate) fn prepare(
             &self,
             snapshot: &Snapshot,
@@ -404,9 +447,11 @@ mod proxy_mode {
                 WindowsJobLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
                     .map_err(|_| BackendError::new())?;
             let proxy = SystemProxy::new(Box::new(WinInetSettings), self.marker_path.clone(), port);
-            let controller = Arc::new(ModeController::Proxy(SystemProxyController::new(
-                SidecarProcessController::with_launcher(paths, launcher),
-                Arc::new(proxy),
+            let controller = Arc::new(ModeController::Proxy(Backed::OnDemand(
+                SystemProxyController::new(
+                    SidecarProcessController::with_launcher(paths, launcher),
+                    Arc::new(proxy),
+                ),
             )));
             Ok(PreparedController::with_runtime(controller, staged))
         }
@@ -468,6 +513,21 @@ mod tests {
         let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
         assert!(!production.contains("to_socket_addrs"));
         assert!(!production.contains("with_xray_resolved_hosts"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn proxy_mode_uses_the_service_cores_when_the_service_is_present() {
+        let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
+        let (_, proxy_mode) = production.split_once("mod proxy_mode {").unwrap();
+        // rustfmt may wrap the call, so compare without whitespace.
+        let proxy_mode_compact = proxy_mode.split_whitespace().collect::<String>();
+        assert!(proxy_mode.contains("ServiceCoresController::new("));
+        assert!(proxy_mode_compact.contains(
+            "SystemProxy::new(Box::new(WinInetSettings),self.marker_path.clone(),mixed_port"
+        ));
+        assert!(production.contains("if !options.tun && !use_service {"));
+        assert!(production.contains("proxy_mode.service_controller("));
     }
 
     #[test]
