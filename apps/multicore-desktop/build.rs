@@ -1,3 +1,5 @@
+include!("../../build-support/windows_version_info.rs");
+
 const APP_ICON_SVG: &[u8] = include_bytes!("assets/app-icon.svg");
 const TRAY_ICON_SIZES: [u32; 2] = [32, 64];
 
@@ -58,6 +60,7 @@ export component ComponentCheck inherits Window {{
     println!("cargo:rerun-if-changed=assets/close.svg");
     println!("cargo:rerun-if-changed=assets/refresh.svg");
     println!("cargo:rerun-if-changed=assets/trash.svg");
+    println!("cargo:rerun-if-changed=../../build-support/windows_version_info.rs");
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=app-debug.manifest");
 
@@ -100,11 +103,16 @@ fn compile_windows_resources(
         _ => "app-debug.manifest",
     };
     let manifest_path = manifest_dir.join(manifest_name);
-    let resource_source = format!(
+    let mut resource_source = format!(
         "1 24 \"{}\"\n1 ICON \"{}\"\n",
         manifest_path.display().to_string().replace('\\', "/"),
         icon_path.display().to_string().replace('\\', "/"),
     );
+    resource_source.push_str(&windows_version_info(
+        &multicore_app_version(manifest_dir),
+        "MultiCore",
+        "MultiCore.exe",
+    ));
     std::fs::write(&resource_path, resource_source)
         .expect("failed to create MultiCore Windows resource source");
     embed_resource::compile(&resource_path, embed_resource::NONE)

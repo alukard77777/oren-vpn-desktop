@@ -55,3 +55,46 @@ fn pe_contract_checks_all_four_executables_by_numeric_resource_identifiers() {
     assert!(PE_MANIFEST_TEST.contains("$asInvoker"));
     assert!(PE_MANIFEST_TEST.contains("$requireAdministrator"));
 }
+
+const VERSION_INFO_SOURCE: &str = include_str!("../../../build-support/windows_version_info.rs");
+
+#[test]
+fn every_executable_embeds_a_version_resource_with_a_task_manager_description() {
+    assert!(VERSION_INFO_SOURCE.contains("#pragma code_page(65001)"));
+    assert!(VERSION_INFO_SOURCE.contains("1 VERSIONINFO"));
+    assert!(!VERSION_INFO_SOURCE.contains(" 24 "));
+    for field in [
+        "CompanyName",
+        "FileDescription",
+        "FileVersion",
+        "InternalName",
+        "LegalCopyright",
+        "OriginalFilename",
+        "ProductName",
+        "ProductVersion",
+    ] {
+        assert!(VERSION_INFO_SOURCE.contains(&format!("VALUE \"{field}\"")));
+    }
+    for (script, description, file) in [
+        (DESKTOP_BUILD_SCRIPT, "\"MultiCore\"", "MultiCore.exe"),
+        (
+            DAEMON_BUILD_SCRIPT,
+            "\"MultiCore — фоновый процесс\"",
+            "multicore-daemon.exe",
+        ),
+        (
+            CORE_HOST_BUILD_SCRIPT,
+            "\"MultiCore — служба ядер\"",
+            "multicore-core-host.exe",
+        ),
+        (
+            UPDATER_BUILD_SCRIPT,
+            "\"MultiCore — обновление\"",
+            "multicore-apply.exe",
+        ),
+    ] {
+        assert!(script.contains("windows_version_info("));
+        assert!(script.contains(description), "{file} description");
+        assert!(script.contains(file));
+    }
+}
