@@ -128,6 +128,11 @@ The subscription URL supports three fixed configuration User-Agent values:
 | `multicore-mihomo` | complete Mihomo YAML |
 | `multicore-xray` | one Xray JSON object |
 
+A Mihomo YAML without loopback SOCKS bridges into Xray is a Mihomo-only
+subscription: the Xray response is then optional and an idle Xray config runs.
+Panels such as Remnawave use this with a single `multicore-mihomo` response rule.
+Subscription pages can link `multicore://add/<subscription URL>`.
+
 Configuration requests include `x-hwid`, `x-device-os`, `x-ver-os`, and
 `x-device-model`. Provider metadata may supply a separate optional logo URL in
 any response header matching `<vendor>-servicelogo` (case-insensitive), for

@@ -1,0 +1,109 @@
+# MultiCore — шаблон Mihomo для Remnawave.
+# Клиент сам подставляет external-controller, secret и имя TUN-устройства,
+# а в режиме «без TUN» выключает tun и поднимает локальный mixed-port.
+mode: rule
+log-level: warning
+ipv6: false
+allow-lan: false
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: always
+keep-alive-interval: 30
+
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  strict-route: true
+  dns-hijack:
+    - any:53
+
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 77.88.8.8
+    - 1.1.1.1
+  proxy-server-nameserver:
+    - https://77.88.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://dns.google/dns-query
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "+.stun.*.*"
+    - "+.stun.*.*.*"
+    - time.windows.com
+    - pool.ntp.org
+
+rule-providers:
+  private-ip:
+    type: inline
+    behavior: ipcidr
+    payload:
+      - 0.0.0.0/8
+      - 10.0.0.0/8
+      - 100.64.0.0/10
+      - 127.0.0.0/8
+      - 169.254.0.0/16
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 198.18.0.0/15
+      - 224.0.0.0/3
+
+proxies:
+  - name: "🇸🇪 Sweden"
+    type: vless
+    server: se.example.com
+    port: 443
+    uuid: 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.microsoft.com
+    reality-opts:
+      public-key: M8jUqk1B1X5pY0lU2dR3pJ8kq3mS5nD4vT7wX9yZ0aA
+      short-id: a1b2c3d4e5f60718
+    client-fingerprint: chrome
+
+proxy-groups:
+  - name: "🌍 VPN"
+    type: select
+    proxies:
+      - "⚡ Автовыбор"
+      - "🇸🇪 Sweden"
+  - name: "⚡ Автовыбор"
+    type: url-test
+    url: https://cp.cloudflare.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - "🇸🇪 Sweden"
+
+rules:
+  - RULE-SET,private-ip,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,local,DIRECT
+  # Пример правила по процессу:
+  # - PROCESS-NAME,qbittorrent.exe,DIRECT
+  - MATCH,🌍 VPN

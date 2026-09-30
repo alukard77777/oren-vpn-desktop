@@ -11,8 +11,8 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
-    DeviceIdentity, MAX_CONFIG_BYTES, MAX_SERVICE_LOGO_BYTES, Snapshot, SnapshotCommit,
-    SnapshotSink, normalize_service_logo,
+    DeviceIdentity, IDLE_XRAY_CONFIG, MAX_CONFIG_BYTES, MAX_SERVICE_LOGO_BYTES, Snapshot,
+    SnapshotCommit, SnapshotSink, normalize_service_logo, parse_mihomo,
 };
 
 pub const UA_NATIVE: &str = "multicore-json-massive";
@@ -151,6 +151,7 @@ fn is_metadata_header(name: &str) -> bool {
             | "sub-info-button-text"
             | "banner-button-text"
             | "sub-info-color"
+            | HWID_LIMIT_HEADER
     ) || ["servicename", "servicelogo"].iter().any(|suffix| {
         name.strip_suffix(suffix)
             .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('-'))
@@ -180,6 +181,8 @@ pub enum FetchError {
     Persistence,
     #[error("subscription response exceeds its size limit")]
     TooLarge,
+    #[error("subscription server refused this device: its device limit is reached")]
+    DeviceLimit,
 }
 
 impl FetchError {
@@ -197,6 +200,7 @@ impl FetchError {
             Self::InvalidConfig => "invalid_config",
             Self::Persistence => "could_not_persist",
             Self::TooLarge => "response_too_large",
+            Self::DeviceLimit => "device_limit_reached",
         }
     }
 }
@@ -924,15 +928,29 @@ fn parse_fallback(
     xray: Result<HttpResponse, FetchError>,
 ) -> Result<Snapshot, FetchError> {
     let mihomo = success_response(mihomo?)?;
-    let xray = success_response(xray?)?;
-    Snapshot::parse(strip_utf8_bom(&mihomo.body), strip_utf8_bom(&xray.body))
-        .map_err(|_| {
-            if looks_like_non_config(&mihomo.body) || looks_like_non_config(&xray.body) {
-                FetchError::NotSubscription
-            } else {
-                FetchError::InvalidConfig
+    if device_limit_reached(&mihomo) {
+        return Err(FetchError::DeviceLimit);
+    }
+    let xray = match xray.and_then(success_response) {
+        Ok(xray) => xray,
+        Err(error) => return standalone_mihomo(url, &mihomo).unwrap_or(Err(error)),
+    };
+    let snapshot = match Snapshot::parse(strip_utf8_bom(&mihomo.body), strip_utf8_bom(&xray.body)) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            if let Some(standalone) = standalone_mihomo(url, &mihomo) {
+                return standalone;
             }
-        })?
+            return Err(
+                if looks_like_non_config(&mihomo.body) || looks_like_non_config(&xray.body) {
+                    FetchError::NotSubscription
+                } else {
+                    FetchError::InvalidConfig
+                },
+            );
+        }
+    };
+    snapshot
         .with_merged_subscription_metadata(
             url,
             &mihomo.metadata,
@@ -940,6 +958,41 @@ fn parse_fallback(
             current_unix_time(),
         )
         .map_err(|_| FetchError::InvalidConfig)
+}
+
+/// Panels such as Remnawave serve a Mihomo YAML with native proxies but have
+/// no single-object Xray representation (their Xray JSON is an array, their
+/// default answer share links). When that YAML routes nothing into Xray - no
+/// loopback SOCKS bridge - the Xray half carries no traffic, so it is optional
+/// and an idle config runs in its place. `None` when Mihomo is invalid or does
+/// bridge into Xray: then the provider's Xray response is required as before.
+fn standalone_mihomo(url: &str, mihomo: &HttpResponse) -> Option<Result<Snapshot, FetchError>> {
+    let body = strip_utf8_bom(&mihomo.body);
+    if !parse_mihomo(body)
+        .ok()?
+        .loopback_socks_mappings()
+        .is_empty()
+    {
+        return None;
+    }
+    Some(
+        Snapshot::parse(body, IDLE_XRAY_CONFIG)
+            .and_then(|snapshot| {
+                snapshot.with_subscription_metadata(url, &mihomo.metadata, current_unix_time())
+            })
+            .map_err(|_| FetchError::InvalidConfig),
+    )
+}
+
+/// Remnawave answers a device over its HWID limit with an empty `200` and
+/// this header instead of an error status.
+const HWID_LIMIT_HEADER: &str = "x-hwid-max-devices-reached";
+
+fn device_limit_reached(response: &HttpResponse) -> bool {
+    response
+        .metadata
+        .values(HWID_LIMIT_HEADER)
+        .any(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 /// When the per-core fallback also fails, report whichever failure tells the

@@ -1200,3 +1200,33 @@ fn runtime_paths_are_owner_only() {
         );
     }
 }
+
+#[test]
+fn mihomo_only_runtime_keeps_native_proxies_and_an_idle_xray() {
+    let snapshot = Snapshot::parse(
+        include_bytes!("fixtures/remnawave-multicore-mihomo.yaml"),
+        multicore_core::IDLE_XRAY_CONFIG,
+    )
+    .unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let xray: JsonValue =
+        serde_json::from_slice(&fs::read(&published.xray_config).unwrap()).unwrap();
+    assert!(
+        xray.get("inbounds")
+            .and_then(JsonValue::as_array)
+            .is_none_or(Vec::is_empty)
+    );
+    let outbounds = xray["outbounds"].as_array().unwrap();
+    assert_eq!(outbounds.len(), 1);
+    assert_eq!(outbounds[0]["tag"], multicore_core::IDLE_XRAY_OUTBOUND_TAG);
+    let mihomo: Value =
+        serde_yaml_ng::from_slice(&fs::read(&published.mihomo_config).unwrap()).unwrap();
+    assert_eq!(mihomo["proxies"][0]["type"], Value::from("vless"));
+    assert_eq!(mihomo["tun"]["enable"], Value::from(true));
+}

@@ -12,7 +12,12 @@ For one subscription URL, the client first sends one request with `User-Agent: m
 - Redirects are followed like a browser, up to five hops. An `https` to `http` downgrade, a non-HTTP scheme, and a redirect from a public host to loopback, private or `localhost` addresses are refused.
 - Each request is retried once: after 429/500/502/503/504 (honouring `Retry-After` up to 3 seconds), or through the operating-system proxy when a direct connection cannot be established. Each attempt has a 15-second connect and 30-second total timeout; the whole download is bounded by 120 seconds.
 - Failures are reported to the user by cause (unreachable, timeout, TLS, redirect, HTTP 401/403, 404/410, 429, 5xx, not a MultiCore subscription, invalid configuration). Subscription URLs never appear in these messages or in diagnostics.
-- Both fallback responses must succeed and validate before the client publishes anything.
+- Both fallback responses must succeed and validate before the client publishes anything, with one exception below (Mihomo-only subscriptions).
+- If the Mihomo response carries `X-Hwid-Max-Devices-Reached: true` (Remnawave answers a device over its HWID limit with an empty `200` and this header), the refresh fails with a device-limit error instead of an invalid-config one.
+
+### Mihomo-only subscriptions
+
+When the Mihomo YAML contains no loopback SOCKS bridge into Xray (no `socks5` proxy on `127.0.0.1`), Xray carries no traffic. The Xray response is then optional: if it fails, is not 2xx, or is not one JSON object (share links, Base64, a Remnawave-style array of configs), the client keeps the Mihomo YAML and runs an idle Xray config instead (`{"inbounds":[],"outbounds":[{"tag":"multicore-idle","protocol":"freedom"}]}`). A valid provider Xray object is still used when present. As soon as the YAML bridges into Xray, the Xray response is required again. This lets panels such as Remnawave serve MultiCore with one `multicore-mihomo` response rule; see the Remnawave guide in the public release repository.
 - A failed refresh preserves the complete previous last-good snapshot.
 
 ## Request headers
@@ -138,6 +143,15 @@ Cache-Control: private, no-cache
 
 ["mixed-port: 7890\nproxy-groups: []\n",{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}]
 ```
+
+## Deep links
+
+Both forms show a consent dialog naming only the subscription host before importing:
+
+- `multicore://install-sub?url=<percent-encoded http(s) URL>`: the strict form; the value must be percent-encoded.
+- `multicore://add/<http(s) URL>`: the Happ-style form panel subscription pages generate (for example `multicore://add/{{SUBSCRIPTION_LINK}}` in the Remnawave subpage builder). The subscription URL follows verbatim; a percent-encoded URL is also accepted.
+
+The target must be `http`/`https` with a host, at most 8192 bytes, without spaces, control bytes or a fragment.
 
 ## Multi-subscription note
 

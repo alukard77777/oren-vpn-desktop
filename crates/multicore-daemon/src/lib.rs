@@ -1284,6 +1284,7 @@ fn subscription_fetch_reason(error: FetchError) -> String {
         FetchError::InvalidBundle | FetchError::InvalidConfig => "invalid config".to_owned(),
         FetchError::Persistence => "persistence".to_owned(),
         FetchError::TooLarge => "too large".to_owned(),
+        FetchError::DeviceLimit => "device limit".to_owned(),
     }
 }
 
@@ -1349,6 +1350,12 @@ fn subscription_fetch_api_error(error: FetchError) -> ApiError {
             StatusCode::UNPROCESSABLE_ENTITY,
             "subscription_too_large",
             "Ответ сервера подписки слишком большой.".to_owned(),
+        ),
+        FetchError::DeviceLimit => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subscription_device_limit",
+            "Достигнут лимит устройств для этой подписки. Отвяжите старое устройство в личном кабинете или боте провайдера либо обратитесь в поддержку."
+                .to_owned(),
         ),
         FetchError::Persistence => (
             StatusCode::INTERNAL_SERVER_ERROR,

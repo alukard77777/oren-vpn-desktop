@@ -402,7 +402,9 @@ impl TokioProcessLauncher {
                     return false;
                 };
                 if addresses.is_empty() {
-                    return false;
+                    // Only the idle config of a Mihomo-only subscription has
+                    // no listener; any provider config must expose bridges.
+                    return xray_config_is_idle(&runtime.paths.xray_config);
                 }
                 for address in addresses {
                     if TcpStream::connect(address).await.is_err() {
@@ -744,6 +746,31 @@ fn xray_loopback_inbounds(path: &std::path::Path) -> Result<Vec<std::net::Socket
         }
     }
     Ok(addresses)
+}
+
+/// The runtime copy of `IDLE_XRAY_CONFIG` is re-serialized and may gain an
+/// outbound interface, so it is recognised by shape: no inbound and only the
+/// idle outbound.
+fn xray_config_is_idle(path: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let no_inbounds = document
+        .get("inbounds")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty);
+    let idle_outbound = document
+        .get("outbounds")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|outbounds| {
+            outbounds.len() == 1
+                && outbounds[0].get("tag").and_then(serde_json::Value::as_str)
+                    == Some(crate::IDLE_XRAY_OUTBOUND_TAG)
+        });
+    no_inbounds && idle_outbound
 }
 
 /// Finds one loopback SOCKS inbound whose 1:1-tagged outbound requires DNS
@@ -1200,6 +1227,26 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    #[test]
+    fn idle_xray_is_recognised_after_runtime_rewrites_but_provider_configs_are_not() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("xray.json");
+        std::fs::write(&path, crate::IDLE_XRAY_CONFIG).unwrap();
+        assert!(xray_config_is_idle(&path));
+        std::fs::write(
+            &path,
+            br#"{"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"interface":"Ethernet"}},"tag":"multicore-idle"}]}"#,
+        )
+        .unwrap();
+        assert!(xray_config_is_idle(&path));
+        std::fs::write(
+            &path,
+            br#"{"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}]}"#,
+        )
+        .unwrap();
+        assert!(!xray_config_is_idle(&path));
+    }
 
     #[test]
     fn readiness_targets_use_the_tun_device_by_default() {

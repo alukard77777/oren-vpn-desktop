@@ -172,6 +172,86 @@ async fn panel_without_multicore_support_is_reported_as_not_a_subscription() {
     assert_eq!(result.unwrap_err(), FetchError::NotSubscription);
 }
 
+/// What a stock Remnawave panel serves MultiCore: share links for unknown
+/// agents, a Mihomo YAML with native proxies for a `multicore-mihomo` rule.
+const NATIVE_MIHOMO: &str = "proxies:
+  - name: Sweden
+    type: vless
+    server: se.example.invalid
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [Sweden]
+rules: [MATCH,Proxy]
+";
+const SHARE_LINKS_BASE64: &str =
+    "dmxlc3M6Ly8wMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDBAc2UuZXhhbXBsZS5pbnZhbGlkOjQ0Mw==";
+
+#[tokio::test]
+async fn mihomo_only_subscription_runs_an_idle_xray() {
+    for xray in [
+        ok(SHARE_LINKS_BASE64),
+        ok("[{\"outbounds\":[]},{\"outbounds\":[]}]"),
+        status(404, "not found"),
+        Err(FetchError::Network),
+    ] {
+        let http = FakeHttp::new(vec![
+            ok(SHARE_LINKS_BASE64),
+            Ok(HttpResponse::new(
+                200,
+                NATIVE_MIHOMO.as_bytes().to_vec(),
+                [("profile-title", "Remna")],
+            )),
+            xray,
+        ]);
+        let store = AtomicSnapshot::default();
+        SubscriptionFetcher::new(http)
+            .refresh("https://example.invalid/sub", &store)
+            .await
+            .unwrap();
+        let snapshot = store.current().unwrap();
+        assert_eq!(
+            snapshot.xray.raw_json().as_bytes(),
+            multicore_core::IDLE_XRAY_CONFIG
+        );
+        assert_eq!(snapshot.subscription_info().unwrap().display_name, "Remna");
+    }
+}
+
+#[tokio::test]
+async fn bridged_mihomo_still_requires_the_provider_xray() {
+    let http = FakeHttp::new(vec![
+        ok(SHARE_LINKS_BASE64),
+        ok(MIHOMO),
+        ok(SHARE_LINKS_BASE64),
+    ]);
+    let result = SubscriptionFetcher::new(http)
+        .refresh("https://example.invalid/sub", &AtomicSnapshot::default())
+        .await;
+    assert_eq!(result.unwrap_err(), FetchError::NotSubscription);
+}
+
+#[tokio::test]
+async fn remnawave_device_limit_is_reported_instead_of_an_empty_config() {
+    let limited = || {
+        Ok(HttpResponse::new(
+            200,
+            Vec::new(),
+            [
+                ("X-Hwid-Max-Devices-Reached", "true"),
+                ("announce", "base64:TGltaXQ="),
+            ],
+        ))
+    };
+    let http = FakeHttp::new(vec![limited(), limited(), limited()]);
+    let result = SubscriptionFetcher::new(http)
+        .refresh("https://example.invalid/sub", &AtomicSnapshot::default())
+        .await;
+    assert_eq!(result.unwrap_err(), FetchError::DeviceLimit);
+}
+
 #[tokio::test]
 async fn rejected_request_reports_the_http_status() {
     let http = FakeHttp::new(vec![
@@ -486,5 +566,26 @@ async fn supervisor_serializes_complete_opposing_operations() {
             ("stop".into(), Engine::Mihomo),
             ("stop".into(), Engine::Xray),
         ]
+    );
+}
+
+#[tokio::test]
+async fn remnawave_multicore_template_output_imports_as_mihomo_only() {
+    let mihomo = include_str!("fixtures/remnawave-multicore-mihomo.yaml");
+    let http = FakeHttp::new(vec![
+        status(404, "not found"),
+        ok(mihomo),
+        status(404, "not found"),
+    ]);
+    let store = AtomicSnapshot::default();
+    SubscriptionFetcher::new(http)
+        .refresh("https://example.invalid/api/sub/AbC123", &store)
+        .await
+        .unwrap();
+    let snapshot = store.current().unwrap();
+    assert!(snapshot.mihomo.loopback_socks_mappings().is_empty());
+    assert_eq!(
+        snapshot.xray.raw_json().as_bytes(),
+        multicore_core::IDLE_XRAY_CONFIG
     );
 }

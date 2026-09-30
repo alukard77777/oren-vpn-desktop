@@ -6,6 +6,12 @@ use thiserror::Error;
 
 pub const MAX_CONFIG_BYTES: usize = 32 * 1024 * 1024;
 
+/// Xray config for a Mihomo-only subscription (its YAML has no loopback SOCKS
+/// bridge to Xray). Nothing routes into it: Xray only idles, so connect and
+/// disconnect keep one two-core lifecycle.
+pub const IDLE_XRAY_OUTBOUND_TAG: &str = "multicore-idle";
+pub const IDLE_XRAY_CONFIG: &[u8] = br#"{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"tag":"multicore-idle","protocol":"freedom"}]}"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyGroup {
     pub name: String,
