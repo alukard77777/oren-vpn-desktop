@@ -1974,7 +1974,10 @@ async fn connect_options_reach_the_controller_factory() {
     .unwrap();
 
     let status = backend
-        .connect_with(multicore_daemon::ConnectOptions { tun: false })
+        .connect_with(multicore_daemon::ConnectOptions {
+            tun: false,
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(status.state, ConnectionState::Connected);

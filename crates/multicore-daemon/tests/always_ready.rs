@@ -3,8 +3,9 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -21,6 +22,9 @@ use multicore_daemon::{
 pub const PROFILE_A: &str = "proxies:\n  - {name: node-a, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-a]}\n";
 pub const PROFILE_B: &str = "proxies:\n  - {name: node-b, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-b]}\n";
 const WARM_UP_FAILED: &str = "Ядра не удалось запустить заранее. Они запустятся при подключении.";
+const CORES_LOST: &str =
+    "Служба MultiCore потеряла ядра — подключение разорвано. Подключитесь снова.";
+const PROMPT: Duration = Duration::from_secs(2);
 
 pub struct NeverHttp;
 
@@ -38,6 +42,8 @@ impl HttpClient for NeverHttp {
 pub struct Recording {
     pub calls: Mutex<Vec<(bool, Engine)>>,
     pub fail_xray: AtomicBool,
+    /// `start(Xray)` never finishes: a `Prepare` stuck on a slow service.
+    pub hang_xray: AtomicBool,
 }
 
 pub struct RecordingController(pub Arc<Recording>);
@@ -51,6 +57,9 @@ impl ProcessController for RecordingController {
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
         Box::pin(async move {
             self.0.calls.lock().unwrap().push((true, engine));
+            if engine == Engine::Xray && self.0.hang_xray.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if engine == Engine::Xray && self.0.fail_xray.load(Ordering::SeqCst) {
                 Err(())
             } else {
@@ -70,11 +79,40 @@ impl ProcessController for RecordingController {
     }
 }
 
-pub struct Readiness(pub AtomicBool);
+pub struct Readiness {
+    pub ready: AtomicBool,
+    pub available: AtomicBool,
+    pub lost: AtomicBool,
+    pub released: AtomicUsize,
+}
+
+impl Readiness {
+    pub fn new(ready: bool) -> Self {
+        Self {
+            ready: AtomicBool::new(ready),
+            available: AtomicBool::new(true),
+            lost: AtomicBool::new(false),
+            released: AtomicUsize::new(0),
+        }
+    }
+}
 
 impl CoresReadiness for Readiness {
     fn cores_ready(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    fn service_available(&self) -> bool {
+        self.available.load(Ordering::SeqCst)
+    }
+
+    fn connection_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+        self.ready.store(false, Ordering::SeqCst);
     }
 }
 
@@ -170,7 +208,7 @@ pub fn harness(profiles: &[&str]) -> Harness {
 }
 
 pub async fn enable(harness: &Harness, ready: bool) -> Arc<Readiness> {
-    let readiness = Arc::new(Readiness(AtomicBool::new(ready)));
+    let readiness = Arc::new(Readiness::new(ready));
     harness.backend.enable_always_ready(readiness.clone()).await;
     readiness
 }
@@ -202,7 +240,7 @@ async fn lost_readiness_is_reflected_in_status() {
     let h = harness(&[PROFILE_A]);
     let readiness = enable(&h, true).await;
     h.backend.warm_up().await.unwrap();
-    readiness.0.store(false, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
     assert!(!h.backend.status().await.unwrap().cores_ready);
 }
 
@@ -213,6 +251,8 @@ async fn disconnect_keeps_the_cores_warm() {
     h.backend.warm_up().await.unwrap();
     h.backend.connect().await.unwrap();
     h.backend.disconnect().await.unwrap();
+    // The watcher's warm-up finds the cores of this catalog still running: nothing to start.
+    h.backend.warm_up().await.unwrap();
     assert_eq!(
         *h.recording.calls.lock().unwrap(),
         [
@@ -221,7 +261,6 @@ async fn disconnect_keeps_the_cores_warm() {
             (true, Engine::Mihomo),
             (false, Engine::Mihomo),
             (false, Engine::Xray),
-            (true, Engine::Xray),
         ]
     );
     let status = h.backend.status().await.unwrap();
@@ -235,9 +274,15 @@ async fn activating_another_profile_rewarms_with_its_snapshot() {
     enable(&h, true).await;
     h.backend.warm_up().await.unwrap();
     // The trait method (not the inherent `activate_subscription(&ProfileId)`) re-warms.
+    let warm = h.backend.warm_requests();
+    let _ = tokio::time::timeout(Duration::from_millis(50), warm.notified()).await;
     Backend::activate_subscription(&*h.backend, h.profiles[1].clone())
         .await
         .unwrap();
+    tokio::time::timeout(PROMPT, warm.notified())
+        .await
+        .expect("the change asks the watcher to re-warm");
+    h.backend.warm_up().await.unwrap();
     assert_eq!(h.seen.lock().unwrap().last(), Some(&"b"));
     let xray_starts = h
         .recording
@@ -371,4 +416,199 @@ async fn without_warm_cores_latency_and_session_still_require_a_connection() {
         h.backend.session().await,
         Err(multicore_daemon::SessionError::NotConnected)
     ));
+}
+
+#[tokio::test]
+async fn disconnect_returns_without_waiting_for_the_warm_up() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let warm = h.backend.warm_requests();
+    let _ = tokio::time::timeout(Duration::from_millis(50), warm.notified()).await;
+    // From here a warm-up would hang (a service that stopped answering Prepare).
+    h.recording.hang_xray.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    let status = tokio::time::timeout(PROMPT, h.backend.disconnect())
+        .await
+        .expect("disconnect does not wait for the warm-up")
+        .unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    tokio::time::timeout(PROMPT, warm.notified())
+        .await
+        .expect("the re-warm is requested in the background");
+}
+
+#[tokio::test]
+async fn a_warm_up_in_flight_blocks_neither_selection_nor_disconnect() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, false).await;
+    h.recording.hang_xray.store(true, Ordering::SeqCst);
+    let warming = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.warm_up().await })
+    };
+    // Let the warm-up reach its (never finishing) Prepare.
+    for _ in 0..50 {
+        if !h.recording.calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(*h.recording.calls.lock().unwrap(), [(true, Engine::Xray)]);
+    let catalog = h.backend.catalog().await.unwrap();
+    let group = &catalog.groups[0];
+    tokio::time::timeout(
+        PROMPT,
+        h.backend.select(multicore_daemon::SelectionRequest {
+            revision: catalog.revision,
+            group_id: group.id.clone(),
+            node_id: group.nodes[0].id.clone(),
+        }),
+    )
+    .await
+    .expect("a selection does not wait for the warm-up")
+    .unwrap();
+    tokio::time::timeout(PROMPT, h.backend.disconnect())
+        .await
+        .expect("a disconnect does not wait for the warm-up")
+        .unwrap();
+    warming.abort();
+}
+
+#[tokio::test]
+async fn a_service_that_becomes_available_later_is_used_without_a_restart() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    readiness.available.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    assert!(h.recording.calls.lock().unwrap().is_empty(), "no warm-up");
+    assert!(!h.backend.status().await.unwrap().service_mode);
+    readiness.available.store(true, Ordering::SeqCst);
+    assert!(h.backend.watch_service().await);
+    assert_eq!(*h.recording.calls.lock().unwrap(), [(true, Engine::Xray)]);
+    let status = h.backend.status().await.unwrap();
+    assert!(status.service_mode);
+    assert!(status.cores_ready);
+}
+
+#[tokio::test]
+async fn a_connection_the_service_lost_is_torn_down_and_reported() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    assert!(h.backend.watch_service().await, "healthy: nothing to do");
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Connected
+    );
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    // `stop(Mihomo)` is where proxy mode restores the system proxy.
+    assert_eq!(
+        h.recording.calls.lock().unwrap()[3..],
+        [(false, Engine::Mihomo), (false, Engine::Xray)]
+    );
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert_eq!(status.message.as_deref(), Some(CORES_LOST));
+    assert!(
+        h.backend
+            .events_after(0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.message == CORES_LOST)
+    );
+}
+
+#[tokio::test]
+async fn switching_while_connected_moves_the_connection_to_the_new_generation() {
+    let h = harness(&[PROFILE_A, PROFILE_B]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let active = h.backend.status().await.unwrap().active_profile_id;
+    let (other, letter) = if active.as_deref() == Some(h.profiles[0].as_str()) {
+        (h.profiles[1].clone(), "b")
+    } else {
+        (h.profiles[0].clone(), "a")
+    };
+    let status = Backend::activate_subscription(&*h.backend, other.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(status.active_profile_id.as_deref(), Some(other.as_str()));
+    assert_eq!(h.seen.lock().unwrap().last(), Some(&letter));
+    assert_eq!(
+        h.recording.calls.lock().unwrap()[3..],
+        [
+            (false, Engine::Mihomo),
+            (false, Engine::Xray),
+            (true, Engine::Xray),
+            (true, Engine::Mihomo),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn without_the_service_switching_while_connected_is_still_refused() {
+    let h = harness(&[PROFILE_A, PROFILE_B]);
+    h.backend.connect().await.unwrap();
+    let active = h.backend.status().await.unwrap().active_profile_id;
+    let other = h
+        .profiles
+        .iter()
+        .find(|id| active.as_deref() != Some(id.as_str()))
+        .unwrap()
+        .clone();
+    assert!(
+        Backend::activate_subscription(&*h.backend, other)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Connected
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_last_subscription_releases_the_service_cores() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    Backend::delete_subscription(&*h.backend, h.profiles[0].clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Empty
+    );
+    assert!(h.backend.watch_service().await);
+    assert_eq!(readiness.released.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quit_disconnects_releases_the_cores_and_stops_warming() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    Backend::shutdown(&*h.backend).await.unwrap();
+    assert_eq!(readiness.released.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Ready
+    );
+    let calls = h.recording.calls.lock().unwrap().len();
+    h.backend.warm_up().await.unwrap();
+    assert!(h.backend.watch_service().await);
+    assert_eq!(
+        h.recording.calls.lock().unwrap().len(),
+        calls,
+        "never warmed again"
+    );
 }

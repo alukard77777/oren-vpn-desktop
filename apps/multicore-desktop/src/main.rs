@@ -3442,15 +3442,22 @@ fn wire_cores_ready_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -
     let timer = Timer::default();
     let weak = ui.as_weak();
     let in_flight = Arc::new(AtomicBool::new(false));
+    let ticks = Cell::new(0_u32);
     timer.start(TimerMode::Repeated, Duration::from_secs(2), move || {
-        let waiting = {
+        let (watching, ready) = {
             let model = model.lock().expect("view model lock");
-            model.service_mode()
-                && !model.cores_ready()
-                && !model.presentation().is_connected
-                && model.presentation().has_profile
+            (
+                model.service_mode()
+                    && !model.presentation().is_connected
+                    && model.presentation().has_profile,
+                model.cores_ready(),
+            )
         };
-        if !waiting || in_flight.swap(true, Ordering::AcqRel) {
+        // Once ready, keep checking every 10 s so a later loss of the cores shows up
+        // before latency checks start failing.
+        ticks.set(ticks.get().wrapping_add(1));
+        let due = !ready || ticks.get().is_multiple_of(5);
+        if !watching || !due || in_flight.swap(true, Ordering::AcqRel) {
             return;
         }
         let client = model.lock().expect("view model lock").daemon_client();

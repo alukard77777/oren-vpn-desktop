@@ -8,14 +8,13 @@ use std::{
 
 use multicore_core::{
     DeviceIdentity, MihomoRuntimeControl, ProfileStore, ReqwestHttpClient, Snapshot,
-    SubscriptionFetcher, default_ipv4_interface, elevation_protocol::BrokerErrorCode,
-    stage_runtime_with_mihomo_control,
+    SubscriptionFetcher, default_ipv4_interface, stage_runtime_with_mihomo_control,
 };
 use multicore_daemon::connection_mode::{Backed, ModeController};
 use multicore_daemon::elevated_controller::{production_factory, runtime_generation_from_path};
 use multicore_daemon::service_client::{
-    ControllerSlot, ProductionServiceConnector, ServiceError, ServiceSession, ServiceTunController,
-    SlotSelector, warm_key,
+    ControllerSlot, ProductionServiceConnector, ServiceMode, ServiceSession, ServiceTunController,
+    SlotSelector, WarmStage, WarmStages, warm_key,
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, CoreBackend, PreparedController, bind_loopback,
@@ -39,22 +38,10 @@ type Session = ServiceSession<ProductionServiceConnector>;
 
 const SERVICE_UNAVAILABLE_NOTICE: &str =
     "Служба MultiCore недоступна — права администратора будут запрошены при подключении.";
-const WARM_RETRY_MIN: Duration = Duration::from_secs(5);
-const WARM_RETRY_MAX: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ServiceMode {
-    Service,
-    Unavailable,
-    Absent,
-}
-
-/// The generation staged for the service and what it was staged from.
-struct WarmStage {
-    key: [u8; 32],
-    generation: u64,
-    mixed_port: u16,
-}
+/// How often the watcher looks at the service: also the upper bound for noticing that a
+/// connection carried by the service is gone.
+const WATCH_INTERVAL: Duration = Duration::from_secs(3);
+const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -75,40 +62,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let mut secret_bytes = [0_u8; 32];
-    getrandom::fill(&mut secret_bytes)?;
-    let mihomo_controller_secret: String = secret_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let mihomo_controller_secret = random_hex(32)?;
     let runtime_control =
         MihomoRuntimeControl::new(mihomo_controller_address, mihomo_controller_secret.clone())?;
 
+    // The selector and the dashboard proxy follow this slot: the service's filtered
+    // controller proxy after a `Prepare`, or the daemon's own on-demand Mihomo while a
+    // connection runs without the service.
     let controller_slot = Arc::new(ControllerSlot::default());
     let service: Arc<Session> = Arc::new(ServiceSession::new(
         ProductionServiceConnector::default(),
         controller_slot.clone(),
     ));
-    let service_mode = {
-        let service = service.clone();
-        match tokio::task::spawn_blocking(move || service.probe()).await {
-            Ok(Ok(())) | Ok(Err(ServiceError::Busy)) => ServiceMode::Service,
-            // Not installed, or installed for another copy of MultiCore (the AppImage or a
-            // per-user install next to the service): on-demand elevation, without a notice.
-            Ok(Err(
-                ServiceError::NotInstalled
-                | ServiceError::Rejected(BrokerErrorCode::AuthenticationFailed),
-            )) => ServiceMode::Absent,
-            _ => ServiceMode::Unavailable,
-        }
+    let on_demand_slot = {
+        let slot = controller_slot.clone();
+        move || slot.set(mihomo_controller_address, &mihomo_controller_secret, None)
     };
-    let use_service = service_mode == ServiceMode::Service;
-    // Without the service the dashboard proxy and the selector talk to the daemon's own
-    // on-demand Mihomo; with it, to the service's filtered controller proxy (set on `Prepare`).
-    if !use_service {
-        controller_slot.set(mihomo_controller_address, &mihomo_controller_secret, None);
-    }
-    drop(mihomo_controller_secret);
     let selector = Arc::new(SlotSelector::new(controller_slot.clone()));
 
     // The vendored zashboard build ships as a `dashboard/` sibling of `cores/` and `runtime/`
@@ -143,11 +112,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         marker_path: system_proxy_marker,
     };
     let elevated_factory = Mutex::new(None);
-    let warm_stage: Mutex<Option<WarmStage>> = Mutex::new(None);
+    let warm_stages = WarmStages::default();
+    // Serialises staging, so a Connect and a warm-up never stage the same generation twice.
+    let staging = Mutex::new(());
     let factory_service = service.clone();
     let controller_factory =
         options_controller_factory(move |snapshot: &Snapshot, options: ConnectOptions| {
             let interface = default_ipv4_interface().map_err(|_| BackendError::new())?;
+            // Re-checked on every Connect and warm-up: a service that started after the app
+            // is used at once; on-demand elevation only when it is absent or unreachable now.
+            let use_service = factory_service.probe_mode() == ServiceMode::Service;
+            if options.warm_up && !use_service {
+                // Warming never falls back to an elevation prompt.
+                return Err(BackendError::new());
+            }
             // TUN off without the service: cores run as this user (Windows only).
             #[cfg(windows)]
             if !options.tun && !use_service {
@@ -155,13 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .clone()
                     .with_xray_outbound_interface(interface)
                     .map_err(|_| BackendError::new())?;
+                on_demand_slot();
                 return proxy_mode.prepare(snapshot, &runtime_root, control);
             }
-            #[cfg(not(windows))]
-            let _ = options;
             if use_service {
-                let key = warm_key(snapshot, &interface);
-                let mut warm = warm_stage.lock().map_err(|_| BackendError::new())?;
                 #[cfg(windows)]
                 let controller = |generation, mixed_port| {
                     service_controller(
@@ -176,9 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let controller = |generation, mixed_port| {
                     service_controller(&factory_service, generation, mixed_port, options)
                 };
-                if let Some(stage) = warm.as_ref()
-                    && stage.key == key
-                {
+                let key = warm_key(snapshot, &interface);
+                let _staging = staging.lock().map_err(|_| BackendError::new())?;
+                // A generation the service rejected (for example its mixed port was taken)
+                // is dropped here and staged again with a fresh port.
+                if let Some(stage) = warm_stages.reusable(&key, &factory_service) {
                     return Ok(PreparedController::reuse(controller(
                         stage.generation,
                         stage.mixed_port,
@@ -194,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|_| BackendError::new())?;
                 let generation = runtime_generation_from_path(&staged.paths().directory)
                     .map_err(|_| BackendError::new())?;
-                *warm = Some(WarmStage {
+                warm_stages.remember(WarmStage {
                     key,
                     generation,
                     mixed_port,
@@ -222,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .controller(generation)
                     .map_err(|_| BackendError::new())?,
             )));
+            on_demand_slot();
             Ok(PreparedController::with_runtime(controller, staged))
         });
     let events_log_path = data_directory.join("logs").join("events.log");
@@ -232,18 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         selector,
         Some(events_log_path),
     )?);
-    match service_mode {
-        ServiceMode::Service => {
-            backend.enable_always_ready(service.clone()).await;
-            spawn_warm_loop(backend.clone(), service.clone());
-        }
-        ServiceMode::Unavailable => {
-            backend
-                .record_notice("service_unavailable", SERVICE_UNAVAILABLE_NOTICE)
-                .await;
-        }
-        ServiceMode::Absent => {}
-    }
+    // Always-ready mode is armed from the start; it only acts while the watcher finds the
+    // service available.
+    backend.enable_always_ready(service.clone()).await;
+    spawn_service_watch(backend.clone(), service.clone());
 
     // Read-only dashboard on its own loopback port with its own per-session token. The URL
     // embeds that token and must never be logged; it only leaves this process through the
@@ -288,40 +258,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Keeps the service's cores warm: polls readiness and re-prepares after a lost channel or a
-/// reported core failure, backing off while the service stays unreachable.
-fn spawn_warm_loop<B>(backend: Arc<B>, service: Arc<Session>)
+/// The always-ready watcher. Every [`WATCH_INTERVAL`] (or at once when the backend asks for a
+/// warm-up) it refreshes what it knows about the service — `Status` over the channel while
+/// the service is in use, a fresh probe otherwise, so a service that starts later is picked
+/// up — and lets the backend act on it: warm the cores while Ready, tear a connection down
+/// when the service lost it. Backs off while the service stays unusable.
+fn spawn_service_watch<B>(backend: Arc<B>, service: Arc<Session>)
 where
-    B: WarmUp + Send + Sync + 'static,
+    B: ServiceWatch + Send + Sync + 'static,
 {
+    let warm = backend.warm_signal();
     tokio::spawn(async move {
         let mut delay = Duration::ZERO;
+        let mut noticed = false;
         loop {
-            tokio::time::sleep(delay).await;
-            let poll = service.clone();
-            let _ = tokio::task::spawn_blocking(move || poll.poll()).await;
-            delay = if service.cores_ready() || backend.warm().await {
-                WARM_RETRY_MIN
+            tokio::select! {
+                () = warm.notified() => {}
+                () = tokio::time::sleep(delay) => {}
+            }
+            let session = service.clone();
+            let mode = tokio::task::spawn_blocking(move || {
+                if session.service_available() {
+                    session.poll();
+                    ServiceMode::Service
+                } else {
+                    session.probe_mode()
+                }
+            })
+            .await
+            .unwrap_or(ServiceMode::Unavailable);
+            if mode == ServiceMode::Unavailable && !noticed {
+                noticed = true;
+                backend
+                    .notice("service_unavailable", SERVICE_UNAVAILABLE_NOTICE)
+                    .await;
+            }
+            let healthy = backend.tick().await && mode == ServiceMode::Service;
+            delay = if healthy {
+                WATCH_INTERVAL
             } else {
-                (delay * 2).clamp(WARM_RETRY_MIN, WARM_RETRY_MAX)
+                (delay * 2).clamp(WATCH_INTERVAL, WATCH_BACKOFF_MAX)
             };
         }
     });
 }
 
-/// `CoreBackend::warm_up` behind a small trait so `spawn_warm_loop` needs no generic soup.
-trait WarmUp {
-    fn warm(&self) -> impl std::future::Future<Output = bool> + Send;
+/// The backend calls the watcher needs, behind a small trait so it needs no generic soup.
+trait ServiceWatch {
+    fn warm_signal(&self) -> Arc<tokio::sync::Notify>;
+    fn tick(&self) -> impl std::future::Future<Output = bool> + Send;
+    fn notice(&self, phase: &str, message: &str) -> impl std::future::Future<Output = ()> + Send;
 }
 
-impl<C, P, F> WarmUp for CoreBackend<C, P, F>
+impl<C, P, F> ServiceWatch for CoreBackend<C, P, F>
 where
     C: multicore_core::HttpClient + 'static,
     P: multicore_core::ProcessController + 'static,
     F: 'static,
 {
-    async fn warm(&self) -> bool {
-        self.warm_up().await.is_ok()
+    fn warm_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.warm_requests()
+    }
+
+    async fn tick(&self) -> bool {
+        self.watch_service().await
+    }
+
+    async fn notice(&self, phase: &str, message: &str) {
+        self.record_notice(phase, message).await;
     }
 }
 
@@ -501,6 +505,11 @@ mod tests {
 
     const MAIN_SOURCE: &str = include_str!("main.rs");
 
+    /// Source without whitespace, so the contracts survive rustfmt.
+    fn compact(source: &str) -> String {
+        source.split_whitespace().collect()
+    }
+
     #[test]
     fn dashboard_directory_is_a_sibling_of_cores_not_of_this_executable() {
         // multicore-daemon.exe lives in `<package>/runtime/`; the vendored
@@ -538,9 +547,10 @@ mod tests {
         let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
         assert!(!production.contains("with_external_ui_directory"));
         assert!(!production.contains("/ui/#/setup"));
-        assert!(production.contains("dashboard_proxy::dashboard_router("));
-        assert!(production.contains("controller_slot.clone(),"));
-        assert!(production.contains("dashboard_directory: None,"));
+        let compact = compact(production);
+        assert!(compact.contains("dashboard_proxy::dashboard_router("));
+        assert!(compact.contains("controller_slot.clone()"));
+        assert!(compact.contains("dashboard_directory:None"));
     }
 
     #[cfg(windows)]
@@ -548,13 +558,13 @@ mod tests {
     fn proxy_mode_uses_the_service_cores_when_the_service_is_present() {
         let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
         let (_, proxy_mode) = production.split_once("mod proxy_mode {").unwrap();
-        // rustfmt may wrap the call, so compare without whitespace.
-        let proxy_mode_compact = proxy_mode.split_whitespace().collect::<String>();
-        assert!(proxy_mode.contains("ServiceCoresController::new("));
+        let proxy_mode_compact = compact(proxy_mode);
+        let production = compact(production);
+        assert!(proxy_mode_compact.contains("ServiceCoresController::new("));
         assert!(proxy_mode_compact.contains(
             "SystemProxy::new(Box::new(WinInetSettings),self.marker_path.clone(),mixed_port"
         ));
-        assert!(production.contains("if !options.tun && !use_service {"));
+        assert!(production.contains("if!options.tun&&!use_service{"));
         assert!(production.contains("proxy_mode.service_controller("));
     }
 
@@ -564,15 +574,22 @@ mod tests {
         let (tun_path, proxy_mode) = production
             .split_once("mod proxy_mode {")
             .expect("proxy mode module");
-        // The service is probed before any controller exists, and its readiness drives
-        // always-ready mode.
-        let probe = tun_path.find(".probe()").unwrap();
-        assert!(probe < tun_path.find("options_controller_factory(").unwrap());
-        assert!(tun_path.contains(".enable_always_ready("));
-        assert!(tun_path.contains("SERVICE_UNAVAILABLE_NOTICE"));
-        // Warm generations are keyed by the payloads and the physical interface.
-        assert!(tun_path.contains("warm_key(snapshot, &interface)"));
-        assert!(tun_path.contains("PreparedController::reuse("));
+        let tun_path_compact = compact(tun_path);
+        // The service is re-probed by every Connect and warm-up (not once per start), and the
+        // warm-up never falls back to an elevation prompt.
+        let probe = tun_path_compact
+            .find("factory_service.probe_mode()")
+            .unwrap();
+        assert!(probe < tun_path_compact.find("production_factory()").unwrap());
+        assert!(tun_path_compact.contains("ifoptions.warm_up&&!use_service{"));
+        assert!(tun_path_compact.contains(".enable_always_ready("));
+        assert!(tun_path_compact.contains("spawn_service_watch("));
+        assert!(tun_path_compact.contains("SERVICE_UNAVAILABLE_NOTICE"));
+        // Warm generations are keyed by the payloads and the physical interface; a rejected
+        // one is re-staged.
+        assert!(tun_path_compact.contains("warm_key(snapshot,&interface)"));
+        assert!(tun_path_compact.contains("warm_stages.reusable(&key,&factory_service)"));
+        assert!(tun_path_compact.contains("PreparedController::reuse("));
         // The on-demand path is unchanged: elevated host per generation.
         assert!(tun_path.contains("elevated_factory"));
         assert!(tun_path.contains(".controller(generation)"));

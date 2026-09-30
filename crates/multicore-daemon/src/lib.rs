@@ -79,9 +79,25 @@ const TUNNEL_ON_MESSAGE: &str = "Включается туннель…";
 const WARM_UP_FAILED_MESSAGE: &str =
     "Ядра не удалось запустить заранее. Они запустятся при подключении.";
 
-/// Always-ready mode: whether the service's cores run for the generation it prepared.
+const CORES_LOST_MESSAGE: &str =
+    "Служба MultiCore потеряла ядра — подключение разорвано. Подключитесь снова.";
+
+/// Always-ready mode: the state of the always-ready service as the daemon last saw it.
 pub trait CoresReadiness: Send + Sync + 'static {
+    /// The service's cores run for the generation it prepared.
     fn cores_ready(&self) -> bool;
+    /// The service can be used right now (re-checked continuously, so a service that starts
+    /// after the app is picked up). While false the daemon behaves as without a service.
+    fn service_available(&self) -> bool {
+        true
+    }
+    /// A connection the service carries (its tunnel, or its mixed port behind the system
+    /// proxy) is gone.
+    fn connection_lost(&self) -> bool {
+        false
+    }
+    /// Lets the service stop the cores (Quit, or no subscription left). Blocking.
+    fn release(&self) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -193,6 +209,10 @@ pub struct ConnectOptions {
     /// `false` connects in system-proxy mode: no TUN adapter and no administrator prompt.
     #[serde(default = "default_tun")]
     pub tun: bool,
+    /// Set by the always-ready warm-up, never by a client: the controller must come from the
+    /// service, never from an on-demand elevation (no prompt without a Connect).
+    #[serde(skip)]
+    pub warm_up: bool,
 }
 
 fn default_tun() -> bool {
@@ -201,7 +221,10 @@ fn default_tun() -> bool {
 
 impl Default for ConnectOptions {
     fn default() -> Self {
-        Self { tun: true }
+        Self {
+            tun: true,
+            warm_up: false,
+        }
     }
 }
 
@@ -827,6 +850,10 @@ pub trait Backend: Send + Sync + 'static {
         self.connect().await
     }
     async fn disconnect(&self) -> Result<StatusDto, BackendError>;
+    /// Quit: disconnect and let the always-ready service stop the cores.
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
     async fn select(&self, _request: SelectionRequest) -> Result<CatalogDto, SelectionError> {
         Err(SelectionError::NotConnected)
     }
@@ -958,6 +985,7 @@ fn build_router_shared(
         .route("/subscriptions/{profile_id}", delete(delete_subscription))
         .route("/connect", post(connect))
         .route("/disconnect", post(disconnect))
+        .route("/shutdown", post(shutdown))
         .route("/events", get(events))
         .route("/diagnostics", get(diagnostics))
         .route("/dashboard-url", get(dashboard_url_handler))
@@ -1499,6 +1527,16 @@ async fn connect(State(state): State<AppState>, body: Bytes) -> Result<Json<Stat
         .map_err(|_| ApiError::backend("Не удалось подключиться. Повторите попытку."))
 }
 
+async fn shutdown(State(state): State<AppState>, body: Bytes) -> Result<StatusCode, ApiError> {
+    reject_nonempty_body(&body)?;
+    state
+        .backend
+        .shutdown()
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|_| ApiError::backend("Не удалось остановить ядра."))
+}
+
 async fn disconnect(
     State(state): State<AppState>,
     body: Bytes,
@@ -2011,6 +2049,9 @@ where
     connect_options: std::sync::Mutex<ConnectOptions>,
     post_commit_load_fault: AtomicBool,
     warm_failure_reported: AtomicBool,
+    warm_signal: Arc<tokio::sync::Notify>,
+    /// Quit: the service's cores were released and must not be warmed again.
+    shut_down: AtomicBool,
     list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
     profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
     inner: RwLock<CoreRuntime<P>>,
@@ -2061,6 +2102,13 @@ impl<P: ProcessController> CoreRuntime<P> {
             warm_revision: None,
             readiness: None,
         }
+    }
+
+    /// Always-ready mode is on and the service is usable right now.
+    fn service_active(&self) -> bool {
+        self.readiness
+            .as_ref()
+            .is_some_and(|readiness| readiness.service_available())
     }
 
     fn cores_live(&self) -> bool {
@@ -2160,7 +2208,7 @@ impl<P: ProcessController> CoreRuntime<P> {
                         })
                 }),
             cores_ready: self.cores_live(),
-            service_mode: self.readiness.is_some(),
+            service_mode: self.service_active(),
         }
     }
 
@@ -2489,24 +2537,44 @@ where
             connect_options: std::sync::Mutex::new(ConnectOptions::default()),
             post_commit_load_fault: AtomicBool::new(false),
             warm_failure_reported: AtomicBool::new(false),
+            warm_signal: Arc::new(tokio::sync::Notify::new()),
+            shut_down: AtomicBool::new(false),
             list_logo_publish_hook: std::sync::Mutex::new(None),
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
             inner: RwLock::new(inner),
         })
     }
 
-    /// Always-ready mode: from now on the cores are kept running while Ready.
+    /// Always-ready mode: from now on the cores are kept running while Ready (whenever the
+    /// readiness source reports the service as available).
     pub async fn enable_always_ready(&self, readiness: Arc<dyn CoresReadiness>) {
         self.inner.write().await.readiness = Some(readiness);
+        self.request_warm();
+    }
+
+    /// Signalled whenever the cores should be (re-)warmed: after a snapshot change, a
+    /// disconnect or a failed connect. The service watcher waits on it; request handlers never
+    /// run the warm-up themselves.
+    #[must_use]
+    pub fn warm_requests(&self) -> Arc<tokio::sync::Notify> {
+        self.warm_signal.clone()
+    }
+
+    fn request_warm(&self) {
+        self.warm_signal.notify_one();
     }
 
     /// Starts the idle cores of the current snapshot (always-ready mode only; a no-op
-    /// otherwise, while connected, or without a profile).
+    /// otherwise, while connected, without a profile, or when they already run for this
+    /// catalog). Runs without the operation lock, so selections, disconnects and mutations
+    /// never wait for a `Prepare`; a snapshot changed meanwhile is simply not marked warm.
     pub async fn warm_up(&self) -> Result<(), BackendError> {
-        let _operation = self.operation.lock().await;
+        if self.shut_down.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let (snapshot, revision) = {
             let state = self.inner.read().await;
-            if state.readiness.is_none()
+            if !state.service_active()
                 || state.degraded
                 || state.state.current() != CoreConnectionState::Ready
             {
@@ -2515,13 +2583,17 @@ where
             let Some(snapshot) = state.snapshot.clone() else {
                 return Ok(());
             };
+            if state.cores_live() {
+                return Ok(());
+            }
             (snapshot, state.catalog.revision)
         };
-        let options = self
+        let mut options = self
             .connect_options
             .lock()
             .map(|options| *options)
             .unwrap_or_default();
+        options.warm_up = true;
         let result = match (self.controller_factory)(&snapshot, options) {
             Ok(prepared) => {
                 let controller = prepared.controller();
@@ -2559,6 +2631,91 @@ where
         }
     }
 
+    /// One tick of the always-ready watcher, after the readiness source was refreshed:
+    /// - Connected through the service and the service lost it: tear the connection down
+    ///   (restoring the system proxy) and report it;
+    /// - Ready: warm the cores;
+    /// - no subscription left: let the service stop the cores.
+    ///
+    /// Returns false when something is wrong, so the caller can back off.
+    pub async fn watch_service(&self) -> bool {
+        if self.shut_down.load(Ordering::SeqCst) {
+            return true;
+        }
+        let (current, readiness) = {
+            let state = self.inner.read().await;
+            let Some(readiness) = state.readiness.clone() else {
+                return true;
+            };
+            (state.state.current(), readiness)
+        };
+        match current {
+            CoreConnectionState::Connected if readiness.connection_lost() => {
+                self.cores_lost().await;
+                false
+            }
+            CoreConnectionState::Ready => {
+                readiness.service_available() && self.warm_up().await.is_ok()
+            }
+            CoreConnectionState::Empty if readiness.cores_ready() => {
+                let _ = tokio::task::spawn_blocking(move || readiness.release()).await;
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// The service lost the cores (or the tunnel) under an active connection: stop it the
+    /// usual way, so proxy mode restores the system proxy at once, and report the loss.
+    async fn cores_lost(&self) {
+        let _operation = self.operation.lock().await;
+        let controller = {
+            let state = self.inner.read().await;
+            let lost = state.state.current() == CoreConnectionState::Connected
+                && state
+                    .readiness
+                    .as_ref()
+                    .is_some_and(|readiness| readiness.connection_lost());
+            match (lost, state.controller.clone()) {
+                (true, Some(controller)) => controller,
+                _ => return,
+            }
+        };
+        let result = Supervisor::new(controller).disconnect().await;
+        let mut state = self.inner.write().await;
+        match result {
+            Ok(()) => {
+                let _ = state.state.transition(CoreConnectionState::Ready);
+                state.message = Some(CORES_LOST_MESSAGE.to_owned());
+                state.degraded = false;
+            }
+            Err(_) => {
+                state.mark_error(
+                    "Не удалось полностью остановить подключение. Повторите попытку.",
+                    true,
+                );
+            }
+        }
+        state.push_event(
+            Severity::Error,
+            Component::Core,
+            "service_lost",
+            CORES_LOST_MESSAGE,
+        );
+        drop(state);
+        self.request_warm();
+    }
+
+    /// Quit: disconnect, stop the service's cores and never warm them again.
+    pub async fn shutdown_cores(&self) {
+        self.shut_down.store(true, Ordering::SeqCst);
+        let _ = self.disconnect_now().await;
+        let readiness = self.inner.read().await.readiness.clone();
+        if let Some(readiness) = readiness {
+            let _ = tokio::task::spawn_blocking(move || readiness.release()).await;
+        }
+    }
+
     /// A one-time user-facing notice (for example the fallback to on-demand elevation).
     pub async fn record_notice(&self, phase: &str, message: &str) {
         let mut state = self.inner.write().await;
@@ -2569,10 +2726,36 @@ where
     }
 
     async fn rewarm_after<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
-        if result.is_ok() && self.inner.read().await.readiness.is_some() {
-            let _ = self.warm_up().await;
+        if result.is_ok() {
+            self.request_warm();
         }
         result
+    }
+
+    /// Spec §6: in always-ready mode a subscription switch or refresh while connected moves the
+    /// connection to the new generation. Stops the connection when `condition` holds and
+    /// returns the options to reconnect with.
+    async fn pause_for_generation_change(
+        &self,
+        condition: impl FnOnce(&CoreRuntime<P>) -> bool,
+    ) -> Option<ConnectOptions> {
+        {
+            let state = self.inner.read().await;
+            if state.state.current() != CoreConnectionState::Connected
+                || state.degraded
+                || !state.service_active()
+                || !condition(&state)
+            {
+                return None;
+            }
+        }
+        self.disconnect_now().await.ok()?;
+        Some(
+            self.connect_options
+                .lock()
+                .map(|options| *options)
+                .unwrap_or_default(),
+        )
     }
 
     async fn disconnect_now(&self) -> Result<StatusDto, BackendError> {
@@ -3064,6 +3247,9 @@ where
             (None, None) => {}
         }
         let mut state = self.inner.write().await;
+        // The service keeps the cores of an unchanged catalog running across a disconnect.
+        let warm = state.warm_revision;
+        let warm_profile = state.active_profile_id.clone();
         state.clear_for_active(authoritative_id);
         if let Some((id, revision, _, snapshot)) = loaded {
             let (selections, explicit_selections) = run_blocking(|| {
@@ -3076,6 +3262,12 @@ where
                 selections,
                 explicit_selections,
             );
+            if warm.is_some()
+                && warm == Some(state.catalog.revision)
+                && warm_profile == state.active_profile_id
+            {
+                state.warm_revision = warm;
+            }
         }
     }
 
@@ -3758,7 +3950,19 @@ where
                 .await
                 .map_err(BackendError::from_profile_mutation)
         };
-        self.rewarm_after(result).await
+        // Refreshed while connected: the new snapshot waits as pending; in always-ready mode
+        // the connection moves to it right away.
+        let resume = self
+            .pause_for_generation_change(|state| state.pending_snapshot.is_some())
+            .await;
+        if let Some(options) = resume {
+            let _ = self.connect_with(options).await;
+        }
+        let result = self.rewarm_after(result).await;
+        match result {
+            Ok(_) if resume.is_some() => Ok(self.current_status().await),
+            result => result,
+        }
     }
 
     async fn list_subscriptions(&self) -> Result<SubscriptionListDto, BackendError> {
@@ -3769,11 +3973,23 @@ where
     async fn activate_subscription(&self, id: ProfileId) -> Result<StatusDto, BackendError> {
         self.require_profile(&id)
             .map_err(BackendError::from_profile_mutation)?;
+        // Switching while connected in always-ready mode: stop, switch, reconnect on the new
+        // generation (spec 6). Otherwise switching while connected stays refused.
+        let resume = self
+            .pause_for_generation_change(|state| state.active_profile_id.as_ref() != Some(&id))
+            .await;
         let result = self
             .activate_subscription(&id)
             .await
             .map_err(BackendError::from_profile_mutation);
-        self.rewarm_after(result).await
+        if let Some(options) = resume {
+            let _ = self.connect_with(options).await;
+        }
+        let result = self.rewarm_after(result).await;
+        match result {
+            Ok(_) if resume.is_some() => Ok(self.current_status().await),
+            result => result,
+        }
     }
 
     async fn refresh_subscription_profile(
@@ -3796,6 +4012,12 @@ where
             self.subscription_list_dto()
                 .map_err(BackendError::from_profile_mutation)
         };
+        let resume = self
+            .pause_for_generation_change(|state| state.pending_snapshot.is_some())
+            .await;
+        if let Some(options) = resume {
+            let _ = self.connect_with(options).await;
+        }
         self.rewarm_after(result).await
     }
 
@@ -3893,7 +4115,7 @@ where
                 .transition(CoreConnectionState::Connecting)
                 .map_err(|_| BackendError::new())?;
             state.message = Some(
-                if state.readiness.is_some() {
+                if state.service_active() {
                     TUNNEL_ON_MESSAGE
                 } else {
                     CONNECTING_MESSAGE
@@ -3967,6 +4189,7 @@ where
                 rollback_failed,
                 cause,
             }) => {
+                self.request_warm();
                 if rollback_failed {
                     state.mark_error(
                         "Не удалось полностью отменить запуск. Выполните отключение для очистки.",
@@ -4015,8 +4238,14 @@ where
         }
     }
 
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        self.shutdown_cores().await;
+        Ok(())
+    }
+
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
         let result = self.disconnect_now().await;
+        // The cores stay (or become) warm in the background; the answer does not wait.
         let result = self.rewarm_after(result).await;
         match result {
             Ok(_) => Ok(self.current_status().await),
@@ -4054,7 +4283,8 @@ where
                 .ok_or(SelectionError::UnknownGroup)?;
             // The selector is reachable while connected, or while the service keeps the cores
             // of this catalog warm.
-            let live = state.cores_live();
+            let live =
+                state.state.current() == CoreConnectionState::Connected || state.cores_live();
             let groups = selectable_groups(&snapshot);
             let group_index = groups
                 .iter()
