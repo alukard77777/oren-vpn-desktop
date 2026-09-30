@@ -1,10 +1,13 @@
 #!/bin/sh
-# Forget the removed unit; purge also deletes the service's own state directory.
+# Forget the removed unit and delete the service's own state directory (caches and sanitised
+# copies only, no administrator configuration). postinst enables the service when that
+# directory is missing, so a reinstall after `apt remove` is always-ready again, while an
+# administrator's `systemctl disable` still survives upgrades.
 set -e
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
-if [ "$1" = "purge" ]; then
-    rm -rf /var/lib/multicore
-fi
+case "$1" in
+    remove|purge) rm -rf /var/lib/multicore ;;
+esac
 exit 0
