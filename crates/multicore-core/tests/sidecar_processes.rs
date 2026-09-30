@@ -106,6 +106,7 @@ fn paths() -> RuntimePaths {
         xray_config: PathBuf::from(r"C:\Users\Synthetic User\runtime\xray.json"),
         mihomo_config: PathBuf::from(r"C:\Users\Synthetic User\runtime\mihomo.yaml"),
         dashboard_directory: None,
+        mihomo_home_directory: None,
     }
 }
 
@@ -374,6 +375,7 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
         xray_config,
         mihomo_config: root.join("mihomo.yaml"),
         dashboard_directory: None,
+        mihomo_home_directory: None,
     };
     let launcher = TokioProcessLauncher::for_runtime(runtime_paths, Duration::from_millis(200));
     let command = CommandSpec {
@@ -559,4 +561,82 @@ fn real_core_child_environment_observer_helper() {
     .any(|name| std::env::var_os(name).is_some());
     let output = std::env::var_os("MULTICORE_SIDECAR_TEST_OUTPUT").unwrap();
     std::fs::write(output, inherited.to_string()).unwrap();
+}
+
+#[test]
+fn service_mihomo_runs_in_its_own_home_directory() {
+    let mut paths = paths();
+    let home = PathBuf::from(r"C:\ProgramData\MultiCore\service");
+    paths.mihomo_home_directory = Some(home.clone());
+    let spec = paths.command(Engine::Mihomo);
+    assert_eq!(
+        spec.args,
+        vec![
+            OsString::from("-d"),
+            home.clone().into_os_string(),
+            OsString::from("-f"),
+            paths.mihomo_config.clone().into_os_string(),
+        ]
+    );
+    assert_eq!(
+        spec.env,
+        vec![(OsString::from("SAFE_PATHS"), home.into_os_string())]
+    );
+    let xray = paths.command(Engine::Xray);
+    assert!(xray.env.is_empty());
+}
+
+#[tokio::test]
+async fn the_multicore_tun_probe_answers_promptly_and_consistently() {
+    // The dev PC may run the owner's own MultiCore tunnel, so the answer itself is machine
+    // state; the alias/up rule is pinned by `adapter_requires_exact_alias_and_operational_up`.
+    let first = tokio::time::timeout(
+        Duration::from_secs(5),
+        multicore_core::multicore_tun_is_up(),
+    )
+    .await
+    .expect("the probe never blocks");
+    let second = multicore_core::multicore_tun_is_up().await;
+    assert_eq!(first, second);
+}
+
+/// A service TUN generation starts Mihomo with TUN off and no inbound port at all (plan
+/// amendment A6), so its readiness is the controller alone. Outside service mode the same
+/// config stays "not runnable", as before.
+#[tokio::test]
+async fn service_mihomo_without_ports_is_ready_once_its_controller_listens() {
+    let controller = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = controller.local_addr().unwrap().port();
+    let root = tempfile::tempdir().unwrap();
+    let mihomo_config = root.path().join("mihomo.yaml");
+    std::fs::write(
+        &mihomo_config,
+        format!(
+            "external-controller: 127.0.0.1:{port}\nbind-address: 127.0.0.1\ntun:\n  enable: false\n  device: MultiCore\n"
+        ),
+    )
+    .unwrap();
+    let on_demand = RuntimePaths {
+        xray_binary: PathBuf::new(),
+        mihomo_binary: PathBuf::new(),
+        xray_config: root.path().join("xray.json"),
+        mihomo_config,
+        dashboard_directory: None,
+        mihomo_home_directory: None,
+    };
+    let service = RuntimePaths {
+        mihomo_home_directory: Some(root.path().to_path_buf()),
+        ..on_demand.clone()
+    };
+    let timeout = Duration::from_millis(200);
+    assert!(
+        !TokioProcessLauncher::for_runtime(on_demand, timeout)
+            .current_ready(Engine::Mihomo)
+            .await
+    );
+    let service = TokioProcessLauncher::for_runtime(service, timeout);
+    assert!(service.current_ready(Engine::Mihomo).await);
+    assert_eq!(service.tun_check().await, RuntimeCheckState::Disabled);
+    drop(controller);
+    assert!(!service.current_ready(Engine::Mihomo).await);
 }

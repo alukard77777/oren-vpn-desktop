@@ -241,6 +241,7 @@ mod proxy_mode {
                     .dashboard_directory
                     .clone()
                     .filter(|directory| directory.join("index.html").is_file()),
+                mihomo_home_directory: None,
             };
             let logs = Arc::new(CoreLogBuffer::persistent_or_memory(&self.log_path));
             let launcher =

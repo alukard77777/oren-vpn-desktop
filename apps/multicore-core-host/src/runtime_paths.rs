@@ -207,6 +207,7 @@ pub(crate) fn resolve_from(
             xray_config: fs::canonicalize(xray_config).map_err(|_| ResolveError::Missing)?,
             mihomo_config: fs::canonicalize(mihomo_config).map_err(|_| ResolveError::Missing)?,
             dashboard_directory,
+            mihomo_home_directory: None,
         },
         guards,
     })

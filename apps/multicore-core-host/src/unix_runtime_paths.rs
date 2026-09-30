@@ -200,6 +200,7 @@ pub(crate) fn resolve_from(
             xray_config: canonical(&xray_config)?,
             mihomo_config: canonical(&mihomo_config)?,
             dashboard_directory: canonical_dashboard,
+            mihomo_home_directory: None,
         },
         data_root: canonical_data,
         guards,
