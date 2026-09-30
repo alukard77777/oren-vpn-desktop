@@ -1747,7 +1747,7 @@ export component AppWindow inherits Window {
 
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/link.svg"); label: "Подписки"; badge: root.subscription-profiles.length > 1 ? "" + root.subscription-profiles.length : ""; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/subscriptions.svg"); label: "Подписки"; badge: root.subscription-profiles.length > 1 ? "" + root.subscription-profiles.length : ""; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
