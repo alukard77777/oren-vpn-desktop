@@ -760,7 +760,7 @@ component TitleBarButton inherits Rectangle {
 
     if root.kind == "minimize": Rectangle {
         x: 17px;
-        y: 22px;
+        y: (parent.height - self.height) / 2;
         width: 10px;
         height: 1px;
         background: Theme.text-secondary;
@@ -768,7 +768,7 @@ component TitleBarButton inherits Rectangle {
 
     if root.kind == "maximize": Rectangle {
         x: 17px;
-        y: 17px;
+        y: (parent.height - self.height) / 2;
         width: 10px;
         height: 10px;
         background: transparent;
@@ -778,7 +778,7 @@ component TitleBarButton inherits Rectangle {
 
     if root.kind == "restore": Rectangle {
         x: 16px;
-        y: 18px;
+        y: (parent.height - self.height) / 2 + 1px;
         width: 9px;
         height: 8px;
         background: transparent;
@@ -797,7 +797,7 @@ component TitleBarButton inherits Rectangle {
 
     if root.kind == "close": Image {
         x: 16px;
-        y: 16px;
+        y: (parent.height - self.height) / 2;
         width: 12px;
         height: 12px;
         source: @image-url("../assets/close.svg");
@@ -1144,6 +1144,9 @@ export component AppWindow inherits Window {
             : root.profile-menu-loading ? 144px
             : Math.min(288px, 16px + root.subscription-profiles.length * 54px));
     private property <length> resize-border: 6px;
+    // Title-bar content is lifted by half the resize margin so it centres in the
+    // visible strip (margin + bar), not just the 44px bar below it.
+    private property <length> title-lift: root.resize-border / 2;
     in-out property <string> subscription-draft;
 
     callback import-url(string) -> bool;
@@ -1445,7 +1448,7 @@ export component AppWindow inherits Window {
 
                     Image {
                         x: root.navigation-collapsed ? 22px : 14px;
-                        y: 12px;
+                        y: 12px - root.title-lift;
                         width: 20px;
                         height: 20px;
                         source: @image-url("../assets/app-icon.svg");
@@ -1455,6 +1458,7 @@ export component AppWindow inherits Window {
 
                     if !root.navigation-collapsed: Text {
                         x: 42px;
+                        y: -root.title-lift;
                         width: 112px;
                         height: parent.height;
                         text: "MultiCore";
@@ -1481,7 +1485,7 @@ export component AppWindow inherits Window {
                         5px + 20px + 8px + chip-title.preferred-width + 10px + 1px + 10px + chip-meta.preferred-width + 8px + 12px + 9px);
                     // Clears the expanded rail's brand divider (176px) by 8px.
                     x: root.navigation-collapsed ? 56px : 184px;
-                    y: 7px;
+                    y: 7px - root.title-lift;
                     width: Math.max(0px, parent.width - self.x - 148px);
                     height: 30px;
                     animate x { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
@@ -1719,9 +1723,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                TitleBarButton { x: parent.width - 132px; kind: "minimize"; state-label: "Свернуть окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
-                TitleBarButton { x: parent.width - 88px; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
-                TitleBarButton { x: parent.width - 44px; kind: "close"; state-label: "Закрыть MultiCore"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
+                TitleBarButton { x: parent.width - 132px; y: -root.resize-border; height: 44px + root.resize-border; kind: "minimize"; state-label: "Свернуть окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
+                TitleBarButton { x: parent.width - 88px; y: -root.resize-border; height: 44px + root.resize-border; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
+                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: "Закрыть MultiCore"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
             }
 
             HorizontalLayout {
