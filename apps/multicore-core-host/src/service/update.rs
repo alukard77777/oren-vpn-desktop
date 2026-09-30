@@ -51,7 +51,10 @@ mod production {
     use multicore_release::{
         GitHubRelease, Repository, extract_verified_bundle, verify_archive_file,
     };
-    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS, SetEvent};
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0,
+        System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS, SetEvent, WaitForSingleObject},
+    };
 
     use super::{ClientIdentity, plan_update, session_of};
     use crate::service::core_loop::ServiceUpdater;
@@ -183,6 +186,10 @@ mod production {
                     .await
                     .map_err(|_| BrokerErrorCode::NotReady)?
                 {
+                    // A service stop (SCM stop or shutdown) abandons the download.
+                    if self.stopping() {
+                        return Err(BrokerErrorCode::NotReady);
+                    }
                     written += chunk.len() as u64;
                     if written > release.asset().size() {
                         return Err(BrokerErrorCode::InvalidRequest);
@@ -194,6 +201,10 @@ mod production {
                 output.flush().map_err(|_| BrokerErrorCode::NotReady)?;
                 Ok(())
             })
+        }
+
+        fn stopping(&self) -> bool {
+            (unsafe { WaitForSingleObject(self.stop.as_raw_handle(), 0) }) == WAIT_OBJECT_0
         }
 
         fn stage(&mut self, version: &str) -> Result<Staged, BrokerErrorCode> {
@@ -257,6 +268,10 @@ mod production {
                 .take()
                 .filter(|staged| staged.version == version)
                 .ok_or(BrokerErrorCode::NotReady)?;
+            // The token session of the verified client. A daemon started with `runas` inside
+            // another user's console session relaunches the desktop for that console user
+            // (`WTSQueryUserToken(session)` in the updater); harmless, the update itself is the
+            // same verified release either way.
             let session = session_of(client)
                 .filter(|session| *session != 0)
                 .ok_or(BrokerErrorCode::InvalidRequest)?;

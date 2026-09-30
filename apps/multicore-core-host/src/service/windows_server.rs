@@ -42,26 +42,46 @@ use windows_sys::Win32::{
     },
 };
 
-use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop};
+use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop, execute_shared};
 use super::windows_identity::{
     IdentityError, client_facts, expected_daemon_image, user_data_root, verify_client,
 };
 use crate::windows_pipe::{
-    IO_TIMEOUT, PendingIo, complete_pending, read_message_or_signal, write_frame,
+    IO_TIMEOUT, PendingIo, complete_pending, read_message, read_message_or_signal, write_frame,
 };
 
+/// How long a freshly connected client may take to send its first command.
+const FIRST_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MultiCore.Service.v2";
-/// Protected DACL: FILE_GENERIC_READ | FILE_GENERIC_WRITE for SYSTEM, Administrators and
-/// interactive users (INTERACTIVE, `S-1-5-4`). No Everyone, Anonymous or Network entry.
+/// What an interactive client may do with the pipe: `FILE_READ_DATA | FILE_WRITE_DATA |
+/// FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE`. Deliberately without
+/// `FILE_APPEND_DATA` (= `FILE_CREATE_PIPE_INSTANCE`), so no user can add server instances of
+/// the service pipe and catch other users' daemons. `FILE_WRITE_ATTRIBUTES` is what
+/// `SetNamedPipeHandleState` needs. The daemon opens the pipe with exactly these rights.
+#[allow(
+    dead_code,
+    reason = "pinned by the tests; the daemon opens with the same rights"
+)]
+pub(crate) const CLIENT_PIPE_ACCESS: u32 = 0x0010_0183;
+/// Protected DACL: FILE_GENERIC_READ | FILE_GENERIC_WRITE for SYSTEM and Administrators,
+/// [`CLIENT_PIPE_ACCESS`] for interactive users (INTERACTIVE, `S-1-5-4`). No Everyone,
+/// Anonymous or Network entry.
 pub(crate) const PIPE_SDDL: &str =
-    "D:P(A;;0x0012019f;;;SY)(A;;0x0012019f;;;BA)(A;;0x0012019f;;;IU)";
+    "D:P(A;;0x0012019f;;;SY)(A;;0x0012019f;;;BA)(A;;0x00100183;;;IU)";
 
 pub(crate) type Verifier = dyn Fn(HANDLE) -> Result<ClientIdentity, IdentityError> + Send + Sync;
 
 /// One server instance of `name`. `first` adds `FILE_FLAG_FIRST_PIPE_INSTANCE`, so the service
 /// refuses to start when someone else already owns the name.
+#[allow(dead_code, reason = "the tests pin the production DACL through it")]
 pub(crate) fn create_instance(name: &str, first: bool) -> io::Result<OwnedHandle> {
-    let sddl = OsStr::new(PIPE_SDDL)
+    create_instance_with(name, first, PIPE_SDDL)
+}
+
+/// [`create_instance`] with an explicit security descriptor (tests use narrower ones).
+pub(crate) fn create_instance_with(name: &str, first: bool, sddl: &str) -> io::Result<OwnedHandle> {
+    let sddl = OsStr::new(sddl)
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
@@ -149,10 +169,22 @@ pub(crate) fn serve<C: Cores + 'static>(
     verifier: Arc<Verifier>,
     stop: Arc<OwnedHandle>,
 ) -> io::Result<()> {
+    serve_with(name, PIPE_SDDL, service, verifier, stop)
+}
+
+/// [`serve`] with an explicit pipe DACL. The service DACL lets only SYSTEM and Administrators
+/// create instances, so tests running as a standard user pass one that includes them.
+pub(crate) fn serve_with<C: Cores + 'static>(
+    name: &str,
+    sddl: &str,
+    service: Arc<Mutex<ServiceLoop<C>>>,
+    verifier: Arc<Verifier>,
+    stop: Arc<OwnedHandle>,
+) -> io::Result<()> {
     let next = AtomicU64::new(1);
     let mut first = true;
     loop {
-        let instance = create_instance(name, first)?;
+        let instance = create_instance_with(name, first, sddl)?;
         first = false;
         match wait_connect(instance.as_raw_handle(), stop.as_raw_handle()) {
             Ok(Accepted::Stopped) => return Ok(()),
@@ -182,6 +214,12 @@ fn handle_connection<C: Cores>(
     stop: Arc<OwnedHandle>,
 ) {
     let pipe = instance.as_raw_handle();
+    // The client is identified once it sent its first command: impersonating it (to bind the
+    // connection to its token) needs data read from the pipe. A silent client is dropped.
+    let Ok(first) = read_message(pipe, FIRST_COMMAND_TIMEOUT) else {
+        unsafe { DisconnectNamedPipe(pipe) };
+        return;
+    };
     let Ok(identity) = verifier(pipe) else {
         let _ = reply(
             pipe,
@@ -192,7 +230,11 @@ fn handle_connection<C: Cores>(
         unsafe { DisconnectNamedPipe(pipe) };
         return;
     };
-    while let Ok(frame) = read_message_or_signal(pipe, stop.as_raw_handle()) {
+    let mut pending = Some(first);
+    while let Some(frame) = pending
+        .take()
+        .or_else(|| read_message_or_signal(pipe, stop.as_raw_handle()).ok())
+    {
         let Ok(command) = decode_service_command(&frame) else {
             let _ = reply(
                 pipe,
@@ -203,10 +245,7 @@ fn handle_connection<C: Cores>(
             break;
         };
         let shutdown = command == ServiceCommand::Shutdown;
-        let response = service
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .execute(id, &identity, command);
+        let response = execute_shared(&service, id, &identity, command);
         if !reply(pipe, &response) || shutdown {
             break;
         }

@@ -819,6 +819,27 @@ pub mod windows {
 
     pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\MultiCore.Service.v2";
     pub const SERVICE_NAME: &str = "MultiCore";
+    /// Exactly what the service's pipe DACL grants INTERACTIVE users (core-host
+    /// `windows_server::CLIENT_PIPE_ACCESS`): `FILE_READ_DATA | FILE_WRITE_DATA |
+    /// FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE`. `GENERIC_WRITE` would include
+    /// `FILE_APPEND_DATA` (= create pipe instance), which the service does not grant.
+    pub const SERVICE_PIPE_ACCESS: u32 = 0x0010_0183;
+
+    /// Opens a service pipe with [`SERVICE_PIPE_ACCESS`], identification-level SQOS (the
+    /// server can check but never act as this user) and message read mode.
+    pub fn open_service_pipe(name: &str) -> std::io::Result<std::fs::File> {
+        let pipe = OpenOptions::new()
+            .access_mode(SERVICE_PIPE_ACCESS)
+            .custom_flags(FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+            .open(name)?;
+        let mode = PIPE_READMODE_MESSAGE;
+        if unsafe { SetNamedPipeHandleState(pipe.as_raw_handle(), &mode, ptr::null(), ptr::null()) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pipe)
+    }
 
     fn wide(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
@@ -944,21 +965,8 @@ pub mod windows {
                 }
                 std::thread::sleep(START_POLL);
             }
-            let pipe = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(
-                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                )
-                .open(SERVICE_PIPE_NAME)
-                .map_err(|_| ServiceError::Unavailable)?;
-            let mode = PIPE_READMODE_MESSAGE;
-            if unsafe {
-                SetNamedPipeHandleState(pipe.as_raw_handle(), &mode, ptr::null(), ptr::null())
-            } == 0
-            {
-                return Err(ServiceError::Unavailable);
-            }
+            let pipe =
+                open_service_pipe(SERVICE_PIPE_NAME).map_err(|_| ServiceError::Unavailable)?;
             let mut server_pid = 0;
             if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut server_pid) } == 0
                 || server_pid != service_pid
@@ -967,6 +975,89 @@ pub mod windows {
             }
             Ok(PipeTransport { pipe })
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_pipe_access_tests {
+    use super::windows::{SERVICE_PIPE_ACCESS, open_service_pipe};
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
+        Security::{
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+        System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+            PIPE_WAIT,
+        },
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// A pipe whose DACL grants everyone (standing in for INTERACTIVE) exactly the service's
+    /// client rights.
+    fn restricted_pipe(name: &str) -> HANDLE {
+        let sddl = wide(&format!(
+            "D:P(A;;GA;;;SY)(A;;{SERVICE_PIPE_ACCESS:#010x};;;WD)"
+        ));
+        let mut descriptor = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let security = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let name = wide(name);
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                2,
+                4096,
+                4096,
+                0,
+                &security,
+            )
+        };
+        unsafe { LocalFree(descriptor.cast()) };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        handle
+    }
+
+    #[test]
+    fn the_daemon_opens_the_service_pipe_with_only_the_granted_rights() {
+        assert_eq!(SERVICE_PIPE_ACCESS, 0x0010_0183);
+        assert_eq!(SERVICE_PIPE_ACCESS & 0x4, 0, "no FILE_CREATE_PIPE_INSTANCE");
+        let name = format!(
+            r"\\.\pipe\MultiCore.Service.daemon-test.{}",
+            std::process::id()
+        );
+        let server = restricted_pipe(&name);
+        let generic = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap_err();
+        assert_eq!(generic.raw_os_error(), Some(5), "{generic}");
+        let pipe = open_service_pipe(&name).expect("open with the service client rights");
+        drop(pipe);
+        unsafe { CloseHandle(server) };
     }
 }
 

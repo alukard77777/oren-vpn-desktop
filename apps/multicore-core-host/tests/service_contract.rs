@@ -1080,8 +1080,10 @@ mod windows_pipe_server {
     use super::service::windows_identity::{
         IdentityError, client_facts, normalized, user_data_root,
     };
-    use super::service::windows_server::{PIPE_SDDL, create_instance, serve};
-    use super::windows_pipe::{connect, read_message, write_frame};
+    use super::service::windows_server::{
+        CLIENT_PIPE_ACCESS, PIPE_SDDL, create_instance, create_instance_with, serve_with,
+    };
+    use super::windows_pipe::{read_message, write_frame};
     use multicore_core::elevation_protocol::BrokerErrorCode;
     use multicore_core::service_protocol::{
         ServiceCommand, ServiceResponse, decode_service_frame, encode_service_frame,
@@ -1110,6 +1112,40 @@ mod windows_pipe_server {
             Threading::{CreateEventW, SetEvent},
         },
     };
+
+    /// Opens a service pipe the way the daemon does: exactly the INTERACTIVE rights,
+    /// identification-level SQOS, message read mode.
+    fn connect(name: &str, _timeout: Duration) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Storage::FileSystem::{
+                FILE_FLAG_OVERLAPPED, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+            },
+            System::Pipes::{PIPE_READMODE_MESSAGE, SetNamedPipeHandleState},
+        };
+        let pipe = std::fs::OpenOptions::new()
+            .access_mode(CLIENT_PIPE_ACCESS)
+            .custom_flags(FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+            .open(name)?;
+        let mode = PIPE_READMODE_MESSAGE;
+        if unsafe {
+            SetNamedPipeHandleState(
+                pipe.as_raw_handle(),
+                &mode,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(pipe)
+    }
+
+    /// The service DACL, plus instance creation for the pipe's owner (this test process, a
+    /// standard user); clients still get only the INTERACTIVE rights.
+    const TEST_SDDL: &str =
+        "D:P(A;;0x0012019f;;;SY)(A;;0x0012019f;;;BA)(A;;0x0012019f;;;OW)(A;;0x00100183;;;IU)";
 
     fn unique_name() -> String {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1231,10 +1267,69 @@ mod windows_pipe_server {
             "{sddl}"
         );
         assert!(PIPE_SDDL.contains("IU"));
+        let interactive = sddl
+            .split('(')
+            .find(|ace| ace.ends_with(";;;IU)"))
+            .expect("an INTERACTIVE ace");
+        assert_eq!(interactive, "A;;0x100183;;;IU)", "{sddl}");
+        assert_eq!(CLIENT_PIPE_ACCESS & 0x4, 0, "no FILE_CREATE_PIPE_INSTANCE");
         assert!(
             create_instance(&name, true).is_err(),
             "a second first-instance of an existing name must fail"
         );
+    }
+
+    #[test]
+    fn clients_with_the_interactive_rights_cannot_add_server_instances() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Storage::FileSystem::FILE_FLAG_OVERLAPPED,
+            System::Pipes::{PIPE_READMODE_MESSAGE, SetNamedPipeHandleState},
+        };
+        // The service DACL with Everyone standing in for INTERACTIVE (so the test also runs
+        // over SSH) and SYSTEM as the only instance creator.
+        let name = unique_name();
+        let restricted = format!("D:P(A;;GA;;;SY)(A;;{CLIENT_PIPE_ACCESS:#010x};;;WD)");
+        let _server = create_instance_with(&name, true, &restricted).unwrap();
+        let squatter = create_instance_with(&name, false, &restricted).unwrap_err();
+        assert_eq!(
+            squatter.raw_os_error(),
+            Some(5),
+            "ERROR_ACCESS_DENIED: {squatter}"
+        );
+        let generic = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+            .unwrap_err();
+        assert_eq!(
+            generic.raw_os_error(),
+            Some(5),
+            "GENERIC_WRITE includes FILE_APPEND_DATA and is refused: {generic}"
+        );
+        let client = std::fs::OpenOptions::new()
+            .access_mode(CLIENT_PIPE_ACCESS)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(&name)
+            .unwrap();
+        let mode = PIPE_READMODE_MESSAGE;
+        assert_ne!(
+            unsafe {
+                SetNamedPipeHandleState(
+                    client.as_raw_handle(),
+                    &mode,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        write_frame(
+            client.as_raw_handle(),
+            encode_service_frame(&ServiceCommand::Status).unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1244,7 +1339,15 @@ mod windows_pipe_server {
         let client_name = name.clone();
         let client = thread::spawn(move || connect(&client_name, Duration::from_secs(5)).unwrap());
         // A client may open a freshly created instance before ConnectNamedPipe is called.
-        let _client = client.join().unwrap();
+        let client = client.join().unwrap();
+        // The server identifies a client after its first message (impersonation needs data).
+        write_frame(
+            client.as_raw_handle(),
+            encode_service_frame(&ServiceCommand::Status).unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        read_message(server.as_raw_handle(), Duration::from_secs(5)).unwrap();
         let (facts, token) = client_facts(server.as_raw_handle()).unwrap();
         assert_eq!(
             normalized(&facts.image),
@@ -1288,7 +1391,7 @@ mod windows_pipe_server {
         let stop = manual_event();
         let server = {
             let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
-            thread::spawn(move || serve(&name, service, verifier, stop).unwrap())
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
         };
         let alice = connect_to_server(&name);
         assert!(matches!(
@@ -1320,12 +1423,11 @@ mod windows_pipe_server {
         let stop = manual_event();
         let server = {
             let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
-            thread::spawn(move || serve(&name, service, verifier, stop).unwrap())
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
         };
         let intruder = connect_to_server(&name);
-        let frame = read_message(intruder.as_raw_handle(), Duration::from_secs(5)).unwrap();
         assert_eq!(
-            decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+            request(&intruder, &ServiceCommand::Prepare { generation_id: 1 }),
             ServiceResponse::Error {
                 code: BrokerErrorCode::AuthenticationFailed
             }
@@ -1345,13 +1447,49 @@ mod windows_pipe_server {
     }
 
     #[test]
+    fn a_client_is_identified_only_after_its_first_command_and_a_silent_one_is_dropped() {
+        let name = unique_name();
+        let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let verifier = Arc::new(move |pipe: windows_sys::Win32::Foundation::HANDLE| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            alice_only(pipe)
+        });
+        let stop = manual_event();
+        let server = {
+            let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
+        };
+        let silent = connect_to_server(&name);
+        let started = Instant::now();
+        assert!(
+            read_message(silent.as_raw_handle(), Duration::from_secs(10)).is_err(),
+            "a client that never sends is disconnected"
+        );
+        assert!(started.elapsed() < Duration::from_secs(9));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "never identified");
+        let alice = connect_to_server(&name);
+        assert!(matches!(
+            request(&alice, &ServiceCommand::Status),
+            ServiceResponse::Status { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(alice);
+        unsafe { SetEvent(stop.as_raw_handle()) };
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_stop_signal_ends_open_connections_and_releases_the_owner() {
         let name = unique_name();
         let service = Arc::new(Mutex::new(ServiceLoop::new(FakeCores::default())));
         let stop = manual_event();
         let server = {
             let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
-            thread::spawn(move || serve(&name, service, Arc::new(alice_only), stop).unwrap())
+            thread::spawn(move || {
+                serve_with(&name, TEST_SDDL, service, Arc::new(alice_only), stop).unwrap()
+            })
         };
         let alice = connect_to_server(&name);
         assert!(matches!(
@@ -1876,6 +2014,188 @@ async fn a_trickling_client_is_released_within_the_drain_deadline() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };
     assert!(closed, "the drain deadline must end the connection");
+}
+
+mod update_outside_the_lock {
+    use super::{FakeCores, user};
+    use crate::service::core_loop::{
+        ClientIdentity, ConnectionId, ServiceLoop, ServiceUpdater, execute_shared,
+    };
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse};
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    /// `prepare` reports that the download started, then blocks until released.
+    struct BlockingDownload {
+        started: Sender<()>,
+        release: Mutex<Receiver<Result<(), BrokerErrorCode>>>,
+        begun: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ServiceUpdater for BlockingDownload {
+        fn prepare(
+            &mut self,
+            _client: &ClientIdentity,
+            _version: &str,
+        ) -> Result<(), BrokerErrorCode> {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap()
+        }
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.begun
+                .lock()
+                .unwrap()
+                .push(format!("{}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    fn update() -> ServiceCommand {
+        ServiceCommand::Update {
+            version: "1.2.0".into(),
+        }
+    }
+
+    struct Harness {
+        service: Arc<Mutex<ServiceLoop<FakeCores>>>,
+        started: Receiver<()>,
+        release: Sender<Result<(), BrokerErrorCode>>,
+        begun: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn harness() -> Harness {
+        let (started_tx, started) = channel();
+        let (release, release_rx) = channel();
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let service = Arc::new(Mutex::new(
+            ServiceLoop::new(FakeCores::default()).with_updater(Box::new(BlockingDownload {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+                begun: begun.clone(),
+            })),
+        ));
+        Harness {
+            service,
+            started,
+            release,
+            begun,
+        }
+    }
+
+    fn run(
+        service: &Arc<Mutex<ServiceLoop<FakeCores>>>,
+        connection: u64,
+        key: &str,
+        command: ServiceCommand,
+    ) -> ServiceResponse {
+        execute_shared(service, ConnectionId(connection), &user(key), command)
+    }
+
+    fn spawn_update(
+        service: &Arc<Mutex<ServiceLoop<FakeCores>>>,
+        key: &'static str,
+    ) -> thread::JoinHandle<ServiceResponse> {
+        let service = service.clone();
+        thread::spawn(move || run(&service, 9, key, update()))
+    }
+
+    #[test]
+    fn the_owner_is_served_while_an_update_downloads() {
+        let h = harness();
+        assert!(matches!(
+            run(
+                &h.service,
+                1,
+                "1:alice",
+                ServiceCommand::Prepare { generation_id: 1 }
+            ),
+            ServiceResponse::Prepared { .. }
+        ));
+        let updating = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The download blocks, yet the loop answers at once: no lock is held.
+        assert!(
+            h.service.try_lock().is_ok(),
+            "the download must not hold the lock"
+        );
+        assert_eq!(
+            run(
+                &h.service,
+                1,
+                "1:alice",
+                ServiceCommand::SetTun { on: true }
+            ),
+            ServiceResponse::TunState { on: true }
+        );
+        assert!(matches!(
+            run(&h.service, 1, "1:alice", ServiceCommand::Status),
+            ServiceResponse::Status { tun_on: true, .. }
+        ));
+        h.service.lock().unwrap().tick();
+        assert_eq!(
+            run(&h.service, 2, "1:alice", update()),
+            ServiceResponse::Busy,
+            "a second update while one downloads"
+        );
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(updating.join().unwrap(), ServiceResponse::UpdateStarted);
+        assert!(!h.service.lock().unwrap().cores_mut().running);
+        assert_eq!(*h.begun.lock().unwrap(), ["1:alice@1.2.0"]);
+    }
+
+    #[test]
+    fn a_failed_download_releases_the_update_slot_and_keeps_the_cores() {
+        let h = harness();
+        run(
+            &h.service,
+            1,
+            "1:alice",
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        let updating = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.release
+            .send(Err(BrokerErrorCode::InvalidRequest))
+            .unwrap();
+        assert_eq!(
+            updating.join().unwrap(),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest
+            }
+        );
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        let again = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(again.join().unwrap(), ServiceResponse::UpdateStarted);
+    }
+
+    #[test]
+    fn a_user_who_claimed_the_cores_during_the_download_keeps_them() {
+        let h = harness();
+        let updating = spawn_update(&h.service, "1:alice");
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            run(
+                &h.service,
+                3,
+                "2:bob",
+                ServiceCommand::Prepare { generation_id: 4 }
+            ),
+            ServiceResponse::Prepared { .. }
+        ));
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(updating.join().unwrap(), ServiceResponse::Busy);
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        assert!(h.begun.lock().unwrap().is_empty());
+        assert_eq!(h.service.lock().unwrap().owner_key(), Some("2:bob"));
+    }
 }
 
 /// After `SetTun{off}` the service confirms the loopback mixed port is back (a Mihomo listener
