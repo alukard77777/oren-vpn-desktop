@@ -181,9 +181,18 @@ struct Envelope<T> {
 }
 
 pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    encode_frame_versioned(ELEVATION_PROTOCOL_VERSION, value)
+}
+
+/// Encodes `value` in the bounded envelope used by every privileged channel, tagged with
+/// `version` (1: on-demand host, 2: always-ready service).
+pub fn encode_frame_versioned<T: Serialize>(
+    version: u16,
+    value: &T,
+) -> Result<Vec<u8>, ProtocolError> {
     let payload = Zeroizing::new(
         serde_json::to_vec(&Envelope {
-            version: ELEVATION_PROTOCOL_VERSION,
+            version,
             body: value,
         })
         .map_err(|_| ProtocolError::InvalidSchema)?,
@@ -199,6 +208,14 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
 }
 
 pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtocolError> {
+    decode_frame_versioned(ELEVATION_PROTOCOL_VERSION, frame)
+}
+
+/// Decodes a frame produced by [`encode_frame_versioned`] with exactly `version`.
+pub fn decode_frame_versioned<T: DeserializeOwned>(
+    version: u16,
+    frame: &[u8],
+) -> Result<T, ProtocolError> {
     let header: [u8; 4] = frame
         .get(..4)
         .ok_or(ProtocolError::Truncated)?
@@ -221,7 +238,7 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtocolErro
     std::str::from_utf8(payload).map_err(|_| ProtocolError::InvalidUtf8)?;
     let envelope: Envelope<T> =
         serde_json::from_slice(payload).map_err(|_| ProtocolError::InvalidSchema)?;
-    if envelope.version != ELEVATION_PROTOCOL_VERSION {
+    if envelope.version != version {
         return Err(ProtocolError::UnknownVersion);
     }
     Ok(envelope.body)

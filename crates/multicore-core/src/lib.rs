@@ -6,6 +6,7 @@ mod input;
 mod network;
 mod profile;
 mod service_logo;
+pub mod service_protocol;
 mod sidecar;
 mod snapshot;
 mod state;
