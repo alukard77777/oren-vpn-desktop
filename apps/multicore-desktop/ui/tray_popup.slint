@@ -523,38 +523,110 @@ export component TrayPopup inherits Window {
                     }
                 }
 
-                // The switch; it lights up only while the pointer is over it.
+                // The home screen's "energy rail + power orb" switch, scaled for the tray:
+                // green when on; matte with a blue outline while busy; matte when off.
+                // Solid fills only (gradients ignore border-radius in the software renderer).
                 switch-track := Rectangle {
                     property <bool> hovered: card-touch.has-hover
                         && card-touch.mouse-x >= self.x - 6px && card-touch.mouse-x <= self.x + self.width + 6px
                         && card-touch.mouse-y >= self.y - 6px && card-touch.mouse-y <= self.y + self.height + 6px;
+                    property <bool> lit: root.shown-on && !root.shown-busy;
                     x: parent.width - self.width - 12px;
                     y: (parent.height - self.height) / 2;
-                    width: 46px;
-                    height: 28px;
-                    border-radius: 14px;
-                    background: root.shown-busy ? #4c9dff59
-                        : root.shown-on ? (self.hovered ? #4ad98c : Theme.accent-green)
-                        : (self.hovered ? #3a414b : Theme.line);
-                    border-color: switch-focus.has-focus ? Theme.focus : #ffffff59;
-                    border-width: switch-focus.has-focus ? Theme.focus-width
-                        : self.hovered && root.connection-enabled ? 2px : 0px;
+                    width: 58px;
+                    height: 32px;
+                    background: transparent;
                     opacity: root.connection-enabled || root.shown-busy ? 1 : 0.4;
-                    animate background { duration: 180ms; easing: ease-in-out; }
-                    animate border-width { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                    animate opacity { duration: 180ms; easing: ease-in-out; }
 
                     Rectangle {
-                        x: root.shown-on ? parent.width - self.width - 3px : 3px;
+                        x: 4px;
                         y: (parent.height - self.height) / 2;
-                        width: card-touch.pressed ? 25px : switch-track.hovered ? 23px : 22px;
-                        height: switch-track.hovered ? 23px : 22px;
+                        width: parent.width - 8px;
+                        height: 22px;
                         border-radius: self.height / 2;
-                        background: #ffffff;
-                        drop-shadow-blur: 5px;
+                        background: switch-track.lit ? #28a863 : #1a1e24;
+                        border-color: switch-focus.has-focus ? Theme.focus
+                            : root.shown-busy ? #4c9dff99
+                            : switch-track.lit ? #ffffff26
+                            : (switch-track.hovered ? #4a525e : #2a3038);
+                        border-width: switch-focus.has-focus ? Theme.focus-width : 1px;
+                        drop-shadow-blur: switch-track.lit ? (switch-track.hovered ? 12px : 8px) : 0px;
+                        drop-shadow-color: #3ccb7f55;
+                        animate background, border-color, drop-shadow-blur { duration: 220ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                        Rectangle {
+                            x: 2px;
+                            y: 2px;
+                            width: parent.width - 4px;
+                            height: parent.height / 2 - 2px;
+                            border-radius: self.height / 2;
+                            background: #ffffff;
+                            opacity: switch-track.lit ? 0.14 : 0;
+                        }
+                        for dot[i] in 2: Rectangle {
+                            x: 9px + i * 10px;
+                            y: (parent.height - self.height) / 2;
+                            width: 3px;
+                            height: 3px;
+                            border-radius: 1.5px;
+                            background: root.shown-busy ? Theme.accent-blue : #ffffff;
+                            opacity: root.shown-on || root.shown-busy ? 0.85 - i * 0.35 : 0;
+                            animate opacity { duration: 220ms; easing: ease-out; }
+                        }
+                    }
+
+                    Rectangle {
+                        property <length> size: card-touch.pressed ? 27px : switch-track.hovered ? 31px : 30px;
+                        x: root.shown-on ? parent.width - self.width : 0px;
+                        y: (parent.height - self.height) / 2;
+                        width: self.size;
+                        height: self.size;
+                        border-radius: self.height / 2;
+                        background: switch-track.lit ? #2fbf73 : (switch-track.hovered ? #242931 : #1e2229);
+                        border-color: root.shown-busy ? #4c9dff80
+                            : switch-track.lit ? #ffffff4d
+                            : (switch-track.hovered ? #ffffff2e : #ffffff14);
+                        border-width: 1px;
+                        drop-shadow-blur: switch-track.lit ? 10px : 5px;
                         drop-shadow-offset-y: 1px;
-                        drop-shadow-color: #00000059;
+                        drop-shadow-color: switch-track.lit ? #1e8f5380 : #00000080;
                         animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
                         animate width, height { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                        animate background, border-color { duration: 220ms; easing: ease-out; }
+                        Rectangle {
+                            x: 2px;
+                            y: 2px;
+                            width: parent.width - 4px;
+                            height: parent.height / 2 - 1px;
+                            border-radius: self.width / 2;
+                            background: switch-track.lit ? #ffffff2e : transparent;
+                        }
+                        Rectangle {
+                            x: -3px;
+                            y: -3px;
+                            width: parent.width + 6px;
+                            height: parent.height + 6px;
+                            border-radius: self.height / 2;
+                            border-width: 1px;
+                            border-color: root.shown-busy ? #4c9dff59 : #3ccb7f66;
+                            background: transparent;
+                            opacity: root.shown-on || root.shown-busy ? 1 : 0;
+                            animate opacity { duration: 220ms; easing: ease-out; }
+                        }
+                        Image {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 14px;
+                            height: 14px;
+                            source: root.shown-busy ? @image-url("../assets/shield.svg")
+                                : root.shown-on ? @image-url("../assets/shield-check.svg")
+                                : @image-url("../assets/shield-off.svg");
+                            colorize: root.shown-busy ? Theme.accent-blue
+                                : root.shown-on ? #ffffff
+                                : (switch-track.hovered ? Theme.text-secondary : Theme.text-muted);
+                            image-fit: contain;
+                            accessible-role: none;
+                        }
                     }
                 }
 
