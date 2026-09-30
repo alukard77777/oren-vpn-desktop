@@ -418,8 +418,8 @@ fn an_update_runs_on_its_own_channel_and_keeps_the_cores() {
     {
         thread::yield_now();
     }
-    // While the service downloads, the connection's own channel stays usable and the watcher
-    // does not ask for a Status the busy service could not answer in time.
+    // While the service downloads, the connection's own channel stays usable: the watcher
+    // keeps polling (the service answers outside its update) and a disconnect goes through.
     session.poll();
     assert!(session.cores_ready());
     session.set_tun(false).unwrap();
@@ -427,7 +427,7 @@ fn an_update_runs_on_its_own_channel_and_keeps_the_cores() {
     updating.join().unwrap().unwrap();
     let service = connector.0.lock().unwrap();
     assert_eq!(service.connects, 2, "the update opened its own channel");
-    assert!(!service.commands.contains(&ServiceCommand::Status));
+    assert!(service.commands.contains(&ServiceCommand::Status));
 }
 
 #[test]

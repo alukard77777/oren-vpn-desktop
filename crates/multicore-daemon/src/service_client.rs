@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -247,27 +247,7 @@ pub struct ServiceSession<C: ServiceConnector> {
     /// it is set. Changed only under the transport lock.
     owner: Mutex<Option<u64>>,
     available: AtomicBool,
-    /// `Update` exchanges in flight. The service answers nothing else until the download is
-    /// done, so the watcher's `Status` and `Diagnostics` would time out and drop the
-    /// connection's channel, which makes the service stop the cores even if the update fails.
-    updating: AtomicUsize,
     controller: Arc<ControllerSlot>,
-}
-
-/// Marks an `Update` exchange in flight for as long as it lives.
-struct UpdateInFlight<'a>(&'a AtomicUsize);
-
-impl<'a> UpdateInFlight<'a> {
-    fn begin(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self(counter)
-    }
-}
-
-impl Drop for UpdateInFlight<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 impl<C: ServiceConnector> ServiceSession<C> {
@@ -283,7 +263,6 @@ impl<C: ServiceConnector> ServiceSession<C> {
             in_use: AtomicU8::new(IN_USE_NONE),
             owner: Mutex::new(None),
             available: AtomicBool::new(false),
-            updating: AtomicUsize::new(0),
             controller,
         }
     }
@@ -367,15 +346,7 @@ impl<C: ServiceConnector> ServiceSession<C> {
             .unwrap_or(false)
     }
 
-    fn update_in_flight(&self) -> bool {
-        self.updating.load(Ordering::Acquire) > 0
-    }
-
     pub fn probe(&self) -> Result<(), ServiceError> {
-        if self.update_in_flight() {
-            // The service is there (it is downloading for us) and cannot answer now.
-            return Ok(());
-        }
         let had_channel = self.has_channel();
         let result = match self.request(&ServiceCommand::Status, true) {
             // A channel that died since its last use says nothing about the service: retry on
@@ -535,10 +506,6 @@ impl<C: ServiceConnector> ServiceSession<C> {
 
     /// Refreshes readiness from `Status` over an existing channel (never connects).
     pub fn poll(&self) {
-        if self.update_in_flight() {
-            // Nothing changes while the service downloads; asking would only time out.
-            return;
-        }
         let result = self.exchange(&ServiceCommand::Status, false, |session, response| {
             if let ServiceResponse::Status {
                 generation_id,
@@ -602,9 +569,11 @@ impl<C: ServiceConnector> ServiceSession<C> {
 
     /// Asks the service to download, verify and install `version`. The exchange can take
     /// minutes, so it runs on a channel of its own: the connection's channel (selection,
-    /// latency, disconnect) stays free, and a failed download leaves the cores running.
+    /// latency, disconnect) stays free, and a failed download leaves the cores running. The
+    /// service downloads outside its loop lock and keeps answering `Status`, `SetTun` and
+    /// `Diagnostics` on that channel meanwhile, so the watcher keeps polling as usual and a
+    /// core crash during the download is still noticed.
     pub fn update(&self, version: &str) -> Result<(), ServiceError> {
-        let _in_flight = UpdateInFlight::begin(&self.updating);
         let transport = self.connector.connect()?;
         match transport.request(&ServiceCommand::Update {
             version: version.to_owned(),
@@ -618,9 +587,6 @@ impl<C: ServiceConnector> ServiceSession<C> {
 
     #[must_use]
     pub fn diagnostics(&self) -> ProcessDiagnostics {
-        if self.update_in_flight() {
-            return ProcessDiagnostics::default();
-        }
         match self.request(&ServiceCommand::Diagnostics, false) {
             Ok(ServiceResponse::ProcessDiagnostics {
                 xray,
