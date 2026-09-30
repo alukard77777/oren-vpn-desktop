@@ -450,7 +450,17 @@ impl TokioProcessLauncher {
         self.logs.clone()
     }
 
-    async fn runtime_ready(&self, engine: Engine) -> bool {
+    /// Readiness while a core starts: listeners up and, for Xray, a proven DNS + dial path.
+    pub(crate) async fn startup_ready(&self, engine: Engine) -> bool {
+        self.runtime_ready(engine, true).await
+    }
+
+    /// Whether `engine` is ready. `settle` additionally proves Xray's DNS + outbound dial path
+    /// (a window of over a second); it belongs to starting a core only. Health checks (the
+    /// service's 2 s tick, every `Status`, diagnostics) pass `false`: they run under the
+    /// service's lock, where a settle window stalled every `Status`, `Prepare` and `SetTun`
+    /// for seconds on a subscription with a domain endpoint.
+    async fn runtime_ready(&self, engine: Engine, settle: bool) -> bool {
         let Some(runtime) = &self.runtime else {
             return true;
         };
@@ -483,7 +493,7 @@ impl TokioProcessLauncher {
                 // Require one real proxied dial to succeed first, so nothing
                 // downstream starts until Xray's actual DNS+dial path is
                 // proven, not just its listeners.
-                xray_domain_dns_warm(&runtime.paths.xray_config).await
+                !settle || xray_domain_dns_warm(&runtime.paths.xray_config).await
             }
             Engine::Mihomo => {
                 let Ok(targets) = mihomo_readiness_targets(&runtime.paths) else {
@@ -606,7 +616,7 @@ impl ProcessLauncher for TokioProcessLauncher {
                 if child.has_exited()? {
                     return Err(ProcessError::ReadinessFailed(command.engine));
                 }
-                if self.runtime_ready(command.engine).await {
+                if self.runtime_ready(command.engine, true).await {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -621,7 +631,7 @@ impl ProcessLauncher for TokioProcessLauncher {
         &'a self,
         engine: Engine,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move { self.runtime_ready(engine).await })
+        Box::pin(async move { self.runtime_ready(engine, false).await })
     }
 
     fn diagnostic_logs(&self) -> Vec<CoreLogRecord> {
@@ -722,7 +732,7 @@ pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
         if child.has_exited()? {
             return Err(ProcessError::ReadinessFailed(command.engine));
         }
-        if readiness.current_ready(command.engine).await {
+        if readiness.startup_ready(command.engine).await {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {

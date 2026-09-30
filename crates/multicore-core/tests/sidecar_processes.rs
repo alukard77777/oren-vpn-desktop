@@ -649,6 +649,68 @@ async fn service_mihomo_without_ports_is_ready_once_its_controller_listens() {
     assert!(!service.current_ready(Engine::Mihomo).await);
 }
 
+/// Health checks run under the service's lock every 2 s and on every `Status`. They must not
+/// pay Xray's DNS-and-dial settle window (over a second for a domain endpoint): it stalled
+/// every `Status`, `Prepare` and `SetTun` of a real PC for seconds. Only starting Xray proves
+/// that path.
+#[tokio::test]
+async fn health_check_of_xray_with_a_domain_endpoint_does_not_wait_for_the_settle_window() {
+    use std::io::{Read, Write};
+    let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socks_port = socks.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in socks.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut greeting = [0_u8; 3];
+                if stream.read_exact(&mut greeting).is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&[5, 0]);
+                let mut buffer = [0_u8; 256];
+                if stream.read(&mut buffer).unwrap_or(0) == 0 {
+                    return;
+                }
+                let _ = stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+                while stream.read(&mut buffer).unwrap_or(0) > 0 {}
+            });
+        }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let xray_config = root.path().join("xray.json");
+    std::fs::write(
+        &xray_config,
+        serde_json::json!({
+            "inbounds": [{
+                "tag": "bridge", "protocol": "socks", "listen": "127.0.0.1", "port": socks_port
+            }],
+            "outbounds": [{
+                "tag": "bridge",
+                "protocol": "shadowsocks",
+                "settings": { "address": "edge.example", "port": 443 }
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let paths = RuntimePaths {
+        xray_binary: PathBuf::new(),
+        mihomo_binary: PathBuf::new(),
+        xray_config,
+        mihomo_config: root.path().join("mihomo.yaml"),
+        dashboard_directory: None,
+        mihomo_home_directory: None,
+    };
+    let launcher = TokioProcessLauncher::for_runtime(paths, Duration::from_secs(5));
+    let started = std::time::Instant::now();
+    assert!(launcher.current_ready(Engine::Xray).await);
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "a health check took {:?}: it waited for the startup settle window",
+        started.elapsed()
+    );
+}
+
 /// The persistent core log rotates at a fixed size and keeps exactly one predecessor, so a
 /// chatty core can never fill the disk (a long-running service writes it for days).
 #[test]
