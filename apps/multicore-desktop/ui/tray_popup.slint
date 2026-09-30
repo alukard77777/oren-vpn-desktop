@@ -8,236 +8,105 @@ export struct TrayMenuRow {
     icon: string,
     icon-image: image,
     label: string,
+    // Groups: the selected node's label. Nodes: the latency text.
     detail: string,
+    // Nodes: latency tone ("success" | "warning" | "danger" | "neutral").
+    tone: string,
+    // Groups: the group shown in the popup. Nodes: the selected route.
     selected: bool,
     enabled: bool,
-    expanded: bool,
-    node-count: int,
 }
 
-component PopupAction inherits Rectangle {
+// Quiet footer action: lucide icon + label, soft wash on hover, focus ring.
+component TrayTextAction inherits Rectangle {
     in property <string> label;
-    in property <string> icon;
-    in property <image> icon-image;
-    in property <string> icon-kind;
-    in property <bool> selected: false;
-    in property <bool> enabled: true;
+    in property <image> icon;
+    in property <bool> muted: false;
     callback activated();
 
-    height: 40px;
-    border-radius: Theme.radius-small;
-    background: root.selected ? #4c9dff16 : action-touch.has-hover ? #ffffff0b : transparent;
-    opacity: root.enabled ? 1 : 0.42;
+    height: 36px;
+    border-radius: 8px;
+    background: text-touch.has-hover ? #ffffff0a : transparent;
+    border-color: Theme.focus;
+    border-width: text-focus.has-focus ? Theme.focus-width : 0px;
     accessible-role: button;
     accessible-label: root.label;
-    accessible-enabled: root.enabled;
-    accessible-action-default => { if (root.enabled) { root.activated(); } }
+    accessible-action-default => { root.activated(); }
+    animate background { duration: 120ms; easing: ease-out; }
 
-    if root.icon-image.width > 0: Image {
-        x: 12px;
-        y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
-        source: root.icon-image;
-        image-fit: contain;
-    }
-
-    if root.icon != "" && root.icon-image.width == 0: Text {
-        x: 10px;
-        width: 22px;
-        height: parent.height;
-        text: root.icon;
-        color: Theme.text-secondary;
-        font-family: Theme.emoji-font-family;
-        font-size: 15px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    if root.icon-kind == "window": Path {
-        x: 12px;
-        y: 11px;
-        width: 18px;
-        height: 18px;
-        viewbox-width: 18;
-        viewbox-height: 18;
-        commands: "M 2.5 4.5 L 15.5 4.5 L 15.5 15.5 L 2.5 15.5 Z M 10 2.5 L 15.5 2.5 L 15.5 8 M 15 3 L 9 9";
-        stroke: Theme.text-secondary;
-        stroke-width: 1.5px;
-        fill: transparent;
-    }
-
-    if root.icon-kind == "exit": Path {
-        x: 12px;
-        y: 11px;
-        width: 18px;
-        height: 18px;
-        viewbox-width: 18;
-        viewbox-height: 18;
-        commands: "M 8 3 L 3 3 L 3 15 L 8 15 M 10 6 L 14 9 L 10 12 M 14 9 L 7 9";
-        stroke: Theme.text-muted;
-        stroke-width: 1.5px;
-        fill: transparent;
-    }
-
-    Text {
-        x: root.icon != "" || root.icon-kind != "" ? 40px : 12px;
-        width: parent.width - self.x - (root.selected ? 36px : 12px);
-        height: parent.height;
-        text: root.label;
-        color: root.selected ? Theme.text-primary : Theme.text-secondary;
-        font-family: Theme.font-family;
-        font-size: 13px;
-        font-weight: root.selected ? Theme.weight-semibold : Theme.weight-regular;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-
-    if root.selected: Path {
-        x: parent.width - 25px;
-        y: 14px;
-        width: 12px;
-        height: 10px;
-        viewbox-width: 12;
-        viewbox-height: 10;
-        commands: "M 1 5 L 4.5 8.5 L 11 1.5";
-        stroke: Theme.accent-blue;
-        stroke-width: 1.6px;
-        fill: transparent;
-    }
-
-    action-focus := FocusScope {
-        x: 0px;
-        y: 0px;
-        width: parent.width;
-        height: parent.height;
-        enabled: root.enabled;
-        focus-on-click: true;
-        focus-on-tab-navigation: true;
-        key-pressed(event) => {
-            if (event.text == " " || event.text == "\n") {
-                root.activated();
-                return accept;
-            }
-            return reject;
-        }
-        Rectangle {
-            x: 1px;
-            y: 1px;
-            width: parent.width - 2px;
-            height: parent.height - 2px;
-            border-radius: Theme.radius-small;
-            border-width: parent.has-focus ? 1px : 0px;
-            border-color: Theme.focus;
-            background: transparent;
-        }
-        action-touch := TouchArea {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            height: parent.height;
-            enabled: root.enabled;
-            clicked => { root.activated(); }
-        }
-    }
-}
-
-component TrayConnectAction inherits Rectangle {
-    in property <string> label;
-    in property <bool> connected: false;
-    in property <bool> enabled: true;
-    callback activated();
-
-    height: 56px;
-    border-radius: Theme.radius-large;
-    border-width: connect-focus.has-focus ? Theme.focus-width : 1px;
-    border-color: connect-focus.has-focus ? Theme.focus : root.connected ? #3ccb7f80 : #4c9dff80;
-    background: root.connected ? #101a16 : #101721;
-    clip: true;
-    opacity: root.enabled ? 1 : 0.46;
-    accessible-role: button;
-    accessible-label: root.label;
-    accessible-enabled: root.enabled;
-    accessible-action-default => { if (root.enabled) { root.activated(); } }
-
-    connect-mesh-field := Rectangle {
-        property <bool> active: connect-touch.has-hover || connect-focus.has-focus;
-        property <length> cursor-x: connect-touch.has-hover ? connect-touch.mouse-x : 28px;
-        property <length> cursor-y: connect-touch.has-hover ? connect-touch.mouse-y : 28px;
-        property <color> glow-strong: root.connected ? #22c55e32 : #0091ff3d;
-        property <color> glow-medium: root.connected ? #22c55e1d : #0091ff24;
-        x: 0px;
-        y: 0px;
-        width: parent.width;
-        height: parent.height;
-        background: @radial-gradient(
-            circle 108px at cursor-x cursor-y,
-            glow-strong 0%,
-            glow-medium 36%,
-            #00000000 76%
-        );
-        opacity: self.active ? 1 : 0;
-        animate opacity { duration: 150ms; easing: ease-out; }
-
-        for _[grid-x] in 48: Rectangle {
-            x: grid-x * 6px;
-            y: 0px;
-            width: 6px;
-            height: parent.height;
-            background: transparent;
-            for _[grid-y] in 10: Rectangle {
-                property <float> dx: (grid-x * 6px + 3px - connect-mesh-field.cursor-x) / 112px;
-                property <float> dy: (grid-y * 6px + 3px - connect-mesh-field.cursor-y) / 48px;
-                property <float> distance: Math.sqrt(self.dx * self.dx + self.dy * self.dy);
-                x: 0px;
-                y: grid-y * 6px;
-                width: 6px;
-                height: 6px;
-                background: transparent;
-                border-width: 0.5px;
-                border-color: root.connected ? #8ea39758 : #8f9eae58;
-                opacity: connect-mesh-field.active ? Math.max(0, 1 - self.distance) : 0;
+    HorizontalLayout {
+        alignment: center;
+        spacing: 7px;
+        VerticalLayout {
+            alignment: center;
+            Image {
+                width: 15px;
+                height: 15px;
+                source: root.icon;
+                colorize: text-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
+                image-fit: contain;
+                accessible-role: none;
             }
         }
-    }
-
-    Rectangle {
-        x: 12px;
-        y: 10px;
-        width: 36px;
-        height: 36px;
-        border-radius: 18px;
-        background: root.connected ? #0d1814e8 : #101722e8;
-        border-color: root.connected ? Theme.accent-green : Theme.accent-blue;
-        border-width: 1px;
-        Image {
-            x: 8px;
-            y: 8px;
-            width: 20px;
-            height: 20px;
-            source: @image-url("../assets/power.svg");
-            image-fit: contain;
+        Text {
+            text: root.label;
+            color: text-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
+            font-size: 12.5px;
+            vertical-alignment: center;
             accessible-role: none;
         }
     }
 
+    text-focus := FocusScope {
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        text-touch := TouchArea { clicked => { root.activated(); } }
+    }
+}
+
+// Text-only segment of the route-group track; the shown group is a raised pill.
+component TraySegment inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    callback activated();
+
+    min-width: 0px;
+    horizontal-stretch: 1;
+    height: 26px;
+    border-radius: 7px;
+    background: root.selected ? Theme.elevated : segment-touch.has-hover && root.enabled ? #ffffff08 : transparent;
+    border-color: Theme.focus;
+    border-width: segment-focus.has-focus ? Theme.focus-width : 0px;
+    opacity: root.enabled ? 1 : 0.5;
+    accessible-role: button;
+    accessible-label: root.label + (root.selected ? ", выбрано" : "");
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+    animate background { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+
     Text {
-        x: 60px;
-        width: parent.width - 76px;
+        x: 6px;
+        width: parent.width - 12px;
         height: parent.height;
         text: root.label;
-        color: Theme.text-primary;
-        font-size: 14px;
-        font-weight: Theme.weight-semibold;
+        color: root.selected || segment-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
+        font-size: 12px;
+        font-weight: root.selected ? Theme.weight-semibold : Theme.weight-medium;
+        horizontal-alignment: center;
         vertical-alignment: center;
         overflow: elide;
+        accessible-role: none;
     }
 
-    connect-focus := FocusScope {
-        x: 0px;
-        y: 0px;
-        width: parent.width;
-        height: parent.height;
+    segment-focus := FocusScope {
         enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
@@ -248,69 +117,56 @@ component TrayConnectAction inherits Rectangle {
             }
             return reject;
         }
-        connect-touch := TouchArea {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            height: parent.height;
-            enabled: root.enabled;
-            clicked => { root.activated(); }
-        }
+        segment-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
     }
 }
 
-component RouteGroupAction inherits Rectangle {
+// Row of the inset grouped node list: bare flag, name, graded latency; the
+// selected route is tinted with a blue leading bar (no check mark).
+component TrayNodeRow inherits Rectangle {
     in property <string> icon;
     in property <image> icon-image;
     in property <string> label;
-    in property <string> detail;
-    in property <bool> expanded: false;
+    in property <string> latency;
+    in property <string> tone: "neutral";
+    in property <bool> selected;
     in property <bool> enabled: true;
+    in property <bool> show-separator: false;
     callback activated();
 
-    height: 48px;
-    border-radius: Theme.radius-small;
-    background: root.expanded ? #4c9dff14 : route-group-touch.has-hover ? #ffffff0b : transparent;
-    opacity: root.enabled ? 1 : 0.42;
+    height: 44px;
+    background: root.selected ? Theme.elevated : node-touch.has-hover && root.enabled ? #ffffff06 : transparent;
+    border-color: Theme.focus;
+    border-width: node-focus.has-focus ? Theme.focus-width : 0px;
     accessible-role: button;
-    accessible-label: root.label + ": " + root.detail;
-    accessible-description: root.expanded ? "Список серверов открыт" : "Открыть список серверов";
+    accessible-label: root.label + (root.latency == "" ? "" : ", " + root.latency) + (root.selected ? ", выбрано" : "");
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
+    animate background { duration: 140ms; easing: ease-out; }
 
-    VerticalLayout {
-        x: 44px;
-        y: 7px;
-        width: parent.width - 76px;
-        height: 34px;
-        spacing: 1px;
-        Text {
-            text: root.label;
-            color: Theme.text-primary;
-            font-size: 13px;
-            font-weight: Theme.weight-semibold;
-            overflow: elide;
-        }
-        Text {
-            text: root.detail;
-            color: root.expanded ? Theme.accent-blue : Theme.text-muted;
-            font-size: Theme.type-metadata-size;
-            overflow: elide;
-        }
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: root.selected ? 20px : 8px;
+        border-radius: 1.5px;
+        background: Theme.accent-blue;
+        opacity: root.selected ? 1 : 0;
+        animate opacity, height { duration: 180ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     }
 
     if root.icon-image.width > 0: Image {
-        x: 14px;
+        x: 12px;
         y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
+        width: 20px;
+        height: 20px;
         source: root.icon-image;
         image-fit: contain;
+        accessible-role: none;
     }
-
-    if root.icon-image.width == 0: Text {
-        x: 12px;
-        width: 22px;
+    if root.icon != "" && root.icon-image.width == 0: Text {
+        x: 10px;
+        width: 24px;
         height: parent.height;
         text: root.icon;
         color: Theme.text-secondary;
@@ -318,26 +174,48 @@ component RouteGroupAction inherits Rectangle {
         font-size: 15px;
         horizontal-alignment: center;
         vertical-alignment: center;
+        accessible-role: none;
     }
 
-    Path {
-        x: parent.width - 24px;
-        y: 20px;
-        width: 10px;
-        height: 7px;
-        viewbox-width: 10;
-        viewbox-height: 7;
-        commands: root.expanded ? "M 1 6 L 5 2 L 9 6" : "M 1 1 L 5 5 L 9 1";
-        stroke: root.expanded ? Theme.accent-blue : Theme.text-muted;
-        stroke-width: 1.5px;
-        fill: transparent;
-    }
-
-    route-group-focus := FocusScope {
-        x: 0px;
-        y: 0px;
-        width: parent.width;
+    Text {
+        x: 42px;
+        width: parent.width - self.x - latency-label.width - 22px;
         height: parent.height;
+        text: root.label;
+        color: root.selected || node-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
+        font-size: 13px;
+        font-weight: root.selected ? Theme.weight-semibold : Theme.weight-regular;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+
+    latency-label := Text {
+        x: parent.width - self.width - 14px;
+        width: Math.min(self.preferred-width, 88px);
+        height: parent.height;
+        text: root.latency;
+        color: root.tone == "success" ? Theme.accent-green
+            : root.tone == "warning" ? Theme.warning
+            : root.tone == "danger" ? Theme.error
+            : Theme.text-muted;
+        font-size: 12px;
+        font-weight: Theme.weight-semibold;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    // Hairline inset to where the name starts; none under the last row.
+    if root.show-separator: Rectangle {
+        x: 42px;
+        y: parent.height - 1px;
+        width: parent.width - 42px;
+        height: 1px;
+        background: #ffffff0f;
+    }
+
+    node-focus := FocusScope {
         enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
@@ -348,24 +226,7 @@ component RouteGroupAction inherits Rectangle {
             }
             return reject;
         }
-        Rectangle {
-            x: 1px;
-            y: 1px;
-            width: parent.width - 2px;
-            height: parent.height - 2px;
-            border-radius: Theme.radius-small;
-            border-width: parent.has-focus ? 1px : 0px;
-            border-color: Theme.focus;
-            background: transparent;
-        }
-        route-group-touch := TouchArea {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            height: parent.height;
-            enabled: root.enabled;
-            clicked => { root.activated(); }
-        }
+        node-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
     }
 }
 
@@ -374,9 +235,10 @@ export component TrayPopup inherits Window {
     height: 460px;
     no-frame: true;
     always-on-top: true;
-    background: #15181d;
+    background: Theme.canvas;
     default-font-family: Theme.font-family;
 
+    // Tooltip-style status line, kept for assistive technology.
     in property <string> status-text: "Готово";
     in property <string> connection-label: "Подключиться";
     in property <bool> connection-enabled: true;
@@ -384,14 +246,60 @@ export component TrayPopup inherits Window {
     in property <bool> has-profile: true;
     in property <[TrayMenuRow]> group-rows;
     in property <[TrayMenuRow]> node-rows;
+    // Mirrored from the main window while the popup is open.
+    in property <string> subscription-title;
+    in property <string> subscription-expiry;
+    in property <bool> subscription-failed: false;
+    in property <string> toggle-title: "Защита выключена";
+    in property <bool> toggle-on: false;
+    in property <bool> toggle-busy: false;
+    in property <bool> toggle-detail-is-exit: true;
+    in property <string> status-tone: "neutral";
+    in property <string> supporting;
+    in property <string> exit-name;
+    in property <string> exit-icon;
+    in property <image> exit-icon-image;
+    in property <string> exit-latency;
+    in property <string> session-uptime;
+    in property <bool> reduced-motion: false;
 
     callback toggle-connection();
+    // Shows that group's nodes (the same group the home screen shows).
     callback toggle-group(string);
     callback select-node(string, string);
     callback open-main();
     callback add-subscription();
     callback exit-app();
     callback dismiss();
+
+    // Optimistic switch, as on the home screen: the knob and title follow the
+    // press at once; the real state takes over when the daemon reports it.
+    private property <string> toggle-intent: "none";
+    private property <bool> shown-on: root.toggle-intent == "on" ? true
+        : root.toggle-intent == "off" ? false
+        : root.toggle-on;
+    private property <bool> shown-busy: root.toggle-busy || root.toggle-intent != "none";
+    private property <string> shown-title: root.toggle-intent == "on" ? "Подключение…"
+        : root.toggle-intent == "off" ? "Отключение…"
+        : root.toggle-title;
+    private property <string> shown-tone: root.toggle-intent != "none" ? "neutral" : root.status-tone;
+    function press-toggle() {
+        if (!root.connection-enabled) {
+            return;
+        }
+        if (!root.toggle-busy) {
+            root.toggle-intent = root.toggle-on ? "off" : "on";
+        }
+        root.toggle-connection();
+    }
+    changed toggle-busy => { root.toggle-intent = "none"; }
+    changed toggle-on => { root.toggle-intent = "none"; }
+    changed status-tone => { root.toggle-intent = "none"; }
+    toggle-intent-expiry := Timer {
+        interval: 8s;
+        running: root.toggle-intent != "none";
+        triggered => { root.toggle-intent = "none"; }
+    }
 
     popup-focus := FocusScope {
         width: parent.width;
@@ -404,119 +312,389 @@ export component TrayPopup inherits Window {
             return reject;
         }
 
-        Rectangle {
+        popup-card := Rectangle {
             x: 1px;
             y: 1px;
             width: parent.width - 2px;
             height: parent.height - 2px;
-            background: #15181dfa;
-            border-color: #343a43;
+            background: Theme.canvas;
+            border-color: #ffffff0f;
             border-width: 1px;
-            border-radius: Theme.radius-large;
+            border-radius: 12px;
+            clip: true;
 
-            VerticalLayout {
-                padding: 14px;
-                spacing: 10px;
-
-                HorizontalLayout {
-                    height: 34px;
-                    vertical-stretch: 0;
-                    spacing: 10px;
-                    Rectangle {
-                        width: 24px;
-                        height: 24px;
-                        border-radius: Theme.radius-small;
-                        background: #4c9dff18;
-                        Text {
-                            text: "∞";
-                            color: Theme.accent-blue;
-                            font-size: 15px;
-                            font-weight: Theme.weight-semibold;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 1px;
-                        Text { text: "MULTICORE"; color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-bold; letter-spacing: 1px; }
-                        Text { text: root.status-text; color: Theme.text-muted; font-size: Theme.type-metadata-size; overflow: elide; }
-                    }
-                }
-
-                if root.has-profile: connect-action := TrayConnectAction {
-                    label: root.connection-label;
-                    enabled: root.connection-enabled;
-                    connected: root.connected;
-                    activated => { root.toggle-connection(); }
-                }
-
-                if !root.has-profile: PopupAction {
-                    height: 44px;
-                    vertical-stretch: 0;
-                    label: "Добавить подписку";
-                    icon-kind: "window";
-                    activated => { root.add-subscription(); }
-                }
-
-                Rectangle { height: 1px; vertical-stretch: 0; background: Theme.line; }
-
-                Text {
+            // Header: wordmark left, active subscription right.
+            tray-header := Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: 46px;
+                Image {
+                    x: 14px;
+                    y: (parent.height - self.height) / 2;
+                    width: 18px;
                     height: 18px;
-                    vertical-stretch: 0;
-                    text: "Маршруты";
-                    color: Theme.text-muted;
-                    font-size: Theme.type-metadata-size;
-                    font-weight: Theme.weight-semibold;
+                    source: @image-url("../assets/app-icon.svg");
+                    image-fit: contain;
+                    accessible-role: none;
+                }
+                Text {
+                    x: 40px;
+                    height: parent.height;
+                    text: "MULTICORE";
+                    color: Theme.text-primary;
+                    font-size: 12.5px;
+                    font-weight: Theme.weight-bold;
+                    letter-spacing: 0.5px;
                     vertical-alignment: center;
+                    accessible-role: none;
+                }
+                HorizontalLayout {
+                    x: 132px;
+                    width: parent.width - self.x - 14px;
+                    height: parent.height;
+                    alignment: end;
+                    spacing: 0px;
+                    if root.has-profile: Text {
+                        max-width: 90px;
+                        text: root.subscription-title;
+                        color: Theme.text-secondary;
+                        font-size: 11.5px;
+                        font-weight: Theme.weight-medium;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if root.has-profile && (root.subscription-failed || root.subscription-expiry != ""): Text {
+                        text: root.subscription-failed ? " · Не удалось обновить" : " · " + root.subscription-expiry;
+                        color: root.subscription-failed ? Theme.error : Theme.text-muted;
+                        font-size: 11.5px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if !root.has-profile: Text {
+                        text: "Нет подписки";
+                        color: Theme.text-muted;
+                        font-size: 11.5px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    x: 0;
+                    y: parent.height - 1px;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.line;
+                }
+            }
+
+            // Connection module: shield, state, exit line and the switch.
+            if root.has-profile: connect-card := Rectangle {
+                x: 10px;
+                y: 56px;
+                width: parent.width - 20px;
+                height: 68px;
+                background: Theme.surface;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: root.shown-busy ? #4c9dff59
+                    : root.shown-tone == "success" ? #3ccb7f59
+                    : root.shown-tone == "danger" ? #f06a6a66
+                    : root.shown-tone == "warning" ? #e7aa4566
+                    : #ffffff0a;
+                clip: true;
+                animate border-color { duration: 220ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+
+                // Cursor-reactive cell mesh, only while the pointer is over the card.
+                card-mesh := Rectangle {
+                    property <bool> active: card-touch.has-hover;
+                    property <length> cursor-x: card-touch.mouse-x;
+                    property <length> cursor-y: card-touch.mouse-y;
+                    property <color> glow-strong: root.shown-tone == "success" ? #22c55e32 : root.shown-tone == "danger" ? #f06a6a32 : #0091ff3d;
+                    property <color> glow-medium: root.shown-tone == "success" ? #22c55e1d : root.shown-tone == "danger" ? #f06a6a1d : #0091ff24;
+                    property <color> grid-line: root.shown-tone == "success" ? #8ea39758 : root.shown-tone == "danger" ? #a3939358 : #8f9eae58;
+                    background: @radial-gradient(
+                        circle 120px at cursor-x cursor-y,
+                        glow-strong 0%,
+                        glow-medium 36%,
+                        #00000000 76%
+                    );
+                    opacity: self.active ? 1 : 0;
+                    visible: self.opacity > 0;
+                    animate opacity { duration: 160ms; easing: ease-out; }
+
+                    for _[grid-x] in 36: Rectangle {
+                        x: grid-x * 8px;
+                        y: 0;
+                        width: 8px;
+                        height: parent.height;
+                        background: transparent;
+                        for _[grid-y] in 9: Rectangle {
+                            property <float> dx: (grid-x * 8px + 4px - card-mesh.cursor-x) / 120px;
+                            property <float> dy: (grid-y * 8px + 4px - card-mesh.cursor-y) / 52px;
+                            property <float> distance: Math.sqrt(self.dx * self.dx + self.dy * self.dy);
+                            x: 0;
+                            y: grid-y * 8px;
+                            width: 8px;
+                            height: 8px;
+                            background: transparent;
+                            border-width: 0.5px;
+                            border-color: card-mesh.grid-line;
+                            opacity: card-mesh.active ? Math.max(0, 1 - self.distance) : 0;
+                        }
+                    }
                 }
 
-                route-scroll := ScrollView {
-                    horizontal-stretch: 1;
-                    vertical-stretch: 1;
-                    viewport-width: self.width;
-                    VerticalLayout {
-                        width: route-scroll.viewport-width;
-                        spacing: 2px;
-                        for group in root.group-rows: Rectangle {
-                            height: 48px + (group.expanded ? group.node-count * 42px : 0px);
-                            background: transparent;
-                            route-group := RouteGroupAction {
-                                x: 0px;
-                                y: 0px;
-                                width: parent.width;
-                                icon: group.icon;
-                                icon-image: group.icon-image;
-                                label: group.label;
-                                detail: group.detail;
-                                expanded: group.expanded;
-                                enabled: group.enabled;
-                                activated => { root.toggle-group(group.id); }
-                            }
-                            if group.expanded: VerticalLayout {
-                                x: 12px;
-                                y: 48px;
-                                width: parent.width - 12px;
-                                spacing: 0px;
-                                for node in root.node-rows: Rectangle {
-                                    height: node.group-id == group.id ? 42px : 0px;
-                                    background: transparent;
-                                    PopupAction {
-                                        x: 0px;
-                                        y: 2px;
-                                        width: parent.width;
-                                        height: 40px;
-                                        visible: parent.height > 0px;
-                                        label: node.label;
-                                        icon: node.icon;
-                                        icon-image: node.icon-image;
-                                        selected: node.selected;
-                                        enabled: node.enabled;
-                                        activated => { root.select-node(node.group-id, node.id); }
-                                    }
-                                }
-                            }
+                shield-badge := Rectangle {
+                    x: 12px;
+                    y: (parent.height - self.height) / 2;
+                    width: 38px;
+                    height: 38px;
+                    border-radius: 10px;
+                    background: root.shown-busy ? Theme.elevated
+                        : root.shown-tone == "success" ? #3ccb7f24
+                        : root.shown-tone == "danger" ? #f06a6a24
+                        : root.shown-tone == "warning" ? #e7aa4524
+                        : Theme.elevated;
+                    animate background { duration: 220ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+
+                    // Breathing ring only while connecting/disconnecting.
+                    if root.shown-busy && !root.reduced-motion: Rectangle {
+                        property <float> phase: (1 + Math.sin(animation-tick() / 1400ms * 360deg)) / 2;
+                        x: -3px;
+                        y: -3px;
+                        width: parent.width + 6px;
+                        height: parent.height + 6px;
+                        border-radius: 13px;
+                        border-width: 1.5px;
+                        border-color: Theme.accent-blue;
+                        background: transparent;
+                        opacity: 0.15 + 0.45 * self.phase;
+                    }
+
+                    Image {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 20px;
+                        height: 20px;
+                        source: root.shown-busy ? @image-url("../assets/shield.svg")
+                            : root.shown-tone == "success" ? @image-url("../assets/shield-check.svg")
+                            : root.shown-tone == "danger" || root.shown-tone == "warning" ? @image-url("../assets/shield-alert.svg")
+                            : @image-url("../assets/shield-off.svg");
+                        colorize: root.shown-busy ? Theme.accent-blue
+                            : root.shown-tone == "success" ? Theme.accent-green
+                            : root.shown-tone == "danger" ? Theme.error
+                            : root.shown-tone == "warning" ? Theme.warning
+                            : Theme.text-muted;
+                        image-fit: contain;
+                        accessible-role: none;
+                    }
+                }
+
+                VerticalLayout {
+                    x: 62px;
+                    width: parent.width - self.x - 70px;
+                    height: parent.height;
+                    alignment: center;
+                    spacing: 3px;
+                    Text {
+                        text: root.shown-title;
+                        color: Theme.text-primary;
+                        font-size: 14px;
+                        font-weight: Theme.weight-semibold;
+                        overflow: elide;
+                    }
+                    if root.toggle-detail-is-exit: HorizontalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        if root.exit-icon-image.width > 0: VerticalLayout {
+                            alignment: center;
+                            Image { width: 12px; height: 12px; source: root.exit-icon-image; image-fit: contain; accessible-role: none; }
                         }
-                        if root.group-rows.length == 0: Text {
+                        if root.exit-icon != "" && root.exit-icon-image.width == 0: Text { text: root.exit-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                        if root.exit-name != "": Text { max-width: 110px; text: root.exit-name; color: Theme.text-secondary; font-size: 11.5px; vertical-alignment: center; overflow: elide; }
+                        if root.exit-latency != "": Text { text: "· " + root.exit-latency; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; }
+                        if root.session-uptime != "": Text { text: "· " + root.session-uptime; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; accessible-label: "Время сессии " + root.session-uptime; }
+                    }
+                    if !root.toggle-detail-is-exit: Text {
+                        text: root.supporting;
+                        color: root.shown-tone == "danger" ? #f0a3a3 : Theme.text-secondary;
+                        font-size: 11.5px;
+                        overflow: elide;
+                    }
+                }
+
+                // The switch; it lights up only while the pointer is over it.
+                switch-track := Rectangle {
+                    property <bool> hovered: card-touch.has-hover
+                        && card-touch.mouse-x >= self.x - 6px && card-touch.mouse-x <= self.x + self.width + 6px
+                        && card-touch.mouse-y >= self.y - 6px && card-touch.mouse-y <= self.y + self.height + 6px;
+                    x: parent.width - self.width - 12px;
+                    y: (parent.height - self.height) / 2;
+                    width: 46px;
+                    height: 28px;
+                    border-radius: 14px;
+                    background: root.shown-busy ? #4c9dff59
+                        : root.shown-on ? (self.hovered ? #4ad98c : Theme.accent-green)
+                        : (self.hovered ? #3a414b : Theme.line);
+                    border-color: switch-focus.has-focus ? Theme.focus : #ffffff59;
+                    border-width: switch-focus.has-focus ? Theme.focus-width
+                        : self.hovered && root.connection-enabled ? 2px : 0px;
+                    opacity: root.connection-enabled || root.shown-busy ? 1 : 0.4;
+                    animate background { duration: 180ms; easing: ease-in-out; }
+                    animate border-width { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+
+                    Rectangle {
+                        x: root.shown-on ? parent.width - self.width - 3px : 3px;
+                        y: (parent.height - self.height) / 2;
+                        width: card-touch.pressed ? 25px : switch-track.hovered ? 23px : 22px;
+                        height: switch-track.hovered ? 23px : 22px;
+                        border-radius: self.height / 2;
+                        background: #ffffff;
+                        drop-shadow-blur: 5px;
+                        drop-shadow-offset-y: 1px;
+                        drop-shadow-color: #00000059;
+                        animate x { duration: 260ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
+                        animate width, height { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                    }
+                }
+
+                // Keyboard/a11y entry for the switch; the whole card is clickable.
+                switch-focus := FocusScope {
+                    x: switch-track.x;
+                    y: switch-track.y;
+                    width: switch-track.width;
+                    height: switch-track.height;
+                    enabled: root.connection-enabled;
+                    focus-on-click: false;
+                    focus-on-tab-navigation: true;
+                    accessible-role: switch;
+                    accessible-label: root.connection-label;
+                    accessible-checked: root.shown-on;
+                    accessible-enabled: self.enabled;
+                    accessible-action-default => { root.press-toggle(); }
+                    key-pressed(event) => {
+                        if (event.text == " " || event.text == "\n") {
+                            root.press-toggle();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                card-touch := TouchArea {
+                    mouse-cursor: root.connection-enabled ? pointer : default;
+                    enabled: root.connection-enabled;
+                    clicked => { root.press-toggle(); }
+                }
+            }
+
+            // No subscription yet: one action instead of the module and routes.
+            if !root.has-profile: Rectangle {
+                x: 10px;
+                y: 56px;
+                width: parent.width - 20px;
+                height: 60px;
+                background: Theme.surface;
+                border-color: #ffffff0a;
+                border-width: 1px;
+                border-radius: 12px;
+                add-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.add-subscription(); }
+                }
+                Rectangle {
+                    x: 12px;
+                    y: (parent.height - self.height) / 2;
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 10px;
+                    background: #4c9dff1f;
+                    Image {
+                        x: 10px;
+                        y: 10px;
+                        width: 16px;
+                        height: 16px;
+                        source: @image-url("../assets/tray-add.svg");
+                        colorize: Theme.accent-blue;
+                        image-fit: contain;
+                        accessible-role: none;
+                    }
+                }
+                VerticalLayout {
+                    x: 60px;
+                    width: parent.width - self.x - 12px;
+                    alignment: center;
+                    spacing: 2px;
+                    Text { text: "Добавить подписку"; color: add-touch.has-hover ? Theme.accent-blue-hover : Theme.accent-blue; font-size: 13px; font-weight: Theme.weight-semibold; }
+                    Text { text: "Откроется главное окно"; color: Theme.text-muted; font-size: 11.5px; }
+                }
+                FocusScope {
+                    focus-on-tab-navigation: true;
+                    accessible-role: button;
+                    accessible-label: "Добавить подписку";
+                    accessible-action-default => { root.add-subscription(); }
+                    key-pressed(event) => {
+                        if (event.text == " " || event.text == "\n") {
+                            root.add-subscription();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+            }
+
+            // Route groups: a text-only segmented track.
+            if root.has-profile && root.group-rows.length > 0: group-track := Rectangle {
+                x: 10px;
+                y: 134px;
+                width: parent.width - 20px;
+                height: 32px;
+                background: #0a0c0f;
+                border-color: Theme.line;
+                border-width: 1px;
+                border-radius: 9px;
+                HorizontalLayout {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                    padding: 2px;
+                    spacing: 2px;
+                    for group in root.group-rows: TraySegment {
+                        label: group.label;
+                        selected: group.selected;
+                        enabled: group.enabled;
+                        activated => { root.toggle-group(group.id); }
+                    }
+                }
+            }
+
+            // The shown group's nodes in one inset grouped card.
+            if root.has-profile: node-card := Rectangle {
+                x: 10px;
+                y: root.group-rows.length > 0 ? 176px : 134px;
+                width: parent.width - 20px;
+                height: Math.min(node-list.preferred-height, parent.height - self.y - 54px);
+                background: Theme.surface;
+                border-color: #ffffff0a;
+                border-width: 1px;
+                border-radius: 12px;
+                clip: true;
+                ScrollView {
+                    node-list := VerticalLayout {
+                        spacing: 0px;
+                        for node[index] in root.node-rows: TrayNodeRow {
+                            icon: node.icon;
+                            icon-image: node.icon-image;
+                            label: node.label;
+                            latency: node.detail;
+                            tone: node.tone;
+                            selected: node.selected;
+                            enabled: node.enabled;
+                            show-separator: index < root.node-rows.length - 1;
+                            activated => { root.select-node(node.group-id, node.id); }
+                        }
+                        if root.node-rows.length == 0: Text {
                             height: 48px;
                             text: "Маршруты пока недоступны";
                             color: Theme.text-muted;
@@ -526,15 +704,37 @@ export component TrayPopup inherits Window {
                         }
                     }
                 }
+            }
 
-                Rectangle { height: 1px; vertical-stretch: 0; background: Theme.line; }
-
-                HorizontalLayout {
-                    height: 40px;
-                    vertical-stretch: 0;
-                    spacing: 4px;
-                    PopupAction { horizontal-stretch: 1; label: "Открыть"; icon-kind: "window"; activated => { root.open-main(); } }
-                    PopupAction { width: 104px; horizontal-stretch: 0; label: "Выйти"; icon-kind: "exit"; activated => { root.exit-app(); } }
+            // Footer: two quiet actions split by a hairline.
+            tray-footer := Rectangle {
+                x: 0;
+                y: parent.height - 44px;
+                width: parent.width;
+                height: 44px;
+                Rectangle { x: 0; y: 0; width: parent.width; height: 1px; background: Theme.line; }
+                TrayTextAction {
+                    x: 6px;
+                    y: 4px;
+                    width: parent.width / 2 - 10px;
+                    label: "Открыть";
+                    icon: @image-url("../assets/tray-open.svg");
+                    activated => { root.open-main(); }
+                }
+                Rectangle {
+                    x: (parent.width - 1px) / 2;
+                    y: 13px;
+                    width: 1px;
+                    height: 18px;
+                    background: Theme.line;
+                }
+                TrayTextAction {
+                    x: parent.width / 2 + 4px;
+                    y: 4px;
+                    width: parent.width / 2 - 10px;
+                    label: "Выйти";
+                    icon: @image-url("../assets/tray-quit.svg");
+                    activated => { root.exit-app(); }
                 }
             }
         }

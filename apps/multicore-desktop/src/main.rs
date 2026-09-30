@@ -43,8 +43,8 @@ use slint::{
     CloseRequestResponse, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
 use tray::{
-    TrayAccordionState, TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayMenuModel,
-    TrayNode, TrayPopupModelCache, build_menu_model,
+    TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayMenuModel, TrayNode,
+    TrayPopupModelCache, build_menu_model,
 };
 use updater::{UpdateAction, UpdateState};
 use view_model::{
@@ -867,7 +867,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     );
     let tray_popup = create_tray_popup()?;
     let tray_popup_open = Rc::new(Cell::new(false));
-    let tray_accordion = Rc::new(RefCell::new(TrayAccordionState::default()));
     wire_tray_popup_actions(
         &tray_popup,
         ui.as_weak(),
@@ -875,13 +874,12 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         preference_writer.clone(),
         preference_tracker.clone(),
         tray_popup_open.clone(),
-        tray_accordion.clone(),
     );
     let _tray_popup_focus_timer = wire_tray_popup_focus_loss(
         &tray_popup,
         tray_popup_open.clone(),
         model.clone(),
-        tray_accordion.clone(),
+        ui.as_weak(),
     );
     let tray_model = tray_menu_model(&model.lock().expect("view model lock"));
     let tray_model_source = model.clone();
@@ -891,7 +889,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     let tray_preference_tracker = preference_tracker.clone();
     let tray_interaction_popup = tray_popup.as_weak();
     let tray_interaction_popup_open = tray_popup_open.clone();
-    let tray_interaction_accordion = tray_accordion;
     let tray_runtime = tray::start(
         tray_model,
         move || tray_menu_model(&tray_model_source.lock().expect("view model lock")),
@@ -912,7 +909,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
                     &tray_action_ui,
                     &tray_action_model,
                     &tray_interaction_popup_open,
-                    &tray_interaction_accordion,
                     PhysicalPosition { x, y },
                 );
             }
@@ -2171,40 +2167,17 @@ fn hide_window_to_tray(ui: &AppWindow) {
     }
 }
 
-fn apply_tray_popup_model(
-    popup: &TrayPopup,
-    model: TrayMenuModel,
-    accordion: &mut TrayAccordionState,
-) {
-    let nodes = model
-        .nodes
+fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
+    // The popup shows one group at a time: the one selected on the home screen.
+    let shown_group = model
+        .groups
         .iter()
-        .take(64)
-        .filter_map(|entry| match &entry.command {
-            TrayCommand::SelectNode { group_id, node_id } => Some(TrayMenuRow {
-                id: node_id.clone().into(),
-                group_id: group_id.clone().into(),
-                icon: entry.icon.clone().into(),
-                icon_image: emoji_images::image_for(&entry.icon),
-                label: entry.label.clone().into(),
-                detail: "".into(),
-                selected: entry.checked,
-                enabled: entry.enabled,
-                expanded: false,
-                node_count: 0,
-            }),
+        .find(|entry| entry.checked)
+        .or_else(|| model.groups.first())
+        .and_then(|entry| match &entry.command {
+            TrayCommand::SelectGroup { group_id } => Some(group_id.clone()),
             _ => None,
-        })
-        .collect::<Vec<_>>();
-    accordion.retain_available(
-        model
-            .groups
-            .iter()
-            .filter_map(|entry| match &entry.command {
-                TrayCommand::SelectGroup { group_id } => Some(group_id.as_str()),
-                _ => None,
-            }),
-    );
+        });
     let groups = model
         .groups
         .iter()
@@ -2217,14 +2190,33 @@ fn apply_tray_popup_model(
                 icon_image: emoji_images::image_for(&entry.icon),
                 label: entry.label.clone().into(),
                 detail: entry.detail.clone().into(),
-                selected: false,
+                tone: "".into(),
+                selected: shown_group.as_deref() == Some(group_id.as_str()),
                 enabled: entry.enabled,
-                expanded: accordion.is_expanded(group_id),
-                node_count: nodes
-                    .iter()
-                    .filter(|node| node.group_id.as_str() == group_id)
-                    .count() as i32,
             }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let nodes = model
+        .nodes
+        .iter()
+        .take(64)
+        .filter_map(|entry| match &entry.command {
+            TrayCommand::SelectNode { group_id, node_id }
+                if shown_group.as_deref() == Some(group_id.as_str()) =>
+            {
+                Some(TrayMenuRow {
+                    id: node_id.clone().into(),
+                    group_id: group_id.clone().into(),
+                    icon: entry.icon.clone().into(),
+                    icon_image: emoji_images::image_for(&entry.icon),
+                    label: entry.label.clone().into(),
+                    detail: entry.detail.clone().into(),
+                    tone: entry.tone.clone().into(),
+                    selected: entry.checked,
+                    enabled: entry.enabled,
+                })
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2236,6 +2228,74 @@ fn apply_tray_popup_model(
     popup.set_has_profile(model.has_profile);
     popup.set_group_rows(ModelRc::new(VecModel::from(groups)));
     popup.set_node_rows(ModelRc::new(VecModel::from(nodes)));
+}
+
+/// Mirrors what the main window already shows (subscription, connection state,
+/// real exit node, live timer) into the tray popup. Only runs while the popup is
+/// open, and only writes values that changed, so an idle popup does not redraw.
+fn sync_tray_live_state(popup: &TrayPopup, main: &AppWindow) {
+    macro_rules! mirror {
+        ($get:ident, $set:ident, $source:expr) => {{
+            let value = $source;
+            if popup.$get() != value {
+                popup.$set(value);
+            }
+        }};
+    }
+    mirror!(
+        get_subscription_title,
+        set_subscription_title,
+        main.get_subscription_title()
+    );
+    mirror!(
+        get_subscription_expiry,
+        set_subscription_expiry,
+        main.get_subscription_expiry()
+    );
+    mirror!(
+        get_subscription_failed,
+        set_subscription_failed,
+        !main.get_subscription_refresh_error().is_empty()
+    );
+    mirror!(get_toggle_title, set_toggle_title, main.get_toggle_title());
+    mirror!(get_toggle_on, set_toggle_on, main.get_toggle_on());
+    mirror!(get_toggle_busy, set_toggle_busy, main.get_toggle_busy());
+    mirror!(
+        get_toggle_detail_is_exit,
+        set_toggle_detail_is_exit,
+        main.get_toggle_detail_is_exit()
+    );
+    mirror!(get_status_tone, set_status_tone, main.get_status_tone());
+    mirror!(get_supporting, set_supporting, main.get_supporting());
+    mirror!(
+        get_session_uptime,
+        set_session_uptime,
+        main.get_session_uptime()
+    );
+    mirror!(get_exit_latency, set_exit_latency, main.get_node_latency());
+    mirror!(
+        get_reduced_motion,
+        set_reduced_motion,
+        main.get_reduced_motion()
+    );
+    // The real node behind an automatic group when known, else the exit itself.
+    let real = main.get_exit_now_name();
+    let (name, icon, image) = if real.is_empty() {
+        (
+            main.get_node_name(),
+            main.get_node_icon(),
+            main.get_node_icon_image(),
+        )
+    } else {
+        (
+            real,
+            main.get_exit_now_icon(),
+            main.get_exit_now_icon_image(),
+        )
+    };
+    mirror!(get_exit_name, set_exit_name, name);
+    mirror!(get_exit_icon, set_exit_icon, icon);
+    mirror!(get_exit_icon_image, set_exit_icon_image, image);
 }
 
 fn hide_tray_popup(weak: &slint::Weak<TrayPopup>, open: &Rc<Cell<bool>>) {
@@ -2250,7 +2310,6 @@ fn toggle_tray_popup(
     main_weak: &slint::Weak<AppWindow>,
     model: &Arc<Mutex<DesktopViewModel>>,
     open: &Rc<Cell<bool>>,
-    accordion: &Rc<RefCell<TrayAccordionState>>,
     anchor: PhysicalPosition,
 ) {
     if open.get() {
@@ -2263,8 +2322,8 @@ fn toggle_tray_popup(
     apply_tray_popup_model(
         &popup,
         tray_menu_model(&model.lock().expect("view model lock")),
-        &mut accordion.borrow_mut(),
     );
+    sync_tray_live_state(&popup, &main);
     let _ = popup.show();
     let monitors = main
         .window()
@@ -2302,6 +2361,8 @@ fn dispatch_tray_popup_command(
     handle_tray_command(ui, model, command, preference_writer, preference_tracker);
 }
 
+/// Runs a popup action that keeps the popup open (route and group picks, the
+/// connect switch), then refreshes what the popup shows.
 fn dispatch_tray_popup_selection(
     popup: &slint::Weak<TrayPopup>,
     ui: &slint::Weak<AppWindow>,
@@ -2309,45 +2370,16 @@ fn dispatch_tray_popup_selection(
     command: TrayCommand,
     preference_writer: &Arc<Mutex<PreferenceWriter>>,
     preference_tracker: &Arc<Mutex<PersistenceTracker>>,
-    accordion: &Rc<RefCell<TrayAccordionState>>,
 ) {
     handle_tray_command(ui, model, command, preference_writer, preference_tracker);
     if let Some(popup) = popup.upgrade() {
         apply_tray_popup_model(
             &popup,
             tray_menu_model(&model.lock().expect("view model lock")),
-            &mut accordion.borrow_mut(),
         );
-    }
-}
-
-fn dispatch_tray_popup_group_toggle(
-    popup: &slint::Weak<TrayPopup>,
-    ui: &slint::Weak<AppWindow>,
-    model: &Arc<Mutex<DesktopViewModel>>,
-    group_id: String,
-    preference_writer: &Arc<Mutex<PreferenceWriter>>,
-    preference_tracker: &Arc<Mutex<PersistenceTracker>>,
-    accordion: &Rc<RefCell<TrayAccordionState>>,
-) {
-    let expanded = accordion.borrow_mut().toggle(&group_id);
-    if expanded {
-        handle_tray_command(
-            ui,
-            model,
-            TrayCommand::SelectGroup {
-                group_id: group_id.clone(),
-            },
-            preference_writer,
-            preference_tracker,
-        );
-    }
-    if let Some(popup) = popup.upgrade() {
-        apply_tray_popup_model(
-            &popup,
-            tray_menu_model(&model.lock().expect("view model lock")),
-            &mut accordion.borrow_mut(),
-        );
+        if let Some(main) = ui.upgrade() {
+            sync_tray_live_state(&popup, &main);
+        }
     }
 }
 
@@ -2358,7 +2390,6 @@ fn wire_tray_popup_actions(
     preference_writer: Arc<Mutex<PreferenceWriter>>,
     preference_tracker: Arc<Mutex<PersistenceTracker>>,
     open: Rc<Cell<bool>>,
-    accordion: Rc<RefCell<TrayAccordionState>>,
 ) {
     let popup_weak = popup.as_weak();
     let dismiss_popup = popup_weak.clone();
@@ -2384,53 +2415,45 @@ fn wire_tray_popup_actions(
             );
         }
     };
-    popup.on_toggle_connection(wire_command(TrayCommand::ToggleConnection));
+    // Opening the window and quitting close the popup; the switch keeps it open
+    // so "Подключение…" and the result stay visible.
     popup.on_open_main(wire_command(TrayCommand::ShowWindow));
     // Without a profile the main window opens on the inline onboarding.
     popup.on_add_subscription(wire_command(TrayCommand::ShowWindow));
     popup.on_exit_app(wire_command(TrayCommand::Exit));
 
-    let group_popup = popup_weak.clone();
-    let group_ui = ui.clone();
-    let group_model = model.clone();
-    let group_writer = preference_writer.clone();
-    let group_tracker = preference_tracker.clone();
-    let group_accordion = accordion.clone();
-    popup.on_toggle_group(move |group_id| {
-        dispatch_tray_popup_group_toggle(
-            &group_popup,
-            &group_ui,
-            &group_model,
-            group_id.to_string(),
-            &group_writer,
-            &group_tracker,
-            &group_accordion,
-        );
-    });
-
-    let node_popup = popup_weak;
-    let node_accordion = accordion;
-    popup.on_select_node(move |group_id, node_id| {
-        dispatch_tray_popup_selection(
-            &node_popup,
-            &ui,
-            &model,
-            TrayCommand::SelectNode {
-                group_id: group_id.to_string(),
-                node_id: node_id.to_string(),
-            },
-            &preference_writer,
-            &preference_tracker,
-            &node_accordion,
-        );
-    });
+    let wire_in_place = |command_for: fn(String, String) -> TrayCommand| {
+        let popup = popup_weak.clone();
+        let ui = ui.clone();
+        let model = model.clone();
+        let writer = preference_writer.clone();
+        let tracker = preference_tracker.clone();
+        move |first: SharedString, second: SharedString| {
+            dispatch_tray_popup_selection(
+                &popup,
+                &ui,
+                &model,
+                command_for(first.to_string(), second.to_string()),
+                &writer,
+                &tracker,
+            );
+        }
+    };
+    let toggle = wire_in_place(|_, _| TrayCommand::ToggleConnection);
+    popup.on_toggle_connection(move || toggle("".into(), "".into()));
+    let show_group = wire_in_place(|group_id, _| TrayCommand::SelectGroup { group_id });
+    popup.on_toggle_group(move |group_id| show_group(group_id, "".into()));
+    popup.on_select_node(wire_in_place(|group_id, node_id| TrayCommand::SelectNode {
+        group_id,
+        node_id,
+    }));
 }
 
 fn wire_tray_popup_focus_loss(
     popup: &TrayPopup,
     open: Rc<Cell<bool>>,
     model: Arc<Mutex<DesktopViewModel>>,
-    accordion: Rc<RefCell<TrayAccordionState>>,
+    main: slint::Weak<AppWindow>,
 ) -> Timer {
     let timer = Timer::default();
     let weak = popup.as_weak();
@@ -2453,7 +2476,10 @@ fn wire_tray_popup_focus_loss(
         };
         let next_model = tray_menu_model(&model.lock().expect("view model lock"));
         if model_cache.borrow_mut().observe(&next_model) {
-            apply_tray_popup_model(&popup, next_model, &mut accordion.borrow_mut());
+            apply_tray_popup_model(&popup, next_model);
+        }
+        if let Some(main) = main.upgrade() {
+            sync_tray_live_state(&popup, &main);
         }
         let focused = popup
             .window()
@@ -2499,10 +2525,13 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                             label: display.label,
                             icon: display.icon,
                             selected: node.selected,
+                            latency_text: node.latency_text,
+                            latency_tone: node.latency_tone,
                         }
                     })
                     .collect();
                 TrayGroup {
+                    selected: catalog.selected_group_id.as_deref() == Some(group.id.as_str()),
                     id: group.id,
                     label: group_display.label,
                     icon: group_display.icon,
@@ -4667,7 +4696,7 @@ mod window_tests {
     #[test]
     fn branded_tray_popup_source_contract() {
         let app = include_str!("../ui/app.slint");
-        let popup = include_str!("../ui/tray_popup.slint");
+        let popup = include_str!("../ui/tray_popup.slint").replace("\r\n", "\n");
         let rust = include_str!("main.rs");
 
         for required in [
@@ -4678,17 +4707,19 @@ mod window_tests {
             "import \"../assets/fonts/Twemoji.Mozilla.ttf\";",
             "icon: string,",
             "detail: string,",
-            "expanded: bool,",
-            "node-count: int,",
+            "tone: string,",
             "callback toggle-group(string);",
-            "component TrayConnectAction inherits Rectangle",
-            "connect-mesh-field := Rectangle",
-            "icon-kind: \"window\"",
-            "detail: group.detail;",
-            "expanded: group.expanded;",
-            "visible: node.group-id == group.id;",
+            // Header wordmark + subscription, module with switch, segments, list, footer.
+            "text: \"MULTICORE\";",
+            "connect-card := Rectangle",
+            "card-mesh := Rectangle",
+            "switch-track := Rectangle",
+            "component TraySegment inherits Rectangle",
+            "component TrayNodeRow inherits Rectangle",
+            "show-separator: index < root.node-rows.length - 1;",
+            "component TrayTextAction inherits Rectangle",
             "TrayInteraction::ShowMenu",
-            "TrayAccordionState",
+            "fn sync_tray_live_state(",
             "place_tray_popup(",
             ".take(12)",
             ".take(64)",
@@ -4698,23 +4729,38 @@ mod window_tests {
                 "missing branded tray popup contract: {required}"
             );
         }
-        assert!(!popup.contains("text: \"УЗЕЛ\";"));
-        assert!(!popup.contains("expanded-group-id"));
-        assert!(!popup.contains("marker: \"↗\""));
+        // The old accordion, big connect button and check marks are gone.
+        assert!(!popup.contains("expanded: bool,"));
+        assert!(!popup.contains("TrayConnectAction"));
+        assert!(!popup.contains("M 1 5 L 4.5 8.5 L 11 1.5"));
+        assert!(!rust.contains(concat!("TrayAccordion", "State")));
+        // Optimistic switch, as on the home screen.
+        assert!(popup.contains("root.toggle-intent = root.toggle-on ? \"off\" : \"on\";"));
+        assert!(popup.contains("toggle-intent-expiry := Timer {\n        interval: 8s;"));
+        // Busy ring reads animation-tick() only while busy and motion is allowed.
+        assert!(popup.contains("if root.shown-busy && !root.reduced-motion: Rectangle {"));
+        // The mesh only shows under the pointer.
+        assert!(popup.contains("opacity: self.active ? 1 : 0;"));
     }
 
     #[test]
-    fn tray_popup_hidden_nodes_do_not_accumulate_layout_spacing() {
-        let popup = include_str!("../ui/tray_popup.slint");
-        let expanded_nodes = popup
-            .split("if group.expanded: VerticalLayout")
+    fn tray_popup_shows_one_group_with_graded_latency_rows() {
+        let popup = include_str!("../ui/tray_popup.slint").replace("\r\n", "\n");
+        let rust = include_str!("main.rs");
+        // Rust sends only the shown group's nodes; the list has no hidden rows.
+        assert!(rust.contains("if shown_group.as_deref() == Some(group_id.as_str()) =>"));
+        assert!(popup.contains("for node[index] in root.node-rows: TrayNodeRow {"));
+        let row = popup
+            .split("component TrayNodeRow inherits Rectangle")
             .nth(1)
-            .and_then(|source| source.split("if root.group-rows.length == 0").next())
-            .expect("expanded tray node layout");
-
-        assert!(expanded_nodes.contains("spacing: 0px;"));
-        assert!(expanded_nodes.contains("height: node.group-id == group.id ? 42px : 0px;"));
-        assert!(!expanded_nodes.contains("height: self.visible ? 40px : 0px;"));
+            .and_then(|source| source.split("export component TrayPopup").next())
+            .expect("tray node row");
+        assert!(row.contains("height: 44px;"));
+        assert!(row.contains("root.tone == \"success\" ? Theme.accent-green"));
+        assert!(row.contains("root.tone == \"warning\" ? Theme.warning"));
+        assert!(row.contains("root.tone == \"danger\" ? Theme.error"));
+        assert!(row.contains("background: root.selected ? Theme.elevated"));
+        assert!(row.contains("if root.show-separator: Rectangle {"));
     }
 
     #[test]
@@ -4728,7 +4774,7 @@ mod window_tests {
             .and_then(|source| source.split("in property <string> status-text").next())
             .expect("tray popup window header");
 
-        assert!(window_header.contains("background: #15181d;"));
+        assert!(window_header.contains("background: Theme.canvas;"));
         assert!(!window_header.contains("background: transparent;"));
         assert!(rust.contains("apply_tray_popup_native_rounding(window)"));
         assert!(shell.contains("DwmSetWindowAttribute"));
@@ -4737,7 +4783,7 @@ mod window_tests {
     }
 
     #[test]
-    fn tray_popup_lifecycle_keeps_route_accordion_open_but_closes_terminal_actions() {
+    fn tray_popup_lifecycle_keeps_in_place_actions_open_but_closes_terminal_actions() {
         let popup = include_str!("../ui/tray_popup.slint");
         let rust = include_str!("main.rs");
 
@@ -4767,8 +4813,18 @@ mod window_tests {
             .expect("desktop main entrypoint");
         let compact_main = main_entry.split_whitespace().collect::<String>();
         assert!(compact_main.contains(
-            "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone(),tray_accordion.clone(),)"
+            "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone(),ui.as_weak(),)"
         ));
+        // The switch keeps the popup open (it goes through the in-place dispatcher),
+        // while opening the window and quitting close it.
+        let actions = rust
+            .split("fn wire_tray_popup_actions(")
+            .nth(1)
+            .and_then(|source| source.split("fn wire_tray_popup_focus_loss(").next())
+            .expect("tray popup action wiring");
+        assert!(actions.contains("wire_in_place(|_, _| TrayCommand::ToggleConnection)"));
+        assert!(actions.contains("popup.on_open_main(wire_command(TrayCommand::ShowWindow));"));
+        assert!(actions.contains("popup.on_exit_app(wire_command(TrayCommand::Exit));"));
         let compact_rust = rust.split_whitespace().collect::<String>();
         assert!(compact_rust.contains("ifopen.get(){hide_tray_popup"));
         assert!(rust.contains("with_winit_window(|window| window.has_focus())"));
@@ -4776,29 +4832,31 @@ mod window_tests {
     }
 
     #[test]
-    fn tray_route_group_uses_the_whole_row_as_its_accordion_trigger() {
+    fn tray_segments_and_rows_use_their_whole_surface_as_the_trigger() {
         let popup = include_str!("../ui/tray_popup.slint");
-        let route_group = popup
-            .split("component RouteGroupAction inherits Rectangle")
-            .nth(1)
-            .and_then(|source| {
-                source
-                    .split("export component TrayPopup inherits Window")
-                    .next()
-            })
-            .expect("route group component source");
-
-        for required in [
-            "route-group-focus := FocusScope",
-            "width: parent.width;",
-            "height: parent.height;",
-            "route-group-touch := TouchArea",
-            "clicked => { root.activated(); }",
+        for (component, next) in [
+            (
+                "component TraySegment inherits Rectangle",
+                "component TrayNodeRow inherits Rectangle",
+            ),
+            (
+                "component TrayNodeRow inherits Rectangle",
+                "export component TrayPopup inherits Window",
+            ),
         ] {
-            assert!(
-                route_group.contains(required),
-                "route-group row must expose a full-surface accordion trigger: {required}"
-            );
+            let source = popup
+                .split(component)
+                .nth(1)
+                .and_then(|rest| rest.split(next).next())
+                .expect("tray component source");
+            for required in [
+                "FocusScope {",
+                "TouchArea {",
+                "clicked => { root.activated(); }",
+                "accessible-role: button;",
+            ] {
+                assert!(source.contains(required), "{component}: {required}");
+            }
         }
     }
 
