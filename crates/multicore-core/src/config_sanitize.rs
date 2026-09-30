@@ -1,6 +1,12 @@
 //! Turns a runtime generation staged by the (untrusted) user daemon into configs the privileged
-//! service may run: every listener on loopback, the controller and its secret owned by the
-//! service, every provider cache inside the service directory, and no file the user named.
+//! service may run: every configured inbound on loopback, the controller and its secret owned
+//! by the service, every provider cache, EasyTier state and Xray `xdrive` folder inside the
+//! client's service-owned home, and no file the user named.
+//!
+//! Threat model: a local user process stages a config that the SYSTEM/root service runs, so the
+//! rules stop a config from reaching local files, sockets or host settings the user could not
+//! reach. Network behaviour a provider chooses (EasyTier peer listeners and exit nodes, `xdrive`
+//! cloud storage) is not a local escalation and is run as written.
 //!
 //! Listening ports (plan amendment A6): a generation staged for system-proxy mode (`tun.enable`
 //! explicitly `false`, as `MihomoRuntimeControl::with_proxy_mode` writes it) keeps exactly one
@@ -18,7 +24,8 @@
 //! routing rules keep only matchers and targets ([`ALLOWED_XRAY_RULE_KEYS`], so no `webhook`);
 //! outbounds keep only their documented fields and a known protocol. At any depth, server-only
 //! features ([`XRAY_FORBIDDEN_KEYS`]) and file reads are refused, and no endpoint value
-//! ([`XRAY_ENDPOINT_KEYS`]) may name a local socket or file.
+//! ([`XRAY_ENDPOINT_KEYS`]) may name a local socket or file. The `xdrive` transport is kept with
+//! its `local` folders confined to the client's home and its `template` URLs checked.
 
 use std::{net::IpAddr, path::Path};
 
@@ -209,6 +216,7 @@ pub fn sanitize_mihomo(
     }
     rewrite_provider_paths(mapping, "rule-providers", "rule", service_directory)?;
     rewrite_provider_paths(mapping, "proxy-providers", "proxy", service_directory)?;
+    confine_easytier_state_dirs(mapping, service_directory)?;
     reject_credential_files(mapping)?;
     reject_merge_keys_and_tags(&document)?;
     let yaml = serde_yaml_ng::to_string(&document)
@@ -263,13 +271,7 @@ fn rewrite_provider_paths(
                     _ => "yaml",
                 };
                 let digest = Sha256::digest(name.as_bytes());
-                let file = format!(
-                    "{prefix}-{}.{extension}",
-                    digest[..8]
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                );
+                let file = format!("{prefix}-{}.{extension}", hex_prefix(&digest));
                 let path = Path::new(service_directory).join("providers").join(file);
                 provider.insert(
                     key("path"),
@@ -317,7 +319,6 @@ fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
         for (index, proxy) in proxies.iter().enumerate() {
             let at = format!("proxies[{index}]");
             reject_credential_paths_in(proxy, &at)?;
-            reject_overlay_listeners(proxy, &at)?;
         }
     }
     if let Some(providers) = mapping
@@ -342,7 +343,6 @@ fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
                 for (index, proxy) in payload.iter().enumerate() {
                     let at = format!("proxy-providers.{name}.payload[{index}]");
                     reject_credential_paths_in(proxy, &at)?;
-                    reject_overlay_listeners(proxy, &at)?;
                 }
             }
         }
@@ -350,46 +350,113 @@ fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
     Ok(())
 }
 
-/// EasyTier proxy fields (Mihomo v1.19.32) that turn an outbound into a server reachable from
-/// other machines: peer `listeners` (e.g. `tcp://0.0.0.0:11010`, or the default one that
-/// `no-listener: false` opens), `mapped-listeners`, and `enable-exit-node`/`proxy-networks`,
-/// which let overlay peers route through this host and its networks. A privileged core keeps
-/// every listener on loopback, so such a proxy is refused in inline proxies and inline provider
-/// payloads (remote provider content is fetched by Mihomo itself and is not seen here).
-fn reject_overlay_listeners(proxy: &Value, at: &str) -> Result<(), SanitizeError> {
-    let Some(proxy) = proxy.as_mapping() else {
-        return Ok(());
-    };
-    let mut fields = Vec::with_capacity(proxy.len());
-    for (name, value) in proxy {
-        fields.push((mihomo_field_name(name.as_str().unwrap_or(""))?, name, value));
+/// EasyTier proxies (Mihomo v1.19.32, `adapter/outbound/easytier.go`) are run as the provider
+/// wrote them, including peer `listeners`, `mapped-listeners`, `no-listener: false`,
+/// `enable-exit-node` and `proxy-networks`: which networks the overlay exposes is the
+/// provider's choice, not a local privilege escalation. Every socket EasyTier opens goes through
+/// Mihomo's IP dialer (`component/easytier/platform.go`: TCP/UDP only, no unix sockets, FakeTCP
+/// refused), and its generated TOML forces `no_tun` (`component/easytier/toml.go`).
+///
+/// The one filesystem field is `state-dir`, where `init` creates the directory (`MkdirAll`) and
+/// reads/writes an `instance_id` file. Mihomo already resolves it against its home and refuses it
+/// outside `SAFE_PATHS` (`C.Path.IsSafePath`; in service mode `SAFE_PATHS` is the client's own
+/// home only, and remote provider content relies on that check). Inline proxies and inline
+/// provider payloads are additionally pinned here: any `state-dir` spelling is replaced by
+/// `<home>/easytier/<hash of the proxy's location and name>`, so neither a path nor a crafted
+/// `name` (the default `easytier/<name>`) can pick the directory.
+fn confine_easytier_state_dirs(
+    mapping: &mut Mapping,
+    service_directory: &str,
+) -> Result<(), SanitizeError> {
+    if let Some(proxies) = mapping
+        .get_mut(key("proxies"))
+        .and_then(Value::as_sequence_mut)
+    {
+        for proxy in proxies.iter_mut() {
+            confine_easytier_state_dir(proxy, "proxies", service_directory)?;
+        }
     }
-    let is_easytier = fields.iter().any(|(field, _, value)| {
-        field == "type"
-            && value
-                .as_str()
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("easytier"))
-    });
-    if !is_easytier {
-        return Ok(());
-    }
-    for (field, name, value) in fields {
-        let serving = match field.as_str() {
-            "listeners" | "mapped-listeners" | "proxy-networks" => {
-                !value.is_null() && value.as_sequence().is_none_or(|items| !items.is_empty())
+    if let Some(providers) = mapping
+        .get_mut(key("proxy-providers"))
+        .and_then(Value::as_mapping_mut)
+    {
+        for (name, provider) in providers.iter_mut() {
+            let scope = format!("proxy-providers.{}", name.as_str().unwrap_or(""));
+            let Some(provider) = provider.as_mapping_mut() else {
+                continue;
+            };
+            for (field, payload) in provider.iter_mut() {
+                let is_payload = field
+                    .as_str()
+                    .and_then(|field| mihomo_field_name(field).ok())
+                    .as_deref()
+                    == Some("payload");
+                if let Some(payload) = payload.as_sequence_mut().filter(|_| is_payload) {
+                    for proxy in payload.iter_mut() {
+                        confine_easytier_state_dir(proxy, &scope, service_directory)?;
+                    }
+                }
             }
-            "no-listener" => value.as_bool() != Some(true),
-            "enable-exit-node" => value.as_bool() != Some(false),
-            _ => false,
-        };
-        if serving {
-            return Err(SanitizeError::NonLoopbackListener(format!(
-                "{at}.{}",
-                name.as_str().unwrap_or("")
-            )));
         }
     }
     Ok(())
+}
+
+fn confine_easytier_state_dir(
+    proxy: &mut Value,
+    scope: &str,
+    service_directory: &str,
+) -> Result<(), SanitizeError> {
+    let Some(proxy) = proxy.as_mapping_mut() else {
+        return Ok(());
+    };
+    let mut is_easytier = false;
+    let mut name = None;
+    for (field, value) in proxy.iter() {
+        match mihomo_field_name(field.as_str().unwrap_or(""))?.as_str() {
+            "type" => {
+                is_easytier |= value
+                    .as_str()
+                    .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("easytier"));
+            }
+            // The exact `name` wins, as in Mihomo's decoder; any spelling keeps it stable.
+            "name" if name.is_none() || field.as_str() == Some("name") => {
+                name = value.as_str().map(str::to_owned);
+            }
+            _ => {}
+        }
+    }
+    if !is_easytier {
+        return Ok(());
+    }
+    proxy.retain(|field, _| {
+        field
+            .as_str()
+            .and_then(|field| mihomo_field_name(field).ok())
+            .as_deref()
+            != Some("state-dir")
+    });
+    let digest = Sha256::digest(format!("{scope} {}", name.unwrap_or_default()).as_bytes());
+    let directory = Path::new(service_directory)
+        .join("easytier")
+        .join(hex_prefix(&digest));
+    proxy.insert(
+        key("state-dir"),
+        Value::String(
+            directory
+                .to_str()
+                .ok_or(SanitizeError::ServiceDirectory)?
+                .to_owned(),
+        ),
+    );
+    Ok(())
+}
+
+fn hex_prefix(digest: &[u8]) -> String {
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Mihomo decodes proxies and providers with its `structure` decoder, which looks keys up
@@ -617,24 +684,32 @@ pub const XRAY_ENDPOINT_KEYS: &[&str] = &[
 ];
 
 /// Keys refused wherever they appear (ASCII-folded): server-side features a client bridge never
-/// needs (`masquerade` file server/proxy, `fallbacks`, `decryption`, `echServerKeys`), raw
-/// socket powers of the privileged core (`customSockopt` = arbitrary `setsockopt`), and the
-/// v26.9.30 `xdrive` transport (`xdriveSettings`): its `local` service creates, reads and deletes
-/// files under any `remoteFolder`, and its `template` service sends HTTP requests to any URL,
-/// both with the core's own privileges.
+/// needs (`masquerade` file server/proxy, `fallbacks`, `decryption`, `echServerKeys`) and raw
+/// socket powers of the privileged core (`customSockopt` = arbitrary `setsockopt`).
 pub const XRAY_FORBIDDEN_KEYS: &[&str] = &[
     "masquerade",
     "fallbacks",
     "decryption",
     "echServerKeys",
     "customSockopt",
-    "xdriveSettings",
 ];
 
-/// Stream transports refused as a `network` (or its alias `method`) value, ASCII-folded.
-const XRAY_FORBIDDEN_TRANSPORTS: &[&str] = &["xdrive"];
+/// `xdrive` storage services of the pinned Xray (`XDriveConfig.Build`, matched exactly).
+pub const XRAY_XDRIVE_SERVICES: &[&str] = &["local", "Google Drive", "template"];
 
-pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
+/// Where a client's `xdrive` `local` folders live, under its service-owned home.
+pub const XRAY_XDRIVE_DIRECTORY: &str = "xdrive";
+
+/// Sanitises a staged Xray config for the privileged service. `client_home` is the client's
+/// own service-owned home (Xray's `XRAY_LOCATION_ASSET`, Mihomo's `-d`); `xdrive` `local`
+/// folders are confined under it (see [`shape_xdrive`]).
+pub fn sanitize_xray(input: &[u8], client_home: &Path) -> Result<Vec<u8>, SanitizeError> {
+    if !client_home.is_absolute() {
+        return Err(SanitizeError::ServiceDirectory);
+    }
+    let client_home = client_home
+        .to_str()
+        .ok_or(SanitizeError::ServiceDirectory)?;
     let mut document: Json = serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
     reject_ambiguous_keys(&document)?;
     let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
@@ -647,6 +722,7 @@ pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     }
     reject_xray_references(&document, "$")?;
     strip_output_files(&mut document);
+    shape_xdrive_settings(&mut document, "$", client_home)?;
     let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
     for (name, value) in root.iter_mut() {
         if name.eq_ignore_ascii_case("inbounds") {
@@ -909,7 +985,7 @@ fn is_local_endpoint(text: &str) -> bool {
 }
 
 /// The refusals that apply at any depth of the kept sections: file reads (`certificateFile`,
-/// `keyFile`, `ext:`), [`XRAY_FORBIDDEN_KEYS`], an `xdrive` transport, a socket `tproxy` mode, a `unix` socket `type`
+/// `keyFile`, `ext:`), [`XRAY_FORBIDDEN_KEYS`], a socket `tproxy` mode, a `unix` socket `type`
 /// or `network`, and a local socket or file in any [`XRAY_ENDPOINT_KEYS`] value.
 fn reject_xray_references(value: &Json, at: &str) -> Result<(), SanitizeError> {
     match value {
@@ -923,10 +999,6 @@ fn reject_xray_references(value: &Json, at: &str) -> Result<(), SanitizeError> {
                     return Err(SanitizeError::FileReference(here));
                 }
                 if is_named(name, XRAY_FORBIDDEN_KEYS)
-                    || (is_named(name, &["network", "method"])
-                        && child
-                            .as_str()
-                            .is_some_and(|kind| is_named(kind.trim(), XRAY_FORBIDDEN_TRANSPORTS)))
                     || (name.eq_ignore_ascii_case("tproxy")
                         && !child.as_str().is_some_and(|mode| {
                             mode.is_empty() || mode.eq_ignore_ascii_case("off")
@@ -971,6 +1043,181 @@ fn reject_xray_references(value: &Json, at: &str) -> Result<(), SanitizeError> {
             return Err(SanitizeError::FileReference(at.to_owned()));
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Shapes every `xdriveSettings` object (ASCII-folded, at any depth; Xray reads it from a
+/// `streamSettings`) of the pinned Xray v26.9.30 `xdrive` transport
+/// (`transport/internet/xdrive`, `XDriveConfig` in `infra/conf/transport_method.go`):
+///
+/// - `service` must be exactly one of [`XRAY_XDRIVE_SERVICES`] (as `XDriveConfig.Build`).
+/// - `local` (`local.go`) is the only service that touches the filesystem: it `MkdirAll`s
+///   `remoteFolder` and creates, reads, renames and `RemoveAll`s objects below it as the
+///   privileged core. Its `remoteFolder` must be a relative path of plain name components
+///   ([`is_xdrive_component`]: no absolute, drive, UNC or `\` path, no `.`/`..`, no ADS or
+///   device name) and is rewritten to `<client home>/xdrive/<components>`. The home is
+///   service-owned and private, so no user can plant a symlink or junction below it; object
+///   names coming from the peer are `path.Clean`ed under the root by Xray itself.
+/// - `template` (`template.go`) sends HTTP requests through Xray's own TCP dialer (no unix
+///   sockets). Every request URL (`put`/`get`/`delete`/`list` `url`, `auth.tokenUrl`) must be a
+///   literal `http(s)://host` whose authority has no `{placeholder}` (so substitution cannot
+///   pick the host) and whose host is not a local socket or file ([`is_local_endpoint`]).
+///   Loopback and private hosts stay allowed, as for every other endpoint: a TCP request from
+///   the core reaches nothing a local user could not reach.
+/// - `Google Drive` (`drive.go`) talks only to Google's fixed HTTPS endpoints.
+fn shape_xdrive_settings(
+    value: &mut Json,
+    at: &str,
+    client_home: &str,
+) -> Result<(), SanitizeError> {
+    match value {
+        Json::Object(map) => {
+            for (name, child) in map.iter_mut() {
+                let here = format!("{at}.{name}");
+                if name.eq_ignore_ascii_case("xdriveSettings") {
+                    shape_xdrive(child, &here, client_home)?;
+                } else {
+                    shape_xdrive_settings(child, &here, client_home)?;
+                }
+            }
+        }
+        Json::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                shape_xdrive_settings(item, &format!("{at}[{index}]"), client_home)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn shape_xdrive(settings: &mut Json, at: &str, client_home: &str) -> Result<(), SanitizeError> {
+    if settings.is_null() {
+        return Ok(());
+    }
+    let settings = settings.as_object_mut().ok_or(SanitizeError::Malformed)?;
+    let service = field(settings, "service")
+        .and_then(Json::as_str)
+        .filter(|service| XRAY_XDRIVE_SERVICES.contains(service))
+        .ok_or_else(|| SanitizeError::ForbiddenField(format!("{at}.service")))?
+        .to_owned();
+    if let Some(template) = field(settings, "template").filter(|template| !template.is_null()) {
+        check_xdrive_template(template, &format!("{at}.template"))?;
+    }
+    if service != "local" {
+        return Ok(());
+    }
+    let folder_at = format!("{at}.remoteFolder");
+    let folder = field(settings, "remoteFolder")
+        .and_then(Json::as_str)
+        .ok_or_else(|| SanitizeError::FileReference(folder_at.clone()))?;
+    let components = folder
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if folder.starts_with('/')
+        || components.is_empty()
+        || components.len() > 8
+        || !components
+            .iter()
+            .all(|component| is_xdrive_component(component))
+    {
+        return Err(SanitizeError::FileReference(folder_at));
+    }
+    let mut directory = Path::new(client_home).join(XRAY_XDRIVE_DIRECTORY);
+    for component in components {
+        directory.push(component);
+    }
+    let directory = directory
+        .to_str()
+        .ok_or(SanitizeError::ServiceDirectory)?
+        .to_owned();
+    settings.retain(|name, _| !name.eq_ignore_ascii_case("remoteFolder"));
+    settings.insert("remoteFolder".to_owned(), directory.into());
+    Ok(())
+}
+
+/// One component of an `xdrive` `local` folder: 1-64 ASCII letters, digits, `-`, `_` or `.`,
+/// not `.`/`..` or anything ending in `.` (Windows would strip it), and no Windows device name.
+fn is_xdrive_component(component: &str) -> bool {
+    const DEVICES: &[&str] = &["con", "prn", "aux", "nul", "conin$", "conout$"];
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let numbered_device = (stem.starts_with("com") || stem.starts_with("lpt"))
+        && stem.len() == 4
+        && stem.as_bytes()[3].is_ascii_digit();
+    (1..=64).contains(&component.len())
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !component.ends_with('.')
+        && !DEVICES.contains(&stem.as_str())
+        && !numbered_device
+}
+
+/// Checks the request URLs of an `xdrive` `template` (Go decodes it case-insensitively).
+fn check_xdrive_template(template: &Json, at: &str) -> Result<(), SanitizeError> {
+    let template = template.as_object().ok_or(SanitizeError::Malformed)?;
+    let mut urls = Vec::new();
+    for operation in ["put", "get", "delete", "list"] {
+        if let Some(settings) = field(template, operation).filter(|value| !value.is_null()) {
+            let settings = settings.as_object().ok_or(SanitizeError::Malformed)?;
+            if let Some(url) = field(settings, "url") {
+                urls.push((format!("{at}.{operation}.url"), url));
+            }
+        }
+    }
+    if let Some(auth) = field(template, "auth").filter(|value| !value.is_null()) {
+        let auth = auth.as_object().ok_or(SanitizeError::Malformed)?;
+        if let Some(url) = field(auth, "tokenUrl") {
+            urls.push((format!("{at}.auth.tokenUrl"), url));
+        }
+    }
+    for (here, url) in urls {
+        match url {
+            Json::Null => {}
+            Json::String(text) if text.is_empty() => {}
+            Json::String(text) => check_xdrive_url(text, &here)?,
+            _ => return Err(SanitizeError::Malformed),
+        }
+    }
+    Ok(())
+}
+
+/// A literal `http(s)://host[:port]/...` URL with no whitespace or control characters, no
+/// placeholder, escape or `\` in its authority, and a host that is not a local socket or file.
+fn check_xdrive_url(text: &str, at: &str) -> Result<(), SanitizeError> {
+    let lower = text.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .filter(|_| {
+            !text
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ')
+        });
+    let Some(rest) = rest else {
+        return Err(if is_local_endpoint(text) {
+            SanitizeError::LocalEndpoint(at.to_owned())
+        } else {
+            SanitizeError::ForbiddenField(at.to_owned())
+        });
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => host_port.split(':').next().unwrap_or(""),
+    };
+    if authority.contains(['{', '}', '\\', '%']) || host.is_empty() {
+        return Err(SanitizeError::ForbiddenField(at.to_owned()));
+    }
+    if is_local_endpoint(host) {
+        return Err(SanitizeError::LocalEndpoint(at.to_owned()));
     }
     Ok(())
 }

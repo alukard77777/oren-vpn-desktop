@@ -19,6 +19,11 @@ fn policy() -> MihomoServicePolicy<'static> {
     }
 }
 
+/// The client's service-owned home (Mihomo `-d`, Xray `XRAY_LOCATION_ASSET`).
+fn home() -> &'static Path {
+    Path::new(SERVICE_DIR)
+}
+
 fn yaml(bytes: &[u8]) -> Value {
     serde_yaml_ng::from_slice(bytes).unwrap()
 }
@@ -219,7 +224,7 @@ fn xray_logs_listeners_and_file_references_are_sanitised() {
     let out = sanitize_xray(
         br#"{"log":{"loglevel":"warning","access":"C:\\Windows\\a.log","error":"/etc/x"},
             "inbounds":[{"port":1080,"protocol":"socks"},{"listen":"127.0.0.1","port":1081,"protocol":"socks"}],
-            "outbounds":[{"protocol":"freedom"}]}"#,
+            "outbounds":[{"protocol":"freedom"}]}"#, home(),
     )
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -228,38 +233,44 @@ fn xray_logs_listeners_and_file_references_are_sanitised() {
     assert_eq!(doc["log"]["loglevel"], "warning");
     assert_eq!(doc["inbounds"][0]["listen"], "127.0.0.1");
     assert_eq!(
-        sanitize_xray(br#"{"inbounds":[{"listen":"0.0.0.0","port":1}]}"#),
+        sanitize_xray(br#"{"inbounds":[{"listen":"0.0.0.0","port":1}]}"#, home()),
         Err(SanitizeError::NonLoopbackListener(
             "inbounds[0].listen".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"inbounds":[{"listen":"/run/x.sock","port":1}]}"#),
+        sanitize_xray(
+            br#"{"inbounds":[{"listen":"/run/x.sock","port":1}]}"#,
+            home()
+        ),
         Err(SanitizeError::NonLoopbackListener(
             "inbounds[0].listen".into()
         ))
     );
     // `api` (and every other non-allowlisted section) is dropped, whatever it listens on.
     let without_api: serde_json::Value = serde_json::from_slice(
-        &sanitize_xray(br#"{"api":{"tag":"api","listen":"0.0.0.0:10085"}}"#).unwrap(),
+        &sanitize_xray(br#"{"api":{"tag":"api","listen":"0.0.0.0:10085"}}"#, home()).unwrap(),
     )
     .unwrap();
     assert!(without_api.get("api").is_none());
     assert_eq!(
         sanitize_xray(
-            br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"certificateFile":"C:\\k.pem"}]}}}]}"#
+            br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"certificateFile":"C:\\k.pem"}]}}}]}"#, home()
         ),
         Err(SanitizeError::FileReference(
             "$.outbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"routing":{"rules":[{"domain":["ext:..\\..\\SAM:x"]}]}}"#),
+        sanitize_xray(
+            br#"{"routing":{"rules":[{"domain":["ext:..\\..\\SAM:x"]}]}}"#,
+            home()
+        ),
         Err(SanitizeError::FileReference(
             "$.routing.rules[0].domain[0]".into()
         ))
     );
-    assert_eq!(sanitize_xray(b"[1]"), Err(SanitizeError::Malformed));
+    assert_eq!(sanitize_xray(b"[1]", home()), Err(SanitizeError::Malformed));
 }
 
 #[test]
@@ -284,7 +295,7 @@ fn a_daemon_staged_proxy_mode_generation_is_accepted() {
             .unwrap()
             .contains("daemon-secret")
     );
-    sanitize_xray(&xray).unwrap();
+    sanitize_xray(&xray, home()).unwrap();
 }
 
 #[test]
@@ -442,7 +453,7 @@ fn credential_paths_are_refused_everywhere() {
 #[test]
 fn xray_keys_are_matched_case_insensitively() {
     let out = sanitize_xray(
-        br#"{"LOG":{"Access":"C:/Windows/evil.txt","ERROR":"C:/e","LogLevel":"warning","dnsLog":true}}"#,
+        br#"{"LOG":{"Access":"C:/Windows/evil.txt","ERROR":"C:/e","LogLevel":"warning","dnsLog":true}}"#, home(),
     )
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -456,7 +467,7 @@ fn xray_keys_are_matched_case_insensitively() {
         br#"{"Metrics":{"Listen":"[::]:11111"}}"#,
     ] {
         let doc: serde_json::Value =
-            serde_json::from_slice(&sanitize_xray(input).unwrap()).unwrap();
+            serde_json::from_slice(&sanitize_xray(input, home()).unwrap()).unwrap();
         assert!(
             doc.as_object().unwrap().is_empty(),
             "{}",
@@ -464,42 +475,51 @@ fn xray_keys_are_matched_case_insensitively() {
         );
     }
     assert_eq!(
-        sanitize_xray(br#"{"Inbounds":[{"Listen":"0.0.0.0","port":1}]}"#),
+        sanitize_xray(br#"{"Inbounds":[{"Listen":"0.0.0.0","port":1}]}"#, home()),
         Err(SanitizeError::NonLoopbackListener(
             "inbounds[0].listen".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"CertificateFile":"C:/k.pem"}]}}}]}"#),
+        sanitize_xray(br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"CertificateFile":"C:/k.pem"}]}}}]}"#, home()),
         Err(SanitizeError::FileReference(
             "$.outbounds[0].streamSettings.tlsSettings.certificates[0].CertificateFile".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"outbounds":[{"x":{"KEYFILE":"C:/k.pem"}}]}"#),
+        sanitize_xray(br#"{"outbounds":[{"x":{"KEYFILE":"C:/k.pem"}}]}"#, home()),
         Err(SanitizeError::FileReference(
             "$.outbounds[0].x.KEYFILE".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"dns":{"hosts":{"ext:C:/SAM:x":"1.1.1.1"}}}"#),
+        sanitize_xray(br#"{"dns":{"hosts":{"ext:C:/SAM:x":"1.1.1.1"}}}"#, home()),
         Err(SanitizeError::FileReference(
             "$.dns.hosts.ext:C:/SAM:x".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"routing":{"rules":[{"ip":["EXT:C:/SAM:x"]}]}}"#),
+        sanitize_xray(
+            br#"{"routing":{"rules":[{"ip":["EXT:C:/SAM:x"]}]}}"#,
+            home()
+        ),
         Err(SanitizeError::FileReference(
             "$.routing.rules[0].ip[0]".into()
         ))
     );
     // Two keys that fold to the same name are ambiguous for Go: refused.
     assert_eq!(
-        sanitize_xray(br#"{"inbounds":[{"listen":"127.0.0.1","Listen":"0.0.0.0"}]}"#),
+        sanitize_xray(
+            br#"{"inbounds":[{"listen":"127.0.0.1","Listen":"0.0.0.0"}]}"#,
+            home()
+        ),
         Err(SanitizeError::Malformed)
     );
     assert_eq!(
-        sanitize_xray(br#"{"log":{"loglevel":"none"},"Log":{"access":"C:/x"}}"#),
+        sanitize_xray(
+            br#"{"log":{"loglevel":"none"},"Log":{"access":"C:/x"}}"#,
+            home()
+        ),
         Err(SanitizeError::Malformed)
     );
 }
@@ -519,14 +539,17 @@ fn xray_keys_with_unicode_fold_aliases_are_refused() {
         "{\"routing\":{\"rules\":[{\"é\":1}]}}",
     ] {
         assert_eq!(
-            sanitize_xray(input.as_bytes()),
+            sanitize_xray(input.as_bytes(), home()),
             Err(SanitizeError::Malformed),
             "{input}"
         );
     }
     // Non-ASCII *values* stay allowed (e.g. remarks, IDN domains).
-    sanitize_xray("{\"outbounds\":[{\"tag\":\"узел\",\"protocol\":\"freedom\"}]}".as_bytes())
-        .unwrap();
+    sanitize_xray(
+        "{\"outbounds\":[{\"tag\":\"узел\",\"protocol\":\"freedom\"}]}".as_bytes(),
+        home(),
+    )
+    .unwrap();
 }
 
 /// Mihomo's `structure` decoder accepts `_` for `-` in proxy fields, and field names are ASCII.
@@ -617,13 +640,13 @@ fn xray_sections_are_allowlisted_and_geodata_is_dropped() {
         "inbounds":[{"protocol":"socks","port":1080}],
         "outbounds":[{"protocol":"freedom"}]}"#;
     assert_eq!(
-        sanitize_xray(input),
+        sanitize_xray(input, home()),
         Err(SanitizeError::Malformed),
         "geodata and GeoData fold together"
     );
     let input = String::from_utf8_lossy(input).replace("\"GeoData\":{\"cron\":\"* * * * *\"},", "");
     let doc: serde_json::Value =
-        serde_json::from_slice(&sanitize_xray(input.as_bytes()).unwrap()).unwrap();
+        serde_json::from_slice(&sanitize_xray(input.as_bytes(), home()).unwrap()).unwrap();
     let mut kept = doc.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
     kept.sort();
     assert_eq!(
@@ -644,7 +667,7 @@ fn xray_sections_are_allowlisted_and_geodata_is_dropped() {
         assert!(multicore_core::ALLOWED_XRAY_SECTIONS.contains(&name.as_str()));
     }
     let upper: serde_json::Value = serde_json::from_slice(
-        &sanitize_xray(br#"{"GEODATA":{"cron":"* * * * *","assets":[]}}"#).unwrap(),
+        &sanitize_xray(br#"{"GEODATA":{"cron":"* * * * *","assets":[]}}"#, home()).unwrap(),
     )
     .unwrap();
     assert!(upper.as_object().unwrap().is_empty());
@@ -658,7 +681,7 @@ fn master_key_logs_are_stripped_at_any_depth() {
             {"protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"masterkeylog":"/root/.bashrc","publicKey":"k"}}},
             {"protocol":"vless","settings":{"deep":[{"MASTERKEYLOG":"/tmp/x"}]}}
         ]}"#;
-    let text = String::from_utf8(sanitize_xray(input).unwrap()).unwrap();
+    let text = String::from_utf8(sanitize_xray(input, home()).unwrap()).unwrap();
     assert!(
         !text.to_ascii_lowercase().contains("masterkeylog"),
         "{text}"
@@ -667,7 +690,8 @@ fn master_key_logs_are_stripped_at_any_depth() {
     // A non-ASCII spelling (Kelvin sign) is refused by the key check.
     assert_eq!(
         sanitize_xray(
-            "{\"outbounds\":[{\"tlsSettings\":{\"master\u{212a}eyLog\":\"/x\"}}]}".as_bytes()
+            "{\"outbounds\":[{\"tlsSettings\":{\"master\u{212a}eyLog\":\"/x\"}}]}".as_bytes(),
+            home()
         ),
         Err(SanitizeError::Malformed)
     );
@@ -690,7 +714,7 @@ fn only_loopback_socks_inbounds_are_run() {
             r#"{{"inbounds":[{{"protocol":"socks","port":1}},{{"protocol":"{protocol}","port":2,"settings":{{"followRedirect":true}}}}]}}"#
         );
         assert_eq!(
-            sanitize_xray(input.as_bytes()),
+            sanitize_xray(input.as_bytes(), home()),
             Err(SanitizeError::ForbiddenProtocol(
                 "inbounds[1].protocol".into()
             )),
@@ -698,13 +722,16 @@ fn only_loopback_socks_inbounds_are_run() {
         );
     }
     assert_eq!(
-        sanitize_xray(br#"{"inbounds":[{"port":1}]}"#),
+        sanitize_xray(br#"{"inbounds":[{"port":1}]}"#, home()),
         Err(SanitizeError::ForbiddenProtocol(
             "inbounds[0].protocol".into()
         ))
     );
-    sanitize_xray(br#"{"inbounds":[{"protocol":"SOCKS","port":1,"settings":{"udp":true}}]}"#)
-        .unwrap();
+    sanitize_xray(
+        br#"{"inbounds":[{"protocol":"SOCKS","port":1,"settings":{"udp":true}}]}"#,
+        home(),
+    )
+    .unwrap();
 }
 
 /// Re-review 2 N3: provider fields the sanitiser reads must be spelled exactly.
@@ -846,13 +873,13 @@ const BRIDGE_XRAY: &str = r#"{
 fn realistic_bridge_configs_pass_unchanged() {
     let input: serde_json::Value = serde_json::from_str(BRIDGE_XRAY).unwrap();
     let output: serde_json::Value =
-        serde_json::from_slice(&sanitize_xray(BRIDGE_XRAY.as_bytes()).unwrap()).unwrap();
+        serde_json::from_slice(&sanitize_xray(BRIDGE_XRAY.as_bytes(), home()).unwrap()).unwrap();
     let mut expected = input.clone();
     expected["outbounds"][4]["settings"]["noKernelTun"] = true.into();
     assert_eq!(output, expected);
     // A user's `noKernelTun: false` does not survive either.
     let forced = sanitize_xray(
-        br#"{"outbounds":[{"protocol":"WireGuard","settings":{"NoKernelTun":false,"secretKey":"k"}}]}"#,
+        br#"{"outbounds":[{"protocol":"WireGuard","settings":{"NoKernelTun":false,"secretKey":"k"}}]}"#, home(),
     )
     .unwrap();
     let forced: serde_json::Value = serde_json::from_slice(&forced).unwrap();
@@ -861,7 +888,7 @@ fn realistic_bridge_configs_pass_unchanged() {
         serde_json::json!({"secretKey": "k", "noKernelTun": true})
     );
     // The idle config of a Mihomo-only subscription passes too.
-    sanitize_xray(multicore_core::IDLE_XRAY_CONFIG).unwrap();
+    sanitize_xray(multicore_core::IDLE_XRAY_CONFIG, home()).unwrap();
 }
 
 /// Re-review 3 H1R3-1: a routing rule keeps only its matchers and target, so `webhook` (whose
@@ -875,6 +902,7 @@ fn routing_rules_keep_only_matchers_and_targets() {
               "Webhook2":{},"somethingNew":{"url":"https://example.com"}}],
             "balancers":[{"tag":"b","selector":["a"],"strategy":{"type":"leastLoad",
               "settings":{"maxRTT":"1s"},"extra":1},"hook":{}}]}}"#,
+        home(),
     )
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -888,6 +916,7 @@ fn routing_rules_keep_only_matchers_and_targets() {
     // Case variants are dropped the same way.
     let out = sanitize_xray(
         br#"{"Routing":{"Rules":[{"OutboundTag":"d","WEBHOOK":{"url":"https://x"}}]}}"#,
+        home(),
     )
     .unwrap();
     assert!(!String::from_utf8(out).unwrap().contains("WEBHOOK"));
@@ -902,7 +931,7 @@ fn routing_rules_keep_only_matchers_and_targets() {
             r#"{{"routing":{{"rules":[{{"inboundTag":["in"],"outboundTag":"direct","webhook":{{"url":"{url}"}}}}]}}}}"#
         );
         assert_eq!(
-            sanitize_xray(input.as_bytes()),
+            sanitize_xray(input.as_bytes(), home()),
             Err(SanitizeError::LocalEndpoint(
                 "$.routing.rules[0].webhook.url".into()
             )),
@@ -916,7 +945,7 @@ fn routing_rules_keep_only_matchers_and_targets() {
 #[test]
 fn inbounds_must_be_exactly_a_loopback_socks_bridge() {
     let refused = |inbound: &str| {
-        sanitize_xray(format!(r#"{{"inbounds":[{inbound}]}}"#).as_bytes()).unwrap_err()
+        sanitize_xray(format!(r#"{{"inbounds":[{inbound}]}}"#).as_bytes(), home()).unwrap_err()
     };
     let field = |name: &str| SanitizeError::ForbiddenField(format!("inbounds[0].{name}"));
     let base = r#""listen":"127.0.0.1","port":1080,"protocol":"socks""#;
@@ -1008,6 +1037,7 @@ fn inbounds_must_be_exactly_a_loopback_socks_bridge() {
     // Accepted forms are written back canonically.
     let out = sanitize_xray(
         br#"{"inbounds":[{"Tag":"a","PORT":"1080","Protocol":"SOCKS","Settings":{"UDP":true}}]}"#,
+        home(),
     )
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -1029,6 +1059,7 @@ fn socks_inbound_settings_tolerate_harmless_client_keys() {
               "accounts":[{"user":"u","pass":"p","level":1}]},
             "sniffing":{"enabled":true,"destOverride":"http, tls,quic","future":1,
               "domainsExcluded":"a.example"}}]}"#,
+        home(),
     )
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -1042,18 +1073,24 @@ fn socks_inbound_settings_tolerate_harmless_client_keys() {
     // Server-side features stay refused inside settings, and the inbound shape is unchanged.
     assert_eq!(
         sanitize_xray(
-            br#"{"inbounds":[{"port":1,"protocol":"socks","settings":{"fallbacks":[{"dest":80}]}}]}"#
+            br#"{"inbounds":[{"port":1,"protocol":"socks","settings":{"fallbacks":[{"dest":80}]}}]}"#, home()
         ),
         Err(SanitizeError::ForbiddenField(
             "$.inbounds[0].settings.fallbacks".into()
         ))
     );
     assert_eq!(
-        sanitize_xray(br#"{"inbounds":[{"port":1,"protocol":"socks","allocate":{}}]}"#),
+        sanitize_xray(
+            br#"{"inbounds":[{"port":1,"protocol":"socks","allocate":{}}]}"#,
+            home()
+        ),
         Err(SanitizeError::ForbiddenField("inbounds[0].allocate".into()))
     );
     assert_eq!(
-        sanitize_xray(br#"{"inbounds":[{"port":1,"protocol":"socks","sniffing":{"enabled":1}}]}"#),
+        sanitize_xray(
+            br#"{"inbounds":[{"port":1,"protocol":"socks","sniffing":{"enabled":1}}]}"#,
+            home()
+        ),
         Err(SanitizeError::Malformed)
     );
 }
@@ -1138,7 +1175,7 @@ fn endpoints_never_name_a_local_socket_or_file() {
             let escaped = serde_json::to_string(form).unwrap();
             let input = template.replace("\"@X@\"", &escaped);
             assert_eq!(
-                sanitize_xray(input.as_bytes()),
+                sanitize_xray(input.as_bytes(), home()),
                 Err(SanitizeError::LocalEndpoint((*at).to_owned())),
                 "{input}"
             );
@@ -1146,7 +1183,10 @@ fn endpoints_never_name_a_local_socket_or_file() {
     }
     // A unix `network`/`type` is refused too.
     assert_eq!(
-        sanitize_xray(br#"{"outbounds":[{"protocol":"dns","settings":{"network":"unix"}}]}"#),
+        sanitize_xray(
+            br#"{"outbounds":[{"protocol":"dns","settings":{"network":"unix"}}]}"#,
+            home()
+        ),
         Err(SanitizeError::LocalEndpoint(
             "$.outbounds[0].settings.network".into()
         ))
@@ -1159,6 +1199,7 @@ fn endpoints_never_name_a_local_socket_or_file() {
               "tcpSettings":{"header":{"type":"http","request":{"path":["/"],
                 "headers":{"Host":["a.example"]}}}}}},
           {"protocol":"freedom","settings":{"redirect":"127.0.0.1:53"}}]}"#,
+        home(),
     )
     .unwrap();
 }
@@ -1198,18 +1239,19 @@ fn server_only_features_are_refused_everywhere() {
         ),
     ] {
         assert_eq!(
-            sanitize_xray(input.as_bytes()),
+            sanitize_xray(input.as_bytes(), home()),
             Err(SanitizeError::ForbiddenField(at.to_owned())),
             "{input}"
         );
     }
     sanitize_xray(
         br#"{"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"tproxy":"off"}}}]}"#,
+        home(),
     )
     .unwrap();
     // Unknown outbound fields are dropped; an unknown or missing protocol is refused.
     let out = sanitize_xray(
-        br#"{"outbounds":[{"protocol":"Freedom","tag":"d","listen":"0.0.0.0","allocate":{},"x":1}]}"#,
+        br#"{"outbounds":[{"protocol":"Freedom","tag":"d","listen":"0.0.0.0","allocate":{},"x":1}]}"#, home(),
     )
     .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -1223,7 +1265,10 @@ fn server_only_features_are_refused_everywhere() {
         r#"{"tag":"x"}"#,
     ] {
         assert_eq!(
-            sanitize_xray(format!(r#"{{"outbounds":[{outbound}]}}"#).as_bytes()),
+            sanitize_xray(
+                format!(r#"{{"outbounds":[{outbound}]}}"#).as_bytes(),
+                home()
+            ),
             Err(SanitizeError::ForbiddenProtocol(
                 "outbounds[0].protocol".into()
             )),
@@ -1232,42 +1277,272 @@ fn server_only_features_are_refused_everywhere() {
     }
 }
 
-/// Xray v26.9.30 `xdrive` transport: the `local` service creates, reads and deletes files under
-/// any `remoteFolder` and `template` sends HTTP requests anywhere, as the privileged core.
+fn xdrive_outbound(settings: &str) -> String {
+    format!(
+        r#"{{"outbounds":[{{"protocol":"vless","settings":{{"address":"a.example","port":443,"id":"27848739-7e62-4138-9fd3-098a63964b6b","encryption":"none"}},"streamSettings":{{"network":"xdrive","xdriveSettings":{settings}}}}}]}}"#
+    )
+}
+
+fn xdrive_settings(out: &[u8]) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_slice(out).unwrap();
+    doc["outbounds"][0]["streamSettings"]["xdriveSettings"].clone()
+}
+
+const XDRIVE_AT: &str = "$.outbounds[0].streamSettings.xdriveSettings";
+
+/// Xray v26.9.30 `xdrive` (`transport/internet/xdrive/local.go`): the `local` service
+/// `MkdirAll`s `remoteFolder` and creates, reads and deletes files below it as the privileged
+/// core, so the folder is always rewritten into `<client home>/xdrive/...`.
 #[test]
-fn xdrive_transport_is_refused() {
-    for (input, at) in [
-        (
-            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"network":"xdrive","xdriveSettings":{"service":"local","remoteFolder":"/etc"}}}]}"#,
-            "$.outbounds[0].streamSettings.network",
-        ),
-        (
-            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"XDriveSettings":{"service":"template","template":{}}}}]}"#,
-            "$.outbounds[0].streamSettings.XDriveSettings",
-        ),
-        (
-            r#"{"outbounds":[{"protocol":"vless","streamSettings":{"method":" XDrive "}}]}"#,
-            "$.outbounds[0].streamSettings.method",
-        ),
+fn xdrive_local_folders_are_confined_to_the_client_home() {
+    for (folder, parts) in [
+        ("tunnel", vec!["tunnel"]),
+        ("a/b-1/c_2.d", vec!["a", "b-1", "c_2.d"]),
+        ("a//b/", vec!["a", "b"]),
     ] {
+        let out = sanitize_xray(
+            xdrive_outbound(&format!(
+                r#"{{"service":"local","remoteFolder":"{folder}"}}"#
+            ))
+            .as_bytes(),
+            home(),
+        )
+        .unwrap();
+        let mut expected = home().join("xdrive");
+        for part in parts {
+            expected.push(part);
+        }
         assert_eq!(
-            sanitize_xray(input.as_bytes()),
-            Err(SanitizeError::ForbiddenField(at.to_owned())),
-            "{input}"
+            xdrive_settings(&out)["remoteFolder"],
+            expected.to_str().unwrap(),
+            "{folder}"
         );
     }
-    // A shadowsocks `method` (cipher) is not a transport.
-    sanitize_xray(
-        br#"{"outbounds":[{"protocol":"shadowsocks","settings":{"servers":[{"address":"a.example","port":1,"method":"aes-128-gcm","password":"x"}]}}]}"#,
+    // Any key spelling ends up as the one canonical, rewritten `remoteFolder`.
+    let out = sanitize_xray(
+        xdrive_outbound(r#"{"Service":"local","REMOTEFOLDER":"x","SegmentBytes":65536}"#)
+            .as_bytes(),
+        home(),
     )
     .unwrap();
+    let settings = xdrive_settings(&out);
+    assert_eq!(
+        settings["remoteFolder"],
+        home().join("xdrive").join("x").to_str().unwrap()
+    );
+    assert!(settings.get("REMOTEFOLDER").is_none(), "{settings}");
+    assert_eq!(settings["SegmentBytes"], 65536);
+
+    for folder in [
+        "/etc",
+        "/tmp/xdrive",
+        "C:/Windows",
+        r"C:\\Windows",
+        r"\\\\server\\share",
+        r"a\\b",
+        "..",
+        "a/../../b",
+        "./a",
+        "a/.",
+        "a.",
+        "a:b",
+        "a:stream",
+        "CON",
+        "nul.txt",
+        "com1",
+        "LPT9.log",
+        "",
+        "/",
+        "a b",
+        "a/b/c/d/e/f/g/h/i",
+        "%APPDATA%",
+        "~",
+        "$HOME",
+    ] {
+        let input = xdrive_outbound(&format!(
+            r#"{{"service":"local","remoteFolder":"{folder}"}}"#
+        ));
+        assert_eq!(
+            sanitize_xray(input.as_bytes(), home()),
+            Err(SanitizeError::FileReference(format!(
+                "{XDRIVE_AT}.remoteFolder"
+            ))),
+            "{folder}"
+        );
+    }
+    assert_eq!(
+        sanitize_xray(xdrive_outbound(r#"{"service":"local"}"#).as_bytes(), home()),
+        Err(SanitizeError::FileReference(format!(
+            "{XDRIVE_AT}.remoteFolder"
+        )))
+    );
+    // Only Xray's exact service names; anything else is refused before Xray sees it.
+    for service in [r#""Local""#, r#""dropbox""#, r#""""#, "1", "null"] {
+        assert_eq!(
+            sanitize_xray(
+                xdrive_outbound(&format!(r#"{{"service":{service},"remoteFolder":"x"}}"#))
+                    .as_bytes(),
+                home()
+            ),
+            Err(SanitizeError::ForbiddenField(format!(
+                "{XDRIVE_AT}.service"
+            ))),
+            "{service}"
+        );
+    }
+    // The home itself must be an absolute path.
+    assert_eq!(
+        sanitize_xray(b"{}", Path::new("relative/home")),
+        Err(SanitizeError::ServiceDirectory)
+    );
+}
+
+fn xdrive_template(put_url: &str) -> String {
+    xdrive_outbound(&format!(
+        r#"{{"service":"template","remoteFolder":"folder","secrets":["t"],"template":{{
+            "auth":{{"type":"static","header":{{"Authorization":"Bearer {{secret0}}"}}}},
+            "put":{{"method":"PUT","url":"{put_url}"}},
+            "get":{{"method":"GET","url":"https://dav.example/{{folder}}/{{name}}"}},
+            "delete":{{"method":"DELETE","url":"https://dav.example/{{folder}}/{{name}}"}},
+            "list":{{"method":"PROPFIND","url":"https://dav.example/{{folder}}/","namesRegex":"<d:href>/folder/([^<]+)</d:href>"}}}}}}"#
+    ))
+}
+
+/// `xdrive` `template` (`template.go`) sends HTTP requests through Xray's TCP dialer: its URLs
+/// must be literal http(s) URLs whose host is not a local socket or file. Loopback hosts stay
+/// allowed, as for every other endpoint.
+#[test]
+fn xdrive_template_urls_must_be_network_http_urls() {
+    for url in [
+        "https://dav.example/{folder}/{name}",
+        "HTTP://dav.example:8080/{folder}/{name}?x={secret0}",
+        "https://user@dav.example/{name}",
+        "https://[2001:db8::1]:443/{name}",
+        "http://127.0.0.1:8080/{name}",
+    ] {
+        let out = sanitize_xray(xdrive_template(url).as_bytes(), home()).unwrap();
+        let settings = xdrive_settings(&out);
+        assert_eq!(settings["template"]["put"]["url"], url);
+        // A cloud folder name, not a local path: left alone.
+        assert_eq!(settings["remoteFolder"], "folder");
+    }
+    let put = format!("{XDRIVE_AT}.template.put.url");
+    for url in [
+        "unix:/run/docker.sock",
+        "unix:///run/docker.sock",
+        "http+unix://%2Frun%2Fdocker.sock/x",
+        "file:///etc/shadow",
+        "file:C:/Windows/win.ini",
+        "@abstract",
+        "/run/docker.sock",
+        r"C:\\Windows\\x",
+        r"\\\\.\\pipe\\x",
+    ] {
+        assert_eq!(
+            sanitize_xray(xdrive_template(url).as_bytes(), home()),
+            Err(SanitizeError::LocalEndpoint(put.clone())),
+            "{url}"
+        );
+    }
+    for url in [
+        "ftp://dav.example/x",
+        "gopher://dav.example/x",
+        "https://{secret0}/x",
+        "https://dav{folder}.example/x",
+        "https:///x",
+        " https://dav.example/x",
+        "https://dav.example/a b",
+        "https://dav%2eexample/x",
+    ] {
+        assert_eq!(
+            sanitize_xray(xdrive_template(url).as_bytes(), home()),
+            Err(SanitizeError::ForbiddenField(put.clone())),
+            "{url}"
+        );
+    }
+    // The OAuth2 token endpoint is a request URL too; Go decodes the template case-insensitively.
+    let input = xdrive_outbound(
+        r#"{"service":"template","template":{"Auth":{"type":"oauth2","TokenURL":"unix:/run/x.sock"},
+            "put":{"url":"https://a.example/{name}"},"get":{"url":"https://a.example/{name}"},
+            "delete":{"url":"https://a.example/{name}"},"LIST":{"URL":"file:///etc","namesRegex":"(x)"}}}"#,
+    );
+    assert!(matches!(
+        sanitize_xray(input.as_bytes(), home()),
+        Err(SanitizeError::LocalEndpoint(_))
+    ));
+    assert_eq!(
+        sanitize_xray(
+            xdrive_outbound(r#"{"service":"template","template":"https://a.example"}"#).as_bytes(),
+            home()
+        ),
+        Err(SanitizeError::Malformed)
+    );
+    // Google Drive talks only to Google's fixed endpoints; its folder is a Drive folder id.
+    let out = sanitize_xray(
+        xdrive_outbound(
+            r#"{"service":"Google Drive","remoteFolder":"1AbC","secrets":["i","s","r"]}"#,
+        )
+        .as_bytes(),
+        home(),
+    )
+    .unwrap();
+    assert_eq!(xdrive_settings(&out)["remoteFolder"], "1AbC");
+    // `method` is `network`'s alias, and a shadowsocks `method` (cipher) is untouched.
+    sanitize_xray(
+        br#"{"outbounds":[{"protocol":"vless","streamSettings":{"method":" XDrive "}}]}"#,
+        home(),
+    )
+    .unwrap();
+    sanitize_xray(
+        br#"{"outbounds":[{"protocol":"shadowsocks","settings":{"servers":[{"address":"a.example","port":1,"method":"aes-128-gcm","password":"x"}]}}]}"#,
+        home(),
+    )
+    .unwrap();
+}
+
+const XDRIVE_XRAY_LOCAL: &str = r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":18121}],
+ "outbounds":[{"protocol":"vless","tag":"x",
+   "settings":{"address":"a.example","port":443,"id":"27848739-7e62-4138-9fd3-098a63964b6b","encryption":"none"},
+   "streamSettings":{"network":"xdrive","xdriveSettings":{"service":"local","remoteFolder":"shared/tunnel"}}}]}"#;
+
+const XDRIVE_XRAY_TEMPLATE: &str = r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":18122}],
+ "outbounds":[{"protocol":"vless","tag":"x",
+   "settings":{"address":"a.example","port":443,"id":"27848739-7e62-4138-9fd3-098a63964b6b","encryption":"none"},
+   "streamSettings":{"network":"xdrive","xdriveSettings":{"service":"template","remoteFolder":"folder","secrets":["t"],
+     "template":{"auth":{"type":"static","header":{"Authorization":"Bearer {secret0}"}},
+       "put":{"method":"PUT","url":"https://dav.example/{folder}/{name}"},
+       "get":{"method":"GET","url":"https://dav.example/{folder}/{name}"},
+       "delete":{"method":"DELETE","url":"https://dav.example/{folder}/{name}"},
+       "list":{"method":"PROPFIND","url":"https://dav.example/{folder}/","namesRegex":"<d:href>/folder/([^<]+)</d:href>"}}}}}]}"#;
+
+/// Live check: the pinned Xray accepts sanitised `xdrive` outbounds (local folder rewritten into
+/// a real temporary home, and a template).
+#[test]
+#[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
+fn live_pinned_xray_accepts_sanitised_xdrive_outbounds() {
+    let client_home = tempfile::tempdir().unwrap();
+    let local = sanitize_xray(XDRIVE_XRAY_LOCAL.as_bytes(), client_home.path()).unwrap();
+    assert_eq!(
+        xdrive_settings(&local)["remoteFolder"],
+        client_home
+            .path()
+            .join("xdrive")
+            .join("shared")
+            .join("tunnel")
+            .to_str()
+            .unwrap()
+    );
+    assert_pinned_xray_accepts(&local);
+    assert_pinned_xray_accepts(
+        &sanitize_xray(XDRIVE_XRAY_TEMPLATE.as_bytes(), client_home.path()).unwrap(),
+    );
 }
 
 /// Xray v26.9.30 client additions: the `masque` outbound is kept, and the new object form of
 /// finalmask `xdns` resolvers (`addr`) may not name a local socket or file.
 #[test]
 fn masque_outbounds_are_kept_and_xdns_resolvers_are_endpoints() {
-    let out = sanitize_xray(MASQUE_XRAY.as_bytes()).unwrap();
+    let out = sanitize_xray(MASQUE_XRAY.as_bytes(), home()).unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(doc["outbounds"][0]["protocol"], "masque");
     assert_eq!(
@@ -1276,7 +1551,7 @@ fn masque_outbounds_are_kept_and_xdns_resolvers_are_endpoints() {
     );
     assert_eq!(
         sanitize_xray(
-            br#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":{"resolvers":[{"type":"tcp","settings":{"addr":"/run/x.sock"}}]}}]}}}]}"#,
+            br#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":{"resolvers":[{"type":"tcp","settings":{"addr":"/run/x.sock"}}]}}]}}}]}"#, home(),
         ),
         Err(SanitizeError::LocalEndpoint(
             "$.outbounds[0].streamSettings.finalmask.udp[0].settings.resolvers[0].settings.addr"
@@ -1284,7 +1559,7 @@ fn masque_outbounds_are_kept_and_xdns_resolvers_are_endpoints() {
         ))
     );
     sanitize_xray(
-        br#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}}]}}}]}"#,
+        br#"{"outbounds":[{"protocol":"vless","streamSettings":{"finalmask":{"udp":[{"type":"xdns","settings":{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}}]}}}]}"#, home(),
     )
     .unwrap();
 }
@@ -1297,67 +1572,113 @@ const MASQUE_XRAY: &str = r#"{"inbounds":[{"protocol":"socks","listen":"127.0.0.
      "masqueSettings":{"host":"m.example.com","path":"/.well-known/masque/ip/{target}/{ipproto}/",
        "user":"u","pass":"p"}}}]}"#;
 
-/// Mihomo v1.19.32 EasyTier proxies can listen for peers on every interface and serve as an
-/// exit node for the overlay; the privileged core refuses both.
+fn mihomo_proxies(out: &[u8]) -> Vec<Value> {
+    yaml(out)["proxies"].as_sequence().unwrap().clone()
+}
+
+/// Mihomo v1.19.32 EasyTier proxies (`adapter/outbound/easytier.go`) run as the provider wrote
+/// them, peer listeners and exit node included; only `state-dir` (created, and an `instance_id`
+/// file written, by the privileged core) is pinned inside the client's home.
 #[test]
-fn easytier_proxies_cannot_listen_or_serve_as_exit_nodes() {
-    for (proxy, at) in [
-        (
-            "{name: e, type: easytier, network-name: n, listeners: ['tcp://0.0.0.0:11010']}",
-            "proxies[0].listeners",
-        ),
-        (
-            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], no_listener: false}",
-            "proxies[0].no_listener",
-        ),
-        (
-            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], mapped-listeners: ['tcp://1.2.3.4:1']}",
-            "proxies[0].mapped-listeners",
-        ),
-        (
-            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], enable-exit-node: true}",
-            "proxies[0].enable-exit-node",
-        ),
-        (
-            "{name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], Proxy-Networks: ['10.0.0.0/24']}",
-            "proxies[0].Proxy-Networks",
-        ),
-    ] {
-        let input = format!("mixed-port: 1\nproxies:\n  - {proxy}\n");
-        assert_eq!(
-            sanitize_mihomo(input.as_bytes(), &policy()),
-            Err(SanitizeError::NonLoopbackListener(at.into())),
-            "{input}"
-        );
+fn easytier_proxies_are_kept_with_state_confined_to_the_home() {
+    let input = b"mixed-port: 1\nproxies:\n  - {name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], listeners: ['tcp://0.0.0.0:11010', 'udp://[::]:11010'], mapped-listeners: ['tcp://1.2.3.4:1'], enable-exit-node: true, proxy-networks: ['10.0.0.0/24'], exit-nodes: ['10.144.0.1']}\n  - {name: f, type: EasyTier, network-name: n, no_listener: false, state-dir: /etc/evil, State_Dir: 'C:\\Windows\\System32'}\n  - {name: ../../../escape, type: easytier, network-name: n, peers: ['tcp://a:1']}\n  - {name: s, type: ss, server: a, port: 1, cipher: aes-128-gcm, password: x, state-dir: /kept}\n";
+    let out = sanitize_mihomo(input, &policy()).unwrap();
+    let proxies = mihomo_proxies(&out.yaml);
+    let e = &proxies[0];
+    assert_eq!(e["listeners"][0], "tcp://0.0.0.0:11010");
+    assert_eq!(e["mapped-listeners"][0], "tcp://1.2.3.4:1");
+    assert_eq!(e["enable-exit-node"], true);
+    assert_eq!(e["proxy-networks"][0], "10.0.0.0/24");
+    assert_eq!(proxies[1]["no_listener"], false);
+    let easytier_home = Path::new(SERVICE_DIR).join("easytier");
+    let mut state_dirs = Vec::new();
+    for proxy in &proxies[..3] {
+        let fields = proxy
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .filter(|key| {
+                key.as_str().unwrap().to_ascii_lowercase().replace('_', "-") == "state-dir"
+            })
+            .count();
+        assert_eq!(fields, 1, "{proxy:?}");
+        let state_dir = Path::new(proxy["state-dir"].as_str().unwrap());
+        assert_eq!(state_dir.parent(), Some(easytier_home.as_path()));
+        state_dirs.push(state_dir.to_owned());
     }
-    assert_eq!(
-        sanitize_mihomo(
-            b"mixed-port: 1\nproxy-providers:\n  p: {type: inline, payload: [{name: e, type: easytier, network-name: n, listeners: ['udp://0.0.0.0:1']}]}\n",
-            &policy()
-        ),
-        Err(SanitizeError::NonLoopbackListener(
-            "proxy-providers.p.payload[0].listeners".into()
-        ))
+    state_dirs.dedup();
+    assert_eq!(state_dirs.len(), 3, "one state directory per proxy");
+    // Stable across generations, so EasyTier keeps its instance id.
+    let again = sanitize_mihomo(input, &policy()).unwrap();
+    assert_eq!(mihomo_proxies(&again.yaml)[0]["state-dir"], e["state-dir"]);
+    // Other proxy types are not EasyTier and keep their fields untouched.
+    assert_eq!(proxies[3]["state-dir"], "/kept");
+
+    // Inline provider payloads are confined too, apart from inline proxies of the same name.
+    let out = sanitize_mihomo(
+        b"mixed-port: 1\nproxies:\n  - {name: e, type: easytier, network-name: n, peers: ['tcp://a:1']}\nproxy-providers:\n  p: {type: inline, payload: [{name: e, type: easytier, network-name: n, listeners: ['udp://0.0.0.0:1'], state-dir: ../../x}]}\n",
+        &policy(),
+    )
+    .unwrap();
+    let document = yaml(&out.yaml);
+    let payload = &document["proxy-providers"]["p"]["payload"][0];
+    assert_eq!(payload["listeners"][0], "udp://0.0.0.0:1");
+    let provider_state = Path::new(payload["state-dir"].as_str().unwrap());
+    assert_eq!(provider_state.parent(), Some(easytier_home.as_path()));
+    assert_ne!(payload["state-dir"], document["proxies"][0]["state-dir"]);
+}
+
+/// Live check: the pinned Mihomo (`MULTICORE_LIVE_MIHOMO`) accepts a sanitised EasyTier proxy
+/// with listeners and an exit node (`mihomo -t`, home = a temporary directory).
+#[test]
+#[ignore = "needs MULTICORE_LIVE_MIHOMO pointing at the pinned Mihomo binary"]
+fn live_pinned_mihomo_accepts_a_sanitised_easytier_proxy() {
+    let mihomo = std::env::var_os("MULTICORE_LIVE_MIHOMO").expect("MULTICORE_LIVE_MIHOMO");
+    let client_home = tempfile::tempdir().unwrap();
+    let input = b"mixed-port: 17990\ntun: {enable: false}\nproxies:\n  - {name: e, type: easytier, network-name: n, network-secret: s, peers: ['tcp://public.example:11010'], listeners: ['tcp://0.0.0.0:11010'], enable-exit-node: true, proxy-networks: ['10.0.0.0/24'], state-dir: /etc/evil}\nrules:\n  - MATCH,e\n";
+    let out = sanitize_mihomo(
+        input,
+        &MihomoServicePolicy {
+            service_directory: client_home.path(),
+            controller_port: 41235,
+            controller_secret: "s",
+        },
+    )
+    .unwrap();
+    let state_dir = mihomo_proxies(&out.yaml)[0]["state-dir"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        Path::new(&state_dir).starts_with(client_home.path()),
+        "{state_dir}"
     );
-    // A plain client: peers only, explicitly no listener and no exit node.
-    sanitize_mihomo(
-        b"mixed-port: 1\nproxies:\n  - {name: e, type: easytier, network-name: n, peers: ['tcp://a:1'], no-listener: true, enable-exit-node: false, listeners: [], exit-nodes: ['10.144.0.1']}\n",
-        &policy(),
-    )
-    .unwrap();
-    // Other proxy types keep their own `listeners`-free fields untouched.
-    sanitize_mihomo(
-        b"mixed-port: 1\nproxies:\n  - {name: s, type: ss, server: a, port: 1, cipher: aes-128-gcm, password: x}\n",
-        &policy(),
-    )
-    .unwrap();
+    let config = client_home.path().join("config.yaml");
+    std::fs::write(&config, &out.yaml).unwrap();
+    let output = std::process::Command::new(mihomo)
+        .arg("-d")
+        .arg(client_home.path())
+        .arg("-f")
+        .arg(&config)
+        .arg("-t")
+        .env("SAFE_PATHS", client_home.path())
+        .output()
+        .unwrap();
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "the pinned Mihomo rejected: {}\n{}\n{}",
+        String::from_utf8_lossy(&out.yaml),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Live check: the pinned Xray accepts a sanitised MASQUE (CONNECT-IP) client outbound.
 #[test]
 #[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
 fn live_pinned_xray_accepts_a_sanitised_masque_outbound() {
-    assert_pinned_xray_accepts(&sanitize_xray(MASQUE_XRAY.as_bytes()).unwrap());
+    assert_pinned_xray_accepts(&sanitize_xray(MASQUE_XRAY.as_bytes(), home()).unwrap());
 }
 
 /// Live check against the pinned Xray (run on the build host):
@@ -1380,7 +1701,7 @@ fn live_pinned_xray_accepts_the_sanitised_adversarial_config() {
               "endpoint":"wg.example.com:51820"}]}}],
         "routing":{"rules":[{"inboundTag":["x"],"outboundTag":"direct",
             "webhook":{"url":"https://attacker.invalid/zz-hook","headers":{"X":"y"}}}]}}"#;
-    let out = sanitize_xray(input).unwrap();
+    let out = sanitize_xray(input, home()).unwrap();
     let text = String::from_utf8(out.clone()).unwrap();
     for gone in [
         "geodata",
@@ -1403,7 +1724,7 @@ fn live_pinned_xray_accepts_the_sanitised_adversarial_config() {
 #[test]
 #[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
 fn live_pinned_xray_accepts_the_sanitised_bridge_config() {
-    assert_pinned_xray_accepts(&sanitize_xray(BRIDGE_XRAY.as_bytes()).unwrap());
+    assert_pinned_xray_accepts(&sanitize_xray(BRIDGE_XRAY.as_bytes(), home()).unwrap());
 }
 
 fn assert_pinned_xray_accepts(config_bytes: &[u8]) {

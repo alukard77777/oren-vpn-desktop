@@ -170,7 +170,7 @@ impl ProductionCores {
             },
         )
         .map_err(|error| refuse(InvalidRequest, "sanitise mihomo.yaml", &error))?;
-        let xray = sanitize_xray(&staged.xray)
+        let xray = sanitize_xray(&staged.xray, &home)
             .map_err(|error| refuse(InvalidRequest, "sanitise xray.json", &error))?;
         let directory = state_dir::fresh_generation_directory(&self.service_directory, generation)
             .map_err(|error| refuse(NotReady, "generation directory", &error))?;
