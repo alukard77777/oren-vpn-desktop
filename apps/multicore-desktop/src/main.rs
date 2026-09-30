@@ -4877,7 +4877,7 @@ mod window_tests {
             "y: 0;",
             "width: 28px;",
             "height: 28px;",
-            "@image-url(\"../assets/refresh.svg\")",
+            "@image-url(\"../assets/title-refresh.svg\")",
             "root.subscription-refresh-pending && !root.reduced-motion",
         ] {
             assert!(
@@ -6373,12 +6373,12 @@ mod window_tests {
         assert!(ui.contains("visible: root.catalog-error == \"\";"));
         assert!(rust.contains("ui.on_retry_catalog(move || {"));
         // Connection module tones: busy is blue, a failed connect reads its reason in red.
-        assert!(ui.contains(": root.toggle-busy ? #4c9dff59\n                            : root.status-tone == \"success\" ? #3ccb7f59"));
-        assert!(ui.contains("source: root.toggle-busy ? @image-url(\"../assets/shield.svg\")"));
+        assert!(ui.contains(": root.shown-busy ? #4c9dff59\n                            : root.shown-tone == \"success\" ? #3ccb7f59"));
+        assert!(ui.contains("source: root.shown-busy ? @image-url(\"../assets/shield.svg\")"));
         assert!(
-            ui.contains("color: root.status-tone == \"danger\" ? #f0a3a3 : Theme.text-secondary;")
+            ui.contains("color: root.shown-tone == \"danger\" ? #f0a3a3 : Theme.text-secondary;")
         );
-        assert!(ui.contains("opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;"));
+        assert!(ui.contains("opacity: root.primary-enabled || root.shown-busy ? 1 : 0.4;"));
     }
 
     #[test]

@@ -1061,8 +1061,11 @@ export component AppWindow inherits Window {
     in property <bool> reduced-motion: false;
     in property <string> system-name: "Windows";
     in property <string> runtime-versions: "MultiCore";
-    private property <bool> ambient-wave-phase: false;
-    private property <bool> ambient-wave-started: false;
+    // Ambient waves drift ~3px/s, so ten steps a second look continuous and cost a
+    // sixth of the redraws a per-frame property animation would.
+    private property <int> ambient-wave-step: 0;
+    // 0 → 1 → 0 over 24 s (12 s each way), cosine-eased like ease-in-out.
+    private property <float> ambient-wave-t: (1 - Math.cos(root.ambient-wave-step / 240 * 360deg)) / 2;
     private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
     in-out property <bool> replace-editor-open: false;
     in-out property <int> import-success-serial: 0;
@@ -1154,6 +1157,27 @@ export component AppWindow inherits Window {
     callback add-subscription();
     callback retry-profile-menu();
     callback primary-action();
+    // Optimistic switch: the knob and title follow the user's intent at once; the
+    // real connection state takes over as soon as the daemon reports it, so network
+    // latency never reads as a laggy UI.
+    private property <string> toggle-intent: "none";
+    private property <bool> shown-on: root.toggle-intent == "on" ? true
+        : root.toggle-intent == "off" ? false
+        : root.toggle-on;
+    private property <bool> shown-busy: root.toggle-busy || root.toggle-intent != "none";
+    private property <string> shown-title: root.toggle-intent == "on" ? "Подключение…"
+        : root.toggle-intent == "off" ? "Отключение…"
+        : root.toggle-title;
+    private property <string> shown-tone: root.toggle-intent != "none" ? "neutral" : root.status-tone;
+    function press-toggle() {
+        if (!root.primary-enabled) {
+            return;
+        }
+        if (!root.toggle-busy) {
+            root.toggle-intent = root.toggle-on ? "off" : "on";
+        }
+        root.primary-action();
+    }
     callback open-dashboard();
     callback open-panel(string);
     callback close-panel();
@@ -1279,26 +1303,23 @@ export component AppWindow inherits Window {
         }
     }
 
-    wave-kickoff := Timer {
-        interval: 80ms;
-        running: root.ambient-motion-active && !root.ambient-wave-started;
-        triggered => {
-            root.ambient-wave-started = true;
-            root.ambient-wave-phase = !root.ambient-wave-phase;
-        }
+    wave-step-timer := Timer {
+        interval: 100ms;
+        running: root.ambient-motion-active;
+        triggered => { root.ambient-wave-step = Math.mod(root.ambient-wave-step + 1, 240); }
     }
 
-    wave-timer := Timer {
-        interval: 12s;
-        running: root.ambient-motion-active && root.ambient-wave-started;
-        triggered => { root.ambient-wave-phase = !root.ambient-wave-phase; }
+    // Any reported change of the real state ends the optimistic phase.
+    changed toggle-busy => { root.toggle-intent = "none"; }
+    changed toggle-on => { root.toggle-intent = "none"; }
+    changed status-tone => { root.toggle-intent = "none"; }
+    // Safety net: never leave the switch showing an intent nothing confirmed.
+    toggle-intent-expiry := Timer {
+        interval: 8s;
+        running: root.toggle-intent != "none";
+        triggered => { root.toggle-intent = "none"; }
     }
 
-    changed ambient-motion-active => {
-        if (!root.ambient-motion-active) {
-            root.ambient-wave-started = false;
-        }
-    }
 
     changed import-success-serial => {
         if (root.import-success-serial > 0) {
@@ -1590,12 +1611,13 @@ export component AppWindow inherits Window {
                             border-color: parent.has-focus ? Theme.focus : transparent;
                             border-width: parent.has-focus ? Theme.focus-width : 0px;
                             animate background { duration: 120ms; easing: ease-out; }
+                            // Same 16px lucide weight as the bell next to it.
                             Image {
-                                x: 7px;
-                                y: 7px;
-                                width: 14px;
-                                height: 14px;
-                                source: subscription-refresh-action.source-mode ? @image-url("../assets/link.svg") : @image-url("../assets/refresh.svg");
+                                x: 6px;
+                                y: 6px;
+                                width: 16px;
+                                height: 16px;
+                                source: subscription-refresh-action.source-mode ? @image-url("../assets/title-link.svg") : @image-url("../assets/title-refresh.svg");
                                 colorize: root.subscription-refresh-pending ? Theme.accent-blue : Theme.text-secondary;
                                 opacity: subscription-refresh-action.enabled || root.subscription-refresh-pending ? 1 : 0.45;
                                 // Spins while the subscription is being fetched.
@@ -1760,8 +1782,8 @@ export component AppWindow inherits Window {
 
                 ambient-wave-a := Path {
                     visible: root.ambient-background-enabled;
-                    x: root.ambient-wave-phase ? -12px : -48px;
-                    y: root.ambient-wave-phase ? 48px : 76px;
+                    x: -48px + 36px * root.ambient-wave-t;
+                    y: 76px - 28px * root.ambient-wave-t;
                     width: parent.width + 76px;
                     // Keep the closing edge of the filled path below the clipped home plane.
                     // Otherwise it reads as a horizontal divider when it crosses content.
@@ -1771,14 +1793,12 @@ export component AppWindow inherits Window {
                     commands: "M 0 124 C 160 40 340 36 500 112 C 668 192 824 184 1000 82 L 1000 800 L 0 800 Z";
                     fill: #c8cdd5;
                     opacity: 0.026;
-                    animate x { duration: 12000ms; easing: ease-in-out; }
-                    animate y { duration: 12000ms; easing: ease-in-out; }
                 }
 
                 ambient-wave-b := Path {
                     visible: root.ambient-background-enabled;
-                    x: root.ambient-wave-phase ? -58px : -22px;
-                    y: root.ambient-wave-phase ? 288px : 254px;
+                    x: -22px - 36px * root.ambient-wave-t;
+                    y: 254px + 34px * root.ambient-wave-t;
                     width: parent.width + 76px;
                     height: parent.height + 80px;
                     viewbox-width: 1000;
@@ -1786,8 +1806,6 @@ export component AppWindow inherits Window {
                     commands: "M 0 74 C 190 174 350 184 510 92 C 670 0 824 34 1000 142 L 1000 800 L 0 800 Z";
                     fill: #aeb5bf;
                     opacity: 0.018;
-                    animate x { duration: 12000ms; easing: ease-in-out; }
-                    animate y { duration: 12000ms; easing: ease-in-out; }
                 }
 
                 ambient-wave-fade := Rectangle {
@@ -1801,7 +1819,7 @@ export component AppWindow inherits Window {
 
                 VerticalLayout {
                     padding: 20px;
-                    spacing: 16px;
+                    spacing: 12px;
 
                     if root.has-profile: connection-strip := Rectangle {
                         height: root.has-profile
@@ -1811,10 +1829,10 @@ export component AppWindow inherits Window {
                                 : (root.import-error == "" ? 124px : 150px);
                         background: root.has-profile ? Theme.surface : #101721;
                         border-color: !root.has-profile ? #4c9dff55
-                            : root.toggle-busy ? #4c9dff59
-                            : root.status-tone == "success" ? #3ccb7f59
-                            : root.status-tone == "danger" ? #f06a6a66
-                            : root.status-tone == "warning" ? #e7aa4566
+                            : root.shown-busy ? #4c9dff59
+                            : root.shown-tone == "success" ? #3ccb7f59
+                            : root.shown-tone == "danger" ? #f06a6a66
+                            : root.shown-tone == "warning" ? #e7aa4566
                             : #ffffff0a;
                         border-width: 1px;
                         border-radius: 14px;
@@ -1832,10 +1850,10 @@ export component AppWindow inherits Window {
                                 property <bool> active: strip-glow-touch.has-hover;
                                 property <length> cursor-x: strip-glow-touch.mouse-x;
                                 property <length> cursor-y: strip-glow-touch.mouse-y;
-                                property <color> glow-strong: root.status-tone == "success" ? #22c55e3d : root.status-tone == "danger" ? #f06a6a3d : #0091ff47;
-                                property <color> glow-medium: root.status-tone == "success" ? #22c55e24 : root.status-tone == "danger" ? #f06a6a24 : #0091ff29;
-                                property <color> glow-soft: root.status-tone == "success" ? #22c55e0f : root.status-tone == "danger" ? #f06a6a0f : #0091ff0f;
-                                property <color> grid-line-strong: root.status-tone == "success" ? #8ea39770 : root.status-tone == "danger" ? #a3939370 : #8f9eae70;
+                                property <color> glow-strong: root.shown-tone == "success" ? #22c55e3d : root.shown-tone == "danger" ? #f06a6a3d : #0091ff47;
+                                property <color> glow-medium: root.shown-tone == "success" ? #22c55e24 : root.shown-tone == "danger" ? #f06a6a24 : #0091ff29;
+                                property <color> glow-soft: root.shown-tone == "success" ? #22c55e0f : root.shown-tone == "danger" ? #f06a6a0f : #0091ff0f;
+                                property <color> grid-line-strong: root.shown-tone == "success" ? #8ea39770 : root.shown-tone == "danger" ? #a3939370 : #8f9eae70;
                                 x: 0;
                                 y: 0;
                                 width: parent.width;
@@ -1889,14 +1907,14 @@ export component AppWindow inherits Window {
                                 width: 44px;
                                 height: 44px;
                                 border-radius: 12px;
-                                background: root.status-tone == "success" ? #3ccb7f24
-                                    : root.status-tone == "danger" ? #f06a6a24
-                                    : root.status-tone == "warning" && !root.toggle-busy ? #e7aa4524
+                                background: root.shown-tone == "success" ? #3ccb7f24
+                                    : root.shown-tone == "danger" ? #f06a6a24
+                                    : root.shown-tone == "warning" && !root.shown-busy ? #e7aa4524
                                     : Theme.elevated;
                                 animate background { duration: 180ms; easing: ease-in-out; }
 
                                 // Soft ring that breathes only while connecting/disconnecting.
-                                if root.toggle-busy && !root.reduced-motion: Rectangle {
+                                if root.shown-busy && !root.reduced-motion: Rectangle {
                                     property <float> phase: (1 + Math.sin(animation-tick() / 1400ms * 360deg)) / 2;
                                     x: -3px;
                                     y: -3px;
@@ -1914,14 +1932,14 @@ export component AppWindow inherits Window {
                                     y: (parent.height - self.height) / 2;
                                     width: 22px;
                                     height: 22px;
-                                    source: root.toggle-busy ? @image-url("../assets/shield.svg")
-                                        : root.status-tone == "success" ? @image-url("../assets/shield-check.svg")
-                                        : root.status-tone == "danger" || root.status-tone == "warning" ? @image-url("../assets/shield-alert.svg")
+                                    source: root.shown-busy ? @image-url("../assets/shield.svg")
+                                        : root.shown-tone == "success" ? @image-url("../assets/shield-check.svg")
+                                        : root.shown-tone == "danger" || root.shown-tone == "warning" ? @image-url("../assets/shield-alert.svg")
                                         : @image-url("../assets/shield-off.svg");
-                                    colorize: root.status-tone == "success" ? Theme.accent-green
-                                        : root.status-tone == "danger" ? Theme.error
-                                        : root.toggle-busy ? Theme.accent-blue
-                                        : root.status-tone == "warning" ? Theme.warning
+                                    colorize: root.shown-tone == "success" ? Theme.accent-green
+                                        : root.shown-tone == "danger" ? Theme.error
+                                        : root.shown-busy ? Theme.accent-blue
+                                        : root.shown-tone == "warning" ? Theme.warning
                                         : Theme.text-muted;
                                     image-fit: contain;
                                     accessible-role: none;
@@ -1941,7 +1959,7 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     alignment: start;
                                     Text {
-                                        text: root.toggle-title;
+                                        text: root.shown-title;
                                         color: Theme.text-primary;
                                         font-size: Theme.type-value-size;
                                         font-weight: Theme.weight-semibold;
@@ -1992,7 +2010,7 @@ export component AppWindow inherits Window {
                                 if !root.toggle-detail-is-exit: Text {
                                     text: root.supporting;
                                     // A failed connect reads its reason in a soft red.
-                                    color: root.status-tone == "danger" ? #f0a3a3 : Theme.text-secondary;
+                                    color: root.shown-tone == "danger" ? #f0a3a3 : Theme.text-secondary;
                                     font-size: Theme.type-metadata-size;
                                     overflow: elide;
                                 }
@@ -2017,12 +2035,12 @@ export component AppWindow inherits Window {
                                 }
                                 accessible-action-default => {
                                     if (root.primary-enabled) {
-                                        root.primary-action();
+                                        root.press-toggle();
                                     }
                                 }
                                 key-pressed(event) => {
                                     if ((event.text == " " || event.text == "\n") && root.primary-enabled) {
-                                        root.primary-action();
+                                        root.press-toggle();
                                         return accept;
                                     }
                                     return reject;
@@ -2039,19 +2057,19 @@ export component AppWindow inherits Window {
                                     width: parent.width;
                                     height: parent.height;
                                     border-radius: self.height / 2;
-                                    background: root.toggle-busy ? #4c9dff59
-                                        : root.toggle-on ? (self.hovered ? #4ad98c : Theme.accent-green)
+                                    background: root.shown-busy ? #4c9dff59
+                                        : root.shown-on ? (self.hovered ? #4ad98c : Theme.accent-green)
                                         : (self.hovered ? #3a414b : Theme.line);
                                     border-color: power-action.has-focus ? Theme.focus : #ffffff59;
                                     border-width: power-action.has-focus ? Theme.focus-width
                                         : self.hovered && root.primary-enabled ? 2px : 0px;
                                     animate border-width { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                                    opacity: root.primary-enabled || root.toggle-busy ? 1 : 0.4;
+                                    opacity: root.primary-enabled || root.shown-busy ? 1 : 0.4;
                                     animate opacity { duration: 180ms; easing: ease-in-out; }
                                     animate background { duration: 180ms; easing: ease-in-out; }
 
                                     toggle-knob := Rectangle {
-                                        x: root.toggle-on ? parent.width - self.width - 4px : 4px;
+                                        x: root.shown-on ? parent.width - self.width - 4px : 4px;
                                         y: (parent.height - self.height) / 2;
                                         width: strip-glow-touch.pressed ? 36px : power-button.hovered ? 33px : 32px;
                                         height: power-button.hovered ? 33px : 32px;
@@ -2078,7 +2096,7 @@ export component AppWindow inherits Window {
                             enabled: !root.profile-menu-open;
                             clicked => {
                                 if (root.primary-enabled) {
-                                    root.primary-action();
+                                    root.press-toggle();
                                 }
                             }
                         }
@@ -2321,7 +2339,8 @@ export component AppWindow inherits Window {
                         min-height: 140px;
                         background: transparent;
                         VerticalLayout {
-                            spacing: 8px;
+                            // Same gap below the heading as above it (the home stack's 12px).
+                            spacing: 12px;
                             routes-header := Rectangle {
                             height: 36px;
                             background: transparent;
@@ -2517,7 +2536,13 @@ export component AppWindow inherits Window {
                                 border-width: 1px;
                                 border-radius: 10px;
                                 clip: true;
+                                // Inside the 1px border, so the 2px padding centres the 32px
+                                // segments in the track (36px inner height).
                                 ScrollView {
+                                x: 1px;
+                                y: 1px;
+                                width: parent.width - 2px;
+                                height: parent.height - 2px;
                                 HorizontalLayout {
                                     padding: 2px;
                                     spacing: 2px;

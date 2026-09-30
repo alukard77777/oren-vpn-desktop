@@ -4924,7 +4924,7 @@ mod tests {
         assert!(!app.contains("Local signal grid: structural guides"));
         // The connection module keeps a state-tinted hairline.
         assert!(app.contains("? 88px"));
-        assert!(app.contains(": root.status-tone == \"success\" ? #3ccb7f59"));
+        assert!(app.contains(": root.shown-tone == \"success\" ? #3ccb7f59"));
         assert!(include_str!("../ui/components.slint").contains("width: 76px;"));
         let route_row = include_str!("../ui/components.slint")
             .split("export component RouteNodeRow")
@@ -5025,10 +5025,12 @@ mod tests {
         assert!(title_subscription.contains("height: 28px;"));
         assert!(refresh_action.contains("width: 28px;"));
         assert!(refresh_action.contains("height: 28px;"));
-        assert!(refresh_action.contains("x: 7px;"));
-        assert!(refresh_action.contains("y: 7px;"));
-        assert!(refresh_action.contains("width: 14px;"));
-        assert!(refresh_action.contains("height: 14px;"));
+        // 16px icon, same lucide weight and inset as the bell beside it.
+        assert!(refresh_action.contains("x: 6px;"));
+        assert!(refresh_action.contains("y: 6px;"));
+        assert!(refresh_action.contains("width: 16px;"));
+        assert!(refresh_action.contains("height: 16px;"));
+        assert!(refresh_action.contains("title-refresh.svg"));
         assert!(
             refresh_action
                 .contains("property <bool> source-mode: !root.subscription-refresh-available;")
@@ -6748,22 +6750,20 @@ mod tests {
 
     #[test]
     fn home_background_is_bounded_pausable_and_non_interactive() {
-        let source = include_str!("../ui/app.slint");
+        let source = &include_str!("../ui/app.slint").replace("\r\n", "\n");
         let components = include_str!("../ui/components.slint");
+        // No per-frame property animation drives the waves (that redrew at 60 fps).
+        assert!(!source.contains("ambient-wave-phase"));
 
         for required in [
             "in-out property <bool> ambient-background-enabled",
             "in-out property <bool> shell-active",
             "in property <bool> reduced-motion",
-            "wave-timer := Timer",
-            "wave-kickoff := Timer",
-            "private property <bool> ambient-wave-started: false",
-            "running: root.ambient-motion-active && !root.ambient-wave-started",
-            "interval: 80ms",
-            "root.ambient-wave-started = true",
-            "root.ambient-wave-phase = !root.ambient-wave-phase",
+            "wave-step-timer := Timer",
+            "interval: 100ms;\n        running: root.ambient-motion-active;",
+            "root.ambient-wave-step = Math.mod(root.ambient-wave-step + 1, 240);",
+            "private property <float> ambient-wave-t: (1 - Math.cos(root.ambient-wave-step / 240 * 360deg)) / 2;",
             "private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == \"home\"",
-            "interval: 12s",
         ] {
             assert!(
                 source.contains(required),
@@ -6802,14 +6802,12 @@ mod tests {
             .and_then(|source| source.split("ambient-wave-b := Path {").next())
             .expect("wave A block");
         for required in [
-            "x: root.ambient-wave-phase ? -12px : -48px;",
-            "y: root.ambient-wave-phase ? 48px : 76px;",
+            "x: -48px + 36px * root.ambient-wave-t;",
+            "y: 76px - 28px * root.ambient-wave-t;",
             "height: parent.height + 80px;",
             "viewbox-height: 800;",
             "L 1000 800 L 0 800 Z",
             "opacity: 0.026;",
-            "animate x { duration: 12000ms; easing: ease-in-out; }",
-            "animate y { duration: 12000ms; easing: ease-in-out; }",
         ] {
             assert!(wave_a.contains(required), "wave A missing: {required}");
         }
@@ -6819,14 +6817,12 @@ mod tests {
             .and_then(|source| source.split("VerticalLayout {").next())
             .expect("wave B block");
         for required in [
-            "x: root.ambient-wave-phase ? -58px : -22px;",
-            "y: root.ambient-wave-phase ? 288px : 254px;",
+            "x: -22px - 36px * root.ambient-wave-t;",
+            "y: 254px + 34px * root.ambient-wave-t;",
             "height: parent.height + 80px;",
             "viewbox-height: 800;",
             "L 1000 800 L 0 800 Z",
             "opacity: 0.018;",
-            "animate x { duration: 12000ms; easing: ease-in-out; }",
-            "animate y { duration: 12000ms; easing: ease-in-out; }",
         ] {
             assert!(wave_b.contains(required), "wave B missing: {required}");
         }
@@ -6861,8 +6857,9 @@ mod tests {
             .and_then(|source| source.rsplit("VerticalLayout {").next())
             .expect("home content stack");
         assert!(home_stack.contains("padding: 20px;"));
-        // One step between the connection module and the routes (no extra gap).
-        assert!(home_stack.contains("spacing: 16px;"));
+        // One step between the connection module and the routes (no extra gap), the
+        // same as the heading's own gap below it.
+        assert!(home_stack.contains("spacing: 12px;"));
         assert!(!home_stack.contains("spacing: 8px;"));
         assert!(!home_stack.contains("spacing: 10px;"));
     }
@@ -7105,6 +7102,40 @@ mod tests {
     }
 
     #[test]
+    fn connect_switch_reflects_intent_immediately() {
+        let app = include_str!("../ui/app.slint").replace(
+            "
+", "
+",
+        );
+        // A press records the intent before the daemon answers…
+        assert!(app.contains("root.toggle-intent = root.toggle-on ? \"off\" : \"on\";"));
+        assert!(app.contains(": root.toggle-intent == \"on\" ? \"Подключение…\""));
+        assert!(app.contains(": root.toggle-intent == \"off\" ? \"Отключение…\""));
+        // …and any real state change (or an 8 s silence) hands control back.
+        for handler in [
+            "changed toggle-busy => { root.toggle-intent = \"none\"; }",
+            "changed toggle-on => { root.toggle-intent = \"none\"; }",
+            "changed status-tone => { root.toggle-intent = \"none\"; }",
+        ] {
+            assert!(app.contains(handler), "{handler}");
+        }
+        assert!(app.contains(
+            "toggle-intent-expiry := Timer {
+        interval: 8s;"
+        ));
+        // The module only reads the shown state and presses through press-toggle.
+        let module = app
+            .split("if root.has-profile: connection-strip := Rectangle {")
+            .nth(1)
+            .and_then(|rest| rest.split("conflicting-apps-banner := Rectangle").next())
+            .expect("connection strip");
+        assert!(!module.contains("root.toggle-on"));
+        assert!(!module.contains("root.toggle-busy"));
+        assert!(!module.contains("root.primary-action();"));
+    }
+
+    #[test]
     fn redesign_motion_is_lightweight_and_respects_reduced_motion() {
         // Checkouts may use CRLF; the multi-line contracts below are written with LF.
         let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
@@ -7127,7 +7158,7 @@ mod tests {
             assert!(app.contains(&head), "{page} must fade in");
         }
         // Continuous animation-tick() work only runs while its state is active.
-        assert!(app.contains("if root.toggle-busy && !root.reduced-motion: Rectangle {"));
+        assert!(app.contains("if root.shown-busy && !root.reduced-motion: Rectangle {"));
         assert!(app.contains(
             "transform-rotation: root.subscription-refresh-pending && !root.reduced-motion"
         ));
@@ -7405,14 +7436,14 @@ mod tests {
             .expect("toggle module source");
         assert!(toggle_module.contains("shield-badge := Rectangle"));
         assert!(toggle_module.contains("width: 44px;"));
-        assert!(toggle_module.contains("text: root.toggle-title;"));
+        assert!(toggle_module.contains("text: root.shown-title;"));
         assert!(toggle_module.contains("if root.toggle-detail-is-exit: HorizontalLayout"));
         assert!(toggle_module.contains("alignment: start;"));
         assert!(toggle_module.contains("width: 72px;"));
         assert!(toggle_module.contains("height: 40px;"));
         assert!(toggle_module.contains("toggle-knob := Rectangle"));
         assert!(
-            toggle_module.contains("x: root.toggle-on ? parent.width - self.width - 4px : 4px;")
+            toggle_module.contains("x: root.shown-on ? parent.width - self.width - 4px : 4px;")
         );
         assert!(
             toggle_module.contains(
@@ -7452,7 +7483,7 @@ mod tests {
         assert!(connection_strip.contains("width: root.has-profile ? parent.width : 0px;"));
         assert!(connection_strip.contains("height: root.has-profile ? parent.height : 0px;"));
         assert!(connection_strip.contains("if (root.primary-enabled)"));
-        assert!(connection_strip.contains("root.primary-action();"));
+        assert!(connection_strip.contains("root.press-toggle();"));
         assert!(connection_strip.contains("strip-glow-touch.pressed"));
         assert!(source.contains("subscription-refresh-action := FocusScope"));
         // The subscription shelf is gone from home: name, expiry, refresh and the
