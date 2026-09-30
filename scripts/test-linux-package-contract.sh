@@ -33,7 +33,9 @@ metadata=(
   usr/share/applications/multicore.desktop
   usr/share/icons/hicolor/scalable/apps/multicore.svg
   usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy
+  usr/lib/systemd/system/multicore.service
 )
+SERVICE_UNIT=usr/lib/systemd/system/multicore.service
 
 for relative in "${executables[@]}"; do
   path="$STAGE/$relative"
@@ -105,6 +107,33 @@ grep -Fxq 'exec "$HERE/usr/lib/multicore/multicore" "$@"' "$ROOT/packaging/linux
   exit 1
 }
 
+cmp -s "$ROOT/packaging/linux/multicore.service" "$STAGE/$SERVICE_UNIT" || {
+  echo 'Staged systemd unit must be packaging/linux/multicore.service unchanged' >&2
+  exit 1
+}
+grep -Fxq 'ExecStart=/usr/lib/multicore/runtime/multicore-core-host --service' "$STAGE/$SERVICE_UNIT" || {
+  echo 'Staged systemd unit must start the packaged core host in service mode' >&2
+  exit 1
+}
+
+# Every package manager format must enable the service on install and disable it on removal.
+# Scriptlets are plain text, so these fragments are checked verbatim in each package.
+require_service_scriptlets() {
+  local label="$1" install_text="$2" removal_text="$3"
+  grep -Fq 'systemctl enable multicore.service' <<<"$install_text" || {
+    echo "$label does not enable the service on install" >&2
+    exit 1
+  }
+  grep -Fq 'systemctl restart multicore.service' <<<"$install_text" || {
+    echo "$label does not start the service on install" >&2
+    exit 1
+  }
+  grep -Fq 'systemctl disable --now multicore.service' <<<"$removal_text" || {
+    echo "$label does not stop and disable the service on removal" >&2
+    exit 1
+  }
+}
+
 [[ -L "$STAGE/usr/bin/multicore" ]] || { echo "Missing /usr/bin/multicore symlink" >&2; exit 1; }
 [[ "$(readlink "$STAGE/usr/bin/multicore")" == "../lib/multicore/multicore" ]] || {
   echo "Incorrect /usr/bin/multicore symlink" >&2
@@ -139,7 +168,7 @@ check_rpm() (
   requires="$(rpm -qp --requires "$package")"
   for dependency in 'gtk3(x86-64)' 'libayatana-appindicator-gtk3(x86-64)' \
       polkit iproute 'libxkbcommon(x86-64)' 'libxkbcommon-x11(x86-64)' 'fontconfig(x86-64)' \
-      'libglvnd-glx(x86-64)' 'libglvnd-egl(x86-64)' hicolor-icon-theme \
+      'libglvnd-glx(x86-64)' 'libglvnd-egl(x86-64)' hicolor-icon-theme systemd \
       'libc.so.6()(64bit)'; do
     grep -Fxq "$dependency" <<<"$requires" || {
       echo "RPM is missing dependency: $dependency" >&2
@@ -217,10 +246,17 @@ check_rpm() (
     }
   done <<<"$records"
 
+  # Install/removal scriptlets manage only the always-ready service; triggers stay forbidden.
   local scriptlets query
-  for query in --scripts --triggers --filetriggers; do
+  scriptlets="$(rpm -qp --scripts "$package")"
+  require_service_scriptlets RPM "$scriptlets" "$scriptlets"
+  grep -Fq 'rm -rf /var/lib/multicore' <<<"$scriptlets" || {
+    echo 'RPM final removal keeps /var/lib/multicore' >&2
+    exit 1
+  }
+  for query in --triggers --filetriggers; do
     scriptlets="$(rpm -qp "$query" "$package")"
-    [[ -z "$scriptlets" ]] || { echo 'RPM must not ship install/removal/trigger scriptlets' >&2; exit 1; }
+    [[ -z "$scriptlets" ]] || { echo 'RPM must not ship trigger scriptlets' >&2; exit 1; }
   done
 
   local work
@@ -263,6 +299,17 @@ for format in "${requested_formats[@]}"; do
       [[ "$(dpkg-deb -f "$deb" Version)" == "$VERSION" ]] || { echo "Incorrect Debian version" >&2; exit 1; }
       [[ "$(dpkg-deb -f "$deb" Architecture)" == "amd64" ]] || { echo "Incorrect Debian architecture" >&2; exit 1; }
       require_listing_entries "$(dpkg-deb -c "$deb")" "./"
+      deb_control="$(mktemp -d)"
+      dpkg-deb -e "$deb" "$deb_control/DEBIAN"
+      for scriptlet in postinst prerm postrm; do
+        [[ -x "$deb_control/DEBIAN/$scriptlet" ]] || { echo "Debian package lacks an executable $scriptlet" >&2; exit 1; }
+      done
+      require_service_scriptlets 'Debian package' "$(cat "$deb_control/DEBIAN/postinst")" "$(cat "$deb_control/DEBIAN/prerm")"
+      grep -Fq 'rm -rf /var/lib/multicore' "$deb_control/DEBIAN/postrm" || {
+        echo 'Debian purge keeps /var/lib/multicore' >&2
+        exit 1
+      }
+      rm -rf "$deb_control"
       ;;
     appimage)
       appimage="$PACKAGES/MultiCore-${VERSION}-x86_64.AppImage"
@@ -272,11 +319,30 @@ for format in "${requested_formats[@]}"; do
         echo "Unexpected AppImage format: $description" >&2
         exit 1
       }
+      # The AppImage keeps the on-demand pkexec host: no systemd unit inside.
+      appimage_root="$(mktemp -d)"
+      appimage_path="$(cd "$(dirname "$appimage")" && pwd)/$(basename "$appimage")"
+      (cd "$appimage_root" && "$appimage_path" --appimage-extract >/dev/null)
+      [[ -x "$appimage_root/squashfs-root/usr/lib/multicore/runtime/multicore-core-host" ]] || {
+        echo 'AppImage extraction did not produce the core host' >&2
+        exit 1
+      }
+      [[ ! -e "$appimage_root/squashfs-root/$SERVICE_UNIT" ]] || {
+        echo 'AppImage must not carry the systemd service unit' >&2
+        exit 1
+      }
+      rm -rf "$appimage_root"
       ;;
     arch)
       arch="$PACKAGES/multicore-${VERSION}-1-x86_64.pkg.tar.zst"
       [[ -f "$arch" ]] || { echo "Missing Arch package: $arch" >&2; exit 1; }
       require_listing_entries "$(tar --zstd -tf "$arch")" ""
+      arch_install="$(tar --zstd -xOf "$arch" .INSTALL)" || { echo 'Arch package lacks its .INSTALL hooks' >&2; exit 1; }
+      require_service_scriptlets 'Arch package' "$arch_install" "$arch_install"
+      grep -Fq 'rm -rf /var/lib/multicore' <<<"$arch_install" || {
+        echo 'Arch removal keeps /var/lib/multicore' >&2
+        exit 1
+      }
       ;;
     rpm)
       check_rpm

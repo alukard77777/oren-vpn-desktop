@@ -10,6 +10,7 @@ optdepends=('gnome-shell-extension-appindicator: tray icon in GNOME')
 options=('!strip' '!debug')
 source=("multicore-${pkgver}-stage.tar.zst")
 sha256sums=('@SHA256@')
+install=multicore.install
 
 package() {
     cp -a "$srcdir/stage/." "$pkgdir/"
