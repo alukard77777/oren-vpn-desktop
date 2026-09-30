@@ -13,10 +13,7 @@
 //! with ASCII case folding, as Go's `encoding/json` does, and an object with two keys that fold
 //! to the same name is refused.
 
-use std::{
-    net::{IpAddr, SocketAddr},
-    path::Path,
-};
+use std::{net::IpAddr, path::Path};
 
 use serde_yaml_ng::{Mapping, Value};
 use sha2::{Digest, Sha256};
@@ -34,6 +31,8 @@ pub enum SanitizeError {
     NonLoopbackListener(String),
     #[error("service directory is not an absolute UTF-8 path")]
     ServiceDirectory,
+    #[error("config uses a protocol the service does not run through {0}")]
+    ForbiddenProtocol(String),
 }
 
 pub struct MihomoServicePolicy<'a> {
@@ -192,6 +191,7 @@ pub fn sanitize_mihomo(
     for pinned in [
         "iproute2-table-index",
         "iproute2-rule-index",
+        "auto-redirect-iproute2-fallback-rule-index",
         "file-descriptor",
     ] {
         tun.remove(key(pinned));
@@ -206,6 +206,9 @@ pub fn sanitize_mihomo(
     Ok(SanitizedMihomo { yaml, mixed_port })
 }
 
+/// Provider fields the sanitiser inspects or rewrites.
+const PROVIDER_CHECKED_FIELDS: &[&str] = &["type", "path", "payload", "format"];
+
 fn rewrite_provider_paths(
     mapping: &mut Mapping,
     section: &str,
@@ -219,8 +222,14 @@ fn rewrite_provider_paths(
     for (name, provider) in providers.iter_mut() {
         let name = name.as_str().ok_or(SanitizeError::Malformed)?;
         let provider = provider.as_mapping_mut().ok_or(SanitizeError::Malformed)?;
+        // Mihomo's provider decoder falls back to a case-insensitive, `_`-for-`-` match when the
+        // exact key is absent; the fields this sanitiser reads must therefore appear exactly.
         for field in provider.keys() {
-            mihomo_field_name(field.as_str().unwrap_or(""))?;
+            let raw = field.as_str().unwrap_or("");
+            let normalised = mihomo_field_name(raw)?;
+            if PROVIDER_CHECKED_FIELDS.contains(&normalised.as_str()) && raw != normalised {
+                return Err(SanitizeError::Malformed);
+            }
         }
         let kind = provider
             .get(key("type"))
@@ -304,7 +313,19 @@ fn reject_credential_files(mapping: &Mapping) -> Result<(), SanitizeError> {
     {
         for (name, provider) in providers {
             let name = name.as_str().unwrap_or("");
-            if let Some(payload) = provider.get("payload").and_then(Value::as_sequence) {
+            let payload = provider.as_mapping().and_then(|provider| {
+                provider
+                    .iter()
+                    .find(|(field, _)| {
+                        field
+                            .as_str()
+                            .and_then(|field| mihomo_field_name(field).ok())
+                            .as_deref()
+                            == Some("payload")
+                    })
+                    .map(|(_, value)| value)
+            });
+            if let Some(payload) = payload.and_then(Value::as_sequence) {
                 for (index, proxy) in payload.iter().enumerate() {
                     reject_credential_paths_in(
                         proxy,
@@ -383,11 +404,38 @@ fn field<'a>(map: &'a JsonMap, name: &str) -> Option<&'a serde_json::Value> {
 /// Xray `log` fields kept; `access`/`error` (file outputs) and anything else are dropped.
 const ALLOWED_XRAY_LOG_KEYS: &[&str] = &["loglevel", "dnslog", "maskaddress"];
 
+/// Top-level Xray sections a provider bridge config may keep (pinned Xray v26.9.9). Everything
+/// else is dropped: `api` and `metrics` (their own listeners), `stats`, `reverse`, `transport`,
+/// `geodata` (scheduled downloads that rename files inside the asset directory), and anything a
+/// later Xray adds. `fakedns` stays because `dns` may reference it; it is an in-memory pool.
+/// `observatory`/`burstObservatory` stay for balancers; they only probe through outbounds.
+pub const ALLOWED_XRAY_SECTIONS: &[&str] = &[
+    "log",
+    "dns",
+    "routing",
+    "inbounds",
+    "outbounds",
+    "policy",
+    "observatory",
+    "burstObservatory",
+    "fakedns",
+];
+
+/// Inbound protocols the service runs: MultiCore's Mihomo reaches Xray only through loopback
+/// SOCKS bridges (`type: socks5` proxies). `tun`, `dokodemo-door` (tproxy/redirect), `http` and
+/// every server protocol are refused.
+pub const ALLOWED_XRAY_INBOUND_PROTOCOLS: &[&str] = &["socks"];
+
 pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
     let mut document: serde_json::Value =
         serde_json::from_slice(input).map_err(|_| SanitizeError::Malformed)?;
     reject_ambiguous_keys(&document)?;
     let root = document.as_object_mut().ok_or(SanitizeError::Malformed)?;
+    root.retain(|name, _| {
+        ALLOWED_XRAY_SECTIONS
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    });
     for (name, value) in root.iter_mut() {
         if !name.eq_ignore_ascii_case("log") {
             continue;
@@ -420,28 +468,51 @@ pub fn sanitize_xray(input: &[u8]) -> Result<Vec<u8>, SanitizeError> {
                     )));
                 }
             }
-        }
-    }
-    // Xray's gRPC API and its metrics/pprof HTTP server listen by themselves, outside `inbounds`.
-    for section in ["api", "metrics"] {
-        let Some(object) = field(root, section) else {
-            continue;
-        };
-        let object = object.as_object().ok_or(SanitizeError::Malformed)?;
-        if let Some(listen) = field(object, "listen") {
-            let loopback = listen
-                .as_str()
-                .and_then(|listen| listen.parse::<SocketAddr>().ok())
-                .is_some_and(|address| address.ip().is_loopback());
-            if !loopback {
-                return Err(SanitizeError::NonLoopbackListener(format!(
-                    "{section}.listen"
+            // Xray lower-cases the protocol name before looking up its loader.
+            let allowed = field(inbound, "protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| {
+                    ALLOWED_XRAY_INBOUND_PROTOCOLS
+                        .iter()
+                        .any(|allowed| protocol.eq_ignore_ascii_case(allowed))
+                });
+            if !allowed {
+                return Err(SanitizeError::ForbiddenProtocol(format!(
+                    "inbounds[{index}].protocol"
                 )));
             }
         }
     }
+    strip_output_files(&mut document);
     reject_xray_file_references(&document, "$")?;
     serde_json::to_vec(&document).map_err(|_| SanitizeError::Malformed)
+}
+
+/// Xray fields that make the (privileged) core create or append to a file: TLS/REALITY
+/// `masterKeyLog` (opened `O_CREATE|O_APPEND` at listener/dial setup). Removed at any depth,
+/// with ASCII case folding. `log.access`/`log.error` are dropped by the `log` allowlist, and
+/// the file-reading fields (`certificateFile`, `keyFile`, `ext:`) are refused below.
+const XRAY_OUTPUT_FILE_KEYS: &[&str] = &["masterKeyLog"];
+
+fn strip_output_files(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|name, _| {
+                !XRAY_OUTPUT_FILE_KEYS
+                    .iter()
+                    .any(|output| name.eq_ignore_ascii_case(output))
+            });
+            for child in map.values_mut() {
+                strip_output_files(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_output_files(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Go's `encoding/json` matches keys with Unicode simple case folding, so `liſten` (U+017F)

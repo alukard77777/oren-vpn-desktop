@@ -269,7 +269,8 @@ pub struct RuntimePaths {
     pub dashboard_directory: Option<PathBuf>,
     /// Service mode: Mihomo's home directory (`-d`). Relative provider caches, `cache.db` and
     /// geodata live here, and it is the only `SAFE_PATHS` entry besides the dashboard. A service
-    /// TUN generation opens no inbound port, so its readiness is the controller alone.
+    /// TUN generation opens no inbound port, so its readiness is the controller alone. Xray gets
+    /// the same directory as `XRAY_LOCATION_ASSET`.
     pub mihomo_home_directory: Option<PathBuf>,
 }
 
@@ -284,7 +285,19 @@ impl RuntimePaths {
                     OsString::from("-config"),
                     self.xray_config.clone().into_os_string(),
                 ],
-                env: Vec::new(),
+                // Service mode: Xray's asset directory (geoip/geosite lookups) is the client's
+                // own service-owned home, never the root-owned cores directory it would default
+                // to (its executable's directory).
+                env: self
+                    .mihomo_home_directory
+                    .iter()
+                    .map(|home| {
+                        (
+                            OsString::from("XRAY_LOCATION_ASSET"),
+                            home.clone().into_os_string(),
+                        )
+                    })
+                    .collect(),
             },
             Engine::Mihomo => {
                 let mut args = Vec::new();

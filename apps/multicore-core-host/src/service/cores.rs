@@ -266,6 +266,13 @@ impl Cores for ProductionCores {
         }
     }
 
+    fn tun_is_on(&mut self) -> Option<bool> {
+        let active = self.active.as_ref()?;
+        let secret = active.controller_secret.as_str();
+        let enabled = mihomo_rest::tun_enabled(active.controller_port, secret).ok()?;
+        Some(enabled || self.runtime.block_on(multicore_core::multicore_tun_is_up()))
+    }
+
     fn health(&mut self) -> CoreHealth {
         let Some(active) = self.active.as_ref() else {
             return CoreHealth::default();

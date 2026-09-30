@@ -239,11 +239,12 @@ fn xray_logs_listeners_and_file_references_are_sanitised() {
             "inbounds[0].listen".into()
         ))
     );
-    assert_eq!(
-        sanitize_xray(br#"{"api":{"tag":"api","listen":"0.0.0.0:10085"}}"#),
-        Err(SanitizeError::NonLoopbackListener("api.listen".into()))
-    );
-    sanitize_xray(br#"{"api":{"tag":"api","listen":"127.0.0.1:10085"}}"#).unwrap();
+    // `api` (and every other non-allowlisted section) is dropped, whatever it listens on.
+    let without_api: serde_json::Value = serde_json::from_slice(
+        &sanitize_xray(br#"{"api":{"tag":"api","listen":"0.0.0.0:10085"}}"#).unwrap(),
+    )
+    .unwrap();
+    assert!(without_api.get("api").is_none());
     assert_eq!(
         sanitize_xray(
             br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"certificateFile":"C:\\k.pem"}]}}}]}"#
@@ -448,30 +449,26 @@ fn xray_keys_are_matched_case_insensitively() {
     let log = doc["LOG"].as_object().unwrap();
     assert_eq!(log.len(), 2, "{log:?}");
     assert!(log.contains_key("LogLevel") && log.contains_key("dnsLog"));
-    for (input, at) in [
-        (
-            &br#"{"api":{"Listen":"0.0.0.0:10085","services":["HandlerService"]}}"#[..],
-            "api.listen",
-        ),
-        (br#"{"API":{"LISTEN":"192.168.1.2:10085"}}"#, "api.listen"),
-        (
-            br#"{"metrics":{"tag":"m","listen":"0.0.0.0:11111"}}"#,
-            "metrics.listen",
-        ),
-        (br#"{"Metrics":{"Listen":"[::]:11111"}}"#, "metrics.listen"),
-        (
-            br#"{"Inbounds":[{"Listen":"0.0.0.0","port":1}]}"#,
-            "inbounds[0].listen",
-        ),
+    for input in [
+        &br#"{"api":{"Listen":"0.0.0.0:10085","services":["HandlerService"]}}"#[..],
+        br#"{"API":{"LISTEN":"192.168.1.2:10085"}}"#,
+        br#"{"metrics":{"tag":"m","listen":"0.0.0.0:11111"}}"#,
+        br#"{"Metrics":{"Listen":"[::]:11111"}}"#,
     ] {
-        assert_eq!(
-            sanitize_xray(input),
-            Err(SanitizeError::NonLoopbackListener(at.into())),
+        let doc: serde_json::Value =
+            serde_json::from_slice(&sanitize_xray(input).unwrap()).unwrap();
+        assert!(
+            doc.as_object().unwrap().is_empty(),
             "{}",
             String::from_utf8_lossy(input)
         );
     }
-    sanitize_xray(br#"{"metrics":{"tag":"m","listen":"127.0.0.1:11111"}}"#).unwrap();
+    assert_eq!(
+        sanitize_xray(br#"{"Inbounds":[{"Listen":"0.0.0.0","port":1}]}"#),
+        Err(SanitizeError::NonLoopbackListener(
+            "inbounds[0].listen".into()
+        ))
+    );
     assert_eq!(
         sanitize_xray(br#"{"outbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"CertificateFile":"C:/k.pem"}]}}}]}"#),
         Err(SanitizeError::FileReference(
@@ -603,4 +600,172 @@ fn tun_routing_table_and_descriptor_overrides_are_dropped() {
         assert!(doc["tun"].get(dropped).is_none(), "{dropped}");
     }
     assert_eq!(doc["tun"]["stack"].as_str(), Some("system"));
+}
+
+/// Re-review 2 N2/N4/N5: the Xray sanitiser is an allowlist. No `geodata` downloads, no
+/// `masterKeyLog` files, and only loopback SOCKS inbounds.
+#[test]
+fn xray_sections_are_allowlisted_and_geodata_is_dropped() {
+    let input = br#"{"log":{"loglevel":"warning"},
+        "geodata":{"cron":"* * * * *","assets":[{"url":"https://attacker/x","file":"mihomo"}]},
+        "GeoData":{"cron":"* * * * *"},
+        "stats":{},"reverse":{"portals":[{"tag":"p","domain":"x"}]},"transport":{},
+        "api":{"tag":"api"},"metrics":{"tag":"m"},"futureSection":{"listen":"0.0.0.0:1"},
+        "dns":{"servers":["1.1.1.1"]},"routing":{"rules":[]},"policy":{"levels":{}},
+        "observatory":{"subjectSelector":["a"]},"burstObservatory":{"subjectSelector":["a"]},
+        "fakedns":[{"ipPool":"198.18.0.0/15","poolSize":65535}],
+        "inbounds":[{"protocol":"socks","port":1080}],
+        "outbounds":[{"protocol":"freedom"}]}"#;
+    assert_eq!(
+        sanitize_xray(input),
+        Err(SanitizeError::Malformed),
+        "geodata and GeoData fold together"
+    );
+    let input = String::from_utf8_lossy(input).replace("\"GeoData\":{\"cron\":\"* * * * *\"},", "");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&sanitize_xray(input.as_bytes()).unwrap()).unwrap();
+    let mut kept = doc.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            "burstObservatory",
+            "dns",
+            "fakedns",
+            "inbounds",
+            "log",
+            "observatory",
+            "outbounds",
+            "policy",
+            "routing"
+        ]
+    );
+    for name in doc.as_object().unwrap().keys() {
+        assert!(multicore_core::ALLOWED_XRAY_SECTIONS.contains(&name.as_str()));
+    }
+    let upper: serde_json::Value = serde_json::from_slice(
+        &sanitize_xray(br#"{"GEODATA":{"cron":"* * * * *","assets":[]}}"#).unwrap(),
+    )
+    .unwrap();
+    assert!(upper.as_object().unwrap().is_empty());
+}
+
+#[test]
+fn master_key_logs_are_stripped_at_any_depth() {
+    let input = br#"{
+        "inbounds":[{"protocol":"socks","port":1,"streamSettings":{"security":"tls",
+            "tlsSettings":{"masterKeyLog":"/etc/nologin","certificates":[]}}}],
+        "outbounds":[
+            {"protocol":"vless","streamSettings":{"security":"tls","tlsSettings":{"MasterKeyLog":"C:/Windows/x"}}},
+            {"protocol":"vless","streamSettings":{"security":"reality","realitySettings":{"masterkeylog":"/root/.bashrc","publicKey":"k"}}},
+            {"protocol":"vless","settings":{"deep":[{"MASTERKEYLOG":"/tmp/x"}]}}
+        ]}"#;
+    let text = String::from_utf8(sanitize_xray(input).unwrap()).unwrap();
+    assert!(
+        !text.to_ascii_lowercase().contains("masterkeylog"),
+        "{text}"
+    );
+    assert!(text.contains("publicKey"));
+    // A non-ASCII spelling (Kelvin sign) is refused by the key check.
+    assert_eq!(
+        sanitize_xray(
+            "{\"outbounds\":[{\"tlsSettings\":{\"master\u{212a}eyLog\":\"/x\"}}]}".as_bytes()
+        ),
+        Err(SanitizeError::Malformed)
+    );
+}
+
+#[test]
+fn only_loopback_socks_inbounds_are_run() {
+    for protocol in [
+        "tun",
+        "dokodemo-door",
+        "http",
+        "vless",
+        "vmess",
+        "trojan",
+        "shadowsocks",
+        "mixed",
+        "tunnel",
+    ] {
+        let input = format!(
+            r#"{{"inbounds":[{{"protocol":"socks","port":1}},{{"protocol":"{protocol}","port":2,"settings":{{"followRedirect":true}}}}]}}"#
+        );
+        assert_eq!(
+            sanitize_xray(input.as_bytes()),
+            Err(SanitizeError::ForbiddenProtocol(
+                "inbounds[1].protocol".into()
+            )),
+            "{protocol}"
+        );
+    }
+    assert_eq!(
+        sanitize_xray(br#"{"inbounds":[{"port":1}]}"#),
+        Err(SanitizeError::ForbiddenProtocol(
+            "inbounds[0].protocol".into()
+        ))
+    );
+    sanitize_xray(br#"{"inbounds":[{"protocol":"SOCKS","port":1,"settings":{"udp":true}}]}"#)
+        .unwrap();
+}
+
+/// Re-review 2 N3: provider fields the sanitiser reads must be spelled exactly.
+#[test]
+fn provider_field_variants_are_refused() {
+    for input in [
+        "mixed-port: 1\nproxy-providers:\n  p: {type: inline, Payload: [{name: s, type: ssh, server: a, port: 22, private-key: /etc/shadow}]}\n",
+        "mixed-port: 1\nrule-providers:\n  r: {Type: file, behavior: domain, path: /etc/x}\n",
+        "mixed-port: 1\nrule-providers:\n  r: {type: http, url: 'https://x', behavior: domain, PATH: /etc/x}\n",
+        "mixed-port: 1\nrule-providers:\n  r: {type: http, url: 'https://x', behavior: domain, FORMAT: mrs}\n",
+    ] {
+        assert_eq!(
+            sanitize_mihomo(input.as_bytes(), &policy()),
+            Err(SanitizeError::Malformed),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn tun_auto_redirect_fallback_rule_index_is_dropped() {
+    let input =
+        "mixed-port: 1\ntun: {enable: true, auto-redirect-iproute2-fallback-rule-index: 0}\n";
+    let doc = yaml(&sanitize_mihomo(input.as_bytes(), &policy()).unwrap().yaml);
+    assert!(
+        doc["tun"]
+            .get("auto-redirect-iproute2-fallback-rule-index")
+            .is_none()
+    );
+}
+
+/// Live check against the pinned Xray (run on the build host):
+/// `MULTICORE_LIVE_XRAY=/path/to/xray cargo test -p multicore-core --test config_sanitize -- --ignored`.
+/// The pinned core must accept the sanitised adversarial config as-is, with nothing left of
+/// `geodata` or `masterKeyLog`.
+#[test]
+#[ignore = "needs MULTICORE_LIVE_XRAY pointing at the pinned Xray binary"]
+fn live_pinned_xray_accepts_the_sanitised_adversarial_config() {
+    let xray = std::env::var_os("MULTICORE_LIVE_XRAY").expect("MULTICORE_LIVE_XRAY");
+    let input = br#"{"log":{"loglevel":"warning","access":"/tmp/zz-access"},
+        "geodata":{"cron":"* * * * *","assets":[{"url":"https://attacker.invalid/x","file":"xray"}]},
+        "api":{"tag":"api","listen":"0.0.0.0:10085","services":["HandlerService"]},
+        "metrics":{"tag":"m","listen":"0.0.0.0:11111"},
+        "inbounds":[{"protocol":"socks","port":18119,"settings":{"udp":true}}],
+        "outbounds":[{"protocol":"freedom","tag":"direct","streamSettings":{"security":"tls",
+            "tlsSettings":{"serverName":"example.com","masterKeyLog":"/tmp/zz-keylog"}}}]}"#;
+    let out = sanitize_xray(input).unwrap();
+    let text = String::from_utf8(out.clone()).unwrap();
+    for gone in ["geodata", "masterKeyLog", "zz-access", "10085", "11111"] {
+        assert!(!text.contains(gone), "{gone} survived: {text}");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("xray.json");
+    std::fs::write(&config, &out).unwrap();
+    let status = std::process::Command::new(xray)
+        .args(["run", "-test", "-config"])
+        .arg(&config)
+        .env("XRAY_LOCATION_ASSET", root.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the pinned Xray rejected: {text}");
 }
