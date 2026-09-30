@@ -919,17 +919,14 @@ where
     build_router(backend, bearer_token, event_epoch, None)
 }
 
-fn build_router<B>(
-    backend: B,
+fn build_router_shared(
+    backend: Arc<dyn Backend>,
     bearer_token: impl AsRef<str>,
     event_epoch: impl Into<String>,
     dashboard_url: Option<Arc<str>>,
-) -> Router
-where
-    B: Backend,
-{
+) -> Router {
     let app_state = AppState {
-        backend: Arc::new(backend),
+        backend,
         event_epoch: Arc::from(event_epoch.into()),
         dashboard_url,
     };
@@ -971,6 +968,32 @@ where
         .with_state(app_state);
 
     Router::new().nest("/v1", v1)
+}
+
+fn build_router<B>(
+    backend: B,
+    bearer_token: impl AsRef<str>,
+    event_epoch: impl Into<String>,
+    dashboard_url: Option<Arc<str>>,
+) -> Router
+where
+    B: Backend,
+{
+    build_router_shared(Arc::new(backend), bearer_token, event_epoch, dashboard_url)
+}
+
+/// Builds the API over a backend the caller keeps a handle to (warm-up, notices).
+pub fn try_router_shared(
+    backend: Arc<dyn Backend>,
+    bearer_token: impl AsRef<str>,
+    dashboard_url: Option<Arc<str>>,
+) -> Result<Router, getrandom::Error> {
+    Ok(build_router_shared(
+        backend,
+        bearer_token,
+        generate_event_epoch()?,
+        dashboard_url,
+    ))
 }
 
 fn generate_event_epoch() -> Result<String, getrandom::Error> {

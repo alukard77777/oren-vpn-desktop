@@ -288,3 +288,22 @@ async fn a_notice_reaches_status_and_events() {
             .any(|event| event.message == "Служба MultiCore недоступна.")
     );
 }
+
+#[tokio::test]
+async fn a_shared_backend_serves_the_router() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let h = harness(&[PROFILE_A]);
+    let backend: Arc<dyn Backend> = h.backend.clone();
+    let app = multicore_daemon::try_router_shared(backend, "shared-token", None).unwrap();
+    let response = app
+        .oneshot(
+            Request::get("/v1/status")
+                .header("authorization", "Bearer shared-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
