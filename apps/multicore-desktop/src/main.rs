@@ -8,6 +8,7 @@ mod conflicting_apps;
 mod daemon;
 mod data_reset;
 mod emoji_images;
+mod layout_shortcuts;
 #[cfg(target_os = "linux")]
 mod linux_display;
 #[cfg(all(test, target_os = "linux"))]
@@ -871,6 +872,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         renderer_fallback::select_software_renderer()?;
     }
     let ui = AppWindow::new()?;
+    layout_shortcuts::install(ui.window());
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
     let _logo_cache_session = logo_cache::LogoCacheSession::install();
