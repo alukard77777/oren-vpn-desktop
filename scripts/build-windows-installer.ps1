@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$PackagePath,
     [string]$OutputDirectory = 'dist\release',
-    [string]$AppVersion = '1.1.1',
+    [string]$AppVersion = '1.1.2',
     [string]$CompilerPath,
     # x64 (default) or x86; the payload must be the package built for the same flavour.
     [ValidateSet('x64', 'x86')]
