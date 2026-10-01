@@ -251,6 +251,8 @@ pub(crate) struct RouteSearchHit {
     pub(crate) group_label: String,
     pub(crate) node_id: String,
     pub(crate) icon: String,
+    /// The node is a proxy group with a downloaded icon image.
+    pub(crate) icon_id: Option<String>,
     pub(crate) prefix: String,
     pub(crate) matched: String,
     pub(crate) suffix: String,
@@ -3506,6 +3508,7 @@ pub(crate) fn search_routes(groups: &[CatalogSearchGroup], query: &str) -> Vec<R
                 group_label: group_label.clone(),
                 node_id: node.id.clone(),
                 icon: display.icon.clone(),
+                icon_id: node.icon_id.clone(),
                 prefix: prefix.to_owned(),
                 matched: matched.to_owned(),
                 suffix: suffix.to_owned(),

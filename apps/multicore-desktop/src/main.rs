@@ -3726,10 +3726,16 @@ fn wire_route_search(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
 
 fn apply_route_search(ui: &AppWindow, catalog: &CatalogPresentation, query: &str) {
     ui.set_route_search_loading(catalog.loading && catalog.search_groups.is_empty());
+    let scale = ui.window().scale_factor();
     let hits = search_routes(&catalog.search_groups, query)
         .into_iter()
         .map(|hit| UiRouteSearchHit {
-            icon_image: emoji_images::image_for(&hit.icon),
+            icon_image: catalog_icon_image(
+                hit.icon_id.as_deref(),
+                &hit.icon,
+                ROUTE_ROW_ICON_PX,
+                scale,
+            ),
             icon: hit.icon.into(),
             group_id: hit.group_id.into(),
             group_label: hit.group_label.into(),
