@@ -62,7 +62,8 @@ foreach ($token in @(
     'Type: filesandordirs; Name: "{app}\.multicore-stage-*"',
     'RegQueryStringValue(',
     "CompareText(AutostartValue, ExpectedAutostartValue) = 0",
-    "RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'MultiCore')"
+    "RegDeleteValue(Root, Key, 'MultiCore')",
+    "DeleteAutostartValue(HKCU, RunKey);"
 )) {
     Assert-True ($definition.Contains($token)) "installer definition is missing: $token"
 }
@@ -161,6 +162,7 @@ try {
     Assert-True $failed 'dropping a required core file from the manifest must fail installer validation'
 
     & (Join-Path $PSScriptRoot 'test-service-installer-contract.ps1')
+    & (Join-Path $PSScriptRoot 'test-installer-user-paths.ps1')
     Write-Output 'PASS: Windows installer contract'
 } finally {
     $resolvedRoot = [IO.Path]::GetFullPath($testRoot)
