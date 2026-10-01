@@ -1,5 +1,7 @@
 //! Verified release metadata and portable-bundle updates for MultiCore.
 
+pub mod brand;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};

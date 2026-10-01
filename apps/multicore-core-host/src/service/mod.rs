@@ -1,5 +1,7 @@
 //! Always-ready service mode: `multicore-core-host --service`.
 
+#[cfg(windows)]
+pub(crate) mod branding;
 pub(crate) mod controller_proxy;
 /// Windows only: Linux cores come from the root-owned `/usr/lib/multicore`.
 #[cfg_attr(not(windows), allow(dead_code))]

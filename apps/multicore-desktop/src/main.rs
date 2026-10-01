@@ -833,6 +833,9 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             return Ok(());
         }
     };
+    // An in-app update from 1.1.1 kept the installer's "MultiCore" entry and shortcuts.
+    #[cfg(windows)]
+    windows_settings::migrate_legacy_brand();
     #[cfg(target_os = "linux")]
     if let Some(appimage) = appimage_handoff::handed_off_from() {
         match windows_settings::adopt_launch_at_sign_in_from(&appimage) {
@@ -7537,6 +7540,19 @@ mod window_tests {
             .find("single_instance::claim_or_forward(&activation)")
             .expect("single-instance forwarding");
         assert!(repair < forwarding);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_the_primary_instance_renames_the_legacy_brand() {
+        let source = include_str!("main.rs");
+        let forwarding = source
+            .find("single_instance::claim_or_forward(&activation)")
+            .expect("single-instance forwarding");
+        let migration = source
+            .find("windows_settings::migrate_legacy_brand();")
+            .expect("installed copies rename the 1.1.1 entry and shortcuts on startup");
+        assert!(forwarding < migration);
     }
 
     #[test]

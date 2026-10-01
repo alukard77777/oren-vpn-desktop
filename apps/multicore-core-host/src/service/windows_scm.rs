@@ -138,6 +138,7 @@ fn run_body() -> io::Result<()> {
         .and_then(std::path::Path::parent)
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| io::Error::other("service executable has no package root"))?;
+    let branding = (directory.clone(), package_root.clone());
     let service = Arc::new(Mutex::new(
         ServiceLoop::new(ProductionCores::new(directory.clone())?).with_updater(Box::new(
             ProductionUpdater::new(directory, package_root, stop.clone()),
@@ -159,6 +160,8 @@ fn run_body() -> io::Result<()> {
             })?
     };
     report(SERVICE_RUNNING, NO_ERROR, 0);
+    // Installs updated in place from 1.1.1 still carry the "MultiCore" names.
+    super::branding::spawn(branding.0, branding.1);
     let result = serve(
         SERVICE_PIPE_NAME,
         service.clone(),

@@ -85,6 +85,34 @@ pub fn ensure_url_protocol_registration() -> io::Result<()> {
     registry::write_protocol_registration(&executable, &command)
 }
 
+/// Renames this install's per-user Apps & Features entry and the user's shortcuts that the
+/// 1.1.1 installer named "MultiCore" (an in-app update replaces only `current`). Runs on its
+/// own thread; cheap once migrated. The service renames the all-users ones.
+#[cfg(windows)]
+pub fn migrate_legacy_brand() {
+    use multicore_release::brand;
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    if !is_installed_executable(&executable) {
+        return;
+    }
+    let Some(root) = executable
+        .parent()
+        .and_then(brand::install_root_of_current)
+        .map(Path::to_path_buf)
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("multicore-branding".into())
+        .spawn(move || {
+            for line in brand::migrate_install(brand::Scope::User, &root) {
+                eprintln!("branding: {line}");
+            }
+        });
+}
+
 pub fn classify_launch_command(
     stored_command: Option<&str>,
     current_executable: &Path,
