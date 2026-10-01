@@ -64,6 +64,18 @@ pub struct AppPreferences {
     /// was declined («Не сейчас»). Written only once set, like `appimage_handoff_seen`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub service_offer_dismissed: bool,
+    /// Size the user dragged the tray popup to (logical px); default when absent. Written only
+    /// once set, so older versions (which reject unknown fields) can still read the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tray_popup_size: Option<TrayPopupSizePreference>,
+}
+
+/// Tray popup size in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrayPopupSizePreference {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Window growth from the expanded rail, in logical pixels.
@@ -93,6 +105,7 @@ impl Default for AppPreferences {
             rail_growth: None,
             appimage_handoff_seen: None,
             service_offer_dismissed: false,
+            tray_popup_size: None,
         }
     }
 }
@@ -666,7 +679,7 @@ mod tests {
 
     use super::{
         AppPreferences, PREFERENCES_SCHEMA_VERSION, PreferenceStore, RailGrowthPreference,
-        VisiblePage, WindowBounds,
+        TrayPopupSizePreference, VisiblePage, WindowBounds,
     };
 
     #[test]
@@ -713,6 +726,10 @@ mod tests {
             }),
             appimage_handoff_seen: Some("/home/me/MultiCore.AppImage".into()),
             service_offer_dismissed: true,
+            tray_popup_size: Some(TrayPopupSizePreference {
+                width: 400,
+                height: 640,
+            }),
         };
 
         store.save(&expected).unwrap();
@@ -747,6 +764,7 @@ mod tests {
                 rail_growth: None,
                 appimage_handoff_seen: None,
                 service_offer_dismissed: false,
+                tray_popup_size: None,
             }
         );
     }

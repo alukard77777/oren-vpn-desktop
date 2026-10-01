@@ -231,8 +231,14 @@ component TrayNodeRow inherits Rectangle {
 }
 
 export component TrayPopup inherits Window {
-    width: 304px;
-    height: 460px;
+    // User-resizable from the edges away from the tray (see grow-up/grow-left);
+    // the default is also the minimum. The host keeps it inside the work area.
+    preferred-width: 304px;
+    preferred-height: 460px;
+    min-width: 304px;
+    min-height: 460px;
+    max-width: 520px;
+    max-height: 900px;
     no-frame: true;
     always-on-top: true;
     background: Theme.canvas;
@@ -248,7 +254,12 @@ export component TrayPopup inherits Window {
     in property <[TrayMenuRow]> node-rows;
     // Mirrored from the main window while the popup is open.
     in property <string> subscription-title;
-    in property <string> subscription-expiry;
+    in property <string> subscription-remaining;
+    in property <string> subscription-days;
+    in property <float> subscription-used-fraction: 0;
+    // No traffic limit: no usage bar under the header.
+    in property <bool> subscription-unlimited: true;
+    in property <string> subscription-quota-tone: "accent";
     in property <bool> subscription-failed: false;
     in property <string> toggle-title: "Защита выключена";
     in property <bool> toggle-on: false;
@@ -262,8 +273,17 @@ export component TrayPopup inherits Window {
     in property <string> exit-latency;
     in property <string> session-uptime;
     in property <bool> reduced-motion: false;
+    // Edges that resize the popup: the ones away from the tray corner it hangs from.
+    in property <bool> grow-up: true;
+    in property <bool> grow-left: true;
+    // "v" (top/bottom edge), "h" (side edge) or "c" (corner) while dragged.
+    in-out property <string> resize-active;
 
     callback toggle-connection();
+    // Drag on a resize edge: pointer offset from the press point, in the popup.
+    callback resize-start(string);
+    callback resize-drag(length, length);
+    callback resize-end();
     // Shows that group's nodes (the same group the home screen shows).
     callback toggle-group(string);
     callback select-node(string, string);
@@ -349,6 +369,7 @@ export component TrayPopup inherits Window {
                     vertical-alignment: center;
                     accessible-role: none;
                 }
+                // Active subscription with compact traffic, as on the title chip.
                 HorizontalLayout {
                     x: 132px;
                     width: parent.width - self.x - 14px;
@@ -356,20 +377,22 @@ export component TrayPopup inherits Window {
                     alignment: end;
                     spacing: 0px;
                     if root.has-profile: Text {
-                        max-width: 90px;
+                        horizontal-stretch: 1;
+                        max-width: self.preferred-width;
                         text: root.subscription-title;
                         color: Theme.text-secondary;
                         font-size: 11.5px;
                         font-weight: Theme.weight-medium;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                         overflow: elide;
                     }
-                    if root.has-profile && (root.subscription-failed || root.subscription-expiry != ""): Text {
-                        text: root.subscription-failed ? " · Не удалось обновить" : " · " + root.subscription-expiry;
-                        color: root.subscription-failed ? Theme.error : Theme.text-muted;
+                    if root.has-profile: Text {
+                        text: root.subscription-failed ? " · Не удалось обновить"
+                            : " · " + root.subscription-remaining + " · " + root.subscription-days;
+                        color: root.subscription-failed || root.subscription-quota-tone == "danger" ? Theme.error : Theme.text-muted;
                         font-size: 11.5px;
                         vertical-alignment: center;
-                        overflow: elide;
                     }
                     if !root.has-profile: Text {
                         text: "Нет подписки";
@@ -384,6 +407,22 @@ export component TrayPopup inherits Window {
                     width: parent.width;
                     height: 1px;
                     background: Theme.line;
+                }
+                // Thin usage bar along the header's bottom edge (limited traffic only).
+                if root.has-profile && !root.subscription-unlimited: Rectangle {
+                    x: 0;
+                    y: parent.height - 2px;
+                    width: parent.width;
+                    height: 2px;
+                    background: #ffffff0d;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * Math.max(0, Math.min(1, root.subscription-used-fraction));
+                        height: parent.height;
+                        background: root.subscription-quota-tone == "danger" ? Theme.error
+                            : root.subscription-quota-tone == "warning" ? Theme.warning
+                            : Theme.accent-blue;
+                    }
                 }
             }
 
@@ -422,7 +461,7 @@ export component TrayPopup inherits Window {
                     visible: self.opacity > 0;
                     animate opacity { duration: 160ms; easing: ease-out; }
 
-                    for _[grid-x] in 36: Rectangle {
+                    for _[grid-x] in Math.ceil(self.width / 8px): Rectangle {
                         x: grid-x * 8px;
                         y: 0;
                         width: 8px;
@@ -511,7 +550,8 @@ export component TrayPopup inherits Window {
                             Image { width: 12px; height: 12px; source: root.exit-icon-image; image-fit: contain; accessible-role: none; }
                         }
                         if root.exit-icon != "" && root.exit-icon-image.width == 0: Text { text: root.exit-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: 11px; vertical-alignment: center; accessible-role: none; }
-                        if root.exit-name != "": Text { max-width: 110px; text: root.exit-name; color: Theme.text-secondary; font-size: 11.5px; vertical-alignment: center; overflow: elide; }
+                        // A wider popup gives a long exit name more room.
+                        if root.exit-name != "": Text { max-width: Math.max(110px, root.width - 194px); text: root.exit-name; color: Theme.text-secondary; font-size: 11.5px; vertical-alignment: center; overflow: elide; }
                         if root.exit-latency != "": Text { text: "· " + root.exit-latency; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; }
                         if root.session-uptime != "": Text { text: "· " + root.session-uptime; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; accessible-label: "Время сессии " + root.session-uptime; }
                     }
@@ -809,6 +849,101 @@ export component TrayPopup inherits Window {
                     activated => { root.exit-app(); }
                 }
             }
+
+            // Resize affordance: a thin accent line on the hovered (soft) or
+            // dragged (solid) edges, and a corner tab while the corner is dragged.
+            property <bool> v-lit: root.resize-active == "v" || root.resize-active == "c" || v-grip.has-hover || corner-grip.has-hover;
+            property <bool> h-lit: root.resize-active == "h" || root.resize-active == "c" || h-grip.has-hover || corner-grip.has-hover;
+            Rectangle {
+                x: 0;
+                y: root.grow-up ? 0 : parent.height - self.height;
+                width: parent.width;
+                height: 2px;
+                background: Theme.accent-blue;
+                opacity: root.resize-active != "" && parent.v-lit ? 1 : parent.v-lit ? 0.45 : 0;
+                animate opacity { duration: 120ms; easing: ease-out; }
+            }
+            Rectangle {
+                x: root.grow-left ? 0 : parent.width - self.width;
+                y: 0;
+                width: 2px;
+                height: parent.height;
+                background: Theme.accent-blue;
+                opacity: root.resize-active != "" && parent.h-lit ? 1 : parent.h-lit ? 0.45 : 0;
+                animate opacity { duration: 120ms; easing: ease-out; }
+            }
+            if root.resize-active == "c": Rectangle {
+                x: root.grow-left ? 0 : parent.width - self.width;
+                y: root.grow-up ? 0 : parent.height - self.height;
+                width: 12px;
+                height: 12px;
+                background: Theme.accent-blue;
+            }
+        }
+
+        // Size readout while dragging, centred like a resize HUD.
+        if root.resize-active != "": Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: size-label.preferred-width + 16px;
+            height: 22px;
+            border-radius: 6px;
+            background: Theme.elevated;
+            border-width: 1px;
+            border-color: #4c9dff99;
+            drop-shadow-blur: 8px;
+            drop-shadow-color: #00000080;
+            size-label := Text {
+                x: 8px;
+                height: parent.height;
+                text: Math.round(root.width / 1px) + " × " + Math.round(root.height / 1px);
+                color: Theme.accent-blue;
+                font-size: 11px;
+                font-weight: Theme.weight-semibold;
+                vertical-alignment: center;
+            }
+        }
+
+        // Grips above everything: top/bottom edge, side edge and their corner.
+        v-grip := TouchArea {
+            x: root.grow-left ? 12px : 0px;
+            y: root.grow-up ? 0px : parent.height - self.height;
+            width: parent.width - 12px;
+            height: 6px;
+            mouse-cursor: ns-resize;
+            pointer-event(event) => { root.grip-event("v", event); }
+            moved => { if (self.pressed) { root.resize-drag(0px, self.mouse-y - self.pressed-y); } }
+        }
+        h-grip := TouchArea {
+            x: root.grow-left ? 0px : parent.width - self.width;
+            y: root.grow-up ? 12px : 0px;
+            width: 6px;
+            height: parent.height - 12px;
+            mouse-cursor: ew-resize;
+            pointer-event(event) => { root.grip-event("h", event); }
+            moved => { if (self.pressed) { root.resize-drag(self.mouse-x - self.pressed-x, 0px); } }
+        }
+        corner-grip := TouchArea {
+            x: root.grow-left ? 0px : parent.width - self.width;
+            y: root.grow-up ? 0px : parent.height - self.height;
+            width: 12px;
+            height: 12px;
+            mouse-cursor: root.grow-up == root.grow-left ? nwse-resize : nesw-resize;
+            pointer-event(event) => { root.grip-event("c", event); }
+            moved => { if (self.pressed) { root.resize-drag(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y); } }
+        }
+    }
+
+    function grip-event(handle: string, event: PointerEvent) {
+        if (event.button != PointerEventButton.left) {
+            return;
+        }
+        if (event.kind == PointerEventKind.down) {
+            root.resize-active = handle;
+            root.resize-start(handle);
+        } else if (event.kind == PointerEventKind.up && root.resize-active != "") {
+            root.resize-active = "";
+            root.resize-end();
         }
     }
 }

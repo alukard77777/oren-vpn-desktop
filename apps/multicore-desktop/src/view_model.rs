@@ -273,6 +273,22 @@ pub(crate) struct SubscriptionPresentation {
     pub(crate) refresh_available: bool,
     pub(crate) refresh_pending: bool,
     pub(crate) error: Option<String>,
+    pub(crate) quota: QuotaPresentation,
+}
+
+/// Compact traffic and term figures for the title-bar chip, its dropdown and the
+/// tray header ("87.6 GiB · 12 дн."), derived from the parsed subscription-userinfo.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QuotaPresentation {
+    /// Traffic left ("87.6 GiB"); "∞ GiB" without a traffic limit.
+    pub(crate) remaining: String,
+    /// "12 дн.", "Бессрочно" without a real end date, "Срок истёк" once it passed.
+    pub(crate) days: String,
+    /// Share of the limit already used, in thousandths; `None` without a limit.
+    pub(crate) used_permille: Option<u16>,
+    /// "accent", "warning" (≥80 % used or ≤3 days left) or "danger" (expired/exhausted).
+    pub(crate) tone: &'static str,
+    pub(crate) expired: bool,
 }
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
@@ -285,6 +301,7 @@ pub(crate) struct SubscriptionProfilePresentation {
     pub(crate) usage: String,
     pub(crate) expiry: String,
     pub(crate) service_logo_path: Option<String>,
+    pub(crate) quota: QuotaPresentation,
 }
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
@@ -1506,6 +1523,7 @@ impl DesktopViewModel {
                 refresh_available: false,
                 refresh_pending: false,
                 error: self.subscription_refresh_error.clone(),
+                quota: quota_presentation(None, None, None, now_unix),
             };
         };
         let used_bytes =
@@ -1523,6 +1541,8 @@ impl DesktopViewModel {
             _ => "Нет данных".into(),
         };
         let expiry = format_expiry(info.expires_at_unix, now_unix);
+        let quota =
+            quota_presentation(used_bytes, info.total_bytes, info.expires_at_unix, now_unix);
         let updated = format_update_date(info.updated_at_unix);
         let updated_stale = info.updated_at_unix != 0
             && now_unix
@@ -1558,6 +1578,7 @@ impl DesktopViewModel {
                 .active_mutation
                 .is_some_and(|active| active.kind == MutationKind::SubscriptionRefresh),
             error: self.subscription_refresh_error.clone(),
+            quota,
         }
     }
 
@@ -3059,7 +3080,14 @@ fn present_subscription_profile(
         (None, Some(total)) => format!("— / {}", format_gib(total)),
         (None, None) => "Нет данных".into(),
     };
-    let expiry = format_expiry(profile.expires_at_unix, current_unix_time());
+    let now_unix = current_unix_time();
+    let expiry = format_expiry(profile.expires_at_unix, now_unix);
+    let quota = quota_presentation(
+        profile.used_bytes,
+        profile.total_bytes,
+        profile.expires_at_unix,
+        now_unix,
+    );
     Some(SubscriptionProfilePresentation {
         id,
         active: profile.active,
@@ -3071,6 +3099,7 @@ fn present_subscription_profile(
             .service_logo_path
             .as_deref()
             .and_then(local_logo_path),
+        quota,
     })
 }
 
@@ -3184,6 +3213,66 @@ fn format_expiry(expires_at_unix: Option<u64>, now_unix: u64) -> String {
         "Бессрочно".into()
     } else {
         format!("Осталось {days} {}", russian_days(days))
+    }
+}
+
+/// Remaining traffic as the chip shows it: one decimal under 100 GiB, whole
+/// GiB above, MiB below 1 GiB.
+fn format_compact_gib(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = bytes as f64;
+    if value < GIB {
+        format!("{} MiB", (value / MIB).floor() as u64)
+    } else if value < 100.0 * GIB {
+        format!("{:.1} GiB", (value / GIB * 10.0).floor() / 10.0)
+    } else {
+        format!("{} GiB", (value / GIB).floor() as u64)
+    }
+}
+
+fn quota_presentation(
+    used_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    expires_at_unix: Option<u64>,
+    now_unix: u64,
+) -> QuotaPresentation {
+    // Providers send total=0 for "no traffic limit".
+    let total = total_bytes.filter(|total| *total > 0);
+    let used = used_bytes.unwrap_or(0);
+    let (remaining, used_permille, exhausted) = match total {
+        Some(total) => (
+            format_compact_gib(total.saturating_sub(used)),
+            Some((u128::from(used.min(total)) * 1000 / u128::from(total)) as u16),
+            used >= total,
+        ),
+        None => ("∞ GiB".to_owned(), None, false),
+    };
+    let expired = expires_at_unix.is_some_and(|expires| expires <= now_unix);
+    let days_left = expires_at_unix
+        .filter(|_| !expired)
+        .map(|expires| (expires - now_unix).div_ceil(86_400))
+        .filter(|days| *days <= UNLIMITED_EXPIRY_DAYS);
+    let days = if expired {
+        "Срок истёк".to_owned()
+    } else {
+        days_left.map_or_else(|| "Бессрочно".to_owned(), |days| format!("{days} дн."))
+    };
+    let tone = if expired || exhausted {
+        "danger"
+    } else if used_permille.is_some_and(|permille| permille >= 800)
+        || days_left.is_some_and(|days| days <= 3)
+    {
+        "warning"
+    } else {
+        "accent"
+    };
+    QuotaPresentation {
+        remaining,
+        days,
+        used_permille,
+        tone,
+        expired,
     }
 }
 
@@ -5165,9 +5254,13 @@ mod tests {
                     .next()
             })
             .expect("title subscription chip source");
-        assert!(chip.contains("if root.has-service-logo: Image {"));
-        assert!(chip.contains("source: root.service-logo;"));
-        assert!(chip.contains("root.subscription-refresh-error != \"\" ? \"Не удалось обновить\""));
+        assert!(chip.contains("chip-logo := QuotaLogo {"));
+        assert!(chip.contains("has-logo: root.has-service-logo;"));
+        assert!(chip.contains("logo: root.service-logo;"));
+        assert!(chip.contains("text: root.chip-meta-text;"));
+        assert!(
+            app.contains("root.subscription-refresh-error != \"\" ? \"· Не удалось обновить\"")
+        );
         assert!(!chip.contains("if root.subscription-refresh-error != \"\": Text"));
         assert!(app.contains("toggle-module := Rectangle"));
         for shield in ["shield-check.svg", "shield-alert.svg", "shield-off.svg"] {
@@ -6928,6 +7021,53 @@ mod tests {
     }
 
     #[test]
+    fn quota_reads_remaining_traffic_days_and_tone() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let now = 1_800_000_000;
+        let day = 86_400;
+        let normal = quota_presentation(
+            Some(12 * GIB + GIB / 2),
+            Some(100 * GIB),
+            Some(now + 12 * day),
+            now,
+        );
+        assert_eq!(normal.remaining, "87.5 GiB");
+        assert_eq!(normal.days, "12 дн.");
+        assert_eq!(normal.used_permille, Some(125));
+        assert_eq!(normal.tone, "accent");
+        assert!(!normal.expired);
+
+        let heavy = quota_presentation(Some(85 * GIB), Some(100 * GIB), None, now);
+        assert_eq!(heavy.tone, "warning");
+        assert_eq!(heavy.days, "Бессрочно");
+        let ending = quota_presentation(Some(0), Some(300 * GIB), Some(now + 3 * day), now);
+        assert_eq!(ending.remaining, "300 GiB");
+        assert_eq!(ending.tone, "warning");
+
+        let expired = quota_presentation(Some(GIB), Some(100 * GIB), Some(now - day), now);
+        assert_eq!(expired.days, "Срок истёк");
+        assert_eq!(expired.tone, "danger");
+        assert!(expired.expired);
+        let exhausted = quota_presentation(Some(120 * GIB), Some(100 * GIB), None, now);
+        assert_eq!(exhausted.remaining, "0 MiB");
+        assert_eq!(exhausted.used_permille, Some(1000));
+        assert_eq!(exhausted.tone, "danger");
+
+        // No limit (absent or total=0): infinite traffic, no gauge.
+        for total in [None, Some(0)] {
+            let unlimited = quota_presentation(Some(5 * GIB), total, Some(now + 12_073 * day), now);
+            assert_eq!(unlimited.remaining, "∞ GiB");
+            assert_eq!(unlimited.used_permille, None);
+            assert_eq!(unlimited.days, "Бессрочно");
+            assert_eq!(unlimited.tone, "accent");
+        }
+        assert_eq!(
+            quota_presentation(None, Some(GIB / 2), None, now).remaining,
+            "512 MiB"
+        );
+    }
+
+    #[test]
     fn expiry_decades_away_reads_as_unlimited() {
         let now = 1_790_000_000;
         let day = 86_400;
@@ -7814,7 +7954,7 @@ mod tests {
         assert!(source.contains("accessible-label: root.primary-label;"));
         assert!(source.contains("in property <image> service-logo;"));
         assert!(source.contains("in property <bool> has-service-logo: false;"));
-        assert!(source.contains("source: root.service-logo;"));
+        assert!(source.contains("logo: root.service-logo;"));
         assert!(!source.contains("if !root.has-service-logo: Image"));
         // The power circle became a switch; the provider logo moved to the title chip.
         assert!(!source.contains("power-glyph := Image"));
