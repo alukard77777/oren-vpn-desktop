@@ -34,6 +34,8 @@ struct FakeService {
     tun: bool,
     /// `Update` waits for this before answering: a download that takes a while.
     update_gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// `StageUpdate` answers with another version than it was asked for.
+    stage_wrong_version: bool,
     /// The next `Prepare` waits here (outside the service lock) until released.
     gate: Option<std::sync::mpsc::Receiver<()>>,
     gate_entered: bool,
@@ -118,6 +120,13 @@ impl ServiceTransport for FakeTransport {
             },
             ServiceCommand::Shutdown => ServiceResponse::ShuttingDown,
             ServiceCommand::Update { .. } => ServiceResponse::UpdateStarted,
+            ServiceCommand::StageUpdate { version } => ServiceResponse::UpdateStaged {
+                version: if service.stage_wrong_version {
+                    "9.9.9".into()
+                } else {
+                    version.clone()
+                },
+            },
         })
     }
 }
@@ -568,6 +577,46 @@ fn an_update_runs_on_its_own_channel_and_keeps_the_cores() {
     let service = connector.0.lock().unwrap();
     assert_eq!(service.connects, 2, "the update opened its own channel");
     assert!(service.commands.contains(&ServiceCommand::Status));
+}
+
+#[test]
+fn staging_runs_on_its_own_channel_and_leaves_the_connection_alone() {
+    let (session, connector, _) = session();
+    session.prepare(3).unwrap();
+    session.set_tun(true).unwrap();
+    assert_eq!(session.stage_update("1.2.0"), Ok(()));
+    let service = connector.0.lock().unwrap();
+    assert_eq!(service.connects, 2, "staging opened its own channel");
+    assert!(service.commands.contains(&ServiceCommand::StageUpdate {
+        version: "1.2.0".into()
+    }));
+    assert!(
+        !service
+            .commands
+            .iter()
+            .any(|command| matches!(command, ServiceCommand::Update { .. })),
+        "staging never asks the service to install"
+    );
+    assert!(
+        service.tun,
+        "the tunnel stays up while the release downloads"
+    );
+}
+
+#[test]
+fn a_refused_or_mismatched_stage_is_reported() {
+    let (session, connector, _) = session();
+    connector.0.lock().unwrap().busy = true;
+    assert_eq!(session.stage_update("1.2.0"), Err(ServiceError::Busy));
+    connector.0.lock().unwrap().busy = false;
+    connector.0.lock().unwrap().stage_wrong_version = true;
+    assert_eq!(session.stage_update("1.2.0"), Err(ServiceError::Protocol));
+    assert!(
+        service_response_timeout(&ServiceCommand::StageUpdate {
+            version: "1.2.0".into()
+        }) >= std::time::Duration::from_secs(10 * 60),
+        "a download gets the update budget"
+    );
 }
 
 #[test]

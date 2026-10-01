@@ -18,20 +18,38 @@ pub const MAX_UPDATE_VERSION_CHARS: usize = 32;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceCommand {
-    Prepare { generation_id: u64 },
-    SetTun { on: bool },
+    Prepare {
+        generation_id: u64,
+    },
+    SetTun {
+        on: bool,
+    },
     Status,
-    Stop { engine: ElevatedEngine },
+    Stop {
+        engine: ElevatedEngine,
+    },
     Diagnostics,
     Shutdown,
-    Update { version: String },
+    /// Downloads and fully verifies `version` but keeps the cores (and the tunnel) running.
+    /// Added after 1.1.1 without a protocol bump: it is additive, and a service that does not
+    /// know it answers `Error{InvalidRequest}` instead of misreading it.
+    StageUpdate {
+        version: String,
+    },
+    /// Installs `version`: reuses the release a `StageUpdate` already verified (downloading and
+    /// verifying it first otherwise), then stops the cores and hands over to the updater.
+    Update {
+        version: String,
+    },
 }
 
 impl ServiceCommand {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Prepare { generation_id: 0 } => Err(ProtocolError::InvalidGeneration),
-            Self::Update { version } if !is_release_version(version) => {
+            Self::Update { version } | Self::StageUpdate { version }
+                if !is_release_version(version) =>
+            {
                 Err(ProtocolError::InvalidSchema)
             }
             _ => Ok(()),
@@ -101,6 +119,10 @@ pub enum ServiceResponse {
         logs: Vec<ElevatedLogRecord>,
     },
     ShuttingDown,
+    /// `StageUpdate` finished: `version` is downloaded and verified, nothing was stopped.
+    UpdateStaged {
+        version: String,
+    },
     UpdateStarted,
     /// Another interactive user's session holds the cores.
     Busy,
@@ -155,6 +177,10 @@ pub fn service_response_matches(command: &ServiceCommand, response: &ServiceResp
         (ServiceCommand::Stop { engine }, ServiceResponse::Stopped { engine: actual }) => {
             engine == actual
         }
+        (
+            ServiceCommand::StageUpdate { version },
+            ServiceResponse::UpdateStaged { version: actual },
+        ) => version == actual,
         (ServiceCommand::Status, ServiceResponse::Status { .. })
         | (ServiceCommand::Diagnostics, ServiceResponse::ProcessDiagnostics { .. })
         | (ServiceCommand::Shutdown, ServiceResponse::ShuttingDown)

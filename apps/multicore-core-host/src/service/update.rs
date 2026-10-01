@@ -6,11 +6,40 @@
 //! The session and the user's update directory handed to the updater come from the
 //! authenticated client (its token's session in `user_key`, its known-folder `data_root`),
 //! never from the request.
+//!
+//! A connected desktop updates in two steps so the user stays online during the download:
+//! `StageUpdate` downloads and verifies with the cores running, the desktop then disconnects,
+//! and `Update` hands the staged release (re-checked against its verified digest) over. A
+//! client that only sends `Update` (1.1.1) gets the one-step download-then-install as before.
+
+use std::path::PathBuf;
 
 use multicore_core::elevation_protocol::BrokerErrorCode;
-use multicore_release::Version;
+use multicore_release::{Version, verify_archive_file};
 
 use super::core_loop::ClientIdentity;
+
+/// A release the service downloaded and verified (GitHub digest and the in-zip
+/// `SHA256SUMS.txt`), waiting for `Update` to hand it to the updater. `StageUpdate` leaves one
+/// behind while the tunnel keeps running; every field comes from the service's own fetch of the
+/// pinned repository's release, never from the client.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct StagedRelease {
+    pub(crate) version: String,
+    pub(crate) archive: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl StagedRelease {
+    /// Whether `Update { version }` may skip the download: the same release, and the archive
+    /// still has the verified size and digest (it sat on disk since it was staged).
+    pub(crate) fn reusable_for(&self, version: &str) -> bool {
+        self.version == version
+            && verify_archive_file(&self.archive, self.size, &self.sha256).is_ok()
+    }
+}
 
 /// Only a strictly newer release is accepted.
 pub(crate) fn plan_update(current: &str, requested: &str) -> Result<(), BrokerErrorCode> {
@@ -56,7 +85,7 @@ mod production {
         System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS, SetEvent, WaitForSingleObject},
     };
 
-    use super::{ClientIdentity, plan_update, session_of};
+    use super::{ClientIdentity, StagedRelease, plan_update, session_of};
     use crate::service::core_loop::ServiceUpdater;
 
     const RELEASE_BODY_LIMIT: usize = 512 * 1024;
@@ -66,20 +95,12 @@ mod production {
     /// Time for the connection to answer `UpdateStarted` before the service stops itself.
     const HANDOVER_DELAY: Duration = Duration::from_secs(2);
 
-    /// A downloaded and verified release, waiting for the cores to stop.
-    struct Staged {
-        version: String,
-        archive: PathBuf,
-        size: u64,
-        sha256: String,
-    }
-
     pub(crate) struct ProductionUpdater {
         service_directory: PathBuf,
         package_root: PathBuf,
         stop: Arc<OwnedHandle>,
         runtime: Option<tokio::runtime::Runtime>,
-        staged: Option<Staged>,
+        staged: Option<StagedRelease>,
         launched: bool,
     }
 
@@ -207,7 +228,7 @@ mod production {
             (unsafe { WaitForSingleObject(self.stop.as_raw_handle(), 0) }) == WAIT_OBJECT_0
         }
 
-        fn stage(&mut self, version: &str) -> Result<Staged, BrokerErrorCode> {
+        fn stage(&mut self, version: &str) -> Result<StagedRelease, BrokerErrorCode> {
             let repository = option_env!("MULTICORE_UPDATE_REPOSITORY")
                 .and_then(|value| Repository::parse(value).ok())
                 .ok_or(BrokerErrorCode::Unsupported)?;
@@ -232,7 +253,7 @@ mod production {
             let verified = extract_verified_bundle(&archive, &check);
             let _ = fs::remove_dir_all(&check);
             verified.map_err(|_| BrokerErrorCode::InvalidRequest)?;
-            Ok(Staged {
+            Ok(StagedRelease {
                 version: version.to_owned(),
                 archive,
                 size: release.asset().size(),
@@ -254,6 +275,15 @@ mod production {
             session_of(client)
                 .filter(|session| *session != 0)
                 .ok_or(BrokerErrorCode::InvalidRequest)?;
+            // `Update` after a `StageUpdate`: the tunnel is already down, so hand over the
+            // release that was verified while it was still up instead of downloading again.
+            if self
+                .staged
+                .as_ref()
+                .is_some_and(|staged| staged.reusable_for(version))
+            {
+                return Ok(());
+            }
             self.staged = None;
             self.staged = Some(self.stage(version)?);
             Ok(())

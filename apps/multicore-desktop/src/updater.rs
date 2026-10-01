@@ -98,7 +98,7 @@ impl UpdateState {
                 detail: if runtime_idle {
                     REPLACEMENT_DETAIL.into()
                 } else {
-                    "Туннель будет остановлен, а клиент перезапущен".into()
+                    "После загрузки туннель будет остановлен, а клиент перезапущен".into()
                 },
                 action_label: "Установить".into(),
                 action: UpdateAction::Install,
@@ -274,11 +274,41 @@ pub(crate) fn install_appimage(image: &Path, staged: &Path, backup: &Path) -> st
     fs::rename(staged, image)
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
+/// A release downloaded and verified (size and SHA-256 from the release) while the tunnel
+/// stays up, waiting to be applied once the client has disconnected.
+#[derive(Debug)]
+pub(crate) struct StagedUpdate {
+    path: PathBuf,
+}
 
+impl StagedUpdate {
+    #[cfg(test)]
+    pub(crate) fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Checks the staged file again right before it is applied: it waited in a user-writable
+    /// directory while the tunnel was being stopped.
+    pub(crate) fn reverify(&self, release: &GitHubRelease) -> Result<(), String> {
+        verify_archive_file(
+            &self.path,
+            release.asset().size(),
+            release.asset().sha256_hex(),
+        )
+        .map_err(|_| "Загруженное обновление изменилось до установки — повторите загрузку".into())
+    }
+}
+
+/// Downloads and verifies `release`, then starts applying it: the path for a client with no
+/// tunnel to keep up.
+pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), String> {
+    let staged = download_and_verify(release)?;
+    start_apply(release, &staged)
+}
+
+/// The AppImage being replaced, the hidden download next to it, and the kept previous image.
+#[cfg(target_os = "linux")]
+fn appimage_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let LinuxInstall::AppImage(image) = linux_install() else {
         return Err("Обновите MultiCore через менеджер пакетов".into());
     };
@@ -291,6 +321,14 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
         .ok_or_else(|| "Некорректное имя AppImage".to_owned())?;
     let staged = directory.join(format!(".{name}.update"));
     let backup = directory.join(format!("{name}.old"));
+    Ok((image, staged, backup))
+}
+
+/// Downloads and verifies `release` without touching the installed AppImage, so the tunnel can
+/// stay up meanwhile.
+#[cfg(target_os = "linux")]
+pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdate, String> {
+    let (_, staged, _) = appimage_paths()?;
     if staged.exists() {
         fs::remove_file(&staged).map_err(|_| "Не удалось очистить прошлую загрузку".to_owned())?;
     }
@@ -305,7 +343,21 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
         let _ = fs::remove_file(&staged);
         return Err("Загруженный AppImage не прошёл SHA-256 проверку".into());
     }
-    install_appimage(&image, &staged, &backup)
+    Ok(StagedUpdate { path: staged })
+}
+
+/// Swaps in the staged AppImage and relaunches it once this process has exited.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    if let Err(error) = staged.reverify(release) {
+        let _ = fs::remove_file(&staged.path);
+        return Err(error);
+    }
+    let (image, _, backup) = appimage_paths()?;
+    install_appimage(&image, &staged.path, &backup)
         .map_err(|_| "Не удалось заменить файл AppImage".to_owned())?;
     Command::new("/bin/sh")
         .arg("-c")
@@ -322,8 +374,10 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
     Ok(())
 }
 
+/// Downloads and verifies `release` into the user's update directory without touching the
+/// install, so the tunnel can stay up meanwhile.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), String> {
+pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdate, String> {
     let update_dir = update_directory()?;
     fs::create_dir_all(&update_dir)
         .map_err(|_| "Не удалось создать папку обновлений".to_owned())?;
@@ -345,7 +399,15 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
     .map_err(|_| "Загруженный архив не прошёл SHA-256 проверку".to_owned())?;
     fs::rename(&partial, &archive)
         .map_err(|_| "Не удалось зафиксировать загруженный архив".to_owned())?;
+    Ok(StagedUpdate { path: archive })
+}
 
+/// Starts the update helper on the staged archive; it waits for this process to exit, swaps
+/// the install (verifying the archive once more) and relaunches MultiCore.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Result<(), String> {
+    staged.reverify(release)?;
+    let update_dir = update_directory()?;
     let current_exe =
         std::env::current_exe().map_err(|_| "Не удалось определить путь MultiCore".to_owned())?;
     let target = current_exe
@@ -372,7 +434,7 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
         .arg("--wait-pid")
         .arg(std::process::id().to_string())
         .arg("--archive")
-        .arg(&archive)
+        .arg(&staged.path)
         .arg("--target")
         .arg(&target)
         .arg("--size")
@@ -669,6 +731,75 @@ mod tests {
         assert_eq!(connected.action, UpdateAction::Install);
         assert!(connected.action_enabled);
         assert!(connected.detail.contains("перезапущен"));
+        assert!(
+            connected.detail.contains("После загрузки"),
+            "the tunnel is stopped only once the download is ready: {}",
+            connected.detail
+        );
+    }
+
+    fn release_of(content: &[u8]) -> GitHubRelease {
+        use sha2::{Digest, Sha256};
+        let body = format!(
+            r#"{{
+            "tag_name":"v0.2.0",
+            "html_url":"https://github.com/Fatyzzz/multi-core/releases/tag/v0.2.0",
+            "assets":[{{
+                "name":"multicore-windows-x64.zip",
+                "browser_download_url":"https://github.com/Fatyzzz/multi-core/releases/download/v0.2.0/multicore-windows-x64.zip",
+                "size":{},
+                "digest":"sha256:{:x}"
+            }}]
+        }}"#,
+            content.len(),
+            Sha256::digest(content)
+        );
+        GitHubRelease::parse(body.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_staged_update_is_checked_again_before_it_is_applied() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multicore-0.2.0.zip");
+        std::fs::write(&path, b"verified package").unwrap();
+        let release = release_of(b"verified package");
+        let staged = super::StagedUpdate::at(path.clone());
+        assert_eq!(staged.reverify(&release), Ok(()));
+        // It waited in the user's update directory while the tunnel was stopped.
+        std::fs::write(&path, b"tampered package").unwrap();
+        assert!(staged.reverify(&release).is_err());
+        assert!(
+            super::start_apply(&release, &staged).is_err(),
+            "a changed package is never handed to the installer"
+        );
+        // Linux drops a tampered download itself; either way a missing file is rejected.
+        let _ = std::fs::remove_file(&path);
+        assert!(staged.reverify(&release).is_err());
+    }
+
+    #[test]
+    fn download_and_apply_is_split_so_the_tunnel_can_stay_up_while_downloading() {
+        let source = include_str!("updater.rs").replace("\r\n", "\n");
+        let combined = source
+            .split("pub(crate) fn download_and_start_apply(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("download_and_start_apply");
+        assert!(combined.contains("let staged = download_and_verify(release)?;"));
+        assert!(combined.contains("start_apply(release, &staged)"));
+        let apply = source
+            .split("pub(crate) fn start_apply(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("start_apply");
+        assert!(
+            apply.contains("staged.reverify(release)"),
+            "start_apply re-checks the staged file first"
+        );
+        assert!(
+            !apply.contains("download_release_to("),
+            "applying never downloads"
+        );
     }
 
     #[test]

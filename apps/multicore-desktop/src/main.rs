@@ -9,6 +9,7 @@ mod crisp_image;
 mod daemon;
 mod data_reset;
 mod emoji_images;
+mod layout_shortcuts;
 #[cfg(target_os = "linux")]
 mod linux_display;
 #[cfg(all(test, target_os = "linux"))]
@@ -39,6 +40,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemon::{DaemonClient, DaemonError, UnavailableDaemonClient};
+use multicore_release::GitHubRelease;
 use preferences::{
     AppPreferences, PreferenceStore, RailGrowthPreference, TrayPopupSizePreference, VisiblePage,
     WindowBounds,
@@ -872,6 +874,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         renderer_fallback::select_software_renderer()?;
     }
     let ui = AppWindow::new()?;
+    layout_shortcuts::install(ui.window());
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
     let _logo_cache_session = logo_cache::LogoCacheSession::install();
@@ -2034,37 +2037,22 @@ fn wire_updater(
 
     let weak = ui.as_weak();
     ui.on_confirm_update_restart(move || {
-        let (plan, action, client, current) = {
-            let mut model = model.lock().expect("view model lock");
-            let plan = update_confirm_plan(&model.presentation());
-            // Checked under the same lock, so begin_primary_action can only
-            // start the Disconnect/Cleanup the plan was based on.
-            let action = match plan {
-                UpdateConfirmPlan::DisconnectFirst => model.begin_primary_action(),
-                UpdateConfirmPlan::InstallNow | UpdateConfirmPlan::Wait => None,
-            };
-            let client = model.daemon_client();
-            (plan, action, client, snapshot(&model))
+        let (plan, current) = {
+            let model = model.lock().expect("view model lock");
+            (update_confirm_plan(&model.presentation()), snapshot(&model))
         };
-        let started = match (plan, action) {
-            (UpdateConfirmPlan::InstallNow, _) => {
+        // Connected: only the download starts here. The tunnel stays up until the update is
+        // downloaded and verified (see `continue_ready_update`).
+        let started = match plan {
+            UpdateConfirmPlan::InstallNow => {
                 start_update_install(weak.clone(), model.clone(), state.clone());
                 true
             }
-            (
-                UpdateConfirmPlan::DisconnectFirst,
-                Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)),
-            ) => {
-                run_disconnect_for_update(
-                    weak.clone(),
-                    model.clone(),
-                    client,
-                    mutation,
-                    state.clone(),
-                );
+            UpdateConfirmPlan::DisconnectFirst => {
+                start_update_download_first(weak.clone(), model.clone(), state.clone());
                 true
             }
-            _ => false,
+            UpdateConfirmPlan::Wait => false,
         };
         // Nothing could start (an operation is still running): keep the
         // dialog open instead of closing it as if the update had begun. Its
@@ -2121,22 +2109,31 @@ fn update_through_service(service_mode: bool) -> bool {
     cfg!(windows) && service_mode
 }
 
+/// Marks the offered update as downloading, in one step under the lock: a second confirm (or
+/// a retry while one runs) finds no available release and never starts a second download.
+fn begin_update_download(state: &Mutex<UpdateState>) -> Option<GitHubRelease> {
+    let mut current = state.lock().expect("update state lock");
+    let release = current.available_release()?;
+    *current = UpdateState::Downloading(release.clone());
+    Some(release)
+}
+
+fn show_update_state(weak: &slint::Weak<AppWindow>, state: &Mutex<UpdateState>, idle: bool) {
+    if let Some(ui) = weak.upgrade() {
+        apply_update_state(&ui, &state.lock().expect("update state lock"), idle);
+    }
+}
+
+/// No tunnel to keep up: download, verify and apply in one go.
 fn start_update_install(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     state: Arc<Mutex<UpdateState>>,
 ) {
-    let release = state.lock().expect("update state lock").available_release();
-    let Some(release) = release else {
+    let Some(release) = begin_update_download(&state) else {
         return;
     };
-    {
-        let mut current = state.lock().expect("update state lock");
-        *current = UpdateState::Downloading(release.clone());
-        if let Some(ui) = weak.upgrade() {
-            apply_update_state(&ui, &current, true);
-        }
-    }
+    show_update_state(&weak, &state, true);
     let (service_mode, client) = {
         let model = model.lock().expect("view model lock");
         (model.service_mode(), model.daemon_client())
@@ -2151,26 +2148,214 @@ fn start_update_install(
         } else {
             updater::download_and_start_apply(&release)
         };
-        match result {
-            Ok(()) => {
-                let _ = slint::invoke_from_event_loop(move || {
-                    let _keep_state_alive = state;
-                    let _keep_window_alive = weak;
-                    let _ = slint::quit_event_loop();
-                });
+        finish_update_install(weak, state, release, result);
+    });
+}
+
+/// From a worker: the updater took over (quit so it can replace this client), or the install
+/// failed and the release stays offered with the reason.
+fn finish_update_install(
+    weak: slint::Weak<AppWindow>,
+    state: Arc<Mutex<UpdateState>>,
+    release: GitHubRelease,
+    result: Result<(), String>,
+) {
+    let _ = slint::invoke_from_event_loop(move || match result {
+        Ok(()) => {
+            let _keep_state_alive = state;
+            let _keep_window_alive = weak;
+            let _ = slint::quit_event_loop();
+        }
+        Err(error) => update_install_failed(&weak, &state, release, error),
+    });
+}
+
+fn update_install_failed(
+    weak: &slint::Weak<AppWindow>,
+    state: &Mutex<UpdateState>,
+    release: GitHubRelease,
+    error: String,
+) {
+    let mut current = state.lock().expect("update state lock");
+    // Keep the release so the home banner stays with the reason
+    // and a retry, instead of vanishing as a check error would.
+    *current = UpdateState::InstallFailed(release, error);
+    if let Some(ui) = weak.upgrade() {
+        apply_update_state(&ui, &current, true);
+    }
+}
+
+/// A downloaded and verified update, waiting for the tunnel to stop.
+struct ReadyUpdate {
+    release: GitHubRelease,
+    package: ReadyPackage,
+}
+
+enum ReadyPackage {
+    /// Per-user install: the verified package in the user's update directory.
+    Local(updater::StagedUpdate),
+    /// Service install: the service holds the verified release; `Update` hands it over.
+    Service,
+}
+
+/// How long a ready update waits for a running operation (connect, switch, reconciliation)
+/// before looking again, and how often it looks before giving up (about a minute).
+const READY_UPDATE_WAIT: Duration = Duration::from_millis(500);
+const MAX_READY_UPDATE_WAITS: u32 = 120;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadyUpdateStep {
+    Apply,
+    Disconnect,
+    WaitAgain,
+    GiveUp,
+}
+
+/// What a downloaded update does next. Idle → apply. Connected → disconnect, but only once:
+/// still connected after our disconnect (it failed, or the user connected again) means the
+/// update gives up and the user keeps the connection. Busy → wait, but not forever.
+fn ready_update_step(
+    plan: UpdateConfirmPlan,
+    disconnect_tried: bool,
+    waits: u32,
+) -> ReadyUpdateStep {
+    match plan {
+        UpdateConfirmPlan::InstallNow => ReadyUpdateStep::Apply,
+        _ if waits >= MAX_READY_UPDATE_WAITS => ReadyUpdateStep::GiveUp,
+        UpdateConfirmPlan::DisconnectFirst if disconnect_tried => ReadyUpdateStep::GiveUp,
+        UpdateConfirmPlan::DisconnectFirst => ReadyUpdateStep::Disconnect,
+        UpdateConfirmPlan::Wait => ReadyUpdateStep::WaitAgain,
+    }
+}
+
+/// Connected: download and verify first while the tunnel stays up (a service install has the
+/// service stage the release; a per-user install downloads into its update directory). Only a
+/// ready update goes on to stop the tunnel; a failed download leaves the connection alone.
+fn start_update_download_first(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    state: Arc<Mutex<UpdateState>>,
+) {
+    let Some(release) = begin_update_download(&state) else {
+        return;
+    };
+    show_update_state(&weak, &state, false);
+    let (service_mode, client) = {
+        let model = model.lock().expect("view model lock");
+        (model.service_mode(), model.daemon_client())
+    };
+    thread::spawn(move || {
+        let result = if update_through_service(service_mode) {
+            client
+                .stage_update_via_service(&release.version().to_string())
+                .map(|()| ReadyPackage::Service)
+                .map_err(|error| error.to_string())
+        } else {
+            updater::download_and_verify(&release).map(ReadyPackage::Local)
+        };
+        let _ = slint::invoke_from_event_loop(move || match result {
+            Ok(package) => {
+                let ready = ReadyUpdate { release, package };
+                continue_ready_update(weak, model, state, ready, false, 0);
             }
-            Err(error) => {
-                let _ = slint::invoke_from_event_loop(move || {
-                    let mut current = state.lock().expect("update state lock");
-                    // Keep the release so the home banner stays with the reason
-                    // and a retry, instead of vanishing as a check error would.
-                    *current = UpdateState::InstallFailed(release, error);
-                    if let Some(ui) = weak.upgrade() {
-                        apply_update_state(&ui, &current, true);
-                    }
-                });
+            Err(error) => update_install_failed(&weak, &state, release, error),
+        });
+    });
+}
+
+/// On the event loop: moves a ready update on by `ready_update_step`. Runs again after its
+/// own disconnect and after each wait, so a user who disconnected (or quit) meanwhile, a
+/// reconciliation, or a running switch are all taken as they are at that moment.
+fn continue_ready_update(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    state: Arc<Mutex<UpdateState>>,
+    ready: ReadyUpdate,
+    disconnect_tried: bool,
+    waits: u32,
+) {
+    let (step, action, client) = {
+        let mut model = model.lock().expect("view model lock");
+        let presentation = model.presentation();
+        let plan = match update_confirm_plan(&presentation) {
+            // Another operation (import, selection) holds the main button: wait for it.
+            UpdateConfirmPlan::DisconnectFirst if !presentation.primary_enabled => {
+                UpdateConfirmPlan::Wait
+            }
+            plan => plan,
+        };
+        let step = ready_update_step(plan, disconnect_tried, waits);
+        // Checked under the same lock, so begin_primary_action can only
+        // start the Disconnect/Cleanup the step was based on.
+        let action = match step {
+            ReadyUpdateStep::Disconnect => model.begin_primary_action(),
+            _ => None,
+        };
+        (step, action, model.daemon_client())
+    };
+    match (step, action) {
+        (ReadyUpdateStep::Apply, _) => apply_ready_update(weak, model, state, ready),
+        (
+            ReadyUpdateStep::Disconnect,
+            Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)),
+        ) => {
+            if let Some(ui) = weak.upgrade() {
+                apply_latest_snapshot(&ui, &model);
+            }
+            let (after_weak, after_model) = (weak.clone(), model.clone());
+            run_disconnect_for_update(
+                weak,
+                model,
+                client,
+                mutation,
+                Box::new(move || {
+                    continue_ready_update(after_weak, after_model, state, ready, true, 0);
+                }),
+            );
+        }
+        (ReadyUpdateStep::GiveUp, _) => {
+            update_install_failed(
+                &weak,
+                &state,
+                ready.release,
+                "Подключение не остановилось, обновление не установлено. Повторите установку."
+                    .into(),
+            );
+            let has_profile = model
+                .lock()
+                .expect("view model lock")
+                .presentation()
+                .has_profile;
+            if has_profile {
+                load_catalog(weak, model);
             }
         }
+        _ => {
+            Timer::single_shot(READY_UPDATE_WAIT, move || {
+                continue_ready_update(weak, model, state, ready, disconnect_tried, waits + 1);
+            });
+        }
+    }
+}
+
+/// The tunnel is down: hand the verified update over and quit for it.
+fn apply_ready_update(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    state: Arc<Mutex<UpdateState>>,
+    ready: ReadyUpdate,
+) {
+    let client = model.lock().expect("view model lock").daemon_client();
+    thread::spawn(move || {
+        let ReadyUpdate { release, package } = ready;
+        let result = match package {
+            ReadyPackage::Local(staged) => updater::start_apply(&release, &staged),
+            // The service re-checks the staged archive and installs it without downloading.
+            ReadyPackage::Service => client
+                .update_via_service(&release.version().to_string())
+                .map_err(|error| error.to_string()),
+        };
+        finish_update_install(weak, state, release, result);
     });
 }
 
@@ -4508,14 +4693,16 @@ fn run_disconnect(
     run_disconnect_with_update(weak, model, client, mutation, None);
 }
 
+/// Disconnects for a ready update; `after` runs on the event loop once the disconnect answered
+/// (a reconciliation it needs runs on as usual and is waited for by the update).
 fn run_disconnect_for_update(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
-    update_state: Arc<Mutex<UpdateState>>,
+    after: Box<dyn FnOnce() + Send>,
 ) {
-    run_disconnect_with_update(weak, model, client, mutation, Some(update_state));
+    run_disconnect_with_update(weak, model, client, mutation, Some(after));
 }
 
 fn run_disconnect_with_update(
@@ -4523,7 +4710,7 @@ fn run_disconnect_with_update(
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
-    update_state: Option<Arc<Mutex<UpdateState>>>,
+    after_update: Option<Box<dyn FnOnce() + Send>>,
 ) {
     thread::spawn(move || {
         let result = client.disconnect();
@@ -4534,36 +4721,30 @@ fn run_disconnect_with_update(
             let reconciliation = reconcile_status.then(|| model.begin_disconnect_reconciliation());
             (reconciliation, snapshot(&model))
         };
-        if update_state.is_some() {
-            apply_disconnect_snapshot_from_worker(
-                weak.clone(),
-                current,
-                model.clone(),
-                update_state.clone(),
-            );
+        if let Some(after) = after_update {
+            let (weak, model) = (weak.clone(), model.clone());
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_latest_snapshot(&ui, &model);
+                }
+                after();
+            });
         } else {
             // A disconnect clears the catalog revision: reload it, or (with the service's warm
             // cores) latency checks would never run again.
             apply_snapshot_from_worker(weak.clone(), current, model.clone(), disconnected, false);
         }
         if let Some(reconciliation) = reconciliation {
-            run_disconnect_reconciliation_with_update(
-                weak,
-                model,
-                client,
-                reconciliation,
-                update_state,
-            );
+            run_disconnect_reconciliation(weak, model, client, reconciliation);
         }
     });
 }
 
-fn run_disconnect_reconciliation_with_update(
+fn run_disconnect_reconciliation(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     client: Arc<dyn DaemonClient>,
     mutation: MutationToken,
-    update_state: Option<Arc<Mutex<UpdateState>>>,
 ) {
     thread::spawn(move || {
         let result = client.status();
@@ -4577,32 +4758,7 @@ fn run_disconnect_reconciliation_with_update(
         let Some(current) = current else {
             return;
         };
-        if update_state.is_some() {
-            apply_disconnect_snapshot_from_worker(weak, current, model, update_state);
-        } else {
-            apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
-        }
-    });
-}
-
-fn apply_disconnect_snapshot_from_worker(
-    weak: slint::Weak<AppWindow>,
-    current: UiSnapshot,
-    model: Arc<Mutex<DesktopViewModel>>,
-    update_state: Option<Arc<Mutex<UpdateState>>>,
-) {
-    let _ = slint::invoke_from_event_loop(move || {
-        let current = if let Some(ui) = weak.upgrade() {
-            apply_latest_snapshot(&ui, &model)
-        } else {
-            current
-        };
-        let runtime_idle = runtime_allows_update(&current.presentation);
-        if runtime_idle && let Some(update_state) = update_state {
-            start_update_install(weak, model, update_state);
-        } else if current.presentation.has_profile {
-            load_catalog(weak, model);
-        }
+        apply_snapshot_from_worker(weak, current, model, refresh_catalog, false);
     });
 }
 
@@ -5306,13 +5462,14 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
 mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode,
-        MAX_PENDING_SUBSCRIPTION_IMPORTS, PREFERENCE_RETRY_DELAYS, PREFERENCE_SAVE_ERROR_RU,
-        PendingImportOutcome, PendingSubscriptionConsents, PendingSubscriptionImports,
-        PersistenceTracker, PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler,
-        UpdateConfirmPlan, UpdateInstallIntent, WindowObservation, WriterCommand, WriterResult,
-        activation_for_launch_arguments, ambient_motion_allowed, delete_focus_plan,
-        drain_latest_write, initial_window_visible, next_maximized, parse_launch_arguments,
-        preference_error_for_result, preference_failure_is_terminal,
+        MAX_PENDING_SUBSCRIPTION_IMPORTS, MAX_READY_UPDATE_WAITS, PREFERENCE_RETRY_DELAYS,
+        PREFERENCE_SAVE_ERROR_RU, PendingImportOutcome, PendingSubscriptionConsents,
+        PendingSubscriptionImports, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
+        ProfilePreferenceReconciler, ReadyUpdateStep, UpdateConfirmPlan, UpdateInstallIntent,
+        WindowObservation, WriterCommand, WriterResult, activation_for_launch_arguments,
+        ambient_motion_allowed, begin_update_download, delete_focus_plan, drain_latest_write,
+        initial_window_visible, next_maximized, parse_launch_arguments,
+        preference_error_for_result, preference_failure_is_terminal, ready_update_step,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
         startup_should_connect, update_check_due, update_confirm_plan, update_install_intent,
@@ -6242,13 +6399,153 @@ mod window_tests {
             "update_through_service(service_mode)",
             "client\n                .update_via_service(",
             "updater::download_and_start_apply(&release)",
-            "UpdateState::InstallFailed(release, error)",
+            "begin_update_download(&state)",
         ] {
             assert!(
                 install.replace("\r\n", "\n").contains(required),
                 "missing: {required}"
             );
         }
+    }
+
+    #[test]
+    fn a_connected_update_downloads_before_anything_is_disconnected() {
+        let rust = include_str!("main.rs").replace("\r\n", "\n");
+        let body = |name: &str| {
+            rust.split(&format!("fn {name}("))
+                .nth(1)
+                .and_then(|source| source.split("\nfn ").next())
+                .unwrap_or_else(|| panic!("missing fn {name}"))
+                .to_owned()
+        };
+        // Confirming while connected only starts the download.
+        let confirm = rust
+            .split("ui.on_confirm_update_restart(move || {")
+            .nth(1)
+            .and_then(|source| source.split("fn update_check_due").next())
+            .expect("confirm handler");
+        assert!(confirm.contains("start_update_download_first("));
+        assert!(!confirm.contains("run_disconnect_for_update"));
+        assert!(!confirm.contains("begin_primary_action"));
+
+        // The download (service: stage only; per user: download and verify) runs first, with
+        // the tunnel up; only a ready update ever reaches the disconnect.
+        let download = body("start_update_download_first");
+        for required in [
+            "begin_update_download(&state)",
+            ".stage_update_via_service(",
+            "updater::download_and_verify(&release)",
+            "continue_ready_update(",
+            "update_install_failed(",
+        ] {
+            assert!(download.contains(required), "missing: {required}");
+        }
+        for forbidden in [
+            "run_disconnect",
+            "begin_primary_action",
+            "start_apply",
+            ".update_via_service(",
+        ] {
+            assert!(
+                !download.contains(forbidden),
+                "download must not {forbidden}"
+            );
+        }
+
+        let continuation = body("continue_ready_update");
+        let step = continuation
+            .find("ready_update_step(")
+            .expect("plan evaluated");
+        let begin = continuation
+            .find("model.begin_primary_action()")
+            .expect("disconnect start");
+        assert!(
+            step < begin,
+            "begin_primary_action must be guarded by the step"
+        );
+        assert_eq!(
+            continuation.matches("model.begin_primary_action()").count(),
+            1
+        );
+        assert!(continuation.contains("run_disconnect_for_update("));
+        assert!(continuation.contains(
+            "ReadyUpdateStep::Disconnect,\n            Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)),"
+        ));
+        assert!(continuation.contains("apply_ready_update("));
+
+        let apply = body("apply_ready_update");
+        assert!(apply.contains("updater::start_apply(&release, &staged)"));
+        assert!(apply.contains(".update_via_service("));
+        assert!(!apply.contains("download_and_verify"));
+        assert!(!apply.contains("stage_update_via_service"));
+    }
+
+    #[test]
+    fn a_ready_update_applies_when_idle_and_disconnects_only_once() {
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::InstallNow, false, 0),
+            ReadyUpdateStep::Apply
+        );
+        // The user disconnected by hand during the download: nothing left to stop.
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::InstallNow, true, 3),
+            ReadyUpdateStep::Apply
+        );
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::DisconnectFirst, false, 0),
+            ReadyUpdateStep::Disconnect
+        );
+        // Still connected after our disconnect (it failed, or the user connected again):
+        // stay connected and report it instead of fighting the user.
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::DisconnectFirst, true, 0),
+            ReadyUpdateStep::GiveUp
+        );
+        // Connecting, switching or reconciling: wait for it to settle, but not forever.
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::Wait, false, 0),
+            ReadyUpdateStep::WaitAgain
+        );
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::Wait, true, MAX_READY_UPDATE_WAITS - 1),
+            ReadyUpdateStep::WaitAgain
+        );
+        assert_eq!(
+            ready_update_step(UpdateConfirmPlan::Wait, false, MAX_READY_UPDATE_WAITS),
+            ReadyUpdateStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn a_second_confirm_never_starts_a_second_download() {
+        use crate::updater::UpdateState;
+        use multicore_release::GitHubRelease;
+        let release = GitHubRelease::parse(br#"{
+            "tag_name":"v9.0.0",
+            "html_url":"https://github.com/Fatyzzz/multi-core/releases/tag/v9.0.0",
+            "assets":[{
+                "name":"multicore-windows-x64.zip",
+                "browser_download_url":"https://github.com/Fatyzzz/multi-core/releases/download/v9.0.0/multicore-windows-x64.zip",
+                "size":1234,
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#)
+        .unwrap();
+        let state = Mutex::new(UpdateState::Available(release.clone()));
+        assert!(begin_update_download(&state).is_some());
+        assert!(matches!(
+            *state.lock().unwrap(),
+            UpdateState::Downloading(_)
+        ));
+        assert!(
+            begin_update_download(&state).is_none(),
+            "already downloading"
+        );
+        // A failed attempt can be retried.
+        *state.lock().unwrap() = UpdateState::InstallFailed(release, "x".into());
+        assert!(begin_update_download(&state).is_some());
+        *state.lock().unwrap() = UpdateState::Current;
+        assert!(begin_update_download(&state).is_none());
     }
 
     #[test]
@@ -6282,7 +6579,8 @@ mod window_tests {
             "in-out property <bool> update-confirm-open",
             "callback confirm-update-restart()",
             "callback cancel-update-restart()",
-            "Скачать обновление и перезапустить клиент?",
+            "Скачаем обновление, не отключая VPN.",
+            "Туннель остановится только после загрузки.",
             "label: \"Обновить и перезапустить\"",
             "label: \"Отмена\"",
             "update-modal-focus := FocusScope",
@@ -6894,25 +7192,11 @@ mod window_tests {
             UpdateConfirmPlan::Wait
         );
 
-        // A Retry/Connect primary action must never be started for an update:
-        // nothing completes it, which used to leave the main button dead.
+        // A Retry/Connect primary action must never be started for an update (nothing
+        // completes it, which used to leave the main button dead): the only
+        // begin_primary_action of the update flow is guarded by `ready_update_step`, see
+        // `a_connected_update_downloads_before_anything_is_disconnected`.
         let rust = include_str!("main.rs");
-        let confirm = rust
-            .split("ui.on_confirm_update_restart(move || {")
-            .nth(1)
-            .and_then(|source| source.split("fn update_check_due").next())
-            .expect("confirm handler");
-        let begin = confirm
-            .find("model.begin_primary_action()")
-            .expect("disconnect start");
-        let guard = confirm
-            .find("UpdateConfirmPlan::DisconnectFirst =>")
-            .expect("plan guard");
-        assert!(
-            guard < begin,
-            "begin_primary_action must be guarded by the plan"
-        );
-        assert_eq!(confirm.matches("model.begin_primary_action()").count(), 1);
 
         let ui = include_str!("../ui/app.slint");
         assert!(ui.contains("in property <bool> update-runtime-busy"));

@@ -6726,11 +6726,7 @@ mod tests {
         let worker = main
             .split("fn run_disconnect_with_update(")
             .nth(1)
-            .and_then(|source| {
-                source
-                    .split("fn run_disconnect_reconciliation_with_update(")
-                    .next()
-            })
+            .and_then(|source| source.split("fn run_disconnect_reconciliation(").next())
             .expect("disconnect worker source");
         assert!(worker.contains("let disconnected = result.is_ok();"));
         assert!(worker.contains("model.clone(), disconnected, false"));
@@ -8649,7 +8645,7 @@ mod tests {
             "callback paste-subscription();",
             "callback update-action();",
             "root.update-action();",
-            "Скачать обновление и перезапустить клиент?",
+            "Скачаем обновление, не отключая VPN.",
         ] {
             assert!(
                 source.contains(required),
