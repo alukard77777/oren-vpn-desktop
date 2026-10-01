@@ -221,4 +221,29 @@ mod tests {
             assert!(!argument.contains("cleandata"), "{argument}");
         }
     }
+
+    #[test]
+    fn the_service_offer_toast_follows_the_card_and_is_declined_for_good() {
+        let ui: String = include_str!("../ui/app.slint").split_whitespace().collect();
+        assert!(ui.contains(
+            "service-toast-visible:root.service-card-visible&&root.has-profile&&!root.service-offer-dismissed;"
+        ));
+        assert!(ui.contains("\"Мгновенноеподключение\""));
+        assert!(ui.contains("\"Установитеслужбу—VPNбудетвключатьсябеззапросаправ\""));
+        // «Установить» is the Settings card's own flow; «Не сейчас» is remembered.
+        assert!(ui.contains("label:root.service-install-busy?\"Загружаем…\":\"Установить\";"));
+        assert!(ui.contains("activated=>{root.install-service();}"));
+        assert!(ui.contains("label:\"Несейчас\";"));
+        assert!(ui.contains("activated=>{root.service-offer-dismissed=true;}"));
+        let main: String = include_str!("main.rs").split_whitespace().collect();
+        assert!(main.contains(
+            "ui.set_service_offer_dismissed(loaded_preferences.service_offer_dismissed);"
+        ));
+        assert_eq!(
+            main.matches("tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());")
+                .count(),
+            2,
+            "saved by the periodic writer and the final flush"
+        );
+    }
 }

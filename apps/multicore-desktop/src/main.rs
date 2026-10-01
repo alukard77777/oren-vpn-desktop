@@ -407,6 +407,10 @@ impl PersistenceTracker {
         self.desired.appimage_handoff_seen = (!appimage.is_empty()).then_some(appimage);
     }
 
+    fn set_service_offer_dismissed(&mut self, dismissed: bool) {
+        self.desired.service_offer_dismissed = dismissed;
+    }
+
     fn set_route_preferences(
         &mut self,
         profile: String,
@@ -887,6 +891,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             .unwrap_or_default()
             .into(),
     );
+    ui.set_service_offer_dismissed(loaded_preferences.service_offer_dismissed);
     ui.set_handoff_notice_seen(
         loaded_preferences
             .appimage_handoff_seen
@@ -1875,6 +1880,7 @@ fn flush_preferences(
         tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
         tracker.set_announcement_seen(ui.get_announcement_seen().into());
         tracker.set_appimage_handoff_seen(ui.get_handoff_notice_seen().into());
+        tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());
         tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
         tracker.set_tun_enabled(ui.get_tun_enabled());
         if let Some((profile, selected_group, selections)) = route_preferences {
@@ -1938,6 +1944,7 @@ fn wire_preference_persistence(
             tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
             tracker.set_announcement_seen(ui.get_announcement_seen().into());
             tracker.set_appimage_handoff_seen(ui.get_handoff_notice_seen().into());
+            tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());
             tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
             tracker.set_tun_enabled(ui.get_tun_enabled());
             if let Some((profile, selected_group, selections)) = route_preferences {

@@ -569,6 +569,31 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_update_action_enabled(true);
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
         }),
+        ("home-service-toast", 840, 720, |ui| {
+            ready(ui);
+            ui.set_service_card_visible(true);
+        }),
+        ("home-three-toasts", 840, 720, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+            ui.set_service_card_visible(true);
+            ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
+        }),
+        ("home-three-toasts-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+            ui.set_service_card_visible(true);
+            ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
+        }),
+        ("first-run-no-service-toast", 840, 720, |ui| {
+            ui.set_service_card_visible(true);
+        }),
         ("home-ready-wide", 1600, 900, ready),
         ("home-update-banner-wide", 1600, 900, |ui| {
             ready(ui);

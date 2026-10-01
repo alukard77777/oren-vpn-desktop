@@ -60,6 +60,10 @@ pub struct AppPreferences {
     /// preferences of everyone else stay readable by older versions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub appimage_handoff_seen: Option<String>,
+    /// Windows per-user install: the one-time "Мгновенное подключение" offer of the service
+    /// was declined («Не сейчас»). Written only once set, like `appimage_handoff_seen`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub service_offer_dismissed: bool,
 }
 
 /// Window growth from the expanded rail, in logical pixels.
@@ -88,6 +92,7 @@ impl Default for AppPreferences {
             tun_enabled: true,
             rail_growth: None,
             appimage_handoff_seen: None,
+            service_offer_dismissed: false,
         }
     }
 }
@@ -707,6 +712,7 @@ mod tests {
                 grown_width: 1016,
             }),
             appimage_handoff_seen: Some("/home/me/MultiCore.AppImage".into()),
+            service_offer_dismissed: true,
         };
 
         store.save(&expected).unwrap();
@@ -740,6 +746,7 @@ mod tests {
                 tun_enabled: true,
                 rail_growth: None,
                 appimage_handoff_seen: None,
+                service_offer_dismissed: false,
             }
         );
     }
@@ -748,6 +755,7 @@ mod tests {
     fn an_unset_hand_off_notice_is_not_written() {
         let raw = serde_json::to_string(&AppPreferences::default()).unwrap();
         assert!(!raw.contains("appimage_handoff_seen"));
+        assert!(!raw.contains("service_offer_dismissed"));
     }
 
     #[test]
