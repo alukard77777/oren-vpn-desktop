@@ -18,6 +18,10 @@ pub const SERVICE_DESCRIPTION: &str = "MULTICORE: ядра Mihomo и Xray для
 /// Inno Setup's uninstall entry for AppId {D95AB954-248C-44C9-9E3A-952398802A2D}.
 pub const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{D95AB954-248C-44C9-9E3A-952398802A2D}_is1";
 pub const SHORTCUT_FILE_NAME: &str = "MULTICORE.lnk";
+/// `HKLM\Software\Classes\multicore`, written by the service-mode installer.
+pub const PROTOCOL_KEY: &str = r"Software\Classes\multicore";
+pub const PROTOCOL_DESCRIPTION: &str = "URL:MULTICORE Protocol";
+const LEGACY_PROTOCOL_DESCRIPTION: &str = "URL:MultiCore Protocol";
 
 /// `<install>` for an executable's `<install>\current` folder; `None` for a portable copy.
 pub fn install_root_of_current(current: &Path) -> Option<&Path> {
@@ -78,6 +82,18 @@ pub fn service_updates(
         (display_name != Some(SERVICE_DISPLAY_NAME)).then_some(SERVICE_DISPLAY_NAME),
         (description != Some(SERVICE_DESCRIPTION)).then_some(SERVICE_DESCRIPTION),
     )
+}
+
+/// The `multicore://` handler's description to set: only the old one, and only when the
+/// handler (`"<exe>" "%1"`) starts this install.
+pub fn protocol_description_update(
+    description: Option<&str>,
+    command: Option<&str>,
+    install_root: &Path,
+) -> Option<&'static str> {
+    let executable = command?.strip_prefix('"')?.split('"').next()?;
+    (description == Some(LEGACY_PROTOCOL_DESCRIPTION) && path_is_within(executable, install_root))
+        .then_some(PROTOCOL_DESCRIPTION)
 }
 
 /// The shortcut in a folder listing still named in the old spelling (`MultiCore.lnk`), if any.
@@ -252,8 +268,9 @@ pub fn migrate_install(scope: Scope, install_root: &Path) -> Vec<String> {
 #[cfg(windows)]
 mod windows {
     use super::{
-        SHORTCUT_FILE_NAME, Scope, UNINSTALL_KEY, legacy_shortcut_name, parse_shell_link,
-        shell_link_points_into, uninstall_entry_updates,
+        PROTOCOL_KEY, SHORTCUT_FILE_NAME, Scope, UNINSTALL_KEY, legacy_shortcut_name,
+        parse_shell_link, protocol_description_update, shell_link_points_into,
+        uninstall_entry_updates,
     };
     use std::{
         ffi::{OsString, c_void},
@@ -303,7 +320,11 @@ mod windows {
             Scope::Machine => HKEY_LOCAL_MACHINE,
             Scope::User => HKEY_CURRENT_USER,
         };
-        let subkey = wide(UNINSTALL_KEY);
+        open_key(root, UNINSTALL_KEY)
+    }
+
+    fn open_key(root: HKEY, subkey: &str) -> io::Result<Option<Key>> {
+        let subkey = wide(subkey);
         let mut key: HKEY = null_mut();
         let status = unsafe {
             RegOpenKeyExW(
@@ -461,9 +482,35 @@ mod windows {
         }
     }
 
+    /// The machine-wide handler the installer wrote; the app rewrites the per-user one itself.
+    fn migrate_protocol(install_root: &Path, log: &mut Vec<String>) {
+        let Ok(Some(key)) = open_key(HKEY_LOCAL_MACHINE, PROTOCOL_KEY) else {
+            return;
+        };
+        let command = open_key(
+            HKEY_LOCAL_MACHINE,
+            &format!(r"{PROTOCOL_KEY}\shell\open\command"),
+        )
+        .ok()
+        .flatten()
+        .and_then(|command| read_value(&command, ""));
+        let description = read_value(&key, "");
+        if let Some(value) =
+            protocol_description_update(description.as_deref(), command.as_deref(), install_root)
+        {
+            match write_value(&key, "", value) {
+                Ok(()) => log.push(format!("URL protocol description set to {value}")),
+                Err(error) => log.push(format!("URL protocol description not set: {error}")),
+            }
+        }
+    }
+
     pub(super) fn migrate_install(scope: Scope, install_root: &Path) -> Vec<String> {
         let mut log = Vec::new();
         migrate_entry(scope, install_root, &mut log);
+        if scope == Scope::Machine {
+            migrate_protocol(install_root, &mut log);
+        }
         let folders = match scope {
             Scope::Machine => [&FOLDERID_CommonPrograms, &FOLDERID_PublicDesktop],
             Scope::User => [&FOLDERID_Programs, &FOLDERID_Desktop],
@@ -486,6 +533,8 @@ mod tests {
         PathBuf::from(ROOT)
     }
 
+    // Windows paths: `\` separates components only there.
+    #[cfg(windows)]
     #[test]
     fn install_root_is_the_parent_of_current_only() {
         assert_eq!(
@@ -603,6 +652,30 @@ mod tests {
         assert_eq!(
             service_updates(Some(SERVICE_DISPLAY_NAME), Some(SERVICE_DESCRIPTION)),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn the_protocol_description_of_this_install_is_renamed() {
+        let command = r#""C:\Program Files\MultiCore\current\MultiCore.exe" "%1""#;
+        let legacy = Some("URL:MultiCore Protocol");
+        assert_eq!(
+            protocol_description_update(legacy, Some(command), &root()),
+            Some(PROTOCOL_DESCRIPTION)
+        );
+        assert_eq!(
+            protocol_description_update(Some(PROTOCOL_DESCRIPTION), Some(command), &root()),
+            None
+        );
+        let foreign = r#""D:\Other\MultiCore.exe" "%1""#;
+        assert_eq!(
+            protocol_description_update(legacy, Some(foreign), &root()),
+            None
+        );
+        assert_eq!(protocol_description_update(legacy, None, &root()), None);
+        assert_eq!(
+            protocol_description_update(legacy, Some("unquoted.exe %1"), &root()),
+            None
         );
     }
 
@@ -758,6 +831,7 @@ mod tests {
         assert!(installer.contains(&format!("#define AppPublisher \"{PRODUCT_NAME}\"")));
         assert!(installer.contains(&format!("DisplayName= \"{SERVICE_DISPLAY_NAME}\"")));
         assert!(installer.contains(&format!("\"{SERVICE_DESCRIPTION}\"")));
+        assert!(installer.contains(&format!("ValueData: \"{PROTOCOL_DESCRIPTION}\"")));
         assert!(installer.contains("AppId={{D95AB954-248C-44C9-9E3A-952398802A2D}"));
         assert!(UNINSTALL_KEY.ends_with(r"\{D95AB954-248C-44C9-9E3A-952398802A2D}_is1"));
         assert!(installer.contains(r#"Name: "{autoprograms}\MULTICORE"; "#));
