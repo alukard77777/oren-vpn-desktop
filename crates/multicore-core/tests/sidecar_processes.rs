@@ -646,6 +646,14 @@ async fn service_mihomo_without_ports_is_ready_once_its_controller_listens() {
     assert!(service.current_ready(Engine::Mihomo).await);
     assert_eq!(service.tun_check().await, RuntimeCheckState::Disabled);
     drop(controller);
+    // Not the dropped port: parallel tests (or the kernel's ephemeral source ports) can take it
+    // over at once and answer the probe. Port 1 is privileged and outside the ephemeral range,
+    // so nothing in a test run listens there.
+    std::fs::write(
+        root.path().join("mihomo.yaml"),
+        "external-controller: 127.0.0.1:1\nbind-address: 127.0.0.1\ntun:\n  enable: false\n  device: MultiCore\n",
+    )
+    .unwrap();
     assert!(!service.current_ready(Engine::Mihomo).await);
 }
 
