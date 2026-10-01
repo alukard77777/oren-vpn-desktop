@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=MultiCore
+Name=MULTICORE
 GenericName=Network client
 Comment=Mihomo routing with Xray transports
 Exec=multicore %u

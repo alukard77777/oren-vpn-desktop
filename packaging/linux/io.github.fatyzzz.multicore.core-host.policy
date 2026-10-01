@@ -2,12 +2,12 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
   "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <vendor>MultiCore</vendor>
+  <vendor>MULTICORE</vendor>
   <action id="io.github.fatyzzz.multicore.core-host">
-    <description>Start the MultiCore network cores</description>
-    <description xml:lang="ru">Запуск сетевых ядер MultiCore</description>
-    <message>MultiCore needs administrator access to create the VPN network interface</message>
-    <message xml:lang="ru">MultiCore нужны права администратора, чтобы создать сетевой интерфейс VPN</message>
+    <description>Start the MULTICORE network cores</description>
+    <description xml:lang="ru">Запуск сетевых ядер MULTICORE</description>
+    <message>MULTICORE needs administrator access to create the VPN network interface</message>
+    <message xml:lang="ru">MULTICORE нужны права администратора, чтобы создать сетевой интерфейс VPN</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>

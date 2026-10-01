@@ -1,4 +1,4 @@
-# MultiCore Windows x86 (32-bit) portable preview
+# MULTICORE Windows x86 (32-bit) portable preview
 
 This file is copied into packages by `scripts/package-windows-release.ps1`.
 Keep the generated directory intact and start `MultiCore.exe`.

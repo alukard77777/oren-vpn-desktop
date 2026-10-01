@@ -1032,7 +1032,7 @@ component QuotaLogo inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    title: "MultiCore";
+    title: "MULTICORE";
     icon: @image-url("../assets/app-icon.svg");
     no-frame: true;
     preferred-width: 840px;
@@ -1171,7 +1171,7 @@ export component AppWindow inherits Window {
     in-out property <bool> shell-active: true;
     in property <bool> reduced-motion: false;
     in property <string> system-name: "Windows";
-    in property <string> runtime-versions: "MultiCore";
+    in property <string> runtime-versions: "MULTICORE";
     // Ambient waves drift ~3px/s, so ten steps a second look continuous and cost a
     // sixth of the redraws a per-frame property animation would.
     private property <int> ambient-wave-step: 0;
@@ -1185,7 +1185,7 @@ export component AppWindow inherits Window {
     private property <int> first-run-trigger-focus-serial: 0;
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
-    in property <string> update-status: "MultiCore 0.3.0";
+    in property <string> update-status: "MULTICORE 0.3.0";
     in property <string> update-detail: "Канал обновлений не настроен";
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
@@ -1637,7 +1637,7 @@ export component AppWindow inherits Window {
                         y: -root.title-lift;
                         width: 112px;
                         height: parent.height;
-                        text: "MultiCore";
+                        text: "MULTICORE";
                         color: Theme.text-primary;
                         font-family: Theme.font-family;
                         font-size: Theme.type-label-size;
@@ -1973,7 +1973,7 @@ export component AppWindow inherits Window {
 
                 TitleBarButton { x: parent.width - 132px; y: -root.resize-border; height: 44px + root.resize-border; kind: "minimize"; state-label: "Свернуть окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
                 TitleBarButton { x: parent.width - 88px; y: -root.resize-border; height: 44px + root.resize-border; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
-                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: "Закрыть MultiCore"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
+                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: "Закрыть MULTICORE"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
             }
 
             HorizontalLayout {
@@ -4212,7 +4212,7 @@ export component AppWindow inherits Window {
                         alignment: center;
                         spacing: 2px;
                         handoff-toast-title := Text { text: "Открыта установленная версия"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
-                        handoff-toast-copy := Text { text: "AppImage можно удалить — используется MultiCore из системы"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                        handoff-toast-copy := Text { text: "AppImage можно удалить — используется MULTICORE из системы"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                     }
                     VerticalLayout {
                         alignment: center;
@@ -4717,7 +4717,7 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 Text {
                     height: 26px;
-                    text: "Обновить MultiCore?";
+                    text: "Обновить MULTICORE?";
                     color: Theme.text-primary;
                     font-family: Theme.font-family;
                     font-size: Theme.type-label-size;

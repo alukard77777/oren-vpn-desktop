@@ -328,7 +328,7 @@ def run_session(evidence):
             return (desktops[0], daemons[0]) if len(desktops) == len(daemons) == 1 else None
 
         def find_window(desktop):
-            matches = command(["xdotool", "search", "--onlyvisible", "--name", "^MultiCore$"], required=False)
+            matches = command(["xdotool", "search", "--onlyvisible", "--name", "^MULTICORE$"], required=False)
             for value in matches.stdout.split():
                 owner = command(["xdotool", "getwindowpid", value], required=False)
                 if owner.returncode == 0 and owner.stdout.strip() == str(desktop[0]):

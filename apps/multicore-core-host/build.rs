@@ -26,7 +26,7 @@ fn main() {
     );
     resource_source.push_str(&windows_version_info(
         &version,
-        "MultiCore — служба ядер",
+        "MULTICORE — служба ядер",
         "multicore-core-host.exe",
     ));
     std::fs::write(&resource_path, resource_source)

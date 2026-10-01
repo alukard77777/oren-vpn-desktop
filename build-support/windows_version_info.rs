@@ -51,13 +51,13 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName", "MultiCore"
+      VALUE "CompanyName", "MULTICORE"
       VALUE "FileDescription", "{description}"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "{internal_name}"
-      VALUE "LegalCopyright", "© 2026 MultiCore contributors"
+      VALUE "LegalCopyright", "© 2026 MULTICORE contributors"
       VALUE "OriginalFilename", "{original_filename}"
-      VALUE "ProductName", "MultiCore"
+      VALUE "ProductName", "MULTICORE"
       VALUE "ProductVersion", "{version}"
     END
   END

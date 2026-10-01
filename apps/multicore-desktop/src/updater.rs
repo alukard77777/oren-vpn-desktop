@@ -67,7 +67,7 @@ impl UpdateState {
     ) -> UpdatePresentation {
         match self {
             Self::Unconfigured => UpdatePresentation {
-                status: format!("MultiCore {}", env!("CARGO_PKG_VERSION")),
+                status: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
                 detail: "Канал обновлений задаётся при сборке".into(),
                 action_label: String::new(),
                 action: UpdateAction::None,
@@ -86,7 +86,7 @@ impl UpdateState {
             },
             Self::Current => UpdatePresentation {
                 status: "Установлена актуальная версия".into(),
-                detail: format!("MultiCore {}", env!("CARGO_PKG_VERSION")),
+                detail: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
                 action_label: "Проверить".into(),
                 action: UpdateAction::Check,
                 action_enabled: true,
@@ -178,7 +178,7 @@ pub(crate) fn check_latest() -> Result<UpdateState, String> {
     let release = GitHubRelease::parse_for_repository(&repository, &body);
     #[cfg(target_os = "linux")]
     let release = GitHubRelease::parse_appimage_for_repository(&repository, &body);
-    let release = release.map_err(|_| "Релиз не соответствует контракту MultiCore".to_owned())?;
+    let release = release.map_err(|_| "Релиз не соответствует контракту MULTICORE".to_owned())?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|_| "Версия клиента собрана неверно".to_owned())?;
     Ok(match release.decision(&current) {
@@ -310,7 +310,7 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
 #[cfg(target_os = "linux")]
 fn appimage_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let LinuxInstall::AppImage(image) = linux_install() else {
-        return Err("Обновите MultiCore через менеджер пакетов".into());
+        return Err("Обновите MULTICORE через менеджер пакетов".into());
     };
     let directory = image
         .parent()
@@ -370,7 +370,7 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|_| "Не удалось перезапустить MultiCore".to_owned())?;
+        .map_err(|_| "Не удалось перезапустить MULTICORE".to_owned())?;
     Ok(())
 }
 
@@ -409,10 +409,10 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
     staged.reverify(release)?;
     let update_dir = update_directory()?;
     let current_exe =
-        std::env::current_exe().map_err(|_| "Не удалось определить путь MultiCore".to_owned())?;
+        std::env::current_exe().map_err(|_| "Не удалось определить путь MULTICORE".to_owned())?;
     let target = current_exe
         .parent()
-        .ok_or_else(|| "Некорректный путь MultiCore".to_owned())?
+        .ok_or_else(|| "Некорректный путь MULTICORE".to_owned())?
         .to_path_buf();
     let helper_source = target.join("runtime").join("multicore-updater.exe");
     if !helper_source.is_file() {
@@ -626,7 +626,7 @@ pub(crate) fn download_release_to(
 pub(crate) fn update_directory() -> Result<PathBuf, String> {
     multicore_platform::dirs::user_data_root()
         .map(|root| root.join("updates"))
-        .map_err(|_| "Каталог данных MultiCore недоступен".to_owned())
+        .map_err(|_| "Каталог данных MULTICORE недоступен".to_owned())
 }
 
 /// Marker the Windows updater waits for before discarding the previous version.

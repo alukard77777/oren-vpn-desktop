@@ -70,7 +70,7 @@ foreach ($token in @(
     'Result := (not Is64BitInstallMode) and IsWin64;',
     'if RegKeyExists(HKLM64, UninstallKey) then',
     '(Pos(''"platform": "windows-x64"'', Manifest) > 0)',
-    'уже установлен 64-битный MultiCore',
+    'уже установлен 64-битный MULTICORE',
     # x64 over an x86 install on 64-bit Windows: migrate it, keeping the user's data.
     'function X86ServiceUninstaller: String;',
     "RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', X86Uninstaller)",
@@ -84,7 +84,7 @@ foreach ($token in @(
     "while (X86PerUserCopyPresent or FileExists(PerUserInstallDir + '\unins000.exe')) and",
     "if WizardIsTaskSelected('autostart') or MoveAutostartFromServiceInstall then",
     "ShellExec('', ServiceUninstaller, '/SILENT /SUPPRESSMSGBOXES /NORESTART'",
-    'MultiCore уже установлен со службой',
+    'MULTICORE уже установлен со службой',
     'Result := RemoveServiceInstall;',
     'MoveAutostartFromServiceInstall',
     # The uninstaller touches the service only for the service install itself.
@@ -93,7 +93,22 @@ foreach ($token in @(
     'ReparsePointAttribute = $400;',
     '(FindRec.Attributes and ReparsePointAttribute) <> 0',
     # A failed registration is reported, not swallowed.
-    'if Registered <> 0 then'
+    'if Registered <> 0 then',
+    # The product name is MULTICORE wherever it is seen; the service NAME stays MultiCore.
+    '#define AppName "MULTICORE"',
+    '#define AppPublisher "MULTICORE"',
+    "ServiceName = 'MultiCore';",
+    "'create ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE""'",
+    # An upgraded service (registered by 1.1.1 as "MultiCore") gets the new display name too.
+    "'config ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE""'",
+    "' ""MULTICORE: ядра Mihomo и Xray для мгновенного подключения""'",
+    # Launch at sign-in keeps its value name, so an upgrade never adds a second entry.
+    'ValueName: "MultiCore"; ValueData: """{app}\current\MultiCore.exe"" --background"',
+    # NTFS keeps the old casing on overwrite: 1.1.1's MultiCore.lnk shortcuts are deleted first.
+    '[InstallDelete]',
+    'Type: files; Name: "{autoprograms}\MultiCore.lnk"',
+    'Type: files; Name: "{autodesktop}\MultiCore.lnk"; Tasks: desktopicon',
+    'Name: "{autodesktop}\MULTICORE"; Filename: "{app}\current\MultiCore.exe"'
 )) {
     Assert-Contains $token
 }

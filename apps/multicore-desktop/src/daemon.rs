@@ -643,13 +643,13 @@ pub trait DaemonClient: Send + Sync {
     /// POST /v1/service/update: the always-ready service downloads and installs `version`
     /// (reusing a release staged by `stage_update_via_service`).
     fn update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
-        Err(DaemonError::new("Служба MultiCore недоступна."))
+        Err(DaemonError::new("Служба MULTICORE недоступна."))
     }
 
     /// POST /v1/service/update/stage: the service only downloads and verifies `version`; the
     /// tunnel keeps running.
     fn stage_update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
-        Err(DaemonError::new("Служба MultiCore недоступна."))
+        Err(DaemonError::new("Служба MULTICORE недоступна."))
     }
 
     /// GET /v1/catalog. IDs are opaque daemon values; labels are presentation data.
@@ -1103,7 +1103,7 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         }
         "subscription_http_status" => "Сервер подписки ответил ошибкой.",
         "subscription_not_multicore" => {
-            "По ссылке пришла веб-страница или список ссылок, а не подписка MultiCore. Скопируйте ссылку подписки для приложения у провайдера."
+            "По ссылке пришла веб-страница или список ссылок, а не подписка MULTICORE. Скопируйте ссылку подписки для приложения у провайдера."
         }
         "subscription_invalid" => {
             "Провайдер прислал повреждённую или неподдерживаемую конфигурацию."
@@ -1117,9 +1117,9 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         }
         "not_connected" => "Подключитесь, чтобы открыть панель Mihomo.",
         "dashboard_unavailable" => "Панель Mihomo недоступна в этой сборке.",
-        "service_busy" => "MultiCore уже запущен у другого пользователя.",
+        "service_busy" => "MULTICORE уже запущен у другого пользователя.",
         "service_update_failed" => "Служба не смогла загрузить или проверить обновление.",
-        "service_unavailable" => "Служба MultiCore недоступна.",
+        "service_unavailable" => "Служба MULTICORE недоступна.",
         _ => return None,
     })
 }
@@ -1619,7 +1619,7 @@ mod http_tests {
             (
                 "409 Conflict",
                 r#"{"code":"service_busy","message":"x"}"#,
-                Some("MultiCore уже запущен у другого пользователя."),
+                Some("MULTICORE уже запущен у другого пользователя."),
             ),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind update server");

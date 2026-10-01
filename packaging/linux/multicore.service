@@ -1,5 +1,5 @@
 [Unit]
-Description=MultiCore always-ready cores service
+Description=MULTICORE always-ready cores service
 Documentation=https://github.com/fatyzzz/multicore
 After=network-online.target
 Wants=network-online.target

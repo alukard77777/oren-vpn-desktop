@@ -254,7 +254,7 @@ mod tests {
     fn the_hand_off_toast_has_the_agreed_copy_and_is_dismissed_per_appimage() {
         let ui: String = include_str!("../ui/app.slint").split_whitespace().collect();
         assert!(ui.contains("\"Открытаустановленнаяверсия\""));
-        assert!(ui.contains("\"AppImageможноудалить—используетсяMultiCoreизсистемы\""));
+        assert!(ui.contains("\"AppImageможноудалить—используетсяMULTICOREизсистемы\""));
         assert!(ui.contains("label:\"Понятно\";"));
         assert!(ui.contains("root.handoff-notice-seen=root.handoff-notice-for;"));
         assert!(ui.contains(

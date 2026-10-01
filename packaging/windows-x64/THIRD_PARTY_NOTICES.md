@@ -1,7 +1,7 @@
 # Third-party notices
 
 This local preview contains executable builds from two independent upstream
-projects. MultiCore does not claim ownership of either project or its marks.
+projects. MULTICORE does not claim ownership of either project or its marks.
 
 ## Xray-core
 

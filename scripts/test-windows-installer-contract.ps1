@@ -22,7 +22,7 @@ $builder = Get-Content -Raw -LiteralPath $BuilderPath
 $installedUpdateSmoke = Get-Content -Raw -LiteralPath $InstalledUpdateSmokePath
 & (Join-Path $PSScriptRoot 'test-installer-shortcut-state.ps1')
 
-Assert-True ($definition.Contains('Name: "{autoprograms}\MultiCore"; Filename: "{app}\current\MultiCore.exe"; WorkingDir: "{app}\current"')) `
+Assert-True ($definition.Contains('Name: "{autoprograms}\MULTICORE"; Filename: "{app}\current\MultiCore.exe"; WorkingDir: "{app}\current"')) `
     'installer must always create a searchable per-user Start menu shortcut'
 Assert-True ($installedUpdateSmoke.Contains('Restore-InstallerShortcutState $shortcutSnapshots $ownedShortcutTargets')) `
     'installed-update smoke must restore user shortcuts after disposable uninstall'

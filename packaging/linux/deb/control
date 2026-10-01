@@ -1,11 +1,11 @@
 Package: multicore
 Version: @VERSION@
 Architecture: amd64
-Maintainer: MultiCore <noreply@multicore.invalid>
+Maintainer: MULTICORE <noreply@multicore.invalid>
 Section: net
 Priority: optional
 Depends: libgtk-3-0, libayatana-appindicator3-1 | libappindicator3-1, pkexec | policykit-1, libxkbcommon0, libfontconfig1, libgl1, iproute2
 Recommends: gnome-shell-extension-appindicator
 Description: Native network client combining Mihomo routing with Xray transports
- MultiCore starts Mihomo and Xray behind one desktop interface. Mihomo owns
+ MULTICORE starts Mihomo and Xray behind one desktop interface. Mihomo owns
  TUN, DNS, rules, and selectors; Xray provides the outbound transports.

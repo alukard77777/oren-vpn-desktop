@@ -254,7 +254,7 @@ mod native {
     }
 
     fn tooltip(model: &TrayMenuModel) -> String {
-        let value = format!("MultiCore — {}", model.status);
+        let value = format!("MULTICORE — {}", model.status);
         value.chars().take(120).collect()
     }
 }
@@ -524,11 +524,11 @@ fn native_label(icon: &str, label: &str, detail: &str) -> String {
 #[cfg(not(windows))]
 pub(crate) fn native_menu_plan(model: &TrayMenuModel) -> Vec<NativeMenuItem> {
     let mut items = vec![
-        NativeMenuItem::Label(native_label("", "MultiCore", &model.status)),
+        NativeMenuItem::Label(native_label("", "MULTICORE", &model.status)),
         NativeMenuItem::Separator,
         NativeMenuItem::Action {
             id: "show".into(),
-            label: "Открыть MultiCore".into(),
+            label: "Открыть MULTICORE".into(),
             enabled: true,
             command: TrayCommand::ShowWindow,
         },
@@ -701,7 +701,7 @@ mod native_menu_tests {
     #[test]
     fn plan_orders_status_actions_routes_and_exit() {
         let plan = native_menu_plan(&build_menu_model(input(true, true)));
-        assert_eq!(plan[0], NativeMenuItem::Label("MultiCore · В сети".into()));
+        assert_eq!(plan[0], NativeMenuItem::Label("MULTICORE · В сети".into()));
         assert_eq!(plan[1], NativeMenuItem::Separator);
         assert!(matches!(
             &plan[2],
@@ -1056,7 +1056,7 @@ mod linux {
             STATUS_ICON_SIZE * 4,
         );
         let icon = StatusIcon::new(&pixbuf);
-        icon.set_title("MultiCore");
+        icon.set_title("MULTICORE");
         icon.set_tooltip(&tooltip(model));
         icon.set_visible(true);
         icon.connect_click("activate", shared.clone());
@@ -1094,7 +1094,7 @@ mod linux {
             .map_err(|error| format!("invalid tray icon: {error}"))?;
         TrayIconBuilder::new()
             .with_id("multicore-main")
-            .with_title("MultiCore")
+            .with_title("MULTICORE")
             .with_tooltip(tooltip(model))
             .with_icon(icon)
             .with_menu(Box::new(build_menu(model, shared)?))
@@ -1194,7 +1194,7 @@ mod linux {
     }
 
     fn tooltip(model: &TrayMenuModel) -> String {
-        let value = format!("MultiCore — {}", model.status);
+        let value = format!("MULTICORE — {}", model.status);
         value.chars().take(120).collect()
     }
 

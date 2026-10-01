@@ -39,7 +39,7 @@ Requires(preun): systemd
 Requires(postun): systemd
 
 %description
-MultiCore starts Mihomo and Xray behind one desktop interface. Mihomo owns
+MULTICORE starts Mihomo and Xray behind one desktop interface. Mihomo owns
 TUN, DNS, rules, and selectors; Xray provides the outbound transports.
 
 %prep

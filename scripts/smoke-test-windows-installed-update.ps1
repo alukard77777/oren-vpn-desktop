@@ -208,8 +208,8 @@ $localAppDataSiblingCanary = Join-Path $testRoot 'local-app-data-sibling-canary.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $protocolKey = 'HKCU:\Software\Classes\multicore'
 . (Join-Path $PSScriptRoot 'installer-shortcut-state.ps1')
-$startMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'MultiCore.lnk'
-$desktopShortcut = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'MultiCore.lnk'
+$startMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'MULTICORE.lnk'
+$desktopShortcut = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'MULTICORE.lnk'
 $shortcutSnapshots = @(Save-InstallerShortcutState @($startMenuShortcut, $desktopShortcut))
 $ownedShortcutTargets = @(
     (Join-Path $installRoot 'current\MultiCore.exe'),

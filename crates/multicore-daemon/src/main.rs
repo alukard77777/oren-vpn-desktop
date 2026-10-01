@@ -37,7 +37,7 @@ type Controller = ModeController<
 type Session = ServiceSession<ProductionServiceConnector>;
 
 const SERVICE_UNAVAILABLE_NOTICE: &str =
-    "Служба MultiCore недоступна — права администратора будут запрошены при подключении.";
+    "Служба MULTICORE недоступна — права администратора будут запрошены при подключении.";
 /// How often the watcher looks at the service: also the upper bound for noticing that a
 /// connection carried by the service is gone.
 const WATCH_INTERVAL: Duration = Duration::from_secs(3);

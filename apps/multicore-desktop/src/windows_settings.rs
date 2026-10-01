@@ -228,7 +228,7 @@ mod autostart {
 
     pub(super) fn desktop_entry(command: &str) -> String {
         format!(
-            "[Desktop Entry]\nType=Application\nName=MultiCore\nComment=MultiCore network client\nExec={command}\nIcon=multicore\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+            "[Desktop Entry]\nType=Application\nName=MULTICORE\nComment=MULTICORE network client\nExec={command}\nIcon=multicore\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
         )
     }
 
@@ -438,7 +438,7 @@ mod registry {
         executable: &std::path::Path,
         command: &str,
     ) -> io::Result<()> {
-        write_string_value(PROTOCOL_KEY, "", "URL:MultiCore Protocol")?;
+        write_string_value(PROTOCOL_KEY, "", "URL:MULTICORE Protocol")?;
         write_string_value(PROTOCOL_KEY, "URL Protocol", "")?;
         write_string_value(
             &format!("{PROTOCOL_KEY}\\DefaultIcon"),
@@ -632,7 +632,7 @@ mod linux_tests {
         let entry = desktop_entry(command);
         assert!(entry.starts_with("[Desktop Entry]\n"));
         assert!(entry.contains("\nType=Application\n"));
-        assert!(entry.contains("\nName=MultiCore\n"));
+        assert!(entry.contains("\nName=MULTICORE\n"));
         assert_eq!(exec_from_desktop_entry(&entry).as_deref(), Some(command));
     }
 

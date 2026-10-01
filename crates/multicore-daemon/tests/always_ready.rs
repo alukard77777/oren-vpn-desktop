@@ -23,7 +23,7 @@ pub const PROFILE_A: &str = "proxies:\n  - {name: node-a, type: socks5}\nproxy-g
 pub const PROFILE_B: &str = "proxies:\n  - {name: node-b, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-b]}\n";
 const WARM_UP_FAILED: &str = "Ядра не удалось запустить заранее. Они запустятся при подключении.";
 const CORES_LOST: &str =
-    "Служба MultiCore потеряла ядра — подключение разорвано. Подключитесь снова.";
+    "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова.";
 const PROMPT: Duration = Duration::from_secs(2);
 
 pub struct NeverHttp;
@@ -380,11 +380,11 @@ async fn a_failing_warm_up_is_reported_once() {
 async fn a_notice_reaches_status_and_events() {
     let h = harness(&[PROFILE_A]);
     h.backend
-        .record_notice("service_unavailable", "Служба MultiCore недоступна.")
+        .record_notice("service_unavailable", "Служба MULTICORE недоступна.")
         .await;
     assert_eq!(
         h.backend.status().await.unwrap().message.as_deref(),
-        Some("Служба MultiCore недоступна.")
+        Some("Служба MULTICORE недоступна.")
     );
     assert!(
         h.backend
@@ -392,7 +392,7 @@ async fn a_notice_reaches_status_and_events() {
             .await
             .unwrap()
             .iter()
-            .any(|event| event.message == "Служба MultiCore недоступна.")
+            .any(|event| event.message == "Служба MULTICORE недоступна.")
     );
 }
 
@@ -874,14 +874,14 @@ async fn a_new_connection_is_checked_by_the_watcher_at_once() {
 async fn the_unavailable_notice_is_cleared_once_the_service_is_back() {
     let h = harness(&[PROFILE_A]);
     h.backend
-        .record_notice("service_unavailable", "Служба MultiCore недоступна.")
+        .record_notice("service_unavailable", "Служба MULTICORE недоступна.")
         .await;
     h.backend.clear_notice("другое сообщение").await;
     assert_eq!(
         h.backend.status().await.unwrap().message.as_deref(),
-        Some("Служба MultiCore недоступна.")
+        Some("Служба MULTICORE недоступна.")
     );
-    h.backend.clear_notice("Служба MultiCore недоступна.").await;
+    h.backend.clear_notice("Служба MULTICORE недоступна.").await;
     assert_eq!(h.backend.status().await.unwrap().message, None);
 }
 

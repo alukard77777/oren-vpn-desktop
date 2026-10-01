@@ -76,20 +76,20 @@ fn every_executable_embeds_a_version_resource_with_a_task_manager_description() 
         assert!(VERSION_INFO_SOURCE.contains(&format!("VALUE \"{field}\"")));
     }
     for (script, description, file) in [
-        (DESKTOP_BUILD_SCRIPT, "\"MultiCore\"", "MultiCore.exe"),
+        (DESKTOP_BUILD_SCRIPT, "\"MULTICORE\"", "MultiCore.exe"),
         (
             DAEMON_BUILD_SCRIPT,
-            "\"MultiCore — фоновый процесс\"",
+            "\"MULTICORE — фоновый процесс\"",
             "multicore-daemon.exe",
         ),
         (
             CORE_HOST_BUILD_SCRIPT,
-            "\"MultiCore — служба ядер\"",
+            "\"MULTICORE — служба ядер\"",
             "multicore-core-host.exe",
         ),
         (
             UPDATER_BUILD_SCRIPT,
-            "\"MultiCore — обновление\"",
+            "\"MULTICORE — обновление\"",
             "multicore-apply.exe",
         ),
     ] {

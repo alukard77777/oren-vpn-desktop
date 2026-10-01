@@ -21,7 +21,7 @@ fn main() {
     );
     resource_source.push_str(&windows_version_info(
         &multicore_app_version(&manifest_dir),
-        "MultiCore — фоновый процесс",
+        "MULTICORE — фоновый процесс",
         "multicore-daemon.exe",
     ));
     std::fs::write(&resource_path, resource_source)

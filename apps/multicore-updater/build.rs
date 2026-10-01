@@ -24,7 +24,7 @@ fn main() {
         resource_source.push('\n');
         resource_source.push_str(&windows_version_info(
             &multicore_app_version(&manifest_dir),
-            "MultiCore — обновление",
+            "MULTICORE — обновление",
             "multicore-apply.exe",
         ));
         let resource_path = output_dir.join("multicore-updater.rc");

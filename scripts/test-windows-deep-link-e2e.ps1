@@ -55,7 +55,7 @@ public static class DeepLinkSmokeWindow {
             if (owner != process) return true;
             var title = new StringBuilder(256);
             GetWindowText(h, title, title.Capacity);
-            if (title.ToString() != "MultiCore") return true;
+            if (title.ToString() != "MULTICORE") return true;
             result = h;
             return false;
         }, IntPtr.Zero);

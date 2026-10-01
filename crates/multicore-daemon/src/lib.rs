@@ -80,7 +80,7 @@ const WARM_UP_FAILED_MESSAGE: &str =
     "Ядра не удалось запустить заранее. Они запустятся при подключении.";
 
 const CORES_LOST_MESSAGE: &str =
-    "Служба MultiCore потеряла ядра — подключение разорвано. Подключитесь снова.";
+    "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова.";
 
 /// Always-ready mode: the state of the always-ready service as the daemon last saw it.
 pub trait CoresReadiness: Send + Sync + 'static {
@@ -1484,7 +1484,7 @@ fn subscription_fetch_api_error(error: FetchError) -> ApiError {
         FetchError::NotSubscription => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "subscription_not_multicore",
-            "По ссылке пришла веб-страница или список ссылок, а не подписка MultiCore. Скопируйте ссылку подписки для приложения у провайдера."
+            "По ссылке пришла веб-страница или список ссылок, а не подписка MULTICORE. Скопируйте ссылку подписки для приложения у провайдера."
                 .to_owned(),
         ),
         FetchError::InvalidBundle | FetchError::InvalidConfig => (
@@ -1777,7 +1777,7 @@ async fn run_service_update(
         Err(service_client::ServiceError::Busy) => Err(ApiError::new(
             StatusCode::CONFLICT,
             "service_busy",
-            "MultiCore уже запущен у другого пользователя.",
+            "MULTICORE уже запущен у другого пользователя.",
         )),
         // No service to talk to (removed, or not running right now): nothing was attempted.
         Err(
@@ -1797,7 +1797,7 @@ fn service_unavailable() -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "service_unavailable",
-        "Служба MultiCore недоступна.",
+        "Служба MULTICORE недоступна.",
     )
 }
 
@@ -5066,7 +5066,7 @@ fn start_failure_message(
         Cause::ReadinessTimedOut => {
             format!("{core} не успел запуститься вовремя. Повторите попытку.")
         }
-        Cause::ServiceBusy => "MultiCore уже запущен у другого пользователя.".to_owned(),
+        Cause::ServiceBusy => "MULTICORE уже запущен у другого пользователя.".to_owned(),
         Cause::Unknown => {
             "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
         }

@@ -110,7 +110,7 @@ fn compile_windows_resources(
     );
     resource_source.push_str(&windows_version_info(
         &multicore_app_version(manifest_dir),
-        "MultiCore",
+        "MULTICORE",
         "MultiCore.exe",
     ));
     std::fs::write(&resource_path, resource_source)
@@ -171,9 +171,9 @@ fn emit_runtime_versions(manifest_dir: &std::path::Path) {
         .and_then(|manifest| {
             let mihomo = pinned_component_version(&manifest, "mihomo")?;
             let xray = pinned_component_version(&manifest, "xray")?;
-            Some(format!("MultiCore · Mihomo {mihomo} · Xray {xray}"))
+            Some(format!("MULTICORE · Mihomo {mihomo} · Xray {xray}"))
         })
-        .unwrap_or_else(|| "MultiCore".to_owned());
+        .unwrap_or_else(|| "MULTICORE".to_owned());
     println!("cargo:rustc-env=MULTICORE_RUNTIME_VERSIONS={runtime_versions}");
 }
 

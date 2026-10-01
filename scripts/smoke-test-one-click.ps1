@@ -53,7 +53,7 @@ function Get-MultiCoreWindow {
         if ($owner -eq $ProcessId -and [MultiCoreSmokeNative]::IsWindowVisible($window)) {
             $title = New-Object Text.StringBuilder 256
             [void][MultiCoreSmokeNative]::GetWindowText($window, $title, $title.Capacity)
-            if ($title.ToString() -ceq 'MultiCore') { $matches.Add($window) }
+            if ($title.ToString() -ceq 'MULTICORE') { $matches.Add($window) }
         }
         return $true
     }

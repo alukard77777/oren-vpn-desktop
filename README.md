@@ -1,6 +1,6 @@
-# MultiCore
+# MULTICORE
 
-MultiCore is a native Windows x64 and Linux x86_64 client written in Rust with a
+MULTICORE is a native Windows x64 and Linux x86_64 client written in Rust with a
 Slint UI. It runs
 two independent cores: Mihomo owns TUN, DNS, rules, process routing, groups, and
 selectors; Xray provides the configured Shadowsocks and FinalMask outbound
@@ -57,7 +57,7 @@ pinned Xray and Mihomo binaries under `cores/`.
 - **Elevation.** The desktop and daemon run as the user. **Connect** starts the
   core host through `pkexec`; installed packages ship the polkit action
   `io.github.fatyzzz.multicore.core-host`, so the password prompt names
-  MultiCore. The daemon listens on an owner-only socket in
+  MULTICORE. The daemon listens on an owner-only socket in
   `$XDG_RUNTIME_DIR/multicore`, requires the connected peer to be root with the
   launched PID, and the host requires the daemon's PID and the invoking user.
   The host resolves configs and cores only through owner- and permission-checked,
@@ -86,7 +86,7 @@ pinned Xray and Mihomo binaries under `cores/`.
 
 ## Subscription profiles
 
-MultiCore stores up to 16 independent profiles. Exactly one profile is active;
+MULTICORE stores up to 16 independent profiles. Exactly one profile is active;
 profiles are never merged. Route selections are persisted per profile. Existing
 single-subscription data under the legacy snapshot directory is migrated locally
 and offline on first profile-store startup. Activating another profile or editing
@@ -103,7 +103,7 @@ and actions compact; saved subscription URLs are not displayed back in the
 profile list.
 
 The tray icon uses exact mouse behavior: left click restores the main window;
-right click toggles MultiCore's own compact control popup with connection,
+right click toggles MULTICORE's own compact control popup with connection,
 group, node, open, and exit actions. The Home page's ambient signal waves are
 bounded behind content and stop while hidden, minimized, or when Windows asks
 applications to reduce motion.
@@ -111,7 +111,7 @@ applications to reduce motion.
 Settings offers separate launch-at-sign-in and auto-connect switches. Auto-connect
 defaults off; when enabled, a background sign-in launch waits for a ready profile
 and network route, then makes one connection attempt. Home shows a dismissible
-update banner only when a newer release is found. MultiCore checks for releases
+update banner only when a newer release is found. MULTICORE checks for releases
 at startup and every 24 hours while it remains open.
 
 The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
@@ -138,7 +138,7 @@ Configuration requests include `x-hwid`, `x-device-os`, `x-ver-os`, and
 any response header matching `<vendor>-servicelogo` (case-insensitive), for
 example `flclashx-servicelogo` or `ajsdjddj-servicelogo`. The vendor prefix must
 be non-empty; it is not a fixed allowlist. The value must be an HTTPS URL with a
-host and without embedded credentials. MultiCore fetches that URL with
+host and without embedded credentials. MULTICORE fetches that URL with
 `multicore-service-logo` and deliberately omits the configuration identity
 headers. Mihomo `proxy-groups` entries may name an HTTPS image in `icon:`;
 those group icons are fetched the same way (`multicore-group-icon`) on each
@@ -155,7 +155,7 @@ needed to bootstrap before TUN. See the complete
 [subscription HTTP contract](docs/subscription-http-contract.md) and the
 [provider implementation contract](docs/contracts/multicore-subscription-backend-prompt.md).
 
-While the active profile is disconnected and ready, MultiCore refreshes it
+While the active profile is disconnected and ready, MULTICORE refreshes it
 automatically using `profile-update-interval`; when the provider omits that
 header, the safe default is six hours. Provider values remain clamped from 15
 minutes through 30 days, and failed automatic attempts back off for 15 minutes.
@@ -166,7 +166,7 @@ effective refresh interval has elapsed.
 The configuration provider sees the usual HTTP request data, the subscription
 URL, the four configuration identity headers, and the selected configuration
 User-Agent. A metadata-provided logo endpoint sees its logo URL and the
-`multicore-service-logo` User-Agent, but not those identity headers. MultiCore
+`multicore-service-logo` User-Agent, but not those identity headers. MULTICORE
 does not operate analytics, telemetry, crash-reporting, account, or subscription
 services. See [PRIVACY.md](PRIVACY.md).
 

@@ -1,4 +1,4 @@
-# MultiCore Windows x64 portable preview
+# MULTICORE Windows x64 portable preview
 
 This file is copied into packages by `scripts/package-windows-release.ps1`.
 Keep the generated directory intact and start `MultiCore.exe`.

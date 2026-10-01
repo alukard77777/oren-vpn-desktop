@@ -328,7 +328,7 @@ fn chip_normal(ui: &AppWindow) {
 fn events() -> ModelRc<UiEvent> {
     let rows = [
         ("21:04:11", "info", "Локальные SOCKS-мосты готовы."),
-        ("21:04:12", "info", "Контроллер и TUN MultiCore готовы."),
+        ("21:04:12", "info", "Контроллер и TUN MULTICORE готовы."),
         (
             "21:05:40",
             "error",
@@ -594,12 +594,12 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_subscription_expiry(s("Бессрочно"));
             ui.set_status_tone(s("warning"));
             ui.set_toggle_title(s("Нет связи с сервисом"));
-            ui.set_supporting(s("Служба MultiCore не отвечает — перезапускаем…"));
+            ui.set_supporting(s("Служба MULTICORE не отвечает — перезапускаем…"));
             ui.set_toggle_detail_is_exit(false);
             ui.set_primary_enabled(false);
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
-                "Запущен Happ — он перехватывает туннель. Закройте его, чтобы MultiCore мог подключиться.",
+                "Запущен Happ — он перехватывает туннель. Закройте его, чтобы MULTICORE мог подключиться.",
             ));
         }),
         ("home-state-connecting", 840, 720, |ui| {
@@ -611,7 +611,7 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_toggle_busy(true);
             ui.set_primary_enabled(false);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 0.3.4 · установится после отключения"));
+            ui.set_update_status(s("MULTICORE 0.3.4 · установится после отключения"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
         }),
@@ -630,7 +630,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-update-banner-menu", 840, 720, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_status(s("MULTICORE 0.4.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
             ui.set_active_panel(s("subscription"));
@@ -638,14 +638,14 @@ fn scenarios() -> Vec<Scenario> {
         ("home-update-banner", 840, 720, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_status(s("MULTICORE 0.4.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
         }),
         ("home-update-banner-min", 700, 620, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_status(s("MULTICORE 0.4.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
         }),
@@ -662,14 +662,14 @@ fn scenarios() -> Vec<Scenario> {
             ready(ui);
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
-                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
             ));
         }),
         ("home-conflicting-banner", 840, 720, |ui| {
             ready(ui);
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
-                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
             ));
         }),
         // Realistic worst case: two conflicting apps plus the appended
@@ -678,26 +678,26 @@ fn scenarios() -> Vec<Scenario> {
             ready(ui);
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
-                "Обнаружены другие VPN-приложения (FlClash, Happ): они могут конфликтовать с MultiCore. Закройте их перед подключением. Закрыть удалось не всё: FlClash запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows».",
+                "Обнаружены другие VPN-приложения (FlClash, Happ): они могут конфликтовать с MULTICORE. Закройте их перед подключением. Закрыть удалось не всё: FlClash запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows».",
             ));
         }),
         ("home-conflicting-banner-menu-min", 700, 620, |ui| {
             ready(ui);
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
-                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
             ));
             ui.set_active_panel(s("subscription"));
         }),
         ("home-both-banners-min", 700, 620, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_status(s("MULTICORE 0.4.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
-                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
+                "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
             ));
         }),
         ("home-handoff-toast", 840, 720, |ui| {
@@ -707,7 +707,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-handoff-and-update-toasts", 840, 720, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_status(s("MULTICORE 1.2.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
@@ -715,7 +715,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-handoff-and-update-toasts-min", 700, 620, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_status(s("MULTICORE 1.2.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
@@ -727,7 +727,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-three-toasts", 840, 720, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_status(s("MULTICORE 1.2.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
             ui.set_service_card_visible(true);
@@ -736,7 +736,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-three-toasts-min", 700, 620, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_status(s("MULTICORE 1.2.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
             ui.set_service_card_visible(true);
@@ -749,7 +749,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-update-banner-wide", 1600, 900, |ui| {
             ready(ui);
             ui.set_update_available(true);
-            ui.set_update_status(s("MultiCore 0.4.0"));
+            ui.set_update_status(s("MULTICORE 0.4.0"));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);
         }),
@@ -888,7 +888,7 @@ fn scenarios() -> Vec<Scenario> {
             ready(ui);
             ui.set_local_page(s("settings"));
             ui.set_settings_section(s("updates"));
-            ui.set_update_status(s("MultiCore 0.4.0 доступна"));
+            ui.set_update_status(s("MULTICORE 0.4.0 доступна"));
             ui.set_update_detail(s("Загрузим подписанный пакет и перезапустим клиент. Активный туннель будет корректно остановлен."));
             ui.set_update_action_label(s("Обновить"));
             ui.set_update_action_enabled(true);

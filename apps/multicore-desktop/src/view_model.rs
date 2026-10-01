@@ -655,11 +655,11 @@ fn conflicting_apps_message(apps: &[&'static str], close_note: &[&'static str]) 
     let names = apps.join(", ");
     let mut message = if apps.len() > 1 {
         format!(
-            "Обнаружены другие VPN-приложения ({names}): они могут конфликтовать с MultiCore. Закройте их перед подключением."
+            "Обнаружены другие VPN-приложения ({names}): они могут конфликтовать с MULTICORE. Закройте их перед подключением."
         )
     } else {
         format!(
-            "Обнаружено другое VPN-приложение ({names}): оно может конфликтовать с MultiCore. Закройте его перед подключением."
+            "Обнаружено другое VPN-приложение ({names}): оно может конфликтовать с MULTICORE. Закройте его перед подключением."
         )
     };
     if !close_note.is_empty() {
@@ -8681,7 +8681,7 @@ mod tests {
         let main = include_str!("main.rs");
 
         for required in [
-            "title: \"MultiCore\";",
+            "title: \"MULTICORE\";",
             "in-out property <string> subscription-draft;",
             "in-out property <bool> replace-editor-open: false;",
             "in-out property <int> import-success-serial: 0;",
@@ -8706,7 +8706,7 @@ mod tests {
             "title: \"Quiet Signal\";",
             "text: \"Quiet Signal\";",
             "BrandMark",
-            "text: \"MultiCore\";",
+            "text: \"MULTICORE\";",
             "text: \"Локально\";",
             "text: \"Подписка\";",
             "label: \"Заменить\";",
@@ -10101,7 +10101,7 @@ mod tests {
             "event.component",
             "Диагностика Xray",
             "Диагностика Mihomo",
-            "Диагностика TUN MultiCore",
+            "Диагностика TUN MULTICORE",
         ] {
             assert!(source.contains(required), "missing {required}");
         }
