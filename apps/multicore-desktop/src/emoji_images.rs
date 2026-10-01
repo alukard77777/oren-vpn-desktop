@@ -1,7 +1,7 @@
 //! Colour emoji drawn as images instead of font glyphs.
 //!
-//! Slint's software renderer (the fallback on machines without OpenGL 2.0,
-//! see `renderer_fallback`) rasterizes glyph outlines only, so colour emoji
+//! Slint's software renderer (the fallback where the GPU renderer can't
+//! start, see `renderer_fallback`) rasterizes glyph outlines only, so colour emoji
 //! fonts come out blank or as grey silhouettes. Node and group names come
 //! from subscriptions and may start with any emoji, so the whole Noto Emoji
 //! 3D set (Apache 2.0 / OFL 1.1, see assets/emoji/LICENSE) is embedded,
