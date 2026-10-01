@@ -172,6 +172,18 @@ pub fn set_launch_at_sign_in(enabled: bool) -> io::Result<LaunchAtSignInState> {
     autostart::apply_in(&autostart::entry_path()?, &autostart::launcher()?, enabled)
 }
 
+/// The installed app took over from an AppImage (see `appimage_handoff`): an autostart entry
+/// that starts exactly that AppImage now starts the installed app, so the one autostart keeps
+/// working and stays shown as on. Any other entry is left alone. True when it was rewritten.
+#[cfg(target_os = "linux")]
+pub fn adopt_launch_at_sign_in_from(appimage: &Path) -> io::Result<bool> {
+    autostart::adopt_in(
+        &autostart::entry_path()?,
+        appimage,
+        &std::env::current_exe()?,
+    )
+}
+
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn set_launch_at_sign_in(_enabled: bool) -> io::Result<LaunchAtSignInState> {
     Err(io::Error::new(
@@ -284,6 +296,18 @@ mod autostart {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn adopt_in(entry: &Path, previous: &Path, executable: &Path) -> io::Result<bool> {
+        let Some(stored) = read_exec(entry)? else {
+            return Ok(false);
+        };
+        if stored != build_launch_command(previous)? {
+            return Ok(false);
+        }
+        require_exec_safe(executable)?;
+        write_entry(entry, &build_launch_command(executable)?)?;
+        Ok(true)
     }
 
     pub(super) fn query_in(entry: &Path, executable: &Path) -> io::Result<LaunchAtSignInState> {
@@ -598,7 +622,7 @@ mod tests {
 mod linux_tests {
     use super::LaunchAtSignInState;
     use super::autostart::{
-        apply_in, desktop_entry, exec_from_desktop_entry, launcher_from, query_in,
+        adopt_in, apply_in, desktop_entry, exec_from_desktop_entry, launcher_from, query_in,
     };
     use std::path::{Path, PathBuf};
 
@@ -711,5 +735,39 @@ mod linux_tests {
                 "{unsafe_name}"
             );
         }
+    }
+
+    #[test]
+    fn an_autostart_of_the_handed_off_appimage_is_adopted_by_the_installed_app() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("autostart").join("multicore.desktop");
+        let image = temp.path().join("MultiCore-1.1.1-x86_64.AppImage");
+        let installed = temp.path().join("usr-lib-multicore").join("multicore");
+        let other = temp.path().join("Other.AppImage");
+        for file in [&image, &installed, &other] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"elf").unwrap();
+        }
+
+        // No autostart: nothing to adopt, nothing written.
+        assert!(!adopt_in(&entry, &image, &installed).unwrap());
+        assert!(!entry.exists());
+
+        // Another launcher's entry is not ours to change.
+        apply_in(&entry, &other, true).unwrap();
+        assert!(!adopt_in(&entry, &image, &installed).unwrap());
+        assert_eq!(
+            query_in(&entry, &other).unwrap(),
+            LaunchAtSignInState::Enabled
+        );
+
+        // The AppImage's own entry now starts the installed app and reads as enabled.
+        apply_in(&entry, &image, true).unwrap();
+        assert!(adopt_in(&entry, &image, &installed).unwrap());
+        assert_eq!(
+            query_in(&entry, &installed).unwrap(),
+            LaunchAtSignInState::Enabled
+        );
+        assert!(!adopt_in(&entry, &image, &installed).unwrap(), "idempotent");
     }
 }

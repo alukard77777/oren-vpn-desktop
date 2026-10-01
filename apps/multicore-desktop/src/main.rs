@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app_icon;
+mod appimage_handoff;
 mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
@@ -753,6 +754,10 @@ fn main() -> Result<(), slint::PlatformError> {
     if data_reset::run_pending_reset(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
         return Ok(());
     }
+    // An AppImage next to an installed deb/rpm/pacman package becomes the installed app
+    // (returns only when there is none, or the hand-off failed).
+    #[cfg(target_os = "linux")]
+    appimage_handoff::hand_off_to_installed_package();
     let software_renderer = renderer_fallback::software_renderer_requested();
     let result = match run_desktop(software_renderer) {
         // Everything run_desktop held (single-instance guard, owned daemon,
@@ -795,6 +800,14 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             return Ok(());
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = appimage_handoff::handed_off_from() {
+        match windows_settings::adopt_launch_at_sign_in_from(&appimage) {
+            Ok(true) => eprintln!("autostart moved from the AppImage to the installed app"),
+            Ok(false) => {}
+            Err(error) => eprintln!("autostart could not be moved from the AppImage: {error}"),
+        }
+    }
     let launch_mode = launch_arguments.mode;
     let (client, _bootstrap_guard): (Arc<dyn DaemonClient>, Option<bootstrap::Bootstrap>) =
         match bootstrap::start() {
