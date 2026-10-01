@@ -135,7 +135,7 @@ Assert-Amd64PeExecutable $UpdaterExecutablePath 'Updater executable'
 Assert-Amd64PeExecutable $CoreHostExecutablePath 'Core-host executable'
 
 if ($PeHeadersOnly) {
-    Write-Host 'PASS: all inputs are AMD64 PE32+ non-DLL executables'
+    Write-Host "PASS: all inputs are $Architecture non-DLL executables ($(if ($Architecture -ceq 'x86') { 'i386 PE32' } else { 'AMD64 PE32+' }))"
     return
 }
 
@@ -217,4 +217,4 @@ Assert-NumericManifest $DaemonExecutablePath $asInvoker
 Assert-NumericManifest $UpdaterExecutablePath $asInvoker
 Assert-NumericManifest $CoreHostExecutablePath $requireAdministrator
 
-Write-Host 'PASS: four AMD64 executables embed semantic numeric RT_MANIFEST #1 with least-privilege levels'
+Write-Host "PASS: four $Architecture executables embed semantic numeric RT_MANIFEST #1 with least-privilege levels"

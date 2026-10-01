@@ -30,8 +30,9 @@ $NoticesPath = Join-Path $RepositoryRoot 'packaging\windows-x64\THIRD_PARTY_NOTI
 $DefaultManifestPath = Join-Path $MetadataRoot 'versions.json'
 $Platform = "windows-$Architecture"
 $ReleaseAssetName = "multicore-$Platform.zip"
-# x64 keeps the host target (no --target) exactly as before; x86 cross-compiles.
-$RustTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { $null }
+# x64 keeps the host target (no --target) exactly as before; x86 cross-compiles. (Not named
+# $RustTarget: PowerShell variables are case-insensitive and $rustTarget is the target directory.)
+$CargoBuildTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { $null }
 if (-not $ManifestPath) { $ManifestPath = $DefaultManifestPath }
 $manifestCandidate = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ManifestPath))
 $isFixtureInvocation = $false
@@ -700,8 +701,8 @@ try {
             throw 'Production packaging builds all Rust executables internally; executable overrides are fixture-only'
         }
         $rustTarget = Join-Path $stage '.rust-target'
-        Invoke-PinnedRustBuild $manifest.build $rustTarget $UpdateRepository $RustTarget
-        $rustRelease = if ($RustTarget) { Join-Path $rustTarget "$RustTarget\release" } else { Join-Path $rustTarget 'release' }
+        Invoke-PinnedRustBuild $manifest.build $rustTarget $UpdateRepository $CargoBuildTarget
+        $rustRelease = if ($CargoBuildTarget) { Join-Path $rustTarget "$CargoBuildTarget\release" } else { Join-Path $rustTarget 'release' }
         $DesktopExecutablePath = Join-Path $rustRelease 'multicore-desktop.exe'
         $DaemonExecutablePath = Join-Path $rustRelease 'multicore-daemon.exe'
         $UpdaterExecutablePath = Join-Path $rustRelease 'multicore-apply.exe'
