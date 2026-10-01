@@ -249,4 +249,18 @@ mod tests {
             .expect("autostart adoption");
         assert!(claim < adopt, "only the primary instance touches autostart");
     }
+
+    #[test]
+    fn the_hand_off_toast_has_the_agreed_copy_and_is_dismissed_per_appimage() {
+        let ui: String = include_str!("../ui/app.slint").split_whitespace().collect();
+        assert!(ui.contains("\"Открытаустановленнаяверсия\""));
+        assert!(ui.contains("\"AppImageможноудалить—используетсяMultiCoreизсистемы\""));
+        assert!(ui.contains("label:\"Понятно\";"));
+        assert!(ui.contains("root.handoff-notice-seen=root.handoff-notice-for;"));
+        assert!(ui.contains(
+            "handoff-toast-visible:root.handoff-notice-for!=\"\"&&root.handoff-notice-for!=root.handoff-notice-seen;"
+        ));
+        // Stacked above the update toast instead of overlapping it.
+        assert!(ui.contains("above:update-toast.shown?update-toast.height+10px:0px;"));
+    }
 }

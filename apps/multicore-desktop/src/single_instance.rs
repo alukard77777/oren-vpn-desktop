@@ -8,6 +8,10 @@ pub(crate) enum Activation {
     Show,
     Background,
     InstallSubscription(String),
+    /// Linux: this launch came from an AppImage that handed off to the installed package (the
+    /// AppImage file). Sent as its own frame after the launch's activation, so an older
+    /// instance that does not know it still gets the deep link.
+    HandedOff(String),
 }
 
 pub(crate) enum Claim {
@@ -36,6 +40,14 @@ pub(crate) fn claim_or_forward(activation: &Activation) -> io::Result<Claim> {
     platform::claim_or_forward(activation, preview_scope)
 }
 
+/// Forwards one more activation to the running primary instance, after `claim_or_forward`
+/// returned `Forwarded`.
+#[cfg(not(windows))]
+pub(crate) fn forward_to_primary(activation: &Activation) -> io::Result<()> {
+    let directory = multicore_platform::dirs::user_runtime_dir()?;
+    platform::forward_in(&directory, activation, false)
+}
+
 fn encode_frame(activation: &Activation) -> Result<Vec<u8>, &'static str> {
     let mut payload = Vec::new();
     match activation {
@@ -47,6 +59,13 @@ fn encode_frame(activation: &Activation) -> Result<Vec<u8>, &'static str> {
             }
             payload.push(1);
             payload.extend_from_slice(url.as_bytes());
+        }
+        Activation::HandedOff(appimage) => {
+            if appimage.is_empty() {
+                return Err("hand-off path is empty");
+            }
+            payload.push(3);
+            payload.extend_from_slice(appimage.as_bytes());
         }
     }
     if payload.len() > MAX_PAYLOAD_LEN {
@@ -285,6 +304,19 @@ mod platform {
         })
     }
 
+    pub(super) fn forward_in(
+        directory: &Path,
+        activation: &Activation,
+        preview_scope: bool,
+    ) -> io::Result<()> {
+        let socket_name = if preview_scope {
+            PREVIEW_SOCKET_NAME
+        } else {
+            SOCKET_NAME
+        };
+        forward(&directory.join(socket_name), activation)
+    }
+
     fn forward(socket: &Path, activation: &Activation) -> io::Result<()> {
         let frame = encode_frame(activation).map_err(io::Error::other)?;
         let started = Instant::now();
@@ -364,6 +396,13 @@ fn decode_frame(frame: &[u8]) -> Result<Activation, &'static str> {
             }
             Ok(Activation::InstallSubscription(url.to_owned()))
         }
+        3 => {
+            let path = std::str::from_utf8(body).map_err(|_| "hand-off path is not UTF-8")?;
+            if path.is_empty() {
+                return Err("hand-off path is empty");
+            }
+            Ok(Activation::HandedOff(path.to_owned()))
+        }
         _ => Err("activation kind is unknown"),
     }
 }
@@ -378,6 +417,7 @@ mod tests {
             Activation::Show,
             Activation::Background,
             Activation::InstallSubscription("https://example.com/sub?token=a%2Fb".into()),
+            Activation::HandedOff("/home/me/MultiCore-1.1.1-x86_64.AppImage".into()),
         ] {
             let frame = encode_frame(&activation).unwrap();
             assert_eq!(decode_frame(&frame).unwrap(), activation);
@@ -402,6 +442,8 @@ mod tests {
         assert!(decode_frame(&framed(&[9])).is_err());
         assert!(decode_frame(&framed(&[1, 0xff])).is_err());
         assert!(decode_frame(&framed(&[1])).is_err());
+        assert!(decode_frame(&framed(&[3])).is_err());
+        assert!(decode_frame(&framed(&[3, 0xff])).is_err());
     }
 
     #[test]
@@ -523,5 +565,33 @@ mod tests {
             Activation::Background
         );
         drop(idle);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_hand_off_notice_follows_the_forwarded_deep_link() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let activations = primary(super::platform::claim_or_forward_in(
+            root.path(),
+            &Activation::Show,
+            false,
+        ));
+        let url = Activation::InstallSubscription("multicore://add?url=x".into());
+        let notice = Activation::HandedOff("/home/me/MultiCore.AppImage".into());
+        assert!(matches!(
+            super::platform::claim_or_forward_in(root.path(), &url, false).unwrap(),
+            super::Claim::Forwarded
+        ));
+        super::platform::forward_in(root.path(), &notice, false).unwrap();
+        assert_eq!(
+            activations.recv_timeout(Duration::from_secs(5)).unwrap(),
+            url
+        );
+        assert_eq!(
+            activations.recv_timeout(Duration::from_secs(5)).unwrap(),
+            notice
+        );
     }
 }

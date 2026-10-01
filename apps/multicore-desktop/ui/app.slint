@@ -1094,6 +1094,10 @@ export component AppWindow inherits Window {
     in-out property <bool> announcement-open: false;
     // Fingerprint of the notice last shown (persisted); see announcement_fingerprint.
     in-out property <string> announcement-seen;
+    // Linux: the AppImage that handed off to this installed copy, and the one whose notice was
+    // dismissed ("Понятно"); the toast shows once per AppImage file.
+    in-out property <string> handoff-notice-for;
+    in-out property <string> handoff-notice-seen;
     // A new notice nobody has opened yet: the bell shows its dot only then.
     in-out property <bool> announcement-unread: false;
     // Window growth from the expanded rail (logical px; 0 = none), persisted so a
@@ -1138,6 +1142,8 @@ export component AppWindow inherits Window {
     // One-frame flags so a banner that appears starts hidden and eases in.
     private property <bool> update-banner-entering: false;
     private property <bool> conflict-banner-entering: false;
+    private property <bool> handoff-toast-entering: false;
+    private property <bool> handoff-toast-visible: root.handoff-notice-for != "" && root.handoff-notice-for != root.handoff-notice-seen;
     private property <bool> profile-menu-was-open: false;
     private property <bool> profile-menu-keyboard-open: false;
     private property <int> profile-shelf-focus-serial: 0;
@@ -1265,10 +1271,17 @@ export component AppWindow inherits Window {
 
     banner-enter := Timer {
         interval: 16ms;
-        running: root.update-banner-entering || root.conflict-banner-entering;
+        running: root.update-banner-entering || root.conflict-banner-entering || root.handoff-toast-entering;
         triggered => {
             root.update-banner-entering = false;
             root.conflict-banner-entering = false;
+            root.handoff-toast-entering = false;
+        }
+    }
+
+    changed handoff-toast-visible => {
+        if (root.handoff-toast-visible && !root.reduced-motion) {
+            root.handoff-toast-entering = true;
         }
     }
 
@@ -3694,6 +3707,64 @@ export component AppWindow inherits Window {
                                 enabled: update-toast.shown && !root.profile-menu-open;
                                 activated => { root.update-banner-dismissed-for = root.update-status; }
                             }
+                        }
+                    }
+                }
+            }
+
+            // AppImage hand-off notice (Linux): the same toast as the update one, stacked above
+            // it when both are up.
+            handoff-toast := Rectangle {
+                property <bool> shown: root.handoff-toast-visible;
+                property <length> motion: root.reduced-motion ? 0px
+                    : root.handoff-toast-entering ? 16px
+                    : self.shown ? 0px : 8px;
+                property <length> above: update-toast.shown ? update-toast.height + 10px : 0px;
+                width: Math.min(356px, parent.width - 32px);
+                height: Math.max(60px, handoff-toast-title.preferred-height + handoff-toast-copy.preferred-height + 30px);
+                x: parent.width - self.width - 16px;
+                y: parent.height - self.height - 16px - self.above + self.motion;
+                opacity: self.shown && !root.handoff-toast-entering ? 1 : 0;
+                visible: self.opacity > 0;
+                background: Theme.elevated;
+                border-color: handoff-toast-hover.has-hover ? #3a414b : Theme.line;
+                border-width: 1px;
+                border-radius: 12px;
+                drop-shadow-blur: 24px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: #00000080;
+                animate opacity { duration: self.shown ? 320ms : 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                animate y { duration: self.shown ? 320ms : 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                animate border-color { duration: 140ms; easing: ease-out; }
+
+                handoff-toast-hover := TouchArea { }
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: start;
+                        padding-top: 1px;
+                        Image { width: 18px; height: 18px; source: @image-url("../assets/circle-check.svg"); colorize: Theme.accent-blue; image-fit: contain; accessible-role: none; }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        alignment: center;
+                        spacing: 2px;
+                        handoff-toast-title := Text { text: "Открыта установленная версия"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
+                        handoff-toast-copy := Text { text: "AppImage можно удалить — используется MultiCore из системы"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        BannerAction {
+                            filled: true;
+                            label: "Понятно";
+                            enabled: handoff-toast.shown && !root.profile-menu-open;
+                            activated => { root.handoff-notice-seen = root.handoff-notice-for; }
                         }
                     }
                 }

@@ -549,6 +549,26 @@ fn scenarios() -> Vec<Scenario> {
                 "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MultiCore. Закройте его перед подключением.",
             ));
         }),
+        ("home-handoff-toast", 840, 720, |ui| {
+            ready(ui);
+            ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
+        }),
+        ("home-handoff-and-update-toasts", 840, 720, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+            ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
+        }),
+        ("home-handoff-and-update-toasts-min", 700, 620, |ui| {
+            ready(ui);
+            ui.set_update_available(true);
+            ui.set_update_status(s("MultiCore 1.2.0"));
+            ui.set_update_action_label(s("Обновить"));
+            ui.set_update_action_enabled(true);
+            ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
+        }),
         ("home-ready-wide", 1600, 900, ready),
         ("home-update-banner-wide", 1600, 900, |ui| {
             ready(ui);
