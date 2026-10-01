@@ -1777,6 +1777,148 @@ mod updates {
         assert!(started.lock().unwrap().is_empty());
     }
 
+    /// Records both phases, so a test sees whether a command downloaded, handed over, or both.
+    struct PhaseRecorder(Arc<Mutex<Vec<String>>>);
+
+    impl ServiceUpdater for PhaseRecorder {
+        fn prepare(
+            &mut self,
+            client: &ClientIdentity,
+            version: &str,
+        ) -> Result<(), BrokerErrorCode> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("prepare {}@{version}", client.user_key));
+            Ok(())
+        }
+        fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("begin {}@{version}", client.user_key));
+            Ok(())
+        }
+    }
+
+    fn stage(version: &str) -> ServiceCommand {
+        ServiceCommand::StageUpdate {
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn staging_downloads_with_the_tunnel_up_and_never_hands_over() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(PhaseRecorder(phases.clone())));
+        let alice = user("1:alice");
+        service.execute(
+            ConnectionId(1),
+            &alice,
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        service.execute(ConnectionId(1), &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(ConnectionId(9), &alice, stage("1.2.0")),
+            ServiceResponse::UpdateStaged {
+                version: "1.2.0".into()
+            }
+        );
+        assert!(service.cores_mut().running && service.cores_mut().tun);
+        assert_eq!(service.owner_key(), Some("1:alice"));
+        assert_eq!(*phases.lock().unwrap(), ["prepare 1:alice@1.2.0"]);
+
+        // After the desktop disconnected, `Update` hands the staged release over.
+        assert_eq!(
+            service.execute(ConnectionId(9), &alice, update("1.2.0")),
+            ServiceResponse::UpdateStarted
+        );
+        assert!(!service.cores_mut().running);
+        assert_eq!(
+            phases.lock().unwrap().last().map(String::as_str),
+            Some("begin 1:alice@1.2.0")
+        );
+    }
+
+    #[test]
+    fn a_failed_stage_leaves_the_tunnel_running() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(FailingDownload(started.clone())));
+        let alice = user("1:alice");
+        service.execute(
+            ConnectionId(1),
+            &alice,
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        service.execute(ConnectionId(1), &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(ConnectionId(9), &alice, stage("1.2.0")),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest
+            }
+        );
+        assert!(service.cores_mut().running && service.cores_mut().tun);
+        assert!(started.lock().unwrap().is_empty());
+        assert_eq!(service.owner_key(), Some("1:alice"));
+    }
+
+    #[test]
+    fn another_users_stage_is_busy_and_without_an_updater_unsupported() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ServiceLoop::new(FakeCores::default())
+            .with_updater(Box::new(PhaseRecorder(phases.clone())));
+        service.execute(
+            ConnectionId(1),
+            &user("1:alice"),
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        assert_eq!(
+            service.execute(ConnectionId(2), &user("2:bob"), stage("1.2.0")),
+            ServiceResponse::Busy
+        );
+        assert!(phases.lock().unwrap().is_empty());
+        assert_eq!(
+            ServiceLoop::new(FakeCores::default()).execute(
+                ConnectionId(1),
+                &user("1:alice"),
+                stage("1.2.0")
+            ),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::Unsupported
+            }
+        );
+    }
+
+    #[test]
+    fn a_staged_release_is_reused_only_for_the_same_intact_version() {
+        use crate::service::update::StagedRelease;
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("multicore-1.2.0.zip");
+        std::fs::write(&archive, b"verified release").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(b"verified release"));
+        let staged = StagedRelease {
+            version: "1.2.0".into(),
+            archive: archive.clone(),
+            size: 16,
+            sha256,
+        };
+        assert!(staged.reusable_for("1.2.0"));
+        assert!(
+            !staged.reusable_for("1.2.1"),
+            "another version is staged afresh"
+        );
+        std::fs::write(&archive, b"tampered release").unwrap();
+        assert!(
+            !staged.reusable_for("1.2.0"),
+            "a changed archive is downloaded again"
+        );
+        std::fs::remove_file(&archive).unwrap();
+        assert!(!staged.reusable_for("1.2.0"));
+    }
+
     #[test]
     fn without_an_updater_updates_are_unsupported() {
         let mut service = ServiceLoop::new(FakeCores::default());
@@ -2262,6 +2404,56 @@ mod update_outside_the_lock {
         assert_eq!(updating.join().unwrap(), ServiceResponse::UpdateStarted);
         assert!(!h.service.lock().unwrap().cores_mut().running);
         assert_eq!(*h.begun.lock().unwrap(), ["1:alice@1.2.0"]);
+    }
+
+    #[test]
+    fn staging_runs_outside_the_lock_and_blocks_a_second_download() {
+        let h = harness();
+        run(
+            &h.service,
+            1,
+            "1:alice",
+            ServiceCommand::Prepare { generation_id: 1 },
+        );
+        let staging = {
+            let service = h.service.clone();
+            thread::spawn(move || {
+                run(
+                    &service,
+                    9,
+                    "1:alice",
+                    ServiceCommand::StageUpdate {
+                        version: "1.2.0".into(),
+                    },
+                )
+            })
+        };
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            h.service.try_lock().is_ok(),
+            "staging must not hold the lock"
+        );
+        assert!(matches!(
+            run(&h.service, 1, "1:alice", ServiceCommand::Status),
+            ServiceResponse::Status { .. }
+        ));
+        for second in [
+            update(),
+            ServiceCommand::StageUpdate {
+                version: "1.2.0".into(),
+            },
+        ] {
+            assert_eq!(run(&h.service, 2, "1:alice", second), ServiceResponse::Busy);
+        }
+        h.release.send(Ok(())).unwrap();
+        assert_eq!(
+            staging.join().unwrap(),
+            ServiceResponse::UpdateStaged {
+                version: "1.2.0".into()
+            }
+        );
+        assert!(h.service.lock().unwrap().cores_mut().running);
+        assert!(h.begun.lock().unwrap().is_empty());
     }
 
     #[test]

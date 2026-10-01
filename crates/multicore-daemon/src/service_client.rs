@@ -193,7 +193,9 @@ pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
     match command {
         ServiceCommand::Prepare { .. } => CORE_READINESS_TIMEOUT * 2 + Duration::from_secs(10),
         ServiceCommand::SetTun { .. } => Duration::from_secs(25),
-        ServiceCommand::Update { .. } => Duration::from_secs(15 * 60),
+        ServiceCommand::Update { .. } | ServiceCommand::StageUpdate { .. } => {
+            Duration::from_secs(15 * 60)
+        }
         ServiceCommand::Status | ServiceCommand::Diagnostics => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     }
@@ -585,6 +587,22 @@ impl<C: ServiceConnector> ServiceSession<C> {
         }
     }
 
+    /// Asks the service to download and verify `version` without stopping anything: the
+    /// connected desktop stages first, disconnects only once this succeeded, then calls
+    /// `update`, which hands the staged release over. Runs on a channel of its own like
+    /// `update`, so the connection keeps working during the download.
+    pub fn stage_update(&self, version: &str) -> Result<(), ServiceError> {
+        let transport = self.connector.connect()?;
+        match transport.request(&ServiceCommand::StageUpdate {
+            version: version.to_owned(),
+        })? {
+            ServiceResponse::UpdateStaged { version: staged } if staged == version => Ok(()),
+            ServiceResponse::Busy => Err(ServiceError::Busy),
+            ServiceResponse::Error { code } => Err(ServiceError::Rejected(code)),
+            _ => Err(ServiceError::Protocol),
+        }
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> ProcessDiagnostics {
         match self.request(&ServiceCommand::Diagnostics, false) {
@@ -640,6 +658,10 @@ impl<C: ServiceConnector> crate::CoresReadiness for ServiceSession<C> {
 impl<C: ServiceConnector> crate::ServiceUpdates for ServiceSession<C> {
     fn update(&self, version: &str) -> Result<(), ServiceError> {
         ServiceSession::update(self, version)
+    }
+
+    fn stage(&self, version: &str) -> Result<(), ServiceError> {
+        ServiceSession::stage_update(self, version)
     }
 }
 

@@ -721,9 +721,22 @@ impl multicore_daemon::ServiceUpdates for RecordingUpdates {
         self.0.lock().unwrap().push(version.to_owned());
         self.1.map_or(Ok(()), Err)
     }
+
+    fn stage(&self, version: &str) -> Result<(), multicore_daemon::service_client::ServiceError> {
+        self.0.lock().unwrap().push(format!("stage {version}"));
+        self.1.map_or(Ok(()), Err)
+    }
 }
 
 async fn post_update(
+    updates: Option<Arc<RecordingUpdates>>,
+    body: &'static str,
+) -> axum::http::StatusCode {
+    post_service_update("/v1/service/update", updates, body).await
+}
+
+async fn post_service_update(
+    path: &'static str,
     updates: Option<Arc<RecordingUpdates>>,
     body: &'static str,
 ) -> axum::http::StatusCode {
@@ -734,7 +747,7 @@ async fn post_update(
     let updates = updates.map(|updates| updates as Arc<dyn multicore_daemon::ServiceUpdates>);
     let app = multicore_daemon::try_router_shared(backend, "t", None, updates).unwrap();
     app.oneshot(
-        Request::post("/v1/service/update")
+        Request::post(path)
             .header("authorization", "Bearer t")
             .header("content-type", "application/json")
             .body(Body::from(body))
@@ -763,6 +776,38 @@ async fn service_updates_are_routed_to_the_service() {
         Some(multicore_daemon::service_client::ServiceError::Busy),
     ));
     assert_eq!(post_update(Some(busy), r#"{"version":"1.2.0"}"#).await, 409);
+}
+
+#[tokio::test]
+async fn staging_an_update_only_downloads_through_the_service() {
+    use multicore_daemon::service_client::ServiceError;
+    const STAGE: &str = "/v1/service/update/stage";
+    let updates = Arc::new(RecordingUpdates(Mutex::default(), None));
+    assert_eq!(
+        post_service_update(STAGE, Some(updates.clone()), r#"{"version":"1.2.0"}"#).await,
+        200
+    );
+    assert_eq!(*updates.0.lock().unwrap(), ["stage 1.2.0"]);
+    assert_eq!(
+        post_service_update(STAGE, Some(updates.clone()), r#"{"version":"1.2.0","x":1}"#).await,
+        400
+    );
+    assert_eq!(
+        post_service_update(STAGE, None, r#"{"version":"1.2.0"}"#).await,
+        404
+    );
+    for (error, status) in [
+        (ServiceError::Busy, 409),
+        (ServiceError::Unavailable, 404),
+        (ServiceError::TimedOut, 502),
+    ] {
+        let updates = Arc::new(RecordingUpdates(Mutex::default(), Some(error)));
+        assert_eq!(
+            post_service_update(STAGE, Some(updates), r#"{"version":"1.2.0"}"#).await,
+            status,
+            "{error:?}"
+        );
+    }
 }
 
 #[tokio::test]

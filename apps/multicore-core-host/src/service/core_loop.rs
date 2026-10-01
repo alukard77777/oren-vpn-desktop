@@ -59,7 +59,8 @@ pub(crate) trait Cores: Send {
 /// Service-side update: download and verify, then hand over to the updater and stop the service.
 pub(crate) trait ServiceUpdater: Send {
     /// Downloads and verifies `version` while the cores keep running; a failure here leaves
-    /// the tunnel untouched.
+    /// the tunnel untouched. Runs for both `StageUpdate` and `Update`, so a release an earlier
+    /// `StageUpdate` already verified should be reused rather than downloaded again.
     fn prepare(&mut self, _client: &ClientIdentity, _version: &str) -> Result<(), BrokerErrorCode> {
         Ok(())
     }
@@ -158,7 +159,8 @@ impl<C: Cores> ServiceLoop<C> {
                 self.stop_everything();
                 ServiceResponse::ShuttingDown
             }
-            ServiceCommand::Update { version } => self.update(client, &version),
+            ServiceCommand::Update { version } => self.update(client, &version, false),
+            ServiceCommand::StageUpdate { version } => self.update(client, &version, true),
         }
     }
 
@@ -213,7 +215,7 @@ impl<C: Cores> ServiceLoop<C> {
         self.owner = None;
     }
 
-    /// Phase 1 of `Update`, under the lock: another user's cores → `Busy`, no updater →
+    /// Phase 1 of `Update` and `StageUpdate`, under the lock: another user's cores → `Busy`, no updater →
     /// `Unsupported`, an update already downloading → `Busy`. Otherwise the updater is taken
     /// out for the download.
     pub(crate) fn start_update(
@@ -265,13 +267,41 @@ impl<C: Cores> ServiceLoop<C> {
         response
     }
 
-    fn update(&mut self, client: &ClientIdentity, version: &str) -> ServiceResponse {
+    /// Phase 3 of `StageUpdate`, under the lock again: the release is downloaded and verified
+    /// (or not); either way nothing is stopped, so the owner's tunnel keeps running until the
+    /// desktop has disconnected and sends `Update`.
+    pub(crate) fn finish_stage(
+        &mut self,
+        version: &str,
+        pending: PendingUpdate,
+        prepared: Result<(), BrokerErrorCode>,
+    ) -> ServiceResponse {
+        self.updating = false;
+        self.updater = Some(pending.updater);
+        match prepared {
+            Ok(()) => ServiceResponse::UpdateStaged {
+                version: version.to_owned(),
+            },
+            Err(code) => ServiceResponse::Error { code },
+        }
+    }
+
+    fn update(
+        &mut self,
+        client: &ClientIdentity,
+        version: &str,
+        stage_only: bool,
+    ) -> ServiceResponse {
         let mut pending = match self.start_update(client) {
             Ok(pending) => pending,
             Err(response) => return response,
         };
         let prepared = pending.updater.prepare(client, version);
-        self.finish_update(client, version, pending, prepared)
+        if stage_only {
+            self.finish_stage(version, pending, prepared)
+        } else {
+            self.finish_update(client, version, pending, prepared)
+        }
     }
 
     fn claim(&mut self, connection: ConnectionId, client: &ClientIdentity) {
@@ -385,9 +415,9 @@ impl<C: Cores> ServiceLoop<C> {
     }
 }
 
-/// Runs one command for a server connection thread. `Update` downloads and verifies without
-/// holding the lock, so the owner's `Status`/`SetTun`, crash restarts, a dropped owner and a
-/// service stop are all served meanwhile; every other command runs under the lock.
+/// Runs one command for a server connection thread. `Update` and `StageUpdate` download and
+/// verify without holding the lock, so the owner's `Status`/`SetTun`, crash restarts, a dropped
+/// owner and a service stop are all served meanwhile; every other command runs under the lock.
 pub(crate) fn execute_shared<C: Cores>(
     service: &Mutex<ServiceLoop<C>>,
     connection: ConnectionId,
@@ -395,13 +425,19 @@ pub(crate) fn execute_shared<C: Cores>(
     command: ServiceCommand,
 ) -> ServiceResponse {
     let lock = || service.lock().unwrap_or_else(PoisonError::into_inner);
-    let ServiceCommand::Update { version } = command else {
-        return lock().execute(connection, client, command);
+    let (version, stage_only) = match command {
+        ServiceCommand::Update { version } => (version, false),
+        ServiceCommand::StageUpdate { version } => (version, true),
+        command => return lock().execute(connection, client, command),
     };
     let mut pending = match lock().start_update(client) {
         Ok(pending) => pending,
         Err(response) => return response,
     };
     let prepared = pending.updater.prepare(client, &version);
-    lock().finish_update(client, &version, pending, prepared)
+    if stage_only {
+        lock().finish_stage(&version, pending, prepared)
+    } else {
+        lock().finish_update(client, &version, pending, prepared)
+    }
 }

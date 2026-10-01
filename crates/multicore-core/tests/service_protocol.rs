@@ -29,6 +29,9 @@ fn every_v2_command_round_trips() {
         ServiceCommand::Update {
             version: "1.1.0".into(),
         },
+        ServiceCommand::StageUpdate {
+            version: "1.1.0".into(),
+        },
     ] {
         let frame = encode_service_frame(&command).unwrap();
         assert_eq!(decode_service_command(&frame), Ok(command));
@@ -63,16 +66,74 @@ fn unknown_fields_zero_generation_and_bad_versions_are_rejected() {
         "01.2.3x",
         &"9".repeat(40),
     ] {
-        let frame = encode_service_frame(&ServiceCommand::Update {
-            version: version.to_owned(),
-        })
-        .unwrap();
-        assert_eq!(
-            decode_service_command(&frame),
-            Err(ProtocolError::InvalidSchema),
-            "{version}"
-        );
+        for command in [
+            ServiceCommand::Update {
+                version: version.to_owned(),
+            },
+            ServiceCommand::StageUpdate {
+                version: version.to_owned(),
+            },
+        ] {
+            let frame = encode_service_frame(&command).unwrap();
+            assert_eq!(
+                decode_service_command(&frame),
+                Err(ProtocolError::InvalidSchema),
+                "{command:?}"
+            );
+        }
     }
+}
+
+/// The two-phase update is additive: `Update` keeps its v2 wire form, so a client that only
+/// knows `Update` still drives a newer service, and `stage_update` is a new variant a v2
+/// service either understands or rejects as an invalid request (never misreads).
+#[test]
+fn staging_is_an_additive_v2_command() {
+    assert_eq!(
+        decode_service_command(&raw(
+            br#"{"version":2,"body":{"update":{"version":"1.2.0"}}}"#
+        )),
+        Ok(ServiceCommand::Update {
+            version: "1.2.0".into()
+        })
+    );
+    assert_eq!(
+        decode_service_command(&raw(
+            br#"{"version":2,"body":{"stage_update":{"version":"1.2.0"}}}"#
+        )),
+        Ok(ServiceCommand::StageUpdate {
+            version: "1.2.0".into()
+        })
+    );
+    let staged = ServiceResponse::UpdateStaged {
+        version: "1.2.0".into(),
+    };
+    let frame = encode_service_frame(&staged).unwrap();
+    assert_eq!(
+        decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+        staged
+    );
+    let stage = ServiceCommand::StageUpdate {
+        version: "1.2.0".into(),
+    };
+    assert!(service_response_matches(&stage, &staged));
+    assert!(!service_response_matches(
+        &stage,
+        &ServiceResponse::UpdateStaged {
+            version: "1.2.1".into()
+        }
+    ));
+    assert!(!service_response_matches(
+        &stage,
+        &ServiceResponse::UpdateStarted
+    ));
+    assert!(!service_response_matches(
+        &ServiceCommand::Update {
+            version: "1.2.0".into()
+        },
+        &staged
+    ));
+    assert!(service_response_matches(&stage, &ServiceResponse::Busy));
 }
 
 #[test]

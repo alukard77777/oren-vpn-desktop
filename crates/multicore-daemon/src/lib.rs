@@ -897,7 +897,10 @@ struct AppState {
 
 /// Updates performed by the always-ready service (see `service_client::ServiceSession`).
 pub trait ServiceUpdates: Send + Sync + 'static {
+    /// Installs `version`, reusing a release `stage` already verified.
     fn update(&self, version: &str) -> Result<(), service_client::ServiceError>;
+    /// Downloads and verifies `version` only; the cores and the tunnel keep running.
+    fn stage(&self, version: &str) -> Result<(), service_client::ServiceError>;
 }
 
 #[derive(Clone)]
@@ -1008,6 +1011,7 @@ fn build_router_shared(
         .route("/dashboard-url", get(dashboard_url_handler))
         .route("/session", get(session))
         .route("/service/update", post(service_update))
+        .route("/service/update/stage", post(service_update_stage))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1687,15 +1691,39 @@ async fn service_update(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    run_service_update(state, body, false).await
+}
+
+/// Only the download and verification of `service_update`: the connected desktop stages the
+/// release with the tunnel up and disconnects only after this answered 200.
+async fn service_update_stage(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    run_service_update(state, body, true).await
+}
+
+async fn run_service_update(
+    state: AppState,
+    body: Bytes,
+    stage_only: bool,
+) -> Result<StatusCode, ApiError> {
     let Some(updates) = state.service_updates.clone() else {
         return Err(service_unavailable());
     };
     let request: ServiceUpdateRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiError::bad_request("Некорректный запрос обновления."))?;
-    let result = tokio::task::spawn_blocking(move || updates.update(&request.version))
-        .await
-        .map_err(|_| ApiError::backend("Служба не ответила."))?;
+    let result = tokio::task::spawn_blocking(move || {
+        if stage_only {
+            updates.stage(&request.version)
+        } else {
+            updates.update(&request.version)
+        }
+    })
+    .await
+    .map_err(|_| ApiError::backend("Служба не ответила."))?;
     match result {
+        Ok(()) if stage_only => Ok(StatusCode::OK),
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(service_client::ServiceError::Busy) => Err(ApiError::new(
             StatusCode::CONFLICT,
