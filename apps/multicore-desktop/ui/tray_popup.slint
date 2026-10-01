@@ -850,7 +850,7 @@ export component TrayPopup inherits Window {
                 property <string> revealed-group-id;
                 property <length> selected-tab-x;
                 property <length> selected-tab-width;
-                property <length> edge-room: 40px;
+                property <length> edge-room: 48px;
                 animate scroll-target { duration: root.reduced-motion ? 0ms : 180ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                 changed viewport-width => { self.reveal(self.selected-tab-x, self.selected-tab-width); }
                 function reveal-selected(tab-x: length, tab-width: length) {
@@ -941,12 +941,12 @@ export component TrayPopup inherits Window {
                 if self.overflowing: Rectangle {
                     x: 1px;
                     y: 1px;
-                    width: 40px;
+                    width: 48px;
                     height: parent.height - 2px;
                     opacity: group-track.scroll-x > 0.5px ? 1 : 0;
                     visible: self.opacity > 0;
                     animate opacity { duration: root.reduced-motion ? 0ms : 140ms; easing: ease-out; }
-                    background: @linear-gradient(90deg, #0a0c0f 0%, #0a0c0f 55%, #0a0c0f00 100%);
+                    background: @linear-gradient(90deg, #0a0c0f 0%, #0a0c0f 50%, #0a0c0f00 100%);
                     group-prev := TouchArea {
                         width: 22px;
                         height: parent.height;
@@ -966,12 +966,12 @@ export component TrayPopup inherits Window {
                 if self.overflowing: Rectangle {
                     x: parent.width - self.width - 1px;
                     y: 1px;
-                    width: 40px;
+                    width: 48px;
                     height: parent.height - 2px;
                     opacity: group-track.scroll-x < group-track.max-scroll - 0.5px ? 1 : 0;
                     visible: self.opacity > 0;
                     animate opacity { duration: root.reduced-motion ? 0ms : 140ms; easing: ease-out; }
-                    background: @linear-gradient(90deg, #0a0c0f00 0%, #0a0c0f 45%, #0a0c0f 100%);
+                    background: @linear-gradient(90deg, #0a0c0f00 0%, #0a0c0f 50%, #0a0c0f 100%);
                     group-next := TouchArea {
                         x: parent.width - self.width;
                         width: 22px;
