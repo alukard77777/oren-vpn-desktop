@@ -48,6 +48,20 @@ projects. MULTICORE does not claim ownership of either project or its marks.
 - Use: every emoji rescaled to 40px WebP and embedded in the desktop app so
   colour emoji render without GPU font support
 
+## Skia graphics library
+
+- Project: Google Skia, as packaged by rust-skia (`rust-skia/skia`, tag `m150-0.98.1`,
+  commit `90af6f5c5a3ed8788b805fe6ca3fcdf28c2c2bc9`) and linked through `skia-safe` /
+  `skia-bindings` 0.99.0 (MIT)
+- License: BSD 3-Clause ("Copyright (c) 2011 Google Inc."); the full text is in the
+  pinned Skia source's `LICENSE` file
+- Use: the desktop app's renderer (Slint's Skia renderer on Direct3D 12); built from
+  the pinned source by `scripts/build-skia-binaries.ps1` and linked statically
+- Statically linked Skia dependencies, each under its own permissive license recorded
+  in the pinned source's `third_party/externals`: HarfBuzz (MIT), ICU (Unicode
+  License v3), libpng (libpng license), zlib (zlib license), libjpeg-turbo (IJG/BSD),
+  expat (MIT), Wuffs (Apache 2.0), SPIRV-Cross (Apache 2.0), D3D12 Memory Allocator (MIT)
+
 ## Rust update-bundle libraries
 
 - `sha2` by the RustCrypto Developers — MIT OR Apache-2.0

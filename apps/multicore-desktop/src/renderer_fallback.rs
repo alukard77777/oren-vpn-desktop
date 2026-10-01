@@ -1,14 +1,18 @@
-//! Falls back to Slint's software renderer where OpenGL 2.0 is unavailable.
+//! Falls back to Slint's software renderer where the GPU renderer can't start.
 //!
-//! FemtoVG needs OpenGL 2.0+. A Windows machine without a vendor display
-//! driver (a fresh install, a Hyper-V/VirtualBox guest with the basic display
-//! adapter, some RDP sessions) only has the built-in OpenGL 1.1, and the app
-//! used to exit before showing any window ("Failed to initialize OpenGL
-//! driver: Could not locate glCreateShader symbol"). Slint's own renderer
-//! fallback only covers a renderer that cannot be constructed, not a GL
-//! context that fails when the window is first shown, and the platform can
-//! only be selected once per process - so the app records the failure and
-//! restarts itself with the software renderer.
+//! The GPU renderer is Skia: Direct3D 12 on Windows (a hardware adapter with
+//! feature level 11, else Microsoft's WARP software adapter), OpenGL on Linux
+//! (where Skia itself drops to its CPU raster surface if no GL context can be
+//! created). Direct3D replaced FemtoVG on OpenGL 2.0, which a Windows machine
+//! without a vendor display driver (a fresh install, a Hyper-V/VirtualBox guest
+//! with the basic display adapter, some RDP sessions) lacks - the app used to
+//! exit there before showing any window ("Failed to initialize OpenGL driver:
+//! Could not locate glCreateShader symbol"). Direct3D can still fail on a broken
+//! driver or a system without Direct3D 12. Slint's own renderer fallback only
+//! covers a renderer that cannot be constructed, not a surface that fails when
+//! the window is first shown, and the platform can only be selected once per
+//! process - so the app records the failure and restarts itself with the
+//! software renderer.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -36,6 +40,21 @@ pub fn select_software_renderer() -> Result<(), slint::PlatformError> {
         .select()
 }
 
+/// Skia on Direct3D 12. Without the explicit Direct3D request Slint's Skia
+/// renderer draws on the CPU on Windows. `SLINT_BACKEND` (a manual override
+/// for diagnostics) keeps Slint's own selection.
+#[cfg(windows)]
+pub fn select_gpu_renderer() -> Result<(), slint::PlatformError> {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return Ok(());
+    }
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .renderer_name("skia".into())
+        .require_d3d()
+        .select()
+}
+
 /// Whether a platform error from creating or showing a window means the GPU
 /// renderer itself could not start, as opposed to any other startup failure.
 pub fn is_gpu_renderer_failure(error: &slint::PlatformError) -> bool {
@@ -50,6 +69,12 @@ fn is_gpu_renderer_failure_text(text: &str) -> bool {
         "WGL",
         "GL context",
         "suitable renderer",
+        // Skia on Direct3D 12 (Windows) and Vulkan.
+        "D3D",
+        "DXGI",
+        "Direct3D",
+        "Skia",
+        "Vulkan",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -139,6 +164,18 @@ mod tests {
         ));
         assert!(is_gpu_renderer_failure_text(
             "Winit backend failed to find a suitable renderer: no display"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "error calling D3D12CreateDevice failed. 887a0004"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "unable to create DXGIFactory4 failed. 80004005"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "unable to create Skia D3D DirectContext"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "Direct3D rendering requested but this is only supported on Windows"
         ));
         assert!(!is_gpu_renderer_failure_text(
             "No default Slint platform was selected"

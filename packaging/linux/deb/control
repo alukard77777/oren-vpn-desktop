@@ -4,7 +4,7 @@ Architecture: amd64
 Maintainer: MULTICORE <noreply@multicore.invalid>
 Section: net
 Priority: optional
-Depends: libgtk-3-0, libayatana-appindicator3-1 | libappindicator3-1, pkexec | policykit-1, libxkbcommon0, libfontconfig1, libgl1, iproute2
+Depends: libgtk-3-0, libayatana-appindicator3-1 | libappindicator3-1, pkexec | policykit-1, libxkbcommon0, libfontconfig1, libfreetype6, libstdc++6, libgl1, iproute2
 Recommends: gnome-shell-extension-appindicator
 Description: Native network client combining Mihomo routing with Xray transports
  MULTICORE starts Mihomo and Xray behind one desktop interface. Mihomo owns

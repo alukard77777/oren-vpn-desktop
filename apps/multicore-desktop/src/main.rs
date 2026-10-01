@@ -737,6 +737,9 @@ thread_local! {
     static CREATING_TRAY_POPUP: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Winit with Skia on OpenGL (Slint's default renderer for this build; Skia
+/// itself drops to its CPU raster surface if no GL context can be created), or
+/// Slint's software renderer after a GPU failure.
 #[cfg(target_os = "linux")]
 fn select_linux_backend(software_renderer: bool) -> Result<(), slint::PlatformError> {
     let selector = slint::BackendSelector::new().backend_name("winit".into());
@@ -874,6 +877,8 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     #[cfg(not(target_os = "linux"))]
     if software_renderer {
         renderer_fallback::select_software_renderer()?;
+    } else {
+        renderer_fallback::select_gpu_renderer()?;
     }
     let ui = AppWindow::new()?;
     layout_shortcuts::install(ui.window());

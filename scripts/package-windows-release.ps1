@@ -13,6 +13,9 @@ param(
     # x64 (default, PE32+ AMD64) or x86 (PE32 i386, Rust target i686-pc-windows-msvc).
     [ValidateSet('x64', 'x86')]
     [string]$Architecture = 'x64',
+    # Holds skia-binaries-<key>.tar.gz for this architecture, built by scripts/build-skia-binaries.ps1
+    # and pinned in versions.json (build.skiaBinaries). Defaults to MULTICORE_SKIA_BINARIES_DIR.
+    [string]$SkiaBinariesDirectory = $env:MULTICORE_SKIA_BINARIES_DIR,
     [Parameter(DontShow = $true)]
     [switch]$FixtureContractMode
 )
@@ -111,8 +114,38 @@ function Assert-NoPrivateBuildPaths {
     }
 }
 
+# rust-skia publishes no prebuilt Skia for the static C runtime (+crt-static) or for 32-bit
+# Windows, so skia-bindings links the pinned, locally built archive instead of downloading one
+# (it would otherwise try to build Skia from source, or link a different build).
+function Resolve-PinnedSkiaBinaries {
+    param([object]$Build)
+    if (-not ($Build.PSObject.Properties.Name -contains 'skiaBinaries')) { throw 'versions.json lacks the build.skiaBinaries pin' }
+    $pin = $Build.skiaBinaries
+    $expectedTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+    if ([string]$pin.key -cnotmatch "^[0-9a-f]{20}-$expectedTarget-[a-z0-9-]+-static$") { throw 'build.skiaBinaries.key is not a static-CRT key for this architecture' }
+    if ([string]$pin.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'build.skiaBinaries.sha256 is not a SHA-256 pin' }
+    if ([string]::IsNullOrWhiteSpace($SkiaBinariesDirectory)) {
+        throw "Packaging needs the pinned Skia binaries: pass -SkiaBinariesDirectory (or set MULTICORE_SKIA_BINARIES_DIR) to the directory holding skia-binaries-$($pin.key).tar.gz, built by scripts/build-skia-binaries.ps1"
+    }
+    $directory = (Get-FullPath $SkiaBinariesDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $archive = Join-Path $directory "skia-binaries-$($pin.key).tar.gz"
+    Assert-File $archive 'Pinned Skia binaries archive'
+    if ((Get-Sha256 $archive) -cne [string]$pin.sha256) { throw "Skia binaries archive does not match its SHA-256 pin: $archive" }
+    [PSCustomObject]@{ Key = [string]$pin.key; Url = 'file://' + $directory.Replace([IO.Path]::DirectorySeparatorChar, '/') + '/skia-binaries-{key}.tar.gz' }
+}
+
+function Assert-LinkedPinnedSkia {
+    param([string]$TargetDirectory, [string]$Target, [string]$Key)
+    $buildRoot = if ($Target) { Join-Path $TargetDirectory (Join-Path $Target 'release\build') } else { Join-Path $TargetDirectory 'release\build' }
+    $keys = @(Get-ChildItem -Path $buildRoot -Directory -Filter 'skia-bindings-*' | ForEach-Object { Join-Path $_.FullName 'out\skia\key.txt' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    if ($keys.Count -ne 1) { throw "Expected one skia-bindings output with key.txt, found $($keys.Count)" }
+    $linked = (Get-Content -Raw -LiteralPath $keys[0]).Trim()
+    if ($linked -cne $Key) { throw "The build linked Skia binaries $linked instead of the pinned $Key" }
+}
+
 function Invoke-PinnedRustBuild {
     param([object]$Build, [string]$TargetDirectory, [string]$UpdateRepository, [string]$Target)
+    $skia = Resolve-PinnedSkiaBinaries $Build
     $hadRustFlags = Test-Path Env:RUSTFLAGS
     $savedRustFlags = $env:RUSTFLAGS
     $hadEncodedFlags = Test-Path Env:CARGO_ENCODED_RUSTFLAGS
@@ -125,6 +158,10 @@ function Invoke-PinnedRustBuild {
     $savedTargetDirectory = $env:CARGO_TARGET_DIR
     $hadUpdateRepository = Test-Path Env:MULTICORE_UPDATE_REPOSITORY
     $savedUpdateRepository = $env:MULTICORE_UPDATE_REPOSITORY
+    $savedSkiaEnvironment = @{}
+    foreach ($name in @('SKIA_BINARIES_URL', 'FORCE_SKIA_BUILD', 'FORCE_SKIA_BINARIES_DOWNLOAD', 'SKIA_SOURCE_DIR', 'SKIA_LIBRARY_SEARCH_PATH', 'SKIA_DEBUG')) {
+        $savedSkiaEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
     Push-Location $RepositoryRoot
     try {
         $cargoVersion = (& cargo -V 2>&1 | Out-String).Trim()
@@ -167,10 +204,13 @@ function Invoke-PinnedRustBuild {
         } else {
             Remove-Item Env:MULTICORE_UPDATE_REPOSITORY -ErrorAction SilentlyContinue
         }
+        foreach ($name in $savedSkiaEnvironment.Keys) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        $env:SKIA_BINARIES_URL = $skia.Url
         $targetArguments = @()
         if ($Target) { $targetArguments = @('--target', $Target) }
         & cargo build --locked --release @targetArguments -p $Build.desktopPackage -p $Build.daemonPackage -p $Build.updaterPackage -p $Build.coreHostPackage
         if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust release build failed' }
+        Assert-LinkedPinnedSkia $TargetDirectory $Target $skia.Key
     } finally {
         Pop-Location
         if ($hadRustFlags) { $env:RUSTFLAGS = $savedRustFlags } else { Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue }
@@ -179,6 +219,7 @@ function Invoke-PinnedRustBuild {
         if ($hadCxxFlags) { $env:CXXFLAGS = $savedCxxFlags } else { Remove-Item Env:CXXFLAGS -ErrorAction SilentlyContinue }
         if ($hadTargetDirectory) { $env:CARGO_TARGET_DIR = $savedTargetDirectory } else { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
         if ($hadUpdateRepository) { $env:MULTICORE_UPDATE_REPOSITORY = $savedUpdateRepository } else { Remove-Item Env:MULTICORE_UPDATE_REPOSITORY -ErrorAction SilentlyContinue }
+        foreach ($name in $savedSkiaEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedSkiaEnvironment[$name], 'Process') }
     }
 }
 

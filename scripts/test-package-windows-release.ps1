@@ -214,6 +214,16 @@ Assert-True ($PackagerSource.Contains('$PrivilegedBrokerReleaseReady = $true')) 
 Assert-True ($PackagerSource.Contains('$AssertReleaseReady')) 'packager must expose the explicit CI readiness check'
 Assert-True ($PackagerSource.Contains("fixtureContract -ceq 'multicore-package-test-v1'")) 'fixture authorization must require the synthetic manifest marker'
 Assert-True ($PackagerSource.Contains("'-Ctarget-feature=+crt-static'")) 'release builds must link the C runtime statically (clean Windows has no vcruntime140.dll)'
+Assert-True ($PackagerSource.Contains('$skia = Resolve-PinnedSkiaBinaries $Build')) 'release builds must link the SHA-256-pinned Skia binaries (no prebuilt exists for +crt-static or x86)'
+Assert-True ($PackagerSource.Contains('$env:SKIA_BINARIES_URL = $skia.Url')) 'skia-bindings must read the pinned archive instead of downloading or building Skia'
+Assert-True ($PackagerSource.Contains('Assert-LinkedPinnedSkia $TargetDirectory $Target $skia.Key')) 'release builds must prove they linked the pinned Skia key'
+foreach ($skiaArchitecture in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'))) {
+    $skiaManifest = Get-Content -Raw -LiteralPath (Join-Path $RepositoryRoot "packaging\windows-$($skiaArchitecture[0])\versions.json") | ConvertFrom-Json
+    $skiaPin = $skiaManifest.build.skiaBinaries
+    Assert-True ([string]$skiaPin.key -cmatch "^[0-9a-f]{20}-$($skiaArchitecture[1])-d3d-gl-jpegd-jpege-pdf-textlayout-static$") "windows-$($skiaArchitecture[0]) must pin a static-CRT Direct3D Skia build"
+    Assert-True ([string]$skiaPin.sha256 -cmatch '^[0-9a-f]{64}$') "windows-$($skiaArchitecture[0]) Skia binaries need a SHA-256 pin"
+    Assert-True ([string]$skiaPin.source.commit -cmatch '^[0-9a-f]{40}$') "windows-$($skiaArchitecture[0]) Skia source needs a full commit pin"
+}
 Assert-True ($PackagerSource.IndexOf('$PrivilegedBrokerReleaseReady = $true', [StringComparison]::Ordinal) -lt $PackagerSource.IndexOf('function Invoke-PinnedRustBuild', [StringComparison]::Ordinal)) 'release gate must be evaluated before Rust builds or downloads'
 foreach ($required in @('README.md', 'THIRD_PARTY_NOTICES.md', 'licenses\Xray-core-MPL-2.0.txt', 'licenses\mihomo-GPL-3.0.txt')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $MetadataRoot $required)) "metadata file $required must exist"

@@ -144,6 +144,9 @@ foreach ($token in @(
     'rustup target add i686-pc-windows-msvc --toolchain 1.98.1-x86_64-pc-windows-msvc',
     'cargo test --workspace --locked --target i686-pc-windows-msvc',
     'cargo clippy --workspace --all-targets --locked --target i686-pc-windows-msvc -- -D warnings',
+    # No rust-skia download exists for 32-bit Windows: the pinned static-CRT Skia build.
+    '$env:SKIA_BINARIES_URL = powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pinned-skia-binaries-url.ps1 -Architecture x86',
+    "`$env:CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'",
     '-ReleaseAssetPath dist/release/multicore-windows-x86.zip',
     '-CoreHostExecutablePath dist/release/multicore-windows-x86/runtime/multicore-core-host.exe',
     "`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'x86'",

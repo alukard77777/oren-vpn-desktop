@@ -241,7 +241,7 @@ check_rpm() (
   for dependency in 'gtk3(x86-64)' 'libayatana-appindicator-gtk3(x86-64)' \
       polkit iproute 'libxkbcommon(x86-64)' 'libxkbcommon-x11(x86-64)' 'fontconfig(x86-64)' \
       'libglvnd-glx(x86-64)' 'libglvnd-egl(x86-64)' hicolor-icon-theme systemd \
-      'libc.so.6()(64bit)'; do
+      'libc.so.6()(64bit)' 'libfreetype.so.6()(64bit)' 'libstdc++.so.6()(64bit)'; do
     grep -Fxq "$dependency" <<<"$requires" || {
       echo "RPM is missing dependency: $dependency" >&2
       exit 1

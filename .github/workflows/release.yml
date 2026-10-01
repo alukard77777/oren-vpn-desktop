@@ -77,10 +77,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --workspace --all-targets --locked -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # rust-skia has no 32-bit Windows download: link the pinned static-CRT Skia build
+          # (MULTICORE_SKIA_BINARIES_DIR on the runner, see docs/renderer.md).
+          $env:SKIA_BINARIES_URL = powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pinned-skia-binaries-url.ps1 -Architecture x86
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
           cargo test --workspace --locked --target i686-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --workspace --all-targets --locked --target i686-pc-windows-msvc -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item Env:SKIA_BINARIES_URL, Env:CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
