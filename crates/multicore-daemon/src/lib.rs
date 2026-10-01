@@ -127,6 +127,11 @@ pub struct StatusDto {
     /// This daemon drives the always-ready MultiCore service.
     #[serde(default)]
     pub service_mode: bool,
+    /// Only in an import's answer: the profile it added or updated. It differs from
+    /// `active_profile_id` when the import was kept in the list without switching to it
+    /// (connected, and switching would need a disconnect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1564,13 +1569,6 @@ async fn import_subscription(
         .await
         .map(Json)
         .map_err(|error| {
-            if error.profile_mutation() == Some(ProfileMutationError::Connected) {
-                return ApiError::new(
-                    StatusCode::CONFLICT,
-                    "import_requires_disconnect",
-                    "Отключите VPN, чтобы добавить подписку: новая подписка сразу становится активной.",
-                );
-            }
             profile_api_error(
                 error,
                 "Не удалось импортировать подписку. Проверьте ссылку и повторите попытку.",
@@ -2380,6 +2378,7 @@ impl<P: ProcessController> CoreRuntime<P> {
                 }),
             cores_ready: self.cores_live(),
             service_mode: self.service_active(),
+            imported_profile_id: None,
         }
     }
 
@@ -3994,6 +3993,148 @@ where
         );
     }
 
+    async fn connected_cleanly(&self) -> bool {
+        let state = self.inner.read().await;
+        !state.degraded && state.state.current() == CoreConnectionState::Connected
+    }
+
+    /// Adding a subscription never needs a disconnect. It is downloaded while the tunnel
+    /// stays up (a failure leaves the connection alone), kept in the list, and then switched
+    /// to exactly like a manual switch: in always-ready mode the connection moves to it; where
+    /// switching needs a disconnect, it waits in the list and the current connection stays.
+    async fn import_while_connected(&self, url: &str) -> Result<StatusDto, BackendError>
+    where
+        C: HttpClient + 'static,
+        P: 'static,
+        F: 'static,
+    {
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Storage,
+            ));
+        }
+        let existing = match run_blocking(|| self.store.find_exact_source(url)) {
+            Ok(existing) => existing,
+            Err(error) => {
+                return Err(BackendError::from_profile_mutation(
+                    self.map_profile_error_logged("import_lookup_failed", error)
+                        .await,
+                ));
+            }
+        };
+        if let Some(id) = existing.as_ref()
+            && self.store.active_id().as_ref() == Some(id)
+        {
+            // The connected subscription itself: adding it again refreshes it.
+            let mut status = Backend::refresh_subscription(self).await?;
+            status.imported_profile_id = Some(id.as_str().to_owned());
+            return Ok(status);
+        }
+        let staging = AtomicSnapshot::default();
+        let (snapshot, _) = self
+            .fetch_subscription(url, &staging)
+            .await
+            .map_err(BackendError::from_profile_mutation)?
+            .into_parts();
+        let id = {
+            let _operation = self.operation.lock().await;
+            self.store_inactive_profile_locked(existing, snapshot)
+                .await
+                .map_err(BackendError::from_profile_mutation)?
+        };
+        let imported_profile_id = Some(id.as_str().to_owned());
+        let mut status = match Backend::activate_subscription(self, id).await {
+            Ok(status) => status,
+            // Switching needs a disconnect in this mode: the subscription waits in the list.
+            Err(error) if error.profile_mutation() == Some(ProfileMutationError::Connected) => {
+                self.current_status().await
+            }
+            // Added, but the switch failed: the list has changed all the same.
+            Err(_) => {
+                return Err(BackendError::from_profile_mutation(
+                    ProfileMutationError::Committed,
+                ));
+            }
+        };
+        status.imported_profile_id = imported_profile_id;
+        Ok(status)
+    }
+
+    /// Stores a downloaded subscription without touching the active profile or the live
+    /// connection: as a new profile, or over the inactive profile with the same link.
+    async fn store_inactive_profile_locked(
+        &self,
+        existing: Option<ProfileId>,
+        snapshot: Arc<Snapshot>,
+    ) -> Result<ProfileId, ProfileMutationError> {
+        let (id, previous, maintenance_debt) = match existing {
+            Some(id) => {
+                let previous = match run_blocking(|| self.store.profile_snapshot(&id)) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        return Err(self
+                            .map_profile_error_logged("import_previous_load_failed", error)
+                            .await);
+                    }
+                };
+                let debt = match run_blocking(|| self.store.replace_profile(&id, snapshot)) {
+                    Ok(_) => false,
+                    Err(error) if error.mutation_committed() => true,
+                    Err(error) => {
+                        return Err(self
+                            .map_profile_error_logged("import_replace_failed", error)
+                            .await);
+                    }
+                };
+                (id, Some(previous), debt)
+            }
+            None => match run_blocking(|| self.store.add_profile(snapshot)) {
+                Ok(id) => (id, None, false),
+                Err(
+                    ProfileError::IndexMaintenanceDebt { id, .. }
+                    | ProfileError::CleanupDebt {
+                        id,
+                        mutation_committed: true,
+                        ..
+                    },
+                ) => (id, None, true),
+                Err(error) => {
+                    return Err(self
+                        .map_profile_error_logged("import_create_failed", error)
+                        .await);
+                }
+            },
+        };
+        let (revision, physical_generation, persisted) =
+            run_blocking(|| self.store.profile_snapshot_generation(&id))
+                .map_err(|_| ProfileMutationError::Committed)?;
+        if let Some((previous_revision, previous)) = previous {
+            run_blocking(|| {
+                carry_forward_selections(
+                    &self.store,
+                    &id,
+                    previous_revision,
+                    &previous,
+                    revision,
+                    &persisted,
+                )
+            })
+            .map_err(|_| ProfileMutationError::Committed)?;
+        }
+        self.retain_profile_logo(&id, physical_generation, &persisted);
+        self.inner.write().await.push_event(
+            Severity::Info,
+            Component::Subscription,
+            "import",
+            "Subscription imported.",
+        );
+        if maintenance_debt {
+            self.record_maintenance_debt("profile_import").await;
+        }
+        Ok(id)
+    }
+
     async fn import_profile_locked(&self, url: &str) -> Result<StatusDto, ProfileMutationError>
     where
         C: 'static,
@@ -4380,13 +4521,19 @@ where
         &self,
         request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
+        if self.connected_cleanly().await {
+            return self.import_while_connected(&request.url).await;
+        }
         let result = {
             let _operation = self.operation.lock().await;
             self.import_profile_locked(&request.url)
                 .await
                 .map_err(BackendError::from_profile_mutation)
         };
-        self.rewarm_after(result).await
+        self.rewarm_after(result).await.map(|mut status| {
+            status.imported_profile_id = status.active_profile_id.clone();
+            status
+        })
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {
@@ -5522,6 +5669,7 @@ impl MemoryState {
             subscription: None,
             cores_ready: false,
             service_mode: false,
+            imported_profile_id: None,
         }
     }
 
@@ -5591,15 +5739,21 @@ impl Backend for MemoryBackend {
         request: ImportSubscriptionRequest,
     ) -> Result<StatusDto, BackendError> {
         let mut state = self.inner.write().await;
-        state.require_mutable()?;
+        if state.connection == ConnectionState::Connecting {
+            return Err(BackendError::from_profile_mutation(
+                ProfileMutationError::Connected,
+            ));
+        }
+        // Connected: the subscription is added to the list and the connection stays as it is.
+        let keep_active = state.connection == ConnectionState::Connected;
         let source_url = request.url.trim();
-        if let Some(existing_id) = state
+        let imported_id = if let Some(existing_id) = state
             .profiles
             .iter()
             .find(|profile| profile.source_url == source_url)
             .map(|profile| profile.id.clone())
         {
-            state.active_profile_id = Some(existing_id);
+            existing_id
         } else {
             if state.profiles.len() >= MAX_PROFILES {
                 return Err(BackendError::from_profile_mutation(
@@ -5618,11 +5772,16 @@ impl Backend for MemoryBackend {
                 source_url: source_url.to_owned(),
                 display_name,
             });
-            state.active_profile_id = Some(id);
+            id
+        };
+        if !keep_active {
+            state.active_profile_id = Some(imported_id.clone());
+            state.connection = ConnectionState::Ready;
         }
-        state.connection = ConnectionState::Ready;
         state.push_event("info", "Подписка импортирована.");
-        Ok(state.status())
+        let mut status = state.status();
+        status.imported_profile_id = Some(imported_id.as_str().to_owned());
+        Ok(status)
     }
 
     async fn refresh_subscription(&self) -> Result<StatusDto, BackendError> {

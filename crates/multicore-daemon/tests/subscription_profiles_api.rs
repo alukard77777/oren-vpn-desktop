@@ -30,6 +30,7 @@ impl Backend for MutationErrorBackend {
             subscription: None,
             cores_ready: false,
             service_mode: false,
+            imported_profile_id: None,
         })
     }
 
@@ -515,4 +516,25 @@ async fn backend_storage_and_degraded_conflicts_use_exact_redacted_errors() {
         assert!(!serialized.contains("Connected"));
         assert!(!serialized.contains("https://"));
     }
+}
+
+#[tokio::test]
+async fn importing_while_connected_answers_with_the_added_profile_and_keeps_the_connection() {
+    let app = app();
+    let first = import(&app, "https://first.invalid/sub")
+        .await
+        .active_profile_id
+        .unwrap();
+    app.clone()
+        .oneshot(request(Method::POST, "/v1/connect", Body::empty()))
+        .await
+        .unwrap();
+
+    let added = import(&app, "https://second.invalid/sub").await;
+
+    assert_eq!(added.state, ConnectionState::Connected);
+    assert_eq!(added.active_profile_id.as_deref(), Some(first.as_str()));
+    let added_id = added.imported_profile_id.expect("the added profile");
+    assert_ne!(added_id, first);
+    assert_eq!(list(&app).await.profiles.len(), 2);
 }
