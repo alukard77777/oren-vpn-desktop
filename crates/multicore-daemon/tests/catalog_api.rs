@@ -973,7 +973,11 @@ proxy-groups:
                 }
                 UA_GROUP_ICON if !url.ends_with("missing.svg") => HttpResponse::new(
                     200,
-                    br#"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='#4c9dff'/></svg>"#.to_vec(),
+                    format!(
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='{}'/></svg>",
+                        if url.ends_with("main.svg") { "#4c9dff" } else { "#30d158" }
+                    )
+                    .into_bytes(),
                     std::iter::empty::<(&str, &str)>(),
                 ),
                 _ => return Err(FetchError::Network),
@@ -1003,10 +1007,7 @@ async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
     let main = &catalog.groups[0];
     assert_eq!(main.label, "Main");
     let main_icon = main.icon_id.clone().expect("main group icon");
-    assert_eq!(
-        main_icon,
-        multicore_core::group_icon_key("https://icons.example/main.svg")
-    );
+    assert_eq!(main_icon.len(), 32);
     // A node that is itself a group carries that group's icon.
     assert_eq!(main.nodes[0].label, "Auto");
     let auto_icon = main.nodes[0].icon_id.clone().expect("auto group icon");

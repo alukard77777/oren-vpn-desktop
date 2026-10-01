@@ -39,7 +39,7 @@ pub struct Snapshot {
     service_logo_unfetched: bool,
     /// Normalized PNGs of Mihomo `proxy-groups[].icon` images, keyed by `group_icon_key`
     /// of the icon URL. Persisted as `group-icons.json` in the snapshot generation.
-    group_icons: BTreeMap<String, Vec<u8>>,
+    group_icons: BTreeMap<String, GroupIcon>,
     /// Icon URLs that could not be downloaded this time (never persisted); see
     /// `with_service_logo_carried_from`.
     group_icons_unfetched: BTreeSet<String>,
@@ -52,10 +52,31 @@ const MAX_GROUP_ICONS_FILE_BYTES: u64 =
     (MAX_GROUP_ICONS * MAX_GROUP_ICON_OUTPUT_BYTES * 4 / 3 + 64 * 1024) as u64;
 
 /// A stable, URL-free identifier for a group icon URL (the first 128 bits of its SHA-256 in
-/// hex): the on-disk cache key and the opaque id the daemon hands to the UI.
+/// hex): the on-disk cache key of that URL's image.
 pub fn group_icon_key(url: &str) -> String {
+    group_icon_key_bytes(url.as_bytes())
+}
+
+/// A downloaded group icon and its content id: the id the UI sees changes whenever the image
+/// does, so a provider swapping the picture behind the same URL is never shown stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupIcon {
+    id: String,
+    png: Vec<u8>,
+}
+
+impl GroupIcon {
+    fn new(png: Vec<u8>) -> Self {
+        Self {
+            id: group_icon_key_bytes(&png),
+            png,
+        }
+    }
+}
+
+fn group_icon_key_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(url.as_bytes())
+    Sha256::digest(bytes)
         .iter()
         .take(16)
         .map(|byte| format!("{byte:02x}"))
@@ -359,7 +380,7 @@ impl Snapshot {
 
     pub(crate) fn set_group_icon_png(&mut self, key: String, png: Vec<u8>) {
         self.group_icons_unfetched.remove(&key);
-        self.group_icons.insert(key, png);
+        self.group_icons.insert(key, GroupIcon::new(png));
     }
 
     pub(crate) fn mark_group_icon_unfetched(&mut self, key: String) {
@@ -367,8 +388,8 @@ impl Snapshot {
         self.group_icons_unfetched.insert(key);
     }
 
-    /// The opaque id of the downloaded icon of the first proxy group named `group_name`, when
-    /// that group names an icon image and the image is available.
+    /// The opaque content id of the downloaded icon of the first proxy group named
+    /// `group_name`, when that group names an icon image and the image is available.
     pub fn group_icon_id(&self, group_name: &str) -> Option<String> {
         let icon = self
             .mihomo
@@ -378,12 +399,15 @@ impl Snapshot {
             .icon
             .as_deref()?;
         let key = group_icon_key(&validate_url(icon, false, true)?);
-        self.group_icons.contains_key(&key).then_some(key)
+        self.group_icons.get(&key).map(|icon| icon.id.clone())
     }
 
     /// The canonical PNG behind a `group_icon_id`.
     pub fn group_icon_png(&self, id: &str) -> Option<&[u8]> {
-        self.group_icons.get(id).map(Vec::as_slice)
+        self.group_icons
+            .values()
+            .find(|icon| icon.id == id)
+            .map(|icon| icon.png.as_slice())
     }
 
     pub fn service_logo_path(&self) -> Option<&Path> {
@@ -1946,14 +1970,14 @@ fn load_generation(directory: &DirectoryCapability) -> Option<Snapshot> {
     Some(snapshot)
 }
 
-fn encode_group_icons(icons: &BTreeMap<String, Vec<u8>>) -> io::Result<Vec<u8>> {
+fn encode_group_icons(icons: &BTreeMap<String, GroupIcon>) -> io::Result<Vec<u8>> {
     use base64::Engine as _;
     let encoded: BTreeMap<&str, String> = icons
         .iter()
-        .map(|(key, png)| {
+        .map(|(key, icon)| {
             (
                 key.as_str(),
-                base64::engine::general_purpose::STANDARD.encode(png),
+                base64::engine::general_purpose::STANDARD.encode(&icon.png),
             )
         })
         .collect();
@@ -1961,7 +1985,7 @@ fn encode_group_icons(icons: &BTreeMap<String, Vec<u8>>) -> io::Result<Vec<u8>> 
 }
 
 /// Every entry is re-validated: a damaged or foreign entry is dropped, never shown.
-fn decode_group_icons(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+fn decode_group_icons(bytes: &[u8]) -> BTreeMap<String, GroupIcon> {
     use base64::Engine as _;
     let Ok(encoded) = serde_json::from_slice::<BTreeMap<String, String>>(bytes) else {
         return BTreeMap::new();
@@ -1974,7 +1998,7 @@ fn decode_group_icons(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
             let png = base64::engine::general_purpose::STANDARD
                 .decode(value)
                 .ok()?;
-            is_canonical_group_icon(&png).then_some((key, png))
+            is_canonical_group_icon(&png).then(|| (key, GroupIcon::new(png)))
         })
         .collect()
 }

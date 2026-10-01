@@ -718,7 +718,8 @@ async fn group_icons_are_fetched_once_per_https_url_persisted_and_carried_over()
         ]
     );
     let main = first.group_icon_id("Main").expect("main icon");
-    assert_eq!(main, group_icon_key("https://icons.example/main.png"));
+    assert_eq!(main.len(), 32);
+    assert_ne!(main, group_icon_key("https://icons.example/main.png"));
     assert_eq!(first.group_icon_id("Dup").as_deref(), Some(main.as_str()));
     assert!(first.group_icon_id("Auto").is_some());
     assert!(first.group_icon_id("Plain").is_none());
