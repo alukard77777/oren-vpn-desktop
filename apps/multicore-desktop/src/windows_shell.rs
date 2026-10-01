@@ -34,6 +34,53 @@ pub fn apply_tray_popup_native_rounding(window: &slint::winit_030::winit::window
 #[cfg(not(target_os = "windows"))]
 pub fn apply_tray_popup_native_rounding(_window: &slint::winit_030::winit::window::Window) {}
 
+/// Moves and resizes the tray popup in one step, so the corner at the tray does
+/// not jitter while an opposite edge is dragged.
+pub fn set_tray_popup_rect(window: &slint::winit_030::winit::window::Window, rect: PhysicalRect) {
+    #[cfg(target_os = "windows")]
+    {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+        };
+        if let Ok(handle) = window.window_handle()
+            && let RawWindowHandle::Win32(win32) = handle.as_raw()
+        {
+            let moved = unsafe {
+                SetWindowPos(
+                    win32.hwnd.get() as _,
+                    std::ptr::null_mut(),
+                    rect.x,
+                    rect.y,
+                    rect.width as i32,
+                    rect.height as i32,
+                    SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+                )
+            };
+            if moved != 0 {
+                return;
+            }
+        }
+    }
+    use slint::winit_030::winit::dpi::{PhysicalPosition, PhysicalSize};
+    window.set_outer_position(PhysicalPosition::new(rect.x, rect.y));
+    let _ = window.request_inner_size(PhysicalSize::new(rect.width, rect.height));
+}
+
+/// The pointer in physical desktop coordinates, where the platform reports it.
+#[cfg(target_os = "windows")]
+pub fn global_cursor_position() -> Option<(i32, i32)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut point = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn global_cursor_position() -> Option<(i32, i32)> {
+    None
+}
+
 #[cfg(test)]
 pub const RESIZE_BORDER: u32 = 6;
 
@@ -229,6 +276,159 @@ fn place_tray_popup_on_monitor(
     PhysicalPosition {
         x: desired_x.clamp(min_x, max_x) as i32,
         y: desired_y.clamp(min_y, max_y) as i32,
+    }
+}
+
+/// Edges of the tray popup that resize it: the ones away from the tray corner it
+/// is anchored to (a bottom taskbar: top and left).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayPopupGrip {
+    pub up: bool,
+    pub left: bool,
+}
+
+/// The monitor whose work area the tray popup opens in.
+pub fn tray_popup_monitor(
+    anchor: PhysicalPosition,
+    monitors: &[MonitorRect],
+) -> Option<&MonitorRect> {
+    select_tray_monitor(anchor, monitors)
+}
+
+pub fn tray_popup_grip(anchor: PhysicalPosition, monitors: &[MonitorRect]) -> TrayPopupGrip {
+    let edge = select_tray_monitor(anchor, monitors).map_or(TrayTaskbarEdge::Bottom, |monitor| {
+        infer_taskbar_edge(anchor, monitor)
+    });
+    match edge {
+        TrayTaskbarEdge::Bottom | TrayTaskbarEdge::Right => TrayPopupGrip {
+            up: true,
+            left: true,
+        },
+        TrayTaskbarEdge::Top => TrayPopupGrip {
+            up: false,
+            left: true,
+        },
+        TrayTaskbarEdge::Left => TrayPopupGrip {
+            up: true,
+            left: false,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Tray popup bounds in logical pixels: the approved default is the minimum.
+pub const TRAY_POPUP_MIN: (u32, u32) = (304, 460);
+pub const TRAY_POPUP_MAX: (u32, u32) = (520, 900);
+
+/// The popup's physical size for a logical one: within its limits and the work
+/// area (minus the gap kept to the taskbar).
+pub fn tray_popup_size(
+    logical: (u32, u32),
+    scale_milli: u32,
+    work: Option<&MonitorRect>,
+) -> (u32, u32) {
+    const GAP: u32 = 20;
+    let scale = |value: u32| (u64::from(value) * u64::from(scale_milli.max(500)) / 1000) as u32;
+    let fit = |value: u32, min: u32, max: u32, room: Option<u32>| {
+        let max = room.map_or(scale(max), |room| scale(max).min(room.saturating_sub(GAP)));
+        scale(value.max(min)).min(max.max(scale(min)))
+    };
+    (
+        fit(
+            logical.0,
+            TRAY_POPUP_MIN.0,
+            TRAY_POPUP_MAX.0,
+            work.map(|work| work.width),
+        ),
+        fit(
+            logical.1,
+            TRAY_POPUP_MIN.1,
+            TRAY_POPUP_MAX.1,
+            work.map(|work| work.height),
+        ),
+    )
+}
+
+/// Which edges a tray-popup drag moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayResizeHandle {
+    pub horizontal: bool,
+    pub vertical: bool,
+}
+
+/// New popup bounds while an edge is dragged by `delta` (physical) from `start`:
+/// the corner at the tray stays put, the size stays within `min`/`max` and the
+/// grown edge never leaves the work area of the monitor the popup is on.
+pub fn resize_tray_popup(
+    start: PhysicalRect,
+    delta: (i32, i32),
+    handle: TrayResizeHandle,
+    grip: TrayPopupGrip,
+    limits: ((u32, u32), (u32, u32)),
+    monitors: &[MonitorRect],
+) -> PhysicalRect {
+    let (min, max) = limits;
+    let center = PhysicalPosition {
+        x: start.x.saturating_add((start.width / 2) as i32),
+        y: start.y.saturating_add((start.height / 2) as i32),
+    };
+    let work = select_tray_monitor(center, monitors);
+    let right = i64::from(start.x) + i64::from(start.width);
+    let bottom = i64::from(start.y) + i64::from(start.height);
+    let span = |size: u32, delta: i32, grows_back: bool, room: Option<i64>, min: u32, max: u32| {
+        let wanted = i64::from(size)
+            + if grows_back {
+                -i64::from(delta)
+            } else {
+                i64::from(delta)
+            };
+        let max = room.map_or(i64::from(max), |room| i64::from(max).min(room));
+        wanted.min(max).max(i64::from(min)) as u32
+    };
+    let width = if handle.horizontal {
+        let room = work.map(|work| {
+            if grip.left {
+                right - i64::from(work.x)
+            } else {
+                i64::from(work.x) + i64::from(work.width) - i64::from(start.x)
+            }
+        });
+        span(start.width, delta.0, grip.left, room, min.0, max.0)
+    } else {
+        start.width
+    };
+    let height = if handle.vertical {
+        let room = work.map(|work| {
+            if grip.up {
+                bottom - i64::from(work.y)
+            } else {
+                i64::from(work.y) + i64::from(work.height) - i64::from(start.y)
+            }
+        });
+        span(start.height, delta.1, grip.up, room, min.1, max.1)
+    } else {
+        start.height
+    };
+    PhysicalRect {
+        x: if grip.left {
+            (right - i64::from(width)) as i32
+        } else {
+            start.x
+        },
+        y: if grip.up {
+            (bottom - i64::from(height)) as i32
+        } else {
+            start.y
+        },
+        width,
+        height,
     }
 }
 
@@ -639,7 +839,96 @@ mod tests {
         next_maximized, parse_resize_edge, place_tray_popup, rail_grow_delta, rail_shrink_width,
         restore_bounds, restore_placement,
     };
+    use super::{
+        PhysicalRect, TrayPopupGrip, TrayResizeHandle, resize_tray_popup, tray_popup_grip,
+        tray_popup_size,
+    };
     use crate::preferences::WindowBounds;
+
+    const LIMITS: ((u32, u32), (u32, u32)) = ((304, 460), (520, 900));
+    const BOTH: TrayResizeHandle = TrayResizeHandle {
+        horizontal: true,
+        vertical: true,
+    };
+    const TOP: TrayResizeHandle = TrayResizeHandle {
+        horizontal: false,
+        vertical: true,
+    };
+
+    fn rect(x: i32, y: i32, width: u32, height: u32) -> PhysicalRect {
+        PhysicalRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn tray_popup_grows_from_the_edges_away_from_the_tray_corner() {
+        let monitors = [monitor(0, 0, 1_920, 1_040, true)];
+        let up_left = TrayPopupGrip {
+            up: true,
+            left: true,
+        };
+        assert_eq!(
+            tray_popup_grip(PhysicalPosition { x: 1_910, y: 1_070 }, &monitors),
+            up_left
+        );
+        assert_eq!(
+            tray_popup_grip(PhysicalPosition { x: -10, y: 900 }, &monitors),
+            TrayPopupGrip {
+                up: true,
+                left: false
+            }
+        );
+        let start = rect(1_606, 570, 304, 460);
+        // Dragging the top-left corner up-left grows it; the bottom-right stays.
+        let grown = resize_tray_popup(start, (-96, -180), BOTH, up_left, LIMITS, &monitors);
+        assert_eq!(grown, rect(1_510, 390, 400, 640));
+        // Only the top edge: the width is untouched.
+        let taller = resize_tray_popup(start, (-50, -40), TOP, up_left, LIMITS, &monitors);
+        assert_eq!(taller, rect(1_606, 530, 304, 500));
+        // Never below the minimum or above the maximum.
+        let small = resize_tray_popup(start, (200, 300), BOTH, up_left, LIMITS, &monitors);
+        assert_eq!(small, start);
+        let huge = resize_tray_popup(start, (-900, -900), BOTH, up_left, LIMITS, &monitors);
+        assert_eq!(huge, rect(1_390, 130, 520, 900));
+        // A short work area caps the height at its top edge.
+        let short = [monitor(0, 0, 1_920, 700, true)];
+        let low = rect(1_606, 230, 304, 460);
+        let capped = resize_tray_popup(low, (0, -500), TOP, up_left, LIMITS, &short);
+        assert_eq!(capped, rect(1_606, 0, 304, 690));
+        // A top panel (Linux): the popup hangs down and grows from its bottom edge.
+        let down_left = TrayPopupGrip {
+            up: false,
+            left: true,
+        };
+        let lower = resize_tray_popup(
+            rect(1_596, 34, 304, 460),
+            (0, 100),
+            TOP,
+            down_left,
+            LIMITS,
+            &monitors,
+        );
+        assert_eq!(lower, rect(1_596, 34, 304, 560));
+    }
+
+    #[test]
+    fn tray_popup_size_respects_limits_scale_and_work_area() {
+        let work = monitor(0, 0, 1_920, 1_040, true);
+        assert_eq!(tray_popup_size((400, 640), 1_000, Some(&work)), (400, 640));
+        assert_eq!(tray_popup_size((100, 100), 1_000, Some(&work)), (304, 460));
+        assert_eq!(
+            tray_popup_size((900, 2_000), 1_000, Some(&work)),
+            (520, 900)
+        );
+        assert_eq!(tray_popup_size((400, 640), 1_500, Some(&work)), (600, 960));
+        let short = monitor(0, 0, 1_366, 728, true);
+        assert_eq!(tray_popup_size((400, 900), 1_000, Some(&short)), (400, 708));
+        assert_eq!(tray_popup_size((400, 640), 1_000, None), (400, 640));
+    }
 
     #[test]
     fn rail_grows_by_the_full_width_when_there_is_room() {

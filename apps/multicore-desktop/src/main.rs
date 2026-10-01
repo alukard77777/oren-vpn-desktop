@@ -38,7 +38,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemon::{DaemonClient, DaemonError, UnavailableDaemonClient};
 use preferences::{
-    AppPreferences, PreferenceStore, RailGrowthPreference, VisiblePage, WindowBounds,
+    AppPreferences, PreferenceStore, RailGrowthPreference, TrayPopupSizePreference, VisiblePage,
+    WindowBounds,
 };
 use slint::winit_030::WinitWindowAccessor;
 use slint::{
@@ -60,10 +61,12 @@ use view_model::{
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
     COLLAPSED_RAIL_WIDTH, CloseDisposition, EXPANDED_RAIL_WIDTH, MinimizeDisposition, MonitorRect,
-    MonitorSignature, PhysicalPosition, RAIL_RESIZE_MS, RailGrowth,
-    apply_tray_popup_native_rounding, close_disposition, minimize_disposition, monitor_cap_changed,
+    MonitorSignature, PhysicalPosition, PhysicalRect, RAIL_RESIZE_MS, RailGrowth, TRAY_POPUP_MAX,
+    TRAY_POPUP_MIN, TrayPopupGrip, TrayResizeHandle, apply_tray_popup_native_rounding,
+    close_disposition, global_cursor_position, minimize_disposition, monitor_cap_changed,
     next_maximized, parse_resize_edge, place_tray_popup, rail_grow_delta, rail_resize_frame,
-    rail_shrink_width, restore_placement,
+    rail_shrink_width, resize_tray_popup, restore_placement, set_tray_popup_rect, tray_popup_grip,
+    tray_popup_monitor, tray_popup_size,
 };
 
 slint::include_modules!();
@@ -395,6 +398,13 @@ impl PersistenceTracker {
         self.desired.rail_growth = (delta > 0 && grown_width > 0).then(|| RailGrowthPreference {
             delta: delta.unsigned_abs(),
             grown_width: grown_width.unsigned_abs(),
+        });
+    }
+
+    fn set_tray_popup_size(&mut self, size: (u32, u32)) {
+        self.desired.tray_popup_size = Some(TrayPopupSizePreference {
+            width: size.0,
+            height: size.1,
         });
     }
 
@@ -922,6 +932,12 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     );
     let tray_popup = create_tray_popup()?;
     let tray_popup_open = Rc::new(Cell::new(false));
+    let tray_popup_geometry = Rc::new(TrayPopupGeometry::new(loaded_preferences.tray_popup_size));
+    wire_tray_popup_resize(
+        &tray_popup,
+        tray_popup_geometry.clone(),
+        preference_tracker.clone(),
+    );
     wire_tray_popup_actions(
         &tray_popup,
         ui.as_weak(),
@@ -964,6 +980,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
                     &tray_action_ui,
                     &tray_action_model,
                     &tray_interaction_popup_open,
+                    &tray_popup_geometry,
                     PhysicalPosition { x, y },
                 );
             }
@@ -2359,9 +2376,29 @@ fn sync_tray_live_state(popup: &TrayPopup, main: &AppWindow) {
         main.get_subscription_title()
     );
     mirror!(
-        get_subscription_expiry,
-        set_subscription_expiry,
-        main.get_subscription_expiry()
+        get_subscription_remaining,
+        set_subscription_remaining,
+        main.get_subscription_remaining()
+    );
+    mirror!(
+        get_subscription_days,
+        set_subscription_days,
+        main.get_subscription_days()
+    );
+    mirror!(
+        get_subscription_used_fraction,
+        set_subscription_used_fraction,
+        main.get_subscription_used_fraction()
+    );
+    mirror!(
+        get_subscription_unlimited,
+        set_subscription_unlimited,
+        main.get_subscription_unlimited()
+    );
+    mirror!(
+        get_subscription_quota_tone,
+        set_subscription_quota_tone,
+        main.get_subscription_quota_tone()
     );
     mirror!(
         get_subscription_failed,
@@ -2411,9 +2448,151 @@ fn sync_tray_live_state(popup: &TrayPopup, main: &AppWindow) {
 
 fn hide_tray_popup(weak: &slint::Weak<TrayPopup>, open: &Rc<Cell<bool>>) {
     if let Some(popup) = weak.upgrade() {
+        popup.set_resize_active("".into());
         let _ = popup.hide();
     }
     open.set(false);
+}
+
+/// Size and resize state of the tray popup, shared by opening and the edge drags.
+struct TrayPopupGeometry {
+    /// Logical size the user chose (or the default), restored on every open.
+    size: Cell<(u32, u32)>,
+    grip: Cell<TrayPopupGrip>,
+    drag: RefCell<Option<TrayResizeDrag>>,
+}
+
+struct TrayResizeDrag {
+    start: PhysicalRect,
+    cursor: Option<(i32, i32)>,
+    handle: TrayResizeHandle,
+    monitors: Vec<MonitorRect>,
+}
+
+impl TrayPopupGeometry {
+    fn new(saved: Option<TrayPopupSizePreference>) -> Self {
+        let size = saved.map_or(TRAY_POPUP_MIN, |size| {
+            (
+                size.width.clamp(TRAY_POPUP_MIN.0, TRAY_POPUP_MAX.0),
+                size.height.clamp(TRAY_POPUP_MIN.1, TRAY_POPUP_MAX.1),
+            )
+        });
+        Self {
+            size: Cell::new(size),
+            grip: Cell::new(TrayPopupGrip {
+                up: true,
+                left: true,
+            }),
+            drag: RefCell::new(None),
+        }
+    }
+}
+
+fn tray_popup_outer_rect(window: &slint::winit_030::winit::window::Window) -> Option<PhysicalRect> {
+    let position = window.outer_position().ok()?;
+    let size = window.outer_size();
+    Some(PhysicalRect {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    })
+}
+
+fn scaled_size(size: (u32, u32), scale: f64) -> (u32, u32) {
+    (
+        (f64::from(size.0) * scale).round() as u32,
+        (f64::from(size.1) * scale).round() as u32,
+    )
+}
+
+/// Edge drags on the popup: its tray corner stays put, the size is clamped to its
+/// limits and the work area, and the final size is remembered.
+fn wire_tray_popup_resize(
+    popup: &TrayPopup,
+    geometry: Rc<TrayPopupGeometry>,
+    preference_tracker: Arc<Mutex<PersistenceTracker>>,
+) {
+    let weak = popup.as_weak();
+    let start_geometry = geometry.clone();
+    popup.on_resize_start(move |handle| {
+        let Some(popup) = weak.upgrade() else {
+            return;
+        };
+        let drag = popup
+            .window()
+            .with_winit_window(|window| {
+                Some(TrayResizeDrag {
+                    start: tray_popup_outer_rect(window)?,
+                    cursor: global_cursor_position(),
+                    handle: TrayResizeHandle {
+                        horizontal: handle.as_str() != "v",
+                        vertical: handle.as_str() != "h",
+                    },
+                    monitors: monitor_rects(window),
+                })
+            })
+            .flatten();
+        *start_geometry.drag.borrow_mut() = drag;
+    });
+
+    let weak = popup.as_weak();
+    let drag_geometry = geometry.clone();
+    popup.on_resize_drag(move |dx, dy| {
+        let Some(popup) = weak.upgrade() else {
+            return;
+        };
+        let drag = drag_geometry.drag.borrow();
+        let Some(drag) = drag.as_ref() else {
+            return;
+        };
+        let grip = drag_geometry.grip.get();
+        let _ = popup.window().with_winit_window(|window| {
+            let scale = window.scale_factor();
+            let current = tray_popup_outer_rect(window).unwrap_or(drag.start);
+            // Absolute from the press where the desktop pointer is known; else the
+            // offset inside the popup, which resets as the dragged edge follows it.
+            let (base, delta) = match (drag.cursor, global_cursor_position()) {
+                (Some(start), Some(now)) => (drag.start, (now.0 - start.0, now.1 - start.1)),
+                _ => (
+                    current,
+                    (
+                        (f64::from(dx) * scale).round() as i32,
+                        (f64::from(dy) * scale).round() as i32,
+                    ),
+                ),
+            };
+            let limits = (
+                scaled_size(TRAY_POPUP_MIN, scale),
+                scaled_size(TRAY_POPUP_MAX, scale),
+            );
+            let next = resize_tray_popup(base, delta, drag.handle, grip, limits, &drag.monitors);
+            if next != current {
+                set_tray_popup_rect(window, next);
+            }
+        });
+    });
+
+    let weak = popup.as_weak();
+    popup.on_resize_end(move || {
+        geometry.drag.borrow_mut().take();
+        let Some(popup) = weak.upgrade() else {
+            return;
+        };
+        let scale = f64::from(popup.window().scale_factor());
+        let size = popup.window().size();
+        let logical = (
+            ((f64::from(size.width) / scale).round() as u32)
+                .clamp(TRAY_POPUP_MIN.0, TRAY_POPUP_MAX.0),
+            ((f64::from(size.height) / scale).round() as u32)
+                .clamp(TRAY_POPUP_MIN.1, TRAY_POPUP_MAX.1),
+        );
+        geometry.size.set(logical);
+        preference_tracker
+            .lock()
+            .expect("preference tracker lock")
+            .set_tray_popup_size(logical);
+    });
 }
 
 fn toggle_tray_popup(
@@ -2421,6 +2600,7 @@ fn toggle_tray_popup(
     main_weak: &slint::Weak<AppWindow>,
     model: &Arc<Mutex<DesktopViewModel>>,
     open: &Rc<Cell<bool>>,
+    geometry: &TrayPopupGeometry,
     anchor: PhysicalPosition,
 ) {
     if open.get() {
@@ -2440,22 +2620,41 @@ fn toggle_tray_popup(
         .window()
         .with_winit_window(monitor_rects)
         .unwrap_or_default();
-    let popup_size = popup
-        .window()
-        .with_winit_window(|window| window.outer_size())
-        .map(|size| (size.width, size.height))
-        .unwrap_or((304, 460));
-    if let Some(position) = place_tray_popup(anchor, popup_size, &monitors, None) {
-        let _ = popup.window().with_winit_window(|window| {
-            use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
-            use slint::winit_030::winit::window::WindowLevel;
-            apply_tray_popup_native_rounding(window);
-            window.set_window_level(WindowLevel::AlwaysOnTop);
-            window.set_outer_position(WinitPhysicalPosition::new(position.x, position.y));
-            window.focus_window();
-            window.request_redraw();
-        });
-    }
+    // The remembered size, fitted to this monitor, anchored at the tray corner;
+    // the edges away from that corner resize it.
+    let grip = tray_popup_grip(anchor, &monitors);
+    geometry.grip.set(grip);
+    popup.set_grow_up(grip.up);
+    popup.set_grow_left(grip.left);
+    let monitor = tray_popup_monitor(anchor, &monitors);
+    let _ = popup.window().with_winit_window(|window| {
+        use slint::winit_030::winit::dpi::PhysicalSize as WinitPhysicalSize;
+        use slint::winit_030::winit::window::WindowLevel;
+        let scale_milli = monitor.map_or_else(
+            || (window.scale_factor() * 1000.0).round() as u32,
+            |monitor| monitor.scale_milli,
+        );
+        let popup_size = tray_popup_size(geometry.size.get(), scale_milli, monitor);
+        apply_tray_popup_native_rounding(window);
+        window.set_window_level(WindowLevel::AlwaysOnTop);
+        match place_tray_popup(anchor, popup_size, &monitors, None) {
+            Some(position) => set_tray_popup_rect(
+                window,
+                PhysicalRect {
+                    x: position.x,
+                    y: position.y,
+                    width: popup_size.0,
+                    height: popup_size.1,
+                },
+            ),
+            None => {
+                let _ =
+                    window.request_inner_size(WinitPhysicalSize::new(popup_size.0, popup_size.1));
+            }
+        }
+        window.focus_window();
+        window.request_redraw();
+    });
     open.set(true);
 }
 
@@ -4587,6 +4786,13 @@ fn subscription_initial(name: &str) -> String {
         .unwrap_or_else(|| "П".into())
 }
 
+/// Share of the traffic limit used, for the ring gauges (0 without a limit).
+fn used_fraction(quota: &view_model::QuotaPresentation) -> f32 {
+    quota
+        .used_permille
+        .map_or(0.0, |permille| f32::from(permille) / 1000.0)
+}
+
 /// Stable 64-bit FNV-1a fingerprint of a provider notice (`None` when there is
 /// none). Stable across Rust versions, unlike `DefaultHasher`.
 fn announcement_fingerprint(text: &str) -> Option<String> {
@@ -4652,6 +4858,12 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_initial(subscription_initial(&snapshot.subscription.display_name).into());
     ui.set_subscription_usage(snapshot.subscription.usage.clone().into());
     ui.set_subscription_expiry(snapshot.subscription.expiry.clone().into());
+    let quota = &snapshot.subscription.quota;
+    ui.set_subscription_remaining(quota.remaining.clone().into());
+    ui.set_subscription_days(quota.days.clone().into());
+    ui.set_subscription_used_fraction(used_fraction(quota));
+    ui.set_subscription_unlimited(quota.used_permille.is_none());
+    ui.set_subscription_quota_tone(quota.tone.into());
     ui.set_subscription_updated(snapshot.subscription.updated.clone().into());
     ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
@@ -4710,6 +4922,12 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                         .map(|letter| letter.to_uppercase().to_string())
                         .unwrap_or_else(|| "M".into())
                         .into(),
+                    remaining: profile.quota.remaining.clone().into(),
+                    days: profile.quota.days.clone().into(),
+                    used_fraction: used_fraction(&profile.quota),
+                    unlimited: profile.quota.used_permille.is_none(),
+                    quota_tone: profile.quota.tone.into(),
+                    expired: profile.quota.expired,
                 }
             })
             .collect::<Vec<_>>();
@@ -5008,6 +5226,53 @@ mod window_tests {
     }
 
     #[test]
+    fn tray_popup_resizes_from_its_free_edges_and_remembers_the_size() {
+        let popup = include_str!("../ui/tray_popup.slint").replace("\r\n", "\n");
+        for required in [
+            "min-width: 304px;",
+            "min-height: 460px;",
+            "max-width: 520px;",
+            "max-height: 900px;",
+            "v-grip := TouchArea",
+            "h-grip := TouchArea",
+            "corner-grip := TouchArea",
+            "callback resize-drag(length, length);",
+            "Math.round(root.width / 1px) + \" × \" + Math.round(root.height / 1px)",
+            "if root.has-profile && !root.subscription-unlimited: Rectangle {",
+        ] {
+            assert!(
+                popup.contains(required),
+                "missing tray resize contract: {required}"
+            );
+        }
+        assert!(!popup.contains("width: 304px;\n    height: 460px;"));
+        let rust = include_str!("main.rs");
+        assert!(rust.contains("wire_tray_popup_resize("));
+        assert!(rust.contains(".set_tray_popup_size(logical)"));
+        assert!(rust.contains("TrayPopupGeometry::new(loaded_preferences.tray_popup_size)"));
+    }
+
+    #[test]
+    fn title_chip_motion_settles_without_running_timers() {
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
+        // Each phase timer runs only inside its phase; the spinner reads the clock
+        // only while visible and never under reduced motion.
+        for required in [
+            "running: root.chip-phase == \"logo\";",
+            "running: root.chip-phase == \"hold\";",
+            "running: root.chip-logo-entering;",
+            "root.chip-logo-entering = !root.reduced-motion;",
+            "transform-rotation: self.visible && !root.reduced-motion",
+            "if (root.subscription-refresh-error == \"\") {",
+        ] {
+            assert!(
+                app.contains(required),
+                "missing chip motion contract: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn tray_popup_uses_an_opaque_fallback_and_native_windows_rounding() {
         let popup = include_str!("../ui/tray_popup.slint");
         let rust = include_str!("main.rs");
@@ -5165,7 +5430,7 @@ mod window_tests {
             "subscription-refresh-action := FocusScope",
             "root.subscription-refresh-pending ? \"Подписка обновляется\" : \"Обновить подписку\"",
             "root.refresh-subscription();",
-            "accessible-description: root.subscription-title + \". Обновлено \" + root.subscription-updated",
+            "accessible-description: root.subscription-title + \", осталось \" + root.subscription-remaining + \", \" + root.subscription-days + \". Обновлено \" + root.subscription-updated",
             "announcement-popover := Rectangle",
             "announcement-copy := Text",
             "routes-heading := HorizontalLayout",
@@ -5184,7 +5449,7 @@ mod window_tests {
             .and_then(|source| source.split("announcement-bell := FocusScope").next())
             .expect("subscription refresh action source");
         for unchanged in [
-            "x: parent.chip-width + 6px;",
+            "x: parent.chip-width + 4px;",
             "y: 1px;",
             "width: 28px;",
             "height: 28px;",
@@ -5621,14 +5886,21 @@ mod window_tests {
                     .next()
             })
             .expect("title subscription switcher source");
-        // A bordered pill: surface at rest, lifted on hover, elevated while open.
+        // Variant C: a quiet chip (no pill) with the traffic ring, the logo in its
+        // spot during the refresh motion, and the compact quota after the name.
         assert!(switcher.contains(
-            "background: root.profile-menu-open ? Theme.elevated : chip-touch.has-hover ? #181c21 : Theme.surface;"
+            "background: root.profile-menu-open ? #ffffff14 : chip-touch.has-hover ? #ffffff0d : transparent;"
         ));
-        assert!(switcher.contains("border-radius: 8px;"));
-        assert!(switcher.contains("chip-avatar := Rectangle"));
-        assert!(switcher.contains("text: root.subscription-initial;"));
-        assert!(switcher.contains("chip-divider := Rectangle"));
+        assert!(switcher.contains("border-radius: 6px;"));
+        assert!(switcher.contains("chip-ring := QuotaRing"));
+        assert!(switcher.contains("chip-spinner := Path"));
+        assert!(switcher.contains("chip-logo := QuotaLogo"));
+        assert!(switcher.contains("letter: root.subscription-initial;"));
+        assert!(switcher.contains("text: root.chip-meta-text;"));
+        assert!(
+            ui.contains("\"· \" + root.subscription-remaining + \" · \" + root.subscription-days")
+        );
+        assert!(!switcher.contains("chip-divider := Rectangle"));
         assert!(switcher.contains("function toggle-menu(keyboard: bool)"));
         assert!(switcher.contains("root.profile-menu-keyboard-open = keyboard;"));
 
@@ -5637,13 +5909,19 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("// A taskbar restore").next())
             .expect("animated profile popover source");
-        // The menu hangs under the title chip, 8px left of the main pane.
+        // The menu hangs under the title chip, left-aligned with it.
         for required in [
-            "x: -8px;",
-            "width: Math.min(420px, parent.width - 16px);",
-            "height: Math.min(parent.height - 16px, root.profile-menu-content-height);",
+            "x: root.navigation-collapsed ? -8px : 8px;",
+            "width: Math.min(320px, parent.width - 16px);",
+            "height: Math.min(parent.height - 8px, root.profile-menu-content-height);",
             "opacity: root.profile-menu-open ? 1 : 0;",
-            "y: root.profile-menu-open ? 8px : 0px;",
+            "y: root.profile-menu-open ? -2px : -8px;",
+            "text: \"МОИ ПОДПИСКИ\";",
+            "text: \"ИСТЕКЛА\";",
+            "menu-add := FocusScope",
+            "menu-all := FocusScope",
+            "root.add-subscription();",
+            "root.local-page = \"subscriptions\";",
             "animate opacity { duration: 160ms; easing: ease-out; }",
             "animate y { duration: 160ms; easing: ease-out; }",
         ] {
@@ -5659,7 +5937,7 @@ mod window_tests {
         assert!(!ui.contains("text: \"Обн.\""));
         assert!(!ui.contains("text: \"×\""));
         assert!(!ui.contains("home-banner-offset"));
-        assert!(ui.contains("Math.min(288px, 16px + root.subscription-profiles.length * 54px)"));
+        assert!(ui.contains("Math.min(328px, 8px + root.subscription-profiles.length * 40px)"));
         assert!(!ui.contains("text: \"Профили\""));
         assert!(main.contains("model.finish_profile_list(token, result)"));
         assert!(main.contains("model.finish_profile_activation(token, result)"));

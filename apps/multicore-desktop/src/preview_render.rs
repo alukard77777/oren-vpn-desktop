@@ -49,21 +49,43 @@ fn output_dir() -> PathBuf {
         })
 }
 
-fn settle() {
+fn settle(steps: u32) {
     // Let entry animations (menu fade, modal fade) finish before capture.
-    for _ in 0..4 {
+    for _ in 0..steps {
         std::thread::sleep(Duration::from_millis(120));
         slint::platform::update_timers_and_animations();
     }
 }
 
+/// `MULTICORE_PREVIEW_ONLY=chip,tray` renders only scenarios starting with those prefixes.
+fn wanted(name: &str) -> bool {
+    std::env::var("MULTICORE_PREVIEW_ONLY").map_or(true, |only| {
+        only.split(',')
+            .map(str::trim)
+            .any(|prefix| !prefix.is_empty() && name.starts_with(prefix))
+    })
+}
+
 fn capture(component: &impl ComponentHandle, name: &str, width: u32, height: u32) {
+    capture_after(component, name, width, height, 4);
+}
+
+fn capture_after(
+    component: &impl ComponentHandle,
+    name: &str,
+    width: u32,
+    height: u32,
+    settle_steps: u32,
+) {
+    if !wanted(name) {
+        return;
+    }
     let window = LAST_WINDOW
         .with(|last| last.borrow().clone())
         .expect("preview window adapter");
     window.set_size(PhysicalSize::new(width, height));
     component.show().expect("show preview component");
-    settle();
+    settle(settle_steps);
     window.request_redraw();
     let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (width * height) as usize];
     window.draw_if_needed(|renderer| {
@@ -129,6 +151,7 @@ fn nodes(pending_selected: bool) -> ModelRc<UiCatalogNode> {
 }
 
 fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
+    // (id, title, usage, expiry, active, available, remaining, days, used, tone, expired)
     let rows = [
         (
             "p1",
@@ -137,6 +160,11 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
             "Срок неизвестен",
             true,
             true,
+            "∞ GiB",
+            "Бессрочно",
+            -1.0_f32,
+            "accent",
+            false,
         ),
         (
             "p2",
@@ -145,8 +173,25 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
             "Осталось 12 дней",
             false,
             true,
+            "87.6 GiB",
+            "12 дн.",
+            0.124,
+            "accent",
+            false,
         ),
-        ("p3", "Поездки", "Нет данных", "Срок истёк", false, false),
+        (
+            "p3",
+            "Поездки",
+            "Нет данных",
+            "Срок истёк",
+            false,
+            false,
+            "40.0 GiB",
+            "Срок истёк",
+            0.6,
+            "danger",
+            true,
+        ),
         (
             "p4",
             "Резерв с очень длинным названием провайдера подписки",
@@ -154,22 +199,47 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
             "Осталось 1 день",
             false,
             true,
+            "9.0 GiB",
+            "1 дн.",
+            0.9,
+            "warning",
+            false,
         ),
-        ("p5", "Пятая", "Нет данных", "Срок неизвестен", false, true),
+        (
+            "p5",
+            "Пятая",
+            "Нет данных",
+            "Срок неизвестен",
+            false,
+            true,
+            "∞ GiB",
+            "Бессрочно",
+            -1.0,
+            "accent",
+            false,
+        ),
     ]
     .into_iter()
     .take(count)
     .map(
-        |(id, title, usage, expiry, active, available)| UiSubscriptionProfile {
-            id: s(id),
-            title: s(title),
-            usage: s(usage),
-            expiry: s(expiry),
-            active,
-            available,
-            has_logo: false,
-            logo: Default::default(),
-            fallback: s(&title.chars().next().unwrap().to_string()),
+        |(id, title, usage, expiry, active, available, remaining, days, used, tone, expired)| {
+            UiSubscriptionProfile {
+                id: s(id),
+                title: s(title),
+                usage: s(usage),
+                expiry: s(expiry),
+                active,
+                available,
+                has_logo: false,
+                logo: Default::default(),
+                fallback: s(&title.chars().next().unwrap().to_string()),
+                remaining: s(remaining),
+                days: s(days),
+                used_fraction: used.max(0.0),
+                unlimited: used < 0.0,
+                quota_tone: s(tone),
+                expired,
+            }
         },
     )
     .collect::<Vec<_>>();
@@ -223,6 +293,22 @@ fn connected(ui: &AppWindow) {
     ui.set_subscription_management_enabled(false);
     ui.set_profile_switch_locked(true);
     ui.set_catalog_selection_enabled(true);
+}
+
+/// Title chip on Fjord VPN with a quota (remaining, days, share used, tone).
+fn chip(ui: &AppWindow, remaining: &str, days: &str, used: f32, tone: &str) {
+    connected(ui);
+    ui.set_subscription_title(s("Fjord VPN"));
+    ui.set_subscription_initial(s("F"));
+    ui.set_subscription_remaining(s(remaining));
+    ui.set_subscription_days(s(days));
+    ui.set_subscription_used_fraction(used.max(0.0));
+    ui.set_subscription_unlimited(used < 0.0);
+    ui.set_subscription_quota_tone(s(tone));
+}
+
+fn chip_normal(ui: &AppWindow) {
+    chip(ui, "87.6 GiB", "12 дн.", 0.124, "accent");
 }
 
 fn events() -> ModelRc<UiEvent> {
@@ -329,6 +415,55 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_import_error(s(
                 "Не удалось добавить подписку. Проверьте URL и повторите попытку.",
             ));
+        }),
+        ("chip-normal", 840, 720, chip_normal),
+        ("chip-warning", 840, 720, |ui| {
+            chip(ui, "9.0 GiB", "2 дн.", 0.91, "warning");
+        }),
+        ("chip-expired", 840, 720, |ui| {
+            chip(ui, "40.0 GiB", "Срок истёк", 0.6, "danger");
+        }),
+        ("chip-unlimited", 840, 720, |ui| {
+            chip(ui, "∞ GiB", "Бессрочно", -1.0, "accent");
+        }),
+        ("chip-unlimited-days", 840, 720, |ui| {
+            chip(ui, "∞ GiB", "12 дн.", -1.0, "accent");
+        }),
+        ("chip-refresh-error", 840, 720, |ui| {
+            chip_normal(ui);
+            ui.set_subscription_refresh_error(s("Не удалось обновить подписку"));
+        }),
+        ("chip-long-name-min", 700, 620, |ui| {
+            chip_normal(ui);
+            ui.set_subscription_title(s("Резерв с очень длинным названием провайдера подписки"));
+        }),
+        ("chip-long-name-expanded-min", 876, 620, |ui| {
+            chip_normal(ui);
+            ui.set_navigation_collapsed(false);
+            ui.set_subscription_title(s("Резерв с очень длинным названием провайдера подписки"));
+        }),
+        ("chip-motion-1-refreshing", 840, 720, |ui| {
+            chip_normal(ui);
+            ui.set_subscription_refresh_pending(true);
+            ui.set_chip_phase(s("refreshing"));
+        }),
+        ("chip-motion-3-hold", 840, 720, |ui| {
+            chip(ui, "86.4 GiB", "12 дн.", 0.136, "accent");
+            ui.set_chip_phase(s("hold"));
+        }),
+        ("chip-motion-4-settled", 840, 720, |ui| {
+            chip(ui, "86.4 GiB", "12 дн.", 0.136, "accent");
+        }),
+        ("chip-menu", 840, 720, |ui| {
+            chip_normal(ui);
+            ui.set_profile_switch_locked(false);
+            ui.set_subscription_profiles(profiles(5));
+            ui.set_active_panel(s("subscription"));
+        }),
+        ("chip-menu-locked-min", 700, 620, |ui| {
+            chip_normal(ui);
+            ui.set_subscription_profiles(profiles(4));
+            ui.set_active_panel(s("subscription"));
         }),
         ("home-ready", 840, 720, ready),
         ("home-ready-min", 700, 620, ready),
@@ -749,6 +884,134 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
     )
 }
 
+/// Plays a real refresh (pending on, then off with a new quota) with full motion
+/// and stacks the title-bar strip at fixed times into one image, top to bottom:
+/// before, refreshing, then roughly every 100 ms (wall clock) up to 2.4 s.
+fn chip_motion_strip(unlimited: bool) {
+    const WIDTH: u32 = 840;
+    const HEIGHT: u32 = 720;
+    const STRIP: (u32, u32, u32, u32) = (40, 0, 300, 50);
+    let ui = AppWindow::new().expect("create app window");
+    if unlimited {
+        chip(&ui, "∞ GiB", "12 дн.", -1.0, "accent");
+    } else {
+        chip_normal(&ui);
+    }
+    ui.set_reduced_motion(false);
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(WIDTH, HEIGHT));
+    ui.show().expect("show preview component");
+    let mut frames = Vec::new();
+    let mut render = |frames: &mut Vec<image::RgbImage>, keep: bool| {
+        window.request_redraw();
+        let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (WIDTH * HEIGHT) as usize];
+        window.draw_if_needed(|renderer| {
+            renderer.render(&mut buffer, WIDTH as usize);
+        });
+        if keep {
+            let bytes = buffer
+                .iter()
+                .flat_map(|pixel| [pixel.r, pixel.g, pixel.b])
+                .collect::<Vec<_>>();
+            let full = image::RgbImage::from_raw(WIDTH, HEIGHT, bytes).expect("frame");
+            frames.push(
+                image::imageops::crop_imm(&full, STRIP.0, STRIP.1, STRIP.2, STRIP.3).to_image(),
+            );
+        }
+    };
+    let tick = |ms: u64| {
+        std::thread::sleep(Duration::from_millis(ms));
+        slint::platform::update_timers_and_animations();
+    };
+    tick(16);
+    render(&mut frames, true);
+    ui.set_subscription_refresh_pending(true);
+    for _ in 0..10 {
+        tick(16);
+        render(&mut frames, false);
+    }
+    render(&mut frames, true);
+    if !unlimited {
+        ui.set_subscription_remaining(s("86.4 GiB"));
+        ui.set_subscription_used_fraction(0.136);
+    }
+    ui.set_subscription_refresh_pending(false);
+    // Real time: a software frame takes tens of ms, and Slint's timers and
+    // animations run on the wall clock.
+    let started = std::time::Instant::now();
+    let mut next_keep = 0;
+    while started.elapsed() <= Duration::from_millis(2_400) {
+        tick(16);
+        let elapsed = started.elapsed().as_millis();
+        let keep = elapsed >= next_keep;
+        if keep {
+            next_keep += 100;
+        }
+        render(&mut frames, keep);
+    }
+    ui.hide().expect("hide preview component");
+    let scale = 2;
+    let mut sheet = image::RgbImage::from_pixel(
+        STRIP.2 * scale,
+        frames.len() as u32 * (STRIP.3 * scale + 4),
+        image::Rgb([60, 0, 60]),
+    );
+    for (index, frame) in frames.iter().enumerate() {
+        let big = image::imageops::resize(
+            frame,
+            STRIP.2 * scale,
+            STRIP.3 * scale,
+            image::imageops::FilterType::Nearest,
+        );
+        image::imageops::replace(
+            &mut sheet,
+            &big,
+            0,
+            index as i64 * i64::from(STRIP.3 * scale + 4),
+        );
+    }
+    let directory = output_dir();
+    std::fs::create_dir_all(&directory).expect("create preview directory");
+    let name = if unlimited {
+        "chip-motion-strip-unlimited.png"
+    } else {
+        "chip-motion-strip.png"
+    };
+    let path = directory.join(name);
+    sheet.save(&path).expect("save motion strip");
+    println!("{}", path.display());
+}
+
+fn tray_many_rows() -> ModelRc<TrayMenuRow> {
+    let rows = [
+        ("n1", "🌍", "Автовыбор", "42 мс", "success", true),
+        ("n2", "🇸🇪", "Sweden", "42 мс", "success", false),
+        ("n3", "🇩🇪", "Germany", "96 мс", "warning", false),
+        ("n4", "🇳🇱", "Netherlands", "48 мс", "success", false),
+        ("n5", "🇫🇮", "Finland", "52 мс", "success", false),
+        ("n6", "🇵🇱", "Poland", "61 мс", "success", false),
+        ("n7", "🇺🇸", "United States", "144 мс", "warning", false),
+        ("n8", "🇯🇵", "Japan", "220 мс", "warning", false),
+        ("n9", "🇦🇱", "Albania", "Тайм-аут", "danger", false),
+    ]
+    .into_iter()
+    .map(|(id, icon, label, latency, tone, selected)| TrayMenuRow {
+        id: s(id),
+        group_id: s("g1"),
+        icon: s(icon),
+        icon_image: crate::emoji_images::image_for(icon),
+        label: s(label),
+        detail: s(latency),
+        tone: s(tone),
+        selected,
+        enabled: true,
+    })
+    .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
 fn tray_connected(popup: &TrayPopup) {
     let (groups, nodes) = tray_rows();
     popup.set_status_text(s("В сети · Автовыбор"));
@@ -757,7 +1020,10 @@ fn tray_connected(popup: &TrayPopup) {
     popup.set_group_rows(groups);
     popup.set_node_rows(nodes);
     popup.set_subscription_title(s("Fjord VPN"));
-    popup.set_subscription_expiry(s("Бессрочно"));
+    popup.set_subscription_remaining(s("87.6 GiB"));
+    popup.set_subscription_days(s("12 дн."));
+    popup.set_subscription_used_fraction(0.124);
+    popup.set_subscription_unlimited(false);
     popup.set_toggle_title(s("Защита включена"));
     popup.set_toggle_on(true);
     popup.set_status_tone(s("success"));
@@ -772,9 +1038,24 @@ fn tray_connected(popup: &TrayPopup) {
 fn render_ui_previews() {
     slint::platform::set_platform(Box::new(PreviewPlatform)).expect("install preview platform");
     for (name, width, height, setup) in scenarios() {
+        if !wanted(name) {
+            continue;
+        }
         let ui = AppWindow::new().expect("create app window");
         setup(&ui);
         capture(&ui, name, width, height);
+    }
+
+    // Motion frame 2: the provider logo right after it popped in (before the
+    // 350 ms phase timer hands over to the hold).
+    let ui = AppWindow::new().expect("create app window");
+    chip(&ui, "86.4 GiB", "12 дн.", 0.136, "accent");
+    ui.set_chip_phase(s("logo"));
+    capture_after(&ui, "chip-motion-2-logo", 840, 720, 1);
+
+    if wanted("chip-motion-strip") {
+        chip_motion_strip(false);
+        chip_motion_strip(true);
     }
 
     // One window through expand → collapse, like a user toggling the rail while
@@ -802,6 +1083,26 @@ fn render_ui_previews() {
     let popup = TrayPopup::new().expect("create tray popup");
     tray_connected(&popup);
     capture(&popup, "tray-connected", 304, 460);
+
+    // Dragged larger by its top-left corner: accent edges and the size readout.
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_node_rows(tray_many_rows());
+    popup.set_resize_active(s("c"));
+    capture(&popup, "tray-resizing", 400, 640);
+
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_node_rows(tray_many_rows());
+    capture(&popup, "tray-large", 400, 640);
+
+    // No traffic limit: infinite traffic, no usage bar.
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_subscription_remaining(s("∞ GiB"));
+    popup.set_subscription_days(s("Бессрочно"));
+    popup.set_subscription_unlimited(true);
+    capture(&popup, "tray-unlimited", 304, 460);
 
     let popup = TrayPopup::new().expect("create tray popup");
     tray_connected(&popup);

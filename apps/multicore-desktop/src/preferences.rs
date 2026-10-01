@@ -55,6 +55,16 @@ pub struct AppPreferences {
     /// How much the window grew when the rail was expanded (logical px), so a
     /// collapse after a restart can still shrink it back.
     pub rail_growth: Option<RailGrowthPreference>,
+    /// Size the user dragged the tray popup to (logical px); default when absent.
+    pub tray_popup_size: Option<TrayPopupSizePreference>,
+}
+
+/// Tray popup size in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrayPopupSizePreference {
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Window growth from the expanded rail, in logical pixels.
@@ -82,6 +92,7 @@ impl Default for AppPreferences {
             announcement_seen: None,
             tun_enabled: true,
             rail_growth: None,
+            tray_popup_size: None,
         }
     }
 }
@@ -655,7 +666,7 @@ mod tests {
 
     use super::{
         AppPreferences, PREFERENCES_SCHEMA_VERSION, PreferenceStore, RailGrowthPreference,
-        VisiblePage, WindowBounds,
+        TrayPopupSizePreference, VisiblePage, WindowBounds,
     };
 
     #[test]
@@ -700,6 +711,10 @@ mod tests {
                 delta: 176,
                 grown_width: 1016,
             }),
+            tray_popup_size: Some(TrayPopupSizePreference {
+                width: 400,
+                height: 640,
+            }),
         };
 
         store.save(&expected).unwrap();
@@ -732,6 +747,7 @@ mod tests {
                 announcement_seen: None,
                 tun_enabled: true,
                 rail_growth: None,
+                tray_popup_size: None,
             }
         );
     }
