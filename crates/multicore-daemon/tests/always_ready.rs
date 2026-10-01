@@ -49,6 +49,9 @@ pub struct Recording {
     pub factory_entered: AtomicBool,
     /// When set, the factory reports that it staged anew instead of reusing the warm one.
     pub restage_reason: Mutex<Option<String>>,
+    /// The next `stop` waits here (a disconnect still tearing the tunnel down).
+    pub stop_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    pub stop_entered: AtomicBool,
 }
 
 pub struct RecordingController(pub Arc<Recording>);
@@ -78,6 +81,11 @@ impl ProcessController for RecordingController {
         engine: Engine,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>> {
         Box::pin(async move {
+            let gate = self.0.stop_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                self.0.stop_entered.store(true, Ordering::SeqCst);
+                gate.notified().await;
+            }
             self.0.calls.lock().unwrap().push((false, engine));
             Ok(())
         })
@@ -830,4 +838,159 @@ async fn the_unavailable_notice_is_cleared_once_the_service_is_back() {
     );
     h.backend.clear_notice("Служба MultiCore недоступна.").await;
     assert_eq!(h.backend.status().await.unwrap().message, None);
+}
+
+#[tokio::test]
+async fn a_connect_during_a_switch_waits_and_ends_on_the_new_profile() {
+    let h = harness(&[PROFILE_A, PROFILE_B]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let active = h.backend.status().await.unwrap().active_profile_id;
+    let (other, letter) = if active.as_deref() == Some(h.profiles[0].as_str()) {
+        (h.profiles[1].clone(), "b")
+    } else {
+        (h.profiles[0].clone(), "a")
+    };
+    // The switch's disconnect is held while the tunnel goes down.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *h.recording.stop_gate.lock().unwrap() = Some(gate.clone());
+    let switching = {
+        let backend = h.backend.clone();
+        let other = other.clone();
+        tokio::spawn(async move { Backend::activate_subscription(&*backend, other).await })
+    };
+    while !h.recording.stop_entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The user presses Connect in the middle of the switch.
+    let connecting = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.connect().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    let switched = tokio::time::timeout(PROMPT, switching)
+        .await
+        .expect("the switch finishes")
+        .unwrap();
+    let connected = tokio::time::timeout(PROMPT, connecting)
+        .await
+        .expect("the Connect finishes")
+        .unwrap();
+    let switched = switched.expect("the switch is not broken by the Connect");
+    let connected = connected.expect("the Connect is answered with the switched connection");
+    assert_eq!(switched.active_profile_id.as_deref(), Some(other.as_str()));
+    assert_eq!(connected.state, ConnectionState::Connected);
+    assert_eq!(connected.active_profile_id.as_deref(), Some(other.as_str()));
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(status.active_profile_id.as_deref(), Some(other.as_str()));
+    assert_eq!(h.seen.lock().unwrap().last(), Some(&letter));
+}
+
+#[tokio::test]
+async fn a_disconnect_during_a_switch_is_applied_after_it() {
+    let h = harness(&[PROFILE_A, PROFILE_B]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let active = h.backend.status().await.unwrap().active_profile_id;
+    let other = h
+        .profiles
+        .iter()
+        .find(|id| active.as_deref() != Some(id.as_str()))
+        .unwrap()
+        .clone();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *h.recording.stop_gate.lock().unwrap() = Some(gate.clone());
+    let switching = {
+        let backend = h.backend.clone();
+        let other = other.clone();
+        tokio::spawn(async move { Backend::activate_subscription(&*backend, other).await })
+    };
+    while !h.recording.stop_entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let disconnecting = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.disconnect().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    switching.await.unwrap().unwrap();
+    let status = disconnecting.await.unwrap().unwrap();
+    // The user's last word wins: no connection is resumed behind the Disconnect.
+    assert_eq!(status.state, ConnectionState::Ready);
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert_eq!(status.active_profile_id.as_deref(), Some(other.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_warm_up_superseded_by_a_failed_connect_is_not_reported_as_failed() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, false).await;
+    let (release, gate) = std::sync::mpsc::channel();
+    *h.recording.factory_gate.lock().unwrap() = Some(gate);
+    let warming = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.warm_up().await })
+    };
+    while !h.recording.factory_entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A Connect takes the session and fails; the warm-up's Prepare is then refused.
+    h.recording.fail_xray.store(true, Ordering::SeqCst);
+    assert!(h.backend.connect().await.is_err());
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Ready
+    );
+    release.send(()).unwrap();
+    assert!(
+        warming.await.unwrap().is_ok(),
+        "a superseded warm-up does not make the watcher back off"
+    );
+    let events = h.backend.events_after(0).await.unwrap();
+    assert!(
+        events.iter().all(|event| event.message != WARM_UP_FAILED),
+        "a refused warm-up is not a warm-up failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_warm_up_after_a_connection_cycle_prepares_nothing_and_asks_again() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, false).await;
+    let warm = h.backend.warm_requests();
+    // A warm-up stuck in its service probe...
+    let (release, gate) = std::sync::mpsc::channel();
+    *h.recording.factory_gate.lock().unwrap() = Some(gate);
+    let warming = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.warm_up().await })
+    };
+    while !h.recording.factory_entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // ...outlives a whole Connect and Disconnect.
+    h.backend.connect().await.unwrap();
+    h.backend.disconnect().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(50), warm.notified()).await;
+    release.send(()).unwrap();
+    warming.await.unwrap().unwrap();
+    assert_eq!(
+        *h.recording.calls.lock().unwrap(),
+        [
+            (true, Engine::Xray),
+            (true, Engine::Mihomo),
+            (false, Engine::Mihomo),
+            (false, Engine::Xray),
+        ],
+        "the stale warm-up does not Prepare its old generation"
+    );
+    tokio::time::timeout(PROMPT, warm.notified())
+        .await
+        .expect("a fresh warm-up is requested at once");
 }

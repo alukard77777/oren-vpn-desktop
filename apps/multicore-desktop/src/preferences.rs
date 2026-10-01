@@ -55,6 +55,15 @@ pub struct AppPreferences {
     /// How much the window grew when the rail was expanded (logical px), so a
     /// collapse after a restart can still shrink it back.
     pub rail_growth: Option<RailGrowthPreference>,
+    /// Linux: the AppImage whose hand-off notice ("Открыта установленная версия") was
+    /// dismissed, so it is shown once per AppImage file. Written only once set, so the
+    /// preferences of everyone else stay readable by older versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appimage_handoff_seen: Option<String>,
+    /// Windows per-user install: the one-time "Мгновенное подключение" offer of the service
+    /// was declined («Не сейчас»). Written only once set, like `appimage_handoff_seen`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub service_offer_dismissed: bool,
 }
 
 /// Window growth from the expanded rail, in logical pixels.
@@ -82,6 +91,8 @@ impl Default for AppPreferences {
             announcement_seen: None,
             tun_enabled: true,
             rail_growth: None,
+            appimage_handoff_seen: None,
+            service_offer_dismissed: false,
         }
     }
 }
@@ -700,6 +711,8 @@ mod tests {
                 delta: 176,
                 grown_width: 1016,
             }),
+            appimage_handoff_seen: Some("/home/me/MultiCore.AppImage".into()),
+            service_offer_dismissed: true,
         };
 
         store.save(&expected).unwrap();
@@ -732,8 +745,17 @@ mod tests {
                 announcement_seen: None,
                 tun_enabled: true,
                 rail_growth: None,
+                appimage_handoff_seen: None,
+                service_offer_dismissed: false,
             }
         );
+    }
+
+    #[test]
+    fn an_unset_hand_off_notice_is_not_written() {
+        let raw = serde_json::to_string(&AppPreferences::default()).unwrap();
+        assert!(!raw.contains("appimage_handoff_seen"));
+        assert!(!raw.contains("service_offer_dismissed"));
     }
 
     #[test]

@@ -2132,6 +2132,12 @@ where
     latency_permits: Arc<tokio::sync::Semaphore>,
     exit_now_cache: std::sync::Mutex<Option<ExitNowCache>>,
     operation: tokio::sync::Mutex<()>,
+    /// Held by a subscription switch or refresh across its disconnect, switch and reconnect,
+    /// and by a user Connect or Disconnect, so a user request never lands between those steps
+    /// (always taken before `operation`, never while holding it).
+    generation_change: tokio::sync::Mutex<()>,
+    /// Bumped by every Connect attempt: a warm-up that saw it change was superseded.
+    connect_attempts: AtomicU64,
     /// Options of the latest connect; background preparation reuses them.
     connect_options: std::sync::Mutex<ConnectOptions>,
     post_commit_load_fault: AtomicBool,
@@ -2621,6 +2627,8 @@ where
             latency_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES)),
             exit_now_cache: std::sync::Mutex::new(None),
             operation: tokio::sync::Mutex::new(()),
+            generation_change: tokio::sync::Mutex::new(()),
+            connect_attempts: AtomicU64::new(0),
             connect_options: std::sync::Mutex::new(ConnectOptions::default()),
             post_commit_load_fault: AtomicBool::new(false),
             warm_failure_reported: AtomicBool::new(false),
@@ -2675,6 +2683,7 @@ where
             }
             (snapshot, state.catalog.revision)
         };
+        let attempts = self.connect_attempts.load(Ordering::SeqCst);
         let mut options = self
             .connect_options
             .lock()
@@ -2685,6 +2694,13 @@ where
             Ok(prepared) => {
                 let controller = prepared.controller();
                 match prepared.activate() {
+                    // A Connect (and maybe its Disconnect) ran while the factory probed the
+                    // service: this generation is stale, so do not Prepare it over what the
+                    // connection left; warm again from the current state instead.
+                    Ok(()) if self.warm_up_superseded(attempts, revision).await => {
+                        self.request_warm();
+                        return Ok(());
+                    }
                     Ok(()) => controller
                         .start(Engine::Xray)
                         .await
@@ -2694,6 +2710,12 @@ where
             }
             Err(error) => Err(error),
         };
+        if result.is_err() && self.connect_attempts.load(Ordering::SeqCst) != attempts {
+            // Refused (`InUse`) because a Connect took the session meanwhile, even if that
+            // Connect has already failed back to Ready: not a warm-up failure. The Connect
+            // requested a fresh warm-up itself.
+            return Ok(());
+        }
         let mut state = self.inner.write().await;
         match result {
             Ok(()) => {
@@ -2723,6 +2745,14 @@ where
                 Err(error)
             }
         }
+    }
+
+    async fn warm_up_superseded(&self, attempts: u64, revision: u64) -> bool {
+        if self.connect_attempts.load(Ordering::SeqCst) != attempts {
+            return true;
+        }
+        let state = self.inner.read().await;
+        state.state.current() != CoreConnectionState::Ready || state.catalog.revision != revision
     }
 
     /// One tick of the always-ready watcher, after the readiness source was refreshed:
@@ -2843,9 +2873,229 @@ where
         result
     }
 
+    /// Reconnects after `pause_for_generation_change` (never after Quit).
+    async fn resume_after_generation_change(&self, options: ConnectOptions) {
+        if !self.shut_down.load(Ordering::SeqCst) {
+            let _ = self.connect_now(options).await;
+        }
+    }
+
+    async fn connect_now(&self, options: ConnectOptions) -> Result<StatusDto, BackendError> {
+        let _operation = self.operation.lock().await;
+        self.connect_attempts.fetch_add(1, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        if let Ok(mut current) = self.connect_options.lock() {
+            *current = options;
+        }
+        let (snapshot, queued_selections) = {
+            let state = self.inner.read().await;
+            if state.degraded {
+                return Err(BackendError::new());
+            }
+            if state.state.current() != CoreConnectionState::Ready {
+                return Err(BackendError::new());
+            }
+            let snapshot = state.snapshot.clone().ok_or_else(BackendError::new)?;
+            let queued_selections = selectable_groups(&snapshot)
+                .iter()
+                .zip(&state.explicit_selected_nodes)
+                .filter_map(|(group, node)| {
+                    node.as_ref()
+                        .map(|node| (group.name.to_owned(), node.clone()))
+                })
+                .collect::<Vec<_>>();
+            (snapshot, queued_selections)
+        };
+        let prepared = match run_blocking(|| (self.controller_factory)(&snapshot, options)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let mut state = self.inner.write().await;
+                state.message =
+                    Some("Не удалось подготовить сетевой интерфейс и адреса узлов.".to_owned());
+                state.push_event(
+                    Severity::Error,
+                    Component::Core,
+                    "runtime_publish",
+                    "Подготовка конфигурации перед подключением завершилась ошибкой.",
+                );
+                return Err(error);
+            }
+        };
+        let controller = prepared.controller();
+        let restage_reason = prepared.restage_reason.clone();
+        let prepared_ms = started.elapsed().as_millis();
+        if let Some(reason) = &restage_reason {
+            // The warm generation was not reused, so this Connect staged and prepared again
+            // (restarting the cores): the reason names which staged input differed.
+            let mut state = self.inner.write().await;
+            state.push_event_with_details(
+                Severity::Debug,
+                Component::Core,
+                "connect",
+                "Прогретая конфигурация не подошла, запуск подготовлен заново.",
+                json!({ "reason": reason, "prepare_ms": prepared_ms }),
+            );
+        }
+        if prepared.activate().is_err() {
+            let mut state = self.inner.write().await;
+            state.message = Some("Не удалось активировать конфигурацию запуска.".to_owned());
+            state.push_event(
+                Severity::Error,
+                Component::Core,
+                "runtime_publish",
+                "Активация конфигурации перед подключением завершилась ошибкой.",
+            );
+            return Err(BackendError::new());
+        }
+        {
+            let mut state = self.inner.write().await;
+            state.controller = Some(controller.clone());
+            state
+                .state
+                .transition(CoreConnectionState::Connecting)
+                .map_err(|_| BackendError::new())?;
+            state.message = Some(
+                if state.service_active() {
+                    TUNNEL_ON_MESSAGE
+                } else {
+                    CONNECTING_MESSAGE
+                }
+                .to_owned(),
+            );
+            state.push_event(
+                Severity::Info,
+                Component::Core,
+                "connect",
+                "Запускается подключение.",
+            );
+        }
+        // If this future is dropped before the outcome is recorded, leave a cleanable error.
+        let mut abandoned = AbandonedConnectGuard::new(&self.inner);
+
+        let result = Supervisor::new(controller.clone()).connect().await;
+        let started_ms = started.elapsed().as_millis();
+        if result.is_ok() {
+            for (group, node) in queued_selections {
+                if self.selector.select(&group, &node).await.is_err() {
+                    let rollback = Supervisor::new(controller.clone()).disconnect().await;
+                    let mut state = self.inner.write().await;
+                    abandoned.disarm();
+                    if rollback.is_ok() {
+                        state
+                            .state
+                            .transition(CoreConnectionState::Ready)
+                            .map_err(|_| BackendError::new())?;
+                        state.message = Some(
+                            "Mihomo did not apply the queued route selection; connection was rolled back."
+                                .to_owned(),
+                        );
+                        state.degraded = false;
+                    } else {
+                        state.mark_error(
+                            "Mihomo route selection failed and core rollback was incomplete.",
+                            true,
+                        );
+                    }
+                    state.push_event(
+                        Severity::Error,
+                        Component::Mihomo,
+                        "selection_replay",
+                        "Queued Mihomo selection replay failed during connection startup.",
+                    );
+                    return Err(BackendError::new());
+                }
+            }
+        }
+        let mut state = self.inner.write().await;
+        abandoned.disarm();
+        match result {
+            Ok(()) => {
+                state
+                    .state
+                    .transition(CoreConnectionState::Connected)
+                    .map_err(|_| BackendError::new())?;
+                state.connected_since_unix_ms = unix_timestamp_ms();
+                state.message = None;
+                state.degraded = false;
+                // Where a slow Connect spends its time: the factory (staging or reusing the
+                // warm generation), the cores' start (the service's tunnel switch) and the
+                // selection replay.
+                state.push_event_with_details(
+                    Severity::Info,
+                    Component::Core,
+                    "connect",
+                    "Подключение установлено.",
+                    json!({
+                        "prepare_ms": prepared_ms,
+                        "restaged": restage_reason.is_some(),
+                        "start_ms": started_ms.saturating_sub(prepared_ms),
+                        "replay_ms": started.elapsed().as_millis().saturating_sub(started_ms),
+                        "total_ms": started.elapsed().as_millis(),
+                    }),
+                );
+                // The watcher checks the new connection right away and keeps its short interval.
+                self.request_warm();
+                Ok(state.status())
+            }
+            Err(multicore_core::SupervisorError::StartFailed {
+                engine,
+                rollback_failed,
+                cause,
+            }) => {
+                self.request_warm();
+                if rollback_failed {
+                    state.mark_error(
+                        "Не удалось полностью отменить запуск. Выполните отключение для очистки.",
+                        true,
+                    );
+                } else {
+                    state
+                        .state
+                        .transition(CoreConnectionState::Ready)
+                        .map_err(|_| BackendError::new())?;
+                    state.message = Some(start_failure_message(engine, cause));
+                    state.degraded = false;
+                }
+                // The cause used to reach only the status line, so a copied
+                // log said "connect failed" with nothing to act on.
+                let shown = start_failure_message(engine, cause);
+                state.push_event_with_details(
+                    Severity::Error,
+                    Component::Core,
+                    "connect",
+                    "Запуск подключения завершился ошибкой.",
+                    json!({
+                        "engine": format!("{engine:?}"),
+                        "cause": format!("{cause:?}"),
+                        "rollback_failed": rollback_failed,
+                        "shown": shown,
+                        "os": std::env::consts::OS,
+                    }),
+                );
+                Err(BackendError::new())
+            }
+            Err(multicore_core::SupervisorError::StopFailed) => {
+                state.mark_error(
+                    "Состояние процессов неизвестно. Выполните отключение для очистки.",
+                    true,
+                );
+                state.push_event_with_details(
+                    Severity::Error,
+                    Component::Core,
+                    "connect",
+                    "Запуск подключения завершился ошибкой.",
+                    json!({ "cause": "stop_failed_during_start", "os": std::env::consts::OS }),
+                );
+                Err(BackendError::new())
+            }
+        }
+    }
+
     /// Spec §6: in always-ready mode a subscription switch or refresh while connected moves the
     /// connection to the new generation. Stops the connection when `condition` holds and
-    /// returns the options to reconnect with.
+    /// returns the options to reconnect with. The caller holds `generation_change` across the
+    /// pause, the switch and the reconnect, so a user Connect or Disconnect waits for the whole
+    /// sequence instead of slipping in between.
     async fn pause_for_generation_change(
         &self,
         condition: impl FnOnce(&CoreRuntime<P>) -> bool,
@@ -4070,12 +4320,14 @@ where
         };
         // Refreshed while connected: the new snapshot waits as pending; in always-ready mode
         // the connection moves to it right away.
+        let switch = self.generation_change.lock().await;
         let resume = self
             .pause_for_generation_change(|state| state.pending_snapshot.is_some())
             .await;
         if let Some(options) = resume {
-            let _ = self.connect_with(options).await;
+            self.resume_after_generation_change(options).await;
         }
+        drop(switch);
         let result = self.rewarm_after(result).await;
         match result {
             Ok(_) if resume.is_some() => Ok(self.current_status().await),
@@ -4093,6 +4345,7 @@ where
             .map_err(BackendError::from_profile_mutation)?;
         // Switching while connected in always-ready mode: stop, switch, reconnect on the new
         // generation (spec 6). Otherwise switching while connected stays refused.
+        let switch = self.generation_change.lock().await;
         let resume = self
             .pause_for_generation_change(|state| state.active_profile_id.as_ref() != Some(&id))
             .await;
@@ -4101,8 +4354,9 @@ where
             .await
             .map_err(BackendError::from_profile_mutation);
         if let Some(options) = resume {
-            let _ = self.connect_with(options).await;
+            self.resume_after_generation_change(options).await;
         }
+        drop(switch);
         let result = self.rewarm_after(result).await;
         match result {
             Ok(_) if resume.is_some() => Ok(self.current_status().await),
@@ -4130,12 +4384,14 @@ where
             self.subscription_list_dto()
                 .map_err(BackendError::from_profile_mutation)
         };
+        let switch = self.generation_change.lock().await;
         let resume = self
             .pause_for_generation_change(|state| state.pending_snapshot.is_some())
             .await;
         if let Some(options) = resume {
-            let _ = self.connect_with(options).await;
+            self.resume_after_generation_change(options).await;
         }
+        drop(switch);
         self.rewarm_after(result).await
     }
 
@@ -4175,213 +4431,18 @@ where
     }
 
     async fn connect_with(&self, options: ConnectOptions) -> Result<StatusDto, BackendError> {
-        let _operation = self.operation.lock().await;
-        let started = std::time::Instant::now();
-        if let Ok(mut current) = self.connect_options.lock() {
-            *current = options;
-        }
-        let (snapshot, queued_selections) = {
-            let state = self.inner.read().await;
-            if state.degraded {
-                return Err(BackendError::new());
+        let _switch = if let Ok(switch) = self.generation_change.try_lock() {
+            switch
+        } else {
+            // A subscription switch is moving the connection: wait for it. If it reconnected
+            // (on the new profile), that connection is the answer to this Connect.
+            let switch = self.generation_change.lock().await;
+            if self.inner.read().await.state.current() == CoreConnectionState::Connected {
+                return Ok(self.current_status().await);
             }
-            if state.state.current() != CoreConnectionState::Ready {
-                return Err(BackendError::new());
-            }
-            let snapshot = state.snapshot.clone().ok_or_else(BackendError::new)?;
-            let queued_selections = selectable_groups(&snapshot)
-                .iter()
-                .zip(&state.explicit_selected_nodes)
-                .filter_map(|(group, node)| {
-                    node.as_ref()
-                        .map(|node| (group.name.to_owned(), node.clone()))
-                })
-                .collect::<Vec<_>>();
-            (snapshot, queued_selections)
+            switch
         };
-        let prepared = match run_blocking(|| (self.controller_factory)(&snapshot, options)) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let mut state = self.inner.write().await;
-                state.message =
-                    Some("Не удалось подготовить сетевой интерфейс и адреса узлов.".to_owned());
-                state.push_event(
-                    Severity::Error,
-                    Component::Core,
-                    "runtime_publish",
-                    "Подготовка конфигурации перед подключением завершилась ошибкой.",
-                );
-                return Err(error);
-            }
-        };
-        let controller = prepared.controller();
-        let restage_reason = prepared.restage_reason.clone();
-        let prepared_ms = started.elapsed().as_millis();
-        if let Some(reason) = &restage_reason {
-            // The warm generation was not reused, so this Connect staged and prepared again
-            // (restarting the cores): the reason names which staged input differed.
-            let mut state = self.inner.write().await;
-            state.push_event_with_details(
-                Severity::Debug,
-                Component::Core,
-                "connect",
-                "Прогретая конфигурация не подошла, запуск подготовлен заново.",
-                json!({ "reason": reason, "prepare_ms": prepared_ms }),
-            );
-        }
-        if prepared.activate().is_err() {
-            let mut state = self.inner.write().await;
-            state.message = Some("Не удалось активировать конфигурацию запуска.".to_owned());
-            state.push_event(
-                Severity::Error,
-                Component::Core,
-                "runtime_publish",
-                "Активация конфигурации перед подключением завершилась ошибкой.",
-            );
-            return Err(BackendError::new());
-        }
-        {
-            let mut state = self.inner.write().await;
-            state.controller = Some(controller.clone());
-            state
-                .state
-                .transition(CoreConnectionState::Connecting)
-                .map_err(|_| BackendError::new())?;
-            state.message = Some(
-                if state.service_active() {
-                    TUNNEL_ON_MESSAGE
-                } else {
-                    CONNECTING_MESSAGE
-                }
-                .to_owned(),
-            );
-            state.push_event(
-                Severity::Info,
-                Component::Core,
-                "connect",
-                "Запускается подключение.",
-            );
-        }
-        // If this future is dropped before the outcome is recorded, leave a cleanable error.
-        let mut abandoned = AbandonedConnectGuard::new(&self.inner);
-
-        let result = Supervisor::new(controller.clone()).connect().await;
-        let started_ms = started.elapsed().as_millis();
-        if result.is_ok() {
-            for (group, node) in queued_selections {
-                if self.selector.select(&group, &node).await.is_err() {
-                    let rollback = Supervisor::new(controller.clone()).disconnect().await;
-                    let mut state = self.inner.write().await;
-                    abandoned.disarm();
-                    if rollback.is_ok() {
-                        state
-                            .state
-                            .transition(CoreConnectionState::Ready)
-                            .map_err(|_| BackendError::new())?;
-                        state.message = Some(
-                            "Mihomo did not apply the queued route selection; connection was rolled back."
-                                .to_owned(),
-                        );
-                        state.degraded = false;
-                    } else {
-                        state.mark_error(
-                            "Mihomo route selection failed and core rollback was incomplete.",
-                            true,
-                        );
-                    }
-                    state.push_event(
-                        Severity::Error,
-                        Component::Mihomo,
-                        "selection_replay",
-                        "Queued Mihomo selection replay failed during connection startup.",
-                    );
-                    return Err(BackendError::new());
-                }
-            }
-        }
-        let mut state = self.inner.write().await;
-        abandoned.disarm();
-        match result {
-            Ok(()) => {
-                state
-                    .state
-                    .transition(CoreConnectionState::Connected)
-                    .map_err(|_| BackendError::new())?;
-                state.connected_since_unix_ms = unix_timestamp_ms();
-                state.message = None;
-                state.degraded = false;
-                // Where a slow Connect spends its time: the factory (staging or reusing the
-                // warm generation), the cores' start (the service's tunnel switch) and the
-                // selection replay.
-                state.push_event_with_details(
-                    Severity::Info,
-                    Component::Core,
-                    "connect",
-                    "Подключение установлено.",
-                    json!({
-                        "prepare_ms": prepared_ms,
-                        "restaged": restage_reason.is_some(),
-                        "start_ms": started_ms.saturating_sub(prepared_ms),
-                        "replay_ms": started.elapsed().as_millis().saturating_sub(started_ms),
-                        "total_ms": started.elapsed().as_millis(),
-                    }),
-                );
-                // The watcher checks the new connection right away and keeps its short interval.
-                self.request_warm();
-                Ok(state.status())
-            }
-            Err(multicore_core::SupervisorError::StartFailed {
-                engine,
-                rollback_failed,
-                cause,
-            }) => {
-                self.request_warm();
-                if rollback_failed {
-                    state.mark_error(
-                        "Не удалось полностью отменить запуск. Выполните отключение для очистки.",
-                        true,
-                    );
-                } else {
-                    state
-                        .state
-                        .transition(CoreConnectionState::Ready)
-                        .map_err(|_| BackendError::new())?;
-                    state.message = Some(start_failure_message(engine, cause));
-                    state.degraded = false;
-                }
-                // The cause used to reach only the status line, so a copied
-                // log said "connect failed" with nothing to act on.
-                let shown = start_failure_message(engine, cause);
-                state.push_event_with_details(
-                    Severity::Error,
-                    Component::Core,
-                    "connect",
-                    "Запуск подключения завершился ошибкой.",
-                    json!({
-                        "engine": format!("{engine:?}"),
-                        "cause": format!("{cause:?}"),
-                        "rollback_failed": rollback_failed,
-                        "shown": shown,
-                        "os": std::env::consts::OS,
-                    }),
-                );
-                Err(BackendError::new())
-            }
-            Err(multicore_core::SupervisorError::StopFailed) => {
-                state.mark_error(
-                    "Состояние процессов неизвестно. Выполните отключение для очистки.",
-                    true,
-                );
-                state.push_event_with_details(
-                    Severity::Error,
-                    Component::Core,
-                    "connect",
-                    "Запуск подключения завершился ошибкой.",
-                    json!({ "cause": "stop_failed_during_start", "os": std::env::consts::OS }),
-                );
-                Err(BackendError::new())
-            }
-        }
+        self.connect_now(options).await
     }
 
     async fn shutdown(&self) -> Result<(), BackendError> {
@@ -4390,6 +4451,8 @@ where
     }
 
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
+        // After a switch in progress, so its reconnect cannot undo this Disconnect.
+        let _switch = self.generation_change.lock().await;
         let result = self.disconnect_now().await;
         // The cores stay (or become) warm in the background; the answer does not wait.
         let result = self.rewarm_after(result).await;

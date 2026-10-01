@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app_icon;
+mod appimage_handoff;
 mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
@@ -402,6 +403,14 @@ impl PersistenceTracker {
         self.desired.announcement_seen = (!fingerprint.is_empty()).then_some(fingerprint);
     }
 
+    fn set_appimage_handoff_seen(&mut self, appimage: String) {
+        self.desired.appimage_handoff_seen = (!appimage.is_empty()).then_some(appimage);
+    }
+
+    fn set_service_offer_dismissed(&mut self, dismissed: bool) {
+        self.desired.service_offer_dismissed = dismissed;
+    }
+
     fn set_route_preferences(
         &mut self,
         profile: String,
@@ -753,6 +762,10 @@ fn main() -> Result<(), slint::PlatformError> {
     if data_reset::run_pending_reset(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
         return Ok(());
     }
+    // An AppImage next to an installed deb/rpm/pacman package becomes the installed app
+    // (returns only when there is none, or the hand-off failed).
+    #[cfg(target_os = "linux")]
+    appimage_handoff::hand_off_to_installed_package();
     let software_renderer = renderer_fallback::software_renderer_requested();
     let result = match run_desktop(software_renderer) {
         // Everything run_desktop held (single-instance guard, owned daemon,
@@ -789,12 +802,32 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             _guard,
             activations,
         }) => (_guard, activations),
-        Ok(single_instance::Claim::Forwarded) => return Ok(()),
+        Ok(single_instance::Claim::Forwarded) => {
+            // The running instance shows the hand-off notice (a frame of its own after the
+            // launch's activation, which an older instance simply ignores).
+            #[cfg(target_os = "linux")]
+            if let Some(appimage) = appimage_handoff::handed_off_from() {
+                let notice =
+                    single_instance::Activation::HandedOff(appimage.to_string_lossy().into_owned());
+                if let Err(error) = single_instance::forward_to_primary(&notice) {
+                    eprintln!("hand-off notice could not be forwarded: {error}");
+                }
+            }
+            return Ok(());
+        }
         Err(error) => {
             eprintln!("single-instance coordination failed: {error}");
             return Ok(());
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = appimage_handoff::handed_off_from() {
+        match windows_settings::adopt_launch_at_sign_in_from(&appimage) {
+            Ok(true) => eprintln!("autostart moved from the AppImage to the installed app"),
+            Ok(false) => {}
+            Err(error) => eprintln!("autostart could not be moved from the AppImage: {error}"),
+        }
+    }
     let launch_mode = launch_arguments.mode;
     let (client, _bootstrap_guard): (Arc<dyn DaemonClient>, Option<bootstrap::Bootstrap>) =
         match bootstrap::start() {
@@ -858,6 +891,20 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             .unwrap_or_default()
             .into(),
     );
+    ui.set_service_offer_dismissed(loaded_preferences.service_offer_dismissed);
+    ui.set_handoff_notice_seen(
+        loaded_preferences
+            .appimage_handoff_seen
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    // Reached through an AppImage hand-off: a one-time toast says which copy runs. Set even
+    // when starting hidden (autostart), so it shows when the window is next opened.
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = appimage_handoff::handed_off_from() {
+        ui.set_handoff_notice_for(appimage.to_string_lossy().as_ref().into());
+    }
     ui.set_auto_connect_on_startup(loaded_preferences.auto_connect_on_startup);
     ui.set_reduced_motion(reduced_motion_from_client_area_animation(
         client_area_animation_enabled(),
@@ -1200,6 +1247,9 @@ fn wire_external_activations(
                 match activation {
                     single_instance::Activation::Background => {}
                     single_instance::Activation::Show => restore_and_focus(&ui),
+                    single_instance::Activation::HandedOff(appimage) => {
+                        ui.set_handoff_notice_for(appimage.into());
+                    }
                     single_instance::Activation::InstallSubscription(url) => {
                         let current = {
                             let mut model = model.lock().expect("view model lock");
@@ -1829,6 +1879,8 @@ fn flush_preferences(
         tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
         tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
         tracker.set_announcement_seen(ui.get_announcement_seen().into());
+        tracker.set_appimage_handoff_seen(ui.get_handoff_notice_seen().into());
+        tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());
         tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
         tracker.set_tun_enabled(ui.get_tun_enabled());
         if let Some((profile, selected_group, selections)) = route_preferences {
@@ -1891,6 +1943,8 @@ fn wire_preference_persistence(
             tracker.set_auto_connect_on_startup(ui.get_auto_connect_on_startup());
             tracker.set_navigation_collapsed(ui.get_navigation_collapsed());
             tracker.set_announcement_seen(ui.get_announcement_seen().into());
+            tracker.set_appimage_handoff_seen(ui.get_handoff_notice_seen().into());
+            tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());
             tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
             tracker.set_tun_enabled(ui.get_tun_enabled());
             if let Some((profile, selected_group, selections)) = route_preferences {

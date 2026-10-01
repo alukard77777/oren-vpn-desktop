@@ -76,6 +76,13 @@ fn is_repeated_low_level_entry(
 }
 
 fn write_low_level_entry(path: &std::path::Path, context: &str, detail: impl fmt::Display) {
+    // Writers seek to the end themselves (no O_APPEND, see below), so two threads writing at
+    // once would land on the same offset and one line would overwrite the other; rotation
+    // must not interleave with a write either.
+    static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write = WRITE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -2733,8 +2740,16 @@ mod http_tests {
             );
         }
         assert!(path.starts_with(std::env::temp_dir()));
-        record_low_level("isolation_probe", "test only");
-        assert!(read_low_level_log().is_some_and(|log| log.contains("isolation_probe")));
+        // Unique, so neither the repeat filter nor another test's line can stand in for it.
+        let probe = format!(
+            "isolation_probe_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        record_low_level(&probe, "test only");
+        assert!(read_low_level_log().is_some_and(|log| log.contains(&probe)));
     }
 
     #[test]
