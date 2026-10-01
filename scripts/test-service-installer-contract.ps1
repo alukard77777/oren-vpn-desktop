@@ -98,9 +98,9 @@ foreach ($token in @(
     '#define AppName "MULTICORE"',
     '#define AppPublisher "MULTICORE"',
     "ServiceName = 'MultiCore';",
-    "'create ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE""'",
+    "'create ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE Service""'",
     # An upgraded service (registered by 1.1.1 as "MultiCore") gets the new display name too.
-    "'config ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE""'",
+    "'config ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE Service""'",
     "' ""MULTICORE: ядра Mihomo и Xray для мгновенного подключения""'",
     # Launch at sign-in keeps its value name, so an upgrade never adds a second entry.
     'ValueName: "MultiCore"; ValueData: """{app}\current\MultiCore.exe"" --background"',

@@ -378,14 +378,16 @@ begin
   RunTool(ExpandConstant('{sys}\net.exe'), 'stop ' + ServiceName);
 end;
 
+{ The display name must differ from the service name "MultiCore" by more than case: the SCM
+  shows the service name instead of a display name that matches it case-insensitively. }
 procedure RegisterService;
 var
   Registered: Integer;
 begin
   if RunSc('query ' + ServiceName) = 0 then
-    Registered := RunSc('config ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem DisplayName= "MULTICORE"')
+    Registered := RunSc('config ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem DisplayName= "MULTICORE Service"')
   else
-    Registered := RunSc('create ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem DisplayName= "MULTICORE"');
+    Registered := RunSc('create ' + ServiceName + ' binPath= "\"' + ServiceBinaryPath + '\" --service" start= auto obj= LocalSystem DisplayName= "MULTICORE Service"');
   if Registered <> 0 then
   begin
     { 1072: the old service is still marked for deletion until a reboot. }
