@@ -5,7 +5,14 @@
     "rustToolchain": "1.98.1",
     "desktopPackage": "multicore-desktop",
     "daemonPackage": "multicore-daemon",
-    "coreHostPackage": "multicore-core-host"
+    "coreHostPackage": "multicore-core-host",
+    "skiaBinaries": {
+      "skiaBindings": "0.99.0",
+      "key": "a25a0fdb7d90429aa2d1-x86_64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan",
+      "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz",
+      "sha256": "097e78d775c9156dc4b070b9cca7008dbab587513ecb1924baf4cf9620f3119b",
+      "license": "BSD-3-Clause"
+    }
   },
   "components": {
     "xray": {

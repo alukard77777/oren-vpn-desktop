@@ -6,7 +6,19 @@
     "desktopPackage": "multicore-desktop",
     "daemonPackage": "multicore-daemon",
     "updaterPackage": "multicore-updater",
-    "coreHostPackage": "multicore-core-host"
+    "coreHostPackage": "multicore-core-host",
+    "skiaBinaries": {
+      "skiaBindings": "0.99.0",
+      "key": "a25a0fdb7d90429aa2d1-i686-pc-windows-msvc-d3d-gl-jpegd-jpege-pdf-textlayout-static",
+      "sha256": "b9cc08872cbbd1fba04e1155a95daf0dd40b54c20849e72d1e430cec33d1a2fe",
+      "source": {
+        "repository": "rust-skia/skia",
+        "tag": "m150-0.98.1",
+        "commit": "90af6f5c5a3ed8788b805fe6ca3fcdf28c2c2bc9"
+      },
+      "builtWith": "scripts/build-skia-binaries.ps1, LLVM 23.1.2 clang-cl, +crt-static",
+      "license": "BSD-3-Clause"
+    }
   },
   "components": {
     "xray": {

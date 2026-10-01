@@ -27,12 +27,36 @@ rustc --version | grep -q "^rustc $TOOLCHAIN " || {
 }
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target/linux-release}"
+
+# Skia (the desktop's GPU renderer): skia-bindings links the SHA-256-pinned rust-skia
+# prebuilt archive from the download cache instead of fetching an unverified one itself.
+mkdir -p "$CACHE"
+read -r SKIA_KEY SKIA_URL SKIA_SHA <<<"$(python3 - "$MANIFEST" <<'PY'
+import json, sys
+skia = json.load(open(sys.argv[1]))["build"]["skiaBinaries"]
+print(skia["key"], skia["url"], skia["sha256"])
+PY
+)"
+SKIA_ARCHIVE="$CACHE/skia-binaries-$SKIA_KEY.tar.gz"
+if [[ ! -f "$SKIA_ARCHIVE" ]] || ! echo "$SKIA_SHA  $SKIA_ARCHIVE" | sha256sum -c --status; then
+    curl -fsSL --proto '=https' --tlsv1.2 -o "$SKIA_ARCHIVE.part" "$SKIA_URL"
+    mv "$SKIA_ARCHIVE.part" "$SKIA_ARCHIVE"
+fi
+echo "$SKIA_SHA  $SKIA_ARCHIVE" | sha256sum -c --quiet
+CACHE_ABS="$(cd "$CACHE" && pwd)"
+export SKIA_BINARIES_URL="file://$CACHE_ABS/skia-binaries-{key}.tar.gz"
+unset FORCE_SKIA_BUILD FORCE_SKIA_BINARIES_DOWNLOAD SKIA_SOURCE_DIR SKIA_LIBRARY_SEARCH_PATH SKIA_DEBUG
 export RUSTFLAGS="--remap-path-prefix=$ROOT=/source/multicore --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
 cargo build --release --locked \
     --manifest-path "$ROOT/Cargo.toml" \
     -p multicore-desktop -p multicore-daemon -p multicore-core-host
+# The newest skia-bindings output is this build's (a persistent target dir keeps older ones).
+linked_skia="$(ls -t "$CARGO_TARGET_DIR"/release/build/skia-bindings-*/out/skia/key.txt 2>/dev/null | head -n 1)"
+[[ -n "$linked_skia" && "$(cat "$linked_skia")" == "$SKIA_KEY" ]] || {
+    echo "the build did not link the pinned Skia binaries $SKIA_KEY" >&2
+    exit 1
+}
 
-mkdir -p "$CACHE"
 fetch_core() {
     local name="$1"
     local fields
