@@ -4,39 +4,61 @@ use std::io::Write;
 use std::path::Path;
 
 use multicore_release::{
-    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, archive_entry_unix_mode, extract_verified_bundle,
-    extract_verified_bundle_with_limit, sha256_bytes,
+    MAX_ARCHIVE_ENTRIES, MAX_EXPANDED_BYTES, WindowsArch, archive_entry_unix_mode,
+    extract_verified_bundle, extract_verified_bundle_for_arch, extract_verified_bundle_with_limit,
+    sha256_bytes,
 };
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 
-fn fake_pe() -> Vec<u8> {
+/// The other Windows flavour than this build's.
+fn foreign_arch() -> WindowsArch {
+    match WindowsArch::CURRENT {
+        WindowsArch::X64 => WindowsArch::X86,
+        WindowsArch::X86 => WindowsArch::X64,
+    }
+}
+
+fn fake_pe_for(arch: WindowsArch) -> Vec<u8> {
+    // PE32+ carries a 0xf0-byte optional header, PE32 a 0xe0-byte one.
+    let optional_size: u16 = match arch {
+        WindowsArch::X64 => 0x00f0,
+        WindowsArch::X86 => 0x00e0,
+    };
     let mut bytes = vec![0_u8; 512];
     bytes[0..2].copy_from_slice(b"MZ");
     bytes[0x3c..0x40].copy_from_slice(&(0x80_u32).to_le_bytes());
     bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
-    bytes[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+    bytes[0x84..0x86].copy_from_slice(&arch.pe_machine().to_le_bytes());
     bytes[0x86..0x88].copy_from_slice(&1_u16.to_le_bytes());
-    bytes[0x94..0x96].copy_from_slice(&0x00f0_u16.to_le_bytes());
+    bytes[0x94..0x96].copy_from_slice(&optional_size.to_le_bytes());
     bytes[0x96..0x98].copy_from_slice(&0x0002_u16.to_le_bytes());
-    bytes[0x98..0x9a].copy_from_slice(&0x020b_u16.to_le_bytes());
+    bytes[0x98..0x9a].copy_from_slice(&arch.pe_optional_magic().to_le_bytes());
     bytes
 }
 
-fn required_files() -> BTreeMap<String, Vec<u8>> {
+fn fake_pe() -> Vec<u8> {
+    fake_pe_for(WindowsArch::CURRENT)
+}
+
+fn required_files_for(arch: WindowsArch) -> BTreeMap<String, Vec<u8>> {
     BTreeMap::from([
-        ("MultiCore.exe".into(), fake_pe()),
+        ("MultiCore.exe".into(), fake_pe_for(arch)),
         ("README.md".into(), b"readme".to_vec()),
         ("THIRD_PARTY_NOTICES.md".into(), b"notices".to_vec()),
-        ("cores/mihomo.exe".into(), fake_pe()),
-        ("cores/xray.exe".into(), fake_pe()),
+        ("cores/mihomo.exe".into(), fake_pe_for(arch)),
+        ("cores/xray.exe".into(), fake_pe_for(arch)),
         ("licenses/Xray-core-MPL-2.0.txt".into(), b"mpl".to_vec()),
         ("licenses/mihomo-GPL-3.0.txt".into(), b"gpl".to_vec()),
-        ("runtime/multicore-core-host.exe".into(), fake_pe()),
-        ("runtime/multicore-daemon.exe".into(), fake_pe()),
-        ("runtime/multicore-updater.exe".into(), fake_pe()),
+        ("runtime/multicore-core-host.exe".into(), fake_pe_for(arch)),
+        ("runtime/multicore-daemon.exe".into(), fake_pe_for(arch)),
+        ("runtime/multicore-updater.exe".into(), fake_pe_for(arch)),
         ("versions.json".into(), b"{}".to_vec()),
     ])
+}
+
+fn required_files() -> BTreeMap<String, Vec<u8>> {
+    required_files_for(WindowsArch::CURRENT)
 }
 
 fn write_bundle(path: &Path, files: &BTreeMap<String, Vec<u8>>, sums: &BTreeMap<String, Vec<u8>>) {
@@ -98,6 +120,48 @@ fn valid_bundle_extracts_and_verifies_every_file() {
     assert_eq!(
         std::fs::read(destination.join("MultiCore.exe")).unwrap(),
         fake_pe()
+    );
+}
+
+#[test]
+fn each_flavour_accepts_only_its_own_executables() {
+    for (bundle_arch, client_arch) in [
+        (WindowsArch::X64, WindowsArch::X64),
+        (WindowsArch::X86, WindowsArch::X86),
+        (WindowsArch::X64, WindowsArch::X86),
+        (WindowsArch::X86, WindowsArch::X64),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("bundle.zip");
+        let files = required_files_for(bundle_arch);
+        write_bundle(&archive, &files, &files);
+        let destination = temp.path().join("out");
+        let result = extract_verified_bundle_for_arch(&archive, &destination, client_arch);
+        if bundle_arch == client_arch {
+            assert_eq!(result.unwrap().files(), 12);
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(client_arch.pe_description()),
+                "{bundle_arch:?} bundle for {client_arch:?}: {error}"
+            );
+            assert!(!destination.exists(), "a rejected bundle must be removed");
+        }
+    }
+}
+
+#[test]
+fn this_build_rejects_the_other_flavours_bundle() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("bundle.zip");
+    let files = required_files_for(foreign_arch());
+    write_bundle(&archive, &files, &files);
+    let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(WindowsArch::CURRENT.pe_description()),
+        "{error}"
     );
 }
 
@@ -262,7 +326,7 @@ fn missing_required_updater_is_rejected() {
 }
 
 #[test]
-fn missing_or_non_pe32_plus_amd64_core_host_is_rejected() {
+fn missing_or_foreign_core_host_is_rejected() {
     let temp = TempDir::new().unwrap();
     let archive = temp.path().join("missing-core-host.zip");
     let mut files = required_files();
@@ -277,15 +341,37 @@ fn missing_or_non_pe32_plus_amd64_core_host_is_rejected() {
         "{error}"
     );
 
-    let archive = temp.path().join("pe32-core-host.zip");
+    // The right machine with the other flavour's optional-header magic (PE32 vs PE32+).
+    let archive = temp.path().join("foreign-magic-core-host.zip");
     let mut files = required_files();
-    let mut pe32 = fake_pe();
-    pe32[0x98..0x9a].copy_from_slice(&0x010b_u16.to_le_bytes());
-    files.insert("runtime/multicore-core-host.exe".into(), pe32);
+    let mut foreign_magic = fake_pe();
+    foreign_magic[0x98..0x9a].copy_from_slice(&foreign_arch().pe_optional_magic().to_le_bytes());
+    files.insert("runtime/multicore-core-host.exe".into(), foreign_magic);
     write_bundle(&archive, &files, &files);
 
-    let error = extract_verified_bundle(&archive, &temp.path().join("pe32-out")).unwrap_err();
-    assert!(error.to_string().contains("PE32+ AMD64"), "{error}");
+    let error = extract_verified_bundle(&archive, &temp.path().join("magic-out")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(WindowsArch::CURRENT.pe_description()),
+        "{error}"
+    );
+
+    // Only the core host built for the other flavour.
+    let archive = temp.path().join("foreign-core-host.zip");
+    let mut files = required_files();
+    files.insert(
+        "runtime/multicore-core-host.exe".into(),
+        fake_pe_for(foreign_arch()),
+    );
+    write_bundle(&archive, &files, &files);
+    let error = extract_verified_bundle(&archive, &temp.path().join("foreign-out")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(WindowsArch::CURRENT.pe_description()),
+        "{error}"
+    );
 }
 
 #[test]
@@ -321,7 +407,12 @@ fn malformed_core_host_pe_structure_and_image_flags_are_rejected() {
         write_bundle(&archive, &files, &files);
 
         let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
-        assert!(error.to_string().contains("PE32+ AMD64"), "{name}: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains(WindowsArch::CURRENT.pe_description()),
+            "{name}: {error}"
+        );
     }
 }
 
@@ -331,10 +422,23 @@ fn built_release_bundle_matches_updater_contract() {
     let archive = std::env::var_os("MULTICORE_RELEASE_BUNDLE")
         .map(std::path::PathBuf::from)
         .expect("MULTICORE_RELEASE_BUNDLE must name the built release ZIP");
+    // The x64 test binary also checks the x86 bundle: MULTICORE_RELEASE_BUNDLE_ARCH=x86.
+    let arch = match std::env::var("MULTICORE_RELEASE_BUNDLE_ARCH").as_deref() {
+        Ok("x86") => WindowsArch::X86,
+        Ok("x64") => WindowsArch::X64,
+        Ok(other) => panic!("unknown MULTICORE_RELEASE_BUNDLE_ARCH {other:?}"),
+        Err(_) => WindowsArch::CURRENT,
+    };
+    let expected_name = arch.bundle_asset_name();
+    assert_eq!(
+        archive.file_name().and_then(|name| name.to_str()),
+        Some(expected_name),
+        "the {arch:?} release bundle must be named {expected_name}"
+    );
     let temp = TempDir::new().unwrap();
     let destination = temp.path().join("release");
 
-    let inventory = extract_verified_bundle(&archive, &destination).unwrap();
+    let inventory = extract_verified_bundle_for_arch(&archive, &destination, arch).unwrap();
 
     // Every payload file is listed in SHA256SUMS.txt, which is itself in the
     // bundle; a fixed count broke once the dashboard (32 files) was bundled.

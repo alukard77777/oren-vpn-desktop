@@ -309,7 +309,7 @@ pub(crate) fn resolve_from(
             .rev()
             .find(|guard| guard.path == *binary)
             .ok_or(ResolveError::Missing)?;
-        validate_amd64_pe(&mut guard.handle)?;
+        validate_native_pe(&mut guard.handle)?;
     }
     Ok(ResolvedRuntime {
         data_root: canonical_data.clone(),
@@ -531,7 +531,9 @@ fn open_guard(path: &Path, directory: bool) -> Result<GuardedPath, ResolveError>
     })
 }
 
-fn validate_amd64_pe(file: &mut File) -> Result<(), ResolveError> {
+/// The cores must be images of this build's architecture (PE32+ AMD64 or PE32 i386).
+fn validate_native_pe(file: &mut File) -> Result<(), ResolveError> {
+    let arch = multicore_release::WindowsArch::CURRENT;
     let mut dos = [0u8; 64];
     file.read_exact(&mut dos)
         .map_err(|_| ResolveError::InvalidPe)?;
@@ -551,8 +553,8 @@ fn validate_amd64_pe(file: &mut File) -> Result<(), ResolveError> {
     let characteristics = u16::from_le_bytes([header[22], header[23]]);
     let magic = u16::from_le_bytes([header[24], header[25]]);
     if &header[..4] != b"PE\0\0"
-        || machine != 0x8664
-        || magic != 0x20b
+        || machine != arch.pe_machine()
+        || magic != arch.pe_optional_magic()
         || characteristics & 0x0002 == 0
         || characteristics & 0x2000 != 0
     {
@@ -587,6 +589,11 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    const NATIVE_MACHINE: u16 = multicore_release::WindowsArch::CURRENT.pe_machine();
+    const FOREIGN_MACHINE: u16 = match multicore_release::WindowsArch::CURRENT {
+        multicore_release::WindowsArch::X64 => 0x014c,
+        multicore_release::WindowsArch::X86 => 0x8664,
+    };
     fn pe(path: &Path, machine: u16, dll: bool) {
         let mut bytes = vec![0u8; 0x100];
         bytes[..2].copy_from_slice(b"MZ");
@@ -595,7 +602,8 @@ mod tests {
         bytes[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
         let flags = 0x0002u16 | if dll { 0x2000 } else { 0 };
         bytes[0x96..0x98].copy_from_slice(&flags.to_le_bytes());
-        bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        let magic = multicore_release::WindowsArch::CURRENT.pe_optional_magic();
+        bytes[0x98..0x9a].copy_from_slice(&magic.to_le_bytes());
         fs::write(path, bytes).unwrap();
     }
     fn fixture() -> (TestDir, PathBuf, PathBuf) {
@@ -605,8 +613,8 @@ mod tests {
         fs::create_dir_all(package.join("cores")).unwrap();
         let host = package.join("runtime/multicore-core-host.exe");
         fs::write(&host, b"host").unwrap();
-        pe(&package.join("cores/xray.exe"), 0x8664, false);
-        pe(&package.join("cores/mihomo.exe"), 0x8664, false);
+        pe(&package.join("cores/xray.exe"), NATIVE_MACHINE, false);
+        pe(&package.join("cores/mihomo.exe"), NATIVE_MACHINE, false);
         let data = root.path().join("Local/MultiCore");
         fs::create_dir_all(data.join("runtime/runtime-00000000000000000007")).unwrap();
         fs::write(
@@ -961,7 +969,7 @@ mod tests {
         ));
         pe(
             &h.parent().unwrap().parent().unwrap().join("cores/xray.exe"),
-            0x014c,
+            FOREIGN_MACHINE,
             false,
         );
         assert!(matches!(
@@ -974,7 +982,7 @@ mod tests {
         let (_r, d, h) = fixture();
         pe(
             &h.parent().unwrap().parent().unwrap().join("cores/xray.exe"),
-            0x8664,
+            NATIVE_MACHINE,
             true,
         );
         assert!(matches!(

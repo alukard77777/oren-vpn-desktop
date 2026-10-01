@@ -11,9 +11,77 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const WINDOWS_ASSET_NAME: &str = "multicore-windows-x64.zip";
+/// Windows release flavour. Every release carries one portable bundle and one installer per
+/// flavour; a client only ever takes the assets of the architecture it was compiled for, so a
+/// 32-bit build never installs the x64 bundle and the reverse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsArch {
+    /// `x86_64-pc-windows-msvc`: PE32+ AMD64 images.
+    X64,
+    /// `i686-pc-windows-msvc`: PE32 i386 images.
+    X86,
+}
+
+impl WindowsArch {
+    /// The flavour of this build. Non-Windows builds report x64; they never use these assets.
+    pub const CURRENT: Self = if cfg!(target_arch = "x86") {
+        Self::X86
+    } else {
+        Self::X64
+    };
+
+    /// Portable bundle and updater asset.
+    pub const fn bundle_asset_name(self) -> &'static str {
+        match self {
+            Self::X64 => "multicore-windows-x64.zip",
+            Self::X86 => "multicore-windows-x86.zip",
+        }
+    }
+
+    /// Inno Setup installer asset.
+    pub const fn installer_asset_name(self) -> &'static str {
+        match self {
+            Self::X64 => "MultiCore-Setup-x64.exe",
+            Self::X86 => "MultiCore-Setup-x86.exe",
+        }
+    }
+
+    /// COFF `Machine` of every executable in the bundle.
+    pub const fn pe_machine(self) -> u16 {
+        match self {
+            Self::X64 => 0x8664,
+            Self::X86 => 0x014c,
+        }
+    }
+
+    /// Optional-header magic: PE32+ (`0x20b`) or PE32 (`0x10b`).
+    pub const fn pe_optional_magic(self) -> u16 {
+        match self {
+            Self::X64 => 0x020b,
+            Self::X86 => 0x010b,
+        }
+    }
+
+    /// Image kind named in verification errors.
+    pub const fn pe_description(self) -> &'static str {
+        match self {
+            Self::X64 => "PE32+ AMD64",
+            Self::X86 => "PE32 i386",
+        }
+    }
+
+    /// Size of the optional header up to the data directories.
+    pub const fn pe_optional_header_fixed_size(self) -> u16 {
+        match self {
+            Self::X64 => 112,
+            Self::X86 => 96,
+        }
+    }
+}
+
+pub const WINDOWS_ASSET_NAME: &str = WindowsArch::CURRENT.bundle_asset_name();
 /// The Inno Setup installer; per-user installs run it to migrate to the service.
-pub const WINDOWS_INSTALLER_ASSET_NAME: &str = "MultiCore-Setup-x64.exe";
+pub const WINDOWS_INSTALLER_ASSET_NAME: &str = WindowsArch::CURRENT.installer_asset_name();
 
 pub fn appimage_asset_name(version: &Version) -> String {
     format!("MultiCore-{version}-x86_64.AppImage")
@@ -175,7 +243,17 @@ pub struct GitHubRelease {
 
 impl GitHubRelease {
     pub fn parse(body: &[u8]) -> Result<Self, UpdateError> {
-        Self::parse_named(body, |_| WINDOWS_ASSET_NAME.to_owned())
+        Self::parse_for_arch(body, WindowsArch::CURRENT)
+    }
+
+    /// The portable bundle of one Windows flavour; `parse` takes this build's flavour.
+    pub fn parse_for_arch(body: &[u8], arch: WindowsArch) -> Result<Self, UpdateError> {
+        Self::parse_named(body, |_| arch.bundle_asset_name().to_owned())
+    }
+
+    /// The installer of one Windows flavour.
+    pub fn parse_installer_for_arch(body: &[u8], arch: WindowsArch) -> Result<Self, UpdateError> {
+        Self::parse_named(body, |_| arch.installer_asset_name().to_owned())
     }
 
     pub fn parse_appimage(body: &[u8]) -> Result<Self, UpdateError> {
@@ -254,7 +332,7 @@ impl GitHubRelease {
     ) -> Result<Self, UpdateError> {
         Self::pinned_to(
             repository,
-            Self::parse_named(body, |_| WINDOWS_INSTALLER_ASSET_NAME.to_owned())?,
+            Self::parse_installer_for_arch(body, WindowsArch::CURRENT)?,
         )
     }
 
@@ -375,6 +453,16 @@ pub fn extract_verified_bundle(
     extract_verified_bundle_with_limit(archive_path, destination, MAX_EXPANDED_BYTES)
 }
 
+/// Extract and verify a bundle of one Windows flavour. `extract_verified_bundle` requires the
+/// flavour of this build, so an updater never installs executables it cannot run.
+pub fn extract_verified_bundle_for_arch(
+    archive_path: &Path,
+    destination: &Path,
+    arch: WindowsArch,
+) -> Result<BundleInventory, UpdateError> {
+    extract_verified_bundle_checked(archive_path, destination, MAX_EXPANDED_BYTES, arch)
+}
+
 /// Extract and verify a bundle with an explicit expanded-size ceiling.
 ///
 /// The limit parameter is useful to callers that need a tighter policy than the
@@ -384,6 +472,20 @@ pub fn extract_verified_bundle_with_limit(
     destination: &Path,
     max_expanded_bytes: u64,
 ) -> Result<BundleInventory, UpdateError> {
+    extract_verified_bundle_checked(
+        archive_path,
+        destination,
+        max_expanded_bytes,
+        WindowsArch::CURRENT,
+    )
+}
+
+fn extract_verified_bundle_checked(
+    archive_path: &Path,
+    destination: &Path,
+    max_expanded_bytes: u64,
+    arch: WindowsArch,
+) -> Result<BundleInventory, UpdateError> {
     let max_expanded_bytes = effective_expanded_limit(max_expanded_bytes);
     if destination.exists() {
         return Err(UpdateError::InvalidBundle(
@@ -391,7 +493,7 @@ pub fn extract_verified_bundle_with_limit(
         ));
     }
     fs::create_dir(destination)?;
-    let result = extract_verified_bundle_inner(archive_path, destination, max_expanded_bytes);
+    let result = extract_verified_bundle_inner(archive_path, destination, max_expanded_bytes, arch);
     if result.is_err() {
         let _ = fs::remove_dir_all(destination);
     }
@@ -406,6 +508,7 @@ fn extract_verified_bundle_inner(
     archive_path: &Path,
     destination: &Path,
     max_expanded_bytes: u64,
+    arch: WindowsArch,
 ) -> Result<BundleInventory, UpdateError> {
     let archive_file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(archive_file)?;
@@ -529,7 +632,7 @@ fn extract_verified_bundle_inner(
     }
 
     for executable in REQUIRED_PE_FILES {
-        validate_pe_x64(&destination.join(executable))?;
+        validate_pe(&destination.join(executable), arch)?;
     }
 
     Ok(BundleInventory {
@@ -628,16 +731,18 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
+/// Every bundled executable must be an image of `arch`: an x86 client never accepts an x64
+/// bundle (it could not run it) and the reverse.
+fn validate_pe(path: &Path, arch: WindowsArch) -> Result<(), UpdateError> {
     const PE_SIGNATURE_AND_COFF_SIZE: u64 = 24;
-    const PE32_PLUS_STANDARD_OPTIONAL_SIZE: u16 = 112;
     const SECTION_HEADER_SIZE: u64 = 40;
     const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
     const IMAGE_FILE_DLL: u16 = 0x2000;
 
     let invalid = || {
         UpdateError::InvalidBundle(format!(
-            "required executable is not PE32+ AMD64: {}",
+            "required executable is not {}: {}",
+            arch.pe_description(),
             path.display()
         ))
     };
@@ -666,9 +771,9 @@ fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
     let optional_size = u16::from_le_bytes(coff[20..22].try_into().expect("fixed slice"));
     let characteristics = u16::from_le_bytes(coff[22..24].try_into().expect("fixed slice"));
     if &coff[..4] != b"PE\0\0"
-        || machine != 0x8664
+        || machine != arch.pe_machine()
         || sections == 0
-        || optional_size < PE32_PLUS_STANDARD_OPTIONAL_SIZE
+        || optional_size < arch.pe_optional_header_fixed_size()
         || characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0
         || characteristics & IMAGE_FILE_DLL != 0
     {
@@ -685,7 +790,7 @@ fn validate_pe_x64(path: &Path) -> Result<(), UpdateError> {
     }
     let mut magic = [0_u8; 2];
     file.read_exact(&mut magic).map_err(|_| invalid())?;
-    if u16::from_le_bytes(magic) != 0x020b {
+    if u16::from_le_bytes(magic) != arch.pe_optional_magic() {
         return Err(invalid());
     }
     Ok(())

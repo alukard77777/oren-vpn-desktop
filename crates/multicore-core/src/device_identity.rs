@@ -743,8 +743,13 @@ fn registry_string(subkey: &str, value: &str) -> Option<String> {
     use std::{ffi::c_void, ptr};
     use windows_sys::Win32::{
         Foundation::ERROR_SUCCESS,
-        System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW},
+        System::Registry::{
+            HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+        },
     };
+    // Always the native (64-bit) view: a 32-bit build on 64-bit Windows is otherwise
+    // redirected to WOW6432Node, which has no MachineGuid. 32-bit Windows ignores the flag.
+    let flags = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY;
     let subkey: Vec<u16> = subkey.encode_utf16().chain(Some(0)).collect();
     let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
     let mut bytes = 0_u32;
@@ -753,7 +758,7 @@ fn registry_string(subkey: &str, value: &str) -> Option<String> {
             HKEY_LOCAL_MACHINE,
             subkey.as_ptr(),
             value.as_ptr(),
-            RRF_RT_REG_SZ,
+            flags,
             ptr::null_mut(),
             ptr::null_mut(),
             &mut bytes,
@@ -769,7 +774,7 @@ fn registry_string(subkey: &str, value: &str) -> Option<String> {
             HKEY_LOCAL_MACHINE,
             subkey.as_ptr(),
             value.as_ptr(),
-            RRF_RT_REG_SZ,
+            flags,
             ptr::null_mut(),
             buffer.as_mut_ptr().cast::<c_void>(),
             &mut bytes,

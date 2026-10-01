@@ -293,7 +293,7 @@ fn validate_packaged_executable(
 
 #[cfg(windows)]
 fn validate_native_executable(file: &mut File) -> Result<(), BootstrapError> {
-    validate_amd64_pe32_plus(file)
+    validate_native_pe(file)
 }
 
 #[cfg(not(windows))]
@@ -329,11 +329,14 @@ fn open_locked_executable(path: &Path) -> Result<File, BootstrapError> {
     File::open(path).map_err(|_| BootstrapError::Package)
 }
 
+/// The package's executables must be images of this build's architecture: PE32+ AMD64 for the
+/// x64 build, PE32 i386 for the x86 build.
 #[cfg(windows)]
-fn validate_amd64_pe32_plus(file: &mut File) -> Result<(), BootstrapError> {
+fn validate_native_pe(file: &mut File) -> Result<(), BootstrapError> {
     const MAX_PE_HEADER_BYTES: u64 = 1024 * 1024;
-    const MIN_PE32_PLUS_OPTIONAL_HEADER: u16 = 112;
     const MAX_OPTIONAL_HEADER: u16 = 4096;
+    let arch = multicore_release::WindowsArch::CURRENT;
+    let fixed_optional_header = arch.pe_optional_header_fixed_size();
     const MAX_SECTIONS: u16 = 96;
     const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
     const IMAGE_FILE_DLL: u16 = 0x2000;
@@ -360,12 +363,12 @@ fn validate_amd64_pe32_plus(file: &mut File) -> Result<(), BootstrapError> {
     let optional_size = u16::from_le_bytes([coff[20], coff[21]]);
     let characteristics = u16::from_le_bytes([coff[22], coff[23]]);
     if &coff[..4] != b"PE\0\0"
-        || machine != 0x8664
+        || machine != arch.pe_machine()
         || section_count == 0
         || section_count > MAX_SECTIONS
         || characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0
         || characteristics & IMAGE_FILE_DLL != 0
-        || !(MIN_PE32_PLUS_OPTIONAL_HEADER..=MAX_OPTIONAL_HEADER).contains(&optional_size)
+        || !(fixed_optional_header..=MAX_OPTIONAL_HEADER).contains(&optional_size)
     {
         return Err(BootstrapError::Package);
     }
@@ -382,18 +385,20 @@ fn validate_amd64_pe32_plus(file: &mut File) -> Result<(), BootstrapError> {
 
     file.seek(SeekFrom::Start(optional_start))
         .map_err(|_| BootstrapError::Package)?;
-    let mut optional = [0_u8; MIN_PE32_PLUS_OPTIONAL_HEADER as usize];
-    file.read_exact(&mut optional)
+    // PE32 and PE32+ share SizeOfHeaders at offset 60; NumberOfRvaAndSizes closes the fixed part.
+    let fixed = usize::from(fixed_optional_header);
+    let mut optional = [0_u8; 112];
+    file.read_exact(&mut optional[..fixed])
         .map_err(|_| BootstrapError::Package)?;
     let optional_magic = u16::from_le_bytes([optional[0], optional[1]]);
     let size_of_headers =
         u32::from_le_bytes(optional[60..64].try_into().expect("fixed slice")) as u64;
     let data_directory_count =
-        u32::from_le_bytes(optional[108..112].try_into().expect("fixed slice"));
-    let required_optional_size = 112_u64
+        u32::from_le_bytes(optional[fixed - 4..fixed].try_into().expect("fixed slice"));
+    let required_optional_size = u64::from(fixed_optional_header)
         .checked_add(u64::from(data_directory_count) * 8)
         .ok_or(BootstrapError::Package)?;
-    if optional_magic != 0x20b
+    if optional_magic != arch.pe_optional_magic()
         || data_directory_count > 16
         || required_optional_size > u64::from(optional_size)
         || size_of_headers < section_table_end
@@ -1560,6 +1565,18 @@ mod tests {
         }
     }
 
+    /// COFF machine and optional-header magic of this build and of the other Windows flavour.
+    #[cfg(windows)]
+    const NATIVE: (u16, u16) = (
+        multicore_release::WindowsArch::CURRENT.pe_machine(),
+        multicore_release::WindowsArch::CURRENT.pe_optional_magic(),
+    );
+    #[cfg(windows)]
+    const FOREIGN: (u16, u16) = match multicore_release::WindowsArch::CURRENT {
+        multicore_release::WindowsArch::X64 => (0x014c, 0x10b),
+        multicore_release::WindowsArch::X86 => (0x8664, 0x20b),
+    };
+
     #[cfg(windows)]
     fn write_test_pe(path: &Path, machine: u16, magic: u16, characteristics: u16) {
         let mut image = vec![0_u8; 0x200];
@@ -1585,12 +1602,20 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pe_validation_rejects_incoherent_or_unbounded_headers_and_sections() {
+        const FIXED: u16 = multicore_release::WindowsArch::CURRENT.pe_optional_header_fixed_size();
+        const SHORT_OPTIONAL_HEADER: u16 = FIXED - 1;
+        // NumberOfRvaAndSizes closes the fixed optional header, which starts at 0x98.
+        const DATA_DIRECTORY_COUNT: usize = 0x98 + FIXED as usize - 4;
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("fixture.exe");
         let cases: &[(&str, std::ops::Range<usize>, &[u8])] = &[
             ("zero sections", 0x86..0x88, &0_u16.to_le_bytes()),
             ("not executable", 0x96..0x98, &0x20_u16.to_le_bytes()),
-            ("short optional header", 0x94..0x96, &111_u16.to_le_bytes()),
+            (
+                "short optional header",
+                0x94..0x96,
+                &(SHORT_OPTIONAL_HEADER).to_le_bytes(),
+            ),
             (
                 "optional header outside file",
                 0x94..0x96,
@@ -1613,29 +1638,29 @@ mod tests {
             ),
             (
                 "too many data directories",
-                0x104..0x108,
+                DATA_DIRECTORY_COUNT..DATA_DIRECTORY_COUNT + 4,
                 &17_u32.to_le_bytes(),
             ),
         ];
         for (name, range, mutation) in cases {
-            write_test_pe(&path, 0x8664, 0x20b, 0x0022);
+            write_test_pe(&path, NATIVE.0, NATIVE.1, 0x0022);
             mutate_test_pe(&path, range.clone(), mutation);
             let mut file = File::open(&path).unwrap();
-            assert!(validate_amd64_pe32_plus(&mut file).is_err(), "case: {name}");
+            assert!(validate_native_pe(&mut file).is_err(), "case: {name}");
         }
 
-        write_test_pe(&path, 0x8664, 0x20b, 0x0022);
+        write_test_pe(&path, NATIVE.0, NATIVE.1, 0x0022);
         mutate_test_pe(&path, 0x198..0x19c, &0x80_u32.to_le_bytes());
         mutate_test_pe(&path, 0x19c..0x1a0, &0x1f0_u32.to_le_bytes());
         let mut file = File::open(&path).unwrap();
         assert!(
-            validate_amd64_pe32_plus(&mut file).is_err(),
+            validate_native_pe(&mut file).is_err(),
             "section raw range must remain within the file"
         );
 
         let current_exe = std::env::current_exe().unwrap();
         let mut current = File::open(current_exe).unwrap();
-        validate_amd64_pe32_plus(&mut current).expect("the native test PE must remain accepted");
+        validate_native_pe(&mut current).expect("the native test PE must remain accepted");
     }
 
     #[cfg(windows)]
@@ -1648,14 +1673,14 @@ mod tests {
         fs::create_dir_all(&runtime).unwrap();
         fs::create_dir_all(&cores).unwrap();
         let desktop = package.join("MultiCore.exe");
-        write_test_pe(&desktop, 0x8664, 0x20b, 0x0022);
+        write_test_pe(&desktop, NATIVE.0, NATIVE.1, 0x0022);
         for path in [
             runtime.join("multicore-daemon.exe"),
             runtime.join("multicore-updater.exe"),
             cores.join("xray.exe"),
             cores.join("mihomo.exe"),
         ] {
-            write_test_pe(&path, 0x8664, 0x20b, 0x0022);
+            write_test_pe(&path, NATIVE.0, NATIVE.1, 0x0022);
         }
         let paths = derive_and_validate_paths(
             &desktop,
@@ -1673,11 +1698,11 @@ mod tests {
         let updater = runtime.join("multicore-updater.exe");
         fs::remove_file(&updater).unwrap();
         assert!(derive_and_validate_paths(&desktop, temp.path()).is_err());
-        write_test_pe(&updater, 0x8664, 0x20b, 0x0022);
+        write_test_pe(&updater, NATIVE.0, NATIVE.1, 0x0022);
 
-        write_test_pe(&xray, 0x014c, 0x10b, 0x0022);
+        write_test_pe(&xray, FOREIGN.0, FOREIGN.1, 0x0022);
         assert!(derive_and_validate_paths(&desktop, temp.path()).is_err());
-        write_test_pe(&xray, 0x8664, 0x20b, 0x2022);
+        write_test_pe(&xray, NATIVE.0, NATIVE.1, 0x2022);
         assert!(derive_and_validate_paths(&desktop, temp.path()).is_err());
         fs::remove_file(&xray).unwrap();
         fs::create_dir(&xray).unwrap();
@@ -1693,15 +1718,20 @@ mod tests {
         fs::create_dir_all(package.join("runtime")).unwrap();
         fs::create_dir_all(package.join("cores")).unwrap();
         let desktop = package.join("MultiCore.exe");
-        write_test_pe(&desktop, 0x8664, 0x20b, 0x0022);
+        write_test_pe(&desktop, NATIVE.0, NATIVE.1, 0x0022);
         let outside = temp.path().join("outside.exe");
-        write_test_pe(&outside, 0x8664, 0x20b, 0x0022);
+        write_test_pe(&outside, NATIVE.0, NATIVE.1, 0x0022);
         if symlink_file(&outside, package.join("runtime/multicore-daemon.exe")).is_err() {
             // Creating symlinks requires Developer Mode or elevation on some Windows hosts.
             return;
         }
-        write_test_pe(&package.join("cores/xray.exe"), 0x8664, 0x20b, 0x0022);
-        write_test_pe(&package.join("cores/mihomo.exe"), 0x8664, 0x20b, 0x0022);
+        write_test_pe(&package.join("cores/xray.exe"), NATIVE.0, NATIVE.1, 0x0022);
+        write_test_pe(
+            &package.join("cores/mihomo.exe"),
+            NATIVE.0,
+            NATIVE.1,
+            0x0022,
+        );
         assert!(derive_and_validate_paths(&desktop, temp.path()).is_err());
     }
 
