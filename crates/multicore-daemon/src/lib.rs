@@ -159,6 +159,9 @@ pub struct SubscriptionInfoDto {
     #[serde(default)]
     pub service_logo_path: Option<String>,
     pub refresh_available: bool,
+    /// The provider's `dumb-mode` header: clients show only the first route group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dumb_mode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,6 +296,9 @@ pub struct GroupDto {
     pub label: String,
     pub selected: bool,
     pub nodes: Vec<NodeDto>,
+    /// Opaque id of the group's downloaded `icon` image (`GET /v1/group-icons/{id}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -302,6 +308,9 @@ pub struct NodeDto {
     pub selected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<u64>,
+    /// When the node is itself a proxy group (e.g. a url-test "Auto"), that group's icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -880,6 +889,10 @@ pub trait Backend: Send + Sync + 'static {
     async fn session(&self) -> Result<SessionDto, SessionError> {
         Err(SessionError::NotConnected)
     }
+    /// The canonical PNG of a catalog `icon_id`, when the active snapshot holds it.
+    async fn group_icon(&self, _icon_id: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -982,6 +995,7 @@ fn build_router_shared(
     let v1 = Router::new()
         .route("/status", get(status))
         .route("/catalog", get(catalog))
+        .route("/group-icons/{icon_id}", get(group_icon))
         .route("/latencies", post(latencies))
         .route("/selections/{group_id}", put(select_node))
         .route("/subscriptions", get(list_subscriptions))
@@ -1176,6 +1190,41 @@ async fn catalog(State(state): State<AppState>, body: Bytes) -> Result<Json<Cata
         .await
         .map(Json)
         .map_err(|_| ApiError::backend("Не удалось получить каталог. Повторите попытку."))
+}
+
+async fn group_icon(
+    State(state): State<AppState>,
+    Path(icon_id): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    reject_nonempty_body(&body)?;
+    let png = if is_group_icon_id(&icon_id) {
+        state.backend.group_icon(&icon_id).await
+    } else {
+        None
+    };
+    let png = png.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_icon",
+            "Значок группы не найден. Обновите каталог.",
+        )
+    })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        png,
+    )
+        .into_response())
+}
+
+fn is_group_icon_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn latencies(
@@ -2298,6 +2347,7 @@ impl<P: ProcessController> CoreRuntime<P> {
                                 .and_then(std::path::Path::to_str)
                                 .map(ToOwned::to_owned),
                             refresh_available: snapshot.subscription_source_url().is_some(),
+                            dumb_mode: info.dumb_mode,
                         })
                 }),
             cores_ready: self.cores_live(),
@@ -4289,6 +4339,15 @@ where
         Ok(runtime.catalog.clone())
     }
 
+    async fn group_icon(&self, icon_id: &str) -> Option<Vec<u8>> {
+        let runtime = self.inner.read().await;
+        runtime
+            .snapshot
+            .as_ref()?
+            .group_icon_png(icon_id)
+            .map(<[u8]>::to_vec)
+    }
+
     async fn import_subscription(
         &self,
         request: ImportSubscriptionRequest,
@@ -5023,6 +5082,7 @@ fn build_catalog(
                     label: safe_catalog_label(node, "Узел", node_index),
                     selected: selected_node_index == Some(node_index),
                     delay_ms: None,
+                    icon_id: snapshot.group_icon_id(node),
                 })
                 .collect();
             GroupDto {
@@ -5030,6 +5090,7 @@ fn build_catalog(
                 label: safe_catalog_label(group.name, "Группа", group_index),
                 selected,
                 nodes,
+                icon_id: snapshot.group_icon_id(group.name),
             }
         })
         .collect();

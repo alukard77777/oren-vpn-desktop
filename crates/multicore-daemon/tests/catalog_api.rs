@@ -7,7 +7,7 @@ use axum::{
 use http_body_util::BodyExt;
 use multicore_core::{
     Engine, FetchError, HttpClient, HttpResponse, ProcessController, ProfileStore, Snapshot,
-    SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_XRAY,
+    SubscriptionFetcher, UA_GROUP_ICON, UA_MIHOMO, UA_NATIVE, UA_XRAY,
 };
 use multicore_daemon::{
     Backend, CatalogDto, CoreBackend, ImportSubscriptionRequest, MAX_CATALOG_GROUPS,
@@ -932,4 +932,130 @@ async fn reconstructed_daemon_uses_persisted_generation_for_revision_and_ids() {
         first_catalog.groups[0].nodes[0].id,
         second_catalog.groups[0].nodes[0].id
     );
+}
+
+struct IconFixtureHttp;
+
+impl HttpClient for IconFixtureHttp {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        user_agent: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+        let mihomo = r#"
+proxies:
+  - name: NL One
+    type: socks5
+proxy-groups:
+  - name: Main
+    type: select
+    icon: https://icons.example/main.svg
+    proxies: [Auto, NL One]
+  - name: Auto
+    type: url-test
+    icon: https://icons.example/auto.svg
+    proxies: [NL One]
+  - name: Emoji
+    type: select
+    icon: https://icons.example/missing.svg
+    proxies: [NL One]
+"#;
+        Box::pin(async move {
+            Ok(match user_agent {
+                UA_NATIVE => HttpResponse::new(404, Vec::new(), std::iter::empty::<(&str, &str)>()),
+                UA_MIHOMO => HttpResponse::new(
+                    200,
+                    mihomo.as_bytes().to_vec(),
+                    std::iter::empty::<(&str, &str)>(),
+                ),
+                UA_XRAY => {
+                    HttpResponse::new(200, br#"{}"#.to_vec(), std::iter::empty::<(&str, &str)>())
+                }
+                UA_GROUP_ICON if !url.ends_with("missing.svg") => HttpResponse::new(
+                    200,
+                    br#"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='#4c9dff'/></svg>"#.to_vec(),
+                    std::iter::empty::<(&str, &str)>(),
+                ),
+                _ => return Err(FetchError::Network),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let backend = CoreBackend::new(
+        store,
+        SubscriptionFetcher::new(IconFixtureHttp),
+        |_snapshot| Ok(Arc::new(NoopController)),
+    )
+    .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://example.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+
+    let catalog = backend.catalog().await.unwrap();
+    let main = &catalog.groups[0];
+    assert_eq!(main.label, "Main");
+    let main_icon = main.icon_id.clone().expect("main group icon");
+    assert_eq!(
+        main_icon,
+        multicore_core::group_icon_key("https://icons.example/main.svg")
+    );
+    // A node that is itself a group carries that group's icon.
+    assert_eq!(main.nodes[0].label, "Auto");
+    let auto_icon = main.nodes[0].icon_id.clone().expect("auto group icon");
+    assert_ne!(auto_icon, main_icon);
+    assert_eq!(main.nodes[1].icon_id, None);
+    // A failed download leaves no icon (the UI keeps its fallback glyph).
+    assert_eq!(catalog.groups[1].label, "Emoji");
+    assert_eq!(catalog.groups[1].icon_id, None);
+
+    let app = router(backend, TOKEN);
+    let response = app
+        .clone()
+        .oneshot(authenticated_request(
+            &format!("/v1/group-icons/{main_icon}"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    for missing in [
+        "0123456789abcdef0123456789abcdef".to_owned(),
+        "not-an-icon".to_owned(),
+        main_icon.to_uppercase(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authenticated_request(
+                &format!("/v1/group-icons/{missing}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{missing}");
+    }
+    let unauthorized = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/group-icons/{main_icon}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 }
