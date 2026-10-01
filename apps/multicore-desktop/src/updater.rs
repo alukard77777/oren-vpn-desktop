@@ -772,7 +772,8 @@ mod tests {
             super::start_apply(&release, &staged).is_err(),
             "a changed package is never handed to the installer"
         );
-        std::fs::remove_file(&path).unwrap();
+        // Linux drops a tampered download itself; either way a missing file is rejected.
+        let _ = std::fs::remove_file(&path);
         assert!(staged.reverify(&release).is_err());
     }
 
