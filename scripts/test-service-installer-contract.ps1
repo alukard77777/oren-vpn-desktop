@@ -71,6 +71,18 @@ foreach ($token in @(
     'if RegKeyExists(HKLM64, UninstallKey) then',
     '(Pos(''"platform": "windows-x64"'', Manifest) > 0)',
     'уже установлен 64-битный MultiCore',
+    # x64 over an x86 install on 64-bit Windows: migrate it, keeping the user's data.
+    'function X86ServiceUninstaller: String;',
+    "RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', X86Uninstaller)",
+    "ExpandConstant('{commonpf32}\MultiCore\')",
+    'function RemoveX86ServiceInstall: String;',
+    "Exec(X86Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'",
+    'Result := X86ServiceUninstaller;',
+    'function X86PerUserCopyPresent: Boolean;',
+    '(Pos(''"platform": "windows-x86"'', Manifest) > 0)',
+    'function RemoveX86PerUserCopy: String;',
+    "while (X86PerUserCopyPresent or FileExists(PerUserInstallDir + '\unins000.exe')) and",
+    "if WizardIsTaskSelected('autostart') or MoveAutostartFromServiceInstall then",
     "ShellExec('', ServiceUninstaller, '/SILENT /SUPPRESSMSGBOXES /NORESTART'",
     'MultiCore уже установлен со службой',
     'Result := RemoveServiceInstall;',
@@ -135,6 +147,23 @@ if (-not ($prepare.IndexOf('Result := RemoveServiceInstall;') -ge 0 -and $prepar
 }
 if (-not ($prepare.IndexOf('if X64InstallPresent then') -ge 0 -and $prepare.IndexOf('if X64InstallPresent then') -lt $prepare.IndexOf('Result := RemoveServiceInstall;'))) {
     throw 'FAIL: the x86 installer must refuse an x64 install before touching any install'
+}
+if (-not ($prepare.IndexOf('ServiceInstallDir) <> 0') -lt $prepare.IndexOf('Result := RemoveX86ServiceInstall;') -and $prepare.IndexOf('Result := RemoveX86ServiceInstall;') -lt $prepare.IndexOf('WaitForPerUserCopyToExit'))) {
+    throw 'FAIL: x64 service mode must migrate an x86 service install after the directory check and before the per-user wait'
+}
+if (-not ($prepare.IndexOf('Result := RemoveServiceInstall;') -lt $prepare.IndexOf('Result := RemoveX86PerUserCopy;') -and $prepare.IndexOf('Result := RemoveX86PerUserCopy;') -lt $prepare.IndexOf('ServiceInstallDir) <> 0'))) {
+    throw 'FAIL: x64 per-user mode must remove the service install, then an x86 per-user copy'
+}
+foreach ($guard in @(@('function X86ServiceUninstaller:', 'HKLM32'), @('function X86PerUserCopyPresent:', 'LoadStringFromFile'))) {
+    $header = $guard[0]
+    $body = Get-Body $header
+    if (-not ($body.IndexOf('if not Is64BitInstallMode then') -ge 0 -and $body.IndexOf('if not Is64BitInstallMode then') -lt $body.IndexOf($guard[1]))) {
+        throw "FAIL: $header must do nothing in the x86 installer"
+    }
+}
+$x86Removal = Get-Body 'function RemoveX86ServiceInstall:'
+if (-not ($x86Removal.IndexOf('StopService;') -ge 0 -and $x86Removal.IndexOf('StopService;') -lt $x86Removal.IndexOf('WaitForExit(') -and $x86Removal.IndexOf('WaitForExit(') -lt $x86Removal.IndexOf('Exec(X86Uninstaller'))) {
+    throw 'FAIL: the x86 service install is stopped and its processes gone before its uninstaller runs'
 }
 $x64Check = Get-Body 'function X64InstallPresent:'
 if (-not ($x64Check.IndexOf('if not IsX86SetupOn64BitWindows then') -ge 0 -and $x64Check.IndexOf('if not IsX86SetupOn64BitWindows then') -lt $x64Check.IndexOf('RegKeyExists(HKLM64'))) {
