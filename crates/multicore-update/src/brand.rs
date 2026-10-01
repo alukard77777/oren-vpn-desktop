@@ -48,26 +48,95 @@ pub fn path_is_within(path: &str, root: &Path) -> bool {
     !root.is_empty() && (path == root || path.starts_with(&format!("{root}\\")))
 }
 
+/// What this install's uninstall entry holds now (`None`: absent or unreadable).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UninstallEntry<'a> {
+    pub install_location: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+    pub publisher: Option<&'a str>,
+    pub display_version: Option<&'a str>,
+    /// The DWORDs Inno Setup writes next to `DisplayVersion`, when present.
+    pub major_version: Option<u32>,
+    pub minor_version: Option<u32>,
+    pub version_major: Option<u32>,
+    pub version_minor: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryValue {
+    Text(String),
+    Number(u32),
+}
+
+impl std::fmt::Display for EntryValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => formatter.write_str(text),
+            Self::Number(number) => write!(formatter, "{number}"),
+        }
+    }
+}
+
+/// `(major, minor)` of a version such as `1.1.2` or `1.2.0-rc.1`.
+pub fn major_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.split(['-', '+']).next()?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
 /// Values of the uninstall entry to rewrite, as (value name, new data). Only the entry of
-/// this install (its `InstallLocation`) changes, and only names still spelled "MultiCore".
+/// this install (its `InstallLocation`) changes: names still spelled "MultiCore", and the
+/// version an in-app update moved past (`DisplayVersion`, Inno's version DWORDs and the
+/// version at the end of `DisplayName`). Empty once both are current.
 pub fn uninstall_entry_updates(
-    install_location: Option<&str>,
-    display_name: Option<&str>,
-    publisher: Option<&str>,
+    entry: &UninstallEntry<'_>,
     install_root: &Path,
-) -> Vec<(&'static str, String)> {
-    let Some(location) = install_location else {
+    version: &str,
+) -> Vec<(&'static str, EntryValue)> {
+    let Some(location) = entry.install_location else {
         return Vec::new();
     };
     if normalize(location) != install_root.to_str().map(normalize).unwrap_or_default() {
         return Vec::new();
     }
     let mut updates = Vec::new();
-    if let Some(rest) = display_name.and_then(|name| name.strip_prefix(LEGACY_PRODUCT_NAME)) {
-        updates.push(("DisplayName", format!("{PRODUCT_NAME}{rest}")));
+    if let Some(name) = entry.display_name {
+        let mut renamed = match name.strip_prefix(LEGACY_PRODUCT_NAME) {
+            Some(rest) => format!("{PRODUCT_NAME}{rest}"),
+            None => name.to_owned(),
+        };
+        // Inno's AppVerName ("MULTICORE version 1.1.1") ends with the installed version.
+        if let Some(installed) = entry
+            .display_version
+            .filter(|installed| !installed.is_empty() && *installed != version)
+            && let Some(head) = renamed.strip_suffix(installed)
+            && head.ends_with(' ')
+        {
+            renamed = format!("{head}{version}");
+        }
+        if renamed != name {
+            updates.push(("DisplayName", EntryValue::Text(renamed)));
+        }
     }
-    if publisher == Some(LEGACY_PRODUCT_NAME) {
-        updates.push(("Publisher", PRODUCT_NAME.to_owned()));
+    if entry.publisher == Some(LEGACY_PRODUCT_NAME) {
+        updates.push(("Publisher", EntryValue::Text(PRODUCT_NAME.to_owned())));
+    }
+    if entry
+        .display_version
+        .is_some_and(|installed| installed != version)
+    {
+        updates.push(("DisplayVersion", EntryValue::Text(version.to_owned())));
+    }
+    if let Some((major, minor)) = major_minor(version) {
+        for (name, current, wanted) in [
+            ("MajorVersion", entry.major_version, major),
+            ("MinorVersion", entry.minor_version, minor),
+            ("VersionMajor", entry.version_major, major),
+            ("VersionMinor", entry.version_minor, minor),
+        ] {
+            if current.is_some_and(|current| current != wanted) {
+                updates.push((name, EntryValue::Number(wanted)));
+            }
+        }
     }
     updates
 }
@@ -258,19 +327,20 @@ pub enum Scope {
     User,
 }
 
-/// Renames this install's Apps & Features entry and shortcuts to MULTICORE. Best effort and
-/// idempotent; returns one line per change or failure for the caller's log.
+/// Renames this install's Apps & Features entry and shortcuts to MULTICORE and moves the
+/// entry's version to `version` (the running build). Best effort and idempotent, cheap when
+/// current; returns one line per change or failure for the caller's log.
 #[cfg(windows)]
-pub fn migrate_install(scope: Scope, install_root: &Path) -> Vec<String> {
-    windows::migrate_install(scope, install_root)
+pub fn migrate_install(scope: Scope, install_root: &Path, version: &str) -> Vec<String> {
+    windows::migrate_install(scope, install_root, version)
 }
 
 #[cfg(windows)]
 mod windows {
     use super::{
-        PROTOCOL_KEY, SHORTCUT_FILE_NAME, Scope, UNINSTALL_KEY, legacy_shortcut_name,
-        parse_shell_link, protocol_description_update, shell_link_points_into,
-        uninstall_entry_updates,
+        EntryValue, PROTOCOL_KEY, SHORTCUT_FILE_NAME, Scope, UNINSTALL_KEY, UninstallEntry,
+        legacy_shortcut_name, parse_shell_link, protocol_description_update,
+        shell_link_points_into, uninstall_entry_updates,
     };
     use std::{
         ffi::{OsString, c_void},
@@ -286,8 +356,8 @@ mod windows {
                 Com::CoTaskMemFree,
                 Registry::{
                     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE,
-                    REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW,
-                    RegSetValueExW,
+                    REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
+                    RegOpenKeyExW, RegSetValueExW,
                 },
             },
             UI::Shell::{
@@ -383,6 +453,42 @@ mod windows {
         String::from_utf16(&buffer).ok()
     }
 
+    fn read_dword(key: &Key, name: &str) -> Option<u32> {
+        let name = wide(name);
+        let mut value = 0_u32;
+        let mut byte_len = 4_u32;
+        let status = unsafe {
+            RegGetValueW(
+                key.0,
+                null(),
+                name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                null_mut(),
+                (&raw mut value).cast::<c_void>(),
+                &mut byte_len,
+            )
+        };
+        (status == ERROR_SUCCESS).then_some(value)
+    }
+
+    fn write_dword(key: &Key, name: &str, value: u32) -> io::Result<()> {
+        let name = wide(name);
+        let status = unsafe {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_DWORD,
+                (&raw const value).cast::<u8>(),
+                4,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(())
+    }
+
     fn write_value(key: &Key, name: &str, value: &str) -> io::Result<()> {
         let name = wide(name);
         let value = wide(value);
@@ -404,7 +510,7 @@ mod windows {
         Ok(())
     }
 
-    fn migrate_entry(scope: Scope, install_root: &Path, log: &mut Vec<String>) {
+    fn migrate_entry(scope: Scope, install_root: &Path, version: &str, log: &mut Vec<String>) {
         let key = match open_entry(scope) {
             Ok(Some(key)) => key,
             Ok(None) => return,
@@ -413,14 +519,28 @@ mod windows {
                 return;
             }
         };
-        let updates = uninstall_entry_updates(
-            read_value(&key, "InstallLocation").as_deref(),
-            read_value(&key, "DisplayName").as_deref(),
-            read_value(&key, "Publisher").as_deref(),
-            install_root,
+        let (location, display_name, publisher, display_version) = (
+            read_value(&key, "InstallLocation"),
+            read_value(&key, "DisplayName"),
+            read_value(&key, "Publisher"),
+            read_value(&key, "DisplayVersion"),
         );
-        for (name, value) in updates {
-            match write_value(&key, name, &value) {
+        let entry = UninstallEntry {
+            install_location: location.as_deref(),
+            display_name: display_name.as_deref(),
+            publisher: publisher.as_deref(),
+            display_version: display_version.as_deref(),
+            major_version: read_dword(&key, "MajorVersion"),
+            minor_version: read_dword(&key, "MinorVersion"),
+            version_major: read_dword(&key, "VersionMajor"),
+            version_minor: read_dword(&key, "VersionMinor"),
+        };
+        for (name, value) in uninstall_entry_updates(&entry, install_root, version) {
+            let written = match &value {
+                EntryValue::Text(text) => write_value(&key, name, text),
+                EntryValue::Number(number) => write_dword(&key, name, *number),
+            };
+            match written {
                 Ok(()) => log.push(format!("uninstall entry {name} set to {value}")),
                 Err(error) => log.push(format!("uninstall entry {name} not set: {error}")),
             }
@@ -505,9 +625,9 @@ mod windows {
         }
     }
 
-    pub(super) fn migrate_install(scope: Scope, install_root: &Path) -> Vec<String> {
+    pub(super) fn migrate_install(scope: Scope, install_root: &Path, version: &str) -> Vec<String> {
         let mut log = Vec::new();
-        migrate_entry(scope, install_root, &mut log);
+        migrate_entry(scope, install_root, version, &mut log);
         if scope == Scope::Machine {
             migrate_protocol(install_root, &mut log);
         }
@@ -580,39 +700,94 @@ mod tests {
         ));
     }
 
+    const VERSION: &str = "1.1.2";
+
+    fn installed_1_1_1(location: Option<&'static str>) -> UninstallEntry<'static> {
+        UninstallEntry {
+            install_location: location,
+            display_name: Some("MultiCore version 1.1.1"),
+            publisher: Some("MultiCore"),
+            display_version: Some("1.1.1"),
+            major_version: Some(1),
+            minor_version: Some(1),
+            version_major: Some(1),
+            version_minor: Some(1),
+        }
+    }
+
+    fn text(value: &str) -> EntryValue {
+        EntryValue::Text(value.to_owned())
+    }
+
     #[test]
-    fn the_uninstall_entry_of_this_install_is_renamed_once() {
+    fn the_uninstall_entry_of_this_install_takes_the_new_name_and_version() {
+        let entry = installed_1_1_1(Some(r"C:\Program Files\MultiCore\"));
         assert_eq!(
-            uninstall_entry_updates(
-                Some(r"C:\Program Files\MultiCore\"),
-                Some("MultiCore version 1.1.1"),
-                Some("MultiCore"),
-                &root(),
-            ),
+            uninstall_entry_updates(&entry, &root(), VERSION),
             vec![
-                ("DisplayName", "MULTICORE version 1.1.1".to_owned()),
-                ("Publisher", "MULTICORE".to_owned()),
+                ("DisplayName", text("MULTICORE version 1.1.2")),
+                ("Publisher", text("MULTICORE")),
+                ("DisplayVersion", text("1.1.2")),
             ]
         );
+        let minor_bump = uninstall_entry_updates(&entry, &root(), "1.2.0");
+        assert!(minor_bump.contains(&("MinorVersion", EntryValue::Number(2))));
+        assert!(minor_bump.contains(&("VersionMinor", EntryValue::Number(2))));
+        assert!(!minor_bump.iter().any(|(name, _)| name.contains("Major")));
         assert_eq!(
-            uninstall_entry_updates(
-                Some(r"C:\Program Files\MultiCore\"),
-                Some("MultiCore версия 1.1.1"),
-                Some("MULTICORE"),
-                &root(),
-            ),
-            vec![("DisplayName", "MULTICORE версия 1.1.1".to_owned())]
+            uninstall_entry_updates(&entry, &root(), "2.0.0-rc.1")
+                .into_iter()
+                .filter(|(name, _)| name.contains("Major"))
+                .count(),
+            2
         );
-        // Already migrated: nothing to do.
-        assert!(
-            uninstall_entry_updates(
-                Some(r"C:\Program Files\MultiCore\"),
-                Some("MULTICORE version 1.1.2"),
-                Some("MULTICORE"),
-                &root(),
-            )
-            .is_empty()
+    }
+
+    #[test]
+    fn the_uninstall_entry_follows_every_version_change() {
+        // Renamed by an earlier start (or the 1.1.2 installer), then updated in-app again.
+        let entry = UninstallEntry {
+            install_location: Some(r"C:\Program Files\MultiCore\"),
+            display_name: Some("MULTICORE версия 1.1.2"),
+            publisher: Some("MULTICORE"),
+            display_version: Some("1.1.2"),
+            ..UninstallEntry::default()
+        };
+        assert_eq!(
+            uninstall_entry_updates(&entry, &root(), "1.1.3"),
+            vec![
+                ("DisplayName", text("MULTICORE версия 1.1.3")),
+                ("DisplayVersion", text("1.1.3")),
+            ]
         );
+        // Current: nothing to do.
+        assert!(uninstall_entry_updates(&entry, &root(), "1.1.2").is_empty());
+        // A name without the version keeps its text; only the version values move.
+        let plain = UninstallEntry {
+            display_name: Some("MULTICORE"),
+            ..entry
+        };
+        assert_eq!(
+            uninstall_entry_updates(&plain, &root(), "1.1.3"),
+            vec![("DisplayVersion", text("1.1.3"))]
+        );
+        // The suffix must be a whole word: "11.1.2" does not end in " 1.1.2".
+        let glued = UninstallEntry {
+            display_name: Some("MULTICORE 11.1.2"),
+            ..entry
+        };
+        assert_eq!(
+            uninstall_entry_updates(&glued, &root(), "1.1.3"),
+            vec![("DisplayVersion", text("1.1.3"))]
+        );
+    }
+
+    #[test]
+    fn versions_split_into_major_and_minor() {
+        assert_eq!(major_minor("1.1.2"), Some((1, 1)));
+        assert_eq!(major_minor("1.12.0-rc.1"), Some((1, 12)));
+        assert_eq!(major_minor("2"), None);
+        assert_eq!(major_minor("x.1"), None);
     }
 
     #[test]
@@ -624,13 +799,7 @@ mod tests {
             Some(""),
         ] {
             assert!(
-                uninstall_entry_updates(
-                    location,
-                    Some("MultiCore version 1.1.1"),
-                    Some("MultiCore"),
-                    &root()
-                )
-                .is_empty(),
+                uninstall_entry_updates(&installed_1_1_1(location), &root(), VERSION).is_empty(),
                 "{location:?}"
             );
         }

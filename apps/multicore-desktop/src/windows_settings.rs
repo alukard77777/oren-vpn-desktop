@@ -107,7 +107,8 @@ pub fn migrate_legacy_brand() {
     let _ = std::thread::Builder::new()
         .name("multicore-branding".into())
         .spawn(move || {
-            for line in brand::migrate_install(brand::Scope::User, &root) {
+            for line in brand::migrate_install(brand::Scope::User, &root, env!("CARGO_PKG_VERSION"))
+            {
                 eprintln!("branding: {line}");
             }
         });

@@ -157,7 +157,11 @@ fn migrate(package_root: &Path) -> Vec<String> {
     let mut log = Vec::new();
     rename_service(&mut log);
     match brand::install_root_of_current(package_root) {
-        Some(root) => log.extend(brand::migrate_install(Scope::Machine, root)),
+        Some(root) => log.extend(brand::migrate_install(
+            Scope::Machine,
+            root,
+            env!("MULTICORE_APP_VERSION"),
+        )),
         None => log.push(format!(
             "{} is not an installed copy; shortcuts left alone",
             package_root.display()
