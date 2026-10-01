@@ -5,6 +5,9 @@ param(
     [string]$OutputDirectory = 'dist\release',
     [string]$AppVersion = '1.1.1',
     [string]$CompilerPath,
+    # x64 (default) or x86; the payload must be the package built for the same flavour.
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture = 'x64',
     [switch]$ValidateOnly
 )
 
@@ -136,11 +139,19 @@ if ($ValidateOnly) {
     return
 }
 
+# The package's own hash-verified manifest names its flavour: an x86 installer must never carry
+# the x64 payload (or the reverse).
+$payloadManifest = Get-Content -Raw -LiteralPath (Join-Path $payload 'versions.json') | ConvertFrom-Json
+if ([string]$payloadManifest.platform -cne "windows-$Architecture") {
+    throw "Payload platform '$($payloadManifest.platform)' does not match installer architecture windows-$Architecture"
+}
+
 $compiler = Resolve-Compiler $CompilerPath
 $output = Get-FullPath $OutputDirectory
 Assert-NoReparseAncestor $output
 if (-not (Test-Path -LiteralPath $output)) { New-Item -ItemType Directory -Path $output | Out-Null }
-$finalPath = Join-Path $output 'MultiCore-Setup-x64.exe'
+$installerName = "MultiCore-Setup-$Architecture.exe"
+$finalPath = Join-Path $output $installerName
 if (Test-Path -LiteralPath $finalPath) { throw "Refusing to overwrite existing installer: $finalPath" }
 
 $temporaryOutput = Join-Path $output ('.multicore-installer-' + [Guid]::NewGuid().ToString('N'))
@@ -150,12 +161,13 @@ try {
         "/DPayloadDir=$payload",
         "/DOutputDir=$temporaryOutput",
         "/DAppVersion=$AppVersion",
+        "/DArch=$Architecture",
         '/Qp',
         $DefinitionPath
     )
     & $compiler @arguments
     if ($LASTEXITCODE -ne 0) { throw "ISCC.exe failed with exit code $LASTEXITCODE" }
-    $builtPath = Join-Path $temporaryOutput 'MultiCore-Setup-x64.exe'
+    $builtPath = Join-Path $temporaryOutput $installerName
     if (-not (Test-Path -LiteralPath $builtPath -PathType Leaf)) { throw 'ISCC.exe did not produce the expected installer' }
     Move-Item -LiteralPath $builtPath -Destination $finalPath
     Write-Output "Created Windows installer: $finalPath"

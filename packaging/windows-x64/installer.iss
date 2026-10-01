@@ -7,6 +7,13 @@
 #ifndef AppVersion
   #error AppVersion must be provided by build-windows-installer.ps1
 #endif
+; x64 (default) or x86: the 32-bit flavour for 32-bit Windows, installed in 32-bit mode.
+#ifndef Arch
+  #define Arch "x64"
+#endif
+#if Arch != "x64" && Arch != "x86"
+  #error Arch must be x64 or x86
+#endif
 
 #define AppName "MultiCore"
 #define AppPublisher "MultiCore"
@@ -27,10 +34,17 @@ PrivilegesRequiredOverridesAllowed=commandline dialog
 ; "Без службы" over a service install removes the service install first (PrepareToInstall).
 UsePreviousPrivileges=no
 UsedUserAreasWarning=no
+#if Arch == "x64"
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir={#OutputDir}
 OutputBaseFilename=MultiCore-Setup-x64
+#else
+; Same AppId as x64. Always 32-bit install mode: {commonpf} is Program Files (x86) on 64-bit
+; Windows, Program Files on 32-bit Windows; the uninstall entry lives in the 32-bit view.
+ArchitecturesAllowed=x86compatible
+OutputBaseFilename=MultiCore-Setup-x86
+#endif
+OutputDir={#OutputDir}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -141,9 +155,16 @@ begin
   Result := ExpandConstant('{app}\current\runtime\multicore-core-host.exe');
 end;
 
-{ Service mode installs only here: the SYSTEM service must never run from a user-writable folder. }
+{ Service mode installs only here: the SYSTEM service must never run from a user-writable folder.
+  The x86 installer always runs in 32-bit install mode (Program Files (x86) on 64-bit Windows),
+  the x64 one always in 64-bit mode. }
 function ServiceInstallDir: String;
 begin
+  if not Is64BitInstallMode then
+  begin
+    Result := ExpandConstant('{commonpf32}\MultiCore');
+    exit;
+  end;
   Result := ExpandConstant('{commonpf64}\MultiCore');
 end;
 
@@ -450,9 +471,15 @@ end;
 function ServiceInstallUninstaller: String;
 var
   Uninstaller: String;
+  Found: Boolean;
 begin
   Result := '';
-  if RegQueryStringValue(HKLM64, UninstallKey, 'UninstallString', Uninstaller) then
+  { Each flavour's uninstall entry lives in the registry view of its install mode. }
+  if Is64BitInstallMode then
+    Found := RegQueryStringValue(HKLM64, UninstallKey, 'UninstallString', Uninstaller)
+  else
+    Found := RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', Uninstaller);
+  if Found then
   begin
     Uninstaller := RemoveQuotes(Uninstaller);
     if FileExists(Uninstaller) then
@@ -509,6 +536,45 @@ begin
   end;
 end;
 
+{ The 32-bit installer (32-bit install mode) on 64-bit Windows: the x64 installer fits better. }
+function IsX86SetupOn64BitWindows: Boolean;
+begin
+  Result := (not Is64BitInstallMode) and IsWin64;
+end;
+
+{ An x64 install found by the x86 installer: its service install (64-bit uninstall entry) or a
+  per-user copy whose package manifest is the x64 one. }
+function X64InstallPresent: Boolean;
+var
+  Manifest: AnsiString;
+begin
+  Result := False;
+  if not IsX86SetupOn64BitWindows then
+    exit;
+  if RegKeyExists(HKLM64, UninstallKey) then
+  begin
+    Result := True;
+    exit;
+  end;
+  if (PerUserInstallDir <> '') and
+     LoadStringFromFile(PerUserInstallDir + '\current\versions.json', Manifest) and
+     (Pos('"platform": "windows-x64"', Manifest) > 0) then
+    Result := True;
+end;
+
+<event('InitializeSetup')>
+function WarnX86SetupOn64BitWindows: Boolean;
+begin
+  Result := True;
+  if not IsX86SetupOn64BitWindows then
+    exit;
+  { Silent installs (the app's own service migration) keep the 32-bit flavour. }
+  Result := SuppressibleMsgBox('Это 32-битная версия MultiCore. На 64-битной Windows лучше установить '
+      + 'MultiCore-Setup-x64.exe: 32-битная версия работает, но медленнее и может дольше поднимать TUN.'
+      + #13#10#13#10 + 'Всё равно установить 32-битную версию?',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES;
+end;
+
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   { Service mode has exactly one allowed location. }
@@ -529,6 +595,13 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  { Never replace an x64 install with the 32-bit flavour. }
+  if X64InstallPresent then
+  begin
+    Result := 'На этом компьютере уже установлен 64-битный MultiCore. Установите MultiCore-Setup-x64.exe '
+      + 'или сначала удалите MultiCore в «Параметры → Приложения».';
+    exit;
+  end;
   if not IsAdminInstallMode then
   begin
     Result := RemoveServiceInstall;

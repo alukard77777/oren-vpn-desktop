@@ -45,6 +45,9 @@ foreach ($token in @(
     # I2: service mode installs only to Program Files (no dir page, /DIR= refused).
     "Result := (PageID = wpSelectDir) and IsAdminInstallMode;",
     "Result := ExpandConstant('{commonpf64}\MultiCore');",
+    # x86 flavour: 32-bit install mode, so Program Files (x86) on 64-bit Windows.
+    "Result := ExpandConstant('{commonpf32}\MultiCore');",
+    'if not Is64BitInstallMode then',
     "CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')), ServiceInstallDir) <> 0",
     # I3: a running per-user copy (desktop, daemon, core host, cores) blocks the migration.
     "'SELECT Handle, ExecutablePath, SessionId FROM Win32_Process'",
@@ -61,6 +64,13 @@ foreach ($token in @(
     'DeleteUserProtocolHandler;',
     # M6: "Без службы" over a service install removes the service install first (or stops).
     "RegQueryStringValue(HKLM64, UninstallKey, 'UninstallString', Uninstaller)",
+    "RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', Uninstaller)",
+    # x86 on 64-bit Windows: warn (x64 preferred) and never replace an x64 install.
+    "<event('InitializeSetup')>",
+    'Result := (not Is64BitInstallMode) and IsWin64;',
+    'if RegKeyExists(HKLM64, UninstallKey) then',
+    '(Pos(''"platform": "windows-x64"'', Manifest) > 0)',
+    'уже установлен 64-битный MultiCore',
     "ShellExec('', ServiceUninstaller, '/SILENT /SUPPRESSMSGBOXES /NORESTART'",
     'MultiCore уже установлен со службой',
     'Result := RemoveServiceInstall;',
@@ -122,6 +132,13 @@ if (-not ($install.IndexOf('RemovePerUserCopy;') -ge 0 -and $install.IndexOf('Re
 }
 if (-not ($prepare.IndexOf('Result := RemoveServiceInstall;') -ge 0 -and $prepare.IndexOf('Result := RemoveServiceInstall;') -lt $prepare.IndexOf('ServiceInstallDir) <> 0'))) {
     throw 'FAIL: a per-user install must deal with an existing service install before anything else'
+}
+if (-not ($prepare.IndexOf('if X64InstallPresent then') -ge 0 -and $prepare.IndexOf('if X64InstallPresent then') -lt $prepare.IndexOf('Result := RemoveServiceInstall;'))) {
+    throw 'FAIL: the x86 installer must refuse an x64 install before touching any install'
+}
+$x64Check = Get-Body 'function X64InstallPresent:'
+if (-not ($x64Check.IndexOf('if not IsX86SetupOn64BitWindows then') -ge 0 -and $x64Check.IndexOf('if not IsX86SetupOn64BitWindows then') -lt $x64Check.IndexOf('RegKeyExists(HKLM64'))) {
+    throw 'FAIL: the x64 installer (and 32-bit Windows) must never evaluate the x64-install refusal'
 }
 $lookup = Get-Body 'procedure LookupInteractiveUser;'
 if (-not $lookup.Contains('if not IsAdminInstallMode then')) {

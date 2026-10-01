@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "platform": "windows-x86",
+  "build": {
+    "rustToolchain": "1.98.1",
+    "desktopPackage": "multicore-desktop",
+    "daemonPackage": "multicore-daemon",
+    "updaterPackage": "multicore-updater",
+    "coreHostPackage": "multicore-core-host"
+  },
+  "components": {
+    "xray": {
+      "project": "XTLS/Xray-core",
+      "version": "v26.9.30",
+      "commit": "b26a91de4f3294e26a0ad0a970b81a386a41f789",
+      "license": "MPL-2.0",
+      "asset": {
+        "name": "Xray-windows-32.zip",
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-windows-32.zip",
+        "sha256": "709a5f478b7314805c19ad6248cfd15b40dd224efdebfaa48282a41821b7f715",
+        "entry": "xray.exe",
+        "executableSha256": "8fef35c35970e30a3cfff8a9e6bb60a500621d718f93967bc9ee69a7794b2365",
+        "maximumExpandedBytes": 268435456
+      },
+      "licenseFile": {
+        "name": "Xray-core-MPL-2.0.txt",
+        "url": "https://raw.githubusercontent.com/XTLS/Xray-core/b26a91de4f3294e26a0ad0a970b81a386a41f789/LICENSE",
+        "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+      },
+      "source": {
+        "url": "https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip",
+        "sha256": "eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b"
+      }
+    },
+    "mihomo": {
+      "project": "MetaCubeX/mihomo",
+      "version": "v1.19.32",
+      "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
+      "license": "GPL-3.0-only",
+      "asset": {
+        "name": "mihomo-windows-386-v1.19.32.zip",
+        "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-386-v1.19.32.zip",
+        "sha256": "2fb4cfe1552e74eb1b2a0b98ec334041286a0de2ca01ca1ae16b4bf179c09b3f",
+        "entry": "mihomo-windows-386.exe",
+        "executableSha256": "113d2a9118c26288df743cd753da519f2b2b8de17f1db7a3a892c1dd795eec2e",
+        "maximumExpandedBytes": 268435456,
+        "note": "Mihomo embeds Wintun (sing-tun): this 386 build carries the x86 wintun.dll plus the amd64/arm64 driver helpers Wintun uses under WOW64, so no wintun.dll is shipped separately (same as x64)."
+      },
+      "licenseFile": {
+        "name": "mihomo-GPL-3.0.txt",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE",
+        "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+      },
+      "source": {
+        "url": "https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip",
+        "sha256": "63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30"
+      }
+    },
+    "dashboard": {
+      "project": "Zephyruso/zashboard",
+      "version": "v3.29.1",
+      "commit": "50717b02dac68425cdc5b80cb754bea768ee4fc9",
+      "license": "MIT",
+      "asset": {
+        "name": "dist-no-fonts.zip",
+        "url": "https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist-no-fonts.zip",
+        "sha256": "21371cd111b6b3d87774f3ea3ddeacdcb0f6aff8690a16d652daa3ea6e3b0145",
+        "rootPrefix": "dist/",
+        "maximumEntryBytes": 8388608,
+        "maximumExpandedBytes": 33554432,
+        "maximumEntryCount": 64,
+        "indexHtmlSha256": "70bb3dc4057cbc0feaff524672f2b0fbafa52279b757dbdc8cb8fdc3e6a73510",
+        "note": "dist-no-fonts is used (not dist-cdn-fonts/dist) so the vendored static UI never references a runtime font CDN. Verified empirically against the pinned Mihomo v1.19.30 binary: Mihomo requires an external-ui directory to be a subpath of its own home directory or listed in the SAFE_PATHS environment variable of the process that spawns it, and otherwise attempts a live download of a dashboard from the internet -- this package must always stage this directory and set SAFE_PATHS before launching Mihomo. indexHtmlSha256 pins the exact unpatched upstream index.html the packaging scripts know how to CSP-patch; a future re-vendor must review and re-pin it deliberately."
+      },
+      "licenseFile": {
+        "name": "zashboard-MIT.txt",
+        "url": "https://raw.githubusercontent.com/Zephyruso/zashboard/50717b02dac68425cdc5b80cb754bea768ee4fc9/LICENSE",
+        "sha256": "ffc390eec51f16b58506b1a42c99fe0cd9ffea1e3081aab443100fd8c20182d9"
+      },
+      "contentSecurityPolicy": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' data: https:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+    }
+  }
+}
