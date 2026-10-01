@@ -56,7 +56,9 @@ Set-StrictMode -Version Latest
 
 $AppId = '{D95AB954-248C-44C9-9E3A-952398802A2D}_is1'
 $TaskName = 'MultiCoreLiveTest'
-$ServiceRoot = Join-Path $env:ProgramFiles 'MultiCore'
+# The x86 installer installs in 32-bit mode: Program Files (x86) on 64-bit Windows.
+$IsX86Installer = [bool]($InstallerPath -and (Split-Path -Leaf $InstallerPath) -like '*-x86.exe')
+$ServiceRoot = if ($IsX86Installer -and ${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} 'MultiCore' } else { Join-Path $env:ProgramFiles 'MultiCore' }
 $PerUserRoot = Join-Path $env:LOCALAPPDATA 'Programs\MultiCore'
 $DataRoot = Join-Path $env:LOCALAPPDATA 'MultiCore'
 $ProgramDataRoot = Join-Path $env:ProgramData 'MultiCore'
@@ -160,8 +162,8 @@ function Add-DriverResults([string]$Prefix, [object[]]$Checks) {
 }
 
 function Get-UninstallEntry {
-    foreach ($hive in 'HKLM:', 'HKCU:') {
-        $key = "$hive\Software\Microsoft\Windows\CurrentVersion\Uninstall\$AppId"
+    foreach ($hive in 'HKLM:', 'HKLM:\Software\WOW6432Node', 'HKCU:') {
+        $key = $(if ($hive -like '*WOW6432Node') { "$hive" } else { "$hive\Software" }) + "\Microsoft\Windows\CurrentVersion\Uninstall\$AppId"
         if (Test-Path $key) { return Get-ItemProperty $key }
     }
     $null
@@ -428,6 +430,7 @@ try {
     if ($installOk) {
         Invoke-InstallChecks
         $driverArguments = @('-Mode', $Mode)
+        if ($Mode -eq 'Service') { $driverArguments += @('-InstallRoot', $ServiceRoot) }
         $driverArguments += @('-TrafficUrl', $(if ($TrafficUrl) { $TrafficUrl } else { 'none' }))
         if ($SubscriptionUrl) { $driverArguments += @('-SubscriptionUrl', $SubscriptionUrl) }
         if ($WithDesktop -and $Mode -eq 'Service') { $driverArguments += '-WithDesktop' }

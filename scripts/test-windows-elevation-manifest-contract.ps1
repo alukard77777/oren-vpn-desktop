@@ -55,6 +55,17 @@ try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Checker -DesktopExecutablePath $valid -DaemonExecutablePath $valid -UpdaterExecutablePath $valid -CoreHostExecutablePath $valid -PeHeadersOnly | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) 'synthetic AMD64 PE32+ executable header must pass header-only validation'
 
+    # The x86 flavour accepts only i386 PE32 and rejects AMD64 PE32+.
+    $valid32 = Join-Path $root 'valid32.exe'; New-PeHeaderFixture $valid32 -Machine 0x014c -OptionalMagic 0x010b
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Checker -Architecture x86 -DesktopExecutablePath $valid32 -DaemonExecutablePath $valid32 -UpdaterExecutablePath $valid32 -CoreHostExecutablePath $valid32 -PeHeadersOnly | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'synthetic i386 PE32 executable header must pass x86 header-only validation'
+    $savedErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $x86Output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Checker -Architecture x86 -DesktopExecutablePath $valid -DaemonExecutablePath $valid -UpdaterExecutablePath $valid -CoreHostExecutablePath $valid -PeHeadersOnly 2>&1 | Out-String
+    $x86ExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $savedErrorPreference
+    Assert-True ($x86ExitCode -ne 0 -and $x86Output.Contains('is not i386')) 'x86 validation must reject AMD64 images'
+
     foreach ($case in @(
         @{ Name = 'x86'; Machine = [uint16]0x014c; Magic = [uint16]0x020b; Dll = $false; Malformed = $false; Expected = 'is not AMD64' },
         @{ Name = 'arm64'; Machine = [uint16]0xaa64; Magic = [uint16]0x020b; Dll = $false; Malformed = $false; Expected = 'is not AMD64' },

@@ -10,6 +10,9 @@ param(
     [string]$UpdateRepository,
     [string]$ReleaseAssetPath,
     [switch]$AssertReleaseReady,
+    # x64 (default, PE32+ AMD64) or x86 (PE32 i386, Rust target i686-pc-windows-msvc).
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture = 'x64',
     [Parameter(DontShow = $true)]
     [switch]$FixtureContractMode
 )
@@ -21,8 +24,15 @@ Set-StrictMode -Version Latest
 $PrivilegedBrokerReleaseReady = $true
 $ReleaseGateMessage = 'Production packaging is disabled until the least-privilege core broker and package inventory are complete (Tasks 2-4).'
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
-$MetadataRoot = Join-Path $RepositoryRoot 'packaging\windows-x64'
+$MetadataRoot = Join-Path $RepositoryRoot "packaging\windows-$Architecture"
+# Both flavours ship the same notices (identical core versions and licenses).
+$NoticesPath = Join-Path $RepositoryRoot 'packaging\windows-x64\THIRD_PARTY_NOTICES.md'
 $DefaultManifestPath = Join-Path $MetadataRoot 'versions.json'
+$Platform = "windows-$Architecture"
+$ReleaseAssetName = "multicore-$Platform.zip"
+# x64 keeps the host target (no --target) exactly as before; x86 cross-compiles. (Not named
+# $RustTarget: PowerShell variables are case-insensitive and $rustTarget is the target directory.)
+$CargoBuildTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { $null }
 if (-not $ManifestPath) { $ManifestPath = $DefaultManifestPath }
 $manifestCandidate = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ManifestPath))
 $isFixtureInvocation = $false
@@ -102,7 +112,7 @@ function Assert-NoPrivateBuildPaths {
 }
 
 function Invoke-PinnedRustBuild {
-    param([object]$Build, [string]$TargetDirectory, [string]$UpdateRepository)
+    param([object]$Build, [string]$TargetDirectory, [string]$UpdateRepository, [string]$Target)
     $hadRustFlags = Test-Path Env:RUSTFLAGS
     $savedRustFlags = $env:RUSTFLAGS
     $hadEncodedFlags = Test-Path Env:CARGO_ENCODED_RUSTFLAGS
@@ -157,7 +167,9 @@ function Invoke-PinnedRustBuild {
         } else {
             Remove-Item Env:MULTICORE_UPDATE_REPOSITORY -ErrorAction SilentlyContinue
         }
-        & cargo build --locked --release -p $Build.desktopPackage -p $Build.daemonPackage -p $Build.updaterPackage -p $Build.coreHostPackage
+        $targetArguments = @()
+        if ($Target) { $targetArguments = @('--target', $Target) }
+        & cargo build --locked --release @targetArguments -p $Build.desktopPackage -p $Build.daemonPackage -p $Build.updaterPackage -p $Build.coreHostPackage
         if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust release build failed' }
     } finally {
         Pop-Location
@@ -185,7 +197,7 @@ function New-ReleaseAsset {
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $assetFull = Get-FullPath $AssetPath
-    if ([IO.Path]::GetFileName($assetFull) -cne 'multicore-windows-x64.zip') { throw 'ReleaseAssetPath filename must be multicore-windows-x64.zip' }
+    if ([IO.Path]::GetFileName($assetFull) -cne $ReleaseAssetName) { throw "ReleaseAssetPath filename must be $ReleaseAssetName" }
     if (Test-Path -LiteralPath $assetFull) { throw "Release asset already exists: $assetFull" }
     $assetParent = Split-Path -Parent $assetFull
     if (-not (Test-Path -LiteralPath $assetParent)) { New-Item -ItemType Directory -Path $assetParent | Out-Null }
@@ -267,7 +279,7 @@ function Assert-SafeLeafName {
 function Assert-ExactProductionPin {
     param([string]$Name, [object]$Component)
     $pins = @{
-        xray = @(
+        'x64/xray' = @(
             'XTLS/Xray-core', 'v26.9.30', 'b26a91de4f3294e26a0ad0a970b81a386a41f789', 'MPL-2.0',
             'Xray-windows-64.zip', 'https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-windows-64.zip',
             'b17a619343c11b89d8faf36278298856749b15c52277d875d32051b33dcda617', 'xray.exe',
@@ -277,11 +289,32 @@ function Assert-ExactProductionPin {
             'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
             'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
         )
-        mihomo = @(
+        'x64/mihomo' = @(
             'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
             'mihomo-windows-amd64-compatible-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-amd64-compatible-v1.19.32.zip',
             '974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0', 'mihomo-windows-amd64-compatible.exe',
             '04f8d7fc2b314771e1ecbf15951d59f0e1cb7914503c88cfb6972ff6a824e314', '268435456',
+            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
+            '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
+            'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
+            '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
+        )
+        # x86: the same upstream releases and commits, 32-bit Windows assets.
+        'x86/xray' = @(
+            'XTLS/Xray-core', 'v26.9.30', 'b26a91de4f3294e26a0ad0a970b81a386a41f789', 'MPL-2.0',
+            'Xray-windows-32.zip', 'https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-windows-32.zip',
+            '709a5f478b7314805c19ad6248cfd15b40dd224efdebfaa48282a41821b7f715', 'xray.exe',
+            '8fef35c35970e30a3cfff8a9e6bb60a500621d718f93967bc9ee69a7794b2365', '268435456',
+            'Xray-core-MPL-2.0.txt', 'https://raw.githubusercontent.com/XTLS/Xray-core/b26a91de4f3294e26a0ad0a970b81a386a41f789/LICENSE',
+            '1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5',
+            'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
+            'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
+        )
+        'x86/mihomo' = @(
+            'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
+            'mihomo-windows-386-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-386-v1.19.32.zip',
+            '2fb4cfe1552e74eb1b2a0b98ec334041286a0de2ca01ca1ae16b4bf179c09b3f', 'mihomo-windows-386.exe',
+            '113d2a9118c26288df743cd753da519f2b2b8de17f1db7a3a892c1dd795eec2e', '268435456',
             'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
             '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
             'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
@@ -295,8 +328,8 @@ function Assert-ExactProductionPin {
         [string]$Component.licenseFile.name, [string]$Component.licenseFile.url, [string]$Component.licenseFile.sha256,
         [string]$Component.source.url, [string]$Component.source.sha256
     )
-    $expected = $pins[$Name]
-    if ($actual.Count -ne $expected.Count) { throw "Incomplete built-in pin tuple for $Name" }
+    $expected = $pins["$Architecture/$Name"]
+    if ($null -eq $expected -or $actual.Count -ne $expected.Count) { throw "Incomplete built-in pin tuple for $Name" }
     for ($index = 0; $index -lt $expected.Count; $index++) {
         if ($actual[$index] -cne $expected[$index]) { throw "Production manifest does not match the built-in immutable $Name pin tuple" }
     }
@@ -485,8 +518,17 @@ function Read-UInt16 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUIn
 function Read-UInt32 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUInt32($Bytes, $Offset) }
 function Read-UInt64 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUInt64($Bytes, $Offset) }
 
-function Assert-Amd64PeExecutable {
+# PE32+ AMD64 for x64, PE32 i386 for x86. PE32 has BaseOfData and 32-bit ImageBase/stack/heap
+# fields, so everything after offset 24 of the optional header sits 16 bytes earlier.
+function Assert-NativePeExecutable {
     param([string]$Path, [string]$Description)
+    $isPe32 = $Architecture -ceq 'x86'
+    $expectedMachine = if ($isPe32) { 0x014c } else { 0x8664 }
+    $machineName = if ($isPe32) { 'i386' } else { 'AMD64' }
+    $expectedMagic = if ($isPe32) { 0x010b } else { 0x020b }
+    $formatName = if ($isPe32) { 'PE32' } else { 'PE32+' }
+    $minimumOptional = if ($isPe32) { 0xe0 } else { 0xf0 }
+    $fixedOptional = if ($isPe32) { 96 } else { 112 }
     Assert-File $Path $Description
     $bytes = [IO.File]::ReadAllBytes((Get-FullPath $Path))
     if ($bytes.Length -lt 512 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "$Description is not a coherent PE executable" }
@@ -498,10 +540,10 @@ function Assert-Amd64PeExecutable {
     $optionalSize = Read-UInt16 $bytes ($coff + 16)
     $characteristics = Read-UInt16 $bytes ($coff + 18)
     $optional = $coff + 20
-    if ($machine -ne 0x8664) { throw "$Description is not AMD64" }
-    if ($sections -lt 1 -or $sections -gt 96 -or $optionalSize -lt 0xf0 -or ($optional + $optionalSize) -gt $bytes.Length) { throw "$Description has incoherent PE/COFF dimensions" }
+    if ($machine -ne $expectedMachine) { throw "$Description is not $machineName" }
+    if ($sections -lt 1 -or $sections -gt 96 -or $optionalSize -lt $minimumOptional -or ($optional + $optionalSize) -gt $bytes.Length) { throw "$Description has incoherent PE/COFF dimensions" }
     if (($characteristics -band 0x0002) -eq 0 -or ($characteristics -band 0x2000) -ne 0) { throw "$Description is not a non-DLL executable image" }
-    if ((Read-UInt16 $bytes $optional) -ne 0x020b) { throw "$Description is not PE32+" }
+    if ((Read-UInt16 $bytes $optional) -ne $expectedMagic) { throw "$Description is not $formatName" }
     $entryPoint = Read-UInt32 $bytes ($optional + 16)
     $sectionAlignment = Read-UInt32 $bytes ($optional + 32)
     $fileAlignment = Read-UInt32 $bytes ($optional + 36)
@@ -511,12 +553,19 @@ function Assert-Amd64PeExecutable {
     $sizeOfImage = Read-UInt32 $bytes ($optional + 56)
     $sizeOfHeaders = Read-UInt32 $bytes ($optional + 60)
     $subsystem = Read-UInt16 $bytes ($optional + 68)
-    [uint64]$stackReserve = Read-UInt64 $bytes ($optional + 72)
-    [uint64]$stackCommit = Read-UInt64 $bytes ($optional + 80)
-    [uint64]$heapReserve = Read-UInt64 $bytes ($optional + 88)
-    [uint64]$heapCommit = Read-UInt64 $bytes ($optional + 96)
-    $directoryCount = Read-UInt32 $bytes ($optional + 108)
-    if ($directoryCount -gt 16 -or (112 + (8 * $directoryCount)) -gt $optionalSize) { throw "$Description has incoherent PE32+ data directories" }
+    if ($isPe32) {
+        [uint64]$stackReserve = Read-UInt32 $bytes ($optional + 72)
+        [uint64]$stackCommit = Read-UInt32 $bytes ($optional + 76)
+        [uint64]$heapReserve = Read-UInt32 $bytes ($optional + 80)
+        [uint64]$heapCommit = Read-UInt32 $bytes ($optional + 84)
+    } else {
+        [uint64]$stackReserve = Read-UInt64 $bytes ($optional + 72)
+        [uint64]$stackCommit = Read-UInt64 $bytes ($optional + 80)
+        [uint64]$heapReserve = Read-UInt64 $bytes ($optional + 88)
+        [uint64]$heapCommit = Read-UInt64 $bytes ($optional + 96)
+    }
+    $directoryCount = Read-UInt32 $bytes ($optional + $fixedOptional - 4)
+    if ($directoryCount -gt 16 -or ($fixedOptional + (8 * $directoryCount)) -gt $optionalSize) { throw "$Description has incoherent $formatName data directories" }
     if ($entryPoint -eq 0 -or $entryPoint -ge $sizeOfImage -or $sizeOfImage -eq 0 -or $sizeOfHeaders -lt $sectionTableEnd -or $sizeOfHeaders -gt $bytes.Length) { throw "$Description has incoherent entry/image/header sizes" }
     if ($subsystem -notin @(2, 3)) { throw "$Description does not target the supported Windows GUI/CUI subsystems" }
     if ($stackReserve -eq 0 -or $stackCommit -eq 0 -or $stackCommit -gt $stackReserve -or $heapReserve -eq 0 -or $heapCommit -eq 0 -or $heapCommit -gt $heapReserve) { throw "$Description has incoherent loader stack/heap bounds" }
@@ -602,7 +651,7 @@ try {
     $stagedManifest = Join-Path $stage 'versions.json'
     Copy-CreateNew $manifestFull $stagedManifest
     $manifest = Get-Content -Raw -LiteralPath $stagedManifest | ConvertFrom-Json
-    if ($manifest.schemaVersion -ne 1 -or $manifest.platform -cne 'windows-x64') { throw 'Unsupported Windows package manifest' }
+    if ($manifest.schemaVersion -ne 1 -or $manifest.platform -cne $Platform) { throw "Unsupported Windows package manifest (expected platform $Platform)" }
     if ($manifest.build.rustToolchain -cne '1.98.1' -or $manifest.build.desktopPackage -cne 'multicore-desktop' -or $manifest.build.daemonPackage -cne 'multicore-daemon' -or $manifest.build.updaterPackage -cne 'multicore-updater' -or $manifest.build.coreHostPackage -cne 'multicore-core-host') { throw 'Unexpected build provenance in manifest' }
     foreach ($componentName in @('xray', 'mihomo')) {
         $component = $manifest.components.$componentName
@@ -652,11 +701,12 @@ try {
             throw 'Production packaging builds all Rust executables internally; executable overrides are fixture-only'
         }
         $rustTarget = Join-Path $stage '.rust-target'
-        Invoke-PinnedRustBuild $manifest.build $rustTarget $UpdateRepository
-        $DesktopExecutablePath = Join-Path $rustTarget 'release\multicore-desktop.exe'
-        $DaemonExecutablePath = Join-Path $rustTarget 'release\multicore-daemon.exe'
-        $UpdaterExecutablePath = Join-Path $rustTarget 'release\multicore-apply.exe'
-        $CoreHostExecutablePath = Join-Path $rustTarget 'release\multicore-core-host.exe'
+        Invoke-PinnedRustBuild $manifest.build $rustTarget $UpdateRepository $CargoBuildTarget
+        $rustRelease = if ($CargoBuildTarget) { Join-Path $rustTarget "$CargoBuildTarget\release" } else { Join-Path $rustTarget 'release' }
+        $DesktopExecutablePath = Join-Path $rustRelease 'multicore-desktop.exe'
+        $DaemonExecutablePath = Join-Path $rustRelease 'multicore-daemon.exe'
+        $UpdaterExecutablePath = Join-Path $rustRelease 'multicore-apply.exe'
+        $CoreHostExecutablePath = Join-Path $rustRelease 'multicore-core-host.exe'
     } elseif (-not $DesktopExecutablePath -or -not $DaemonExecutablePath -or -not $UpdaterExecutablePath -or -not $CoreHostExecutablePath) {
         throw 'Fixture packaging requires all executable paths'
     }
@@ -668,10 +718,10 @@ try {
     Copy-CreateNew $DaemonExecutablePath $stagedDaemon
     Copy-CreateNew $UpdaterExecutablePath $stagedUpdater
     Copy-CreateNew $CoreHostExecutablePath $stagedCoreHost
-    Assert-Amd64PeExecutable $stagedDesktop 'Staged desktop executable'
-    Assert-Amd64PeExecutable $stagedDaemon 'Staged daemon executable'
-    Assert-Amd64PeExecutable $stagedUpdater 'Staged updater executable'
-    Assert-Amd64PeExecutable $stagedCoreHost 'Staged core-host executable'
+    Assert-NativePeExecutable $stagedDesktop 'Staged desktop executable'
+    Assert-NativePeExecutable $stagedDaemon 'Staged daemon executable'
+    Assert-NativePeExecutable $stagedUpdater 'Staged updater executable'
+    Assert-NativePeExecutable $stagedCoreHost 'Staged core-host executable'
     if ($isProductionManifest) {
         Assert-NoPrivateBuildPaths $stagedDesktop 'Staged desktop executable'
         Assert-NoPrivateBuildPaths $stagedDaemon 'Staged daemon executable'
@@ -692,7 +742,7 @@ try {
         $coreTarget = Join-Path $stage ("cores\$componentName.exe")
         Expand-ExactZipEntry $archive $component.asset.entry ([int64]$component.asset.maximumExpandedBytes) $coreTarget
         Assert-Hash $coreTarget $component.asset.executableSha256 "$componentName executable"
-        Assert-Amd64PeExecutable $coreTarget "$componentName executable"
+        Assert-NativePeExecutable $coreTarget "$componentName executable"
 
         $licenseTarget = Join-Path $stage ('licenses\' + $component.licenseFile.name)
         Get-InputFile $component.licenseFile.name $component.licenseFile.url $licenseTarget
@@ -718,7 +768,7 @@ try {
     }
 
     Copy-CreateNew (Join-Path $MetadataRoot 'README.md') (Join-Path $stage 'README.md')
-    Copy-CreateNew (Join-Path $MetadataRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $stage 'THIRD_PARTY_NOTICES.md')
+    Copy-CreateNew $NoticesPath (Join-Path $stage 'THIRD_PARTY_NOTICES.md')
 
     $inputs = Get-FullPath (Join-Path $stage '.inputs')
     if ((Split-Path -Parent $inputs) -cne (Get-FullPath $stage) -or (Split-Path -Leaf $inputs) -cne '.inputs') { throw 'Refusing unsafe staging-input cleanup' }

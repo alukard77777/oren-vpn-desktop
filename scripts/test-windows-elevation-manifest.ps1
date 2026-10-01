@@ -13,6 +13,10 @@ param(
 
     [switch]$PeHeadersOnly,
 
+    # x64 (default): AMD64 PE32+. x86: i386 PE32.
+    [ValidateSet('x64', 'x86')]
+    [string]$Architecture = 'x64',
+
     [Parameter(DontShow = $true)]
     [string]$ManifestXmlFixturePath,
 
@@ -54,15 +58,19 @@ function Assert-Amd64PeExecutable {
     $optionalSize = [BitConverter]::ToUInt16($bytes, $coff + 16)
     $characteristics = [BitConverter]::ToUInt16($bytes, $coff + 18)
     $optional = $coff + 20
-    if ($machine -ne 0x8664) { throw "$Description is not AMD64" }
+    $expectedMachine = if ($Architecture -ceq 'x86') { 0x014c } else { 0x8664 }
+    $machineName = if ($Architecture -ceq 'x86') { 'i386' } else { 'AMD64' }
+    if ($machine -ne $expectedMachine) { throw "$Description is not $machineName" }
     if ($optionalSize -lt 2 -or ([uint64]$optional + $optionalSize) -gt $bytes.Length) {
         throw "$Description has a truncated optional header"
     }
     if (($characteristics -band 0x0002) -eq 0 -or ($characteristics -band 0x2000) -ne 0) {
         throw "$Description is not a non-DLL executable image"
     }
-    if ([BitConverter]::ToUInt16($bytes, $optional) -ne 0x020b) {
-        throw "$Description is not PE32+"
+    $expectedMagic = if ($Architecture -ceq 'x86') { 0x010b } else { 0x020b }
+    $formatName = if ($Architecture -ceq 'x86') { 'PE32' } else { 'PE32+' }
+    if ([BitConverter]::ToUInt16($bytes, $optional) -ne $expectedMagic) {
+        throw "$Description is not $formatName"
     }
 }
 
@@ -127,7 +135,7 @@ Assert-Amd64PeExecutable $UpdaterExecutablePath 'Updater executable'
 Assert-Amd64PeExecutable $CoreHostExecutablePath 'Core-host executable'
 
 if ($PeHeadersOnly) {
-    Write-Host 'PASS: all inputs are AMD64 PE32+ non-DLL executables'
+    Write-Host "PASS: all inputs are $Architecture non-DLL executables ($(if ($Architecture -ceq 'x86') { 'i386 PE32' } else { 'AMD64 PE32+' }))"
     return
 }
 
@@ -209,4 +217,4 @@ Assert-NumericManifest $DaemonExecutablePath $asInvoker
 Assert-NumericManifest $UpdaterExecutablePath $asInvoker
 Assert-NumericManifest $CoreHostExecutablePath $requireAdministrator
 
-Write-Host 'PASS: four AMD64 executables embed semantic numeric RT_MANIFEST #1 with least-privilege levels'
+Write-Host "PASS: four $Architecture executables embed semantic numeric RT_MANIFEST #1 with least-privilege levels"

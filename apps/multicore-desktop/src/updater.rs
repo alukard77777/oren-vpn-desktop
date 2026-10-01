@@ -704,10 +704,10 @@ fn confirm_started_in(
 #[cfg(test)]
 mod tests {
     use super::{UpdateAction, UpdateState};
-    use multicore_release::GitHubRelease;
+    use multicore_release::{GitHubRelease, WindowsArch};
 
     fn release() -> GitHubRelease {
-        GitHubRelease::parse(br#"{
+        GitHubRelease::parse_for_arch(br#"{
             "tag_name":"v0.2.0",
             "html_url":"https://github.com/Fatyzzz/multi-core/releases/tag/v0.2.0",
             "assets":[{
@@ -716,7 +716,7 @@ mod tests {
                 "size":1234,
                 "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }]
-        }"#).unwrap()
+        }"#, WindowsArch::X64).unwrap()
     }
 
     #[test]

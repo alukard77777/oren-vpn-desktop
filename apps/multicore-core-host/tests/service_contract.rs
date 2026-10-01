@@ -389,9 +389,11 @@ fn reading_a_client_generation_leaves_its_runtime_free_for_the_next_one() {
         bytes[..2].copy_from_slice(b"MZ");
         bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
         bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
-        bytes[0x84..0x86].copy_from_slice(&0x8664_u16.to_le_bytes());
+        // Cores of this build's architecture (x64 or x86).
+        let arch = multicore_release::WindowsArch::CURRENT;
+        bytes[0x84..0x86].copy_from_slice(&arch.pe_machine().to_le_bytes());
         bytes[0x96..0x98].copy_from_slice(&0x0002_u16.to_le_bytes());
-        bytes[0x98..0x9a].copy_from_slice(&0x20b_u16.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&arch.pe_optional_magic().to_le_bytes());
         fs::write(path, bytes).unwrap();
     }
     let root = tempfile::tempdir().unwrap();

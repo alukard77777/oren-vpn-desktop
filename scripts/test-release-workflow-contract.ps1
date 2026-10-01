@@ -140,6 +140,14 @@ foreach ($token in @(
     '-UpdateRepository fatyzzz/multicore-releases',
     'multicore-windows-x64.zip',
     'MultiCore-Setup-x64.exe',
+    # 32-bit Windows flavour.
+    'rustup target add i686-pc-windows-msvc --toolchain 1.98.1-x86_64-pc-windows-msvc',
+    'cargo test --workspace --locked --target i686-pc-windows-msvc',
+    'cargo clippy --workspace --all-targets --locked --target i686-pc-windows-msvc -- -D warnings',
+    '-ReleaseAssetPath dist/release/multicore-windows-x86.zip',
+    '-CoreHostExecutablePath dist/release/multicore-windows-x86/runtime/multicore-core-host.exe',
+    "`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'x86'",
+    '-PackagePath dist/release/multicore-windows-x86',
     'test-windows-installer-contract.ps1',
     'test-smoke-test-one-click-contract.ps1',
     'test-packaged-daemon-smoke-contract.ps1',
@@ -228,6 +236,13 @@ Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh -
 Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats arch')) `
     'Arch artifacts must be inspected before upload'
 
+foreach ($x86Asset in @("'dist/release/multicore-windows-x86.zip',", "'dist/release/MultiCore-Setup-x86.exe',")) {
+    Assert-True ([regex]::Matches($workflow, [regex]::Escape($x86Asset)).Count -eq 2) `
+        "x86 asset must appear in the release checksums and the publication stage: $x86Asset"
+}
+$x86PackageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x86.zip', [StringComparison]::Ordinal)
+$x86BundleArchIndex = $workflow.IndexOf("`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'x86'", [StringComparison]::Ordinal)
+Assert-True ($x86PackageIndex -ge 0 -and $x86BundleArchIndex -gt $x86PackageIndex) 'x86 updater bundle contract must run after the x86 release ZIP is created'
 $packageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x64.zip', [StringComparison]::Ordinal)
 $realBundleIndex = $workflow.IndexOf('$env:MULTICORE_RELEASE_BUNDLE', [StringComparison]::Ordinal)
 $daemonSmokeIndex = $workflow.IndexOf('smoke-test-packaged-daemon.ps1', [StringComparison]::Ordinal)

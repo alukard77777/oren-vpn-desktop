@@ -7,6 +7,13 @@
 #ifndef AppVersion
   #error AppVersion must be provided by build-windows-installer.ps1
 #endif
+; x64 (default) or x86: the 32-bit flavour for 32-bit Windows, installed in 32-bit mode.
+#ifndef Arch
+  #define Arch "x64"
+#endif
+#if Arch != "x64" && Arch != "x86"
+  #error Arch must be x64 or x86
+#endif
 
 #define AppName "MultiCore"
 #define AppPublisher "MultiCore"
@@ -27,10 +34,17 @@ PrivilegesRequiredOverridesAllowed=commandline dialog
 ; "Без службы" over a service install removes the service install first (PrepareToInstall).
 UsePreviousPrivileges=no
 UsedUserAreasWarning=no
+#if Arch == "x64"
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir={#OutputDir}
 OutputBaseFilename=MultiCore-Setup-x64
+#else
+; Same AppId as x64. Always 32-bit install mode: {commonpf} is Program Files (x86) on 64-bit
+; Windows, Program Files on 32-bit Windows; the uninstall entry lives in the 32-bit view.
+ArchitecturesAllowed=x86compatible
+OutputBaseFilename=MultiCore-Setup-x86
+#endif
+OutputDir={#OutputDir}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -112,7 +126,8 @@ var
   UserSid: String;
   { That user's %LOCALAPPDATA%; '' when it could not be found. }
   UserLocalAppDataPath: String;
-  { "Без службы" replaced a service install whose launch at sign-in was on. }
+  { "Без службы" replaced a service install, or x64 replaced an x86 install, whose launch at
+    sign-in was on: turn it on again for this install. }
   MoveAutostartFromServiceInstall: Boolean;
 
 function GetCurrentProcessId: Cardinal;
@@ -141,9 +156,16 @@ begin
   Result := ExpandConstant('{app}\current\runtime\multicore-core-host.exe');
 end;
 
-{ Service mode installs only here: the SYSTEM service must never run from a user-writable folder. }
+{ Service mode installs only here: the SYSTEM service must never run from a user-writable folder.
+  The x86 installer always runs in 32-bit install mode (Program Files (x86) on 64-bit Windows),
+  the x64 one always in 64-bit mode. }
 function ServiceInstallDir: String;
 begin
+  if not Is64BitInstallMode then
+  begin
+    Result := ExpandConstant('{commonpf32}\MultiCore');
+    exit;
+  end;
   Result := ExpandConstant('{commonpf64}\MultiCore');
 end;
 
@@ -446,18 +468,46 @@ begin
     Log('Per-user MultiCore uninstaller exited with ' + IntToStr(ResultCode));
 end;
 
+{ x64 on 64-bit Windows: the uninstaller of an x86 service install (32-bit uninstall view,
+  Program Files (x86)), or ''. The x86 installer reads that entry as its own, so never here. }
+function X86ServiceUninstaller: String;
+var
+  X86Uninstaller: String;
+begin
+  Result := '';
+  if not Is64BitInstallMode then
+    exit;
+  if RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', X86Uninstaller) then
+  begin
+    X86Uninstaller := RemoveQuotes(X86Uninstaller);
+    { Only the x86 service install's own uninstaller in the administrators-only folder. }
+    if (CompareText(ExtractFilePath(X86Uninstaller), ExpandConstant('{commonpf32}\MultiCore\')) = 0) and
+       FileExists(X86Uninstaller) then
+      Result := X86Uninstaller;
+  end;
+end;
+
 { The uninstaller of a service-mode (all users) install, or '' when there is none. }
 function ServiceInstallUninstaller: String;
 var
   Uninstaller: String;
+  Found: Boolean;
 begin
   Result := '';
-  if RegQueryStringValue(HKLM64, UninstallKey, 'UninstallString', Uninstaller) then
+  { Each flavour's uninstall entry lives in the registry view of its install mode. }
+  if Is64BitInstallMode then
+    Found := RegQueryStringValue(HKLM64, UninstallKey, 'UninstallString', Uninstaller)
+  else
+    Found := RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', Uninstaller);
+  if Found then
   begin
     Uninstaller := RemoveQuotes(Uninstaller);
     if FileExists(Uninstaller) then
       Result := Uninstaller;
   end;
+  { x64 "Без службы" over an x86 service install removes it the same way. }
+  if Result = '' then
+    Result := X86ServiceUninstaller;
 end;
 
 { "Без службы" over a service install would leave two installs. Remove the service install
@@ -509,6 +559,134 @@ begin
   end;
 end;
 
+{ x64 service mode over an x86 service install (installed by mistake on 64-bit Windows): stop
+  the service, wait for its processes, run its own uninstaller (elevated: Program Files (x86) is
+  administrators-only; /VERYSILENT keeps subscriptions and settings), then install x64. }
+function RemoveX86ServiceInstall: String;
+var
+  X86Uninstaller, X86Dir, AutostartValue: String;
+  ResultCode, Waited: Integer;
+begin
+  Result := '';
+  X86Uninstaller := X86ServiceUninstaller;
+  if X86Uninstaller = '' then
+    exit;
+  X86Dir := RemoveBackslash(ExtractFilePath(X86Uninstaller));
+  Log('Replacing the x86 service install in ' + X86Dir);
+  { Keep the signed-in user's launch at sign-in: the x86 uninstaller removes its value. }
+  MoveAutostartFromServiceInstall :=
+    RegQueryStringValue(UserHiveRoot, UserHiveKey(RunKey), 'MultiCore', AutostartValue) and
+    (CompareText(AutostartValue, '"' + X86Dir + '\current\{#AppExeName}" --background') = 0);
+  StopService;
+  if not WaitForExit(X86Dir, False) then
+  begin
+    MoveAutostartFromServiceInstall := False;
+    Result := 'MultiCore ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    exit;
+  end;
+  if not Exec(X86Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    ResultCode := -1;
+  Waited := 0;
+  while (X86ServiceUninstaller <> '') and (Waited < ServiceUninstallWaitSeconds) do
+  begin
+    Sleep(1000);
+    Waited := Waited + 1;
+  end;
+  if X86ServiceUninstaller <> '' then
+  begin
+    MoveAutostartFromServiceInstall := False;
+    Result := 'Не удалось удалить 32-битный MultiCore (код ' + IntToStr(ResultCode) + '). '
+      + 'Удалите его в «Параметры → Приложения» и запустите установку снова.';
+  end;
+end;
+
+{ x64 on 64-bit Windows: the signed-in user's per-user copy is the x86 package. }
+function X86PerUserCopyPresent: Boolean;
+var
+  Manifest: AnsiString;
+begin
+  Result := False;
+  if not Is64BitInstallMode then
+    exit;
+  Result := (PerUserInstallDir <> '') and
+    LoadStringFromFile(PerUserInstallDir + '\current\versions.json', Manifest) and
+    (Pos('"platform": "windows-x86"', Manifest) > 0);
+end;
+
+{ x64 "Без службы" over an x86 per-user copy: same folder and entry, but a 32-bit-mode install.
+  Remove it with its own uninstaller (silent: the data stays), then install x64. }
+function RemoveX86PerUserCopy: String;
+var
+  AutostartValue: String;
+  Waited: Integer;
+begin
+  Result := '';
+  if not X86PerUserCopyPresent then
+    exit;
+  if not WaitForPerUserCopyToExit then
+  begin
+    Result := 'MultiCore ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    exit;
+  end;
+  MoveAutostartFromServiceInstall :=
+    RegQueryStringValue(HKEY_CURRENT_USER, RunKey, 'MultiCore', AutostartValue) and
+    (CompareText(AutostartValue, '"' + PerUserInstallDir + '\current\{#AppExeName}" --background') = 0);
+  RemovePerUserCopy;
+  { Also wait for the old uninstaller to delete itself: in the same folder the new install
+    would otherwise get unins001.exe, which RemovePerUserCopy (service migration) cannot find. }
+  Waited := 0;
+  while (X86PerUserCopyPresent or FileExists(PerUserInstallDir + '\unins000.exe')) and
+        (Waited < ServiceUninstallWaitSeconds) do
+  begin
+    Sleep(1000);
+    Waited := Waited + 1;
+  end;
+  if X86PerUserCopyPresent then
+  begin
+    MoveAutostartFromServiceInstall := False;
+    Result := 'Не удалось удалить 32-битный MultiCore. Удалите его в «Параметры → Приложения» и запустите установку снова.';
+  end;
+end;
+
+{ The 32-bit installer (32-bit install mode) on 64-bit Windows: the x64 installer fits better. }
+function IsX86SetupOn64BitWindows: Boolean;
+begin
+  Result := (not Is64BitInstallMode) and IsWin64;
+end;
+
+{ An x64 install found by the x86 installer: its service install (64-bit uninstall entry) or a
+  per-user copy whose package manifest is the x64 one. }
+function X64InstallPresent: Boolean;
+var
+  Manifest: AnsiString;
+begin
+  Result := False;
+  if not IsX86SetupOn64BitWindows then
+    exit;
+  if RegKeyExists(HKLM64, UninstallKey) then
+  begin
+    Result := True;
+    exit;
+  end;
+  if (PerUserInstallDir <> '') and
+     LoadStringFromFile(PerUserInstallDir + '\current\versions.json', Manifest) and
+     (Pos('"platform": "windows-x64"', Manifest) > 0) then
+    Result := True;
+end;
+
+<event('InitializeSetup')>
+function WarnX86SetupOn64BitWindows: Boolean;
+begin
+  Result := True;
+  if not IsX86SetupOn64BitWindows then
+    exit;
+  { Silent installs (the app's own service migration) keep the 32-bit flavour. }
+  Result := SuppressibleMsgBox('Это 32-битная версия MultiCore. На 64-битной Windows лучше установить '
+      + 'MultiCore-Setup-x64.exe: 32-битная версия работает, но медленнее и может дольше поднимать TUN.'
+      + #13#10#13#10 + 'Всё равно установить 32-битную версию?',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES;
+end;
+
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   { Service mode has exactly one allowed location. }
@@ -529,9 +707,18 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  { Never replace an x64 install with the 32-bit flavour. }
+  if X64InstallPresent then
+  begin
+    Result := 'На этом компьютере уже установлен 64-битный MultiCore. Установите MultiCore-Setup-x64.exe '
+      + 'или сначала удалите MultiCore в «Параметры → Приложения».';
+    exit;
+  end;
   if not IsAdminInstallMode then
   begin
     Result := RemoveServiceInstall;
+    if Result = '' then
+      Result := RemoveX86PerUserCopy;
     exit;
   end;
   if CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')), ServiceInstallDir) <> 0 then
@@ -539,6 +726,9 @@ begin
     Result := 'Со службой MultiCore устанавливается только в ' + ServiceInstallDir + '.';
     exit;
   end;
+  Result := RemoveX86ServiceInstall;
+  if Result <> '' then
+    exit;
   if DirExists(PerUserInstallDir) and not WaitForPerUserCopyToExit then
   begin
     Result := 'MultiCore ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
@@ -564,7 +754,7 @@ begin
   begin
     if IsAdminInstallMode then
     begin
-      if WizardIsTaskSelected('autostart') then
+      if WizardIsTaskSelected('autostart') or MoveAutostartFromServiceInstall then
         RegisterAutostartForUser;
       RegisterService;
     end

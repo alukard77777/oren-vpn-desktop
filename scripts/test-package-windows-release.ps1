@@ -85,6 +85,40 @@ function New-TestPe {
     [IO.File]::WriteAllBytes($Path, $bytes)
 }
 
+# A PE32 i386 image for the x86 flavour (PE32: 32-bit ImageBase and stack/heap fields, 0xe0-byte
+# optional header, section table at 0x178).
+function New-TestPe32 {
+    param([string]$Path, [uint16]$Machine = 0x014c)
+    $bytes = New-Object byte[] 1024
+    $bytes[0] = 0x4d; $bytes[1] = 0x5a
+    Set-UInt32 $bytes 0x3c 0x80
+    $bytes[0x80] = 0x50; $bytes[0x81] = 0x45
+    Set-UInt16 $bytes 0x84 $Machine
+    Set-UInt16 $bytes 0x86 1
+    Set-UInt16 $bytes 0x94 0xe0
+    Set-UInt16 $bytes 0x96 0x0102
+    Set-UInt16 $bytes 0x98 0x010b
+    Set-UInt32 $bytes 0xa8 0x1000
+    Set-UInt32 $bytes 0xb4 0x00400000
+    Set-UInt32 $bytes 0xb8 0x1000
+    Set-UInt32 $bytes 0xbc 0x0200
+    Set-UInt32 $bytes 0xd0 0x2000
+    Set-UInt32 $bytes 0xd4 0x0200
+    Set-UInt16 $bytes 0xdc 3
+    Set-UInt32 $bytes 0xe0 0x100000
+    Set-UInt32 $bytes 0xe4 0x1000
+    Set-UInt32 $bytes 0xe8 0x100000
+    Set-UInt32 $bytes 0xec 0x1000
+    Set-UInt32 $bytes 0xf4 16
+    [Text.Encoding]::ASCII.GetBytes('.text').CopyTo($bytes, 0x178)
+    Set-UInt32 $bytes 0x180 0x100
+    Set-UInt32 $bytes 0x184 0x1000
+    Set-UInt32 $bytes 0x188 0x200
+    Set-UInt32 $bytes 0x18c 0x200
+    Set-UInt32 $bytes 0x19c 0x60000020
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
+
 function New-TestZip {
     param([string]$Path, [object[]]$Entries)
     Add-Type -AssemblyName System.IO.Compression
@@ -113,14 +147,15 @@ function Write-TestManifest {
         [string]$MihomoExecutableHash,
         [int64]$MaximumExpandedBytes = 1048576,
         [string]$XrayArchiveHash,
-        [string]$MihomoArchiveHash
+        [string]$MihomoArchiveHash,
+        [string]$Platform = 'windows-x64'
     )
     if (-not $XrayArchiveHash) { $XrayArchiveHash = Get-Sha256 (Join-Path $InputDirectory 'xray-fixture.zip') }
     if (-not $MihomoArchiveHash) { $MihomoArchiveHash = Get-Sha256 (Join-Path $InputDirectory 'mihomo-fixture.zip') }
     $manifest = [ordered]@{
         schemaVersion = 1
         fixtureContract = 'multicore-package-test-v1'
-        platform = 'windows-x64'
+        platform = $Platform
         build = [ordered]@{ rustToolchain = '1.98.1'; desktopPackage = 'multicore-desktop'; daemonPackage = 'multicore-daemon'; updaterPackage = 'multicore-updater'; coreHostPackage = 'multicore-core-host' }
         components = [ordered]@{
             xray = [ordered]@{
@@ -141,7 +176,7 @@ function Write-TestManifest {
 }
 
 function Invoke-Package {
-    param([string]$Destination, [string]$InputDirectory, [string]$Manifest, [string]$Desktop, [string]$Daemon, [string]$CoreHost, [string]$ReleaseAsset)
+    param([string]$Destination, [string]$InputDirectory, [string]$Manifest, [string]$Desktop, [string]$Daemon, [string]$CoreHost, [string]$ReleaseAsset, [string]$Architecture, [string]$UpdaterPath)
     $parameters = @{
         DestinationPath = $Destination
         OfflineSourceDirectory = $InputDirectory
@@ -152,7 +187,9 @@ function Invoke-Package {
         UpdaterExecutablePath = $Updater
         FixtureContractMode = $true
     }
+    if ($UpdaterPath) { $parameters.UpdaterExecutablePath = $UpdaterPath }
     if ($ReleaseAsset) { $parameters.ReleaseAssetPath = $ReleaseAsset }
+    if ($Architecture) { $parameters.Architecture = $Architecture }
     & $Packager @parameters
 }
 
@@ -578,6 +615,46 @@ try {
     Assert-DashboardPackageFailure 'dashboard-weak-csp' {
         param($i, $m) Write-DashboardManifest $m $i $xrayHash $mihomoHash -IndexHtmlSha256 $dashboardIndexSha256 -ContentSecurityPolicy "default-src 'self'; script-src 'self' 'unsafe-inline'"
     }
+
+    # The x86 flavour: PE32 i386 executables, platform windows-x86, multicore-windows-x86.zip.
+    $x86Root = Join-Path $TestRoot 'x86'; New-Item -ItemType Directory -Path $x86Root | Out-Null
+    $x86Exes = @{}
+    foreach ($name in @('desktop', 'daemon', 'core-host', 'updater', 'xray', 'mihomo')) {
+        $x86Exes[$name] = Join-Path $x86Root "$name.exe"; New-TestPe32 $x86Exes[$name]
+    }
+    $x86Input = Join-Path $x86Root 'input'; New-Item -ItemType Directory -Path $x86Input | Out-Null
+    New-TestZip (Join-Path $x86Input 'xray-fixture.zip') @(@{ Name = 'xray.exe'; Data = [IO.File]::ReadAllBytes($x86Exes['xray']); Attributes = $null })
+    New-TestZip (Join-Path $x86Input 'mihomo-fixture.zip') @(@{ Name = 'mihomo.exe'; Data = [IO.File]::ReadAllBytes($x86Exes['mihomo']); Attributes = $null })
+    Copy-Item -LiteralPath (Join-Path $MetadataRoot 'licenses\Xray-core-MPL-2.0.txt') -Destination $x86Input
+    Copy-Item -LiteralPath (Join-Path $MetadataRoot 'licenses\mihomo-GPL-3.0.txt') -Destination $x86Input
+    $x86Manifest = Join-Path $x86Root 'versions.json'
+    Write-TestManifest $x86Manifest $x86Input (Get-Sha256 $x86Exes['xray']) (Get-Sha256 $x86Exes['mihomo']) -Platform 'windows-x86'
+    $x86Out = Join-Path $x86Root 'package'
+    $x86Asset = Join-Path $x86Root 'multicore-windows-x86.zip'
+    Invoke-Package $x86Out $x86Input $x86Manifest $x86Exes['desktop'] $x86Exes['daemon'] $x86Exes['core-host'] $x86Asset 'x86' $x86Exes['updater'] | Out-Null
+    Assert-True (Test-Path -LiteralPath $x86Asset -PathType Leaf) 'x86 packaging must publish multicore-windows-x86.zip'
+    Assert-True ((Get-Sha256 (Join-Path $x86Out 'runtime\multicore-core-host.exe')) -eq (Get-Sha256 $x86Exes['core-host'])) 'x86 core host must be staged unmodified'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $x86Out 'README.md')).Contains('x86 (32-bit)')) 'x86 package must carry the x86 README'
+
+    $x86Failures = @(
+        # x86 packaging must refuse x64 executables, the x64 manifest and the x64 asset name.
+        @{ Name = 'x86-with-x64-desktop'; Desktop = $Desktop; Manifest = $x86Manifest; Asset = $null },
+        @{ Name = 'x86-with-x64-manifest'; Desktop = $x86Exes['desktop']; Manifest = $manifest; Asset = $null },
+        @{ Name = 'x86-with-x64-asset-name'; Desktop = $x86Exes['desktop']; Manifest = $x86Manifest; Asset = (Join-Path $x86Root 'wrong\multicore-windows-x64.zip') }
+    )
+    foreach ($case in $x86Failures) {
+        $destination = Join-Path $x86Root $case.Name
+        $failed = $false
+        try { Invoke-Package $destination $x86Input $case.Manifest $case.Desktop $x86Exes['daemon'] $x86Exes['core-host'] $case.Asset 'x86' $x86Exes['updater'] | Out-Null } catch { $failed = $true }
+        Assert-True $failed "$($case.Name) must fail"
+        Assert-True (-not (Test-Path -LiteralPath $destination)) "$($case.Name) must not publish a partial destination"
+        Assert-NoStageResidue $x86Root $case.Name
+    }
+    # And x64 packaging must refuse x86 executables (the x86-pe case above covers a core) and the
+    # x86 manifest.
+    $failed = $false
+    try { Invoke-Package (Join-Path $x86Root 'x64-with-x86-manifest') $x86Input $x86Manifest $Desktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
+    Assert-True $failed 'x64 packaging must refuse the x86 manifest'
 
     Write-Output 'PASS: Windows release package contract and failure atomicity'
 } finally {
