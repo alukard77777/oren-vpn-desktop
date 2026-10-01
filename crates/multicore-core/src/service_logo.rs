@@ -11,6 +11,10 @@ pub const MAX_SERVICE_LOGO_BYTES: usize = 512 * 1024;
 pub const MAX_SERVICE_LOGO_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_SOURCE_DIMENSION: u32 = 2048;
 const MAX_OUTPUT_DIMENSION: u32 = 256;
+/// Group icons are drawn at 14-22 logical px; 128 px covers 4x displays with room to spare
+/// and keeps a subscription with dozens of icons small on disk and on the wire.
+pub const MAX_GROUP_ICON_DIMENSION: u32 = 128;
+pub const MAX_GROUP_ICON_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_DECODED_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SVG_ELEMENTS: usize = 4096;
 const MAX_SVG_DEPTH: usize = 64;
@@ -36,41 +40,76 @@ pub(crate) fn is_image_host_placeholder(source: &[u8]) -> bool {
 /// Validates an untrusted provider image and converts it into a bounded RGBA PNG.
 /// The input format is detected from its bytes; filenames and response MIME types are ignored.
 pub fn normalize_service_logo(source: &[u8]) -> Option<Vec<u8>> {
+    normalize_image(source, OutputBounds::SERVICE_LOGO)
+}
+
+/// Same validation as `normalize_service_logo`, for a Mihomo `proxy-groups[].icon` image,
+/// bounded to `MAX_GROUP_ICON_DIMENSION` and `MAX_GROUP_ICON_OUTPUT_BYTES`.
+pub fn normalize_group_icon(source: &[u8]) -> Option<Vec<u8>> {
+    normalize_image(source, OutputBounds::GROUP_ICON)
+}
+
+#[derive(Clone, Copy)]
+struct OutputBounds {
+    dimension: u32,
+    bytes: usize,
+}
+
+impl OutputBounds {
+    const SERVICE_LOGO: Self = Self {
+        dimension: MAX_OUTPUT_DIMENSION,
+        bytes: MAX_SERVICE_LOGO_OUTPUT_BYTES,
+    };
+    const GROUP_ICON: Self = Self {
+        dimension: MAX_GROUP_ICON_DIMENSION,
+        bytes: MAX_GROUP_ICON_OUTPUT_BYTES,
+    };
+}
+
+fn normalize_image(source: &[u8], bounds: OutputBounds) -> Option<Vec<u8>> {
     if source.is_empty() || source.len() > MAX_SERVICE_LOGO_BYTES {
         return None;
     }
     match image::guess_format(source).ok() {
         Some(format @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP)) => {
-            normalize_raster(source, format)
+            normalize_raster(source, format, bounds)
         }
         Some(_) => None,
-        None if looks_like_svg(source) => normalize_svg(source),
+        None if looks_like_svg(source) => normalize_svg(source, bounds),
         None => None,
     }
 }
 
 pub(crate) fn is_canonical_service_logo(source: &[u8]) -> bool {
-    if source.len() > MAX_SERVICE_LOGO_OUTPUT_BYTES
+    is_canonical(source, OutputBounds::SERVICE_LOGO)
+}
+
+pub(crate) fn is_canonical_group_icon(source: &[u8]) -> bool {
+    is_canonical(source, OutputBounds::GROUP_ICON)
+}
+
+fn is_canonical(source: &[u8], bounds: OutputBounds) -> bool {
+    if source.len() > bounds.bytes
         || image::guess_format(source).ok() != Some(ImageFormat::Png)
         || contains_png_animation(source)
     {
         return false;
     }
     decode_raster(source, ImageFormat::Png).is_some_and(|image| {
-        image.width() <= MAX_OUTPUT_DIMENSION
-            && image.height() <= MAX_OUTPUT_DIMENSION
+        image.width() <= bounds.dimension
+            && image.height() <= bounds.dimension
             && image.color() == image::ColorType::Rgba8
     })
 }
 
-fn normalize_raster(source: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+fn normalize_raster(source: &[u8], format: ImageFormat, bounds: OutputBounds) -> Option<Vec<u8>> {
     if (format == ImageFormat::Png && contains_png_animation(source))
         || (format == ImageFormat::WebP && contains_webp_animation(source))
     {
         return None;
     }
     let image = decode_raster(source, format)?;
-    encode_scaled_rgba(image)
+    encode_scaled_rgba(image, bounds)
 }
 
 fn decode_raster(source: &[u8], format: ImageFormat) -> Option<DynamicImage> {
@@ -93,10 +132,10 @@ fn decode_raster(source: &[u8], format: ImageFormat) -> Option<DynamicImage> {
         .then_some(image)
 }
 
-fn encode_scaled_rgba(image: DynamicImage) -> Option<Vec<u8>> {
+fn encode_scaled_rgba(image: DynamicImage, bounds: OutputBounds) -> Option<Vec<u8>> {
     let (width, height) = image.dimensions();
-    let scale = (MAX_OUTPUT_DIMENSION as f64 / f64::from(width))
-        .min(MAX_OUTPUT_DIMENSION as f64 / f64::from(height))
+    let scale = (f64::from(bounds.dimension) / f64::from(width))
+        .min(f64::from(bounds.dimension) / f64::from(height))
         .min(1.0);
     let target_width = (f64::from(width) * scale).round().max(1.0) as u32;
     let target_height = (f64::from(height) * scale).round().max(1.0) as u32;
@@ -115,10 +154,10 @@ fn encode_scaled_rgba(image: DynamicImage) -> Option<Vec<u8>> {
     DynamicImage::ImageRgba8(rgba)
         .write_to(&mut output, ImageFormat::Png)
         .ok()?;
-    (output.get_ref().len() <= MAX_SERVICE_LOGO_OUTPUT_BYTES).then(|| output.into_inner())
+    (output.get_ref().len() <= bounds.bytes).then(|| output.into_inner())
 }
 
-fn normalize_svg(source: &[u8]) -> Option<Vec<u8>> {
+fn normalize_svg(source: &[u8], bounds: OutputBounds) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(source).ok()?;
     if !bounded_xml_preflight(text) {
         return None;
@@ -144,11 +183,16 @@ fn normalize_svg(source: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let scale = (MAX_OUTPUT_DIMENSION as f32 / size.width())
-        .min(MAX_OUTPUT_DIMENSION as f32 / size.height())
-        .min(1.0);
-    let width = (size.width() * scale).round().max(1.0) as u32;
-    let height = (size.height() * scale).round().max(1.0) as u32;
+    // A vector is rasterized at the full output bound, never at its nominal size: a 24x24
+    // viewBox drawn at 24 px and then scaled up by the UI came out blurry on HiDPI screens.
+    let scale =
+        (bounds.dimension as f32 / size.width()).min(bounds.dimension as f32 / size.height());
+    let width = (size.width() * scale)
+        .round()
+        .clamp(1.0, bounds.dimension as f32) as u32;
+    let height = (size.height() * scale)
+        .round()
+        .clamp(1.0, bounds.dimension as f32) as u32;
     let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
     resvg::render(
         &tree,
@@ -156,7 +200,7 @@ fn normalize_svg(source: &[u8]) -> Option<Vec<u8>> {
         &mut pixmap.as_mut(),
     );
     let output = pixmap.encode_png().ok()?;
-    (output.len() <= MAX_SERVICE_LOGO_OUTPUT_BYTES).then_some(output)
+    (output.len() <= bounds.bytes).then_some(output)
 }
 
 fn bounded_xml_preflight(source: &str) -> bool {

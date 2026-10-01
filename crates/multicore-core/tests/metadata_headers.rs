@@ -576,3 +576,79 @@ async fn successful_massive_response_is_terminal_and_preserves_config_bytes() {
     );
     assert_ne!(UA_MIHOMO, UA_XRAY);
 }
+
+#[tokio::test]
+async fn dumb_mode_header_is_a_case_insensitive_switch_with_optional_vendor_prefix() {
+    for (name, value, expected) in [
+        ("dumb-mode", "on", true),
+        ("Dumb-Mode", "ON", true),
+        ("dumb-mode", "true", true),
+        ("dumb-mode", "1", true),
+        ("flclashx-dumb-mode", "on", true),
+        ("dumb-mode", "off", false),
+        ("dumb-mode", "False", false),
+        ("dumb-mode", "0", false),
+        ("dumb-mode", "maybe", false),
+        ("xdumb-mode", "on", false),
+    ] {
+        let snapshot = native_info([(name, value)]).await;
+        assert_eq!(
+            snapshot.subscription_info().unwrap().dumb_mode,
+            expected,
+            "{name}: {value}"
+        );
+    }
+    assert!(!native_info([]).await.subscription_info().unwrap().dumb_mode);
+}
+
+#[test]
+fn dumb_mode_is_persisted_only_when_on_and_old_records_default_to_off() {
+    let root = TempDirectory::new();
+    let store = PersistentSnapshotStore::open(&root.0).unwrap();
+    let snapshot = Snapshot::parse(MIHOMO.as_bytes(), XRAY.as_bytes())
+        .unwrap()
+        .with_subscription_source("https://dumb.example/private", None, 1)
+        .unwrap();
+    store.commit(snapshot).unwrap();
+    let persisted = fs::read_to_string(
+        root.0
+            .join("snapshot-00000000000000000001")
+            .join("subscription.json"),
+    )
+    .unwrap();
+    assert!(!persisted.contains("dumb_mode"));
+    drop(store);
+    let reopened = PersistentSnapshotStore::open(&root.0).unwrap();
+    assert!(
+        !reopened
+            .current()
+            .unwrap()
+            .subscription_info()
+            .unwrap()
+            .dumb_mode
+    );
+}
+
+#[tokio::test]
+async fn dumb_mode_survives_a_store_round_trip() {
+    let root = TempDirectory::new();
+    let store = PersistentSnapshotStore::open(&root.0).unwrap();
+    SubscriptionFetcher::new(FakeHttp::new(vec![response(
+        200,
+        bundle(),
+        [("dumb-mode", "on")],
+    )]))
+    .refresh("https://example.invalid/private-token", &store)
+    .await
+    .unwrap();
+    drop(store);
+    let reopened = PersistentSnapshotStore::open(&root.0).unwrap();
+    assert!(
+        reopened
+            .current()
+            .unwrap()
+            .subscription_info()
+            .unwrap()
+            .dumb_mode
+    );
+}

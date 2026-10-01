@@ -12,13 +12,19 @@ use thiserror::Error;
 
 use crate::{
     DeviceIdentity, IDLE_XRAY_CONFIG, MAX_CONFIG_BYTES, MAX_SERVICE_LOGO_BYTES, Snapshot,
-    SnapshotCommit, SnapshotSink, normalize_service_logo, parse_mihomo,
+    SnapshotCommit, SnapshotSink, normalize_group_icon, normalize_service_logo, parse_mihomo,
 };
 
 pub const UA_NATIVE: &str = "multicore-json-massive";
 pub const UA_MIHOMO: &str = "multicore-mihomo";
 pub const UA_XRAY: &str = "multicore-xray";
 pub const UA_SERVICE_LOGO: &str = "multicore-service-logo";
+/// Mihomo `proxy-groups[].icon` images: fetched exactly like the service logo.
+pub const UA_GROUP_ICON: &str = "multicore-group-icon";
+/// All group icons of one refresh share this budget; a slow icon host never holds the
+/// subscription refresh for long, and icons not fetched in time keep their previous copy.
+const GROUP_ICONS_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+const GROUP_ICON_CONCURRENCY: usize = 4;
 const LOGO_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const LOGO_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
 const SUBSCRIPTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -157,6 +163,8 @@ fn is_metadata_header(name: &str) -> bool {
             .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('-'))
     }) || name == "subscription-userinfo"
         || name.ends_with("-subscription-userinfo")
+        || name == "dumb-mode"
+        || name.ends_with("-dumb-mode")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -430,8 +438,8 @@ impl HttpClient for ReqwestHttpClient {
         user_agent: &'static str,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
         Box::pin(async move {
-            if user_agent == UA_SERVICE_LOGO {
-                tokio::time::timeout(LOGO_TOTAL_TIMEOUT, self.get_service_logo(url))
+            if is_image_user_agent(user_agent) {
+                tokio::time::timeout(LOGO_TOTAL_TIMEOUT, self.get_service_logo(url, user_agent))
                     .await
                     .map_err(|_| FetchError::Timeout)?
             } else {
@@ -442,13 +450,17 @@ impl HttpClient for ReqwestHttpClient {
 }
 
 impl ReqwestHttpClient {
-    async fn get_service_logo(&self, url: &str) -> Result<HttpResponse, FetchError> {
+    async fn get_service_logo(
+        &self,
+        url: &str,
+        user_agent: &'static str,
+    ) -> Result<HttpResponse, FetchError> {
         let parsed = reqwest::Url::parse(url).map_err(|_| FetchError::Network)?;
         let host = parsed.host_str().ok_or(FetchError::Network)?;
         let port = parsed.port_or_known_default().ok_or(FetchError::Network)?;
         let addresses = resolve_global_logo_addresses(host, port).await?;
         let client = build_pinned_logo_client(host, &addresses)?;
-        perform_get(&client, url, UA_SERVICE_LOGO).await
+        perform_get(&client, url, user_agent).await
     }
 }
 
@@ -749,6 +761,7 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
                     let outcome = match outcome {
                         Ok(mut snapshot) => {
                             self.fetch_optional_logo(&mut snapshot).await;
+                            self.fetch_group_icons(&mut snapshot).await;
                             store.save(snapshot).map_err(|_| FetchError::Persistence)
                         }
                         Err(error) => Err(error),
@@ -782,6 +795,7 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         {
             Ok(mut snapshot) => {
                 self.fetch_optional_logo(&mut snapshot).await;
+                self.fetch_group_icons(&mut snapshot).await;
                 store.save(snapshot).map_err(|_| FetchError::Persistence)
             }
             Err(error) => Err(error),
@@ -817,6 +831,51 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             snapshot.set_service_logo_png(png);
         } else {
             snapshot.mark_service_logo_unfetched();
+        }
+    }
+
+    /// Downloads the images named by Mihomo `proxy-groups[].icon` through the same pinned,
+    /// global-address-only, size- and time-bounded path as the service logo, a few at a time
+    /// and within one overall budget. An icon that fails is marked unfetched, so a refresh
+    /// keeps the previous copy (`Snapshot::with_service_logo_carried_from`).
+    async fn fetch_group_icons(&self, snapshot: &mut Snapshot) {
+        let pending = snapshot.group_icon_urls();
+        if pending.is_empty() {
+            return;
+        }
+        let mut outcomes: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(pending.len());
+        let fetch_one = |url: Option<String>| async move {
+            let url = url?;
+            let response = self.client.get(&url, UA_GROUP_ICON).await.ok()?;
+            Some(
+                (response.status_is_success()
+                    && !crate::service_logo::is_image_host_placeholder(&response.body))
+                .then(|| normalize_group_icon(&response.body))
+                .flatten(),
+            )
+        };
+        let fetch_all = async {
+            for batch in pending.chunks(GROUP_ICON_CONCURRENCY) {
+                let url = |index: usize| batch.get(index).map(|(_, url)| url.clone());
+                let (first, second, third, fourth) = tokio::join!(
+                    fetch_one(url(0)),
+                    fetch_one(url(1)),
+                    fetch_one(url(2)),
+                    fetch_one(url(3))
+                );
+                for ((key, _), result) in batch.iter().zip([first, second, third, fourth]) {
+                    outcomes.push((key.clone(), result.flatten()));
+                }
+            }
+        };
+        let _ = tokio::time::timeout(GROUP_ICONS_TOTAL_TIMEOUT, fetch_all).await;
+        for (key, _) in &pending {
+            match outcomes.iter_mut().find(|(done, _)| done == key) {
+                Some((_, png @ Some(_))) => {
+                    snapshot.set_group_icon_png(key.clone(), png.take().expect("checked"));
+                }
+                _ => snapshot.mark_group_icon_unfetched(key.clone()),
+            }
         }
     }
 }
@@ -1060,8 +1119,12 @@ fn parse_native(body: &[u8]) -> Result<Snapshot, FetchError> {
     Snapshot::parse(mihomo.as_bytes(), xray.get().as_bytes()).map_err(|_| FetchError::InvalidBundle)
 }
 
+fn is_image_user_agent(user_agent: &str) -> bool {
+    user_agent == UA_SERVICE_LOGO || user_agent == UA_GROUP_ICON
+}
+
 fn accept_for(user_agent: &str) -> &'static str {
-    if user_agent == UA_SERVICE_LOGO {
+    if is_image_user_agent(user_agent) {
         "image/png, image/jpeg, image/webp, image/svg+xml"
     } else if user_agent == UA_NATIVE {
         "application/vnd.multicore.bundle+json, application/json"
@@ -1071,7 +1134,7 @@ fn accept_for(user_agent: &str) -> &'static str {
 }
 
 fn response_limit(user_agent: &str) -> usize {
-    if user_agent == UA_SERVICE_LOGO {
+    if is_image_user_agent(user_agent) {
         MAX_SERVICE_LOGO_BYTES
     } else {
         MAX_CONFIG_BYTES

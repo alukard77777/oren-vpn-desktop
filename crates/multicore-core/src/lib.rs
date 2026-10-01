@@ -28,7 +28,7 @@ pub use device_identity::{DeviceIdentity, DeviceIdentityError, derive_incy_hwid,
 pub use event::{Component, Event, Severity};
 pub use fetch::{
     AttemptOutcome, FetchDiagnostics, FetchError, HttpClient, HttpResponse, ReqwestHttpClient,
-    SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO, UA_XRAY,
+    SubscriptionFetcher, UA_GROUP_ICON, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO, UA_XRAY,
 };
 pub use input::{
     ConfigError, IDLE_XRAY_CONFIG, IDLE_XRAY_OUTBOUND_TAG, MAX_CONFIG_BYTES, MihomoConfig,
@@ -40,7 +40,8 @@ pub use profile::{
     ProfileError, ProfileId, ProfileStore, ProfileSummary,
 };
 pub use service_logo::{
-    MAX_SERVICE_LOGO_BYTES, MAX_SERVICE_LOGO_OUTPUT_BYTES, normalize_service_logo,
+    MAX_GROUP_ICON_DIMENSION, MAX_GROUP_ICON_OUTPUT_BYTES, MAX_SERVICE_LOGO_BYTES,
+    MAX_SERVICE_LOGO_OUTPUT_BYTES, normalize_group_icon, normalize_service_logo,
 };
 pub use sidecar::{
     CORE_READINESS_TIMEOUT, CommandSpec, CoreLogBuffer, CoreLogRecord, DiagnosticStream,
@@ -49,10 +50,11 @@ pub use sidecar::{
     TokioProcessLauncher, multicore_tun_is_up, rotated_log_path,
 };
 pub use snapshot::{
-    AtomicSnapshot, MihomoRuntimeControl, PersistenceError, PersistentSnapshotStore,
-    PublishedRuntime, ServiceLogoLease, Snapshot, SnapshotCommit, SnapshotSink, StagedRuntime,
-    SubscriptionInfo, publish_runtime, publish_runtime_with_mihomo_control,
-    stage_runtime_with_mihomo_control, xray_outbound_server_domains,
+    AtomicSnapshot, MAX_GROUP_ICONS, MihomoRuntimeControl, PersistenceError,
+    PersistentSnapshotStore, PublishedRuntime, ServiceLogoLease, Snapshot, SnapshotCommit,
+    SnapshotSink, StagedRuntime, SubscriptionInfo, group_icon_key, publish_runtime,
+    publish_runtime_with_mihomo_control, stage_runtime_with_mihomo_control,
+    xray_outbound_server_domains,
 };
 pub use state::{ConnectionState, StateError, StateMachine};
 pub use supervisor::{Engine, ProcessController, StartFailureCause, Supervisor, SupervisorError};

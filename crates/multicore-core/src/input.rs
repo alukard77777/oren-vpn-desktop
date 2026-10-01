@@ -5,6 +5,7 @@ use serde_yaml_ng::Value as YamlValue;
 use thiserror::Error;
 
 pub const MAX_CONFIG_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GROUP_ICON_FIELD_BYTES: usize = 2048;
 
 /// Xray config for a Mihomo-only subscription (its YAML has no loopback SOCKS
 /// bridge to Xray). Nothing routes into it: Xray only idles, so connect and
@@ -17,6 +18,9 @@ pub struct ProxyGroup {
     pub name: String,
     pub group_type: String,
     pub proxies: Vec<String>,
+    /// The group's `icon` value, as written by the provider (usually an image URL).
+    /// Untrusted: only `Snapshot` decides whether it is a fetchable HTTPS URL.
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,10 +173,15 @@ pub fn parse_mihomo(bytes: &[u8]) -> Result<MihomoConfig, ConfigError> {
                 .filter_map(YamlValue::as_str)
                 .map(ToOwned::to_owned)
                 .collect();
+            let icon = string_field(group, "icon")
+                .map(str::trim)
+                .filter(|icon| !icon.is_empty() && icon.len() <= MAX_GROUP_ICON_FIELD_BYTES)
+                .map(ToOwned::to_owned);
             Some(ProxyGroup {
                 name,
                 group_type,
                 proxies,
+                icon,
             })
         })
         .collect();

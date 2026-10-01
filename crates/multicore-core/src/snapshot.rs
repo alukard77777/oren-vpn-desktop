@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -19,7 +19,10 @@ use crate::{
     ConfigError, MAX_CONFIG_BYTES, MihomoConfig, XrayConfig,
     fetch::SubscriptionMetadataHeaders,
     parse_mihomo, parse_xray,
-    service_logo::{MAX_SERVICE_LOGO_OUTPUT_BYTES, is_canonical_service_logo},
+    service_logo::{
+        MAX_GROUP_ICON_OUTPUT_BYTES, MAX_SERVICE_LOGO_OUTPUT_BYTES, is_canonical_group_icon,
+        is_canonical_service_logo,
+    },
     store_root::{CapabilityFile, DirectoryCapability},
 };
 
@@ -34,6 +37,36 @@ pub struct Snapshot {
     /// The subscription named a logo but it could not be downloaded this
     /// time (never persisted); see `with_service_logo_carried_from`.
     service_logo_unfetched: bool,
+    /// Normalized PNGs of Mihomo `proxy-groups[].icon` images, keyed by `group_icon_key`
+    /// of the icon URL. Persisted as `group-icons.json` in the snapshot generation.
+    group_icons: BTreeMap<String, Vec<u8>>,
+    /// Icon URLs that could not be downloaded this time (never persisted); see
+    /// `with_service_logo_carried_from`.
+    group_icons_unfetched: BTreeSet<String>,
+}
+
+/// At most this many distinct group icon URLs are downloaded per subscription.
+pub const MAX_GROUP_ICONS: usize = 32;
+const GROUP_ICONS_FILE: &str = "group-icons.json";
+const MAX_GROUP_ICONS_FILE_BYTES: u64 =
+    (MAX_GROUP_ICONS * MAX_GROUP_ICON_OUTPUT_BYTES * 4 / 3 + 64 * 1024) as u64;
+
+/// A stable, URL-free identifier for a group icon URL (the first 128 bits of its SHA-256 in
+/// hex): the on-disk cache key and the opaque id the daemon hands to the UI.
+pub fn group_icon_key(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(url.as_bytes())
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_group_icon_key(key: &str) -> bool {
+    key.len() == 32
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A lightweight lease that keeps a validated, app-owned service-logo file addressable.
@@ -73,6 +106,9 @@ pub struct SubscriptionInfo {
     pub announcement_action_label: Option<String>,
     #[serde(default)]
     pub announcement_tone: Option<AnnouncementTone>,
+    /// `dumb-mode: on`: the provider asks clients to show only the first proxy group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dumb_mode: bool,
 }
 
 impl SubscriptionInfo {
@@ -147,6 +183,8 @@ impl Snapshot {
             service_logo_path: None,
             service_logo_file: None,
             service_logo_unfetched: false,
+            group_icons: BTreeMap::new(),
+            group_icons_unfetched: BTreeSet::new(),
         })
     }
 
@@ -224,6 +262,7 @@ impl Snapshot {
                 announcement_text: metadata.announcement_text.into_option(),
                 announcement_action_label: metadata.announcement_action_label,
                 announcement_tone: metadata.announcement_tone,
+                dumb_mode: metadata.dumb_mode.unwrap_or(false),
             },
             targets: metadata.targets,
         });
@@ -277,16 +316,74 @@ impl Snapshot {
     /// (a network blip, or a fake-ip VPN answering DNS) the refreshed profile
     /// used to be saved without any logo. Keeps `previous`'s logo in that
     /// case only - a subscription that no longer names a logo drops it.
+    ///
+    /// Group icons follow the same rule per icon URL: one that could not be downloaded keeps
+    /// `previous`'s copy for the same URL; an icon the config no longer names is not kept.
     pub fn with_service_logo_carried_from(self: Arc<Self>, previous: &Snapshot) -> Arc<Self> {
-        if !self.service_logo_unfetched || self.service_logo_png.is_some() {
+        let carry_logo = self.service_logo_unfetched
+            && self.service_logo_png.is_none()
+            && previous.service_logo_png.is_some();
+        let carry_icons = self
+            .group_icons_unfetched
+            .iter()
+            .any(|key| previous.group_icons.contains_key(key));
+        if !carry_logo && !carry_icons {
             return self;
         }
-        let Some(png) = previous.service_logo_png.clone() else {
-            return self;
-        };
         let mut carried = Arc::unwrap_or_clone(self);
-        carried.set_service_logo_png(png);
+        if carry_logo && let Some(png) = previous.service_logo_png.clone() {
+            carried.set_service_logo_png(png);
+        }
+        for key in std::mem::take(&mut carried.group_icons_unfetched) {
+            if let Some(png) = previous.group_icons.get(&key) {
+                carried.group_icons.insert(key, png.clone());
+            }
+        }
         Arc::new(carried)
+    }
+
+    /// The distinct, fetchable (absolute HTTPS) group icon URLs of the Mihomo config, in
+    /// config order, at most `MAX_GROUP_ICONS`, each with its `group_icon_key`.
+    pub(crate) fn group_icon_urls(&self) -> Vec<(String, String)> {
+        let mut seen = BTreeSet::new();
+        self.mihomo
+            .groups()
+            .iter()
+            .filter_map(|group| group.icon.as_deref())
+            .filter_map(|icon| validate_url(icon, false, true))
+            .filter(|url| seen.insert(url.clone()))
+            .take(MAX_GROUP_ICONS)
+            .map(|url| (group_icon_key(&url), url))
+            .collect()
+    }
+
+    pub(crate) fn set_group_icon_png(&mut self, key: String, png: Vec<u8>) {
+        self.group_icons_unfetched.remove(&key);
+        self.group_icons.insert(key, png);
+    }
+
+    pub(crate) fn mark_group_icon_unfetched(&mut self, key: String) {
+        self.group_icons.remove(&key);
+        self.group_icons_unfetched.insert(key);
+    }
+
+    /// The opaque id of the downloaded icon of the first proxy group named `group_name`, when
+    /// that group names an icon image and the image is available.
+    pub fn group_icon_id(&self, group_name: &str) -> Option<String> {
+        let icon = self
+            .mihomo
+            .groups()
+            .iter()
+            .find(|group| group.name == group_name)?
+            .icon
+            .as_deref()?;
+        let key = group_icon_key(&validate_url(icon, false, true)?);
+        self.group_icons.contains_key(&key).then_some(key)
+    }
+
+    /// The canonical PNG behind a `group_icon_id`.
+    pub fn group_icon_png(&self, id: &str) -> Option<&[u8]> {
+        self.group_icons.get(id).map(Vec::as_slice)
     }
 
     pub fn service_logo_path(&self) -> Option<&Path> {
@@ -312,6 +409,7 @@ struct ParsedSubscriptionMetadata {
     announcement_text: MetadataValue<String>,
     announcement_action_label: Option<String>,
     announcement_tone: Option<AnnouncementTone>,
+    dumb_mode: Option<bool>,
     targets: SubscriptionTargets,
 }
 
@@ -377,6 +475,7 @@ impl ParsedSubscriptionMetadata {
             false,
         );
         metadata.targets.logo_url = first_vendor_url(headers, "servicelogo", false, true);
+        metadata.dumb_mode = headers.suffix_values("dumb-mode").find_map(parse_switch);
         metadata
     }
 
@@ -395,6 +494,7 @@ impl ParsedSubscriptionMetadata {
                 .announcement_action_label
                 .or(fallback.announcement_action_label),
             announcement_tone: self.announcement_tone.or(fallback.announcement_tone),
+            dumb_mode: self.dumb_mode.or(fallback.dumb_mode),
             targets: SubscriptionTargets {
                 home_url: self.targets.home_url.or(fallback.targets.home_url),
                 support_url: self.targets.support_url.or(fallback.targets.support_url),
@@ -405,6 +505,15 @@ impl ParsedSubscriptionMetadata {
                 logo_url: self.targets.logo_url.or(fallback.targets.logo_url),
             },
         }
+    }
+}
+
+/// `on`/`off` style provider switches: on|off, true|false, yes|no, 1|0 in any case.
+fn parse_switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -924,10 +1033,13 @@ impl PersistentSnapshotStore {
                 "xray.json",
                 "subscription.json",
                 "service-logo.png",
+                GROUP_ICONS_FILE,
             ] {
                 match directory.file_metadata(OsStr::new(config))? {
                     Some((true, _)) => directory.secure_regular_file(OsStr::new(config))?,
-                    Some((false, _)) if config != "service-logo.png" => {
+                    Some((false, _))
+                        if !matches!(config, "service-logo.png" | GROUP_ICONS_FILE) =>
+                    {
                         return Err(PersistenceError::Io(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "snapshot config is not a regular file",
@@ -1044,6 +1156,12 @@ impl PersistentSnapshotStore {
             }
             if let Some(logo) = &snapshot.service_logo_png {
                 staging.write_file(OsStr::new("service-logo.png"), logo)?;
+            }
+            if !snapshot.group_icons.is_empty() {
+                staging.write_file(
+                    OsStr::new(GROUP_ICONS_FILE),
+                    &encode_group_icons(&snapshot.group_icons)?,
+                )?;
             }
             staging.sync()?;
             self.root
@@ -1815,7 +1933,50 @@ fn load_generation(directory: &DirectoryCapability) -> Option<Snapshot> {
         snapshot.service_logo_path = retained.path().map(Path::to_owned);
         snapshot.service_logo_file = Some(retained);
     }
+    if directory
+        .file_metadata(OsStr::new(GROUP_ICONS_FILE))
+        .ok()
+        .flatten()
+        .is_some_and(|(regular, len)| regular && len <= MAX_GROUP_ICONS_FILE_BYTES)
+        && let Ok(bytes) =
+            directory.read_file(OsStr::new(GROUP_ICONS_FILE), MAX_GROUP_ICONS_FILE_BYTES)
+    {
+        snapshot.group_icons = decode_group_icons(&bytes);
+    }
     Some(snapshot)
+}
+
+fn encode_group_icons(icons: &BTreeMap<String, Vec<u8>>) -> io::Result<Vec<u8>> {
+    use base64::Engine as _;
+    let encoded: BTreeMap<&str, String> = icons
+        .iter()
+        .map(|(key, png)| {
+            (
+                key.as_str(),
+                base64::engine::general_purpose::STANDARD.encode(png),
+            )
+        })
+        .collect();
+    serde_json::to_vec(&encoded).map_err(io::Error::other)
+}
+
+/// Every entry is re-validated: a damaged or foreign entry is dropped, never shown.
+fn decode_group_icons(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    use base64::Engine as _;
+    let Ok(encoded) = serde_json::from_slice::<BTreeMap<String, String>>(bytes) else {
+        return BTreeMap::new();
+    };
+    encoded
+        .into_iter()
+        .filter(|(key, _)| is_group_icon_key(key))
+        .take(MAX_GROUP_ICONS)
+        .filter_map(|(key, value)| {
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()?;
+            is_canonical_group_icon(&png).then_some((key, png))
+        })
+        .collect()
 }
 
 fn create_snapshot_staging(

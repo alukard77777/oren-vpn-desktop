@@ -609,3 +609,154 @@ async fn fallback_uses_mihomo_logo_precedence_and_fetches_only_that_url_once() {
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn small_svg_viewbox_is_rasterized_at_the_full_output_bound() {
+    let normalized = normalize_service_logo(
+        br#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 12' width='24' height='12'><rect width='24' height='12' fill='#123456'/></svg>"#,
+    )
+    .unwrap();
+    let output = image::load_from_memory_with_format(&normalized, ImageFormat::Png).unwrap();
+    assert_eq!((output.width(), output.height()), (256, 128));
+
+    let icon = multicore_core::normalize_group_icon(
+        br#"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><circle cx='8' cy='8' r='8' fill='#fff'/></svg>"#,
+    )
+    .unwrap();
+    let output = image::load_from_memory_with_format(&icon, ImageFormat::Png).unwrap();
+    assert_eq!((output.width(), output.height()), (128, 128));
+}
+
+#[test]
+fn group_icons_are_bounded_to_their_own_smaller_output() {
+    let large = RgbaImage::from_pixel(600, 300, Rgba([9, 8, 7, 255]));
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(large)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    let icon = multicore_core::normalize_group_icon(&bytes.into_inner()).unwrap();
+    let output = image::load_from_memory_with_format(&icon, ImageFormat::Png).unwrap();
+    assert_eq!((output.width(), output.height()), (128, 64));
+    assert!(icon.len() <= multicore_core::MAX_GROUP_ICON_OUTPUT_BYTES);
+}
+
+const ICON_MIHOMO: &str = "proxies:\n  - {name: A, type: socks5, server: 127.0.0.1, port: 30001}\nproxy-groups:\n  - name: Main\n    type: select\n    icon: https://icons.example/main.png\n    proxies: [Auto, A]\n  - name: Auto\n    type: url-test\n    icon: https://icons.example/auto.svg\n    proxies: [A]\n  - name: Plain\n    type: select\n    icon: http://icons.example/insecure.png\n    proxies: [A]\n  - name: Dup\n    type: select\n    icon: https://icons.example/main.png\n    proxies: [A]\n  - name: Broken\n    type: select\n    icon: https://icons.example/broken.png\n    proxies: [A]\n";
+
+#[derive(Clone)]
+struct IconHttp {
+    calls: Arc<Mutex<Vec<(String, &'static str)>>>,
+    broken_fails: bool,
+}
+
+impl HttpClient for IconHttp {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        user_agent: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((url.to_owned(), user_agent));
+            if user_agent == UA_NATIVE {
+                let body = format!("[{},{}]", serde_json::to_string(ICON_MIHOMO).unwrap(), XRAY);
+                return Ok(HttpResponse::new(
+                    200,
+                    body.into_bytes(),
+                    [] as [(&str, &str); 0],
+                ));
+            }
+            if url.ends_with("auto.svg") {
+                return Ok(HttpResponse::new(
+                    200,
+                    br#"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='#0f0'/></svg>"#.to_vec(),
+                    [] as [(&str, &str); 0],
+                ));
+            }
+            if url.ends_with("broken.png") && self.broken_fails {
+                return Err(FetchError::Timeout);
+            }
+            Ok(HttpResponse::new(
+                200,
+                encoded(ImageFormat::Png),
+                [] as [(&str, &str); 0],
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn group_icons_are_fetched_once_per_https_url_persisted_and_carried_over() {
+    use multicore_core::{UA_GROUP_ICON, group_icon_key};
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let root = temp_root("group-icons");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    let first = SubscriptionFetcher::new(IconHttp {
+        calls: calls.clone(),
+        broken_fails: false,
+    })
+    .refresh("https://subscription.example/private", &store)
+    .await
+    .unwrap()
+    .into_committed();
+
+    let mut icon_calls: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, agent)| *agent == UA_GROUP_ICON)
+        .map(|(url, _)| url.clone())
+        .collect();
+    icon_calls.sort();
+    assert_eq!(
+        icon_calls,
+        [
+            "https://icons.example/auto.svg",
+            "https://icons.example/broken.png",
+            "https://icons.example/main.png",
+        ]
+    );
+    let main = first.group_icon_id("Main").expect("main icon");
+    assert_eq!(main, group_icon_key("https://icons.example/main.png"));
+    assert_eq!(first.group_icon_id("Dup").as_deref(), Some(main.as_str()));
+    assert!(first.group_icon_id("Auto").is_some());
+    assert!(first.group_icon_id("Plain").is_none());
+    assert!(first.group_icon_id("Missing").is_none());
+    let svg_icon = first
+        .group_icon_png(&first.group_icon_id("Auto").unwrap())
+        .unwrap();
+    let decoded = image::load_from_memory_with_format(svg_icon, ImageFormat::Png).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (128, 128));
+
+    // Reopening reads the icons back from disk: no refetch on launch.
+    drop(first);
+    drop(store);
+    let reopened = PersistentSnapshotStore::open(&root).unwrap();
+    let loaded = reopened.current().unwrap();
+    assert_eq!(loaded.group_icon_id("Main").as_deref(), Some(main.as_str()));
+    let broken = loaded
+        .group_icon_id("Broken")
+        .expect("broken icon fetched the first time");
+
+    // A refresh whose download fails keeps the previous copy of that icon.
+    let staging = multicore_core::AtomicSnapshot::default();
+    let refreshed = SubscriptionFetcher::new(IconHttp {
+        calls: Arc::default(),
+        broken_fails: true,
+    })
+    .refresh("https://subscription.example/private", &staging)
+    .await
+    .unwrap()
+    .into_committed();
+    assert!(refreshed.group_icon_id("Broken").is_none());
+    let carried = refreshed.with_service_logo_carried_from(&loaded);
+    assert_eq!(
+        carried.group_icon_id("Broken").as_deref(),
+        Some(broken.as_str())
+    );
+
+    drop(loaded);
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
