@@ -629,8 +629,15 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Данные сессии недоступны."))
     }
 
-    /// POST /v1/service/update: the always-ready service downloads and installs `version`.
+    /// POST /v1/service/update: the always-ready service downloads and installs `version`
+    /// (reusing a release staged by `stage_update_via_service`).
     fn update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
+        Err(DaemonError::new("Служба MultiCore недоступна."))
+    }
+
+    /// POST /v1/service/update/stage: the service only downloads and verifies `version`; the
+    /// tunnel keeps running.
+    fn stage_update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
         Err(DaemonError::new("Служба MultiCore недоступна."))
     }
 
@@ -747,6 +754,35 @@ pub struct HttpDaemonClient {
 }
 
 impl HttpDaemonClient {
+    /// The service downloads (minutes) before it answers, hence the long timeout.
+    fn post_service_update(
+        &self,
+        path: &str,
+        version: &str,
+        success: u16,
+    ) -> Result<(), DaemonError> {
+        #[derive(serde::Serialize)]
+        struct UpdateRequest<'a> {
+            version: &'a str,
+        }
+        let response = self
+            .http
+            .post(self.endpoint(path))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(15 * 60))
+            .json(&UpdateRequest { version })
+            .send()
+            .map_err(map_error)?;
+        if response.status().as_u16() == success {
+            return Ok(());
+        }
+        let code = error_code(response);
+        Err(
+            DaemonError::definitive_http("Служба не смогла установить обновление.")
+                .with_known_code(&code),
+        )
+    }
+
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, DaemonError> {
         Self::with_timeouts(
             base_url,
@@ -1226,26 +1262,11 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn update_via_service(&self, version: &str) -> Result<(), DaemonError> {
-        #[derive(serde::Serialize)]
-        struct UpdateRequest<'a> {
-            version: &'a str,
-        }
-        let response = self
-            .http
-            .post(self.endpoint("/v1/service/update"))
-            .bearer_auth(&self.token)
-            .timeout(Duration::from_secs(15 * 60))
-            .json(&UpdateRequest { version })
-            .send()
-            .map_err(map_error)?;
-        if response.status().as_u16() == 202 {
-            return Ok(());
-        }
-        let code = error_code(response);
-        Err(
-            DaemonError::definitive_http("Служба не смогла установить обновление.")
-                .with_known_code(&code),
-        )
+        self.post_service_update("/v1/service/update", version, 202)
+    }
+
+    fn stage_update_via_service(&self, version: &str) -> Result<(), DaemonError> {
+        self.post_service_update("/v1/service/update/stage", version, 200)
     }
 
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError> {
@@ -1555,6 +1576,53 @@ mod http_tests {
             let result = client.update_via_service("1.2.0");
             let request = server.join().expect("update server");
             assert!(request.starts_with("POST /v1/service/update "), "{request}");
+            assert!(request.contains(r#"{"version":"1.2.0"}"#));
+            match expected {
+                None => assert!(result.is_ok()),
+                Some(message) => assert_eq!(result.unwrap_err().to_string(), message),
+            }
+        }
+    }
+
+    #[test]
+    fn staging_an_update_is_posted_separately_and_failures_are_explained() {
+        for (status, body, expected) in [
+            ("200 OK", "", None),
+            (
+                "502 Bad Gateway",
+                r#"{"code":"service_update_failed","message":"x"}"#,
+                Some("Служба не смогла загрузить или проверить обновление."),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind stage server");
+            let address = listener.local_addr().expect("stage server address");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept stage request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !String::from_utf8_lossy(&request).contains("\"version\"") {
+                    let read = stream.read(&mut buffer).expect("read stage request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write stage response");
+                String::from_utf8_lossy(&request).into_owned()
+            });
+            let client = HttpDaemonClient::new(format!("http://{address}"), "token")
+                .expect("loopback client");
+            let result = client.stage_update_via_service("1.2.0");
+            let request = server.join().expect("stage server");
+            assert!(
+                request.starts_with("POST /v1/service/update/stage "),
+                "{request}"
+            );
             assert!(request.contains(r#"{"version":"1.2.0"}"#));
             match expected {
                 None => assert!(result.is_ok()),
