@@ -29,6 +29,7 @@ fn status() -> StatusDto {
         subscription: None,
         cores_ready: false,
         service_mode: false,
+        imported_profile_id: None,
     }
 }
 

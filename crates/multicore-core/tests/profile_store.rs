@@ -255,6 +255,31 @@ fn oversized_index_is_rejected_before_deserialization() {
 }
 
 #[test]
+fn an_added_profile_leaves_the_active_one_in_place() {
+    let root = TempDirectory::new();
+    let store = ProfileStore::open(root.profiles(), None).unwrap();
+    let first = store
+        .create_profile(snapshot("https://first.invalid/sub", "First"))
+        .unwrap();
+    let added = store
+        .add_profile(snapshot("https://added.invalid/sub", "Added"))
+        .unwrap();
+
+    assert_ne!(added, first);
+    assert_eq!(store.active_id(), Some(first.clone()));
+    assert_eq!(
+        store
+            .find_exact_source("https://added.invalid/sub")
+            .unwrap(),
+        Some(added.clone())
+    );
+    drop(store);
+    let reopened = ProfileStore::open(root.profiles(), None).unwrap();
+    assert_eq!(reopened.active_id(), Some(first));
+    assert!(reopened.contains(&added));
+}
+
+#[test]
 fn create_replace_activate_delete_and_exact_lookup_stay_isolated() {
     let root = TempDirectory::new();
     let profiles = root.profiles();

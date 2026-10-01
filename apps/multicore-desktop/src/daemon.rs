@@ -192,6 +192,10 @@ pub struct DaemonStatus {
     /// The daemon drives the always-ready MultiCore service.
     #[serde(default)]
     pub service_mode: bool,
+    /// Only in an import's answer: the profile it added. When it is not the active one, the
+    /// import was kept in the list without switching to it.
+    #[serde(default)]
+    pub imported_profile_id: Option<String>,
 }
 
 /// Safe subscription collection returned by the daemon. Source URLs deliberately have no
@@ -1072,9 +1076,6 @@ struct DashboardUrlResponse {
 /// displayed, so provider URLs or tokens can never be reflected into the UI.
 fn known_error_message(code: &str) -> Option<&'static str> {
     Some(match code {
-        "import_requires_disconnect" => {
-            "Отключите VPN, чтобы добавить подписку: новая подписка сразу становится активной."
-        }
         "profile_busy" => "Отключитесь перед изменением подписки.",
         "profile_limit" => "Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите.",
         "subscription_unreachable" => {
@@ -2606,8 +2607,8 @@ mod http_tests {
             ),
             (
                 "409 Conflict",
-                "import_requires_disconnect",
-                "Отключите VPN",
+                "profile_busy",
+                "Отключитесь перед изменением",
             ),
         ] {
             let body = format!(

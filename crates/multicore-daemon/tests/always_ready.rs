@@ -11,30 +11,52 @@ use std::{
 use async_trait::async_trait;
 use multicore_core::{
     Engine, FetchError, HttpClient, HttpResponse, ProcessController, ProfileId, ProfileStore,
-    Snapshot, SubscriptionFetcher,
+    Snapshot, SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_XRAY,
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, ConnectionState, CoreBackend, CoresReadiness,
-    MihomoSelector, OptionsControllerFactory, PreparedController, SelectorError,
-    options_controller_factory,
+    ImportSubscriptionRequest, MihomoSelector, OptionsControllerFactory, PreparedController,
+    ProfileMutationError, SelectorError, options_controller_factory,
 };
 
 pub const PROFILE_A: &str = "proxies:\n  - {name: node-a, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-a]}\n";
 pub const PROFILE_B: &str = "proxies:\n  - {name: node-b, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-b]}\n";
+pub const PROFILE_C: &str = "proxies:\n  - {name: node-c, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-c]}\n";
+/// Served by [`SubscriptionHttp`].
+pub const NEW_SUBSCRIPTION: &str = "https://c.invalid/sub";
+/// Unreachable through [`SubscriptionHttp`].
+pub const FAILING_SUBSCRIPTION: &str = "https://fail.invalid/sub";
 const WARM_UP_FAILED: &str = "Ядра не удалось запустить заранее. Они запустятся при подключении.";
 const CORES_LOST: &str =
     "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова.";
 const PROMPT: Duration = Duration::from_secs(2);
 
-pub struct NeverHttp;
+/// A subscription server: every URL serves `PROFILE_C`, except one containing `fail`,
+/// which is unreachable.
+pub struct SubscriptionHttp;
 
-impl HttpClient for NeverHttp {
+impl HttpClient for SubscriptionHttp {
     fn get<'a>(
         &'a self,
-        _: &'a str,
-        _: &'static str,
+        url: &'a str,
+        user_agent: &'static str,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
-        Box::pin(async { Err(FetchError::Network) })
+        Box::pin(async move {
+            if url.contains("fail") {
+                return Err(FetchError::Network);
+            }
+            let body = match user_agent {
+                UA_NATIVE => format!("[{},{{}}]", serde_json::to_string(PROFILE_C).unwrap()),
+                UA_MIHOMO => PROFILE_C.to_owned(),
+                UA_XRAY => "{}".to_owned(),
+                _ => return Err(FetchError::Network),
+            };
+            Ok(HttpResponse::new(
+                200,
+                body.into_bytes(),
+                std::iter::empty::<(&str, &str)>(),
+            ))
+        })
     }
 }
 
@@ -165,7 +187,7 @@ pub type FactoryFn = Box<
 pub type Factory = OptionsControllerFactory<FactoryFn>;
 
 pub struct Harness {
-    pub backend: Arc<CoreBackend<NeverHttp, RecordingController, Factory>>,
+    pub backend: Arc<CoreBackend<SubscriptionHttp, RecordingController, Factory>>,
     pub recording: Arc<Recording>,
     pub seen: Arc<Mutex<Vec<&'static str>>>,
     pub profiles: Vec<ProfileId>,
@@ -201,6 +223,8 @@ pub fn harness(profiles: &[&str]) -> Harness {
             .unwrap()
             .push(if snapshot.mihomo.raw_yaml().contains("node-b") {
                 "b"
+            } else if snapshot.mihomo.raw_yaml().contains("node-c") {
+                "c"
             } else {
                 "a"
             });
@@ -213,7 +237,7 @@ pub fn harness(profiles: &[&str]) -> Harness {
     let selector = Arc::new(QuietSelector::default());
     let backend = CoreBackend::new_with_connect_options(
         store,
-        SubscriptionFetcher::new(NeverHttp),
+        SubscriptionFetcher::new(SubscriptionHttp),
         options_controller_factory(factory),
         selector.clone(),
         None,
@@ -1038,4 +1062,204 @@ async fn a_late_warm_up_after_a_connection_cycle_prepares_nothing_and_asks_again
     tokio::time::timeout(PROMPT, warm.notified())
         .await
         .expect("a fresh warm-up is requested at once");
+}
+
+async fn import(h: &Harness, url: &str) -> Result<multicore_daemon::StatusDto, BackendError> {
+    Backend::import_subscription(&*h.backend, ImportSubscriptionRequest { url: url.into() }).await
+}
+
+async fn profile_count(h: &Harness) -> usize {
+    Backend::list_subscriptions(&*h.backend)
+        .await
+        .unwrap()
+        .profiles
+        .len()
+}
+
+#[tokio::test]
+async fn adding_a_subscription_while_connected_moves_the_connection_to_it() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let before = h.recording.calls.lock().unwrap().len();
+
+    let status = import(&h, NEW_SUBSCRIPTION).await.unwrap();
+
+    assert_eq!(status.state, ConnectionState::Connected);
+    let added = status
+        .imported_profile_id
+        .clone()
+        .expect("the added profile");
+    assert_ne!(added, h.profiles[0].as_str());
+    assert_eq!(status.active_profile_id.as_deref(), Some(added.as_str()));
+    assert_eq!(h.seen.lock().unwrap().last(), Some(&"c"));
+    assert_eq!(
+        h.recording.calls.lock().unwrap()[before..],
+        [
+            (false, Engine::Mihomo),
+            (false, Engine::Xray),
+            (true, Engine::Xray),
+            (true, Engine::Mihomo),
+        ]
+    );
+    assert_eq!(profile_count(&h).await, 2);
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(status.active_profile_id.as_deref(), Some(added.as_str()));
+}
+
+#[tokio::test]
+async fn without_the_service_a_subscription_added_while_connected_waits_in_the_list() {
+    let h = harness(&[PROFILE_A]);
+    h.backend.connect().await.unwrap();
+    let before = h.recording.calls.lock().unwrap().clone();
+
+    let status = import(&h, NEW_SUBSCRIPTION).await.unwrap();
+
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(
+        status.active_profile_id.as_deref(),
+        Some(h.profiles[0].as_str())
+    );
+    let added = status
+        .imported_profile_id
+        .clone()
+        .expect("the added profile");
+    assert_ne!(added, h.profiles[0].as_str());
+    assert_eq!(
+        *h.recording.calls.lock().unwrap(),
+        before,
+        "the connection is left alone"
+    );
+    let list = Backend::list_subscriptions(&*h.backend).await.unwrap();
+    assert_eq!(list.profiles.len(), 2);
+    assert_eq!(
+        list.active_profile_id.as_deref(),
+        Some(h.profiles[0].as_str())
+    );
+
+    // After a disconnect the added subscription is one click away.
+    h.backend.disconnect().await.unwrap();
+    let switched = Backend::activate_subscription(&*h.backend, ProfileId::parse(&added).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(switched.active_profile_id.as_deref(), Some(added.as_str()));
+}
+
+#[tokio::test]
+async fn a_failed_import_while_connected_keeps_the_connection() {
+    for service in [true, false] {
+        let h = harness(&[PROFILE_A]);
+        if service {
+            enable(&h, true).await;
+            h.backend.warm_up().await.unwrap();
+        }
+        h.backend.connect().await.unwrap();
+        let before = h.recording.calls.lock().unwrap().clone();
+
+        let error = import(&h, FAILING_SUBSCRIPTION).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error.profile_mutation(),
+                Some(ProfileMutationError::Fetch(FetchError::Network))
+            ),
+            "service={service}: {error:?}"
+        );
+        assert_eq!(
+            *h.recording.calls.lock().unwrap(),
+            before,
+            "service={service}"
+        );
+        let status = h.backend.status().await.unwrap();
+        assert_eq!(
+            status.state,
+            ConnectionState::Connected,
+            "service={service}"
+        );
+        assert_eq!(
+            status.active_profile_id.as_deref(),
+            Some(h.profiles[0].as_str())
+        );
+        assert_eq!(profile_count(&h).await, 1, "service={service}");
+    }
+}
+
+#[tokio::test]
+async fn re_adding_the_connected_subscription_refreshes_it_in_place() {
+    let h = harness(&[]);
+    enable(&h, true).await;
+    let first = import(&h, NEW_SUBSCRIPTION).await.unwrap();
+    let id = first
+        .active_profile_id
+        .clone()
+        .expect("first import activates");
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+
+    let status = import(&h, NEW_SUBSCRIPTION).await.unwrap();
+
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(status.active_profile_id.as_deref(), Some(id.as_str()));
+    assert_eq!(status.imported_profile_id.as_deref(), Some(id.as_str()));
+    assert_eq!(profile_count(&h).await, 1);
+}
+
+#[tokio::test]
+async fn the_first_subscription_is_activated_at_once() {
+    let h = harness(&[]);
+    let status = import(&h, NEW_SUBSCRIPTION).await.unwrap();
+    let added = status
+        .imported_profile_id
+        .clone()
+        .expect("the added profile");
+    assert_eq!(status.active_profile_id.as_deref(), Some(added.as_str()));
+    assert_eq!(status.state, ConnectionState::Ready);
+}
+
+#[tokio::test]
+async fn a_connect_during_an_import_switch_waits_and_ends_on_the_new_subscription() {
+    let h = harness(&[PROFILE_A]);
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *h.recording.stop_gate.lock().unwrap() = Some(gate.clone());
+    let importing = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move {
+            Backend::import_subscription(
+                &*backend,
+                ImportSubscriptionRequest {
+                    url: NEW_SUBSCRIPTION.into(),
+                },
+            )
+            .await
+        })
+    };
+    while !h.recording.stop_entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let connecting = {
+        let backend = h.backend.clone();
+        tokio::spawn(async move { backend.connect().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    let imported = tokio::time::timeout(PROMPT, importing)
+        .await
+        .expect("the import finishes")
+        .unwrap()
+        .expect("the import is not broken by the Connect");
+    let connected = tokio::time::timeout(PROMPT, connecting)
+        .await
+        .expect("the Connect finishes")
+        .unwrap()
+        .expect("the Connect is answered with the switched connection");
+    let added = imported.imported_profile_id.clone().unwrap();
+    assert_eq!(imported.active_profile_id.as_deref(), Some(added.as_str()));
+    assert_eq!(connected.state, ConnectionState::Connected);
+    assert_eq!(connected.active_profile_id.as_deref(), Some(added.as_str()));
+    assert_eq!(h.seen.lock().unwrap().last(), Some(&"c"));
 }

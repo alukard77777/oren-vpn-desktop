@@ -81,6 +81,7 @@ struct UiSnapshot {
     panel: Panel,
     import_pending: bool,
     import_error: String,
+    import_notice: String,
     subscription: SubscriptionPresentation,
     profiles: SubscriptionProfilesPresentation,
     catalog: CatalogPresentation,
@@ -92,8 +93,6 @@ struct UiSnapshot {
 }
 
 const MAX_PENDING_SUBSCRIPTION_IMPORTS: usize = 16;
-const DEEP_LINK_WAITING_FOR_DISCONNECT_RU: &str =
-    "Отключите VPN: подписка добавится автоматически после отключения.";
 
 #[derive(Default)]
 struct PendingSubscriptionConsents {
@@ -1224,22 +1223,12 @@ fn wire_pending_subscription_imports(
         {
             return;
         }
-        let (ready, connected, notice) = {
-            let mut model = model.lock().expect("view model lock");
-            let connected = model.presentation().is_connected;
-            let notice =
-                if connected && model.import_error() != Some(DEEP_LINK_WAITING_FOR_DISCONNECT_RU) {
-                    model.set_import_error_message(DEEP_LINK_WAITING_FOR_DISCONNECT_RU);
-                    Some(snapshot(&model))
-                } else {
-                    None
-                };
-            (model.can_begin_external_import(), connected, notice)
-        };
-        if let Some(notice) = notice {
-            apply_snapshot(&ui, &notice);
-        }
-        if connected || !ready {
+        // A deep link is added like a manual import, connected or not.
+        if !model
+            .lock()
+            .expect("view model lock")
+            .can_begin_external_import()
+        {
             return;
         }
         pending
@@ -5075,6 +5064,7 @@ fn snapshot(model: &DesktopViewModel) -> UiSnapshot {
         panel: model.panel(),
         import_pending: model.import_pending(),
         import_error: model.import_error().unwrap_or_default().to_owned(),
+        import_notice: model.import_notice().unwrap_or_default().to_owned(),
         subscription: model.subscription_presentation(),
         profiles: model.profile_presentation(),
         catalog: model.catalog_presentation(),
@@ -5203,6 +5193,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     );
     ui.set_import_pending(snapshot.import_pending);
     ui.set_import_error(snapshot.import_error.clone().into());
+    ui.set_import_notice(snapshot.import_notice.clone().into());
     ui.set_subscription_title(snapshot.subscription.display_name.clone().into());
     ui.set_subscription_initial(subscription_initial(&snapshot.subscription.display_name).into());
     ui.set_subscription_usage(snapshot.subscription.usage.clone().into());

@@ -17,7 +17,7 @@ use axum::{
 use http_body_util::BodyExt;
 use multicore_core::{
     Engine, FetchError, HttpClient, HttpResponse, ProcessController, ProfileStore, Snapshot,
-    SubscriptionFetcher,
+    SubscriptionFetcher, UA_MIHOMO, UA_NATIVE, UA_XRAY,
 };
 use multicore_daemon::{
     Backend, BackendError, CoreBackend, MihomoHttpSelector, MihomoSelector, SelectionRequest,
@@ -61,6 +61,30 @@ impl HttpClient for NeverHttp {
         _: &'static str,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
         Box::pin(async { Err(FetchError::Network) })
+    }
+}
+
+/// Serves `MIHOMO` as a subscription.
+struct ServingHttp;
+impl HttpClient for ServingHttp {
+    fn get<'a>(
+        &'a self,
+        _: &'a str,
+        user_agent: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+        Box::pin(async move {
+            let body = match user_agent {
+                UA_NATIVE => format!("[{},{{}}]", serde_json::to_string(MIHOMO).unwrap()),
+                UA_MIHOMO => MIHOMO.to_owned(),
+                UA_XRAY => "{}".to_owned(),
+                _ => return Err(FetchError::Network),
+            };
+            Ok(HttpResponse::new(
+                200,
+                body.into_bytes(),
+                std::iter::empty::<(&str, &str)>(),
+            ))
+        })
     }
 }
 
@@ -311,7 +335,7 @@ async fn select_and_import_are_serialized_by_the_shared_operation_mutex() {
     let backend = Arc::new(
         CoreBackend::new_with_selector(
             store,
-            SubscriptionFetcher::new(NeverHttp),
+            SubscriptionFetcher::new(ServingHttp),
             |_snapshot| Ok(Arc::new(NoopController)),
             Arc::new(BlockingSelector {
                 entered: entered.clone(),
@@ -347,9 +371,12 @@ async fn select_and_import_are_serialized_by_the_shared_operation_mutex() {
 
     release.notify_one();
     assert!(select_task.await.unwrap().is_ok());
-    // Import acquires the mutex only afterwards and correctly observes that the cores remain
-    // connected, so it does not begin a refresh.
-    assert!(import_task.await.unwrap().is_err());
+    // The download ran while connected; storing it waited for the selection. Without the
+    // service it is only added to the list, and the connection stays on the active profile.
+    let imported = import_task.await.unwrap().unwrap();
+    assert_eq!(imported.state, multicore_daemon::ConnectionState::Connected);
+    assert!(imported.imported_profile_id.is_some());
+    assert_ne!(imported.imported_profile_id, imported.active_profile_id);
 }
 
 fn request(uri: &str, body: Value, authenticated: bool) -> Request<Body> {

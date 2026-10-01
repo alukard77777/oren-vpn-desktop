@@ -17,6 +17,9 @@ use crate::daemon::{
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
 const MAX_SUBSCRIPTION_PROFILES: usize = 16;
 pub(crate) const MAX_SUBSCRIPTION_URL_BYTES: usize = 8_192;
+/// A subscription added while connected in a mode where switching needs a disconnect.
+pub(crate) const IMPORT_KEPT_NOTICE_RU: &str =
+    "Подписка добавлена. Переключиться на неё можно после отключения VPN.";
 const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
 const STABLE_ROUTE_KEY_PREFIX: &str = "label-sha256:";
 
@@ -744,6 +747,8 @@ pub struct DesktopViewModel {
     panel: Panel,
     import_pending: bool,
     import_error: Option<String>,
+    /// Not an error: the last import was added to the list without switching to it.
+    import_notice: Option<String>,
     import_previous_state: Option<UiState>,
     connection_notice: Option<String>,
     subscription: Option<DaemonSubscriptionInfo>,
@@ -827,6 +832,7 @@ impl DesktopViewModel {
             panel: Panel::None,
             import_pending: false,
             import_error: None,
+            import_notice: None,
             import_previous_state: None,
             connection_notice: None,
             subscription: None,
@@ -935,8 +941,16 @@ impl DesktopViewModel {
         self.import_error = Some(message.to_owned());
     }
 
+    /// Shown only while the connection that kept the import waiting is up.
+    pub(crate) fn import_notice(&self) -> Option<&str> {
+        self.import_notice
+            .as_deref()
+            .filter(|_| matches!(self.state, UiState::Connected { .. }))
+    }
+
     pub(crate) fn dismiss_import_error(&mut self) {
         self.import_error = None;
+        self.import_notice = None;
     }
 
     pub(crate) fn daemon_client(&self) -> Arc<dyn DaemonClient> {
@@ -1761,6 +1775,7 @@ impl DesktopViewModel {
         };
         let token = self.next_mutation(kind);
         self.connection_notice = None;
+        self.import_notice = None;
         if action == PrimaryAction::Connect {
             let current = self.state.presentation();
             self.state = UiState::Connecting {
@@ -1779,8 +1794,7 @@ impl DesktopViewModel {
     }
 
     pub(crate) fn can_begin_external_import(&self) -> bool {
-        !self.presentation().is_connected
-            && !self.import_pending
+        !self.import_pending
             && !self.profile_mutation_pending()
             && !self.profile_reconciliation_required()
             && !self.profile_status_reload_needed
@@ -1814,6 +1828,7 @@ impl DesktopViewModel {
             return None;
         }
         self.import_error = None;
+        self.import_notice = None;
         self.import_previous_state = Some(self.state.clone());
         self.import_pending = true;
         Some(self.next_mutation(MutationKind::Import))
@@ -1863,6 +1878,19 @@ impl DesktopViewModel {
             .take()
             .unwrap_or_else(|| self.state.clone());
         match result {
+            // Added to the list while connected; the connection stays on the active one.
+            Ok(status)
+                if status.imported_profile_id.is_some()
+                    && status.imported_profile_id != status.active_profile_id =>
+            {
+                self.invalidate_profile_list_request();
+                self.advance_profile_epoch();
+                self.state = self.apply_daemon_status(status);
+                self.profile_error = None;
+                self.profile_reload_needed = true;
+                self.import_error = None;
+                self.import_notice = Some(IMPORT_KEPT_NOTICE_RU.to_owned());
+            }
             Ok(status) => {
                 self.invalidate_profile_list_request();
                 self.advance_profile_epoch();
@@ -6199,7 +6227,7 @@ mod tests {
     }
 
     #[test]
-    fn external_import_waits_for_existing_import_or_connected_tunnel() {
+    fn external_import_waits_for_an_existing_import_but_not_for_the_tunnel() {
         let mut disconnected = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
         assert!(disconnected.can_begin_external_import());
         let refresh = disconnected.begin_refresh();
@@ -6219,8 +6247,127 @@ mod tests {
         disconnected.finish_import(import, Err(DaemonError::new("offline")));
         assert!(disconnected.can_begin_external_import());
 
+        // A connected tunnel no longer holds a deep link back.
         let connected = connected_view_model_with_catalog();
-        assert!(!connected.can_begin_external_import());
+        assert!(connected.can_begin_external_import());
+    }
+
+    fn connected_on(active: &str) -> DesktopViewModel {
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some(active.into()),
+                profile: Some("Первая".into()),
+                current_node: Some("Узел".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        model
+    }
+
+    const FIRST_PROFILE: &str = "00000000-0000-4000-8000-000000000001";
+    const SECOND_PROFILE: &str = "00000000-0000-4000-8000-000000000002";
+
+    #[test]
+    fn an_import_kept_in_the_list_while_connected_is_a_notice_not_an_error() {
+        let mut model = connected_on(FIRST_PROFILE);
+        let import = model
+            .begin_import("https://subscription.invalid/second")
+            .expect("adding works while connected");
+        model.finish_import(
+            import,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some(FIRST_PROFILE.into()),
+                imported_profile_id: Some(SECOND_PROFILE.into()),
+                profile: Some("Первая".into()),
+                current_node: Some("Узел".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert_eq!(model.import_error(), None);
+        assert_eq!(model.import_notice(), Some(IMPORT_KEPT_NOTICE_RU));
+        assert!(model.presentation().is_connected);
+        assert_eq!(
+            model.profile_presentation().active_id.as_deref(),
+            Some(FIRST_PROFILE)
+        );
+        assert!(model.take_profile_list_reload_needed());
+
+        // The notice belongs to that import: the next one starts clean.
+        model
+            .begin_import("https://subscription.invalid/third")
+            .expect("next import");
+        assert_eq!(model.import_notice(), None);
+    }
+
+    #[test]
+    fn an_import_that_moved_the_connection_needs_no_notice() {
+        let mut model = connected_on(FIRST_PROFILE);
+        let import = model
+            .begin_import("https://subscription.invalid/second")
+            .expect("adding works while connected");
+        model.finish_import(
+            import,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some(SECOND_PROFILE.into()),
+                imported_profile_id: Some(SECOND_PROFILE.into()),
+                profile: Some("Вторая".into()),
+                current_node: Some("Узел".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert_eq!(model.import_error(), None);
+        assert_eq!(model.import_notice(), None);
+        assert!(model.presentation().is_connected);
+        assert_eq!(
+            model.profile_presentation().active_id.as_deref(),
+            Some(SECOND_PROFILE)
+        );
+    }
+
+    #[test]
+    fn a_failed_import_while_connected_stays_connected() {
+        let mut model = connected_on(FIRST_PROFILE);
+        let import = model
+            .begin_import("https://subscription.invalid/second")
+            .expect("adding works while connected");
+        model.finish_import(import, Err(DaemonError::new("offline")));
+        assert!(model.import_error().is_some());
+        assert_eq!(model.import_notice(), None);
+        assert!(model.presentation().is_connected);
+    }
+
+    #[test]
+    fn the_kept_import_notice_goes_away_with_the_connection() {
+        let mut model = connected_on(FIRST_PROFILE);
+        let import = model
+            .begin_import("https://subscription.invalid/second")
+            .expect("adding works while connected");
+        model.finish_import(
+            import,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                active_profile_id: Some(FIRST_PROFILE.into()),
+                imported_profile_id: Some(SECOND_PROFILE.into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert!(model.import_notice().is_some());
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                active_profile_id: Some(FIRST_PROFILE.into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        assert_eq!(model.import_notice(), None);
     }
 
     #[test]

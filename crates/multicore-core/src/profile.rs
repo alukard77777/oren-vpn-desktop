@@ -416,7 +416,21 @@ impl ProfileStore {
         self.maintenance_debt.load(Ordering::Acquire)
     }
 
+    /// Stores a new profile and makes it the active one.
     pub fn create_profile(&self, snapshot: Arc<Snapshot>) -> Result<ProfileId, ProfileError> {
+        self.insert_profile(snapshot, true)
+    }
+
+    /// Stores a new profile and leaves the active one as it is (no active profile stays none).
+    pub fn add_profile(&self, snapshot: Arc<Snapshot>) -> Result<ProfileId, ProfileError> {
+        self.insert_profile(snapshot, false)
+    }
+
+    fn insert_profile(
+        &self,
+        snapshot: Arc<Snapshot>,
+        activate: bool,
+    ) -> Result<ProfileId, ProfileError> {
         let mut index = self.index.write().expect("profile index lock poisoned");
         if occupied_profile_slots(&self.root, &index)? >= MAX_PROFILES {
             return Err(ProfileError::LimitReached);
@@ -460,7 +474,9 @@ impl ProfileStore {
             id: id.clone(),
             created_at_unix: unix_timestamp(),
         });
-        proposed.active_id = Some(id.clone());
+        if activate {
+            proposed.active_id = Some(id.clone());
+        }
         match self.persist_index(&proposed) {
             Ok(IndexCommit::Clean) => {
                 *index = proposed;
