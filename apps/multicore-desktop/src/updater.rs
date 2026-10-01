@@ -754,7 +754,7 @@ mod tests {
             content.len(),
             Sha256::digest(content)
         );
-        GitHubRelease::parse(body.as_bytes()).unwrap()
+        GitHubRelease::parse_for_arch(body.as_bytes(), WindowsArch::X64).unwrap()
     }
 
     #[test]

@@ -6518,8 +6518,8 @@ mod window_tests {
     #[test]
     fn a_second_confirm_never_starts_a_second_download() {
         use crate::updater::UpdateState;
-        use multicore_release::GitHubRelease;
-        let release = GitHubRelease::parse(br#"{
+        use multicore_release::{GitHubRelease, WindowsArch};
+        let release = GitHubRelease::parse_for_arch(br#"{
             "tag_name":"v9.0.0",
             "html_url":"https://github.com/Fatyzzz/multi-core/releases/tag/v9.0.0",
             "assets":[{
@@ -6528,7 +6528,7 @@ mod window_tests {
                 "size":1234,
                 "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }]
-        }"#)
+        }"#, WindowsArch::X64)
         .unwrap();
         let state = Mutex::new(UpdateState::Available(release.clone()));
         assert!(begin_update_download(&state).is_some());
