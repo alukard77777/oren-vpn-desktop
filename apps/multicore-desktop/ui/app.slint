@@ -2051,9 +2051,12 @@ export component AppWindow inherits Window {
                                     if root.exit-now-name != "" && root.exit-now-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.exit-now-icon-image; image-fit: contain; accessible-role: none; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } }
                                     if root.exit-now-name != "" && root.exit-now-icon != "" && root.exit-now-icon-image.width == 0: Text { text: root.exit-now-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
                                     if root.exit-now-name != "": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } accessible-label: "Текущий узел " + root.exit-now-name; }
-                                    if root.node-latency != "": Text { text: "· " + root.node-latency; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
+                                    // Separator dots are their own elements so the 6px spacing sits evenly on both sides.
+                                    if root.node-latency != "": Text { text: "·"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
+                                    if root.node-latency != "": Text { text: root.node-latency; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
                                     // Live speed follows the exit inline; each arrow only shows with a value.
-                                    if root.traffic-down != "": Text { text: "·  ↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
+                                    if root.traffic-down != "": Text { text: "·"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
+                                    if root.traffic-down != "": Text { text: "↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.traffic-down != "": Text { min-width: 56px; text: root.traffic-down; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Загрузка " + root.traffic-down; }
                                     if root.traffic-up != "": Text { text: "↑"; color: Theme.accent-green; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.traffic-up != "": Text { text: root.traffic-up; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Отдача " + root.traffic-up; }
@@ -2485,34 +2488,51 @@ export component AppWindow inherits Window {
                                 opacity: root.route-search-open ? 0 : 1;
                                 visible: self.opacity > 0;
                                 animate opacity, x { duration: root.route-search-open ? 160ms : 280ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                                // Title and meta are top-aligned in the 36px row; the smaller meta
-                                // drops by the size gap so both sit on one baseline.
-                                VerticalLayout {
-                                    horizontal-stretch: 0;
-                                    padding-top: 9px;
-                                    alignment: start;
-                                routes-title := Text {
-                                    text: "Маршруты";
-                                    color: Theme.text-primary;
-                                    font-size: Theme.type-label-size;
-                                    font-weight: Theme.weight-semibold;
-                                    vertical-alignment: top;
-                                }
-                                }
-                                VerticalLayout {
+                                // Title, separator dot and meta share one baseline: each smaller text
+                                // drops by the size gap. The dot is its own element so the gaps on both
+                                // sides of it are equal (a "· " prefix left it hugging the meta).
+                                HorizontalLayout {
                                     horizontal-stretch: 1;
-                                    padding-top: 9px + (Theme.type-label-size - Theme.type-metadata-size) * 1.05;
-                                    alignment: start;
-                                route-updated-meta := Text {
-                                    text: root.latency-check-loading ? "· Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? "· " + root.subscription-updated : "· Обновлено " + root.subscription-updated;
-                                    color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
-                                    font-size: Theme.type-metadata-size;
-                                    horizontal-alignment: left;
-                                    accessible-role: text;
-                                    accessible-live-region: polite;
-                                    vertical-alignment: top;
-                                    overflow: elide;
-                                }
+                                    spacing: 6px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 0;
+                                        padding-top: 9px;
+                                        alignment: start;
+                                    routes-title := Text {
+                                        text: "Маршруты";
+                                        color: Theme.text-primary;
+                                        font-size: Theme.type-label-size;
+                                        font-weight: Theme.weight-semibold;
+                                        vertical-alignment: top;
+                                    }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 0;
+                                        padding-top: 9px + (Theme.type-label-size - Theme.type-metadata-size) * 1.05;
+                                        alignment: start;
+                                        Text {
+                                            text: "·";
+                                            color: Theme.text-muted;
+                                            font-size: Theme.type-metadata-size;
+                                            vertical-alignment: top;
+                                            accessible-role: none;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        padding-top: 9px + (Theme.type-label-size - Theme.type-metadata-size) * 1.05;
+                                        alignment: start;
+                                    route-updated-meta := Text {
+                                        text: root.latency-check-loading ? "Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? root.subscription-updated : "Обновлено " + root.subscription-updated;
+                                        color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
+                                        font-size: Theme.type-metadata-size;
+                                        horizontal-alignment: left;
+                                        accessible-role: text;
+                                        accessible-live-region: polite;
+                                        vertical-alignment: top;
+                                        overflow: elide;
+                                    }
+                                    }
                                 }
                                 route-search-toggle := FocusScope {
                                     width: 32px;

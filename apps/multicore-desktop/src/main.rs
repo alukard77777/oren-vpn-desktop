@@ -5220,14 +5220,16 @@ mod window_tests {
             .and_then(|source| source.split("route-search-toggle := FocusScope").next())
             .expect("routes header source");
         // The bare date ("29.09.2026") next to "Маршруты" read as unexplained.
-        assert!(routes_header.contains(": \"· Обновлено \" + root.subscription-updated;"));
+        assert!(routes_header.contains(": \"Обновлено \" + root.subscription-updated;"));
+        // The separator dot is its own element so both of its gaps are equal.
+        assert!(routes_header.contains("text: \"·\";"));
         assert!(routes_header.contains("root.subscription-updated-stale ? Theme.warning"));
         assert!(routes_header.contains("horizontal-alignment: left;"));
         assert!(!routes_header.contains("horizontal-alignment: right;"));
         assert!(!routes_header.contains("route-updated-divider := Rectangle"));
         assert!(!routes_header.contains("commands: \"M 7 1.5"));
         // Latency progress is shown in place of the timestamp, not as extra chrome.
-        assert!(routes_header.contains("root.latency-check-loading ? \"· Замеряем задержку…\""));
+        assert!(routes_header.contains("root.latency-check-loading ? \"Замеряем задержку…\""));
         assert!(!routes_header.contains("catalog-selection-queued"));
         // Connection card lifts on hover and the mesh/rail decoration fades, not pops.
         assert!(ui.contains("drop-shadow-blur: strip-glow-touch.has-hover ? 20px : 0px;"));

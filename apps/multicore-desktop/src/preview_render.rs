@@ -4,6 +4,7 @@
 //! `cargo test -p multicore-desktop --features preview-render -- --ignored render_ui_previews`
 //!
 //! Screenshots are written to `artifacts/screenshots/<MULTICORE_PREVIEW_SET or "current">`.
+//! `MULTICORE_PREVIEW_SCALE=1.25` renders at a display scale factor (pixel-alignment checks).
 //! No window, GPU, daemon, or user data directory is touched.
 
 use std::cell::RefCell;
@@ -61,6 +62,17 @@ fn capture(component: &impl ComponentHandle, name: &str, width: u32, height: u32
     let window = LAST_WINDOW
         .with(|last| last.borrow().clone())
         .expect("preview window adapter");
+    let scale: f32 = std::env::var("MULTICORE_PREVIEW_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let (width, height) = (
+        (width as f32 * scale) as u32,
+        (height as f32 * scale) as u32,
+    );
+    window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+        scale_factor: scale,
+    });
     window.set_size(PhysicalSize::new(width, height));
     component.show().expect("show preview component");
     settle();

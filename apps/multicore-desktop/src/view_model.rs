@@ -5067,7 +5067,7 @@ mod tests {
         assert!(app.contains("routes-heading := HorizontalLayout"));
         assert!(app.contains("route-updated-meta := Text"));
         assert!(app.contains(
-            "text: root.latency-check-loading ? \"· Замеряем задержку…\" : root.subscription-updated == \"Не обновлялась\" ? \"· \" + root.subscription-updated : \"· Обновлено \" + root.subscription-updated;"
+            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated == \"Не обновлялась\" ? root.subscription-updated : \"Обновлено \" + root.subscription-updated;"
         ));
         assert!(app.contains(
             "color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;"
