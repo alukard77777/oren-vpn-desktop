@@ -51,7 +51,7 @@ pub fn with_logo_cache<R>(f: impl FnOnce(&mut LogoImageCache) -> R) -> R {
 /// silently hiding that logo for the rest of the session.
 #[derive(Default)]
 pub struct LogoImageCache {
-    entries: PathImageCache<slint::Image>,
+    entries: PathImageCache<Rc<RefCell<crate::crisp_image::ScaledImage>>>,
 }
 
 impl LogoImageCache {
@@ -59,11 +59,27 @@ impl LogoImageCache {
         Self::default()
     }
 
-    /// Returns the decoded image for `path`. A successful decode is cached;
-    /// a failed one is retried on the next call instead of being remembered.
-    pub fn image_for_path(&mut self, path: impl AsRef<Path>) -> Option<slint::Image> {
+    /// Returns the logo at `path` resampled to a `logical` px square at `scale` (see
+    /// `crisp_image`). A successful decode is cached with each size drawn; a failed one is
+    /// retried on the next call instead of being remembered.
+    pub fn image_for_path(
+        &mut self,
+        path: impl AsRef<Path>,
+        logical: f32,
+        scale: f32,
+    ) -> Option<slint::Image> {
         let path = path.as_ref();
-        self.entries.get_or_load(path, crate::service_logo::load)
+        let entry = self.entries.get_or_load(path, |path| {
+            crate::service_logo::load(path).map(|source| {
+                Rc::new(RefCell::new(crate::crisp_image::ScaledImage::new(
+                    std::sync::Arc::new(source),
+                )))
+            })
+        })?;
+        let image = entry
+            .borrow_mut()
+            .at(crate::crisp_image::physical_px(logical, scale));
+        Some(image)
     }
 
     /// Drops cached images and failures whose paths are no longer referenced.

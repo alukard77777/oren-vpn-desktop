@@ -15,6 +15,8 @@ export struct TrayMenuRow {
     // Groups: the group shown in the popup. Nodes: the selected route.
     selected: bool,
     enabled: bool,
+    // Nodes: re-measuring this route alone (right click).
+    measuring: bool,
 }
 
 // Quiet footer action: lucide icon + label, soft wash on hover, focus ring.
@@ -71,14 +73,48 @@ component TrayTextAction inherits Rectangle {
     }
 }
 
-// Text-only segment of the route-group track; the shown group is a raised pill.
+// Segment of the route-group track (the group's icon image, when it has one, and its name);
+// the shown group is a raised pill.
 component TraySegment inherits Rectangle {
     in property <string> label;
+    in property <image> icon-image;
     in property <bool> selected;
     in property <bool> enabled: true;
+    property <bool> has-icon: root.icon-image.width > 0;
+    property <length> icon-space: root.has-icon ? 19px : 0px;
+    // Icon and full name with 10px on each side; the track scrolls rather than squeeze below it.
+    out property <length> natural-width: min(180px, segment-label.preferred-width + 20px + root.icon-space + 2px);
     callback activated();
+    callback selected-shown();
+    callback focus-shown();
+    callback selected-moved();
 
-    min-width: 0px;
+    init => {
+        if (root.selected) {
+            root.selected-shown();
+        }
+    }
+    changed selected => {
+        if (root.selected) {
+            root.selected-shown();
+        }
+    }
+    changed x => {
+        if (root.selected) {
+            root.selected-moved();
+        }
+    }
+    changed width => {
+        if (root.selected) {
+            root.selected-moved();
+        }
+    }
+
+    // Set by a track whose segments do not all fit at an equal share: the segment
+    // keeps its natural width and the track scrolls instead of squeezing it.
+    in property <bool> natural-sizing: false;
+    min-width: root.natural-sizing ? root.natural-width : 0px;
+    preferred-width: root.natural-sizing ? root.natural-width : 0px;
     horizontal-stretch: 1;
     height: 26px;
     border-radius: 7px;
@@ -92,15 +128,28 @@ component TraySegment inherits Rectangle {
     accessible-action-default => { if (root.enabled) { root.activated(); } }
     animate background { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
-    Text {
-        x: 6px;
-        width: parent.width - 12px;
+    // With an icon, icon and name are centred as one group.
+    property <length> label-width: min(segment-label.preferred-width, self.width - 20px - root.icon-space);
+    property <length> content-x: max(10px, (self.width - root.icon-space - self.label-width) / 2);
+    if root.has-icon: Image {
+        x: root.content-x;
+        y: (parent.height - self.height) / 2;
+        width: 14px;
+        height: 14px;
+        source: root.icon-image;
+        image-fit: contain;
+        accessible-role: none;
+    }
+
+    segment-label := Text {
+        x: root.has-icon ? root.content-x + root.icon-space : 6px;
+        width: root.has-icon ? root.label-width : parent.width - 12px;
         height: parent.height;
         text: root.label;
         color: root.selected || segment-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
         font-size: 12px;
         font-weight: root.selected ? Theme.weight-semibold : Theme.weight-medium;
-        horizontal-alignment: center;
+        horizontal-alignment: root.has-icon ? left : center;
         vertical-alignment: center;
         overflow: elide;
         accessible-role: none;
@@ -110,6 +159,7 @@ component TraySegment inherits Rectangle {
         enabled: root.enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
+        focus-gained(reason) => { root.focus-shown(); }
         key-pressed(event) => {
             if (event.text == " " || event.text == "\n") {
                 root.activated();
@@ -132,7 +182,12 @@ component TrayNodeRow inherits Rectangle {
     in property <bool> selected;
     in property <bool> enabled: true;
     in property <bool> show-separator: false;
+    // Re-measuring this route (right click): a pulsing pill holds the latency's place.
+    in property <bool> measuring: false;
+    in property <bool> reduced-motion: false;
     callback activated();
+    // Right click: re-measure this route's latency only.
+    callback secondary-activated();
 
     height: 44px;
     background: root.selected ? Theme.elevated : node-touch.has-hover && root.enabled ? #ffffff06 : transparent;
@@ -190,6 +245,19 @@ component TrayNodeRow inherits Rectangle {
         accessible-role: none;
     }
 
+    if root.latency == "" && root.measuring: Rectangle {
+        x: parent.width - self.width - 14px;
+        y: (parent.height - self.height) / 2;
+        width: 30px;
+        height: 8px;
+        border-radius: 4px;
+        background: Theme.text-muted;
+        opacity: root.reduced-motion
+            ? 0.2
+            : 0.14 + 0.12 * (1 + sin(animation-tick() / 1200ms * 360deg)) / 2;
+        accessible-role: none;
+    }
+
     latency-label := Text {
         x: parent.width - self.width - 14px;
         width: Math.min(self.preferred-width, 88px);
@@ -226,7 +294,16 @@ component TrayNodeRow inherits Rectangle {
             }
             return reject;
         }
-        node-touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+        node-touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.activated(); }
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up
+                    && self.has-hover) {
+                    root.secondary-activated();
+                }
+            }
+        }
     }
 }
 
@@ -287,6 +364,10 @@ export component TrayPopup inherits Window {
     // Shows that group's nodes (the same group the home screen shows).
     callback toggle-group(string);
     callback select-node(string, string);
+    // Right click on a route: (group id, node id) re-measures that route only.
+    callback measure-node(string, string);
+    // The provider's dumb-mode: one group, so no group tabs.
+    in property <bool> dumb-mode: false;
     callback open-main();
     callback add-subscription();
     callback exit-app();
@@ -755,8 +836,41 @@ export component TrayPopup inherits Window {
                 }
             }
 
-            // Route groups: a text-only segmented track.
-            if root.has-profile && root.group-rows.length > 0: group-track := Rectangle {
+            // Route groups: a segmented track that scrolls sideways when the groups do not fit
+            // (wheel, edge chevrons; the shown group and keyboard focus are kept in view).
+            if root.has-profile && !root.dumb-mode && root.group-rows.length > 0: group-track := Rectangle {
+                property <length> viewport-width: self.width - 2px;
+                // Segments share the track equally while the widest one still fits whole in its
+                // share (`group-measure`); otherwise each takes its natural width and the strip scrolls.
+                property <bool> overflowing: group-measure.min-width * root.group-rows.length
+                    + 2px * (root.group-rows.length - 1) + 4px > self.viewport-width + 0.5px;
+                property <length> max-scroll: self.overflowing ? max(0px, group-row.min-width - self.viewport-width) : 0px;
+                in-out property <length> scroll-target: 0px;
+                property <length> scroll-x: max(0px, min(self.scroll-target, self.max-scroll));
+                property <string> revealed-group-id;
+                property <length> selected-tab-x;
+                property <length> selected-tab-width;
+                property <length> edge-room: 40px;
+                animate scroll-target { duration: root.reduced-motion ? 0ms : 180ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                changed viewport-width => { self.reveal(self.selected-tab-x, self.selected-tab-width); }
+                function reveal-selected(tab-x: length, tab-width: length) {
+                    self.selected-tab-x = tab-x;
+                    self.selected-tab-width = tab-width;
+                    self.reveal(tab-x, tab-width);
+                }
+                function reveal(tab-x: length, tab-width: length) {
+                    if (!self.overflowing) {
+                        return;
+                    }
+                    if (tab-x - self.edge-room < self.scroll-x) {
+                        self.scroll-target = max(0px, tab-x - self.edge-room);
+                    } else if (tab-x + tab-width + self.edge-room > self.scroll-x + self.viewport-width) {
+                        self.scroll-target = min(self.max-scroll, tab-x + tab-width + self.edge-room - self.viewport-width);
+                    }
+                }
+                function page(direction: float) {
+                    self.scroll-target = max(0px, min(self.max-scroll, self.scroll-x + direction * self.viewport-width * 0.6));
+                }
                 x: 10px;
                 y: 134px;
                 width: parent.width - 20px;
@@ -765,18 +879,114 @@ export component TrayPopup inherits Window {
                 border-color: Theme.line;
                 border-width: 1px;
                 border-radius: 9px;
-                HorizontalLayout {
+                clip: true;
+                // The widest segment's natural width (TraySegment's formula): only measured.
+                Rectangle {
+                    visible: false;
+                    width: 0px;
+                    height: 0px;
+                    group-measure := VerticalLayout {
+                        for group in root.group-rows: Rectangle {
+                            min-width: min(180px, measure-label.preferred-width + 20px + (group.icon-image.width > 0 ? 19px : 0px) + 2px);
+                            measure-label := Text {
+                                text: group.label;
+                                font-size: 12px;
+                                font-weight: Theme.weight-semibold;
+                            }
+                        }
+                    }
+                }
+                // Clipped inside the border: a scrolled segment must never paint over it.
+                Rectangle {
                     x: 1px;
                     y: 1px;
                     width: parent.width - 2px;
                     height: parent.height - 2px;
-                    padding: 2px;
-                    spacing: 2px;
-                    for group in root.group-rows: TraySegment {
-                        label: group.label;
-                        selected: group.selected;
-                        enabled: group.enabled;
-                        activated => { root.toggle-group(group.id); }
+                    border-radius: 8px;
+                    clip: true;
+                group-wheel := TouchArea {
+                    scroll-event(event) => {
+                        if (!group-track.overflowing) {
+                            return reject;
+                        }
+                        group-track.scroll-target = max(0px, min(group-track.max-scroll,
+                            group-track.scroll-x - (event.delta-x != 0 ? event.delta-x : event.delta-y)));
+                        return accept;
+                    }
+                    group-row := HorizontalLayout {
+                        x: -group-track.scroll-x;
+                        width: group-track.overflowing ? max(parent.width, self.min-width) : parent.width;
+                        height: parent.height;
+                        padding: 2px;
+                        spacing: 2px;
+                        for group in root.group-rows: TraySegment {
+                            label: group.label;
+                            icon-image: group.icon-image;
+                            selected: group.selected;
+                            natural-sizing: group-track.overflowing;
+                            enabled: group.enabled;
+                            activated => { root.toggle-group(group.id); }
+                            selected-shown => {
+                                if (group-track.revealed-group-id != group.id) {
+                                    group-track.revealed-group-id = group.id;
+                                    group-track.reveal-selected(self.x, self.width);
+                                }
+                            }
+                            selected-moved => { group-track.reveal-selected(self.x, self.width); }
+                            focus-shown => { group-track.reveal(self.x, self.width); }
+                        }
+                    }
+                }
+                }
+                if self.overflowing: Rectangle {
+                    x: 1px;
+                    y: 1px;
+                    width: 40px;
+                    height: parent.height - 2px;
+                    opacity: group-track.scroll-x > 0.5px ? 1 : 0;
+                    visible: self.opacity > 0;
+                    animate opacity { duration: root.reduced-motion ? 0ms : 140ms; easing: ease-out; }
+                    background: @linear-gradient(90deg, #0a0c0f 0%, #0a0c0f 55%, #0a0c0f00 100%);
+                    group-prev := TouchArea {
+                        width: 22px;
+                        height: parent.height;
+                        clicked => { group-track.page(-1); }
+                        Image {
+                            x: 6px;
+                            y: (parent.height - self.height) / 2;
+                            width: 10px;
+                            height: 10px;
+                            source: @image-url("../assets/chevron-left.svg");
+                            colorize: group-prev.has-hover ? Theme.text-primary : Theme.text-muted;
+                            image-fit: contain;
+                            accessible-role: none;
+                        }
+                    }
+                }
+                if self.overflowing: Rectangle {
+                    x: parent.width - self.width - 1px;
+                    y: 1px;
+                    width: 40px;
+                    height: parent.height - 2px;
+                    opacity: group-track.scroll-x < group-track.max-scroll - 0.5px ? 1 : 0;
+                    visible: self.opacity > 0;
+                    animate opacity { duration: root.reduced-motion ? 0ms : 140ms; easing: ease-out; }
+                    background: @linear-gradient(90deg, #0a0c0f00 0%, #0a0c0f 45%, #0a0c0f 100%);
+                    group-next := TouchArea {
+                        x: parent.width - self.width;
+                        width: 22px;
+                        height: parent.height;
+                        clicked => { group-track.page(1); }
+                        Image {
+                            x: 6px;
+                            y: (parent.height - self.height) / 2;
+                            width: 10px;
+                            height: 10px;
+                            source: @image-url("../assets/chevron-right.svg");
+                            colorize: group-next.has-hover ? Theme.text-primary : Theme.text-muted;
+                            image-fit: contain;
+                            accessible-role: none;
+                        }
                     }
                 }
             }
@@ -784,7 +994,7 @@ export component TrayPopup inherits Window {
             // The shown group's nodes in one inset grouped card.
             if root.has-profile: node-card := Rectangle {
                 x: 10px;
-                y: root.group-rows.length > 0 ? 176px : 134px;
+                y: root.group-rows.length > 0 && !root.dumb-mode ? 176px : 134px;
                 width: parent.width - 20px;
                 height: Math.min(node-list.preferred-height, parent.height - self.y - 54px);
                 background: Theme.surface;
@@ -803,8 +1013,11 @@ export component TrayPopup inherits Window {
                             tone: node.tone;
                             selected: node.selected;
                             enabled: node.enabled;
+                            measuring: node.measuring;
+                            reduced-motion: root.reduced-motion;
                             show-separator: index < root.node-rows.length - 1;
                             activated => { root.select-node(node.group-id, node.id); }
+                            secondary-activated => { root.measure-node(node.group-id, node.id); }
                         }
                         if root.node-rows.length == 0: Text {
                             height: 48px;
@@ -878,29 +1091,6 @@ export component TrayPopup inherits Window {
                 width: 12px;
                 height: 12px;
                 background: Theme.accent-blue;
-            }
-        }
-
-        // Size readout while dragging, centred like a resize HUD.
-        if root.resize-active != "": Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: size-label.preferred-width + 16px;
-            height: 22px;
-            border-radius: 6px;
-            background: Theme.elevated;
-            border-width: 1px;
-            border-color: #4c9dff99;
-            drop-shadow-blur: 8px;
-            drop-shadow-color: #00000080;
-            size-label := Text {
-                x: 8px;
-                height: parent.height;
-                text: Math.round(root.width / 1px) + " × " + Math.round(root.height / 1px);
-                color: Theme.accent-blue;
-                font-size: 11px;
-                font-weight: Theme.weight-semibold;
-                vertical-alignment: center;
             }
         }
 

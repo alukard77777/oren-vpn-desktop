@@ -12,6 +12,8 @@ pub(crate) struct TrayGroup {
     pub(crate) id: String,
     pub(crate) label: String,
     pub(crate) icon: String,
+    /// Downloaded group icon image, drawn instead of `icon` when present.
+    pub(crate) icon_id: Option<String>,
     pub(crate) selected_node_label: String,
     /// The group the popup shows (the one selected on the home screen).
     pub(crate) selected: bool,
@@ -23,10 +25,13 @@ pub(crate) struct TrayNode {
     pub(crate) id: String,
     pub(crate) label: String,
     pub(crate) icon: String,
+    pub(crate) icon_id: Option<String>,
     pub(crate) selected: bool,
     pub(crate) latency_text: String,
     /// "success" | "warning" | "danger" | "neutral", as on the home route list.
     pub(crate) latency_tone: String,
+    /// Re-measured on its own (right click): the row shows the placeholder pill.
+    pub(crate) measuring: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,11 +43,15 @@ pub(crate) struct TrayInput {
     pub(crate) has_profile: bool,
     pub(crate) groups: Vec<TrayGroup>,
     pub(crate) route_selection_enabled: bool,
+    /// The provider's dumb-mode: one group, no group tabs.
+    pub(crate) dumb_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TrayMenuEntry {
     pub(crate) icon: String,
+    pub(crate) icon_id: Option<String>,
+    pub(crate) measuring: bool,
     pub(crate) label: String,
     /// Groups: the selected node's label. Nodes: the latency text.
     pub(crate) detail: String,
@@ -63,6 +72,7 @@ pub(crate) struct TrayMenuModel {
     pub(crate) has_profile: bool,
     pub(crate) groups: Vec<TrayMenuEntry>,
     pub(crate) nodes: Vec<TrayMenuEntry>,
+    pub(crate) dumb_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -90,6 +100,8 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
             let group_id = group.id;
             nodes.extend(group.nodes.into_iter().map(|node| TrayMenuEntry {
                 icon: node.icon,
+                icon_id: node.icon_id,
+                measuring: node.measuring,
                 label: node.label,
                 detail: node.latency_text,
                 tone: node.latency_tone,
@@ -102,6 +114,8 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
             }));
             TrayMenuEntry {
                 icon: group.icon,
+                icon_id: group.icon_id,
+                measuring: false,
                 label: group.label,
                 detail: group.selected_node_label,
                 tone: String::new(),
@@ -120,6 +134,7 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
         has_profile: input.has_profile,
         groups,
         nodes,
+        dumb_mode: input.dumb_mode,
     }
 }
 
@@ -283,6 +298,7 @@ mod tests {
                     id: "server:opaque".into(),
                     label: "Сервер".into(),
                     icon: "🌍".into(),
+                    icon_id: None,
                     selected_node_label: "Швеция".into(),
                     selected: true,
                     nodes: vec![TrayNode {
@@ -292,12 +308,15 @@ mod tests {
                         selected: true,
                         latency_text: "42 ms".into(),
                         latency_tone: "success".into(),
+                        icon_id: None,
+                        measuring: false,
                     }],
                 },
                 TrayGroup {
                     id: "games:opaque".into(),
                     label: "Игры".into(),
                     icon: "🎮".into(),
+                    icon_id: None,
                     selected_node_label: "Direct".into(),
                     selected: false,
                     nodes: vec![TrayNode {
@@ -307,10 +326,13 @@ mod tests {
                         selected: true,
                         latency_text: String::new(),
                         latency_tone: "neutral".into(),
+                        icon_id: None,
+                        measuring: false,
                     }],
                 },
             ],
             route_selection_enabled: true,
+            dumb_mode: false,
         };
 
         let model = build_menu_model(input);
@@ -353,6 +375,7 @@ mod tests {
             has_profile: false,
             groups: Vec::new(),
             route_selection_enabled: true,
+            dumb_mode: false,
         });
 
         assert!(model.nodes.is_empty());
@@ -369,6 +392,7 @@ mod tests {
             has_profile: true,
             groups: Vec::new(),
             route_selection_enabled: true,
+            dumb_mode: false,
         });
         let mut cache = TrayPopupModelCache::default();
 

@@ -88,11 +88,26 @@ export component QuietChip inherits Rectangle {
     in property <bool> selected: false;
     in property <bool> focus-on-init: false;
     in property <int> focus-epoch: 0;
+    // Widest a tab grows to show its whole label; only absurdly long names elide.
+    in property <length> max-natural-width: 220px;
+    // Icon and full label with 16px on each side: the track scrolls rather than
+    // squeeze a tab below this.
+    out property <length> natural-width: min(root.max-natural-width,
+        chip-label.preferred-width + 2 * Theme.space-4 + (root.icon == "" ? 0px : 22px) + 2px);
     callback activated();
+    // The tab became the selected one (or was created selected): its track may scroll it into view.
+    callback selected-shown();
+    // Keyboard focus reached the tab.
+    callback focus-shown();
+    // The selected tab moved or resized within its track.
+    callback selected-moved();
 
     init => {
         if (root.focus-on-init) {
             chip-focus.focus();
+        }
+        if (root.selected) {
+            root.selected-shown();
         }
     }
     changed focus-epoch => {
@@ -100,13 +115,35 @@ export component QuietChip inherits Rectangle {
             chip-focus.focus();
         }
     }
+    changed selected => {
+        if (root.selected) {
+            root.selected-shown();
+        }
+    }
+    // Layout changes (the track switching to natural widths, a resize) move the selected tab.
+    changed x => {
+        if (root.selected) {
+            root.selected-moved();
+        }
+    }
+    changed width => {
+        if (root.selected) {
+            root.selected-moved();
+        }
+    }
+
+    // Set by a track whose tabs do not all fit: the tab keeps its natural width
+    // and the track scrolls instead of squeezing it.
+    in property <bool> natural-sizing: false;
 
     // One segment of the route-group segmented control: segments share the
     // track's width; the selected one is a raised pill inside the track.
-    min-width: 96px;
+    min-width: root.natural-sizing ? root.natural-width : 96px;
     horizontal-stretch: 1;
     min-height: 32px;
-    preferred-width: chip-label.preferred-width + Theme.space-3 * 2 + (root.icon == "" ? 0px : 22px);
+    preferred-width: root.natural-sizing
+        ? root.natural-width
+        : chip-label.preferred-width + Theme.space-3 * 2 + (root.icon == "" ? 0px : 22px);
     preferred-height: 32px;
     background: root.selected ? Theme.elevated : chip-touch.has-hover && root.enabled && root.modal-enabled ? #ffffff08 : transparent;
     border-color: Theme.focus;
@@ -180,6 +217,7 @@ export component QuietChip inherits Rectangle {
         enabled: root.enabled && root.modal-enabled;
         focus-on-click: true;
         focus-on-tab-navigation: true;
+        focus-gained(reason) => { root.focus-shown(); }
         key-pressed(event) => {
             if (event.text == " " || event.text == "\n") {
                 root.activated();
@@ -221,6 +259,8 @@ export component RouteNodeRow inherits Rectangle {
     // inset to where the label starts.
     in property <bool> show-separator: false;
     callback activated();
+    // Right click: re-measure this route's latency only (no context menu).
+    callback secondary-activated();
 
     // Row of an inset grouped list: bare flag, label, latency; the selected row
     // is tinted with a blue leading bar (no check mark), others tint on hover.
@@ -402,6 +442,12 @@ export component RouteNodeRow inherits Rectangle {
         row-touch := TouchArea {
             enabled: root.enabled;
             clicked => { root.activated(); }
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up
+                    && self.has-hover) {
+                    root.secondary-activated();
+                }
+            }
         }
     }
 }

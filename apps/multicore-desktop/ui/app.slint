@@ -27,6 +27,8 @@ export struct UiCatalogNode {
     selected: bool,
     latency-text: string,
     latency-tone: string,
+    // Re-measuring this route alone (right click): the placeholder pill pulses.
+    measuring: bool,
 }
 
 export struct UiRouteSearchHit {
@@ -59,7 +61,9 @@ export struct UiSubscriptionProfile {
     active: bool,
     available: bool,
     has-logo: bool,
+    // The logo resampled for the 18px management-list slot and the 12px quota slot.
     logo: image,
+    logo-small: image,
     fallback: string,
     // Compact quota for the title-chip dropdown: "87.6 GiB" over "12 дн.".
     remaining: string,
@@ -1132,6 +1136,8 @@ export component AppWindow inherits Window {
     in property <[UiCatalogGroup]> catalog-groups;
     in property <[UiCatalogNode]> catalog-nodes;
     in property <bool> catalog-loading: false;
+    // The provider's dumb-mode: only the first group's routes, no group tabs.
+    in property <bool> catalog-dumb-mode: false;
     in property <bool> catalog-selection-enabled: false;
     in property <bool> catalog-selection-pending: false;
     in property <string> catalog-error;
@@ -1314,6 +1320,8 @@ export component AppWindow inherits Window {
     // Reloads the route catalog after it failed to load.
     callback retry-catalog();
     callback select-catalog-node(string);
+    // Right click on a route row: re-measure that route's latency only.
+    callback measure-catalog-node(string);
     callback route-search-changed(string);
     // Runs a latency check right now instead of waiting for the 60 s timer.
     callback check-latency();
@@ -2975,7 +2983,47 @@ export component AppWindow inherits Window {
                             }
                             }
                             // Segmented control: one dark track, the selected group is a raised pill.
-                            route-group-track := Rectangle {
+                            // Tabs fill the track while they fit; with more groups than fit they keep
+                            // their natural width and the strip scrolls sideways (wheel, chevrons,
+                            // selection and keyboard focus bring a tab into view).
+                            if !root.catalog-dumb-mode: route-group-track := Rectangle {
+                                // Inner viewport (inside the 1px border).
+                                property <length> viewport-width: self.width - 2px;
+                                // The tabs keep today's shared-width layout while every label fits
+                                // whole in it (`route-group-measure`); otherwise each tab takes its
+                                // natural width and the strip scrolls.
+                                property <bool> overflowing: route-group-measure.min-width > self.viewport-width + 0.5px;
+                                property <length> max-scroll: self.overflowing ? max(0px, route-group-row.min-width - self.viewport-width) : 0px;
+                                // Requested scroll; `scroll-x` keeps it in range while the window resizes.
+                                in-out property <length> scroll-target: 0px;
+                                property <length> scroll-x: max(0px, min(self.scroll-target, self.max-scroll));
+                                property <string> revealed-group-id;
+                                // The selected tab's place in the strip, kept for re-revealing it
+                                // when the track itself is resized.
+                                property <length> selected-tab-x;
+                                property <length> selected-tab-width;
+                                // Room the edge chevron and fade take; a revealed tab clears it.
+                                property <length> edge-room: 48px;
+                                animate scroll-target { duration: root.reduced-motion ? 0ms : 180ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                                changed viewport-width => { self.reveal(self.selected-tab-x, self.selected-tab-width); }
+                                function reveal-selected(tab-x: length, tab-width: length) {
+                                    self.selected-tab-x = tab-x;
+                                    self.selected-tab-width = tab-width;
+                                    self.reveal(tab-x, tab-width);
+                                }
+                                function reveal(tab-x: length, tab-width: length) {
+                                    if (!self.overflowing) {
+                                        return;
+                                    }
+                                    if (tab-x - self.edge-room < self.scroll-x) {
+                                        self.scroll-target = max(0px, tab-x - self.edge-room);
+                                    } else if (tab-x + tab-width + self.edge-room > self.scroll-x + self.viewport-width) {
+                                        self.scroll-target = min(self.max-scroll, tab-x + tab-width + self.edge-room - self.viewport-width);
+                                    }
+                                }
+                                function page(direction: float) {
+                                    self.scroll-target = max(0px, min(self.max-scroll, self.scroll-x + direction * self.viewport-width * 0.6));
+                                }
                                 height: 38px;
                                 background: #0a0c0f;
                                 border-color: Theme.line;
@@ -2983,26 +3031,127 @@ export component AppWindow inherits Window {
                                 border-radius: 10px;
                                 clip: true;
                                 // Inside the 1px border, so the 2px padding centres the 32px
-                                // segments in the track (36px inner height).
-                                ScrollView {
-                                x: 1px;
-                                y: 1px;
-                                width: parent.width - 2px;
-                                height: parent.height - 2px;
-                                HorizontalLayout {
-                                    padding: 2px;
-                                    spacing: 2px;
-                                    for group in root.catalog-groups: QuietChip {
-                                        height: 32px;
-                                        icon: group.icon;
-                                        icon-image: group.icon-image;
-                                        label: group.label;
-                                        selected: group.selected;
-                                        enabled: root.catalog-group-navigation-enabled;
-                                        modal-enabled: !root.profile-menu-open;
-                                        activated => { root.select-catalog-group(group.id); }
+                                // segments in the track (36px inner height). The wheel (vertical or
+                                // horizontal) scrolls the strip; the tabs ignore it, so it reaches here.
+                                // Each tab's shared-layout size plus the 10px its label needs beyond
+                                // it to never elide (QuietChip's natural width): only measured.
+                                Rectangle {
+                                    visible: false;
+                                    width: 0px;
+                                    height: 0px;
+                                    route-group-measure := HorizontalLayout {
+                                        padding: 2px;
+                                        spacing: 2px;
+                                        for group in root.catalog-groups: Rectangle {
+                                            min-width: max(96px, measure-label.preferred-width + Theme.space-3 * 2 + (group.icon == "" ? 0px : 22px)) + 10px;
+                                            measure-label := Text {
+                                                text: group.label;
+                                                font-family: Theme.font-family;
+                                                font-size: Theme.type-metadata-size;
+                                                font-weight: Theme.weight-semibold;
+                                            }
+                                        }
                                     }
                                 }
+                                // Clipped inside the border: a scrolled tab must never paint over it.
+                                Rectangle {
+                                    x: 1px;
+                                    y: 1px;
+                                    width: parent.width - 2px;
+                                    height: parent.height - 2px;
+                                    border-radius: 9px;
+                                    clip: true;
+                                route-group-wheel := TouchArea {
+                                    scroll-event(event) => {
+                                        if (!route-group-track.overflowing) {
+                                            return reject;
+                                        }
+                                        route-group-track.scroll-target = max(0px, min(route-group-track.max-scroll,
+                                            route-group-track.scroll-x - (event.delta-x != 0 ? event.delta-x : event.delta-y)));
+                                        return accept;
+                                    }
+                                    route-group-row := HorizontalLayout {
+                                        x: -route-group-track.scroll-x;
+                                        width: route-group-track.overflowing ? max(parent.width, self.min-width) : parent.width;
+                                        height: parent.height;
+                                        padding: 2px;
+                                        spacing: 2px;
+                                        for group in root.catalog-groups: QuietChip {
+                                            height: 32px;
+                                            icon: group.icon;
+                                            icon-image: group.icon-image;
+                                            label: group.label;
+                                            selected: group.selected;
+                                            natural-sizing: route-group-track.overflowing;
+                                            enabled: root.catalog-group-navigation-enabled;
+                                            modal-enabled: !root.profile-menu-open;
+                                            activated => { root.select-catalog-group(group.id); }
+                                            // Only a change of selection scrolls: the model is rebuilt on
+                                            // every update and must not undo the user's own scrolling.
+                                            selected-shown => {
+                                                if (route-group-track.revealed-group-id != group.id) {
+                                                    route-group-track.revealed-group-id = group.id;
+                                                    route-group-track.reveal-selected(self.x, self.width);
+                                                }
+                                            }
+                                            selected-moved => { route-group-track.reveal-selected(self.x, self.width); }
+                                            focus-shown => { route-group-track.reveal(self.x, self.width); }
+                                        }
+                                    }
+                                }
+                                }
+                                // Soft fades over the clipped edges, each with a chevron that pages the strip.
+                                if self.overflowing: Rectangle {
+                                    x: 1px;
+                                    y: 1px;
+                                    width: 46px;
+                                    height: parent.height - 2px;
+                                    opacity: route-group-track.scroll-x > 0.5px ? 1 : 0;
+                                    visible: self.opacity > 0;
+                                    animate opacity { duration: root.reduced-motion ? 0ms : 140ms; easing: ease-out; }
+                                    background: @linear-gradient(90deg, #0a0c0f 0%, #0a0c0f 60%, #0a0c0f00 100%);
+                                    route-group-prev := TouchArea {
+                                        x: 0;
+                                        width: 28px;
+                                        height: parent.height;
+                                        clicked => { route-group-track.page(-1); }
+                                        Image {
+                                            x: 8px;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 12px;
+                                            height: 12px;
+                                            source: @image-url("../assets/chevron-left.svg");
+                                            colorize: route-group-prev.has-hover ? Theme.text-primary : Theme.text-muted;
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
+                                    }
+                                }
+                                if self.overflowing: Rectangle {
+                                    x: parent.width - self.width - 1px;
+                                    y: 1px;
+                                    width: 46px;
+                                    height: parent.height - 2px;
+                                    opacity: route-group-track.scroll-x < route-group-track.max-scroll - 0.5px ? 1 : 0;
+                                    visible: self.opacity > 0;
+                                    animate opacity { duration: root.reduced-motion ? 0ms : 140ms; easing: ease-out; }
+                                    background: @linear-gradient(90deg, #0a0c0f00 0%, #0a0c0f 40%, #0a0c0f 100%);
+                                    route-group-next := TouchArea {
+                                        x: parent.width - self.width;
+                                        width: 28px;
+                                        height: parent.height;
+                                        clicked => { route-group-track.page(1); }
+                                        Image {
+                                            x: 8px;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 12px;
+                                            height: 12px;
+                                            source: @image-url("../assets/chevron-right.svg");
+                                            colorize: route-group-next.has-hover ? Theme.text-primary : Theme.text-muted;
+                                            image-fit: contain;
+                                            accessible-role: none;
+                                        }
+                                    }
                                 }
                                 if root.catalog-loading && root.catalog-groups.length == 0: HorizontalLayout {
                                     padding: 2px;
@@ -3083,12 +3232,13 @@ export component AppWindow inherits Window {
                                         label: node.label;
                                         supporting-text: "";
                                         trailing-text: node.latency-text;
-                                        trailing-measuring: root.latency-check-loading;
+                                        trailing-measuring: root.latency-check-loading || node.measuring;
                                         trailing-tone: node.latency-tone;
                                         selected: node.selected;
                                         pending: root.catalog-selection-pending && node.selected;
                                         enabled: root.catalog-selection-enabled && !root.profile-menu-open;
                                         activated => { root.select-catalog-node(node.id); }
+                                        secondary-activated => { root.measure-catalog-node(node.id); }
                                     }
                                     if root.catalog-skeleton: route-skeleton := VerticalLayout {
                                         spacing: 0px;
@@ -4247,7 +4397,7 @@ export component AppWindow inherits Window {
                                 if !profile.expired && profile.unlimited: QuotaLogo {
                                     x: 11px; y: 12px;
                                     has-logo: profile.has-logo;
-                                    logo: profile.logo;
+                                    logo: profile.logo-small;
                                     letter: profile.fallback;
                                 }
                                 if !profile.expired && !profile.unlimited: QuotaRing {

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -144,6 +144,17 @@ pub(crate) struct LatencyRequest {
     pub(crate) group_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NodeLatencyToken(u64);
+
+/// Re-measures exactly one route (a right-click on its row).
+pub(crate) struct NodeLatencyRequest {
+    pub(crate) client: Arc<dyn DaemonClient>,
+    pub(crate) token: NodeLatencyToken,
+    pub(crate) catalog_revision: u64,
+    pub(crate) node_id: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LatencyPresentation {
     pub(crate) loading: bool,
@@ -195,6 +206,8 @@ pub(crate) struct CatalogGroupPresentation {
     pub(crate) label: String,
     pub(crate) selected: bool,
     pub(crate) selected_node_label: String,
+    /// The group's downloaded icon image (`crisp_image::group_icon`), if any.
+    pub(crate) icon_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,9 +216,10 @@ pub(crate) struct TrayCatalogGroupPresentation {
     pub(crate) label: String,
     pub(crate) selected_node_label: String,
     pub(crate) nodes: Vec<CatalogNodePresentation>,
+    pub(crate) icon_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CatalogNodePresentation {
     pub(crate) id: String,
     pub(crate) label: String,
@@ -213,6 +227,11 @@ pub(crate) struct CatalogNodePresentation {
     pub(crate) delay_ms: Option<u64>,
     pub(crate) latency_text: String,
     pub(crate) latency_tone: String,
+    /// The node is a proxy group with a downloaded icon image.
+    pub(crate) icon_id: Option<String>,
+    /// Its latency is being re-measured on its own (right-click): the row shows the
+    /// placeholder pill instead of the previous value.
+    pub(crate) measuring: bool,
 }
 
 /// One group with all of its nodes, so route search can look across groups
@@ -250,6 +269,8 @@ pub(crate) struct CatalogPresentation {
     /// Latency of the primary group's selected node, the route the connect
     /// card names. Independent of which group the route list is showing.
     pub(crate) exit_latency_text: String,
+    /// Icon image of that node when it is itself a proxy group (e.g. a url-test "Auto").
+    pub(crate) exit_icon_id: Option<String>,
     pub(crate) loading: bool,
     pub(crate) group_navigation_enabled: bool,
     pub(crate) selection_enabled: bool,
@@ -258,6 +279,8 @@ pub(crate) struct CatalogPresentation {
     // Queue state is asserted in tests; the UI shows the queued route as selected.
     pub(crate) selection_queued: bool,
     pub(crate) error: Option<String>,
+    /// The provider's `dumb-mode`: only the first group is shown and there are no group tabs.
+    pub(crate) dumb_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -348,6 +371,7 @@ struct CatalogGroup {
     label: String,
     is_primary: bool,
     nodes: Vec<CatalogNodePresentation>,
+    icon_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -771,6 +795,9 @@ pub struct DesktopViewModel {
     latency_request_revision: Option<u64>,
     latency_request_group_ids: Vec<String>,
     latency_queued: bool,
+    next_node_latency_generation: u64,
+    /// Single-route measurements in flight, by node id (each row shows its own placeholder).
+    node_latency_pending: BTreeMap<String, NodeLatencyToken>,
     /// The daemon reports running cores (connected, or warm through the service).
     cores_ready: bool,
     service_mode: bool,
@@ -850,6 +877,8 @@ impl DesktopViewModel {
             latency_request_revision: None,
             latency_request_group_ids: Vec::new(),
             latency_queued: false,
+            next_node_latency_generation: 0,
+            node_latency_pending: BTreeMap::new(),
             cores_ready: false,
             service_mode: false,
             latency_error: None,
@@ -915,6 +944,7 @@ impl DesktopViewModel {
     fn apply_daemon_status(&mut self, status: DaemonStatus) -> UiState {
         self.set_authoritative_active_profile(status.active_profile_id.clone());
         self.subscription = status.subscription.clone();
+        self.pin_dumb_mode_group();
         self.cores_ready = status.cores_ready;
         self.service_mode = status.service_mode;
         state_from_status(status)
@@ -1462,6 +1492,7 @@ impl DesktopViewModel {
             .and_then(safe_profile_id);
         self.sync_profile_active_flags();
         self.subscription = status.subscription.clone();
+        self.pin_dumb_mode_group();
         state_from_status(status)
     }
 
@@ -1498,6 +1529,7 @@ impl DesktopViewModel {
         self.next_latency_generation = self.next_latency_generation.wrapping_add(1);
         self.latency_request_pending = None;
         self.latency_request_revision = None;
+        self.node_latency_pending.clear();
         self.latency_request_group_ids.clear();
         self.latency_queued = false;
         self.latency_error = None;
@@ -2234,7 +2266,7 @@ impl DesktopViewModel {
             return None;
         }
         let group_ids = if all_groups {
-            self.catalog_groups
+            self.visible_catalog_groups()
                 .iter()
                 .map(|group| group.id.clone())
                 .collect()
@@ -2317,6 +2349,97 @@ impl DesktopViewModel {
         })
     }
 
+    /// Right-click on a route row: re-measures only that node, through the same daemon
+    /// latency API (and its concurrency and timeouts) as the whole-group check. Each node
+    /// runs at most one measurement at a time; several rows may measure at once.
+    pub(crate) fn begin_node_latency_request(
+        &mut self,
+        node_id: &str,
+    ) -> Option<NodeLatencyRequest> {
+        let cores_live = matches!(self.state, UiState::Connected { .. })
+            || (matches!(self.state, UiState::Ready { .. }) && self.cores_ready);
+        let catalog_revision = self.catalog_revision?;
+        if !cores_live
+            || self.node_latency_pending.contains_key(node_id)
+            || self.profile_mutation_pending()
+            || self.profile_reconciliation_required()
+            || !self
+                .visible_catalog_groups()
+                .iter()
+                .any(|group| group.nodes.iter().any(|node| node.id == node_id))
+        {
+            return None;
+        }
+        self.next_node_latency_generation = self.next_node_latency_generation.wrapping_add(1);
+        let token = NodeLatencyToken(self.next_node_latency_generation);
+        self.node_latency_pending.insert(node_id.to_owned(), token);
+        self.latency_error = None;
+        Some(NodeLatencyRequest {
+            client: self.client.clone(),
+            token,
+            catalog_revision,
+            node_id: node_id.to_owned(),
+        })
+    }
+
+    pub(crate) fn finish_node_latency(
+        &mut self,
+        request_revision: u64,
+        node_id: &str,
+        token: NodeLatencyToken,
+        result: Result<DaemonLatencies, crate::daemon::DaemonError>,
+    ) -> Option<LatencyOutcome> {
+        if self.node_latency_pending.get(node_id) != Some(&token) {
+            return None;
+        }
+        self.node_latency_pending.remove(node_id);
+        if self.catalog_revision != Some(request_revision) {
+            return Some(LatencyOutcome {
+                refresh_catalog: false,
+                rerun: false,
+            });
+        }
+        let mut refresh_catalog = false;
+        match result {
+            Ok(latencies) => {
+                for entry in latencies
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.node_id == node_id)
+                {
+                    let (text, tone) = latency_display(&entry.status, entry.latency_ms);
+                    // The same node can appear in several groups; every copy shows the value.
+                    for node in self
+                        .catalog_groups
+                        .iter_mut()
+                        .flat_map(|group| group.nodes.iter_mut())
+                        .filter(|node| node.id == entry.node_id)
+                    {
+                        node.delay_ms =
+                            (entry.status == "ok").then_some(entry.latency_ms).flatten();
+                        node.latency_text.clone_from(&text);
+                        node.latency_tone.clone_from(&tone);
+                    }
+                }
+            }
+            Err(error) if error.is_stale_revision() => {
+                self.catalog_revision = None;
+                self.latency_queued = true;
+                self.latency_error =
+                    Some("Каталог маршрутов изменился. Обновляем задержку…".into());
+                refresh_catalog = true;
+            }
+            Err(_) => {
+                self.latency_error =
+                    Some("Не удалось проверить задержку. Повторите попытку.".into());
+            }
+        }
+        Some(LatencyOutcome {
+            refresh_catalog,
+            rerun: false,
+        })
+    }
+
     pub(crate) fn finish_catalog(
         &mut self,
         token: CatalogRequestToken,
@@ -2355,6 +2478,8 @@ impl DesktopViewModel {
     pub(crate) fn select_catalog_group(&mut self, id: &str) -> bool {
         if self.catalog_request_pending.is_some()
             || !self.catalog_groups.iter().any(|group| group.id == id)
+            || (self.dumb_mode()
+                && self.catalog_groups.first().map(|group| group.id.as_str()) != Some(id))
         {
             return false;
         }
@@ -2627,10 +2752,62 @@ impl DesktopViewModel {
         }
     }
 
+    /// The provider's `dumb-mode` header: show only the first route group, without tabs.
+    pub(crate) fn dumb_mode(&self) -> bool {
+        self.subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.dumb_mode)
+    }
+
+    /// The groups the UI may show: all of them, or only the first one in dumb mode. The
+    /// hidden groups keep working in the core; they are just not offered.
+    fn visible_catalog_groups(&self) -> &[CatalogGroup] {
+        if self.dumb_mode() {
+            &self.catalog_groups[..self.catalog_groups.len().min(1)]
+        } else {
+            &self.catalog_groups
+        }
+    }
+
+    /// Every icon id the loaded catalog refers to (groups and group-nodes), deduplicated.
+    pub(crate) fn catalog_icon_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        for group in &self.catalog_groups {
+            ids.extend(group.icon_id.iter().cloned());
+            ids.extend(group.nodes.iter().filter_map(|node| node.icon_id.clone()));
+        }
+        ids.into_iter().collect()
+    }
+
+    /// In dumb mode the viewed group is always the first one.
+    fn pin_dumb_mode_group(&mut self) {
+        if self.dumb_mode()
+            && let Some(first) = self.catalog_groups.first()
+        {
+            self.selected_catalog_group = Some(first.id.clone());
+        }
+    }
+
+    /// `nodes` as displayed: a route being re-measured on its own shows the placeholder.
+    fn present_nodes(&self, nodes: &[CatalogNodePresentation]) -> Vec<CatalogNodePresentation> {
+        nodes
+            .iter()
+            .map(|node| {
+                let mut node = node.clone();
+                if self.node_latency_pending.contains_key(&node.id) {
+                    node.measuring = true;
+                    node.latency_text.clear();
+                    node.latency_tone = "neutral".into();
+                }
+                node
+            })
+            .collect()
+    }
+
     pub(crate) fn catalog_presentation(&self) -> CatalogPresentation {
         let selected = self.selected_catalog_group.as_deref();
-        let groups = self
-            .catalog_groups
+        let visible = self.visible_catalog_groups();
+        let groups = visible
             .iter()
             .map(|group| CatalogGroupPresentation {
                 id: group.id.clone(),
@@ -2642,19 +2819,19 @@ impl DesktopViewModel {
                     .find(|node| node.selected)
                     .map(|node| node.label.clone())
                     .unwrap_or_else(|| "Не выбран".into()),
+                icon_id: group.icon_id.clone(),
             })
             .collect();
         let nodes = selected
-            .and_then(|id| self.catalog_groups.iter().find(|group| group.id == id))
-            .map(|group| group.nodes.clone())
+            .and_then(|id| visible.iter().find(|group| group.id == id))
+            .map(|group| self.present_nodes(&group.nodes))
             .unwrap_or_default();
-        let search_groups = self
-            .catalog_groups
+        let search_groups = visible
             .iter()
             .map(|group| CatalogSearchGroup {
                 id: group.id.clone(),
                 label: group.label.clone(),
-                nodes: group.nodes.clone(),
+                nodes: self.present_nodes(&group.nodes),
             })
             .collect();
         CatalogPresentation {
@@ -2671,6 +2848,12 @@ impl DesktopViewModel {
                 .map(|node| node.latency_text.clone())
                 .filter(|latency| latency.chars().any(|c| c.is_ascii_digit()))
                 .unwrap_or_default(),
+            exit_icon_id: self
+                .catalog_groups
+                .iter()
+                .find(|group| group.is_primary)
+                .and_then(|group| group.nodes.iter().find(|node| node.selected))
+                .and_then(|node| node.icon_id.clone()),
             loading: self.catalog_request_pending.is_some(),
             group_navigation_enabled: !self.catalog_groups.is_empty()
                 && self.catalog_request_pending.is_none(),
@@ -2678,6 +2861,7 @@ impl DesktopViewModel {
             selection_pending: self.active_selection.is_some(),
             selection_queued: !self.queued_selections.is_empty(),
             error: self.catalog_error.clone(),
+            dumb_mode: self.dumb_mode(),
         }
     }
 
@@ -2687,16 +2871,12 @@ impl DesktopViewModel {
         max_nodes: usize,
     ) -> Vec<TrayCatalogGroupPresentation> {
         let mut remaining_nodes = max_nodes;
-        self.catalog_groups
+        self.visible_catalog_groups()
             .iter()
             .take(max_groups)
             .map(|group| {
-                let nodes = group
-                    .nodes
-                    .iter()
-                    .take(remaining_nodes)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let nodes =
+                    self.present_nodes(&group.nodes[..group.nodes.len().min(remaining_nodes)]);
                 remaining_nodes = remaining_nodes.saturating_sub(nodes.len());
                 TrayCatalogGroupPresentation {
                     id: group.id.clone(),
@@ -2708,6 +2888,7 @@ impl DesktopViewModel {
                         .map(|node| node.label.clone())
                         .unwrap_or_else(|| "Не выбран".into()),
                     nodes,
+                    icon_id: group.icon_id.clone(),
                 }
             })
             .collect()
@@ -2759,6 +2940,7 @@ impl DesktopViewModel {
                     is_primary: primary_group_id.as_deref() == Some(group.id.as_str()),
                     id: group.id,
                     label: safe_catalog_label(&group.label),
+                    icon_id: group.icon_id.filter(|id| is_icon_id(id)),
                     nodes: group
                         .nodes
                         .into_iter()
@@ -2789,6 +2971,8 @@ impl DesktopViewModel {
                                 delay_ms,
                                 latency_text,
                                 latency_tone,
+                                icon_id: node.icon_id.filter(|id| is_icon_id(id)),
+                                measuring: false,
                             }
                         })
                         .collect(),
@@ -2799,6 +2983,7 @@ impl DesktopViewModel {
             self.latency_queued = true;
         }
         self.apply_restored_route_preferences();
+        self.pin_dumb_mode_group();
         for queued in &self.queued_selections {
             if let Some(group) = self
                 .catalog_groups
@@ -3008,6 +3193,14 @@ fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
         ("error" | "unavailable", _) => ("нет связи".into(), "danger".into()),
         _ => ("нет данных".into(), "neutral".into()),
     }
+}
+
+/// Daemon icon ids are 32 lowercase hex digits; anything else is ignored.
+fn is_icon_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn safe_catalog_label(label: &str) -> String {
@@ -3365,6 +3558,8 @@ mod route_search_tests {
             delay_ms: None,
             latency_text: "42 мс".into(),
             latency_tone: "success".into(),
+            icon_id: None,
+            measuring: false,
         }
     }
 
@@ -5236,7 +5431,11 @@ mod tests {
             .expect("route group track");
         assert!(group_track.contains("height: 38px;"));
         assert!(group_track.contains("border-radius: 10px;"));
-        assert!(group_track.contains("ScrollView {"));
+        // Too many groups scroll sideways instead of squeezing the tabs.
+        assert!(group_track.contains("scroll-event(event) => {"));
+        assert!(group_track.contains("max(parent.width, self.min-width) : parent.width;"));
+        assert!(group_track.contains("route-group-measure := HorizontalLayout"));
+        assert!(app.contains("if self.overflowing: Rectangle {"));
         assert!(
             !normalized_app
                 .contains("height: 60px;\n                                horizontal-stretch: 1;")
@@ -6565,29 +6764,34 @@ mod tests {
                     id: "opaque:first".into(),
                     label: "Резерв https://private.invalid/path".into(),
                     selected: false,
+                    icon_id: None,
                     nodes: vec![DaemonCatalogNode {
                         id: "opaque:node-a".into(),
                         label: "Север".into(),
                         selected: false,
                         delay_ms: None,
+                        icon_id: None,
                     }],
                 },
                 DaemonCatalogGroup {
                     id: "opaque:selected".into(),
                     label: "Основной".into(),
                     selected: true,
+                    icon_id: None,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "opaque:node-b".into(),
                             label: "Восток".into(),
                             selected: true,
                             delay_ms: Some(37),
+                            icon_id: None,
                         },
                         DaemonCatalogNode {
                             id: "opaque:node-c".into(),
                             label: "Запад".into(),
                             selected: false,
                             delay_ms: Some(51),
+                            icon_id: None,
                         },
                     ],
                 },
@@ -6844,6 +7048,236 @@ mod tests {
             .finish_catalog(request.token, Ok(catalog_fixture()))
             .expect("catalog completion");
         view_model
+    }
+
+    fn dumb_mode_status(dumb_mode: bool) -> DaemonStatus {
+        DaemonStatus {
+            state: "connected".into(),
+            profile: Some("Тестовый".into()),
+            current_node: Some("Первый".into()),
+            subscription: Some(DaemonSubscriptionInfo {
+                source_name: "provider.example".into(),
+                display_name: "Provider".into(),
+                dumb_mode,
+                ..DaemonSubscriptionInfo::default()
+            }),
+            ..DaemonStatus::default()
+        }
+    }
+
+    #[test]
+    fn dumb_mode_shows_only_the_first_group_without_tabs_end_to_end() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(refresh, Ok(dumb_mode_status(true)));
+        let request = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(request.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+
+        // The daemon marks the second group as the routing one; dumb mode still shows
+        // only the first group of the config, with its nodes, selection and latency.
+        let catalog = view_model.catalog_presentation();
+        assert!(catalog.dumb_mode);
+        assert_eq!(catalog.groups.len(), 1);
+        assert_eq!(catalog.groups[0].id, "opaque:first");
+        assert_eq!(catalog.selected_group_id.as_deref(), Some("opaque:first"));
+        assert_eq!(
+            catalog
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["opaque:node-a"]
+        );
+        assert_eq!(catalog.search_groups.len(), 1);
+        // Other groups cannot be opened, and latency checks stay on the shown group.
+        assert!(!view_model.select_catalog_group("opaque:selected"));
+        let latency = view_model
+            .begin_forced_latency_request()
+            .expect("latency request");
+        assert_eq!(latency.group_ids, ["opaque:first"]);
+        view_model.finish_latencies(
+            latency.token,
+            Ok(DaemonLatencies {
+                entries: vec![DaemonLatencyEntry {
+                    group_id: "opaque:first".into(),
+                    node_id: "opaque:node-a".into(),
+                    latency_ms: Some(33),
+                    status: "ok".into(),
+                }],
+            }),
+        );
+        assert_eq!(
+            view_model.catalog_presentation().nodes[0].latency_text,
+            "33 ms"
+        );
+        // The tray shows the same single group.
+        let tray = view_model.tray_catalog_groups(12, 64);
+        assert_eq!(tray.len(), 1);
+        assert_eq!(tray[0].id, "opaque:first");
+
+        // Turning dumb mode off brings every group back.
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(refresh, Ok(dumb_mode_status(false)));
+        let catalog = view_model.catalog_presentation();
+        assert!(!catalog.dumb_mode);
+        assert_eq!(catalog.groups.len(), 2);
+        assert!(view_model.select_catalog_group("opaque:selected"));
+    }
+
+    #[test]
+    fn right_click_measures_one_node_with_its_own_placeholder_and_runs_concurrently() {
+        let mut view_model = connected_view_model_with_catalog();
+        let first = view_model
+            .begin_node_latency_request("opaque:node-c")
+            .expect("node latency request");
+        assert_eq!(first.node_id, "opaque:node-c");
+        assert_eq!(first.catalog_revision, 91);
+        // A second click on the same row while it measures is ignored; another row may start.
+        assert!(
+            view_model
+                .begin_node_latency_request("opaque:node-c")
+                .is_none()
+        );
+        let second = view_model
+            .begin_node_latency_request("opaque:node-b")
+            .expect("concurrent node latency request");
+        assert!(
+            view_model
+                .begin_node_latency_request("opaque:unknown")
+                .is_none()
+        );
+
+        let nodes = view_model.catalog_presentation().nodes;
+        for node in &nodes {
+            let measuring = node.id == "opaque:node-c" || node.id == "opaque:node-b";
+            assert_eq!(node.measuring, measuring, "{}", node.id);
+            if measuring {
+                assert_eq!(
+                    node.latency_text, "",
+                    "the placeholder replaces the old value"
+                );
+            }
+        }
+
+        let outcome = view_model
+            .finish_node_latency(
+                91,
+                "opaque:node-c",
+                first.token,
+                Ok(DaemonLatencies {
+                    entries: vec![DaemonLatencyEntry {
+                        group_id: "opaque:selected".into(),
+                        node_id: "opaque:node-c".into(),
+                        latency_ms: Some(77),
+                        status: "ok".into(),
+                    }],
+                }),
+            )
+            .expect("accepted completion");
+        assert!(!outcome.refresh_catalog);
+        let catalog = view_model.catalog_presentation();
+        let node_c = catalog
+            .nodes
+            .iter()
+            .find(|node| node.id == "opaque:node-c")
+            .unwrap();
+        assert!(!node_c.measuring);
+        assert_eq!(node_c.latency_text, "77 ms");
+        assert!(
+            catalog
+                .nodes
+                .iter()
+                .find(|node| node.id == "opaque:node-b")
+                .unwrap()
+                .measuring
+        );
+        // A repeated completion for the same token is ignored.
+        assert!(
+            view_model
+                .finish_node_latency(
+                    91,
+                    "opaque:node-c",
+                    first.token,
+                    Ok(DaemonLatencies::default())
+                )
+                .is_none()
+        );
+
+        // A timeout shows the usual timeout text; the row stops measuring.
+        view_model
+            .finish_node_latency(
+                91,
+                "opaque:node-b",
+                second.token,
+                Ok(DaemonLatencies {
+                    entries: vec![DaemonLatencyEntry {
+                        group_id: "opaque:selected".into(),
+                        node_id: "opaque:node-b".into(),
+                        latency_ms: None,
+                        status: "timeout".into(),
+                    }],
+                }),
+            )
+            .expect("accepted completion");
+        let node_b = view_model
+            .catalog_presentation()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == "opaque:node-b")
+            .unwrap();
+        assert!(!node_b.measuring);
+        assert_eq!(node_b.latency_text, latency_display("timeout", None).0);
+    }
+
+    #[test]
+    fn node_measurement_needs_live_cores_and_a_stale_catalog_refreshes() {
+        let mut cold = warm_view_model_with_catalog(false);
+        assert!(cold.begin_node_latency_request("opaque:node-b").is_none());
+
+        let mut view_model = connected_view_model_with_catalog();
+        let request = view_model
+            .begin_node_latency_request("opaque:node-b")
+            .expect("node latency request");
+        let outcome = view_model
+            .finish_node_latency(
+                91,
+                "opaque:node-b",
+                request.token,
+                Err(crate::daemon::DaemonError::stale_revision()),
+            )
+            .expect("accepted completion");
+        assert!(outcome.refresh_catalog);
+        assert!(!view_model.catalog_presentation().nodes[0].measuring);
+    }
+
+    #[test]
+    fn catalog_icon_ids_are_kept_only_when_well_formed() {
+        let mut catalog = catalog_fixture();
+        catalog.groups[0].icon_id = Some("0123456789abcdef0123456789abcdef".into());
+        catalog.groups[1].icon_id = Some("../../etc/passwd".into());
+        catalog.groups[1].nodes[0].icon_id = Some("fedcba9876543210fedcba9876543210".into());
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(refresh, Ok(dumb_mode_status(false)));
+        let request = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(request.token, Ok(catalog))
+            .expect("catalog completion");
+        assert_eq!(
+            view_model.catalog_icon_ids(),
+            [
+                "0123456789abcdef0123456789abcdef",
+                "fedcba9876543210fedcba9876543210"
+            ]
+        );
+        let presentation = view_model.catalog_presentation();
+        assert_eq!(presentation.groups[1].icon_id, None);
+        assert_eq!(
+            presentation.exit_icon_id.as_deref(),
+            Some("fedcba9876543210fedcba9876543210")
+        );
     }
 
     #[test]
@@ -8140,7 +8574,8 @@ mod tests {
             .expect("QuietChip source");
         // Group chips are equal-width segments of one track.
         assert!(quiet_chip.contains("horizontal-stretch: 1;"));
-        assert!(quiet_chip.contains("min-width: 96px;"));
+        // Never squeezed below the icon and full label (the track scrolls instead).
+        assert!(quiet_chip.contains("min-width: root.natural-sizing ? root.natural-width : 96px;"));
         assert!(!quiet_chip.contains("max-width: 164px;"));
         assert!(quiet_chip.contains("border-radius: 8px;"));
         assert!(quiet_chip.contains("background: root.selected ? Theme.elevated"));

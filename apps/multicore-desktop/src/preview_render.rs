@@ -157,6 +157,7 @@ fn nodes(pending_selected: bool) -> ModelRc<UiCatalogNode> {
         selected: selected && !pending_selected || (pending_selected && id == "n2"),
         latency_text: s(latency),
         latency_tone: s(tone),
+        measuring: false,
     })
     .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(rows))
@@ -244,6 +245,7 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
                 available,
                 has_logo: false,
                 logo: Default::default(),
+                logo_small: Default::default(),
                 fallback: s(&title.chars().next().unwrap().to_string()),
                 remaining: s(remaining),
                 days: s(days),
@@ -355,6 +357,8 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
             delay_ms: None,
             latency_text: latency.into(),
             latency_tone: tone.into(),
+            icon_id: None,
+            measuring: false,
         }
     };
     let catalog = CatalogPresentation {
@@ -912,6 +916,7 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
         tone: s(""),
         selected,
         enabled: true,
+        measuring: false,
     };
     let node = |id: &str, icon: &str, label: &str, latency: &str, tone: &str, selected: bool| {
         TrayMenuRow {
@@ -924,6 +929,7 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
             tone: s(tone),
             selected,
             enabled: true,
+            measuring: false,
         }
     };
     (
@@ -961,7 +967,7 @@ fn chip_motion_strip(unlimited: bool) {
     window.set_size(PhysicalSize::new(WIDTH, HEIGHT));
     ui.show().expect("show preview component");
     let mut frames = Vec::new();
-    let mut render = |frames: &mut Vec<image::RgbImage>, keep: bool| {
+    let render = |frames: &mut Vec<image::RgbImage>, keep: bool| {
         window.request_redraw();
         let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (WIDTH * HEIGHT) as usize];
         window.draw_if_needed(|renderer| {
@@ -1064,6 +1070,7 @@ fn tray_many_rows() -> ModelRc<TrayMenuRow> {
         tone: s(tone),
         selected,
         enabled: true,
+        measuring: false,
     })
     .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(rows))
@@ -1141,7 +1148,7 @@ fn render_ui_previews() {
     tray_connected(&popup);
     capture(&popup, "tray-connected", 304, 460);
 
-    // Dragged larger by its top-left corner: accent edges and the size readout.
+    // Dragged larger by its top-left corner: only the accent edges light up (no size readout).
     let popup = TrayPopup::new().expect("create tray popup");
     tray_connected(&popup);
     popup.set_node_rows(tray_many_rows());
@@ -1197,4 +1204,282 @@ fn render_ui_previews() {
     popup.set_connection_enabled(false);
     popup.set_has_profile(false);
     capture(&popup, "tray-no-profile", 304, 460);
+
+    v112_previews();
+}
+
+// ---- 1.1.2: scrolling group tabs, image group icons, dumb mode, per-row latency, crisp logos.
+
+fn preview_scale() -> f32 {
+    std::env::var("MULTICORE_PREVIEW_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0)
+}
+
+/// Provider-style group icons (Mihomo `icon:` URLs serve images like these), normalized by the
+/// same code the daemon runs on a downloaded icon.
+const V112_ICONS: &[(&str, &str)] = &[
+    (
+        "icon-ru",
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='1' y='4' width='22' height='16' rx='3' fill='#ffffff'/><rect x='1' y='9.33' width='22' height='5.34' fill='#1c57d8'/><path d='M1 14.67h22V17a3 3 0 0 1-3 3H4a3 3 0 0 1-3-3z' fill='#e0312b'/></svg>",
+    ),
+    (
+        "icon-world",
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='10' fill='#2f80ed'/><path d='M12 2a10 10 0 0 1 0 20M12 2a10 10 0 0 0 0 20M2 12h20M4.5 6.5h15M4.5 17.5h15' stroke='#d6e8ff' stroke-width='1.4' fill='none'/><path d='M12 2c3 3 3 17 0 20M12 2c-3 3-3 17 0 20' stroke='#d6e8ff' stroke-width='1.4' fill='none'/></svg>",
+    ),
+    (
+        "icon-telegram",
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='11' fill='#29a9eb'/><path d='M5.5 11.7l11.4-4.4c.6-.2 1 .1.8.9l-1.9 9c-.1.6-.5.8-1 .5l-2.9-2.2-1.4 1.4c-.2.2-.3.3-.6.3l.2-3 5.4-4.9c.2-.2 0-.3-.3-.1l-6.7 4.2-2.9-.9c-.6-.2-.6-.6.2-.8z' fill='#ffffff'/></svg>",
+    ),
+    (
+        "icon-youtube",
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='1' y='4.5' width='22' height='15' rx='4.5' fill='#ff0033'/><path d='M10 8.6v6.8l5.8-3.4z' fill='#ffffff'/></svg>",
+    ),
+    (
+        "icon-discord",
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='1' y='1' width='22' height='22' rx='6' fill='#5865f2'/><path d='M7 8.2c1.3-.7 2.6-1 3.4-1.1l.3.6a10 10 0 0 1 2.6 0l.3-.6c.8.1 2.1.4 3.4 1.1 1.3 2.1 1.9 4.3 1.7 6.6a8.8 8.8 0 0 1-3 1.5l-.6-1c.5-.2 1-.4 1.4-.7l-.4-.3a7.6 7.6 0 0 1-6.2 0l-.4.3c.4.3.9.5 1.4.7l-.6 1a8.8 8.8 0 0 1-3-1.5C5.1 12.5 5.7 10.3 7 8.2z' fill='#ffffff'/><circle cx='9.8' cy='12.3' r='1.1' fill='#5865f2'/><circle cx='14.2' cy='12.3' r='1.1' fill='#5865f2'/></svg>",
+    ),
+    (
+        "icon-auto",
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='11' fill='#1f9d55'/><path d='M7 13l3 3 7-8' stroke='#ffffff' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>",
+    ),
+];
+
+fn install_v112_icons() {
+    for (id, svg) in V112_ICONS {
+        let png = multicore_core::normalize_group_icon(svg.as_bytes()).expect("preview icon");
+        assert!(crate::crisp_image::store_group_icon(id, &png));
+    }
+}
+
+fn v112_icon(id: &str, logical: f32) -> slint::Image {
+    crate::crisp_image::group_icon(id, logical, preview_scale()).expect("stored preview icon")
+}
+
+/// (id, emoji, image icon id, label)
+const V112_GROUPS: &[(&str, &str, &str, &str)] = &[
+    ("g1", "🌍", "", "Сервер"),
+    ("g2", "", "icon-ru", "Россия"),
+    ("g3", "", "icon-world", "Зарубежье"),
+    ("g4", "", "icon-telegram", "Telegram"),
+    ("g5", "", "icon-youtube", "YouTube"),
+    ("g6", "🎮", "", "Игры"),
+    ("g7", "", "icon-discord", "Discord"),
+    ("g8", "📺", "", "Стриминг"),
+    ("g9", "", "", "Прочее"),
+];
+
+fn v112_groups(count: usize, selected: &str) -> ModelRc<UiCatalogGroup> {
+    let rows = V112_GROUPS
+        .iter()
+        .take(count)
+        .map(|(id, emoji, image, label)| {
+            let icon = if emoji.is_empty() { "◎" } else { emoji };
+            UiCatalogGroup {
+                id: s(id),
+                icon: s(icon),
+                icon_image: if image.is_empty() {
+                    crate::emoji_images::image_for(icon)
+                } else {
+                    v112_icon(image, 15.0)
+                },
+                label: s(label),
+                selected: *id == selected,
+            }
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn v112_nodes(measuring: &[&str]) -> ModelRc<UiCatalogNode> {
+    let rows = [
+        ("n1", "", "icon-auto", "Автовыбор", true, "42 мс", "success"),
+        ("n2", "🇦🇱", "", "Albania", false, "96 мс", "warning"),
+        ("n3", "🇩🇪", "", "Germany", false, "181 мс", "danger"),
+        ("n4", "🇸🇪", "", "Sweden", false, "Тайм-аут", "danger"),
+        ("n5", "🇳🇱", "", "Netherlands", false, "64 мс", "success"),
+        ("n6", "", "", "Без VPN", false, "—", "neutral"),
+    ]
+    .into_iter()
+    .map(|(id, emoji, image, label, selected, latency, tone)| {
+        let busy = measuring.contains(&id);
+        UiCatalogNode {
+            id: s(id),
+            icon: s(emoji),
+            icon_image: if image.is_empty() {
+                crate::emoji_images::image_for(emoji)
+            } else {
+                v112_icon(image, 22.0)
+            },
+            label: s(label),
+            selected,
+            latency_text: s(if busy { "" } else { latency }),
+            latency_tone: s(if busy { "neutral" } else { tone }),
+            measuring: busy,
+        }
+    })
+    .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn v112_home(ui: &AppWindow, groups: usize, selected: &str) {
+    connected(ui);
+    ui.set_catalog_groups(v112_groups(groups, selected));
+    ui.set_catalog_nodes(v112_nodes(&[]));
+    ui.set_node_icon(s("◎"));
+    ui.set_node_icon_image(v112_icon("icon-auto", 14.0));
+}
+
+/// A provider logo with fine detail (thin ring, small mark), 256 px like the daemon caches it.
+const V112_LOGO_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='#0f1720'/><circle cx='32' cy='32' r='22' fill='none' stroke='#4c9dff' stroke-width='4'/><path d='M22 40V24l10 10 10-10v16' fill='none' stroke='#ffffff' stroke-width='5' stroke-linejoin='round' stroke-linecap='round'/></svg>";
+
+fn v112_logo_source() -> image::RgbaImage {
+    let png = multicore_core::normalize_service_logo(V112_LOGO_SVG.as_bytes()).expect("logo");
+    crate::crisp_image::decode_png(&png).expect("decoded logo")
+}
+
+fn v112_chip_logo(ui: &AppWindow, crisp: bool) {
+    chip(ui, "∞ GiB", "Бессрочно", -1.0, "accent");
+    let source = v112_logo_source();
+    let image = if crisp {
+        crate::crisp_image::to_slint(&crate::crisp_image::fit(
+            &source,
+            crate::crisp_image::physical_px(12.0, preview_scale()),
+        ))
+    } else {
+        crate::crisp_image::to_slint(&source)
+    };
+    ui.set_has_service_logo(true);
+    ui.set_service_logo(image);
+}
+
+fn v112_tray_groups(count: usize, selected: &str) -> ModelRc<TrayMenuRow> {
+    let rows = V112_GROUPS
+        .iter()
+        .take(count)
+        .map(|(id, emoji, image, label)| TrayMenuRow {
+            id: s(id),
+            group_id: s(""),
+            icon: s(emoji),
+            icon_image: if image.is_empty() {
+                crate::emoji_images::image_for(emoji)
+            } else {
+                v112_icon(image, 14.0)
+            },
+            label: s(label),
+            detail: s(""),
+            tone: s(""),
+            selected: *id == selected,
+            enabled: true,
+            measuring: false,
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn v112_tray_nodes(measuring: &[&str]) -> ModelRc<TrayMenuRow> {
+    let rows = [
+        ("n1", "", "icon-auto", "Автовыбор", "42 мс", "success", true),
+        ("n2", "🇸🇪", "", "Sweden", "42 мс", "success", false),
+        ("n3", "🇩🇪", "", "Germany", "96 мс", "warning", false),
+        ("n4", "🇦🇱", "", "Albania", "Тайм-аут", "danger", false),
+    ]
+    .into_iter()
+    .map(|(id, emoji, image, label, latency, tone, selected)| {
+        let busy = measuring.contains(&id);
+        TrayMenuRow {
+            id: s(id),
+            group_id: s("g1"),
+            icon: s(emoji),
+            icon_image: if image.is_empty() {
+                crate::emoji_images::image_for(emoji)
+            } else {
+                v112_icon(image, 20.0)
+            },
+            label: s(label),
+            detail: s(if busy { "" } else { latency }),
+            tone: s(if busy { "neutral" } else { tone }),
+            selected,
+            enabled: true,
+            measuring: busy,
+        }
+    })
+    .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn v112_previews() {
+    install_v112_icons();
+    type Setup = fn(&AppWindow);
+    let home: &[(&str, u32, u32, Setup)] = &[
+        ("v112-tabs-fit-icons", 840, 720, |ui| v112_home(ui, 4, "g1")),
+        ("v112-tabs-overflow", 840, 720, |ui| v112_home(ui, 9, "g1")),
+        ("v112-tabs-overflow-scrolled", 840, 720, |ui| {
+            v112_home(ui, 9, "g7")
+        }),
+        ("v112-tabs-overflow-end", 840, 720, |ui| {
+            v112_home(ui, 9, "g9")
+        }),
+        ("v112-tabs-overflow-min", 700, 620, |ui| {
+            v112_home(ui, 9, "g1")
+        }),
+        ("v112-tabs-overflow-scrolled-min", 700, 620, |ui| {
+            v112_home(ui, 9, "g5")
+        }),
+        ("v112-tabs-long-name-min", 700, 620, |ui| {
+            v112_home(ui, 3, "g1");
+            use slint::Model as _;
+            let mut rows: Vec<UiCatalogGroup> = ui.get_catalog_groups().iter().collect();
+            rows[2].label = s("Очень длинное название группы от провайдера подписки");
+            ui.set_catalog_groups(ModelRc::new(VecModel::from(rows)));
+        }),
+        ("v112-node-measuring", 840, 720, |ui| {
+            v112_home(ui, 4, "g1");
+            ui.set_catalog_nodes(v112_nodes(&["n3", "n5"]));
+        }),
+        ("v112-dumb-mode", 840, 720, |ui| {
+            v112_home(ui, 1, "g1");
+            ui.set_catalog_dumb_mode(true);
+        }),
+        ("v112-dumb-mode-min", 700, 620, |ui| {
+            v112_home(ui, 1, "g1");
+            ui.set_catalog_dumb_mode(true);
+        }),
+        ("v112-chip-logo-crisp", 840, 720, |ui| {
+            v112_chip_logo(ui, true)
+        }),
+        ("v112-chip-logo-naive", 840, 720, |ui| {
+            v112_chip_logo(ui, false)
+        }),
+    ];
+    for (name, width, height, setup) in home {
+        if !wanted(name) {
+            continue;
+        }
+        let ui = AppWindow::new().expect("create app window");
+        setup(&ui);
+        capture(&ui, name, *width, *height);
+    }
+
+    let tray: &[(&str, &str, bool, &[&str])] = &[
+        ("v112-tray-overflow", "g1", false, &[]),
+        ("v112-tray-overflow-scrolled", "g7", false, &[]),
+        ("v112-tray-measuring", "g1", false, &["n3"]),
+        ("v112-tray-dumb-mode", "g1", true, &[]),
+    ];
+    for (name, selected, dumb, measuring) in tray {
+        if !wanted(name) {
+            continue;
+        }
+        let popup = TrayPopup::new().expect("create tray popup");
+        tray_connected(&popup);
+        popup.set_reduced_motion(true);
+        popup.set_group_rows(v112_tray_groups(if *dumb { 1 } else { 9 }, selected));
+        popup.set_node_rows(v112_tray_nodes(measuring));
+        popup.set_dumb_mode(*dumb);
+        popup.set_exit_name(s("Автовыбор"));
+        popup.set_exit_icon_image(v112_icon("icon-auto", 12.0));
+        capture(&popup, name, 304, 460);
+    }
 }

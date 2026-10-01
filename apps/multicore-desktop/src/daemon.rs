@@ -167,6 +167,8 @@ const SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const API_ERROR_RESPONSE_LIMIT_BYTES: usize = 16 * 1024;
 const DASHBOARD_URL_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 const SESSION_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
+// The daemon serves canonical group icons of at most 128 KiB.
+const GROUP_ICON_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DaemonStatus {
@@ -260,6 +262,9 @@ pub struct DaemonSubscriptionInfo {
     pub service_logo_path: Option<String>,
     #[serde(default)]
     pub refresh_available: bool,
+    /// The provider's `dumb-mode` header: only the first route group is shown.
+    #[serde(default)]
+    pub dumb_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -345,6 +350,9 @@ pub struct DaemonCatalogGroup {
     pub label: String,
     pub selected: bool,
     pub nodes: Vec<DaemonCatalogNode>,
+    /// Opaque id of the group's downloaded icon image (`GET /v1/group-icons/{id}`).
+    #[serde(default)]
+    pub icon_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -353,6 +361,9 @@ pub struct DaemonCatalogNode {
     pub label: String,
     pub selected: bool,
     pub delay_ms: Option<u64>,
+    /// Set when the node is itself a proxy group with a downloaded icon.
+    #[serde(default)]
+    pub icon_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -646,6 +657,20 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Проверка задержки недоступна."))
     }
 
+    /// POST /v1/latencies for exactly these nodes (a right-click on one route row).
+    fn node_latencies(
+        &self,
+        _revision: Option<u64>,
+        _node_ids: &[String],
+    ) -> Result<DaemonLatencies, DaemonError> {
+        Err(DaemonError::new("Проверка задержки недоступна."))
+    }
+
+    /// GET /v1/group-icons/{icon_id}: the canonical PNG of a catalog group icon.
+    fn group_icon(&self, _icon_id: &str) -> Result<Vec<u8>, DaemonError> {
+        Err(DaemonError::new("Значок группы недоступен."))
+    }
+
     /// PUT /v1/selections/{group_id} with `{ "revision", "node_id" }`.
     fn select_node(
         &self,
@@ -877,6 +902,32 @@ impl HttpDaemonClient {
     ) -> Result<DaemonStatus, DaemonError> {
         self.send_json(request, STATUS_RESPONSE_LIMIT_BYTES)
     }
+
+    fn post_latencies(&self, request: LatencyRequest<'_>) -> Result<DaemonLatencies, DaemonError> {
+        let response = self
+            .http
+            .post(self.endpoint("/v1/latencies"))
+            .bearer_auth(&self.token)
+            .json(&request)
+            .send()
+            .map_err(map_error)?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            let stale_revision =
+                decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
+                    .is_ok_and(|body| body.code == "stale_revision");
+            return Err(if stale_revision {
+                DaemonError::stale_revision()
+            } else {
+                DaemonError::definitive_http("Не удалось проверить задержку.")
+            });
+        }
+        if !response.status().is_success() {
+            return Err(DaemonError::definitive_http(
+                "Фоновый сервис отклонил проверку задержки.",
+            ));
+        }
+        decode_bounded_json(response, LATENCIES_RESPONSE_LIMIT_BYTES)
+    }
 }
 
 fn parse_daemon_base_url(value: &str) -> Result<reqwest::Url, DaemonError> {
@@ -966,6 +1017,8 @@ struct SelectionRequest<'a> {
 struct LatencyRequest<'a> {
     revision: Option<u64>,
     group_ids: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    node_ids: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -1260,32 +1313,51 @@ impl DaemonClient for HttpDaemonClient {
         revision: Option<u64>,
         group_ids: &[String],
     ) -> Result<DaemonLatencies, DaemonError> {
+        self.post_latencies(LatencyRequest {
+            revision,
+            group_ids,
+            node_ids: &[],
+        })
+    }
+
+    fn node_latencies(
+        &self,
+        revision: Option<u64>,
+        node_ids: &[String],
+    ) -> Result<DaemonLatencies, DaemonError> {
+        self.post_latencies(LatencyRequest {
+            revision,
+            group_ids: &[],
+            node_ids,
+        })
+    }
+
+    fn group_icon(&self, icon_id: &str) -> Result<Vec<u8>, DaemonError> {
+        let endpoint = self.endpoint_with_segment("/v1/group-icons/", icon_id, None)?;
         let response = self
             .http
-            .post(self.endpoint("/v1/latencies"))
+            .get(endpoint)
             .bearer_auth(&self.token)
-            .json(&LatencyRequest {
-                revision,
-                group_ids,
-            })
             .send()
             .map_err(map_error)?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            let stale_revision =
-                decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
-                    .is_ok_and(|body| body.code == "stale_revision");
-            return Err(if stale_revision {
-                DaemonError::stale_revision()
-            } else {
-                DaemonError::definitive_http("Не удалось проверить задержку.")
-            });
-        }
         if !response.status().is_success() {
-            return Err(DaemonError::definitive_http(
-                "Фоновый сервис отклонил проверку задержки.",
-            ));
+            return Err(DaemonError::definitive_http("Значок группы недоступен."));
         }
-        decode_bounded_json(response, LATENCIES_RESPONSE_LIMIT_BYTES)
+        if response
+            .content_length()
+            .is_some_and(|length| length > GROUP_ICON_RESPONSE_LIMIT_BYTES as u64)
+        {
+            return Err(response_too_large());
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(GROUP_ICON_RESPONSE_LIMIT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| DaemonError::transport("Не удалось прочитать ответ фонового сервиса."))?;
+        if bytes.len() > GROUP_ICON_RESPONSE_LIMIT_BYTES {
+            return Err(response_too_large());
+        }
+        Ok(bytes)
     }
 
     fn select_node(
@@ -1959,18 +2031,21 @@ mod http_tests {
                     id: "group:auto".into(),
                     label: "Авто".into(),
                     selected: true,
+                    icon_id: None,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "node:a".into(),
                             label: "Север".into(),
                             selected: true,
                             delay_ms: Some(42),
+                            icon_id: None,
                         },
                         DaemonCatalogNode {
                             id: "node:b".into(),
                             label: "Резерв".into(),
                             selected: false,
                             delay_ms: None,
+                            icon_id: None,
                         },
                     ],
                 }],
@@ -2017,6 +2092,53 @@ mod http_tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn node_latency_request_posts_only_the_node_id() {
+        let body = r#"{"entries":[{"group_id":"group:auto","node_id":"node:a","latency_ms":42,"status":"ok"}]}"#;
+        let (base_url, server) = start_selection_server("200 OK", body);
+        let client =
+            HttpDaemonClient::new(base_url, "latency-token").expect("authenticated client");
+
+        let latencies = client
+            .node_latencies(Some(17), &["node:a".to_owned()])
+            .expect("node latency request");
+
+        let request = server.join().expect("join latency server");
+        assert!(request.starts_with("POST /v1/latencies HTTP/1.1\r\n"));
+        assert!(request.ends_with(r#"{"revision":17,"group_ids":[],"node_ids":["node:a"]}"#));
+        assert_eq!(latencies.entries.len(), 1);
+        assert_eq!(latencies.entries[0].latency_ms, Some(42));
+    }
+
+    #[test]
+    fn group_icon_is_fetched_by_opaque_id_and_bounded() {
+        let (base_url, server) = start_selection_server("200 OK", "PNGBYTES");
+        let client = HttpDaemonClient::new(base_url, "icon-token").expect("authenticated client");
+        let bytes = client
+            .group_icon("0123456789abcdef0123456789abcdef")
+            .expect("group icon");
+        let request = server.join().expect("join icon server");
+        assert!(
+            request
+                .starts_with("GET /v1/group-icons/0123456789abcdef0123456789abcdef HTTP/1.1\r\n")
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer icon-token\r\n")
+        );
+        assert_eq!(bytes, b"PNGBYTES");
+
+        let (base_url, server) = start_selection_server("404 Not Found", "{}");
+        let client = HttpDaemonClient::new(base_url, "icon-token").expect("authenticated client");
+        assert!(
+            client
+                .group_icon("0123456789abcdef0123456789abcdef")
+                .is_err()
+        );
+        server.join().expect("join icon server");
     }
 
     #[test]

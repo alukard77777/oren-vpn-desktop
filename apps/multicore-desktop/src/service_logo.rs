@@ -3,8 +3,10 @@ use std::path::Path;
 
 const MAX_LOGO_BYTES: u64 = 512 * 1024;
 
-pub(crate) fn load(path: &Path) -> Option<slint::Image> {
-    decode_png(&read_bounded(path)?)
+/// Reads and decodes a cached provider logo (always a canonical PNG) into its RGBA source;
+/// `crate::crisp_image` resamples it to each size it is drawn at.
+pub(crate) fn load(path: &Path) -> Option<image::RgbaImage> {
+    crate::crisp_image::decode_png(&read_bounded(path)?)
 }
 
 fn read_bounded(path: &Path) -> Option<Vec<u8>> {
@@ -15,19 +17,6 @@ fn read_bounded(path: &Path) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     (!bytes.is_empty() && bytes.len() as u64 <= MAX_LOGO_BYTES).then_some(bytes)
-}
-
-fn decode_png(bytes: &[u8]) -> Option<slint::Image> {
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-        .ok()?
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-        image.as_raw(),
-        width,
-        height,
-    );
-    Some(slint::Image::from_rgba8(buffer))
 }
 
 #[cfg(test)]
@@ -48,7 +37,7 @@ mod tests {
         let path = temp.path().join("13");
         std::fs::write(&path, png(3, 2)).unwrap();
         let image = load(&path).unwrap();
-        assert_eq!((image.size().width, image.size().height), (3, 2));
+        assert_eq!(image.dimensions(), (3, 2));
     }
 
     #[test]

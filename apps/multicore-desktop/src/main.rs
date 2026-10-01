@@ -5,6 +5,7 @@ mod appimage_handoff;
 mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
+mod crisp_image;
 mod daemon;
 mod data_reset;
 mod emoji_images;
@@ -1935,10 +1936,17 @@ fn wire_preference_persistence(
     let timer = Timer::default();
     let weak = ui.as_weak();
     let last_monitor_signature = Cell::new(None);
+    let last_scale_factor = Cell::new(ui.window().scale_factor());
     timer.start(TimerMode::Repeated, Duration::from_millis(500), move || {
         let Some(ui) = weak.upgrade() else {
             return;
         };
+        // Logos and group icons are resampled for one scale factor (`crisp_image`); moving
+        // to a display with another one redraws them at its exact pixel size.
+        let scale_factor = ui.window().scale_factor();
+        if scale_factor != last_scale_factor.replace(scale_factor) {
+            apply_latest_snapshot(&ui, &model);
+        }
         if let Some(current) = ui.window().with_winit_window(current_monitor_signature) {
             let previous = last_monitor_signature.get();
             if monitor_cap_changed(previous, current)
@@ -2350,6 +2358,8 @@ fn hide_window_to_tray(ui: &AppWindow) {
 }
 
 fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
+    let scale = popup.window().scale_factor();
+    popup.set_dumb_mode(model.dumb_mode);
     // The popup shows one group at a time: the one selected on the home screen.
     let shown_group = model
         .groups
@@ -2369,12 +2379,18 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                 id: group_id.clone().into(),
                 group_id: "".into(),
                 icon: entry.icon.clone().into(),
-                icon_image: emoji_images::image_for(&entry.icon),
+                icon_image: catalog_icon_image(
+                    entry.icon_id.as_deref(),
+                    &entry.icon,
+                    TRAY_SEGMENT_ICON_PX,
+                    scale,
+                ),
                 label: entry.label.clone().into(),
                 detail: entry.detail.clone().into(),
                 tone: "".into(),
                 selected: shown_group.as_deref() == Some(group_id.as_str()),
                 enabled: entry.enabled,
+                measuring: false,
             }),
             _ => None,
         })
@@ -2391,12 +2407,18 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                     id: node_id.clone().into(),
                     group_id: group_id.clone().into(),
                     icon: entry.icon.clone().into(),
-                    icon_image: emoji_images::image_for(&entry.icon),
+                    icon_image: catalog_icon_image(
+                        entry.icon_id.as_deref(),
+                        &entry.icon,
+                        TRAY_ROW_ICON_PX,
+                        scale,
+                    ),
                     label: entry.label.clone().into(),
                     detail: entry.detail.clone().into(),
                     tone: entry.tone.clone().into(),
                     selected: entry.checked,
                     enabled: entry.enabled,
+                    measuring: entry.measuring,
                 })
             }
             _ => None,
@@ -2811,6 +2833,22 @@ fn wire_tray_popup_actions(
         group_id,
         node_id,
     }));
+    // Right click on a tray route re-measures it in place, like on the home list.
+    let measure_ui = ui.clone();
+    let measure_model = model.clone();
+    let measure_popup = popup_weak.clone();
+    popup.on_measure_node(move |_group_id, node_id| {
+        measure_catalog_node(measure_ui.clone(), measure_model.clone(), node_id.as_str());
+        refresh_tray_popup(&measure_popup, &measure_model);
+    });
+}
+
+/// Rebuilds the open tray popup from the model at once (it otherwise follows on its timer).
+fn refresh_tray_popup(popup: &slint::Weak<TrayPopup>, model: &Arc<Mutex<DesktopViewModel>>) {
+    if let Some(popup) = popup.upgrade() {
+        let next = tray_menu_model(&model.lock().expect("view model lock"));
+        apply_tray_popup_model(&popup, next);
+    }
 }
 
 fn wire_tray_popup_focus_loss(
@@ -2888,9 +2926,11 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                             id: node.id,
                             label: display.label,
                             icon: display.icon,
+                            icon_id: node.icon_id,
                             selected: node.selected,
                             latency_text: node.latency_text,
                             latency_tone: node.latency_tone,
+                            measuring: node.measuring,
                         }
                     })
                     .collect();
@@ -2899,12 +2939,14 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                     id: group.id,
                     label: group_display.label,
                     icon: group_display.icon,
+                    icon_id: group.icon_id,
                     selected_node_label: selected_node.label,
                     nodes,
                 }
             })
             .collect(),
         route_selection_enabled: catalog.selection_enabled,
+        dumb_mode: catalog.dumb_mode,
     })
 }
 
@@ -3628,6 +3670,11 @@ fn wire_catalog_group(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
 }
 
 fn wire_catalog_node(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    let measure_weak = ui.as_weak();
+    let measure_model = model.clone();
+    ui.on_measure_catalog_node(move |id| {
+        measure_catalog_node(measure_weak.clone(), measure_model.clone(), id.as_str());
+    });
     let weak = ui.as_weak();
     ui.on_select_catalog_node(move |id| {
         let (request, current) = {
@@ -4688,6 +4735,8 @@ fn load_catalog_impl(
         if !accepted {
             return;
         }
+        let icon_weak = weak.clone();
+        let icon_model = model.clone();
         let _ = slint::invoke_from_event_loop(move || {
             let latency_queued = weak
                 .upgrade()
@@ -4696,7 +4745,35 @@ fn load_catalog_impl(
                 begin_latency_check(weak, model);
             }
         });
+        fetch_missing_group_icons(&request.client, icon_weak, icon_model);
     });
+}
+
+/// Downloads (from the local daemon) and decodes the group icons the catalog names that are
+/// not cached yet, on the calling worker thread, then redraws once if any arrived.
+fn fetch_missing_group_icons(
+    client: &Arc<dyn daemon::DaemonClient>,
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+) {
+    let wanted = model.lock().expect("view model lock").catalog_icon_ids();
+    let mut fetched = false;
+    for id in wanted {
+        if crisp_image::has_group_icon(&id) {
+            continue;
+        }
+        match client.group_icon(&id) {
+            Ok(png) => fetched |= crisp_image::store_group_icon(&id, &png),
+            Err(error) => daemon::record_low_level("group_icon_fetch_failed", &error),
+        }
+    }
+    if fetched {
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_latest_snapshot(&ui, &model);
+            }
+        });
+    }
 }
 
 fn run_latency_check(
@@ -4725,6 +4802,54 @@ fn run_latency_check(
                 load_catalog(weak, model);
             } else if outcome.rerun {
                 begin_latency_check(weak, model);
+            }
+        });
+    });
+}
+
+/// Right click on a route (home or tray): re-measures only that node. Each row shows its own
+/// placeholder while its request runs; several rows may be measured at once.
+fn measure_catalog_node(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    node_id: &str,
+) {
+    let (request, current) = {
+        let mut model = model.lock().expect("view model lock");
+        let request = model.begin_node_latency_request(node_id);
+        (request, snapshot(&model))
+    };
+    let Some(request) = request else {
+        return;
+    };
+    if let Some(ui) = weak.upgrade() {
+        apply_snapshot(&ui, &current);
+    }
+    thread::spawn(move || {
+        let result = request.client.node_latencies(
+            Some(request.catalog_revision),
+            std::slice::from_ref(&request.node_id),
+        );
+        let completion = {
+            let mut model = model.lock().expect("view model lock");
+            model
+                .finish_node_latency(
+                    request.catalog_revision,
+                    &request.node_id,
+                    request.token,
+                    result,
+                )
+                .map(|outcome| (snapshot(&model), outcome))
+        };
+        let Some((current, outcome)) = completion else {
+            return;
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_snapshot(&ui, &current);
+            }
+            if outcome.refresh_catalog {
+                load_catalog(weak, model);
             }
         });
     });
@@ -4884,7 +5009,12 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_headline(presentation.headline.clone().into());
     ui.set_supporting(presentation.supporting.clone().into());
     let (node_icon, node_name) = split_leading_symbol(&presentation.node);
-    ui.set_node_icon_image(emoji_images::image_for(&node_icon));
+    ui.set_node_icon_image(catalog_icon_image(
+        snapshot.catalog.exit_icon_id.as_deref(),
+        &node_icon,
+        EXIT_LINE_ICON_PX,
+        ui.window().scale_factor(),
+    ));
     ui.set_node_icon(node_icon.into());
     ui.set_node_name(node_name.into());
     ui.set_has_profile(presentation.has_profile);
@@ -4944,22 +5074,24 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                 .filter_map(|profile| profile.service_logo_path.as_deref()),
         )
         .collect::<Vec<_>>();
+    // Each logo is resampled to the exact physical size of the slot it is drawn in.
+    let scale = ui.window().scale_factor();
     let (service_logo, subscription_profiles) = logo_cache::with_logo_cache(|cache| {
         cache.retain_paths(referenced_logo_paths.iter().copied());
         let service_logo = snapshot
             .subscription
             .service_logo_path
             .as_deref()
-            .and_then(|path| cache.image_for_path(path));
+            .and_then(|path| cache.image_for_path(path, QUOTA_LOGO_PX, scale));
         let profiles = snapshot
             .profiles
             .profiles
             .iter()
             .map(|profile| {
-                let logo = profile
-                    .service_logo_path
-                    .as_deref()
-                    .and_then(|path| cache.image_for_path(path));
+                let path = profile.service_logo_path.as_deref();
+                let logo = path.and_then(|path| cache.image_for_path(path, PROFILE_LOGO_PX, scale));
+                let logo_small =
+                    path.and_then(|path| cache.image_for_path(path, QUOTA_LOGO_PX, scale));
                 UiSubscriptionProfile {
                     id: profile.id.clone().into(),
                     title: profile.title.clone().into(),
@@ -4969,6 +5101,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                     available: profile.available,
                     has_logo: logo.is_some(),
                     logo: logo.unwrap_or_default(),
+                    logo_small: logo_small.unwrap_or_default(),
                     fallback: profile
                         .title
                         .chars()
@@ -5082,6 +5215,28 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     );
 }
 
+/// Logical sizes of the image slots in app.slint and tray_popup.slint; images are resampled
+/// to exactly these (times the scale factor) by `crisp_image`.
+const QUOTA_LOGO_PX: f32 = 12.0;
+const PROFILE_LOGO_PX: f32 = 18.0;
+const GROUP_TAB_ICON_PX: f32 = 15.0;
+const ROUTE_ROW_ICON_PX: f32 = 22.0;
+const EXIT_LINE_ICON_PX: f32 = 14.0;
+const TRAY_SEGMENT_ICON_PX: f32 = 14.0;
+const TRAY_ROW_ICON_PX: f32 = 20.0;
+
+/// A group's (or group-node's) downloaded icon when there is one, else the emoji image.
+fn catalog_icon_image(
+    icon_id: Option<&str>,
+    emoji: &str,
+    logical_px: f32,
+    scale: f32,
+) -> slint::Image {
+    icon_id
+        .and_then(|id| crisp_image::group_icon(id, logical_px, scale))
+        .unwrap_or_else(|| emoji_images::image_for(emoji))
+}
+
 /// Latency of the exit shown on the home toggle, when the visible catalog holds
 /// it as the selected node; empty otherwise (never a placeholder like "—").
 fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
@@ -5089,6 +5244,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
     if ui.get_route_search_open() {
         apply_route_search(ui, catalog, ui.get_route_search_query().as_str());
     }
+    let scale = ui.window().scale_factor();
     let groups = catalog
         .groups
         .iter()
@@ -5096,7 +5252,12 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
             let display = derive_catalog_display(&group.label, CatalogDisplayKind::Group);
             UiCatalogGroup {
                 id: group.id.clone().into(),
-                icon_image: emoji_images::image_for(&display.icon),
+                icon_image: catalog_icon_image(
+                    group.icon_id.as_deref(),
+                    &display.icon,
+                    GROUP_TAB_ICON_PX,
+                    scale,
+                ),
                 icon: display.icon.into(),
                 label: display.label.into(),
                 selected: group.selected,
@@ -5110,15 +5271,22 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
             let display = derive_catalog_display(&node.label, CatalogDisplayKind::Node);
             UiCatalogNode {
                 id: node.id.clone().into(),
-                icon_image: emoji_images::image_for(&display.icon),
+                icon_image: catalog_icon_image(
+                    node.icon_id.as_deref(),
+                    &display.icon,
+                    ROUTE_ROW_ICON_PX,
+                    scale,
+                ),
                 icon: display.icon.into(),
                 label: display.label.into(),
                 selected: node.selected,
                 latency_text: node.latency_text.clone().into(),
                 latency_tone: node.latency_tone.clone().into(),
+                measuring: node.measuring,
             }
         })
         .collect::<Vec<_>>();
+    ui.set_catalog_dumb_mode(catalog.dumb_mode);
     ui.set_node_latency(catalog.exit_latency_text.clone().into());
     ui.set_catalog_groups(ModelRc::new(VecModel::from(groups)));
     ui.set_catalog_nodes(ModelRc::new(VecModel::from(nodes)));
@@ -5291,7 +5459,6 @@ mod window_tests {
             "h-grip := TouchArea",
             "corner-grip := TouchArea",
             "callback resize-drag(length, length);",
-            "Math.round(root.width / 1px) + \" × \" + Math.round(root.height / 1px)",
             "if root.has-profile && !root.subscription-unlimited: Rectangle {",
         ] {
             assert!(
@@ -5300,6 +5467,9 @@ mod window_tests {
             );
         }
         assert!(!popup.contains("width: 304px;\n    height: 460px;"));
+        // Resizing shows only the lit edges, never a size readout.
+        assert!(!popup.contains(" × "));
+        assert!(!popup.contains("size-label"));
         let rust = include_str!("main.rs");
         assert!(rust.contains("wire_tray_popup_resize("));
         assert!(rust.contains(".set_tray_popup_size(logical)"));
@@ -5732,18 +5902,21 @@ mod window_tests {
                     id: "group-a".into(),
                     label: "Primary".into(),
                     selected: true,
+                    icon_id: None,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "node-a-default".into(),
                             label: "Default".into(),
                             selected: true,
                             delay_ms: None,
+                            icon_id: None,
                         },
                         DaemonCatalogNode {
                             id: "node-a-saved".into(),
                             label: "Saved".into(),
                             selected: false,
                             delay_ms: None,
+                            icon_id: None,
                         },
                     ],
                 }],
