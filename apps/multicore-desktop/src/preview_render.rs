@@ -791,6 +791,12 @@ fn scenarios() -> Vec<Scenario> {
             connected(ui);
             ui.set_local_page(s("subscriptions"));
         }),
+        ("subscriptions-import-kept-connected", 840, 720, |ui| {
+            connected(ui);
+            ui.set_local_page(s("subscriptions"));
+            ui.set_subscription_profiles(profiles(3));
+            ui.set_import_notice(s(crate::view_model::IMPORT_KEPT_NOTICE_RU));
+        }),
         ("subscriptions-editor-error", 840, 720, |ui| {
             ready(ui);
             ui.set_local_page(s("subscriptions"));

@@ -1082,6 +1082,8 @@ export component AppWindow inherits Window {
     in property <string> traffic-up;
     in property <bool> import-pending: false;
     in property <string> import-error;
+    // Not an error: an import kept in the list while connected.
+    in property <string> import-notice;
     in property <string> subscription-title: "Подписка";
     // First letter of the subscription name, for the chip avatar without a logo.
     in property <string> subscription-initial: "П";
@@ -3771,6 +3773,15 @@ export component AppWindow inherits Window {
                             min-height: 24px;
                             text: root.import-error;
                             color: Theme.error;
+                            font-size: Theme.type-metadata-size;
+                            wrap: word-wrap;
+                            accessible-role: text;
+                            accessible-live-region: polite;
+                        }
+                        if root.import-notice != "" && root.import-error == "" && !root.replace-editor-open: Text {
+                            min-height: 24px;
+                            text: root.import-notice;
+                            color: Theme.text-secondary;
                             font-size: Theme.type-metadata-size;
                             wrap: word-wrap;
                             accessible-role: text;
