@@ -80,6 +80,10 @@ Accept: image/png, image/jpeg, image/webp, image/svg+xml
 
 Identity headers are deliberately omitted from logo requests. Redirects are disabled. Only HTTPS logo URLs resolving exclusively to global addresses are accepted; the result is bounded, decoded, normalized, and cached as PNG.
 
+### Group icons
+
+A Mihomo `proxy-groups` entry may name an image in `icon:` (an absolute HTTPS URL; PNG, JPEG, WebP or SVG). On each subscription refresh MultiCore downloads up to 32 distinct icon URLs with the same rules as the service logo (`multicore-group-icon` user agent, no identity headers, no redirects, global addresses only, 512 KiB source limit, 12 s per icon, 20 s for all icons together), normalizes each to a PNG of at most 128 px and keeps it with the subscription, so launching the app never refetches them. The icon replaces the group's emoji or fallback glyph in the group tabs, the tray and wherever that group appears as a route (for example an automatic group inside the main selector). An icon that fails to download keeps its previous copy; a missing or invalid icon falls back to the emoji or glyph. Emoji at the start of a group name keep working as before.
+
 ## Accepted response metadata
 
 Metadata may be returned on the successful combined response. In fallback mode, fields are merged independently: the first valid Mihomo value wins, and only a missing/invalid field falls back to Xray.
@@ -96,10 +100,11 @@ Metadata may be returned on the successful combined response. In fallback mode, 
 | Announcement target | `announce-url`, then `sub-info-button-link`, then `banner-button-url` | `http`, `https`, or `tg`; bounded, with no embedded credentials. |
 | Announcement label | `sub-info-button-text`, then `banner-button-text` | Sanitized plain text, maximum 32 characters. |
 | Announcement tone | `sub-info-color` | Only `blue`, `green`, or `red`, mapped to semantic info/success/danger styling. |
+| Simplified routes (dumb mode) | `dumb-mode` or any name ending in `-dumb-mode` (for example `flclashx-dumb-mode`) | `on`/`off` (also `true`/`false`, `yes`/`no`, `1`/`0`), case-insensitive; default `off`. When `on`, the home screen and the tray show no group tabs and only the first `proxy-groups` entry of the Mihomo config (its nodes, selection and latency). Every other group keeps working in the core; it is only not shown. Saved with the subscription and re-read on each refresh. |
 
 Unknown metadata headers are ignored. Generalized vendor prefixes apply only to
-`servicename`, `servicelogo`, and the already supported `subscription-userinfo`
-suffix. A bare `servicelogo` header is not accepted: the name must contain a
+`servicename`, `servicelogo`, `dumb-mode`, and the already supported
+`subscription-userinfo` suffix. A bare `servicelogo` header is not accepted: the name must contain a
 non-empty vendor prefix followed by `-servicelogo`. Remote styling/behavior
 headers such as `flclashx-background`, `ajsdjddj-background`, widgets, settings,
 or routing overrides are intentionally not supported.
@@ -138,6 +143,7 @@ Profile-Update-Interval: 6
 MyProvider-ServiceLogo: https://cdn.example.com/logo.png
 Announce: Плановое обслуживание 20 сентября
 Sub-Info-Color: blue
+Dumb-Mode: off
 X-Multicore-Revision: revision-42
 Cache-Control: private, no-cache
 

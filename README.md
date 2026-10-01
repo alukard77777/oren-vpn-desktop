@@ -140,7 +140,11 @@ example `flclashx-servicelogo` or `ajsdjddj-servicelogo`. The vendor prefix must
 be non-empty; it is not a fixed allowlist. The value must be an HTTPS URL with a
 host and without embedded credentials. MultiCore fetches that URL with
 `multicore-service-logo` and deliberately omits the configuration identity
-headers. A
+headers. Mihomo `proxy-groups` entries may name an HTTPS image in `icon:`;
+those group icons are fetched the same way (`multicore-group-icon`) on each
+refresh and kept with the subscription. A `dumb-mode: on` header (or
+`<vendor>-dumb-mode`) makes the app show only the first proxy group, without
+group tabs. A
 successful HTTP response to `multicore-json-massive` is authoritative: parsing
 failure is reported and does not fall back. Only an unavailable or explicitly
 unsupported massive response triggers the atomic Mihomo + Xray fallback pair.
