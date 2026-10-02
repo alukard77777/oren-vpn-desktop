@@ -13,7 +13,7 @@ msgstr ""
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgid "Выбран провайдером подписки"
-msgstr "Set by your subscription provider"
+msgstr "Set by your provider"
 
 # Slint interface (ui/*.slint)
 
