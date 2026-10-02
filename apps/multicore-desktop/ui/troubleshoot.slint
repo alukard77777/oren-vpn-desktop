@@ -1,0 +1,632 @@
+// «Устранить неполадки»: a check run with step labels, result cards, confirmed fixes and the
+// two separate repair actions. Every destructive fix is a ticked box or a second click.
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { PrimaryAction } from "components.slint";
+
+export struct UiTroubleshootCard {
+    // "error" | "warning" | "info" | "success"
+    tone: string,
+    title: string,
+    detail: string,
+}
+
+export struct UiTroubleshootFix {
+    id: string,
+    title: string,
+    detail: string,
+    needs-admin: bool,
+    needs-reboot: bool,
+    checked: bool,
+}
+
+export struct UiTroubleshootStep {
+    label: string,
+    // "done" | "active" | "pending"
+    state: string,
+}
+
+component Caption inherits Text {
+    color: Theme.text-muted;
+    font-family: Theme.font-family;
+    font-size: 11px;
+    font-weight: Theme.weight-semibold;
+    letter-spacing: 0.6px;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+// Rounded icon tile tinted by tone.
+component ToneTile inherits Rectangle {
+    in property <string> tone;
+    in property <length> size: 28px;
+    width: root.size;
+    height: root.size;
+    border-radius: root.size * 0.3;
+    background: root.tone == "error" ? #f06a6a1f
+        : root.tone == "warning" ? #e7aa451f
+        : root.tone == "success" ? #3ccb7f1f
+        : #4c9dff1f;
+    Image {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: root.size * 0.57;
+        height: self.width;
+        source: root.tone == "error" ? @image-url("../assets/octagon-alert.svg")
+            : root.tone == "warning" ? @image-url("../assets/triangle-alert.svg")
+            : root.tone == "success" ? @image-url("../assets/circle-check.svg")
+            : @image-url("../assets/info.svg");
+        colorize: root.tone == "error" ? Theme.error
+            : root.tone == "warning" ? Theme.warning
+            : root.tone == "success" ? Theme.accent-green
+            : Theme.accent-blue;
+        image-fit: contain;
+        accessible-role: none;
+    }
+}
+
+// Quiet text button: tinted label, no chrome, ring on focus.
+component LinkAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    // "accent" | "danger" | "neutral"
+    in property <string> tone: "accent";
+    callback activated();
+
+    property <color> tint: !root.enabled ? Theme.text-muted
+        : root.tone == "danger" ? (touch.has-hover ? #ff8a8a : Theme.error)
+        : root.tone == "neutral" ? (touch.has-hover ? Theme.text-primary : Theme.text-secondary)
+        : (touch.has-hover ? Theme.accent-blue-hover : Theme.accent-blue);
+    min-width: label-text.preferred-width + 12px;
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    height: 32px;
+    border-radius: 6px;
+    background: touch.pressed && root.enabled ? #ffffff0d : transparent;
+    border-color: Theme.focus;
+    border-width: focus.has-focus ? Theme.focus-width : 0px;
+    opacity: root.enabled ? 1 : 0.6;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    label-text := Text {
+        x: 6px;
+        width: parent.width - 12px;
+        height: parent.height;
+        text: root.label;
+        color: root.tint;
+        font-family: Theme.font-family;
+        font-size: 13px;
+        font-weight: root.tone == "neutral" ? Theme.weight-medium : Theme.weight-semibold;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+        animate color { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+    }
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea { enabled: root.enabled; clicked => { root.activated(); } }
+    }
+}
+
+// One result card row inside a grouped list.
+component ResultRow inherits Rectangle {
+    in property <UiTroubleshootCard> card;
+    in property <bool> show-separator: false;
+    height: Math.max(52px, body.preferred-height + 22px);
+    background: transparent;
+    accessible-role: text;
+    accessible-label: (root.card.tone == "error" ? "Ошибка: " : root.card.tone == "warning" ? "Предупреждение: " : "") + root.card.title + ". " + root.card.detail;
+    ToneTile { x: 0; y: 12px; tone: root.card.tone; }
+    body := VerticalLayout {
+        x: 42px;
+        y: 11px;
+        width: parent.width - self.x;
+        height: self.preferred-height;
+        spacing: 2px;
+        Text { text: root.card.title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; wrap: word-wrap; accessible-role: none; }
+        if root.card.detail != "": Text { text: root.card.detail; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; accessible-role: none; }
+    }
+    if root.show-separator: Rectangle { x: 42px; y: parent.height - 1px; width: parent.width - 42px; height: 1px; background: #ffffff0f; }
+}
+
+// A fix the user may tick.
+component FixRow inherits Rectangle {
+    in property <UiTroubleshootFix> fix;
+    in property <bool> enabled: true;
+    in property <bool> show-separator: false;
+    callback toggled();
+    height: Math.max(56px, body.preferred-height + 22px);
+    background: touch.has-hover && root.enabled ? #ffffff05 : transparent;
+    border-color: Theme.focus;
+    border-width: focus.has-focus ? Theme.focus-width : 0px;
+    accessible-role: checkbox;
+    accessible-label: root.fix.title;
+    accessible-description: root.fix.detail;
+    accessible-checked: root.fix.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.toggled(); } }
+    animate background { duration: 140ms; easing: ease-out; }
+
+    box := Rectangle {
+        x: 4px;
+        y: 14px;
+        width: 20px;
+        height: 20px;
+        border-radius: 6px;
+        background: root.fix.checked ? Theme.accent-blue : transparent;
+        border-color: root.fix.checked ? Theme.accent-blue : (touch.has-hover ? Theme.text-muted : #ffffff38);
+        border-width: 1.5px;
+        opacity: root.enabled ? 1 : 0.5;
+        animate background, border-color { duration: 140ms; easing: ease-out; }
+        if root.fix.checked: Path {
+            x: 4px;
+            y: 5px;
+            width: 12px;
+            height: 10px;
+            viewbox-width: 12;
+            viewbox-height: 10;
+            commands: "M 1 5 L 4.5 8.5 L 11 1.5";
+            stroke: #ffffff;
+            stroke-width: 2px;
+            fill: transparent;
+        }
+    }
+    body := VerticalLayout {
+        x: 42px;
+        y: 11px;
+        width: parent.width - self.x;
+        height: self.preferred-height;
+        spacing: 2px;
+        Text { text: root.fix.title; color: root.enabled ? Theme.text-primary : Theme.text-secondary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; wrap: word-wrap; accessible-role: none; }
+        Text { text: root.fix.detail; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; accessible-role: none; }
+        if root.fix.needs-admin || root.fix.needs-reboot: HorizontalLayout {
+            padding-top: 4px;
+            spacing: 6px;
+            alignment: start;
+            if root.fix.needs-admin: Rectangle {
+                height: 20px;
+                width: admin-label.preferred-width + 14px;
+                border-radius: 6px;
+                background: Theme.elevated;
+                admin-label := Text { x: 7px; height: parent.height; text: "Права администратора"; color: Theme.text-secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+            }
+            if root.fix.needs-reboot: Rectangle {
+                height: 20px;
+                width: reboot-label.preferred-width + 14px;
+                border-radius: 6px;
+                background: #e7aa451f;
+                reboot-label := Text { x: 7px; height: parent.height; text: "Нужна перезагрузка"; color: Theme.warning; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+            }
+        }
+    }
+    if root.show-separator: Rectangle { x: 42px; y: parent.height - 1px; width: parent.width - 42px; height: 1px; background: #ffffff0f; }
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.toggled();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.toggled(); } }
+    }
+}
+
+// A separate repair action with an inline second-click confirmation.
+component RepairRow inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    in property <string> confirm-text;
+    in property <string> action-label;
+    in property <string> confirm-label;
+    in property <bool> confirming: false;
+    in property <bool> busy: false;
+    in property <bool> enabled: true;
+    in property <bool> show-separator: false;
+    callback ask();
+    callback confirm();
+    callback cancel();
+    height: Math.max(60px, row.preferred-height);
+    background: transparent;
+    row := HorizontalLayout {
+        padding-top: 11px;
+        padding-bottom: 11px;
+        spacing: 12px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text { text: root.title; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; wrap: word-wrap; }
+            Text {
+                text: root.confirming ? root.confirm-text : root.detail;
+                color: root.confirming ? Theme.warning : Theme.text-muted;
+                font-size: Theme.type-metadata-size;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                spacing: 2px;
+                if !root.confirming: LinkAction {
+                    label: root.busy ? "Выполняем…" : root.action-label;
+                    enabled: root.enabled && !root.busy;
+                    activated => { root.ask(); }
+                }
+                if root.confirming: LinkAction {
+                    label: "Отмена";
+                    tone: "neutral";
+                    activated => { root.cancel(); }
+                }
+                if root.confirming: LinkAction {
+                    label: root.confirm-label;
+                    tone: "danger";
+                    enabled: root.enabled;
+                    activated => { root.confirm(); }
+                }
+            }
+        }
+    }
+    if root.show-separator: Rectangle { y: parent.height - 1px; width: parent.width + 16px; height: 1px; background: #ffffff0f; }
+}
+
+component GroupCard inherits Rectangle {
+    in property <color> outline: #ffffff0a;
+    background: Theme.surface;
+    border-color: root.outline;
+    border-width: 1px;
+    border-radius: 14px;
+    clip: true;
+}
+
+export component TroubleshootPage inherits Rectangle {
+    // "start" | "running" | "results" | "fixing"
+    in property <string> phase: "start";
+    in property <[UiTroubleshootStep]> steps;
+    in property <int> step-index: 0;
+    in property <[UiTroubleshootCard]> cards;
+    in property <[UiTroubleshootFix]> fixes;
+    // Ticked fixes (kept by the host, which owns the list).
+    in property <int> checked-count: 0;
+    in property <[UiTroubleshootCard]> fix-results;
+    in property <string> summary-tone: "success";
+    in property <string> summary-title;
+    in property <string> summary-detail;
+    in property <bool> reboot-recommended: false;
+    in property <string> error-text;
+    // A connection is up (or starting): checks and fixes would disturb it.
+    in property <bool> connected: false;
+    in property <bool> windows: true;
+    in property <bool> service-reinstall-available: false;
+    // "" | "wintun" | "service": a separate action is running.
+    in property <string> repair-busy;
+    in property <bool> reduced-motion: false;
+    in-out property <string> repair-confirm;
+
+    callback back();
+    callback begin-run();
+    callback toggle-fix(int);
+    callback apply-fixes();
+    callback repair(string);
+    callback retry-connect();
+
+    private property <bool> busy: root.phase == "running" || root.phase == "fixing" || root.repair-busy != "";
+    private property <float> progress: root.steps.length == 0 ? 0 : Math.min(1, (root.step-index + (root.phase == "running" ? 0.5 : 1)) / root.steps.length);
+
+    background: transparent;
+
+    scroll := ScrollView {
+        content := VerticalLayout {
+            width: scroll.visible-width;
+            min-height: scroll.visible-height;
+            padding-left: 28px;
+            padding-right: 28px;
+            padding-top: 14px;
+            padding-bottom: 24px;
+            spacing: 0px;
+
+            HorizontalLayout {
+                height: 30px;
+                alignment: start;
+                LinkAction { label: "‹ Назад"; tone: "neutral"; enabled: !root.busy; activated => { root.back(); } }
+            }
+            Text { height: 36px; text: "Устранение неполадок"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; }
+            Text {
+                text: "Проверим, что на этом компьютере может мешать VPN, и поможем это исправить.";
+                color: Theme.text-muted;
+                font-size: Theme.type-metadata-size;
+                wrap: word-wrap;
+            }
+            Rectangle { height: 16px; background: transparent; }
+
+            // ---- Start -------------------------------------------------------------------
+            if root.phase == "start": GroupCard {
+                height: start-body.preferred-height;
+                outline: #4c9dff40;
+                start-body := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        spacing: 14px;
+                        ToneTile { tone: "info"; size: 36px; }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 3px;
+                            alignment: center;
+                            Text { text: "Что проверим"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                            Text {
+                                text: root.windows
+                                    ? "Антивирусы, программы обхода блокировок, занятые порты, системный прокси, другие VPN, Drover для Discord, файл hosts, групповые политики, время и DNS."
+                                    : "Прокси в переменных окружения, файл hosts и системное время.";
+                                color: Theme.text-secondary;
+                                font-size: Theme.type-metadata-size;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.windows
+                            ? "Сами по ходу проверки мы только отключим сторонний системный прокси и очистим DNS-кэш. Всё остальное — лишь то, что вы отметите."
+                            : "Проверка ничего не меняет в системе.";
+                        color: Theme.text-muted;
+                        font-size: Theme.type-metadata-size;
+                        wrap: word-wrap;
+                    }
+                    if root.connected: Text { text: "Сначала отключитесь: проверка меняет сетевые настройки."; color: Theme.warning; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                    if root.error-text != "": Text { text: root.error-text; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                    HorizontalLayout {
+                        alignment: start;
+                        PrimaryAction {
+                            width: 184px;
+                            label: "Начать проверку";
+                            enabled: !root.connected && !root.busy;
+                            activated => { root.begin-run(); }
+                        }
+                    }
+                }
+            }
+
+            // ---- Running -----------------------------------------------------------------
+            if root.phase == "running": GroupCard {
+                height: run-body.preferred-height;
+                outline: #4c9dff40;
+                run-body := VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            horizontal-stretch: 1;
+                            text: root.step-index < root.steps.length ? root.steps[root.step-index].label : "Готово";
+                            color: Theme.text-primary;
+                            font-size: Theme.type-label-size;
+                            font-weight: Theme.weight-semibold;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: Math.min(root.step-index + 1, root.steps.length) + " из " + root.steps.length;
+                            color: Theme.text-muted;
+                            font-size: Theme.type-metadata-size;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.line;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * root.progress;
+                            height: parent.height;
+                            border-radius: 2px;
+                            background: Theme.accent-blue;
+                            animate width { duration: root.reduced-motion ? 0ms : 320ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 0px;
+                        for step in root.steps: HorizontalLayout {
+                            height: 26px;
+                            spacing: 10px;
+                            Rectangle {
+                                width: 16px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 16px;
+                                        height: 16px;
+                                        border-radius: 8px;
+                                        background: step.state == "done" ? #3ccb7f24 : transparent;
+                                        border-color: step.state == "active" ? Theme.accent-blue : step.state == "pending" ? #ffffff24 : transparent;
+                                        border-width: step.state == "done" ? 0px : 1.5px;
+                                        if step.state == "done": Image { x: 2px; y: 2px; width: 12px; height: 12px; source: @image-url("../assets/circle-check.svg"); colorize: Theme.accent-green; image-fit: contain; }
+                                        if step.state == "active": Rectangle { x: 4px; y: 4px; width: 8px; height: 8px; border-radius: 4px; background: Theme.accent-blue; }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: step.label;
+                                color: step.state == "pending" ? Theme.text-muted : step.state == "active" ? Theme.text-primary : Theme.text-secondary;
+                                font-size: Theme.type-metadata-size;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Results -----------------------------------------------------------------
+            if root.phase == "results" || root.phase == "fixing": VerticalLayout {
+                spacing: 0px;
+                GroupCard {
+                    height: summary-row.preferred-height;
+                    outline: root.summary-tone == "error" ? #f06a6a59 : root.summary-tone == "warning" ? #e7aa4559 : #3ccb7f59;
+                    summary-row := HorizontalLayout {
+                        padding: 16px;
+                        spacing: 14px;
+                        ToneTile { tone: root.summary-tone; size: 36px; }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 2px;
+                            Text { text: root.summary-title; color: Theme.text-primary; font-size: 16px; font-weight: Theme.weight-semibold; wrap: word-wrap; }
+                            Text { text: root.summary-detail; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                        }
+                    }
+                }
+
+                if root.cards.length > 0: VerticalLayout {
+                    Rectangle { height: 18px; background: transparent; }
+                    HorizontalLayout { height: 22px; padding-left: 4px; Caption { text: "ЧТО НАШЛИ"; } }
+                    GroupCard {
+                        height: cards-list.preferred-height;
+                        cards-list := VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            for card[index] in root.cards: ResultRow { card: card; show-separator: index < root.cards.length - 1; }
+                        }
+                    }
+                }
+
+                if root.fixes.length > 0: VerticalLayout {
+                    Rectangle { height: 18px; background: transparent; }
+                    HorizontalLayout { height: 22px; padding-left: 4px; Caption { text: root.summary-tone == "success" ? "ЕСЛИ ВСЁ РАВНО НЕ РАБОТАЕТ" : "ИСПРАВЛЕНИЯ — ОТМЕТЬТЕ НУЖНЫЕ"; } }
+                    GroupCard {
+                        height: fixes-list.preferred-height;
+                        fixes-list := VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 16px;
+                            for fix[index] in root.fixes: FixRow {
+                                fix: fix;
+                                enabled: !root.busy;
+                                show-separator: index < root.fixes.length - 1;
+                                toggled => { root.toggle-fix(index); }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-top: 10px;
+                        spacing: 12px;
+                        PrimaryAction {
+                            width: 220px;
+                            label: root.phase == "fixing" ? "Исправляем…"
+                                : root.checked-count == 0 ? "Отметьте исправления"
+                                : "Исправить выбранное (" + root.checked-count + ")";
+                            enabled: root.checked-count > 0 && !root.busy;
+                            activated => { root.apply-fixes(); }
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "Без вашей отметки ничего не меняется. Для пунктов с правами администратора Windows может спросить разрешение.";
+                            color: Theme.text-muted;
+                            font-size: Theme.type-metadata-size;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                if root.error-text != "": HorizontalLayout { padding-left: 4px; padding-top: 8px; Text { text: root.error-text; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; } }
+            }
+
+            if root.fix-results.length > 0 && root.phase != "running": VerticalLayout {
+                Rectangle { height: 18px; background: transparent; }
+                HorizontalLayout { height: 22px; padding-left: 4px; Caption { text: "РЕЗУЛЬТАТ ИСПРАВЛЕНИЙ"; } }
+                GroupCard {
+                    height: fix-results-list.preferred-height;
+                    fix-results-list := VerticalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        for card[index] in root.fix-results: ResultRow { card: card; show-separator: index < root.fix-results.length - 1; }
+                    }
+                }
+                if root.reboot-recommended: HorizontalLayout {
+                    padding-left: 4px;
+                    padding-top: 6px;
+                    Text { text: "Перезагрузите ПК, чтобы изменения вступили в силу."; color: Theme.warning; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                }
+            }
+
+            // ---- Separate actions (Windows) -------------------------------------------------
+            if root.windows && root.phase != "running": VerticalLayout {
+                Rectangle { height: 18px; background: transparent; }
+                HorizontalLayout { height: 22px; padding-left: 4px; Caption { text: "ОТДЕЛЬНЫЕ ДЕЙСТВИЯ"; } }
+                GroupCard {
+                    height: repairs.preferred-height;
+                    repairs := VerticalLayout {
+                        padding-left: 16px;
+                        padding-right: 10px;
+                        RepairRow {
+                            title: "Переустановить Wintun";
+                            detail: "Удалит сетевой адаптер MULTICORE — при следующем подключении он создастся заново.";
+                            confirm-text: "Понадобятся права администратора. Другие VPN и драйвер Wintun не затронутся.";
+                            action-label: "Переустановить";
+                            confirm-label: "Да, переустановить";
+                            confirming: root.repair-confirm == "wintun";
+                            busy: root.repair-busy == "wintun";
+                            enabled: !root.busy && !root.connected;
+                            show-separator: root.service-reinstall-available;
+                            ask => { root.repair-confirm = "wintun"; }
+                            cancel => { root.repair-confirm = ""; }
+                            confirm => { root.repair-confirm = ""; root.repair("wintun"); }
+                        }
+                        if root.service-reinstall-available: RepairRow {
+                            title: "Переустановить службу";
+                            detail: "Заново зарегистрирует и запустит службу MULTICORE из установленных файлов.";
+                            confirm-text: "Служба перезапустится. Понадобятся права администратора.";
+                            action-label: "Переустановить";
+                            confirm-label: "Да, переустановить";
+                            confirming: root.repair-confirm == "service";
+                            busy: root.repair-busy == "service";
+                            enabled: !root.busy && !root.connected;
+                            ask => { root.repair-confirm = "service"; }
+                            cancel => { root.repair-confirm = ""; }
+                            confirm => { root.repair-confirm = ""; root.repair("service"); }
+                        }
+                    }
+                }
+            }
+
+            if root.phase == "results" || root.phase == "fixing": VerticalLayout {
+                Rectangle { height: 18px; background: transparent; }
+                Text {
+                    text: "Если не помогло — перезагрузите ПК. Расширения браузера вроде «Обход блокировок Рунета» тоже могут мешать VPN.";
+                    color: Theme.text-muted;
+                    font-size: Theme.type-metadata-size;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 14px; background: transparent; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    PrimaryAction {
+                        width: 220px;
+                        label: "Повторить подключение";
+                        enabled: !root.busy && !root.connected;
+                        activated => { root.retry-connect(); }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        LinkAction { label: "Проверить снова"; enabled: !root.busy; activated => { root.begin-run(); } }
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; background: transparent; }
+        }
+    }
+}

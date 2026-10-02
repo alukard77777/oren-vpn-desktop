@@ -1,8 +1,10 @@
 import { LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
+import { TroubleshootPage, UiTroubleshootCard, UiTroubleshootFix, UiTroubleshootStep } from "troubleshoot.slint";
 import "../assets/fonts/Twemoji.Mozilla.ttf";
 export { TrayPopup, TrayMenuRow } from "tray_popup.slint";
+export { UiTroubleshootCard, UiTroubleshootFix, UiTroubleshootStep } from "troubleshoot.slint";
 
 export struct UiEvent {
     timestamp: string,
@@ -1221,6 +1223,27 @@ export component AppWindow inherits Window {
     in property <string> deep-link-confirm-host;
     in-out property <string> deep-link-import-host;
     in-out property <int> deep-link-focus-serial: 0;
+    // «Устранить неполадки»: the home offer after a failed connect, and the page's run state
+    // (src/troubleshoot.rs keeps the run; ui/troubleshoot.slint draws it).
+    in property <bool> troubleshoot-offer-visible: false;
+    in-out property <bool> troubleshoot-offer-dismissed: false;
+    in property <string> troubleshoot-phase: "start";
+    in property <[UiTroubleshootStep]> troubleshoot-steps;
+    in property <int> troubleshoot-step-index: 0;
+    in property <[UiTroubleshootCard]> troubleshoot-cards;
+    in property <[UiTroubleshootFix]> troubleshoot-fixes;
+    in property <int> troubleshoot-checked-count: 0;
+    in property <[UiTroubleshootCard]> troubleshoot-fix-results;
+    in property <string> troubleshoot-summary-tone: "success";
+    in property <string> troubleshoot-summary-title;
+    in property <string> troubleshoot-summary-detail;
+    in property <bool> troubleshoot-reboot: false;
+    in property <string> troubleshoot-error;
+    in property <bool> troubleshoot-windows: true;
+    in property <bool> troubleshoot-service-reinstall: false;
+    in property <string> troubleshoot-repair-busy;
+    in-out property <string> troubleshoot-repair-confirm;
+    in-out property <string> troubleshoot-return-page: "home";
 
     in-out property <string> local-page: "home";
     in-out property <string> settings-section: "general";
@@ -1358,6 +1381,23 @@ export component AppWindow inherits Window {
     in property <bool> conflicting-apps-closing: false;
     callback confirm-deep-link();
     callback cancel-deep-link();
+    callback troubleshoot-start();
+    callback troubleshoot-toggle-fix(int);
+    callback troubleshoot-apply();
+    callback troubleshoot-repair(string);
+    callback troubleshoot-retry-connect();
+    function open-troubleshoot(from: string) {
+        root.troubleshoot-return-page = from;
+        root.troubleshoot-repair-confirm = "";
+        root.close-panel();
+        root.local-page = "troubleshoot";
+    }
+    // A new failure offers troubleshooting again even after «Скрыть».
+    changed troubleshoot-offer-visible => {
+        if (!root.troubleshoot-offer-visible) {
+            root.troubleshoot-offer-dismissed = false;
+        }
+    }
 
     routes-enter := Timer {
         interval: 16ms;
@@ -2542,6 +2582,63 @@ export component AppWindow inherits Window {
                         }
                     }
 
+                    // A failed connect whose cause we cannot name: offer troubleshooting.
+                    if root.troubleshoot-offer-visible && !root.troubleshoot-offer-dismissed: troubleshoot-banner := Rectangle {
+                        height: Math.max(72px, troubleshoot-title.preferred-height + troubleshoot-copy.preferred-height + 30px);
+                        background: transparent;
+                        Rectangle {
+                            width: parent.width;
+                            height: parent.height;
+                            background: Theme.surface;
+                            border-color: #4c9dff47;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            clip: true;
+                            HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 12px;
+                                padding-top: 14px;
+                                padding-bottom: 14px;
+                                spacing: 14px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 32px;
+                                        height: 32px;
+                                        border-radius: 9px;
+                                        background: Theme.elevated;
+                                        Image { x: 7px; y: 7px; width: 18px; height: 18px; source: @image-url("../assets/shield-alert.svg"); colorize: Theme.accent-blue; image-fit: contain; accessible-role: none; }
+                                    }
+                                }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    preferred-width: 0px;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    troubleshoot-title := Text { text: "Не получается подключиться?"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                                    troubleshoot-copy := Text { text: "Проверим антивирусы, прокси, программы обхода блокировок и другое, что мешает VPN."; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        BannerAction {
+                                            primary: true;
+                                            label: "Устранить неполадки";
+                                            enabled: !root.profile-menu-open;
+                                            activated => { root.open-troubleshoot("home"); }
+                                        }
+                                        BannerAction {
+                                            label: "Скрыть";
+                                            enabled: !root.profile-menu-open;
+                                            activated => { root.troubleshoot-offer-dismissed = true; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // First run: logo, one grouped card of actions (paste, or type a link
                     // inline), a footnote and the three steps.
                     if !root.has-profile: first-run-stage := VerticalLayout {
@@ -3716,10 +3813,80 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                        Rectangle { height: 18px; background: transparent; }
+                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ПОМОЩЬ"; } }
+                        troubleshoot-card := Rectangle {
+                            opacity: root.page-entering ? 0 : 1;
+                            animate opacity { duration: 280ms; delay: 96ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            height: Math.max(60px, troubleshoot-row.preferred-height);
+                            background: Theme.surface;
+                            border-color: #ffffff0a;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            troubleshoot-row := HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 10px;
+                                padding-top: 11px;
+                                padding-bottom: 11px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text { text: "Устранить неполадки"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; overflow: elide; }
+                                    Text { text: "Если VPN не подключается: проверим антивирусы, прокси, порты и другое"; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    TextAction {
+                                        label: "Открыть";
+                                        enabled: !root.profile-menu-open;
+                                        activated => { root.open-troubleshoot("settings"); }
+                                    }
+                                }
+                            }
+                        }
                         if root.preference-error != "": HorizontalLayout { padding-left: 4px; padding-top: 10px; Text { min-height: 20px; text: root.preference-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; } }
                         Rectangle { vertical-stretch: 1; min-height: 24px; background: transparent; }
                         Text { height: 24px; text: root.runtime-versions; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; }
                     }
+                }
+            }
+
+            if root.visible-page == "troubleshoot": TroubleshootPage {
+                opacity: root.page-entering ? 0 : 1;
+                y: root.page-entering ? 6px : 0px;
+                animate opacity { duration: 180ms; easing: ease-out; }
+                animate y { duration: 220ms; easing: ease-out; }
+                phase: root.troubleshoot-phase;
+                steps: root.troubleshoot-steps;
+                step-index: root.troubleshoot-step-index;
+                cards: root.troubleshoot-cards;
+                fixes: root.troubleshoot-fixes;
+                checked-count: root.troubleshoot-checked-count;
+                fix-results: root.troubleshoot-fix-results;
+                summary-tone: root.troubleshoot-summary-tone;
+                summary-title: root.troubleshoot-summary-title;
+                summary-detail: root.troubleshoot-summary-detail;
+                reboot-recommended: root.troubleshoot-reboot;
+                error-text: root.troubleshoot-error;
+                connected: root.toggle-on || root.toggle-busy;
+                windows: root.troubleshoot-windows;
+                service-reinstall-available: root.troubleshoot-service-reinstall;
+                repair-busy: root.troubleshoot-repair-busy;
+                reduced-motion: root.reduced-motion;
+                repair-confirm <=> root.troubleshoot-repair-confirm;
+                back => {
+                    root.troubleshoot-repair-confirm = "";
+                    root.local-page = root.troubleshoot-return-page;
+                }
+                begin-run => { root.troubleshoot-start(); }
+                toggle-fix(index) => { root.troubleshoot-toggle-fix(index); }
+                apply-fixes => { root.troubleshoot-apply(); }
+                repair(kind) => { root.troubleshoot-repair(kind); }
+                retry-connect => {
+                    root.local-page = "home";
+                    root.troubleshoot-retry-connect();
                 }
             }
 
