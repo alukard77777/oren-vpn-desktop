@@ -422,7 +422,7 @@ mod tests {
         assert_eq!((current(), source()), (Lang::En, Source::Provider));
         assert_eq!(
             multicore_i18n::tr!("Выбран провайдером подписки"),
-            "Set by your subscription provider"
+            "Set by your provider"
         );
         assert!(!apply_provider_language(Some(Some(Lang::En))));
         assert!(!apply_provider_language(None));

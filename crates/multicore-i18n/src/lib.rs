@@ -426,6 +426,81 @@ mod tests {
         }
     }
 
+    /// English that may run longer than its Russian source (more than 10 % more characters):
+    /// short words with no shorter natural English, checked to fit their place in the
+    /// previews. Everything else must stay within the Russian length.
+    const LONGER_ENGLISH: &[&str] = &[
+        // «Подписка» / "Subscription": no shorter natural word.
+        "Подписка",
+        // Runtime-check states: one short word each.
+        "Запуск",
+        "Сбой",
+        // Tooltip suffix.
+        "до {}",
+        // Plural "{n} days" is one character over "{n} дн.".
+        "{n} дн.",
+        // Troubleshooting step label.
+        "Сеть и DNS…",
+    ];
+
+    fn chars(text: &str) -> usize {
+        text.chars().count()
+    }
+
+    #[test]
+    fn english_is_no_longer_than_russian() {
+        let limit = |russian: &str| chars(russian) * 11 / 10 + usize::from(chars(russian) < 10);
+        let mut long = Vec::new();
+        for (russian, english) in catalog_entries() {
+            if chars(english) > limit(russian) && !LONGER_ENGLISH.contains(&russian) {
+                long.push(format!("{russian:?} -> {english:?}"));
+            }
+        }
+        for ((_, russian), (one, other)) in catalog_plural_entries() {
+            for english in [one, other] {
+                if chars(english) > limit(russian) && !LONGER_ENGLISH.contains(&russian) {
+                    long.push(format!("{russian:?} -> {english:?}"));
+                }
+            }
+        }
+        assert!(
+            long.is_empty(),
+            "English longer than Russian (shorten it or list it in LONGER_ENGLISH):\n{}",
+            long.join("\n")
+        );
+        for russian in LONGER_ENGLISH {
+            assert!(
+                english(russian).is_some()
+                    || catalog_plural_entries().any(|((_, plural), _)| plural == *russian),
+                "stale LONGER_ENGLISH entry {russian:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholders_survive_translation() {
+        let placeholders = |text: &str| {
+            let mut found = text
+                .match_indices('{')
+                .filter_map(|(start, _)| {
+                    let rest = &text[start..];
+                    (!rest.starts_with("{{"))
+                        .then(|| rest.find('}').map(|end| rest[..=end].to_owned()))
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            found.sort();
+            found
+        };
+        for (russian, english) in catalog_entries() {
+            assert_eq!(
+                placeholders(russian),
+                placeholders(english),
+                "placeholders differ: {russian:?} -> {english:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_daemon_message_has_an_english_text() {
         for (code, template) in daemon_messages::ALL {
