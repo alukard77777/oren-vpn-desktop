@@ -511,9 +511,6 @@ msgstr "Protection off"
 msgid "Нет профиля"
 msgstr "No profile"
 
-msgid "Маршрут не выбран"
-msgstr "No route selected"
-
 msgid "Подключиться"
 msgstr "Connect"
 
@@ -795,9 +792,6 @@ msgstr "Hide"
 
 msgid "Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена"
 msgstr "Copy the link from your provider — we'll pick it up from the clipboard"
-
-msgid "Добавляем…"
-msgstr "Adding…"
 
 msgid "Вставить из буфера"
 msgstr "Paste link"
@@ -1180,12 +1174,6 @@ msgstr "selected"
 msgid "выбор применяется"
 msgstr "applying selection"
 
-msgid "Готово"
-msgstr "Ready"
-
-msgid "Подключиться"
-msgstr "Connect"
-
 msgid " · Не удалось обновить"
 msgstr " · Update failed"
 
@@ -1212,9 +1200,6 @@ msgstr "Admin rights"
 
 msgid "Нужна перезагрузка"
 msgstr "Restart needed"
-
-msgid "Проверяем…"
-msgstr "Checking…"
 
 msgid "Исправляем…"
 msgstr "Fixing…"
@@ -1260,9 +1245,6 @@ msgstr "{} of {}"
 
 msgid "РЕЗУЛЬТАТ ИСПРАВЛЕНИЙ"
 msgstr "FIX RESULTS"
-
-msgid "Перезагрузите ПК, чтобы изменения вступили в силу."
-msgstr "Restart your PC for the changes to take effect."
 
 msgid "ЧТО НАШЛИ"
 msgstr "FINDINGS"
@@ -1408,9 +1390,6 @@ msgstr "Expiry unknown"
 
 msgid "Срок истёк"
 msgstr "Expired"
-
-msgid "Бессрочно"
-msgstr "No expiry"
 
 msgid "Осталось {0} {1}"
 msgstr "{0} {1} left"
