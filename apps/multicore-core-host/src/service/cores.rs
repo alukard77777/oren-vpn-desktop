@@ -343,8 +343,10 @@ impl ProductionCores {
                     &format!(
                         "set_tun on timed out: patch {} ms, adapter up: {adapter_up}, Mihomo TUN on: {}",
                         (patched - cleaned).as_millis(),
-                        mihomo_rest::tun_enabled(port, secret)
-                            .map_or_else(|error| format!("{:?}", error.kind()), |on| on.to_string())
+                        mihomo_rest::tun_enabled(port, secret).map_or_else(
+                            |error| format!("{:?}", error.kind()),
+                            |on| on.to_string()
+                        )
                     ),
                 );
                 return Err(BrokerErrorCode::TimedOut);

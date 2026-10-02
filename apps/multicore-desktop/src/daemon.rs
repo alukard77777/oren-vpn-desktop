@@ -1121,13 +1121,9 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         "service_busy" => "MULTICORE уже запущен у другого пользователя.",
         // Why a Connect's cores did not start (the daemon's start-failure codes).
         "elevation_cancelled" => "Подключение отменено: не выдано разрешение администратора.",
-        "elevation_failed" => {
-            "Не удалось запустить службу подключения с правами администратора."
-        }
+        "elevation_failed" => "Не удалось запустить службу подключения с правами администратора.",
         "broker_failed" => "Служба подключения не ответила. Повторите попытку.",
-        "core_failed" => {
-            "Не удалось запустить ядро. Подробности — в логе на странице «Состояние»."
-        }
+        "core_failed" => "Не удалось запустить ядро. Подробности — в логе на странице «Состояние».",
         "core_missing" => {
             "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
         }
@@ -1676,7 +1672,9 @@ mod http_tests {
             });
             let client = HttpDaemonClient::new(format!("http://{address}"), "token")
                 .expect("loopback client");
-            let error = client.connect_with_tun(true).expect_err("cores did not start");
+            let error = client
+                .connect_with_tun(true)
+                .expect_err("cores did not start");
             server.join().expect("connect server");
             assert_eq!(error.to_string(), expected);
         }

@@ -5251,7 +5251,13 @@ async fn failed_core_log_tail<P: ProcessController + ?Sized>(
         .rev()
         .filter(|record| record.engine == engine)
         .take(FAILED_CORE_LOG_TAIL_LINES)
-        .map(|record| record.message.chars().take(FAILED_CORE_LOG_LINE_CHARS).collect())
+        .map(|record| {
+            record
+                .message
+                .chars()
+                .take(FAILED_CORE_LOG_LINE_CHARS)
+                .collect()
+        })
         .collect();
     tail.reverse();
     tail
