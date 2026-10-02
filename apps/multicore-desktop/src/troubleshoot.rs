@@ -347,16 +347,8 @@ mod tests {
 
     #[test]
     fn the_page_lives_under_settings_with_a_fixed_header_and_a_sticky_action_bar() {
-        let page = include_str!("../ui/troubleshoot.slint").replace(
-            "
-", "
-",
-        );
-        let app = include_str!("../ui/app.slint").replace(
-            "
-", "
-",
-        );
+        let page = include_str!("../ui/troubleshoot.slint").replace("\r\n", "\n");
+        let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // No «‹ Назад»: a breadcrumb to Settings, a status pill, «Проверить заново» and ✕.
         assert!(!page.contains("‹ Назад"));
         assert!(page.contains("text: \"Настройки\";"));

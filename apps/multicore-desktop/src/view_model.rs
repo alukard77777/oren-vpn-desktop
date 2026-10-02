@@ -8663,16 +8663,11 @@ mod tests {
         // Updates close the page, below help.
         assert!(connection < app && app < help && help < updates);
         // Status page rhythm: a 16px caption row, the card 8px below, 20px between sections.
-        let settings_lf = settings.replace(
-            "
-", "
-",
-        );
+        let settings_lf = settings.replace("\r\n", "\n");
         for caption in ["ПОДКЛЮЧЕНИЕ", "ПРИЛОЖЕНИЕ", "ПОМОЩЬ", "ОБНОВЛЕНИЯ"]
         {
             assert!(settings_lf.contains(&format!(
-                "HorizontalLayout {{ height: 16px; padding-left: 4px; SectionCaption {{ text: \"{caption}\"; }} }}
-                        Rectangle {{ height: 8px; background: transparent; }}"
+                "HorizontalLayout {{ height: 16px; padding-left: 4px; SectionCaption {{ text: \"{caption}\"; }} }}\n                        Rectangle {{ height: 8px; background: transparent; }}"
             )), "{caption}");
         }
         assert!(!settings.contains("height: 22px; padding-left: 4px; SectionCaption"));
