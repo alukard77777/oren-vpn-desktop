@@ -292,7 +292,7 @@ pub struct DaemonEventBatch {
     pub events: Vec<DaemonEvent>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DaemonDiagnosticLog {
     pub id: u64,
     #[serde(default)]
@@ -305,7 +305,7 @@ pub struct DaemonDiagnosticLog {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DaemonProxyMapping {
     #[serde(default)]
     pub proxy_name: String,
@@ -315,7 +315,7 @@ pub struct DaemonProxyMapping {
     pub xray_label: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DaemonDiagnostics {
     #[serde(default)]
     pub xray: String,

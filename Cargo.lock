@@ -3408,6 +3408,7 @@ dependencies = [
 name = "multicore-desktop"
 version = "1.1.2"
 dependencies = [
+ "chrono",
  "copypasta",
  "embed-resource",
  "getrandom 0.4.3",
@@ -3431,6 +3432,7 @@ dependencies = [
  "webbrowser",
  "windows-sys 0.61.2",
  "x11rb",
+ "zip",
 ]
 
 [[package]]

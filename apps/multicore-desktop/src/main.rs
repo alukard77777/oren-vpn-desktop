@@ -14,11 +14,13 @@ mod layout_shortcuts;
 mod linux_display;
 #[cfg(all(test, target_os = "linux"))]
 mod linux_shell_tests;
+mod log_bundle;
 mod logo_cache;
 mod preferences;
 #[cfg(all(test, feature = "preview-render"))]
 mod preview_render;
 mod renderer_fallback;
+mod save_dialog;
 mod service_install;
 mod service_logo;
 mod single_instance;
@@ -799,6 +801,7 @@ fn main() -> Result<(), slint::PlatformError> {
 }
 
 fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
+    log_bundle::note_app_start();
     multicore_core::ensure_crypto_provider_installed();
     #[cfg(target_os = "linux")]
     linux_display::prefer_desktop_scale();
@@ -971,6 +974,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_copy_diagnostics(&ui, model.clone());
+    wire_save_diagnostics(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
     wire_route_search(&ui, model.clone());
@@ -4250,19 +4254,7 @@ fn wire_copy_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
 }
 
 fn copy_diagnostics_now(weak: &slint::Weak<AppWindow>, model: &Arc<Mutex<DesktopViewModel>>) {
-    let mut text = model
-        .lock()
-        .expect("view model lock")
-        .diagnostics_export_text();
-    // Failures in the desktop-to-local-daemon HTTP call itself (couldn't
-    // connect, response didn't parse, ...) never produce a daemon-side
-    // event - the daemon has no way to know its own response failed to
-    // reach or decode here. Fold in the raw low-level log so this export
-    // still carries real diagnostic signal for exactly that case.
-    if let Some(low_level) = daemon::read_low_level_log() {
-        text.push_str("\n\n--- low-level ---\n");
-        text.push_str(&low_level);
-    }
+    let text = diagnostics_export(model);
     let Some(ui) = weak.upgrade() else {
         return;
     };
@@ -4276,6 +4268,143 @@ fn copy_diagnostics_now(weak: &slint::Weak<AppWindow>, model: &Arc<Mutex<Desktop
             ui.set_diagnostics_copied(false);
         }
     });
+}
+
+/// What «Копировать лог» copies (and `diagnostics.txt` in a saved archive): every known event,
+/// newest first, plus the low-level log of failed daemon calls.
+fn diagnostics_export(model: &Arc<Mutex<DesktopViewModel>>) -> String {
+    let mut text = model
+        .lock()
+        .expect("view model lock")
+        .diagnostics_export_text();
+    // Failures in the desktop-to-local-daemon HTTP call itself (couldn't
+    // connect, response didn't parse, ...) never produce a daemon-side
+    // event - the daemon has no way to know its own response failed to
+    // reach or decode here. Fold in the raw low-level log so this export
+    // still carries real diagnostic signal for exactly that case.
+    if let Some(low_level) = daemon::read_low_level_log() {
+        text.push_str("\n\n--- low-level ---\n");
+        text.push_str(&low_level);
+    }
+    text
+}
+
+/// «Сохранить лог…»: asks where to save, then writes the diagnostics archive (see
+/// `log_bundle`). The label reports «Сохраняем…», then «Сохранено ✓» or «Не сохранено».
+fn wire_save_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+    let weak = ui.as_weak();
+    ui.on_save_diagnostics(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if IN_PROGRESS.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (service_mode, cores_ready) = {
+            let model = model.lock().expect("view model lock");
+            (model.service_mode(), model.cores_ready())
+        };
+        let facts = log_bundle::UiFacts {
+            scale_factor: ui.window().scale_factor(),
+            connection: ui.get_toggle_title().to_string(),
+            service_mode,
+            cores_ready,
+            tun_enabled: ui.get_tun_enabled(),
+            session_uptime: ui.get_session_uptime().to_string(),
+        };
+        let owner = save_dialog::OwnerWindow::of(ui.window());
+        let (weak, model) = (weak.clone(), model.clone());
+        thread::spawn(move || {
+            let outcome = save_diagnostics_archive(&weak, &model, owner, &facts);
+            IN_PROGRESS.store(false, Ordering::Release);
+            if let Some(Err(error)) = &outcome {
+                daemon::record_low_level("diagnostics_archive_failed", error);
+            }
+            let state = match outcome {
+                None => return,
+                Some(Ok(false)) => "saved",
+                Some(Ok(true)) => "saved-downloads",
+                Some(Err(_)) => "failed",
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else {
+                    return;
+                };
+                ui.set_diagnostics_save_state(state.into());
+                let reset = weak.clone();
+                Timer::single_shot(Duration::from_secs(3), move || {
+                    if let Some(ui) = reset.upgrade()
+                        && ui.get_diagnostics_save_state() == state
+                    {
+                        ui.set_diagnostics_save_state("".into());
+                    }
+                });
+            });
+        });
+    });
+}
+
+/// The worker half of «Сохранить лог…». `None` when the user cancelled the dialog; otherwise
+/// whether the archive went to the Downloads fallback, or why it could not be written.
+fn save_diagnostics_archive(
+    weak: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    owner: save_dialog::OwnerWindow,
+    facts: &log_bundle::UiFacts,
+) -> Option<Result<bool, String>> {
+    let name = log_bundle::default_file_name(chrono::Local::now());
+    let (path, fallback) = match save_dialog::choose(owner, &name) {
+        Ok(save_dialog::SaveTarget::Chosen(path)) => (path, false),
+        Ok(save_dialog::SaveTarget::Fallback(path)) => (path, true),
+        Ok(save_dialog::SaveTarget::Cancelled) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let saving = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = saving.upgrade() {
+            ui.set_diagnostics_save_state("saving".into());
+        }
+    });
+    // Like «Копировать лог»: pull the newest events first.
+    let request = model
+        .lock()
+        .expect("view model lock")
+        .begin_events_request();
+    if let Some(request) = request {
+        let result = request
+            .client
+            .events(request.after, request.known_epoch.as_deref());
+        let events = model
+            .lock()
+            .expect("view model lock")
+            .finish_events(request.token, result);
+        if let Some(events) = events {
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_events(&ui, events);
+                }
+            });
+        }
+    }
+    let diagnostics = diagnostics_export(model);
+    let client = model.lock().expect("view model lock").daemon_client();
+    let daemon_diagnostics = match client.diagnostics() {
+        Ok(diagnostics) => serde_json::to_string_pretty(&diagnostics)
+            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }).to_string()),
+        Err(error) => serde_json::json!({ "error": error.to_string() }).to_string(),
+    };
+    let inputs = log_bundle::BundleInputs::for_this_user(
+        log_bundle::system_report(facts),
+        diagnostics,
+        daemon_diagnostics,
+    );
+    Some(
+        log_bundle::write_bundle(&path, &inputs)
+            .map(|()| fallback)
+            .map_err(|error| error.to_string()),
+    )
 }
 
 fn close_panel(

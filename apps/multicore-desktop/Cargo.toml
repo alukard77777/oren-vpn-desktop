@@ -6,6 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# Already built for Slint (i-slint-core); used for the local timestamp of a saved log archive.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 copypasta = "0.10.2"
 getrandom = "0.4"
 image.workspace = true
@@ -24,6 +26,8 @@ slint = { version = "=1.17.0", default-features = false, features = ["std", "bac
 # Already vendored transitively by Slint's winit backend at this exact version; used directly
 # here only to open the Mihomo dashboard URL in the system's default browser.
 webbrowser = "=1.2.4"
+# Already in the workspace for update archives; writes the «Сохранить лог…» archive.
+zip.workspace = true
 
 [features]
 # Offscreen preview renderer used by `render_ui_previews` (ignored test). It
@@ -46,6 +50,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
@@ -53,6 +58,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

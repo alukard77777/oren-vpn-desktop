@@ -386,6 +386,8 @@ component TextAction inherits Rectangle {
     // Momentary feedback ("Скопировано ✓") crossfades over the label.
     in property <string> swap-label;
     in property <bool> swapped: false;
+    // Tint of the feedback: "success" (green), "danger" (red) or "neutral" (progress).
+    in property <string> swap-tone: "success";
     callback activated();
 
     changed focus-epoch => {
@@ -446,7 +448,9 @@ component TextAction inherits Rectangle {
         width: text-label.width;
         height: parent.height;
         text: root.swap-label;
-        color: Theme.accent-green;
+        color: root.swap-tone == "danger" ? Theme.error
+            : root.swap-tone == "neutral" ? Theme.text-secondary
+            : Theme.accent-green;
         font-family: Theme.font-family;
         font-size: 13px;
         font-weight: Theme.weight-semibold;
@@ -1318,6 +1322,10 @@ export component AppWindow inherits Window {
     callback filter-events(string);
     callback copy-diagnostics();
     in-out property <bool> diagnostics-copied: false;
+    // «Сохранить лог…»: "" (idle), "saving", "saved", "saved-downloads" (no dialog: saved to
+    // Downloads) or "failed".
+    callback save-diagnostics();
+    in-out property <string> diagnostics-save-state;
     callback select-catalog-group(string);
     // Reloads the route catalog after it failed to load.
     callback retry-catalog();
@@ -3371,6 +3379,22 @@ export component AppWindow inherits Window {
                                 swapped: root.diagnostics-copied;
                                 enabled: !root.profile-menu-open;
                                 activated => { root.copy-diagnostics(); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            TextAction {
+                                label: "Сохранить лог…";
+                                swap-label: root.diagnostics-save-state == "saving" ? "Сохраняем…"
+                                    : root.diagnostics-save-state == "failed" ? "Не сохранено"
+                                    : root.diagnostics-save-state == "saved-downloads" ? "В Загрузках ✓"
+                                    : "Сохранено ✓";
+                                swap-tone: root.diagnostics-save-state == "failed" ? "danger"
+                                    : root.diagnostics-save-state == "saving" ? "neutral"
+                                    : "success";
+                                swapped: root.diagnostics-save-state != "";
+                                enabled: !root.profile-menu-open;
+                                activated => { root.save-diagnostics(); }
                             }
                         }
                     }
