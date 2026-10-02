@@ -99,6 +99,11 @@ pub struct ServiceLogoLease {
 }
 
 impl ServiceLogoLease {
+    pub(crate) fn new(retained: CapabilityFile) -> Self {
+        Self { retained }
+    }
+
+    /// Valid only while this lease lives (on Linux it names the retained descriptor).
     pub fn path(&self) -> Option<&Path> {
         self.retained.path()
     }

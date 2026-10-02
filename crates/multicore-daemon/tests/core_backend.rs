@@ -925,23 +925,23 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
     assert!(refreshed.subscription.as_ref().unwrap().refresh_available);
     assert_eq!(refreshed.profile, imported.profile);
     assert_eq!(refreshed.current_node, imported.current_node);
-    // The refresh keeps showing the logo while its new copy downloads; the same image keeps
-    // its path.
+    // The refresh keeps showing the logo while its new copy downloads.
     assert_eq!(
         refreshed.subscription.as_ref().unwrap().service_logo_path,
         Some(first_logo.clone())
     );
+    let first_image = std::fs::read(&first_logo).unwrap();
     backend.fetch_service_logos().await;
-    assert_eq!(
-        backend
-            .status()
-            .await
-            .unwrap()
-            .subscription
-            .unwrap()
-            .service_logo_path,
-        Some(first_logo)
-    );
+    // The same image again (the advertised path is a lease's: a /proc fd path on Linux).
+    let downloaded_again = backend
+        .status()
+        .await
+        .unwrap()
+        .subscription
+        .unwrap()
+        .service_logo_path
+        .unwrap();
+    assert_eq!(std::fs::read(downloaded_again).unwrap(), first_image);
     assert_eq!(
         *calls.lock().unwrap(),
         [UA_NATIVE, UA_SERVICE_LOGO, UA_NATIVE, UA_SERVICE_LOGO]
@@ -1194,8 +1194,7 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
     backend.fetch_service_logos().await;
     let refreshed = Backend::list_subscriptions(&backend).await.unwrap();
     let refreshed_logo = refreshed.profiles[0].service_logo_path.as_ref().unwrap();
-    // The same image keeps its file.
-    assert_eq!(refreshed_logo, &inactive_logo);
+    // The same image again (paths are leases', so compared by content).
     assert_eq!(std::fs::read(refreshed_logo).unwrap(), expected_logo);
 
     backend.delete_subscription(&first_id).await.unwrap();

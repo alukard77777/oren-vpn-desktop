@@ -1136,44 +1136,68 @@ fn a_background_logo_replaces_the_shown_one_under_a_new_path_and_goes_with_its_p
     let id = store
         .create_profile(snapshot("https://one.invalid/sub", "One"))
         .unwrap();
-    assert_eq!(store.cached_service_logo(&id), None);
+    assert!(store.cached_service_logo(&id).is_none());
     let logo = |color: &str| {
         normalize_service_logo(
             format!("<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='{color}'/></svg>").as_bytes(),
         )
         .unwrap()
     };
+    // The logo files in the store (paths handed out are lease paths: /proc/<pid>/fd/<n> on
+    // Linux, so files are checked by name here).
+    let logo_files = || {
+        let mut names: Vec<String> = fs::read_dir(directory.profiles())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("logo-") && name.ends_with(".png"))
+            .collect();
+        names.sort();
+        names
+    };
+    let shown = |logo: Option<CachedServiceLogo>| match logo {
+        Some(CachedServiceLogo::Logo(lease)) => Some(fs::read(lease.path().unwrap()).unwrap()),
+        _ => None,
+    };
     let first = store.save_service_logo(&id, &logo("#00ff00")).unwrap();
-    assert_eq!(
-        store.cached_service_logo(&id),
-        Some(CachedServiceLogo::Logo(first.clone()))
-    );
+    assert_eq!(fs::read(first.path().unwrap()).unwrap(), logo("#00ff00"));
+    assert_eq!(shown(store.cached_service_logo(&id)), Some(logo("#00ff00")));
+    let first_files = logo_files();
+    assert_eq!(first_files.len(), 1);
     assert!(store.save_service_logo(&id, b"not a logo").is_err());
-    // A new image gets a new path; the old file goes.
+    // A new image gets a new file, while the lease still handed out keeps reading what it
+    // promised (on Windows that lease keeps the old file until it is released).
     let second = store.save_service_logo(&id, &logo("#ff0000")).unwrap();
-    assert_ne!(first, second);
-    assert!(!first.exists());
-    assert_eq!(fs::read(&second).unwrap(), logo("#ff0000"));
+    assert_eq!(fs::read(second.path().unwrap()).unwrap(), logo("#ff0000"));
+    assert_eq!(fs::read(first.path().unwrap()).unwrap(), logo("#00ff00"));
+    assert_eq!(shown(store.cached_service_logo(&id)), Some(logo("#ff0000")));
+    drop(first);
+    // The same image keeps its file; the old file is gone once nothing holds it.
+    let again = store.save_service_logo(&id, &logo("#ff0000")).unwrap();
+    let second_files = logo_files();
+    assert_eq!(second_files.len(), 1);
+    assert_ne!(second_files, first_files);
+    // An image seen before becomes the newest again, not the oldest.
+    let green_again = store.save_service_logo(&id, &logo("#00ff00")).unwrap();
+    drop((second, again, green_again));
+    assert_eq!(shown(store.cached_service_logo(&id)), Some(logo("#00ff00")));
+    assert_eq!(logo_files().len(), 1);
+    let red = store.save_service_logo(&id, &logo("#ff0000")).unwrap();
+    drop(red);
     // Reopening keeps it; the cache files are not profiles.
     drop(store);
     let store = ProfileStore::open(directory.profiles(), None).unwrap();
     assert_eq!(store.list().unwrap().len(), 1);
-    assert_eq!(
-        store.cached_service_logo(&id),
-        Some(CachedServiceLogo::Logo(second.clone()))
-    );
+    assert_eq!(shown(store.cached_service_logo(&id)), Some(logo("#ff0000")));
     store.mark_service_logo_removed(&id).unwrap();
-    assert_eq!(
+    assert!(matches!(
         store.cached_service_logo(&id),
         Some(CachedServiceLogo::Removed)
-    );
-    assert!(!second.exists());
+    ));
+    assert!(logo_files().is_empty());
     let third = store.save_service_logo(&id, &logo("#0000ff")).unwrap();
-    assert_eq!(
-        store.cached_service_logo(&id),
-        Some(CachedServiceLogo::Logo(third.clone()))
-    );
+    assert_eq!(shown(store.cached_service_logo(&id)), Some(logo("#0000ff")));
+    drop(third);
     store.delete(&id).unwrap();
-    assert!(!third.exists());
-    assert_eq!(store.cached_service_logo(&id), None);
+    assert!(logo_files().is_empty());
+    assert!(store.cached_service_logo(&id).is_none());
 }

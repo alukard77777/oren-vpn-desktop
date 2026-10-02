@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsStr,
     fmt, fs, io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -316,16 +316,24 @@ impl ProfileStore {
         if names.iter().any(|name| *name == removed_logo_name(id)) {
             return Some(CachedServiceLogo::Removed);
         }
-        names
-            .into_iter()
-            .filter(|name| name.ends_with(".png"))
-            .find_map(|name| {
-                let (png, file) = self.read_service_logo(&name)?;
-                crate::service_logo::is_canonical_service_logo(&png)
-                    .then(|| file.path().map(Path::to_owned))
-                    .flatten()
-            })
-            .map(CachedServiceLogo::Logo)
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let mut logos = service_logo_files(id, names);
+        // Newest first: an older file survives only while a lease held it (Windows).
+        logos.sort_by_key(|(sequence, _, _)| std::cmp::Reverse(*sequence));
+        let (chosen, lease) = logos.iter().find_map(|(_, _, name)| {
+            let (png, file) = self.read_service_logo(name)?;
+            (crate::service_logo::is_canonical_service_logo(&png) && file.path().is_some())
+                .then(|| (name.clone(), crate::ServiceLogoLease::new(file)))
+        })?;
+        for (_, _, name) in &logos {
+            if *name != chosen {
+                let _ = self.root.remove_file(OsStr::new(name));
+            }
+        }
+        Some(CachedServiceLogo::Logo(lease))
     }
 
     fn read_service_logo(
@@ -342,8 +350,14 @@ impl ProfileStore {
     }
 
     /// Keeps `png` (a canonical service logo) as profile `id`'s logo. Each image gets its own
-    /// file name, so a path a client already holds never changes its content.
-    pub fn save_service_logo(&self, id: &ProfileId, png: &[u8]) -> Result<PathBuf, ProfileError> {
+    /// file name, so a file a client already reads never changes its content. The returned
+    /// lease must be kept for as long as its path is handed out: on Linux the path names the
+    /// lease's open descriptor (`/proc/<pid>/fd/<n>`).
+    pub fn save_service_logo(
+        &self,
+        id: &ProfileId,
+        png: &[u8],
+    ) -> Result<crate::ServiceLogoLease, ProfileError> {
         if !crate::service_logo::is_canonical_service_logo(png) {
             return Err(ProfileError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -359,7 +373,24 @@ impl ProfileStore {
             .take(8)
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let name = format!("{SERVICE_LOGO_PREFIX}{}-{digest}.png", id.as_str());
+        let newest = service_logo_files(id, self.service_logo_names(id))
+            .into_iter()
+            .max_by_key(|(sequence, _, _)| *sequence);
+        // The newest file already holds this image: keep it (and its clients' paths).
+        // Otherwise the image gets a newer sequence than every file left behind.
+        let name = match newest {
+            Some((_, newest_digest, name)) if newest_digest == digest => name,
+            newest => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_nanos());
+                let sequence = newest.map_or(now, |(sequence, _, _)| now.max(sequence + 1));
+                format!(
+                    "{SERVICE_LOGO_PREFIX}{}-{sequence:032x}-{digest}.png",
+                    id.as_str()
+                )
+            }
+        };
         if self.root.file_metadata(OsStr::new(&name))?.is_none() {
             let temp = format!("{SERVICE_LOGO_PREFIX}{}.tmp", id.as_str());
             if self.root.file_metadata(OsStr::new(&temp))?.is_some() {
@@ -369,13 +400,16 @@ impl ProfileStore {
             self.root
                 .replace_file(OsStr::new(&temp), OsStr::new(&name))?;
         }
+        // Best effort: on Windows a file whose lease is still held stays until the next save
+        // or start-up (the newest sequence wins meanwhile).
         for other in self.service_logo_names(id) {
             if other != name {
                 let _ = self.root.remove_file(OsStr::new(&other));
             }
         }
         self.read_service_logo(&name)
-            .and_then(|(_, file)| file.path().map(Path::to_owned))
+            .filter(|(_, file)| file.path().is_some())
+            .map(|(_, file)| crate::ServiceLogoLease::new(file))
             .ok_or_else(|| ProfileError::Io(io::Error::other("service logo has no stable path")))
     }
 
@@ -1120,15 +1154,31 @@ fn profile_entry_ids(root: &DirectoryCapability) -> Result<Vec<ProfileId>, Profi
 
 const SERVICE_LOGO_PREFIX: &str = "logo-";
 
+/// `logo-<id>-<sequence:032x>-<digest>.png` files of profile `id`: (sequence, digest, name).
+fn service_logo_files(id: &ProfileId, names: Vec<String>) -> Vec<(u128, String, String)> {
+    let prefix = format!("{SERVICE_LOGO_PREFIX}{}-", id.as_str());
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let (sequence, digest) = name
+                .strip_prefix(&prefix)?
+                .strip_suffix(".png")?
+                .split_once('-')?;
+            let sequence = u128::from_str_radix(sequence, 16).ok()?;
+            Some((sequence, digest.to_owned(), name))
+        })
+        .collect()
+}
+
 fn removed_logo_name(id: &ProfileId) -> String {
     format!("{SERVICE_LOGO_PREFIX}{}-none", id.as_str())
 }
 
 /// A profile's provider logo as the background download left it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum CachedServiceLogo {
-    /// The newest logo, at this path (its content never changes).
-    Logo(PathBuf),
+    /// The newest logo; its lease keeps the advertised path valid.
+    Logo(crate::ServiceLogoLease),
     /// The provider removed its logo.
     Removed,
 }

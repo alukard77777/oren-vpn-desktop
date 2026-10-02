@@ -2568,9 +2568,10 @@ impl ServiceLogos {
         generation_logo: Option<&std::path::Path>,
     ) -> Option<String> {
         match self.shown(id) {
-            Some(multicore_core::CachedServiceLogo::Logo(path)) => {
-                path.to_str().map(ToOwned::to_owned)
-            }
+            Some(multicore_core::CachedServiceLogo::Logo(lease)) => lease
+                .path()
+                .and_then(std::path::Path::to_str)
+                .map(ToOwned::to_owned),
             Some(multicore_core::CachedServiceLogo::Removed) => None,
             None => generation_logo
                 .and_then(std::path::Path::to_str)
@@ -3256,6 +3257,20 @@ where
                     continue;
                 }
             };
+            // Release the lease of the logo shown so far first: on Windows a held lease keeps
+            // its file from being replaced (the store would wait for it).
+            let previous = matches!(
+                download,
+                Some(ServiceLogoDownload::Logo(_) | ServiceLogoDownload::Gone) | None
+            )
+            .then(|| {
+                self.service_logos
+                    .shown
+                    .lock()
+                    .expect("service logo lock poisoned")
+                    .remove(&id)
+            })
+            .flatten();
             let stored = match download {
                 Some(ServiceLogoDownload::Logo(png)) => run_blocking(|| {
                     self.store
@@ -3270,7 +3285,8 @@ where
                 // Unreachable this time: the logo shown stays.
                 Some(ServiceLogoDownload::Failed) => continue,
             };
-            if let Ok(logo) = stored {
+            // A failed write keeps showing the previous logo.
+            if let Some(logo) = stored.ok().or(previous) {
                 self.service_logos
                     .shown
                     .lock()
@@ -4139,6 +4155,12 @@ where
         } else {
             false
         };
+        // Release the background logo's lease before its file is deleted.
+        self.service_logos
+            .shown
+            .lock()
+            .expect("service logo lock poisoned")
+            .remove(id);
         let maintenance_debt = match run_blocking(|| self.store.delete(id)) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => true,
