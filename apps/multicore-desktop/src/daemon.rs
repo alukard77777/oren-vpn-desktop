@@ -1427,20 +1427,23 @@ impl DaemonClient for HttpDaemonClient {
             .json(&SelectionRequest { revision, node_id })
             .send()
             .map_err(map_error)?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            let stale_revision =
-                decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
-                    .is_ok_and(|body| body.code == "stale_revision");
-            return Err(if stale_revision {
-                DaemonError::stale_revision()
-            } else {
-                DaemonError::definitive_http("Не удалось изменить маршрут.")
-            });
-        }
         if !response.status().is_success() {
-            return Err(DaemonError::definitive_http(
-                "Фоновый сервис отклонил изменение маршрута.",
-            ));
+            // A refused route change used to leave no trace in the client log.
+            let status = response.status();
+            let code = error_code(response);
+            record_low_level(
+                "daemon_selection_error",
+                format!("status={status} code={code:?}"),
+            );
+            return Err(if status == reqwest::StatusCode::CONFLICT {
+                if code == "stale_revision" {
+                    DaemonError::stale_revision()
+                } else {
+                    DaemonError::definitive_http("Не удалось изменить маршрут.")
+                }
+            } else {
+                DaemonError::definitive_http("Фоновый сервис отклонил изменение маршрута.")
+            });
         }
         decode_bounded_json(response, CATALOG_RESPONSE_LIMIT_BYTES)
     }

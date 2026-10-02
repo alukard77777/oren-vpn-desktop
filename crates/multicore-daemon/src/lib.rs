@@ -4978,11 +4978,14 @@ where
             )
         };
 
-        if live {
-            self.selector
-                .select(&raw_group, &raw_node)
-                .await
-                .map_err(|_| SelectionError::SelectorFailed)?;
+        if live && self.selector.select(&raw_group, &raw_node).await.is_err() {
+            self.inner.write().await.push_event(
+                Severity::Warning,
+                Component::Mihomo,
+                "selection_failed",
+                "Mihomo не применил выбор маршрута.",
+            );
+            return Err(SelectionError::SelectorFailed);
         }
 
         let save_target = if let Some((pending_revision, pending)) = &pending_snapshot {

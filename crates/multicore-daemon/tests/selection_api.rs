@@ -751,6 +751,15 @@ async fn stale_unknown_and_selector_failure_are_stable_and_rollback_selection() 
         multicore_daemon::SelectionError::SelectorFailed
     ));
     assert_eq!(backend.catalog().await.unwrap(), before);
+    // A refused selection leaves a trace in the daemon log (it used to leave none).
+    assert!(
+        backend
+            .events_after(0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.message == "Mihomo не применил выбор маршрута.")
+    );
 }
 
 #[tokio::test]
