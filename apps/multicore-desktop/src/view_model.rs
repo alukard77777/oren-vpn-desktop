@@ -11320,4 +11320,293 @@ mod tests {
         assert!(!presentation.visible);
         assert!(presentation.apps.is_empty());
     }
+
+    // ---- English interface -------------------------------------------------------------
+
+    fn english() -> multicore_i18n::ThreadLanguage {
+        multicore_i18n::ThreadLanguage::set(Lang::En)
+    }
+
+    fn has_cyrillic(text: &str) -> bool {
+        text.chars().any(|c| ('\u{400}'..='\u{4ff}').contains(&c))
+    }
+
+    fn assert_english(text: &str, what: &str) {
+        assert!(!has_cyrillic(text), "{what} is not English: {text:?}");
+    }
+
+    #[test]
+    fn english_state_presentations_carry_no_russian() {
+        let _en = english();
+        // Provider content (profile and server names) stays as the provider wrote it.
+        let profile = "Мой провайдер".to_owned();
+        let node = "🇸🇪 Швеция".to_owned();
+        let states = [
+            UiState::Empty,
+            UiState::Importing,
+            UiState::Ready {
+                profile: profile.clone(),
+                node: node.clone(),
+            },
+            UiState::Connecting {
+                profile: profile.clone(),
+                node: node.clone(),
+                step: "step".into(),
+            },
+            UiState::Disconnecting {
+                profile: profile.clone(),
+                node: node.clone(),
+            },
+            UiState::Connected {
+                profile: profile.clone(),
+                node: node.clone(),
+            },
+            UiState::Error {
+                message: "error".into(),
+            },
+            UiState::ServiceUnreachable {
+                message: "unreachable".into(),
+            },
+            UiState::DaemonDegraded {
+                message: "degraded".into(),
+            },
+        ];
+        for state in states {
+            let presentation = state.presentation();
+            for (what, text) in [
+                ("eyebrow", presentation.eyebrow.to_owned()),
+                ("headline", presentation.headline.clone()),
+                ("supporting", presentation.supporting.clone()),
+                ("primary label", presentation.primary_label.to_owned()),
+            ] {
+                assert_english(&text, &format!("{state:?} {what}"));
+            }
+            if presentation.profile != profile {
+                assert_english(&presentation.profile, &format!("{state:?} profile"));
+            }
+            if presentation.node != node {
+                assert_english(&presentation.node, &format!("{state:?} node"));
+            }
+        }
+        let connected = UiState::Connected { profile, node }.presentation();
+        assert_eq!(connected.eyebrow, "Connected");
+        assert_eq!(connected.headline, "Connection secured");
+        assert_eq!(connected.primary_label, "Disconnect");
+        assert_eq!(UiState::Empty.presentation().headline, "Add a subscription");
+    }
+
+    #[test]
+    fn english_status_fallbacks_carry_no_russian() {
+        let _en = english();
+        for state in ["connecting", "connected", "ready", "error", "bogus"] {
+            let presentation = state_from_status(DaemonStatus {
+                state: state.into(),
+                ..DaemonStatus::default()
+            })
+            .presentation();
+            for text in [
+                presentation.headline,
+                presentation.supporting,
+                presentation.profile,
+                presentation.node,
+            ] {
+                assert_english(&text, state);
+            }
+        }
+        let degraded = state_from_status(DaemonStatus {
+            degraded: true,
+            ..DaemonStatus::default()
+        });
+        assert_eq!(
+            degraded,
+            UiState::DaemonDegraded {
+                message: "Background service is degraded.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn english_quota_and_expiry_read_naturally() {
+        use chrono::TimeZone;
+        let _en = english();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let day = 86_400;
+        let noon = |year, month, day| {
+            chrono::Utc
+                .with_ymd_and_hms(year, month, day, 12, 0, 0)
+                .unwrap()
+                .timestamp() as u64
+        };
+        let now = noon(2026, 10, 2);
+
+        let normal = quota_presentation(
+            Some(75 * GIB),
+            Some(100 * GIB),
+            Some(noon(2026, 10, 13)),
+            now,
+        );
+        assert_eq!(normal.days, "11 days");
+        assert_eq!(
+            normal.tooltip,
+            "Data: 75 / 100 GiB · 25.0 GiB left · until Oct\u{a0}13"
+        );
+        assert_eq!(
+            quota_presentation(None, None, Some(now + day), now).days,
+            "1 day"
+        );
+        let next_year = quota_presentation(None, None, Some(noon(2027, 1, 5)), now);
+        assert_eq!(next_year.tooltip, "Unlimited data · until Jan\u{a0}5, 2027");
+        let forever = quota_presentation(Some(GIB), Some(0), Some(now + 12_073 * day), now);
+        assert_eq!(forever.days, "No expiry");
+        assert_eq!(forever.tooltip, "Unlimited data · no expiry");
+        let expired = quota_presentation(
+            Some(3 * GIB),
+            Some(500 * 1024 * 1024),
+            Some(noon(2026, 9, 30)),
+            now,
+        );
+        assert_eq!(expired.days, "Expired");
+        assert_eq!(expired.tooltip, "Expired Sep\u{a0}30 · data 500 / 500 MiB");
+        let exhausted = quota_presentation(Some(120 * GIB), Some(100 * GIB), None, now);
+        assert_eq!(exhausted.tooltip, "Data used up: 100 / 100 GiB · no expiry");
+
+        assert_eq!(format_expiry(None, now), "Expiry unknown");
+        assert_eq!(format_expiry(Some(now), now), "Expired");
+        assert_eq!(format_expiry(Some(now + day), now), "1 day left");
+        assert_eq!(format_expiry(Some(now + 21 * day), now), "21 days left");
+        assert_eq!(format_expiry(Some(now + 12_073 * day), now), "No expiry");
+
+        assert_eq!(format_update_date(0), "Never updated");
+        assert_eq!(format_update_date(1_789_405_200), "Sep 14, 2026");
+        assert_eq!(format_update_date(1), "Jan 1, 1970");
+    }
+
+    #[test]
+    fn english_speeds_runtime_checks_and_latency() {
+        let _en = english();
+        assert_eq!(format_speed(512.0), "512 B/s");
+        assert_eq!(format_speed(320.0 * 1024.0), "320 KB/s");
+        assert_eq!(format_speed(2.4 * 1024.0 * 1024.0), "2.4 MB/s");
+        assert_eq!(format_speed(3.0 * 1024.0 * 1024.0 * 1024.0), "3.0 GB/s");
+        for value in [
+            None,
+            Some("ready"),
+            Some("starting"),
+            Some("failed"),
+            Some("unsupported"),
+            Some("disabled"),
+            Some("stopped"),
+            Some("other"),
+        ] {
+            assert_english(&present_runtime_check(value, false).value, "runtime check");
+        }
+        assert_eq!(present_runtime_check(None, true).value, "Checking");
+        assert_eq!(present_runtime_check(Some("ready"), false).value, "Ready");
+        for status in ["ok", "timeout", "error", "unavailable", "unknown"] {
+            assert_english(&latency_display(status, Some(42)).0, status);
+        }
+        assert_eq!(latency_display("timeout", None).0, "timeout");
+        assert_eq!(safe_catalog_label("  "), "Untitled");
+    }
+
+    #[test]
+    fn english_conflicting_apps_banner() {
+        let _en = english();
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert_eq!(
+            model.conflicting_apps_presentation().message,
+            "Another VPN app found (FlClash): it may conflict with MULTICORE. Close it before connecting."
+        );
+        model.set_conflicting_apps(vec!["Incy", "FlClash"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.starts_with("Other VPN apps found (FlClash, Incy)"));
+        model.record_close_attempt(&["FlClash"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.contains(" Not everything closed: FlClash runs its engine"));
+        assert_english(&message, "conflicting apps banner");
+    }
+
+    #[test]
+    fn english_view_model_presentations_carry_no_russian_but_provider_content() {
+        // Picked in Settings: a status without `app-language` keeps it.
+        crate::language::choose(Lang::En);
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        assert_english(
+            &model.subscription_presentation().expiry,
+            "empty subscription",
+        );
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                profile: Some("Провайдер".into()),
+                current_node: Some("Швеция".into()),
+                subscription: Some(DaemonSubscriptionInfo {
+                    source_name: "provider.example".into(),
+                    display_name: "Провайдер".into(),
+                    used_bytes: Some(1024),
+                    total_bytes: Some(1024 * 1024 * 1024),
+                    expires_at_unix: Some(current_unix_time() + 5 * 86_400),
+                    updated_at_unix: 1_789_405_200,
+                    ..DaemonSubscriptionInfo::default()
+                }),
+                ..DaemonStatus::default()
+            }),
+        );
+        let presentation = model.presentation();
+        assert_english(presentation.eyebrow, "eyebrow");
+        assert_english(&presentation.headline, "headline");
+        assert_english(&presentation.supporting, "supporting");
+        assert_english(presentation.primary_label, "primary label");
+        let subscription = model.subscription_presentation();
+        assert_eq!(subscription.display_name, "Провайдер");
+        for (what, text) in [
+            ("usage", subscription.usage.as_str()),
+            ("expiry", subscription.expiry.as_str()),
+            ("updated", subscription.updated.as_str()),
+            ("days", subscription.quota.days.as_str()),
+            ("tooltip", subscription.quota.tooltip.as_str()),
+        ] {
+            assert_english(text, what);
+        }
+        assert_eq!(subscription.updated, "Sep 14, 2026");
+        let diagnostics = model.diagnostics_presentation();
+        for check in [diagnostics.xray, diagnostics.mihomo, diagnostics.tun] {
+            assert_english(&check.value, "runtime check");
+        }
+        assert_english(&model.diagnostics_export_text(), "empty event export");
+    }
+
+    #[test]
+    fn a_status_with_app_language_switches_this_threads_language() {
+        crate::language::initialize(Lang::Ru, false);
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let status = |language: Option<&str>| DaemonStatus {
+            state: "ready".into(),
+            subscription: Some(DaemonSubscriptionInfo {
+                display_name: "Provider".into(),
+                app_language: language.map(str::to_owned),
+                ..DaemonSubscriptionInfo::default()
+            }),
+            ..DaemonStatus::default()
+        };
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Ok(status(Some("EN-us"))));
+        assert_eq!(multicore_i18n::current(), Lang::En);
+        assert_eq!(model.presentation().headline, "Ready to connect");
+
+        // Without the header the provider's language no longer applies: Russian again.
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Ok(status(None)));
+        assert_eq!(multicore_i18n::current(), Lang::Ru);
+        assert_eq!(model.presentation().headline, "Можно подключаться");
+
+        // A language picked in Settings wins over the header.
+        crate::language::choose(Lang::Ru);
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Ok(status(Some("en"))));
+        assert_eq!(multicore_i18n::current(), Lang::Ru);
+    }
 }

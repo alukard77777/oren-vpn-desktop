@@ -79,7 +79,7 @@ msgid "Отключиться"
 msgstr "Disconnect"
 
 msgid "Отключение"
-msgstr "Disconnecting"
+msgstr "Stopping"
 
 msgid "Завершаем соединение…"
 msgstr "Closing connection…"
