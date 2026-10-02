@@ -1608,7 +1608,6 @@ fn tall_settings(ui: &AppWindow) {
     ready(ui);
     ui.set_local_page(s("settings"));
     ui.set_tun_toggle_available(true);
-    ui.set_service_card_visible(true);
     ui.set_launch_at_sign_in_error(s(
         "Не удалось изменить автозапуск. Проверьте права доступа к реестру и повторите попытку.",
     ));

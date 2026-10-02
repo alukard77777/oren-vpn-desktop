@@ -3856,7 +3856,8 @@ export component AppWindow inherits Window {
                         padding-right: 28px;
                         padding-bottom: 24px;
                         spacing: 0px;
-                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ПОДКЛЮЧЕНИЕ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ПОДКЛЮЧЕНИЕ"; } }
+                        Rectangle { height: 8px; background: transparent; }
                         connection-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
                         animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
@@ -3936,9 +3937,10 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Rectangle { height: 18px; background: transparent; }
+                        Rectangle { height: 20px; background: transparent; }
 
-                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ПРИЛОЖЕНИЕ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ПРИЛОЖЕНИЕ"; } }
+                        Rectangle { height: 8px; background: transparent; }
                         app-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
                         animate opacity { duration: 280ms; delay: 48ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
@@ -4000,12 +4002,47 @@ export component AppWindow inherits Window {
                             }
                         }
                         if root.launch-at-sign-in-error != "": HorizontalLayout { padding-left: 4px; padding-top: 6px; Text { min-height: 20px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; } }
-                        Rectangle { height: 18px; background: transparent; }
+                        Rectangle { height: 20px; background: transparent; }
 
-                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ОБНОВЛЕНИЯ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ПОМОЩЬ"; } }
+                        Rectangle { height: 8px; background: transparent; }
+                        troubleshoot-card := Rectangle {
+                            opacity: root.page-entering ? 0 : 1;
+                            animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            height: Math.max(60px, troubleshoot-row.preferred-height);
+                            background: Theme.surface;
+                            border-color: #ffffff0a;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            troubleshoot-row := HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 10px;
+                                padding-top: 11px;
+                                padding-bottom: 11px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text { text: "Устранить неполадки"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; overflow: elide; }
+                                    Text { text: "Если VPN не подключается: проверим антивирусы, прокси, порты и другое"; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    TextAction {
+                                        label: "Открыть";
+                                        enabled: !root.profile-menu-open;
+                                        activated => { root.open-troubleshoot("settings"); }
+                                    }
+                                }
+                            }
+                        }
+                        Rectangle { height: 20px; background: transparent; }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ОБНОВЛЕНИЯ"; } }
+                        Rectangle { height: 8px; background: transparent; }
                         updates-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
-                        animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                        animate opacity { duration: 280ms; delay: 96ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                             height: Math.max(60px, updates-row.preferred-height);
                             background: Theme.surface;
                             border-color: root.update-available ? #4c9dff55 : #ffffff0a;
@@ -4031,39 +4068,6 @@ export component AppWindow inherits Window {
                                         enabled: root.update-action-enabled && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
                                             && !(root.update-runtime-busy && root.update-available);
                                         activated => { root.update-action(); }
-                                    }
-                                }
-                            }
-                        }
-                        Rectangle { height: 18px; background: transparent; }
-                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ПОМОЩЬ"; } }
-                        troubleshoot-card := Rectangle {
-                            opacity: root.page-entering ? 0 : 1;
-                            animate opacity { duration: 280ms; delay: 96ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                            height: Math.max(60px, troubleshoot-row.preferred-height);
-                            background: Theme.surface;
-                            border-color: #ffffff0a;
-                            border-width: 1px;
-                            border-radius: 14px;
-                            troubleshoot-row := HorizontalLayout {
-                                padding-left: 16px;
-                                padding-right: 10px;
-                                padding-top: 11px;
-                                padding-bottom: 11px;
-                                spacing: 12px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    spacing: 2px;
-                                    Text { text: "Устранить неполадки"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; overflow: elide; }
-                                    Text { text: "Если VPN не подключается: проверим антивирусы, прокси, порты и другое"; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    TextAction {
-                                        label: "Открыть";
-                                        enabled: !root.profile-menu-open;
-                                        activated => { root.open-troubleshoot("settings"); }
                                     }
                                 }
                             }

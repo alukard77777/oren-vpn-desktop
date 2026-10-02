@@ -8656,10 +8656,27 @@ mod tests {
             .find("text: \"ПОДКЛЮЧЕНИЕ\";")
             .expect("connection section");
         let app = settings.find("text: \"ПРИЛОЖЕНИЕ\";").expect("app section");
+        let help = settings.find("text: \"ПОМОЩЬ\";").expect("help section");
         let updates = settings
             .find("text: \"ОБНОВЛЕНИЯ\";")
             .expect("updates section");
-        assert!(connection < app && app < updates);
+        // Updates close the page, below help.
+        assert!(connection < app && app < help && help < updates);
+        // Status page rhythm: a 16px caption row, the card 8px below, 20px between sections.
+        let settings_lf = settings.replace(
+            "
+", "
+",
+        );
+        for caption in ["ПОДКЛЮЧЕНИЕ", "ПРИЛОЖЕНИЕ", "ПОМОЩЬ", "ОБНОВЛЕНИЯ"]
+        {
+            assert!(settings_lf.contains(&format!(
+                "HorizontalLayout {{ height: 16px; padding-left: 4px; SectionCaption {{ text: \"{caption}\"; }} }}
+                        Rectangle {{ height: 8px; background: transparent; }}"
+            )), "{caption}");
+        }
+        assert!(!settings.contains("height: 22px; padding-left: 4px; SectionCaption"));
+        assert!(!settings.contains("Rectangle { height: 18px; background: transparent; }"));
         assert!(settings.matches("ToggleRow {").count() >= 4);
         // The home update banner's "Подробнее" lands on the updates section.
         assert!(settings.contains("if (root.settings-section == \"updates\") {"));
