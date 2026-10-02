@@ -8608,6 +8608,22 @@ mod window_tests {
         assert!(forwarding < migration);
     }
 
+    /// The expanded rail's label keeps everything left of its count: an English
+    /// "Subscriptions" next to "3" used to be clipped by a fixed 24px reservation.
+    #[test]
+    fn rail_labels_take_the_width_left_of_their_count() {
+        let ui = include_str!("../ui/app.slint");
+        let item = ui
+            .split("component NavItem inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| body.split("\ncomponent ").next())
+            .expect("NavItem component");
+        assert!(item.contains("(root.badge == \"\" ? 0px : nav-badge.width + 8px)"));
+        assert!(item.contains("width: root.badge == \"\" ? 0px : self.preferred-width;"));
+        assert!(item.contains("overflow: elide;"));
+        assert!(!item.contains("24px));"));
+    }
+
     /// After an in-app update the primary instance puts the user's autostart value back in
     /// the plain spelling before the settings page first reads it.
     #[cfg(windows)]

@@ -132,7 +132,8 @@ component NavItem inherits Rectangle {
     // instead of popping in over a still-narrow rail.
     nav-label := Text {
         x: root.compact ? 36px : 44px;
-        width: Math.max(0px, parent.width - self.x - 12px - (root.badge == "" ? 0px : 24px));
+        // Everything left of the badge: an English "Subscriptions" next to "3" still fits.
+        width: Math.max(0px, parent.width - self.x - 12px - (root.badge == "" ? 0px : nav-badge.width + 8px));
         height: parent.height;
         text: root.label;
         color: root.active || nav-touch.has-hover ? Theme.text-primary : Theme.text-secondary;
@@ -140,7 +141,7 @@ component NavItem inherits Rectangle {
         font-size: 13px;
         font-weight: root.active ? Theme.weight-semibold : Theme.weight-medium;
         vertical-alignment: center;
-        overflow: clip;
+        overflow: elide;
         opacity: root.compact ? 0 : 1;
         visible: self.opacity > 0;
         accessible-role: none;
@@ -149,9 +150,10 @@ component NavItem inherits Rectangle {
         animate color { duration: 140ms; easing: ease-out; }
     }
 
-    if root.badge != "": Text {
+    // As wide as its digits, so the label keeps the rest of the row.
+    nav-badge := Text {
         x: parent.width - self.width - 12px;
-        width: 20px;
+        width: root.badge == "" ? 0px : self.preferred-width;
         height: parent.height;
         text: root.badge;
         color: Theme.text-muted;
@@ -160,7 +162,7 @@ component NavItem inherits Rectangle {
         horizontal-alignment: right;
         vertical-alignment: center;
         opacity: nav-label.opacity;
-        visible: self.opacity > 0;
+        visible: root.badge != "" && self.opacity > 0;
         accessible-role: none;
     }
 
