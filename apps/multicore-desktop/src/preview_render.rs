@@ -1722,3 +1722,74 @@ fn icon_placeholder_animates_only_while_loading() {
     );
     popup.hide().expect("hide tray popup");
 }
+
+/// Clicks on the home route list while snapshots stream in (status, latency, icon updates
+/// every few hundred ms). Replacing the rows' model between a press and its release rebuilt
+/// every row and dropped the click; rows updated in place keep it.
+#[test]
+fn a_route_click_survives_snapshots_that_keep_the_rows() {
+    use slint::Model as _;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::cell::Cell;
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = AppWindow::new().expect("create app window");
+    connected(&ui);
+    ui.set_catalog_groups(groups());
+    ui.set_catalog_nodes(nodes(false));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    settle(4);
+    let clicked = Rc::new(RefCell::new(Vec::<SharedString>::new()));
+    let sink = clicked.clone();
+    ui.on_select_catalog_node(move |id| sink.borrow_mut().push(id));
+    let press = |x: f32, y: f32| {
+        let position = slint::LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+    };
+    let release = |x: f32, y: f32| {
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position: slint::LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        });
+        slint::platform::update_timers_and_animations();
+    };
+    // Find the second route row ("n2") with a plain click.
+    let x = 420.0;
+    let row_y = Cell::new(None);
+    for y in (100..720).step_by(4) {
+        press(x, y as f32);
+        release(x, y as f32);
+        if clicked.borrow().last().is_some_and(|id| id == "n2") {
+            row_y.set(Some(y as f32 + 8.0));
+            break;
+        }
+    }
+    let y = row_y.get().expect("the n2 route row is clickable");
+    clicked.borrow_mut().clear();
+
+    // A snapshot that replaces the model mid-click (1.1.2 behaviour): the click is lost.
+    press(x, y);
+    ui.set_catalog_nodes(nodes(false));
+    release(x, y);
+    assert!(clicked.borrow().is_empty(), "a rebuilt row loses the click");
+
+    // The same snapshot applied in place: the click lands.
+    press(x, y);
+    if let Some(model) = crate::sync_rows(
+        ui.get_catalog_nodes(),
+        nodes(false).iter().collect(),
+        |row| row.id.clone(),
+    ) {
+        ui.set_catalog_nodes(model);
+    }
+    release(x, y);
+    assert_eq!(clicked.borrow().as_slice(), [SharedString::from("n2")]);
+    ui.hide().expect("hide app window");
+}
