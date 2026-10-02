@@ -4,13 +4,15 @@
 //! (exactly what «Копировать лог» copies), `daemon-diagnostics.json` (the daemon's
 //! `/v1/diagnostics`: core health, the bounded core log, proxy mappings), `preferences.json`
 //! (with profile ids pseudonymised and paths dropped) and `logs/*` from the data directory
-//! (`events.log`, `client-errors.log`, the per-user core log and rotated predecessors).
+//! (`events.log`, `client-errors.log`, the per-user core log and rotated predecessors), plus
+//! `logs/service.log` (and `service.log.1`) of the always-ready service.
 //!
 //! Every text entry goes through the same redaction as the event feed (`redact_event_text`:
 //! URLs, `token=`/`secret=`/`password=` values, authorization headers, UUID-shaped ids such as
 //! the HWID), plus quoted JSON keys of the same names, the device identity file's exact value
 //! and the user's home directory. Nothing here reads anything the app does not already own:
-//! the service's own files stay out; its core log arrives through the daemon's diagnostics.
+//! the service's files are SYSTEM/root-only, so its core log arrives through the daemon's
+//! diagnostics and its own log through `/v1/service-log` (redacted by the service first).
 //! The uncompressed total is capped at [`MAX_BUNDLE_BYTES`]; files are taken newest first and
 //! a file that does not fit keeps its newest lines.
 
@@ -24,6 +26,7 @@ use std::time::{Instant, SystemTime};
 
 use regex::Regex;
 
+use crate::daemon::{DaemonError, DaemonServiceLog};
 use crate::view_model::redact_event_text;
 
 /// Uncompressed size cap of everything in the archive.
@@ -68,6 +71,8 @@ pub(crate) struct BundleInputs {
     pub(crate) data_root: Option<PathBuf>,
     /// The user's home directory, replaced by `~` everywhere.
     pub(crate) home: Option<PathBuf>,
+    /// The service's own log files (`service.log`, `service.log.1`) as the daemon returned them.
+    pub(crate) service_logs: Vec<(String, String)>,
 }
 
 impl BundleInputs {
@@ -79,8 +84,55 @@ impl BundleInputs {
             daemon_diagnostics: daemon,
             data_root: multicore_platform::dirs::user_data_root().ok(),
             home: home_directory(),
+            service_logs: Vec::new(),
         }
     }
+}
+
+/// The `system.txt` line about the service's log, and its files for `logs/`. Never an error:
+/// without a service (per-user mode), with a service too old to serve it, or with no answer,
+/// the line says so and nothing else is added.
+pub(crate) fn service_log_entries(
+    result: Result<DaemonServiceLog, DaemonError>,
+) -> (String, Vec<(String, String)>) {
+    let line = |value: &str| format!("{:<22}{value}\n", "Журнал службы");
+    let log = match result {
+        Ok(log) => log,
+        Err(_) => return (line("недоступен: фоновый сервис не ответил"), Vec::new()),
+    };
+    let reason = match log.status.as_str() {
+        "included" => None,
+        "no_service" => Some("нет: служба не используется (режим без службы)"),
+        "too_old" => Some("недоступен: служба слишком старая (service too old)"),
+        "busy" => Some("недоступен: службой пользуется другой пользователь"),
+        _ => Some("недоступен: служба не ответила"),
+    };
+    if let Some(reason) = reason {
+        return (line(reason), Vec::new());
+    }
+    let files = log
+        .files
+        .into_iter()
+        .filter(|file| matches!(file.name.as_str(), "service.log" | "service.log.1"))
+        .map(|file| {
+            let text = if file.truncated {
+                format!("{TRUNCATED_MARKER}{}", file.text)
+            } else {
+                file.text
+            };
+            (file.name, text)
+        })
+        .collect::<Vec<_>>();
+    let note = if files.is_empty() {
+        "пуст".to_owned()
+    } else {
+        files
+            .iter()
+            .map(|(name, _)| format!("logs/{name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (line(&note), files)
 }
 
 fn home_directory() -> Option<PathBuf> {
@@ -136,6 +188,13 @@ pub(crate) fn collect_entries(inputs: &BundleInputs) -> Vec<(String, Vec<u8>)> {
         inputs.daemon_diagnostics.clone(),
         &mut budget,
     );
+    // Bounded by the service (512 KiB), so it comes before the user's own logs.
+    let mut names = std::collections::BTreeSet::new();
+    for (name, text) in &inputs.service_logs {
+        if names.insert(name.clone()) {
+            push(format!("logs/{name}"), text.clone(), &mut budget);
+        }
+    }
     if let Some(root) = &inputs.data_root {
         if let Some(preferences) = sanitized_preferences(&root.join("preferences.json")) {
             push("preferences.json".into(), preferences, &mut budget);
@@ -143,6 +202,10 @@ pub(crate) fn collect_entries(inputs: &BundleInputs) -> Vec<(String, Vec<u8>)> {
         for (name, path) in log_files_newest_first(&root.join("logs")) {
             if budget == 0 {
                 break;
+            }
+            // A ZIP cannot hold the same name twice.
+            if !names.insert(name.clone()) {
+                continue;
             }
             if let Ok(text) = read_tail(&path, budget) {
                 push(format!("logs/{name}"), text, &mut budget);
@@ -715,6 +778,7 @@ mod tests {
             ),
             data_root: Some(root.clone()),
             home: Some(directory.path().to_path_buf()),
+            service_logs: Vec::new(),
         };
         let path = directory.path().join("bundle.zip");
         write_bundle(&path, &inputs).unwrap();
@@ -771,6 +835,7 @@ mod tests {
             daemon_diagnostics: "{}".into(),
             data_root: Some(root),
             home: None,
+            service_logs: Vec::new(),
         };
         let entries = collect_entries(&inputs);
         let total = entries.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
@@ -786,6 +851,141 @@ mod tests {
             "newest line kept"
         );
         assert!(!core.contains("line 00000000 "), "oldest line dropped");
+    }
+
+    fn service_log_response(files: &[(&str, &str, bool)]) -> DaemonServiceLog {
+        DaemonServiceLog {
+            status: "included".into(),
+            files: files
+                .iter()
+                .map(
+                    |(name, text, truncated)| crate::daemon::DaemonServiceLogFile {
+                        name: (*name).into(),
+                        text: (*text).into(),
+                        truncated: *truncated,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_service_log_is_archived_and_a_planted_link_or_token_never_reaches_the_zip() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("MultiCore");
+        data_root_with_secrets(&root);
+        // The user's own logs directory happens to hold a `service.log` too.
+        fs::write(root.join("logs").join("service.log"), "user copy\n").unwrap();
+        let home = directory.path().to_string_lossy().into_owned();
+        let planted = format!(
+            "1700000000 prepare generation 2 refused (NotReady) at resolve: GET {SUBSCRIPTION_URL} token={SUBSCRIPTION_TOKEN}\n\
+             1700000001 secret={CONTROLLER_SECRET} hwid {DEVICE_ID} home {home}\\x\n\
+             1700000002 share vless://{DEVICE_ID}@node.example.org:443#Germany\n"
+        );
+        // What the service sends is already redacted; the archive redacts it once more.
+        let served = multicore_core::service_protocol::redact_service_log(&planted);
+        let (note, service_logs) = service_log_entries(Ok(service_log_response(&[
+            ("service.log", &served, true),
+            (
+                "service.log.1",
+                "1690000000 set_tun on ok in 812 ms\n",
+                false,
+            ),
+            ("../evil", "nope", false),
+        ])));
+        assert!(
+            note.contains("logs/service.log, logs/service.log.1"),
+            "{note}"
+        );
+        let inputs = BundleInputs {
+            system: format!("system\n{note}"),
+            diagnostics: "diagnostics".into(),
+            daemon_diagnostics: "{}".into(),
+            data_root: Some(root.clone()),
+            home: Some(directory.path().to_path_buf()),
+            service_logs,
+        };
+        let path = directory.path().join("bundle.zip");
+        write_bundle(&path, &inputs).unwrap();
+        let entries = read_zip(&path);
+        let service = &entries["logs/service.log"];
+        assert!(service.starts_with(TRUNCATED_MARKER), "{service}");
+        assert!(service.contains("1700000000 prepare generation 2 refused (NotReady) at resolve"));
+        assert!(
+            !service.contains("user copy"),
+            "the service's file wins the name"
+        );
+        assert!(entries["logs/service.log.1"].contains("set_tun on ok in 812 ms"));
+        assert!(!entries.keys().any(|name| name.contains("evil")));
+        assert!(entries["system.txt"].contains("Журнал службы"));
+        for (name, text) in &entries {
+            for secret in [
+                SUBSCRIPTION_URL,
+                SUBSCRIPTION_TOKEN,
+                CONTROLLER_SECRET,
+                DEVICE_ID,
+                "panel.example.net",
+                "node.example.org",
+                "vless://",
+                home.as_str(),
+            ] {
+                assert!(!text.contains(secret), "{name} leaks {secret}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_usable_service_log_system_txt_says_why_and_nothing_else_is_added() {
+        for (result, expected) in [
+            (
+                Ok(DaemonServiceLog {
+                    status: "too_old".into(),
+                    files: Vec::new(),
+                }),
+                "service too old",
+            ),
+            (
+                Ok(DaemonServiceLog {
+                    status: "no_service".into(),
+                    files: Vec::new(),
+                }),
+                "режим без службы",
+            ),
+            (
+                Ok(DaemonServiceLog {
+                    status: "busy".into(),
+                    files: Vec::new(),
+                }),
+                "другой пользователь",
+            ),
+            (
+                Ok(DaemonServiceLog {
+                    status: "something_new".into(),
+                    files: Vec::new(),
+                }),
+                "не ответила",
+            ),
+            (Err(DaemonError::new("404")), "фоновый сервис не ответил"),
+            (Ok(service_log_response(&[])), "пуст"),
+        ] {
+            let (note, files) = service_log_entries(result);
+            assert!(note.starts_with("Журнал службы"), "{note}");
+            assert!(note.contains(expected), "{note}");
+            assert!(files.is_empty());
+        }
+        let inputs = BundleInputs {
+            system: "system".into(),
+            diagnostics: "diagnostics".into(),
+            daemon_diagnostics: "{}".into(),
+            data_root: None,
+            home: None,
+            service_logs: Vec::new(),
+        };
+        assert!(
+            !collect_entries(&inputs)
+                .iter()
+                .any(|(name, _)| name.starts_with("logs/service"))
+        );
     }
 
     #[test]

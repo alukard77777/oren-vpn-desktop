@@ -170,6 +170,10 @@ const SESSION_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 // The daemon serves canonical group icons of at most 128 KiB.
 const GROUP_ICON_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
 const TROUBLESHOOT_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
+/// 512 KiB of service log text, JSON-escaped.
+const SERVICE_LOG_RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// The daemon pages the log from the service, possibly behind a `Prepare` holding its lock.
+const SERVICE_LOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// One check: the clock check tries three servers at six seconds each.
 const TROUBLESHOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
 /// Fixes wait for the administrator prompt and for services to stop.
@@ -332,6 +336,24 @@ pub struct DaemonDiagnostics {
     pub logs: Vec<DaemonDiagnosticLog>,
     #[serde(default)]
     pub mappings: Vec<DaemonProxyMapping>,
+}
+
+/// GET /v1/service-log: the always-ready service's own log, redacted by the service.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DaemonServiceLog {
+    /// `included`, `no_service`, `too_old`, `busy` or `unavailable`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub files: Vec<DaemonServiceLogFile>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DaemonServiceLogFile {
+    pub name: String,
+    pub text: String,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// GET /v1/session: when the live connection started and Mihomo's cumulative byte counters.
@@ -634,6 +656,11 @@ pub trait DaemonClient: Send + Sync {
     /// GET /v1/diagnostics. Contains only bounded, redacted runtime data.
     fn diagnostics(&self) -> Result<DaemonDiagnostics, DaemonError> {
         Err(DaemonError::new("Диагностика недоступна."))
+    }
+
+    /// GET /v1/service-log («Сохранить лог…»). Daemons without the route answer 404.
+    fn service_log(&self) -> Result<DaemonServiceLog, DaemonError> {
+        Err(DaemonError::new("Журнал службы недоступен."))
     }
 
     /// GET /v1/dashboard-url. The returned URL embeds the ephemeral Mihomo controller secret for
@@ -1344,6 +1371,15 @@ impl DaemonClient for HttpDaemonClient {
 
     fn stage_update_via_service(&self, version: &str) -> Result<(), DaemonError> {
         self.post_service_update("/v1/service/update/stage", version, 200)
+    }
+
+    fn service_log(&self) -> Result<DaemonServiceLog, DaemonError> {
+        self.send_json(
+            self.http
+                .get(self.endpoint("/v1/service-log"))
+                .timeout(SERVICE_LOG_REQUEST_TIMEOUT),
+            SERVICE_LOG_RESPONSE_LIMIT_BYTES,
+        )
     }
 
     fn troubleshoot_check(

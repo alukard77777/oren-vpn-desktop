@@ -4623,11 +4623,14 @@ fn save_diagnostics_archive(
             .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }).to_string()),
         Err(error) => serde_json::json!({ "error": error.to_string() }).to_string(),
     };
-    let inputs = log_bundle::BundleInputs::for_this_user(
-        log_bundle::system_report(facts),
+    // The service's own log is SYSTEM/root-only: the daemon asks the service for it.
+    let (service_log_note, service_logs) = log_bundle::service_log_entries(client.service_log());
+    let mut inputs = log_bundle::BundleInputs::for_this_user(
+        log_bundle::system_report(facts) + &service_log_note,
         diagnostics,
         daemon_diagnostics,
     );
+    inputs.service_logs = service_logs;
     Some(
         log_bundle::write_bundle(&path, &inputs)
             .map(|()| fallback)
