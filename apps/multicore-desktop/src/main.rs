@@ -7234,7 +7234,7 @@ mod window_tests {
             "profile-scroll := OverlayScroll",
             "Подписок пока нет",
             "Удалить подписку?",
-            "До 16 подписок · активна только одна",
+            "До 100 подписок · активна только одна",
             "Изменить URL",
             "root.settings-section == \"updates\"",
             "profile-menu-keyboard-open",

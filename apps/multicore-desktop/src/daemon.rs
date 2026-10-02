@@ -1148,7 +1148,7 @@ fn known_error_message(code: &str) -> Option<&'static str> {
     Some(match code {
         "profile_busy" => tr!("Отключитесь перед изменением подписки."),
         "profile_limit" => {
-            tr!("Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите.")
+            tr!("Достигнут предел: не больше 100 подписок. Удалите ненужную и повторите.")
         }
         "subscription_unreachable" => {
             tr!(

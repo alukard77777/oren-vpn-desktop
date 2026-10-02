@@ -112,8 +112,8 @@ msgstr "The background service's response is too large."
 msgid "Отключитесь перед изменением подписки."
 msgstr "Disconnect before editing subscriptions."
 
-msgid "Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите."
-msgstr "Limit reached: up to 16 subscriptions. Delete one and try again."
+msgid "Достигнут предел: не больше 100 подписок. Удалите ненужную и повторите."
+msgstr "Limit reached: up to 100 subscriptions. Delete one and try again."
 
 msgid "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
 msgstr "The subscription server is unreachable. Check your internet connection and try again."
@@ -1551,8 +1551,8 @@ msgstr "Open"
 msgid "ОБНОВЛЕНИЯ"
 msgstr "UPDATES"
 
-msgid "До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве"
-msgstr "Up to 16 subscriptions · one active at a time · links stay on this device"
+msgid "До 100 подписок · активна только одна · ссылки хранятся только на этом устройстве"
+msgstr "Up to 100 subscriptions · one active at a time · links stay on this device"
 
 msgid "Добавляем подписку с {}…"
 msgstr "Adding from {}…"
