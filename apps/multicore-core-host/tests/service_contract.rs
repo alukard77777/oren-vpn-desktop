@@ -2102,6 +2102,7 @@ mod unix_service {
                 user_key: "uid:1000".into(),
                 data_root: PathBuf::from("/home/alice/.local/share/multicore"),
                 uid: 1000,
+                administrator: false,
             })
         });
         let (_dir, path, service) = start_server(verifier);
@@ -2178,6 +2179,7 @@ mod unix_service {
                 user_key: "uid:1000".into(),
                 data_root: PathBuf::from("/home/alice/.local/share/multicore"),
                 uid: 1000,
+                administrator: false,
             })
         });
         let (_dir, path, service) = start_server(verifier);
