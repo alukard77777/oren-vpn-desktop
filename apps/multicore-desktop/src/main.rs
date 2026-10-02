@@ -5700,17 +5700,19 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
     // A notice the user has not seen yet opens its popover once, on launch or
-    // when a refresh brings a new one; an unchanged notice stays behind the bell.
+    // when a refresh brings a new one; an unchanged notice stays behind the bell. Like a
+    // switch's notice it hides itself after 15 s (paused while the pointer is over it).
     let fingerprint = announcement_fingerprint(&snapshot.subscription.announcement_text);
     if let Some(fingerprint) = &fingerprint
         && ui.get_announcement_seen().as_str() != fingerprint
     {
         ui.set_announcement_seen(fingerprint.as_str().into());
         ui.set_announcement_unread(true);
+        ui.set_announcement_auto_hide(true);
         ui.set_announcement_open(true);
     }
     // Switching subscriptions shows the new one's notice, which hides itself after 15 s
-    // unless the pointer rests on it; the bell still reopens it.
+    // (paused while the pointer is over it); the bell still reopens it.
     let switched = SWITCH_NOTICE.with(|notice| {
         notice.borrow_mut().observe(
             snapshot.profiles.active_id.as_deref(),

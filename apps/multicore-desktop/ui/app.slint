@@ -1329,9 +1329,20 @@ export component AppWindow inherits Window {
     in-out property <bool> service-offer-dismissed: false;
     // A new notice nobody has opened yet: the bell shows its dot only then.
     in-out property <bool> announcement-unread: false;
-    // Opened by a subscription switch: the popover closes itself after 15 s unless the
-    // pointer rests on it (or it is closed or reopened by hand).
+    // Opened by the app itself (a subscription switch, or a new notice on launch or refresh):
+    // the popover closes itself after 15 s. The countdown pauses only while the pointer is
+    // really over it, and resumes when the pointer leaves. Opened by hand, it stays.
     in-out property <bool> announcement-auto-hide: false;
+    // Quarter-second ticks left before an auto-opened notice closes (15 s).
+    private property <int> announcement-ticks-left: 60;
+    // The opening animation has settled; pointer positions from now on are stable.
+    private property <bool> announcement-hover-settled: false;
+    // First pointer position seen over the settled popover, and whether the pointer has
+    // moved from there: a cursor that merely rests where the popover appeared is no hover.
+    private property <bool> announcement-hover-anchored: false;
+    private property <length> announcement-hover-anchor-x;
+    private property <length> announcement-hover-anchor-y;
+    private property <bool> announcement-pointer-moved: false;
     // Window growth from the expanded rail (logical px; 0 = none), persisted so a
     // collapse after a restart still shrinks the window back.
     in-out property <int> rail-growth-delta: 0;
@@ -1641,16 +1652,35 @@ export component AppWindow inherits Window {
     }
 
     changed announcement-open => {
+        root.announcement-ticks-left = 60;
+        root.announcement-hover-settled = false;
+        root.announcement-hover-anchored = false;
+        root.announcement-pointer-moved = false;
         if (root.announcement-open) {
             root.announcement-unread = false;
         } else {
             root.announcement-auto-hide = false;
         }
     }
+    changed announcement-auto-hide => {
+        if (root.announcement-auto-hide) {
+            root.announcement-ticks-left = 60;
+        }
+    }
     Timer {
-        interval: 15s;
-        running: root.announcement-open && root.announcement-auto-hide;
-        triggered => { root.announcement-open = false; }
+        interval: 400ms;
+        running: root.announcement-open && !root.announcement-hover-settled;
+        triggered => { root.announcement-hover-settled = true; }
+    }
+    Timer {
+        interval: 250ms;
+        running: root.announcement-open && root.announcement-auto-hide && !announcement-popover.hovered;
+        triggered => {
+            root.announcement-ticks-left -= 1;
+            if (root.announcement-ticks-left <= 0) {
+                root.announcement-open = false;
+            }
+        }
     }
 
     changed visible-page => {
@@ -4997,12 +5027,22 @@ export component AppWindow inherits Window {
                 animate y { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                 animate transform-scale { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
-                // Resting the pointer on the notice keeps it open; a click still dismisses it.
-                TouchArea {
+                // The pointer over the notice pauses its countdown; a click still dismisses it.
+                property <bool> hovered: root.announcement-pointer-moved
+                    && (announcement-touch.has-hover || announcement-close-touch.has-hover);
+                announcement-touch := TouchArea {
                     enabled: announcement-popover.shown;
-                    changed has-hover => {
-                        if (self.has-hover) {
-                            root.announcement-auto-hide = false;
+                    pointer-event(event) => {
+                        if (event.kind != PointerEventKind.move || !root.announcement-hover-settled) {
+                            return;
+                        }
+                        if (!root.announcement-hover-anchored) {
+                            root.announcement-hover-anchor-x = self.mouse-x;
+                            root.announcement-hover-anchor-y = self.mouse-y;
+                            root.announcement-hover-anchored = true;
+                        } else if (Math.abs(self.mouse-x - root.announcement-hover-anchor-x) >= 2px
+                            || Math.abs(self.mouse-y - root.announcement-hover-anchor-y) >= 2px) {
+                            root.announcement-pointer-moved = true;
                         }
                     }
                     clicked => { root.announcement-open = false; }

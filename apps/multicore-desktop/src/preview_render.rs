@@ -23,7 +23,11 @@ use crate::{
 
 thread_local! {
     static LAST_WINDOW: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
+    /// Time skipped ahead by `advance_clock`, on top of the real clock.
+    static CLOCK_SKIP: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
+
+static CLOCK_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 struct PreviewPlatform;
 
@@ -32,6 +36,23 @@ impl slint::platform::Platform for PreviewPlatform {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
         LAST_WINDOW.with(|last| *last.borrow_mut() = Some(window.clone()));
         Ok(window)
+    }
+
+    fn duration_since_start(&self) -> Duration {
+        CLOCK_START.get_or_init(std::time::Instant::now).elapsed() + CLOCK_SKIP.get()
+    }
+}
+
+/// Moves Slint's clock forward in 50 ms frames (timers fire, animations finish) without
+/// waiting for real time to pass.
+fn advance_clock(total: Duration) {
+    let frame = Duration::from_millis(50);
+    let mut left = total;
+    while !left.is_zero() {
+        let step = left.min(frame);
+        CLOCK_SKIP.set(CLOCK_SKIP.get() + step);
+        slint::platform::update_timers_and_animations();
+        left -= step;
     }
 }
 
@@ -2229,4 +2250,92 @@ fn a_route_click_survives_snapshots_that_keep_the_rows() {
     release(x, y);
     assert_eq!(clicked.borrow().as_slice(), [SharedString::from("n2")]);
     ui.hide().expect("hide app window");
+}
+
+/// An auto-opened provider notice closes itself after 15 s. Only a pointer that really moves
+/// over it pauses the countdown, which resumes once the pointer leaves; a cursor resting where
+/// the popover appeared does not count.
+#[test]
+fn an_auto_opened_notice_closes_and_hover_only_pauses_it() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let open_notice = |pointer: Option<(f32, f32)>| {
+        let ui = AppWindow::new().expect("create app window");
+        ready(&ui);
+        ui.set_reduced_motion(false);
+        ui.set_subscription_announcement_text(s(
+            "Плановые работы сегодня в 23:00 по московскому времени.",
+        ));
+        let window = LAST_WINDOW
+            .with(|last| last.borrow().clone())
+            .expect("preview window adapter");
+        window
+            .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: 1.0 });
+        window.set_size(PhysicalSize::new(840, 720));
+        ui.show().expect("show app window");
+        if let Some((x, y)) = pointer {
+            window.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(x, y),
+            });
+        }
+        ui.set_announcement_auto_hide(true);
+        ui.set_announcement_open(true);
+        advance_clock(Duration::from_millis(100));
+        (ui, window)
+    };
+    let move_to = |window: &MinimalSoftwareWindow, x: f32, y: f32| {
+        window.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(x, y),
+        });
+        advance_clock(Duration::from_millis(50));
+    };
+
+    // Nobody touches it: closed after 15 s, not before.
+    let (ui, _window) = open_notice(None);
+    advance_clock(Duration::from_secs(14));
+    assert!(ui.get_announcement_open(), "still open before 15 s");
+    advance_clock(Duration::from_millis(1_500));
+    assert!(!ui.get_announcement_open(), "closed after 15 s");
+    ui.hide().expect("hide");
+
+    // The cursor rests where the popover appears (and the opening motion slides under it).
+    let (ui, window) = open_notice(Some((250.0, 120.0)));
+    advance_clock(Duration::from_millis(600));
+    move_to(&window, 250.0, 120.0);
+    move_to(&window, 250.5, 120.0);
+    advance_clock(Duration::from_secs(15));
+    assert!(!ui.get_announcement_open(), "a resting cursor is no hover");
+    ui.hide().expect("hide");
+
+    // A real hover pauses it as long as the pointer stays; leaving resumes the countdown.
+    let (ui, window) = open_notice(None);
+    advance_clock(Duration::from_secs(10));
+    move_to(&window, 240.0, 110.0);
+    move_to(&window, 250.0, 120.0);
+    move_to(&window, 260.0, 125.0);
+    advance_clock(Duration::from_secs(30));
+    assert!(ui.get_announcement_open(), "paused while hovered");
+    move_to(&window, 600.0, 650.0);
+    advance_clock(Duration::from_secs(3));
+    assert!(
+        ui.get_announcement_open(),
+        "resumes with the time it had left"
+    );
+    advance_clock(Duration::from_secs(3));
+    assert!(
+        !ui.get_announcement_open(),
+        "closed once the remaining time ran out"
+    );
+    ui.hide().expect("hide");
+
+    // Opened by hand from the bell: it stays.
+    let (ui, _window) = open_notice(None);
+    ui.set_announcement_open(false);
+    advance_clock(Duration::from_millis(100));
+    ui.set_announcement_open(true);
+    advance_clock(Duration::from_secs(20));
+    assert!(
+        ui.get_announcement_open(),
+        "a notice opened by hand stays open"
+    );
+    ui.hide().expect("hide");
 }
