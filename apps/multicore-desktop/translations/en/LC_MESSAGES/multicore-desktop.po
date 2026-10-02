@@ -14,3 +14,341 @@ msgstr ""
 
 msgid "Выбран провайдером подписки"
 msgstr "Set by your subscription provider"
+
+msgid "Подписка добавлена. Переключиться на неё можно после отключения VPN."
+msgstr "Subscription added. You can switch to it after disconnecting the VPN."
+
+msgid "Профиль не добавлен"
+msgstr "No profile yet"
+
+msgid "Добавьте подписку"
+msgstr "Add a subscription"
+
+msgid "Вставьте URL — остальное настроим автоматически."
+msgstr "Paste a URL — we'll set up the rest."
+
+msgid "Нет профиля"
+msgstr "No profile"
+
+msgid "Маршрут не выбран"
+msgstr "No route selected"
+
+msgid "Подключиться"
+msgstr "Connect"
+
+msgid "Импорт"
+msgstr "Import"
+
+msgid "Добавляем профиль…"
+msgstr "Adding profile…"
+
+msgid "Проверяем подписку и доступные маршруты."
+msgstr "Checking the subscription and its routes."
+
+msgid "Новый профиль"
+msgstr "New profile"
+
+msgid "Добавляем…"
+msgstr "Adding…"
+
+msgid "Готово"
+msgstr "Ready"
+
+msgid "Можно подключаться"
+msgstr "Ready to connect"
+
+msgid "Подключение"
+msgstr "Connecting"
+
+msgid "Устанавливаем соединение…"
+msgstr "Establishing connection…"
+
+msgid "Подключаем…"
+msgstr "Connecting…"
+
+msgid "Подключено"
+msgstr "Connected"
+
+msgid "Соединение защищено"
+msgstr "Connection secured"
+
+msgid "Текущий маршрут"
+msgstr "Current route"
+
+msgid "Отключиться"
+msgstr "Disconnect"
+
+msgid "Отключение"
+msgstr "Disconnecting"
+
+msgid "Завершаем соединение…"
+msgstr "Closing connection…"
+
+msgid "Отключаем локальный маршрут."
+msgstr "Stopping the local route."
+
+msgid "Отключаем…"
+msgstr "Stopping…"
+
+msgid "Не удалось подключиться"
+msgstr "Couldn't connect"
+
+msgid "Что-то пошло не так"
+msgstr "Something went wrong"
+
+msgid "Авто"
+msgstr "Auto"
+
+msgid "Проверить снова"
+msgstr "Check again"
+
+msgid "Нет связи с сервисом"
+msgstr "Service unreachable"
+
+msgid "Сервис не отвечает"
+msgstr "Service is down"
+
+msgid "Состояние неизвестно"
+msgstr "Status unknown"
+
+msgid "Сервис недоступен"
+msgstr "Service offline"
+
+msgid "Ограниченный режим"
+msgstr "Limited mode"
+
+msgid "Остановить туннель"
+msgstr "Stop tunnel"
+
+msgid "Обнаружены другие VPN-приложения ({}): они могут конфликтовать с MULTICORE. Закройте их перед подключением."
+msgstr "Other VPN apps found ({}): they may conflict with MULTICORE. Close them before connecting."
+
+msgid "Обнаружено другое VPN-приложение ({}): оно может конфликтовать с MULTICORE. Закройте его перед подключением."
+msgstr "Another VPN app found ({}): it may conflict with MULTICORE. Close it before connecting."
+
+msgid "Закрыть удалось не всё: {} запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows»."
+msgstr "Not everything closed: {} runs its engine as a Windows service, which this button can't stop without admin rights. Disconnect in that app before closing it, or stop its service in Windows Services."
+
+msgid "Фоновый сервис отвечает не полностью."
+msgstr "Background service is degraded."
+
+msgid "Основной"
+msgstr "Main"
+
+msgid "Проверяем доступность маршрута…"
+msgstr "Checking the route…"
+
+msgid "Повторите попытку через несколько секунд."
+msgstr "Try again in a few seconds."
+
+msgid "Фоновый сервис вернул неизвестное состояние."
+msgstr "Background service reported an unknown state."
+
+msgid "Проверяем фоновый сервис…"
+msgstr "Checking the service…"
+
+msgid "Проверка"
+msgstr "Checking"
+
+msgid "Проверяем состояние…"
+msgstr "Checking status…"
+
+msgid "Проверяем…"
+msgstr "Checking…"
+
+msgid "Не удалось загрузить подписки. Повторите попытку."
+msgstr "Couldn't load subscriptions. Try again."
+
+msgid "Не удалось активировать подписку. Повторите попытку."
+msgstr "Couldn't activate the subscription. Try again."
+
+msgid "Не удалось обновить подписку. Повторите попытку."
+msgstr "Couldn't update the subscription. Try again."
+
+msgid "Введите корректный HTTP(S) URL."
+msgstr "Enter a valid HTTP(S) URL."
+
+msgid "Не удалось изменить ссылку подписку. Повторите попытку."
+msgstr "Couldn't change the subscription link. Try again."
+
+msgid "Не удалось удалить подписку. Повторите попытку."
+msgstr "Couldn't delete the subscription. Try again."
+
+msgid "Отключитесь перед изменением подписки."
+msgstr "Disconnect to change the subscription."
+
+msgid "Дождитесь восстановления фонового сервиса."
+msgstr "Wait for the background service to recover."
+
+msgid "Дождитесь завершения текущей операции."
+msgstr "Wait for the current operation to finish."
+
+msgid "Подписка больше недоступна. Обновите список."
+msgstr "Subscription is gone. Refresh the list."
+
+msgid "Эту подписку сейчас нельзя обновить."
+msgstr "This subscription can't be updated now."
+
+msgid "Проверяем состояние подписок…"
+msgstr "Checking subscriptions…"
+
+msgid "Не удалось подтвердить изменение. Обновляем состояние подписок."
+msgstr "Couldn't confirm the change. Refreshing subscriptions."
+
+msgid "Подписка"
+msgstr "Subscription"
+
+msgid "Нет данных"
+msgstr "No data"
+
+msgid "Добавьте ссылку"
+msgstr "Add a link"
+
+msgid "Не обновлялась"
+msgstr "Never updated"
+
+msgid "Не удалось обновить. Рабочий профиль сохранён."
+msgstr "Update failed. The working profile is kept."
+
+msgid "Запускаем локальный маршрут…"
+msgstr "Starting the local route…"
+
+msgid "Дождитесь завершения операции подключения."
+msgstr "Wait until connecting finishes."
+
+msgid "Не удалось добавить подписку. Проверьте URL и повторите попытку."
+msgstr "Couldn't add the subscription. Check the URL and try again."
+
+msgid "Не удалось подтвердить завершение соединения. Проверяем состояние…"
+msgstr "Couldn't confirm the disconnect. Checking status…"
+
+msgid "Не удалось отключиться. Соединение остаётся активным."
+msgstr "Couldn't disconnect. The connection is still active."
+
+msgid "Не удалось отключиться. Повторите попытку."
+msgstr "Couldn't disconnect. Try again."
+
+msgid "Не удалось подтвердить состояние соединения. Повторите проверку."
+msgstr "Couldn't confirm the connection status. Check again."
+
+msgid "Не удалось обновить диагностику. Повторно откройте экран."
+msgstr "Couldn't refresh diagnostics. Reopen this page."
+
+msgid "Не удалось загрузить события. Повторите попытку."
+msgstr "Couldn't load events. Try again."
+
+msgid "Каталог маршрутов изменился. Обновляем задержку…"
+msgstr "Routes changed. Updating latency…"
+
+msgid "Не удалось проверить задержку. Повторите попытку."
+msgstr "Couldn't check latency. Try again."
+
+msgid "Не удалось загрузить маршруты. Повторите попытку."
+msgstr "Couldn't load routes. Try again."
+
+msgid "Подключено, но часть маршрутов не применилась. Проверьте выбор ещё раз."
+msgstr "Connected, but some routes weren't applied. Check your selection."
+
+msgid "Каталог маршрутов изменился. Обновляем его; повторите выбор."
+msgstr "Routes changed. Refreshing them; pick again."
+
+msgid "Каталог маршрутов обновлён. Повторите выбор."
+msgstr "Routes updated. Pick again."
+
+msgid "Не удалось подтвердить изменение маршрута. Каталог обновляется; повторите попытку."
+msgstr "Couldn't confirm the route change. Refreshing routes; try again."
+
+msgid "Не удалось изменить маршрут. Повторите попытку."
+msgstr "Couldn't change the route. Try again."
+
+msgid "Не выбран"
+msgstr "None"
+
+msgid "Событий пока нет."
+msgstr "No events yet."
+
+msgid "Готов"
+msgstr "Ready"
+
+msgid "Запуск"
+msgstr "Starting"
+
+msgid "Сбой"
+msgstr "Failed"
+
+msgid "Без проверки"
+msgstr "Unchecked"
+
+msgid "Выключен"
+msgstr "Off"
+
+msgid "Выкл"
+msgstr "Off"
+
+msgid "Неизвестно"
+msgstr "Unknown"
+
+msgid "таймаут"
+msgstr "timeout"
+
+msgid "нет связи"
+msgstr "offline"
+
+msgid "нет данных"
+msgstr "no data"
+
+msgid "Без названия"
+msgstr "Untitled"
+
+msgid "Срок неизвестен"
+msgstr "Expiry unknown"
+
+msgid "Срок истёк"
+msgstr "Expired"
+
+msgid "Бессрочно"
+msgstr "No expiry"
+
+msgid "Осталось {0} {1}"
+msgstr "{0} {1} left"
+
+msgid "{n} дн."
+msgid_plural "{n} дн."
+msgstr[0] "{n} day"
+msgstr[1] "{n} days"
+
+msgid "Подписка истекла {}"
+msgstr "Expired {}"
+
+msgid "Подписка истекла"
+msgstr "Expired"
+
+msgid "трафик {}"
+msgstr "data {}"
+
+msgid "Трафик исчерпан: {}"
+msgstr "Data used up: {}"
+
+msgid "Трафик: {} · осталось {}"
+msgstr "Data: {} · {} left"
+
+msgid "Трафик без лимита"
+msgstr "Unlimited data"
+
+msgid "до {}"
+msgstr "until {}"
+
+msgid "бессрочно"
+msgstr "no expiry"
+
+msgid "Б/с"
+msgstr "B/s"
+
+msgid "КБ/с"
+msgstr "KB/s"
+
+msgid "МБ/с"
+msgstr "MB/s"
+
+msgid "ГБ/с"
+msgstr "GB/s"
