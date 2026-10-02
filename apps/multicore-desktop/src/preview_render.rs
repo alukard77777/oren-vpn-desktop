@@ -833,6 +833,22 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_local_page(s("status"));
             ui.set_events(events());
         }),
+        // «Сохранить лог…» feedback: in progress, saved, failed (narrowest window).
+        ("status-save-saving-min", 700, 620, |ui| {
+            connected(ui);
+            ui.set_local_page(s("status"));
+            ui.set_diagnostics_save_state(s("saving"));
+        }),
+        ("status-save-saved-min", 700, 620, |ui| {
+            connected(ui);
+            ui.set_local_page(s("status"));
+            ui.set_diagnostics_save_state(s("saved"));
+        }),
+        ("status-save-failed-min", 700, 620, |ui| {
+            connected(ui);
+            ui.set_local_page(s("status"));
+            ui.set_diagnostics_save_state(s("failed"));
+        }),
         ("home-menu-connected", 840, 720, |ui| {
             connected(ui);
             ui.set_subscription_profiles(profiles(4));
