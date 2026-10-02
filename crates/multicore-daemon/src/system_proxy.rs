@@ -96,6 +96,7 @@ pub struct SystemProxy {
     settings: Box<dyn InternetSettings>,
     marker_path: PathBuf,
     port: u16,
+    tunnel: Option<multicore_core::TunnelProxy>,
 }
 
 impl SystemProxy {
@@ -104,6 +105,25 @@ impl SystemProxy {
             settings,
             marker_path,
             port,
+            tunnel: None,
+        }
+    }
+
+    /// While this proxy is applied, `tunnel` names the mixed port, so the daemon's own
+    /// subscription downloads go through the connection too (see `TunnelProxy`).
+    #[must_use]
+    pub fn publishing_to(mut self, tunnel: multicore_core::TunnelProxy) -> Self {
+        self.tunnel = Some(tunnel);
+        self
+    }
+
+    fn publish(&self, applied: bool) {
+        if let Some(tunnel) = &self.tunnel {
+            tunnel.set(
+                applied.then(|| {
+                    std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.port))
+                }),
+            );
         }
     }
 
@@ -122,10 +142,12 @@ impl SystemProxy {
             return Err(error);
         }
         self.settings.notify_changed();
+        self.publish(true);
         Ok(())
     }
 
     pub fn restore(&self) -> io::Result<()> {
+        self.publish(false);
         recover(self.settings.as_ref(), &self.marker_path)
     }
 }
@@ -404,6 +426,24 @@ mod tests {
         proxy.restore().unwrap();
         assert_eq!(*settings.values.lock().unwrap(), user_settings());
         assert!(!directory.path().join("system-proxy.json").exists());
+    }
+
+    /// While connected in proxy mode the daemon's own downloads go through the mixed port;
+    /// once disconnected (or if applying failed) they go directly again.
+    #[test]
+    fn the_mixed_port_is_published_only_while_the_proxy_is_applied() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = FakeSettings::default();
+        *settings.values.lock().unwrap() = user_settings();
+        let tunnel = multicore_core::TunnelProxy::default();
+        let proxy = proxy(&settings, directory.path()).publishing_to(tunnel.clone());
+        assert_eq!(tunnel.get(), None);
+
+        proxy.apply().unwrap();
+        assert_eq!(tunnel.get(), Some("127.0.0.1:28765".parse().unwrap()));
+
+        proxy.restore().unwrap();
+        assert_eq!(tunnel.get(), None);
     }
 
     #[test]

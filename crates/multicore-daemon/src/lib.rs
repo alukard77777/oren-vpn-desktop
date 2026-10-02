@@ -1719,8 +1719,10 @@ fn valid_subscription_source_url(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-/// Stays below the desktop's 150 s subscription request timeout.
-const SUBSCRIPTION_FETCH_DEADLINE: Duration = Duration::from_secs(120);
+/// One download of a subscription (all its requests, through the connection and directly)
+/// ends within this, with the subscription or with a reason: the refresh indicator never spins
+/// for minutes. Well below the desktop's 150 s subscription request timeout.
+const SUBSCRIPTION_FETCH_DEADLINE: Duration = Duration::from_secs(45);
 
 fn subscription_fetch_reason(error: FetchError) -> String {
     match error {

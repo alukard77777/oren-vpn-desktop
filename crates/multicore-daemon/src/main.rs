@@ -8,7 +8,7 @@ use std::{
 
 use multicore_core::{
     DeviceIdentity, MihomoRuntimeControl, ProfileStore, ReqwestHttpClient, Snapshot,
-    SubscriptionFetcher, default_ipv4_interface, stage_runtime_with_mihomo_control,
+    SubscriptionFetcher, TunnelProxy, default_ipv4_interface, stage_runtime_with_mihomo_control,
 };
 use multicore_daemon::connection_mode::{Backed, ModeController};
 use multicore_daemon::elevated_controller::{production_factory, runtime_generation_from_path};
@@ -91,7 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_directory.join("profiles"),
         Some(data_directory.join("snapshots")),
     )?;
-    let fetcher = SubscriptionFetcher::new(ReqwestHttpClient::new(device_identity)?);
+    // Named by the system proxy while connected in proxy mode: downloads go through it first.
+    let tunnel_proxy = TunnelProxy::default();
+    let fetcher = SubscriptionFetcher::new(
+        ReqwestHttpClient::new(device_identity)?.with_tunnel_proxy(tunnel_proxy.clone()),
+    );
     let runtime_root = data_directory.join("runtime");
     #[cfg(windows)]
     let system_proxy_marker = data_directory.join("system-proxy.json");
@@ -110,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dashboard_directory: None,
         log_path: data_directory.join("logs").join("latest-core.log"),
         marker_path: system_proxy_marker.clone(),
+        tunnel_proxy: tunnel_proxy.clone(),
     };
     let elevated_factory = Mutex::new(None);
     let warm_stages = WarmStages::default();
@@ -506,6 +511,7 @@ mod proxy_mode {
         pub(crate) dashboard_directory: Option<PathBuf>,
         pub(crate) log_path: PathBuf,
         pub(crate) marker_path: PathBuf,
+        pub(crate) tunnel_proxy: multicore_core::TunnelProxy,
     }
 
     impl ProxyMode {
@@ -521,7 +527,8 @@ mod proxy_mode {
                 Box::new(WinInetSettings),
                 self.marker_path.clone(),
                 mixed_port,
-            );
+            )
+            .publishing_to(self.tunnel_proxy.clone());
             Arc::new(ModeController::Proxy(Backed::Service(
                 SystemProxyController::new(
                     ServiceCoresController::new(service.clone(), generation),
@@ -562,7 +569,8 @@ mod proxy_mode {
             let launcher =
                 WindowsJobLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
                     .map_err(|_| BackendError::new())?;
-            let proxy = SystemProxy::new(Box::new(WinInetSettings), self.marker_path.clone(), port);
+            let proxy = SystemProxy::new(Box::new(WinInetSettings), self.marker_path.clone(), port)
+                .publishing_to(self.tunnel_proxy.clone());
             let controller = Arc::new(ModeController::Proxy(Backed::OnDemand(
                 SystemProxyController::new(
                     SidecarProcessController::with_launcher(paths, launcher),

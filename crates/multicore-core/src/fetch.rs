@@ -32,6 +32,52 @@ const SUBSCRIPTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SUBSCRIPTION_REDIRECTS: usize = 5;
 const RETRY_DELAY: Duration = Duration::from_millis(800);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
+/// A 429/5xx is asked again only when it came back this fast. A slow one is the provider's
+/// gateway giving up on its own backend (one panel answers every request it does not serve with
+/// a 502 after ~15 s): asking again only doubled the wait.
+const QUICK_STATUS_RETRY_WITHIN: Duration = Duration::from_secs(5);
+/// One request through the running connection's local proxy; past it (or on any transport
+/// failure) the request goes to the provider directly, once.
+const TUNNEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The same for a logo or group icon, within its own `LOGO_TOTAL_TIMEOUT`.
+const TUNNEL_IMAGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
+/// The native (combined) request answers first; past this head start the per-core requests
+/// run alongside it, so a provider that is slow to refuse the combined request costs a few
+/// seconds instead of its whole timeout.
+const NATIVE_HEAD_START: Duration = Duration::from_secs(3);
+/// How long a Mihomo configuration that needs no Xray still waits for the Xray answer.
+const XRAY_GRACE: Duration = Duration::from_secs(2);
+
+/// The local proxy of the running connection (Mihomo's loopback mixed port), published by the
+/// daemon while MULTICORE is connected in system-proxy mode and cleared when it disconnects.
+/// While it is set, subscription, logo and icon downloads go through the connection first (the
+/// provider may be unreachable directly: DNS or DPI blocking), then directly once. In TUN mode
+/// there is no such port: direct requests already follow the tunnel's routes.
+#[derive(Clone, Default)]
+pub struct TunnelProxy(Arc<std::sync::RwLock<Option<SocketAddr>>>);
+
+impl TunnelProxy {
+    /// Only a loopback address is ever used.
+    pub fn set(&self, address: Option<SocketAddr>) {
+        if let Ok(mut current) = self.0.write() {
+            *current = address.filter(|address| address.ip().is_loopback());
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Option<SocketAddr> {
+        self.0.read().ok().and_then(|current| *current)
+    }
+}
+
+impl std::fmt::Debug for TunnelProxy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("TunnelProxy")
+            .field(&self.get())
+            .finish()
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpResponse {
@@ -223,6 +269,8 @@ impl FetchError {
 pub enum AttemptOutcome {
     /// Never attempted (e.g. the native combined request already answered).
     Skipped,
+    /// Started, then given up on: another request brought the configuration first.
+    Abandoned,
     Ok {
         status: u16,
     },
@@ -257,6 +305,7 @@ impl std::fmt::Display for AttemptOutcome {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Skipped => write!(formatter, "skipped"),
+            Self::Abandoned => write!(formatter, "abandoned"),
             Self::Ok { status } => write!(formatter, "ok({status})"),
             Self::Failed {
                 reason,
@@ -329,6 +378,18 @@ pub struct ReqwestHttpClient {
     /// helps when the provider domain is unreachable directly (DNS or DPI
     /// blocking) but reachable through the user's configured proxy.
     system_proxy_client: reqwest::Client,
+    headers: HeaderMap,
+    tunnel: TunnelProxy,
+    tunnel_attempt_timeout: Duration,
+    /// Clients through the tunnel proxy, for the address they were built for.
+    tunnel_clients: Arc<std::sync::Mutex<Option<TunnelClients>>>,
+}
+
+#[derive(Clone)]
+struct TunnelClients {
+    proxy: SocketAddr,
+    subscription: reqwest::Client,
+    image: reqwest::Client,
 }
 
 impl ReqwestHttpClient {
@@ -351,22 +412,62 @@ impl ReqwestHttpClient {
             "x-device-model",
             HeaderValue::from_str(identity.device_model()).map_err(|_| FetchError::Network)?,
         );
-        let builder = || {
-            reqwest::Client::builder()
-                .default_headers(headers.clone())
-                .redirect(subscription_redirect_policy())
-                .connect_timeout(SUBSCRIPTION_CONNECT_TIMEOUT)
-                .timeout(SUBSCRIPTION_REQUEST_TIMEOUT)
-        };
-        let subscription_client = builder()
+        let subscription_client = subscription_client_builder(&headers)
             .no_proxy()
             .build()
             .map_err(|_| FetchError::Network)?;
-        let system_proxy_client = builder().build().map_err(|_| FetchError::Network)?;
+        let system_proxy_client = subscription_client_builder(&headers)
+            .build()
+            .map_err(|_| FetchError::Network)?;
         Ok(Self {
             subscription_client,
             system_proxy_client,
+            headers,
+            tunnel: TunnelProxy::default(),
+            tunnel_attempt_timeout: TUNNEL_ATTEMPT_TIMEOUT,
+            tunnel_clients: Arc::default(),
         })
+    }
+
+    /// Downloads go through `tunnel` first whenever it names a proxy (see [`TunnelProxy`]).
+    #[must_use]
+    pub fn with_tunnel_proxy(mut self, tunnel: TunnelProxy) -> Self {
+        self.tunnel = tunnel;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_tunnel_attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.tunnel_attempt_timeout = timeout;
+        self
+    }
+
+    /// The clients through the running connection's proxy, while there is one.
+    fn tunnel_clients(&self) -> Option<TunnelClients> {
+        let proxy = self.tunnel.get()?;
+        let mut cached = self.tunnel_clients.lock().ok()?;
+        if let Some(clients) = cached.as_ref().filter(|clients| clients.proxy == proxy) {
+            return Some(clients.clone());
+        }
+        let through = || reqwest::Proxy::all(format!("http://{proxy}")).ok();
+        let subscription = subscription_client_builder(&self.headers)
+            .proxy(through()?)
+            .build()
+            .ok()?;
+        let image = reqwest::Client::builder()
+            .proxy(through()?)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .ok()?;
+        let clients = TunnelClients {
+            proxy,
+            subscription,
+            image,
+        };
+        *cached = Some(clients.clone());
+        Some(clients)
     }
 
     async fn get_subscription(
@@ -374,9 +475,28 @@ impl ReqwestHttpClient {
         url: &str,
         user_agent: &'static str,
     ) -> Result<HttpResponse, FetchError> {
+        if let Some(tunnel) = self.tunnel_clients() {
+            let through = tokio::time::timeout(
+                self.tunnel_attempt_timeout,
+                get_with_quick_status_retry(&tunnel.subscription, url, user_agent),
+            )
+            .await;
+            match through {
+                Ok(Ok(response)) => return Ok(response),
+                // Answers about the subscription itself are the same either way.
+                Ok(Err(error @ (FetchError::Redirect | FetchError::TooLarge))) => {
+                    return Err(error);
+                }
+                // The connection did not get through to the provider: straight to it, once.
+                // The system proxy is this same connection now, so it is not tried again.
+                Ok(Err(_)) | Err(_) => {}
+            }
+            return get_with_quick_status_retry(&self.subscription_client, url, user_agent).await;
+        }
+        let started = std::time::Instant::now();
         match perform_get_detailed(&self.subscription_client, url, user_agent).await {
             Ok(response) => {
-                if let Some(delay) = retry_delay_for_status(&response) {
+                if let Some(delay) = retry_delay_for_status(&response, started.elapsed()) {
                     tokio::time::sleep(delay).await;
                     return perform_get(&self.subscription_client, url, user_agent).await;
                 }
@@ -388,6 +508,34 @@ impl ReqwestHttpClient {
             }
             Err(TransportFailure::Other(error)) => Err(error),
         }
+    }
+}
+
+fn subscription_client_builder(headers: &HeaderMap) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .default_headers(headers.clone())
+        .redirect(subscription_redirect_policy())
+        .connect_timeout(SUBSCRIPTION_CONNECT_TIMEOUT)
+        .timeout(SUBSCRIPTION_REQUEST_TIMEOUT)
+}
+
+/// One request, asked once more after a quick 429/5xx (see [`QUICK_STATUS_RETRY_WITHIN`]).
+async fn get_with_quick_status_retry(
+    client: &reqwest::Client,
+    url: &str,
+    user_agent: &'static str,
+) -> Result<HttpResponse, FetchError> {
+    let started = std::time::Instant::now();
+    match perform_get_detailed(client, url, user_agent).await {
+        Ok(response) => {
+            if let Some(delay) = retry_delay_for_status(&response, started.elapsed()) {
+                tokio::time::sleep(delay).await;
+                return perform_get(client, url, user_agent).await;
+            }
+            Ok(response.response)
+        }
+        Err(TransportFailure::Connect) => Err(FetchError::Network),
+        Err(TransportFailure::Other(error)) => Err(error),
     }
 }
 
@@ -460,7 +608,18 @@ impl ReqwestHttpClient {
         let parsed = reqwest::Url::parse(url).map_err(|_| FetchError::Network)?;
         let host = parsed.host_str().ok_or(FetchError::Network)?;
         let port = parsed.port_or_known_default().ok_or(FetchError::Network)?;
+        // Checked even when the request goes through the connection, which resolves the name
+        // again itself: an image link never reaches this machine's own network.
         let addresses = resolve_global_logo_addresses(host, port).await?;
+        if let Some(tunnel) = self.tunnel_clients()
+            && let Ok(Ok(response)) = tokio::time::timeout(
+                TUNNEL_IMAGE_ATTEMPT_TIMEOUT,
+                perform_get(&tunnel.image, url, user_agent),
+            )
+            .await
+        {
+            return Ok(response);
+        }
         let client = build_pinned_logo_client(host, &addresses)?;
         perform_get(&client, url, user_agent).await
     }
@@ -578,8 +737,12 @@ fn is_tls_error(error: &reqwest::Error) -> bool {
 
 /// One quick retry for rate limiting and transient upstream errors. Anti-bot
 /// front ends commonly answer the first burst of requests with 429/503.
-fn retry_delay_for_status(response: &DetailedResponse) -> Option<Duration> {
+/// Only a quick answer is asked again (see [`QUICK_STATUS_RETRY_WITHIN`]).
+fn retry_delay_for_status(response: &DetailedResponse, elapsed: Duration) -> Option<Duration> {
     let status = response.response.status;
+    if elapsed >= QUICK_STATUS_RETRY_WITHIN {
+        return None;
+    }
     if status == 429 || matches!(status, 500 | 502 | 503 | 504) {
         Some(
             response
@@ -780,11 +943,20 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
     ) {
         let started = std::time::Instant::now();
         let host = safe_host(url);
-        let native_response = self.client.get(url, UA_NATIVE).await;
-        let native_outcome = AttemptOutcome::from_result(&native_response);
+        let (native_response, per_core) = self.negotiate(url).await;
+        let per_core_skipped = if matches!(per_core, PerCoreState::Abandoned) {
+            AttemptOutcome::Abandoned
+        } else {
+            AttemptOutcome::Skipped
+        };
+        let native_outcome = native_response
+            .as_ref()
+            .map_or(AttemptOutcome::Abandoned, AttemptOutcome::from_result);
 
         let native_error = match native_response {
-            Ok(response) if response.status_is_success() => {
+            // Abandoned: the per-core requests brought a configuration first.
+            None => FetchError::Timeout,
+            Some(Ok(response)) if response.status_is_success() => {
                 let body = strip_utf8_bom(&response.body);
                 if looks_like_native_bundle(body) {
                     // A JSON array means the backend recognised the combined
@@ -808,8 +980,8 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
                     let diagnostics = FetchDiagnostics {
                         host,
                         native: native_outcome,
-                        mihomo: AttemptOutcome::Skipped,
-                        xray: AttemptOutcome::Skipped,
+                        mihomo: per_core_skipped,
+                        xray: per_core_skipped,
                         elapsed_ms: u64::try_from(started.elapsed().as_millis())
                             .unwrap_or(u64::MAX),
                     };
@@ -819,16 +991,24 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
                 // recognise the combined request; try the per-core requests.
                 FetchError::NotSubscription
             }
-            Ok(response) => FetchError::HttpStatus(response.status),
-            Err(error) => error,
+            Some(Ok(response)) => FetchError::HttpStatus(response.status),
+            Some(Err(error)) => error,
         };
 
-        let (mihomo, xray) = tokio::join!(
-            self.client.get(url, UA_MIHOMO),
-            self.client.get(url, UA_XRAY)
-        );
+        let PerCore {
+            mihomo,
+            xray,
+            xray_skipped,
+        } = match per_core {
+            PerCoreState::Done(per_core) => per_core,
+            PerCoreState::NotStarted | PerCoreState::Abandoned => self.per_core(url).await,
+        };
         let mihomo_outcome = AttemptOutcome::from_result(&mihomo);
-        let xray_outcome = AttemptOutcome::from_result(&xray);
+        let xray_outcome = if xray_skipped {
+            AttemptOutcome::Skipped
+        } else {
+            AttemptOutcome::from_result(&xray)
+        };
         let outcome = match parse_fallback(url, mihomo, xray)
             .map_err(|error| prefer_informative(native_error, error))
         {
@@ -846,6 +1026,72 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         (outcome, diagnostics)
+    }
+
+    /// The native (combined) request first. When it has not answered within
+    /// [`NATIVE_HEAD_START`], the per-core requests run alongside it: a native bundle that
+    /// arrives first still wins; a Mihomo configuration that arrives first wins and the native
+    /// request is abandoned (`None`).
+    async fn negotiate(
+        &self,
+        url: &str,
+    ) -> (Option<Result<HttpResponse, FetchError>>, PerCoreState) {
+        let native = self.client.get(url, UA_NATIVE);
+        tokio::pin!(native);
+        if let Ok(response) = tokio::time::timeout(NATIVE_HEAD_START, &mut native).await {
+            return (Some(response), PerCoreState::NotStarted);
+        }
+        let per_core = self.per_core(url);
+        tokio::pin!(per_core);
+        // Polled in order (as `join!` did): the native request, then Mihomo, then Xray.
+        tokio::select! {
+            biased;
+            response = &mut native => {
+                if is_native_bundle(&response) {
+                    (Some(response), PerCoreState::Abandoned)
+                } else {
+                    (Some(response), PerCoreState::Done(per_core.await))
+                }
+            }
+            answers = &mut per_core => {
+                if answers.mihomo.as_ref().is_ok_and(HttpResponse::status_is_success) {
+                    (None, PerCoreState::Done(answers))
+                } else {
+                    (Some(native.await), PerCoreState::Done(answers))
+                }
+            }
+        }
+    }
+
+    /// The Mihomo and Xray requests together. A Mihomo configuration that routes nothing
+    /// into Xray (see `standalone_mihomo`) waits only [`XRAY_GRACE`] for the Xray answer,
+    /// which it does not need: a panel that serves only Mihomo may take its whole timeout to
+    /// refuse the Xray request.
+    async fn per_core(&self, url: &str) -> PerCore {
+        let mihomo = self.client.get(url, UA_MIHOMO);
+        let xray = self.client.get(url, UA_XRAY);
+        tokio::pin!(mihomo, xray);
+        tokio::select! {
+            biased;
+            mihomo = &mut mihomo => {
+                if !mihomo_stands_alone(&mihomo) {
+                    let xray = xray.await;
+                    return PerCore { mihomo, xray, xray_skipped: false };
+                }
+                match tokio::time::timeout(XRAY_GRACE, &mut xray).await {
+                    Ok(xray) => PerCore { mihomo, xray, xray_skipped: false },
+                    Err(_) => PerCore {
+                        mihomo,
+                        xray: Err(FetchError::Timeout),
+                        xray_skipped: true,
+                    },
+                }
+            }
+            xray = &mut xray => {
+                let mihomo = mihomo.await;
+                PerCore { mihomo, xray, xray_skipped: false }
+            }
+        }
     }
 
     async fn logo_for(&self, snapshot: &mut Snapshot, defer: bool) {
@@ -1036,6 +1282,37 @@ fn success_response(response: HttpResponse) -> Result<HttpResponse, FetchError> 
     } else {
         Err(FetchError::HttpStatus(response.status))
     }
+}
+
+/// Whether the per-core requests ran during the native one.
+enum PerCoreState {
+    NotStarted,
+    /// Started, then dropped for a native bundle that arrived first.
+    Abandoned,
+    Done(PerCore),
+}
+
+/// The per-core answers; `xray_skipped` when a standalone Mihomo configuration did not wait
+/// for the Xray one.
+struct PerCore {
+    mihomo: Result<HttpResponse, FetchError>,
+    xray: Result<HttpResponse, FetchError>,
+    xray_skipped: bool,
+}
+
+fn is_native_bundle(response: &Result<HttpResponse, FetchError>) -> bool {
+    response.as_ref().is_ok_and(|response| {
+        response.status_is_success() && looks_like_native_bundle(strip_utf8_bom(&response.body))
+    })
+}
+
+/// A Mihomo answer that is a configuration routing nothing into Xray.
+fn mihomo_stands_alone(response: &Result<HttpResponse, FetchError>) -> bool {
+    response.as_ref().is_ok_and(|response| {
+        response.status_is_success()
+            && parse_mihomo(strip_utf8_bom(&response.body))
+                .is_ok_and(|config| config.loopback_socks_mappings().is_empty())
+    })
 }
 
 fn parse_fallback(
@@ -1580,5 +1857,290 @@ mod diagnostics_tests {
         assert_eq!(diagnostics.native, AttemptOutcome::Ok { status: 200 });
         assert_eq!(diagnostics.mihomo, AttemptOutcome::Skipped);
         assert_eq!(diagnostics.xray, AttemptOutcome::Skipped);
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use crate::PersistentSnapshotStore;
+
+    /// The shape of a Mihomo-only subscription (redacted): VLESS and Hysteria2 servers, an
+    /// url-test group with an exclude filter, select groups holding groups, an include-all
+    /// group with a filter, group icons.
+    const MIHOMO_ONLY: &str = r#"mixed-port: 7890
+mode: rule
+proxies:
+  - {name: "🇩🇪 Germany", type: vless, server: de.example.invalid, port: 443, uuid: 00000000-0000-4000-8000-000000000001, network: tcp, tls: true, flow: xtls-rprx-vision, servername: de.example.invalid, client-fingerprint: chrome}
+  - {name: "🇳🇱 Netherlands", type: vless, server: nl.example.invalid, port: 443, uuid: 00000000-0000-4000-8000-000000000002, network: tcp, tls: true}
+  - {name: "🇫🇮 Finland torrent", type: hysteria2, server: fi.example.invalid, port: 443, password: redacted}
+proxy-groups:
+  - {name: "⚡ Fastest", icon: "https://icons.example.invalid/fast.png", type: url-test, exclude-filter: "(?i)(backup|torrent)", lazy: true, tolerance: 500, url: "https://captive.apple.com/generate_204", interval: 300, proxies: ["🇩🇪 Germany", "🇳🇱 Netherlands", "🇫🇮 Finland torrent"]}
+  - {name: "🌍 Abroad", icon: "https://icons.example.invalid/globe.png", type: select, proxies: ["⚡ Fastest", DIRECT, "🇩🇪 Germany", "🇳🇱 Netherlands", "🇫🇮 Finland torrent"]}
+  - {name: "💬 Discord", type: select, proxies: ["🌍 Abroad", "⚡ Fastest", DIRECT, "🇩🇪 Germany"]}
+  - {name: "⬇️ Torrent", type: select, include-all-proxies: true, filter: "(?i)(torrent)", proxies: [DIRECT]}
+rules:
+  - MATCH,🌍 Abroad
+"#;
+
+    /// Each flavour answers after its own delay (virtual time).
+    #[derive(Clone)]
+    struct TimedClient {
+        native: (u64, u16, &'static str),
+        mihomo: (u64, u16, &'static str),
+        xray: (u64, u16, &'static str),
+    }
+
+    impl HttpClient for TimedClient {
+        fn get<'a>(
+            &'a self,
+            _url: &'a str,
+            user_agent: &'static str,
+        ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, FetchError>> + Send + 'a>> {
+            let (delay, status, body) = match user_agent {
+                UA_NATIVE => self.native,
+                UA_MIHOMO => self.mihomo,
+                _ => self.xray,
+            };
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                Ok(HttpResponse::new(
+                    status,
+                    body.as_bytes().to_vec(),
+                    std::iter::empty::<(&str, &str)>(),
+                ))
+            })
+        }
+    }
+
+    /// A panel that serves only Mihomo and answers every other request with a 502 after
+    /// ~15 s took over a minute to refresh (and the refresh indicator spun all along).
+    #[tokio::test(start_paused = true)]
+    async fn a_mihomo_only_panel_slow_to_refuse_other_requests_refreshes_in_seconds() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let client = TimedClient {
+            native: (15_400, 502, ""),
+            mihomo: (400, 200, MIHOMO_ONLY),
+            xray: (15_400, 502, ""),
+        };
+        let started = tokio::time::Instant::now();
+        let (result, diagnostics) = SubscriptionFetcher::new(client)
+            .refresh_with_diagnostics("https://provider.example/sub", &store)
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_ok(), "{diagnostics}");
+        assert!(
+            elapsed <= NATIVE_HEAD_START + XRAY_GRACE + Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        assert_eq!(diagnostics.native, AttemptOutcome::Abandoned);
+        assert_eq!(diagnostics.mihomo, AttemptOutcome::Ok { status: 200 });
+        assert_eq!(diagnostics.xray, AttemptOutcome::Skipped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_native_bundle_that_answers_late_still_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let client = TimedClient {
+            native: (
+                5_000,
+                200,
+                r#"["proxies: []\nproxy-groups: []\nrules: []\n",{"outbounds":[]}]"#,
+            ),
+            mihomo: (10_000, 200, MIHOMO_ONLY),
+            xray: (10_000, 502, ""),
+        };
+        let started = tokio::time::Instant::now();
+        let (result, diagnostics) = SubscriptionFetcher::new(client)
+            .refresh_with_diagnostics("https://provider.example/sub", &store)
+            .await;
+        assert!(result.is_ok(), "{diagnostics}");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(diagnostics.native, AttemptOutcome::Ok { status: 200 });
+        assert_eq!(diagnostics.mihomo, AttemptOutcome::Abandoned);
+        assert_eq!(diagnostics.xray, AttemptOutcome::Abandoned);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_native_refusal_still_goes_straight_to_the_per_core_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PersistentSnapshotStore::open(root.path()).unwrap();
+        let client = TimedClient {
+            native: (100, 404, "not found"),
+            mihomo: (300, 200, MIHOMO_ONLY),
+            xray: (300, 404, "not found"),
+        };
+        let (result, diagnostics) = SubscriptionFetcher::new(client)
+            .refresh_with_diagnostics("https://provider.example/sub", &store)
+            .await;
+        assert!(result.is_ok(), "{diagnostics}");
+        assert!(matches!(diagnostics.native, AttemptOutcome::Failed { .. }));
+        assert_eq!(
+            diagnostics.xray,
+            AttemptOutcome::Failed {
+                reason: "http_status",
+                status: Some(404),
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_quick_429_or_5xx_is_asked_again() {
+        let answer = |status| DetailedResponse {
+            response: HttpResponse::new(status, Vec::new(), std::iter::empty::<(&str, &str)>()),
+            retry_after: None,
+        };
+        assert_eq!(
+            retry_delay_for_status(&answer(502), Duration::from_millis(300)),
+            Some(RETRY_DELAY)
+        );
+        assert_eq!(
+            retry_delay_for_status(&answer(429), Duration::from_secs(1)),
+            Some(RETRY_DELAY)
+        );
+        // A gateway that gave up on its backend after 15 s.
+        assert_eq!(
+            retry_delay_for_status(&answer(502), Duration::from_millis(15_400)),
+            None
+        );
+        assert_eq!(
+            retry_delay_for_status(&answer(404), Duration::from_millis(10)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod tunnel_proxy_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Answers every connection with `body`; returns its address and the request lines seen.
+    async fn server(body: &'static str) -> (SocketAddr, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen: Seen = Arc::default();
+        let log = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 4096];
+                    let length = stream.read(&mut request).await.unwrap_or(0);
+                    let line = String::from_utf8_lossy(&request[..length])
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    log.lock().unwrap().push(line);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (address, seen)
+    }
+
+    /// Accepts connections and never answers.
+    async fn stalled_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        address
+    }
+
+    fn client(tunnel: &TunnelProxy) -> ReqwestHttpClient {
+        let root = tempfile::tempdir().unwrap();
+        let identity = DeviceIdentity::load_or_create(root.path()).unwrap();
+        ReqwestHttpClient::new(identity)
+            .unwrap()
+            .with_tunnel_proxy(tunnel.clone())
+            .with_tunnel_attempt_timeout(Duration::from_secs(2))
+    }
+
+    #[tokio::test]
+    async fn connected_the_subscription_is_downloaded_through_the_connection() {
+        let (provider, provider_seen) = server("DIRECT").await;
+        let (proxy, proxy_seen) = server("THROUGH-THE-CONNECTION").await;
+        let tunnel = TunnelProxy::default();
+        tunnel.set(Some(proxy));
+        let url = format!("http://{provider}/sub");
+        let response = client(&tunnel).get(&url, UA_MIHOMO).await.unwrap();
+        assert_eq!(response.body, b"THROUGH-THE-CONNECTION");
+        let proxy_seen = proxy_seen.lock().unwrap().clone();
+        assert_eq!(proxy_seen.len(), 1, "{proxy_seen:?}");
+        // An HTTP proxy is asked for the absolute URL.
+        assert!(proxy_seen[0].contains(&url), "{proxy_seen:?}");
+        assert!(provider_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_the_subscription_is_downloaded_directly() {
+        let (provider, provider_seen) = server("DIRECT").await;
+        let (proxy, proxy_seen) = server("THROUGH-THE-CONNECTION").await;
+        let tunnel = TunnelProxy::default();
+        tunnel.set(Some(proxy));
+        tunnel.set(None);
+        let url = format!("http://{provider}/sub");
+        let response = client(&tunnel).get(&url, UA_MIHOMO).await.unwrap();
+        assert_eq!(response.body, b"DIRECT");
+        assert_eq!(provider_seen.lock().unwrap().len(), 1);
+        assert!(proxy_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_refuses_falls_back_to_the_provider_directly() {
+        let (provider, provider_seen) = server("DIRECT").await;
+        // Nothing listens there any more.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let tunnel = TunnelProxy::default();
+        tunnel.set(Some(closed));
+        let url = format!("http://{provider}/sub");
+        let response = client(&tunnel).get(&url, UA_MIHOMO).await.unwrap();
+        assert_eq!(response.body, b"DIRECT");
+        assert_eq!(provider_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_stalls_falls_back_to_the_provider_directly_in_time() {
+        let (provider, provider_seen) = server("DIRECT").await;
+        let tunnel = TunnelProxy::default();
+        tunnel.set(Some(stalled_server().await));
+        let url = format!("http://{provider}/sub");
+        let started = std::time::Instant::now();
+        let response = client(&tunnel).get(&url, UA_MIHOMO).await.unwrap();
+        assert_eq!(response.body, b"DIRECT");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(provider_seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_loopback_proxy_is_ever_used() {
+        let tunnel = TunnelProxy::default();
+        tunnel.set(Some("192.168.1.10:7890".parse().unwrap()));
+        assert_eq!(tunnel.get(), None);
+        tunnel.set(Some("127.0.0.1:7890".parse().unwrap()));
+        assert_eq!(tunnel.get(), Some("127.0.0.1:7890".parse().unwrap()));
     }
 }
