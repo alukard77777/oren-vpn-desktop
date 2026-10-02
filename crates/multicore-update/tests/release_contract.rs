@@ -8,6 +8,14 @@ fn repository_accepts_one_owner_and_repository() {
     let repository = Repository::parse("Fatyzzz/multi-core").unwrap();
     assert_eq!(repository.owner(), "Fatyzzz");
     assert_eq!(repository.name(), "multi-core");
+    assert_eq!(
+        repository.release_hint_url(),
+        "https://raw.githubusercontent.com/Fatyzzz/multi-core/main/release.txt"
+    );
+    assert_eq!(
+        repository.latest_release_api_url(),
+        "https://api.github.com/repos/Fatyzzz/multi-core/releases/latest"
+    );
 
     for invalid in ["", "owner", "owner/repo/extra", "../repo", "owner repo/x"] {
         assert!(Repository::parse(invalid).is_err(), "accepted {invalid:?}");

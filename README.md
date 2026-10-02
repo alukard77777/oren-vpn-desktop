@@ -112,7 +112,11 @@ Settings offers separate launch-at-sign-in and auto-connect switches. Auto-conne
 defaults off; when enabled, a background sign-in launch waits for a ready profile
 and network route, then makes one connection attempt. Home shows a dismissible
 update banner only when a newer release is found. MULTICORE checks for releases
-at startup and every 4 hours while it remains open.
+at startup and about hourly while it remains open: it reads the one-line
+`release.txt` on the release repository's `main` branch
+(`https://raw.githubusercontent.com/<owner>/<repo>/main/release.txt`) and asks the
+GitHub releases API (which supplies the assets and digests) only when that file names
+a newer version, or at most every 4 hours while the file is missing.
 
 The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
 daemon. Requests use a random per-launch bearer token, bounded bodies, no proxy,

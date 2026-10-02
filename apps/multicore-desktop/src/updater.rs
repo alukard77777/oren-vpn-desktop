@@ -2,11 +2,19 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use multicore_release::{GitHubRelease, ReleaseDecision, Repository, Version, verify_archive_file};
 
 const RELEASE_BODY_LIMIT: usize = 512 * 1024;
+/// `release.txt` holds one version and a newline; anything longer is not that file.
+const RELEASE_HINT_LIMIT: usize = 64;
+/// Without a usable `release.txt` the releases API is asked at most this often (it allows 60
+/// unauthenticated requests an hour per IP, shared by every client behind one NAT).
+pub(crate) const API_FALLBACK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
+/// When the releases API was last asked, for the fallback cadence.
+static LAST_API_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
 const UPDATE_USER_AGENT: &str = concat!("multicore-updater/", env!("CARGO_PKG_VERSION"));
 #[cfg(target_os = "linux")]
 const REPLACEMENT_DETAIL: &str = "Будет заменён файл AppImage";
@@ -32,6 +40,9 @@ pub(crate) enum UpdateState {
     /// Installing `release` failed; the release is kept so the banner stays
     /// visible with the reason and the install can be retried.
     InstallFailed(GitHubRelease, String),
+    /// GitHub asked us to slow down (or nothing could be learned yet): no error, the next
+    /// scheduled check tries again.
+    Deferred,
     Error(String),
 }
 
@@ -83,6 +94,15 @@ impl UpdateState {
                 action_enabled: false,
                 available: false,
                 busy: true,
+            },
+            Self::Deferred => UpdatePresentation {
+                status: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
+                detail: "Проверим обновления чуть позже".into(),
+                action_label: "Проверить".into(),
+                action: UpdateAction::Check,
+                action_enabled: true,
+                available: false,
+                busy: false,
             },
             Self::Current => UpdatePresentation {
                 status: "Установлена актуальная версия".into(),
@@ -170,58 +190,190 @@ pub(crate) fn configured_repository() -> Result<Option<Repository>, String> {
         .map_err(|_| "В сборке указан неверный GitHub-репозиторий".into())
 }
 
-pub(crate) fn check_latest() -> Result<UpdateState, String> {
-    let repository =
-        configured_repository()?.ok_or_else(|| "Канал обновлений не настроен".to_owned())?;
-    let body = fetch_latest_release_body(&repository)?;
+/// Why `release.txt` gave no version: the check falls back to the releases API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HintError {
+    /// No such file (404) or another HTTP failure.
+    Missing,
+    /// Not one strict `MAJOR.MINOR.PATCH` version, or too long.
+    Invalid,
+    Unreachable,
+}
+
+/// A releases API failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ApiError {
+    /// 403/429: the shared unauthenticated limit is used up; try later, quietly.
+    RateLimited,
+    Failed(String),
+}
+
+/// What one check learned.
+#[derive(Clone, Debug)]
+pub(crate) enum CheckOutcome {
+    State(UpdateState),
+    /// Nothing new (the API was rate limited, or its fallback is not due yet): keep the
+    /// state the app already shows.
+    Unchanged,
+}
+
+/// `release.txt`: exactly one strict version (`1.1.4`, surrounding whitespace allowed).
+pub(crate) fn parse_release_hint(body: &[u8]) -> Result<Version, HintError> {
+    if body.len() > RELEASE_HINT_LIMIT {
+        return Err(HintError::Invalid);
+    }
+    let text = std::str::from_utf8(body)
+        .map_err(|_| HintError::Invalid)?
+        .trim();
+    if text.starts_with('v') {
+        return Err(HintError::Invalid);
+    }
+    Version::parse(text).map_err(|_| HintError::Invalid)
+}
+
+/// One update check. `release.txt` is only a hint: when it names a newer version than this
+/// build, the releases API supplies the release (asset, size, digest) exactly as before; an
+/// equal or older version answers without touching the API. Without a usable hint the API is
+/// asked at most every `API_FALLBACK_INTERVAL`, unless the user asked (`manual`). A release
+/// already offered (`known`) is not fetched again for the same version.
+pub(crate) fn check_latest(manual: bool, known: Option<Version>) -> CheckOutcome {
+    let repository = match configured_repository() {
+        Ok(Some(repository)) => repository,
+        Ok(None) => {
+            return CheckOutcome::State(UpdateState::Error("Канал обновлений не настроен".into()));
+        }
+        Err(error) => return CheckOutcome::State(UpdateState::Error(error)),
+    };
+    let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return CheckOutcome::State(UpdateState::Error("Версия клиента собрана неверно".into()));
+    };
+    let hint = fetch_release_hint(&repository);
+    plan_check(
+        &current,
+        hint,
+        known,
+        manual,
+        &LAST_API_CHECK,
+        Instant::now(),
+        || fetch_latest_release(&repository),
+    )
+}
+
+pub(crate) fn plan_check(
+    current: &Version,
+    hint: Result<Version, HintError>,
+    known: Option<Version>,
+    manual: bool,
+    last_api_check: &Mutex<Option<Instant>>,
+    now: Instant,
+    fetch_release: impl FnOnce() -> Result<GitHubRelease, ApiError>,
+) -> CheckOutcome {
+    match hint {
+        Ok(latest) if latest <= *current => return CheckOutcome::State(UpdateState::Current),
+        Ok(latest) if known == Some(latest) => return CheckOutcome::Unchanged,
+        Ok(_) => {}
+        Err(_) => {
+            let last = *last_api_check.lock().expect("update clock lock");
+            let due = last
+                .is_none_or(|last| now.saturating_duration_since(last) >= API_FALLBACK_INTERVAL);
+            if !manual && !due {
+                return CheckOutcome::Unchanged;
+            }
+        }
+    }
+    *last_api_check.lock().expect("update clock lock") = Some(now);
+    match fetch_release() {
+        Ok(release) => CheckOutcome::State(match release.decision(current) {
+            ReleaseDecision::Current => UpdateState::Current,
+            ReleaseDecision::UpdateAvailable => available_state(release),
+        }),
+        Err(ApiError::RateLimited) => CheckOutcome::Unchanged,
+        Err(ApiError::Failed(message)) => CheckOutcome::State(UpdateState::Error(message)),
+    }
+}
+
+fn update_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::limited(2))
+        .build()
+        .map_err(|_| "Не удалось создать защищённое соединение".to_owned())
+}
+
+/// The pinned repository's `release.txt` (raw.githubusercontent.com caches it ~5 min).
+fn fetch_release_hint(repository: &Repository) -> Result<Version, HintError> {
+    let client = update_client(Duration::from_secs(8)).map_err(|_| HintError::Unreachable)?;
+    let response = client
+        .get(repository.release_hint_url())
+        .header("User-Agent", UPDATE_USER_AGENT)
+        .send()
+        .map_err(|_| HintError::Unreachable)?;
+    if !response.status().is_success() {
+        return Err(HintError::Missing);
+    }
+    let mut body = Vec::new();
+    response
+        .take(RELEASE_HINT_LIMIT as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| HintError::Unreachable)?;
+    parse_release_hint(&body)
+}
+
+fn fetch_latest_release(repository: &Repository) -> Result<GitHubRelease, ApiError> {
+    let body = fetch_latest_release_body_checked(repository)?;
     #[cfg(not(target_os = "linux"))]
-    let release = GitHubRelease::parse_for_repository(&repository, &body);
+    let release = GitHubRelease::parse_for_repository(repository, &body);
     #[cfg(target_os = "linux")]
-    let release = GitHubRelease::parse_appimage_for_repository(&repository, &body);
-    let release = release.map_err(|_| "Релиз не соответствует контракту MULTICORE".to_owned())?;
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| "Версия клиента собрана неверно".to_owned())?;
-    Ok(match release.decision(&current) {
-        ReleaseDecision::Current => UpdateState::Current,
-        ReleaseDecision::UpdateAvailable => available_state(release),
-    })
+    let release = GitHubRelease::parse_appimage_for_repository(repository, &body);
+    release.map_err(|_| ApiError::Failed("Релиз не соответствует контракту MULTICORE".into()))
+}
+
+/// Whether an API answer is GitHub's rate limit rather than a real failure.
+pub(crate) fn is_rate_limited(status: u16) -> bool {
+    matches!(status, 403 | 429)
 }
 
 /// The latest-release JSON of the pinned repository, bounded in size.
 pub(crate) fn fetch_latest_release_body(repository: &Repository) -> Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::limited(2))
-        .build()
-        .map_err(|_| "Не удалось создать защищённое соединение".to_owned())?;
+    fetch_latest_release_body_checked(repository).map_err(|error| match error {
+        ApiError::RateLimited => "GitHub временно ограничил запросы. Повторите позже".to_owned(),
+        ApiError::Failed(message) => message,
+    })
+}
+
+fn fetch_latest_release_body_checked(repository: &Repository) -> Result<Vec<u8>, ApiError> {
+    let client = update_client(Duration::from_secs(12)).map_err(ApiError::Failed)?;
     let mut response = client
         .get(repository.latest_release_api_url())
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("User-Agent", UPDATE_USER_AGENT)
         .send()
-        .map_err(|_| "GitHub сейчас недоступен".to_owned())?;
+        .map_err(|_| ApiError::Failed("GitHub сейчас недоступен".to_owned()))?;
+    if is_rate_limited(response.status().as_u16()) {
+        return Err(ApiError::RateLimited);
+    }
     if !response.status().is_success() {
-        return Err(format!(
+        return Err(ApiError::Failed(format!(
             "GitHub ответил HTTP {}",
             response.status().as_u16()
-        ));
+        )));
     }
     if response
         .content_length()
         .is_some_and(|length| length > RELEASE_BODY_LIMIT as u64)
     {
-        return Err("Ответ GitHub слишком большой".into());
+        return Err(ApiError::Failed("Ответ GitHub слишком большой".into()));
     }
     let mut body = Vec::new();
     response
         .by_ref()
         .take(RELEASE_BODY_LIMIT as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|_| "Не удалось прочитать ответ GitHub".to_owned())?;
+        .map_err(|_| ApiError::Failed("Не удалось прочитать ответ GitHub".to_owned()))?;
     if body.len() > RELEASE_BODY_LIMIT {
-        return Err("Ответ GitHub слишком большой".into());
+        return Err(ApiError::Failed("Ответ GitHub слишком большой".into()));
     }
     Ok(body)
 }
@@ -717,6 +869,192 @@ mod tests {
                 "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }]
         }"#, WindowsArch::X64).unwrap()
+    }
+
+    fn version(value: &str) -> multicore_release::Version {
+        multicore_release::Version::parse(value).unwrap()
+    }
+
+    #[test]
+    fn release_hint_is_one_strict_bounded_version() {
+        use super::{HintError, parse_release_hint};
+        assert_eq!(parse_release_hint(b"1.1.4\n"), Ok(version("1.1.4")));
+        assert_eq!(parse_release_hint(b"  2.0.0 \r\n"), Ok(version("2.0.0")));
+        for garbage in [
+            &b""[..],
+            b"v1.1.4\n",
+            b"1.1\n",
+            b"1.1.4.5",
+            b"1.01.4",
+            b"latest",
+            b"<html>404</html>",
+            b"\xff\xfe1.1.4",
+        ] {
+            assert_eq!(
+                parse_release_hint(garbage),
+                Err(HintError::Invalid),
+                "{garbage:?}"
+            );
+        }
+        let oversized = format!("1.1.4{}", " ".repeat(64));
+        assert_eq!(
+            parse_release_hint(oversized.as_bytes()),
+            Err(HintError::Invalid)
+        );
+    }
+
+    #[test]
+    fn the_api_is_asked_only_when_the_hint_names_a_newer_version() {
+        use super::{CheckOutcome, HintError, plan_check};
+        use std::cell::Cell;
+        use std::sync::Mutex;
+        use std::time::Instant;
+        let current = version("0.1.0");
+        let now = Instant::now();
+        let clock = Mutex::new(None);
+        let calls = Cell::new(0);
+        let api = || {
+            calls.set(calls.get() + 1);
+            Ok(release())
+        };
+
+        // Equal or older: up to date, no API call.
+        for hint in ["0.1.0", "0.0.9"] {
+            let outcome = plan_check(&current, Ok(version(hint)), None, false, &clock, now, api);
+            assert!(matches!(outcome, CheckOutcome::State(UpdateState::Current)));
+        }
+        assert_eq!(calls.get(), 0);
+        assert_eq!(*clock.lock().unwrap(), None);
+
+        // Newer: the release comes from the API, with all its checks.
+        let outcome = plan_check(
+            &current,
+            Ok(version("0.2.0")),
+            None,
+            false,
+            &clock,
+            now,
+            api,
+        );
+        assert!(matches!(
+            outcome,
+            CheckOutcome::State(UpdateState::Available(_) | UpdateState::Managed(_))
+        ));
+        assert_eq!(calls.get(), 1);
+
+        // The same newer version already offered: nothing to fetch again.
+        let outcome = plan_check(
+            &current,
+            Ok(version("0.2.0")),
+            Some(version("0.2.0")),
+            false,
+            &clock,
+            now,
+            api,
+        );
+        assert!(matches!(outcome, CheckOutcome::Unchanged));
+        assert_eq!(calls.get(), 1);
+
+        // Garbage or a missing file: the hint is not trusted for anything.
+        let fresh = Mutex::new(None);
+        let outcome = plan_check(
+            &current,
+            Err(HintError::Invalid),
+            None,
+            false,
+            &fresh,
+            now,
+            api,
+        );
+        assert!(matches!(
+            outcome,
+            CheckOutcome::State(UpdateState::Available(_) | UpdateState::Managed(_))
+        ));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn without_a_hint_the_api_runs_on_its_own_four_hour_cadence() {
+        use super::{API_FALLBACK_INTERVAL, CheckOutcome, HintError, plan_check};
+        use std::cell::Cell;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        let current = version("0.1.0");
+        let start = Instant::now();
+        let clock = Mutex::new(None);
+        let calls = Cell::new(0);
+        let api = || {
+            calls.set(calls.get() + 1);
+            Ok(release())
+        };
+        let missing = || Err(HintError::Missing);
+
+        // First check (startup): the API answers.
+        let _ = plan_check(&current, missing(), None, false, &clock, start, api);
+        assert_eq!(calls.get(), 1);
+        // Hourly checks within 4 h: nothing new, the API is left alone.
+        for hours in 1..4 {
+            let at = start + Duration::from_secs(hours * 3_600);
+            let outcome = plan_check(&current, missing(), None, false, &clock, at, api);
+            assert!(matches!(outcome, CheckOutcome::Unchanged));
+        }
+        assert_eq!(calls.get(), 1);
+        // A user's own «Проверить» does not wait.
+        let _ = plan_check(
+            &current,
+            missing(),
+            None,
+            true,
+            &clock,
+            start + Duration::from_secs(3_700),
+            api,
+        );
+        assert_eq!(calls.get(), 2);
+        // 4 h after that last API call it is due again.
+        let at = start + Duration::from_secs(3_700) + API_FALLBACK_INTERVAL;
+        let _ = plan_check(&current, missing(), None, false, &clock, at, api);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn a_rate_limited_api_is_quietly_tried_later() {
+        use super::{ApiError, CheckOutcome, is_rate_limited, plan_check};
+        use std::sync::Mutex;
+        use std::time::Instant;
+        assert!(is_rate_limited(403));
+        assert!(is_rate_limited(429));
+        assert!(!is_rate_limited(404));
+        assert!(!is_rate_limited(500));
+        let current = version("0.1.0");
+        let clock = Mutex::new(None);
+        let outcome = plan_check(
+            &current,
+            Ok(version("0.2.0")),
+            None,
+            false,
+            &clock,
+            Instant::now(),
+            || Err(ApiError::RateLimited),
+        );
+        assert!(matches!(outcome, CheckOutcome::Unchanged));
+        let outcome = plan_check(
+            &current,
+            Ok(version("0.2.0")),
+            None,
+            false,
+            &clock,
+            Instant::now(),
+            || Err(ApiError::Failed("GitHub ответил HTTP 500".into())),
+        );
+        assert!(matches!(
+            outcome,
+            CheckOutcome::State(UpdateState::Error(_))
+        ));
+        // Deferred is a quiet state with a manual retry, never an error.
+        let deferred = UpdateState::Deferred.presentation(true);
+        assert!(!deferred.available);
+        assert_eq!(deferred.action, UpdateAction::Check);
+        assert!(!deferred.status.contains("Не удалось"));
     }
 
     #[test]

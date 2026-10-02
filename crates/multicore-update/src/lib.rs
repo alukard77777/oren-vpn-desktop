@@ -153,6 +153,16 @@ impl Repository {
         &self.name
     }
 
+    /// A plain-text file on the repository's `main` branch holding only the latest version
+    /// (`1.1.4\n`). The client polls it as a cheap hint; the release itself, its assets and
+    /// digests still come from the releases API.
+    pub fn release_hint_url(&self) -> String {
+        format!(
+            "https://raw.githubusercontent.com/{}/{}/main/release.txt",
+            self.owner, self.name
+        )
+    }
+
     pub fn latest_release_api_url(&self) -> String {
         format!(
             "https://api.github.com/repos/{}/{}/releases/latest",

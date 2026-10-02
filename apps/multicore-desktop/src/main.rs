@@ -1077,6 +1077,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             model.clone(),
             update_state,
             update_check_started_at,
+            false,
         );
     }
     run_refresh(ui.as_weak(), model.clone(), profile_preferences);
@@ -2016,6 +2017,7 @@ fn wire_updater(
                 action_model.clone(),
                 action_state.clone(),
                 check_started_at.clone(),
+                true,
             ),
             UpdateAction::Install => match update_install_intent(runtime_idle) {
                 UpdateInstallIntent::InstallNow => {
@@ -2069,11 +2071,23 @@ fn wire_updater(
     });
 }
 
-/// How long after the last update check the hourly timer starts another one.
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
+/// How long after the last update check the next one starts (plus `update_check_jitter`).
+/// Hourly is cheap: a check reads the tiny `release.txt` and asks the rate-limited releases
+/// API only when it names a newer version (or, without it, at most every 4 hours).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Up to this much is added to each interval so clients started together do not all ask
+/// GitHub at the same minute.
+const UPDATE_CHECK_MAX_JITTER: Duration = Duration::from_secs(10 * 60);
 
-fn update_check_due(elapsed: Duration, busy: bool) -> bool {
-    elapsed >= UPDATE_CHECK_INTERVAL && !busy
+fn update_check_due(elapsed: Duration, jitter: Duration, busy: bool) -> bool {
+    elapsed >= UPDATE_CHECK_INTERVAL + jitter.min(UPDATE_CHECK_MAX_JITTER) && !busy
+}
+
+/// A fresh random delay in `0..=UPDATE_CHECK_MAX_JITTER` (whole seconds).
+fn update_check_jitter() -> Duration {
+    let mut bytes = [0_u8; 8];
+    let random = getrandom::fill(&mut bytes).map_or(0, |()| u64::from_le_bytes(bytes));
+    Duration::from_secs(random % (UPDATE_CHECK_MAX_JITTER.as_secs() + 1))
 }
 
 fn wire_periodic_update_check(
@@ -2087,24 +2101,24 @@ fn wire_periodic_update_check(
         return timer;
     }
     let weak = ui.as_weak();
-    timer.start(
-        TimerMode::Repeated,
-        Duration::from_secs(60 * 60),
-        move || {
-            let busy = matches!(
-                &*state.lock().expect("update state lock"),
-                UpdateState::Checking | UpdateState::Downloading(_)
+    let jitter = Cell::new(update_check_jitter());
+    // A cheap once-a-minute look at the clock; the check itself runs about hourly.
+    timer.start(TimerMode::Repeated, Duration::from_secs(60), move || {
+        let busy = matches!(
+            &*state.lock().expect("update state lock"),
+            UpdateState::Checking | UpdateState::Downloading(_)
+        );
+        if update_check_due(check_started_at.get().elapsed(), jitter.get(), busy) {
+            jitter.set(update_check_jitter());
+            run_update_check(
+                weak.clone(),
+                model.clone(),
+                state.clone(),
+                check_started_at.clone(),
+                false,
             );
-            if update_check_due(check_started_at.get().elapsed(), busy) {
-                run_update_check(
-                    weak.clone(),
-                    model.clone(),
-                    state.clone(),
-                    check_started_at.clone(),
-                );
-            }
-        },
-    );
+        }
+    });
     timer
 }
 
@@ -2370,21 +2384,31 @@ fn run_update_check(
     model: Arc<Mutex<DesktopViewModel>>,
     state: Arc<Mutex<UpdateState>>,
     check_started_at: Rc<Cell<Instant>>,
+    manual: bool,
 ) {
     check_started_at.set(Instant::now());
-    {
+    let previous = {
         let mut current = state.lock().expect("update state lock");
-        *current = UpdateState::Checking;
+        let previous = std::mem::replace(&mut *current, UpdateState::Checking);
         if let Some(ui) = weak.upgrade() {
             let runtime_idle =
                 runtime_allows_update(&model.lock().expect("view model lock").presentation());
             apply_update_state(&ui, &current, runtime_idle);
         }
-    }
+        previous
+    };
+    let known = previous
+        .available_release()
+        .map(|release| release.version());
     thread::spawn(move || {
-        let result = updater::with_pending_install_failure(
-            updater::check_latest().unwrap_or_else(UpdateState::Error),
-        );
+        // Nothing new (rate limited, or the API fallback is not due): keep what was shown.
+        let result = match updater::check_latest(manual, known) {
+            updater::CheckOutcome::State(state) => updater::with_pending_install_failure(state),
+            updater::CheckOutcome::Unchanged => match previous {
+                UpdateState::Checking => UpdateState::Deferred,
+                previous => previous,
+            },
+        };
         let _ = slint::invoke_from_event_loop(move || {
             let runtime_idle =
                 runtime_allows_update(&model.lock().expect("view model lock").presentation());
@@ -8079,12 +8103,31 @@ mod window_tests {
     }
 
     #[test]
-    fn update_check_is_due_every_four_hours_but_not_during_an_update_operation() {
-        assert_eq!(super::UPDATE_CHECK_INTERVAL, Duration::from_secs(14_400));
-        assert!(!update_check_due(Duration::from_secs(14_399), false));
-        assert!(!update_check_due(Duration::from_secs(14_400), true));
-        assert!(update_check_due(Duration::from_secs(14_400), false));
-        assert!(update_check_due(Duration::from_secs(86_400), false));
+    fn update_check_is_due_hourly_plus_jitter_but_not_during_an_update_operation() {
+        let none = Duration::ZERO;
+        let jitter = Duration::from_secs(7 * 60);
+        assert!(!update_check_due(Duration::from_secs(3_599), none, false));
+        assert!(update_check_due(Duration::from_secs(3_600), none, false));
+        assert!(!update_check_due(Duration::from_secs(3_600), none, true));
+        assert!(!update_check_due(
+            Duration::from_secs(3_600 + 419),
+            jitter,
+            false
+        ));
+        assert!(update_check_due(
+            Duration::from_secs(3_600 + 420),
+            jitter,
+            false
+        ));
+        // A jitter never pushes the check past 70 minutes.
+        assert!(update_check_due(
+            Duration::from_secs(4_200),
+            Duration::from_secs(9_999),
+            false
+        ));
+        for _ in 0..64 {
+            assert!(super::update_check_jitter() <= super::UPDATE_CHECK_MAX_JITTER);
+        }
     }
 
     #[test]
