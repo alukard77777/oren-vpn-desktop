@@ -18,7 +18,7 @@ use slint::{ComponentHandle, ModelRc, PhysicalSize, Rgb8Pixel, SharedString, Vec
 
 use crate::{
     AppWindow, TrayMenuRow, TrayPopup, UiCatalogGroup, UiCatalogNode, UiEvent, UiProxyMapping,
-    UiSubscriptionProfile,
+    UiRouteSearchHit, UiSubscriptionProfile,
 };
 
 thread_local! {
@@ -132,6 +132,7 @@ fn groups() -> ModelRc<UiCatalogGroup> {
         id: s(id),
         icon: s(icon),
         icon_image: crate::emoji_images::image_for(icon),
+        icon_loading: false,
         label: s(label),
         selected,
     })
@@ -153,6 +154,7 @@ fn nodes(pending_selected: bool) -> ModelRc<UiCatalogNode> {
         id: s(id),
         icon: s(icon),
         icon_image: crate::emoji_images::image_for(icon),
+        icon_loading: false,
         label: s(label),
         selected: selected && !pending_selected || (pending_selected && id == "n2"),
         latency_text: s(latency),
@@ -358,6 +360,7 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
             latency_text: latency.into(),
             latency_tone: tone.into(),
             icon_id: None,
+            icon_pending: false,
             measuring: false,
         }
     };
@@ -917,6 +920,7 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
         group_id: s(""),
         icon: s(""),
         icon_image: Default::default(),
+        icon_loading: false,
         label: s(label),
         detail: s(""),
         tone: s(""),
@@ -930,6 +934,7 @@ fn tray_rows() -> (ModelRc<TrayMenuRow>, ModelRc<TrayMenuRow>) {
             group_id: s("g1"),
             icon: s(icon),
             icon_image: crate::emoji_images::image_for(icon),
+            icon_loading: false,
             label: s(label),
             detail: s(latency),
             tone: s(tone),
@@ -1071,6 +1076,7 @@ fn tray_many_rows() -> ModelRc<TrayMenuRow> {
         group_id: s("g1"),
         icon: s(icon),
         icon_image: crate::emoji_images::image_for(icon),
+        icon_loading: false,
         label: s(label),
         detail: s(latency),
         tone: s(tone),
@@ -1212,6 +1218,7 @@ fn render_ui_previews() {
     capture(&popup, "tray-no-profile", 304, 460);
 
     v112_previews();
+    icon_loading_previews();
 }
 
 // ---- 1.1.2: scrolling group tabs, image group icons, dumb mode, per-row latency, crisp logos.
@@ -1290,6 +1297,7 @@ fn v112_groups(count: usize, selected: &str) -> ModelRc<UiCatalogGroup> {
                 } else {
                     v112_icon(image, 15.0)
                 },
+                icon_loading: false,
                 label: s(label),
                 selected: *id == selected,
             }
@@ -1318,6 +1326,7 @@ fn v112_nodes(measuring: &[&str]) -> ModelRc<UiCatalogNode> {
             } else {
                 v112_icon(image, 22.0)
             },
+            icon_loading: false,
             label: s(label),
             selected,
             latency_text: s(if busy { "" } else { latency }),
@@ -1373,6 +1382,7 @@ fn v112_tray_groups(count: usize, selected: &str) -> ModelRc<TrayMenuRow> {
             } else {
                 v112_icon(image, 14.0)
             },
+            icon_loading: false,
             label: s(label),
             detail: s(""),
             tone: s(""),
@@ -1403,6 +1413,7 @@ fn v112_tray_nodes(measuring: &[&str]) -> ModelRc<TrayMenuRow> {
             } else {
                 v112_icon(image, 20.0)
             },
+            icon_loading: false,
             label: s(label),
             detail: s(if busy { "" } else { latency }),
             tone: s(if busy { "neutral" } else { tone }),
@@ -1488,4 +1499,226 @@ fn v112_previews() {
         popup.set_exit_icon_image(v112_icon("icon-auto", 12.0));
         capture(&popup, name, 304, 460);
     }
+}
+
+// ---- 1.1.3: group icons still downloading (pulsing placeholder, cross-fade, glyph fallback).
+
+/// Groups and routes whose icon image is still downloading in the loading previews.
+const LOADING_GROUPS: &[&str] = &["g3", "g5", "g7"];
+const LOADING_NODES: &[&str] = &["n1", "n5"];
+
+/// Marks `ids` as still loading (no image yet), or, with `failed`, as finished without
+/// an image (the glyph fallback).
+fn mark_loading<T: Clone + 'static>(
+    model: ModelRc<T>,
+    ids: &[&str],
+    failed: bool,
+    mut edit: impl FnMut(&mut T) -> &str,
+    mut apply: impl FnMut(&mut T, bool),
+) -> ModelRc<T> {
+    use slint::Model as _;
+    let rows = model
+        .iter()
+        .map(|mut row| {
+            let id = edit(&mut row).to_owned();
+            if ids.contains(&id.as_str()) {
+                apply(&mut row, !failed);
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn loading_groups(count: usize, selected: &str, failed: bool) -> ModelRc<UiCatalogGroup> {
+    mark_loading(
+        v112_groups(count, selected),
+        LOADING_GROUPS,
+        failed,
+        |row| row.id.as_str(),
+        |row, loading| {
+            row.icon_image = Default::default();
+            row.icon_loading = loading;
+        },
+    )
+}
+
+fn loading_nodes(failed: bool) -> ModelRc<UiCatalogNode> {
+    mark_loading(
+        v112_nodes(&[]),
+        LOADING_NODES,
+        failed,
+        |row| row.id.as_str(),
+        |row, loading| {
+            row.icon_image = Default::default();
+            row.icon_loading = loading;
+            if row.icon.is_empty() {
+                row.icon = s("◎");
+            }
+        },
+    )
+}
+
+fn loading_tray_groups(selected: &str) -> ModelRc<TrayMenuRow> {
+    mark_loading(
+        v112_tray_groups(9, selected),
+        LOADING_GROUPS,
+        false,
+        |row| row.id.as_str(),
+        |row, loading| {
+            row.icon_image = Default::default();
+            row.icon_loading = loading;
+        },
+    )
+}
+
+fn loading_tray_nodes() -> ModelRc<TrayMenuRow> {
+    mark_loading(
+        v112_tray_nodes(&[]),
+        LOADING_NODES,
+        false,
+        |row| row.id.as_str(),
+        |row, loading| {
+            row.icon_image = Default::default();
+            row.icon_loading = loading;
+            if row.icon.is_empty() {
+                row.icon = s("◎");
+            }
+        },
+    )
+}
+
+fn loading_home(ui: &AppWindow, failed: bool) {
+    v112_home(ui, 9, "g1");
+    ui.set_catalog_groups(loading_groups(9, "g1", failed));
+    ui.set_catalog_nodes(loading_nodes(failed));
+}
+
+fn loading_tray(popup: &TrayPopup) {
+    tray_connected(popup);
+    popup.set_group_rows(loading_tray_groups("g1"));
+    popup.set_node_rows(loading_tray_nodes());
+    popup.set_exit_name(s("Автовыбор"));
+    popup.set_exit_icon_image(v112_icon("icon-auto", 12.0));
+}
+
+fn icon_loading_previews() {
+    install_v112_icons();
+    type Setup = fn(&AppWindow);
+    let home: &[(&str, u32, u32, Setup)] = &[
+        // Full motion: the placeholders pulse (captured at whatever phase the clock is in).
+        ("icon-loading-home", 840, 720, |ui| {
+            loading_home(ui, false);
+            ui.set_reduced_motion(false);
+            ui.set_ambient_background_enabled(false);
+        }),
+        // Reduced motion: static muted circles.
+        ("icon-loading-home-reduced", 840, 720, |ui| {
+            loading_home(ui, false)
+        }),
+        ("icon-loading-home-min", 700, 620, |ui| {
+            loading_home(ui, false)
+        }),
+        // Loading ended without an image: the glyph fallback, as before.
+        ("icon-loading-home-failed", 840, 720, |ui| {
+            loading_home(ui, true)
+        }),
+        ("icon-loading-search", 840, 720, |ui| {
+            v112_home(ui, 4, "g1");
+            open_route_search(ui, "ger", false);
+            use slint::Model as _;
+            let mut hits: Vec<UiRouteSearchHit> = ui.get_route_search_hits().iter().collect();
+            hits[0].icon_image = Default::default();
+            hits[0].icon_loading = true;
+            ui.set_route_search_hits(ModelRc::new(VecModel::from(hits)));
+        }),
+    ];
+    for (name, width, height, setup) in home {
+        if !wanted(name) {
+            continue;
+        }
+        let ui = AppWindow::new().expect("create app window");
+        setup(&ui);
+        capture(&ui, name, *width, *height);
+    }
+
+    for (name, reduced) in [
+        ("icon-loading-tray", false),
+        ("icon-loading-tray-reduced", true),
+    ] {
+        if !wanted(name) {
+            continue;
+        }
+        let popup = TrayPopup::new().expect("create tray popup");
+        loading_tray(&popup);
+        popup.set_reduced_motion(reduced);
+        capture(&popup, name, 304, 460);
+    }
+}
+
+/// The placeholder pulse reads `animation-tick()` only while an icon is loading: once the
+/// image arrives (the row updated in place, so it cross-fades) the window stops asking for
+/// animation frames.
+#[test]
+fn icon_placeholder_animates_only_while_loading() {
+    use slint::Model as _;
+    // Another test on this thread may have installed it already.
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    install_v112_icons();
+    let popup = TrayPopup::new().expect("create tray popup");
+    tray_connected(&popup);
+    popup.set_reduced_motion(false);
+    let nodes = Rc::new(VecModel::from(
+        v112_tray_nodes(&[]).iter().collect::<Vec<TrayMenuRow>>(),
+    ));
+    popup.set_node_rows(ModelRc::from(nodes.clone()));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(304, 460));
+    popup.show().expect("show tray popup");
+    let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); 304 * 460];
+    // Advance the clock and draw, like the event loop does each frame.
+    let mut run_frames = |ms: u64| {
+        for _ in 0..ms / 40 {
+            std::thread::sleep(Duration::from_millis(40));
+            slint::platform::update_timers_and_animations();
+            window.request_redraw();
+            window.draw_if_needed(|renderer| {
+                renderer.render(&mut buffer, 304);
+            });
+        }
+    };
+
+    run_frames(480);
+    assert!(
+        !popup.window().has_active_animations(),
+        "a settled popup must not animate"
+    );
+
+    let mut row = nodes.row_data(0).expect("first node");
+    let icon = row.icon_image.clone();
+    row.icon_image = Default::default();
+    row.icon_loading = true;
+    nodes.set_row_data(0, row.clone());
+    run_frames(480);
+    assert!(
+        popup.window().has_active_animations(),
+        "a loading icon pulses"
+    );
+
+    row.icon_image = icon;
+    row.icon_loading = false;
+    nodes.set_row_data(0, row);
+    run_frames(80);
+    assert!(
+        popup.window().has_active_animations(),
+        "the arriving icon cross-fades"
+    );
+    run_frames(480);
+    assert!(
+        !popup.window().has_active_animations(),
+        "once the icon is in, nothing keeps animating"
+    );
+    popup.hide().expect("hide tray popup");
 }

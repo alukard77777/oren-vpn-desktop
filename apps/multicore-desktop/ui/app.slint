@@ -1,6 +1,6 @@
 import { LineEdit, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
+import { IconLoadingSlot, PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
 import "../assets/fonts/Twemoji.Mozilla.ttf";
 export { TrayPopup, TrayMenuRow } from "tray_popup.slint";
 
@@ -840,6 +840,8 @@ component TitleBarButton inherits Rectangle {
 component RouteSearchRow inherits Rectangle {
     in property <string> icon;
     in property <image> icon-image;
+    // The icon image is still downloading: a placeholder holds the flag's place.
+    in property <bool> icon-loading;
     in property <string> prefix;
     in property <string> matched;
     in property <string> suffix;
@@ -891,8 +893,13 @@ component RouteSearchRow inherits Rectangle {
         width: 30px;
         height: 30px;
         background: transparent;
-        if root.icon-image.width > 0: Image { x: 4px; y: 4px; width: 22px; height: 22px; source: root.icon-image; image-fit: contain; accessible-role: none; }
-        if root.icon-image.width == 0: Text { text: root.icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-value-size; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
+        IconLoadingSlot { x: 4px; y: 4px; width: 22px; height: 22px; icon-image: root.icon-image; icon-loading: root.icon-loading; reduced-motion: Motion.reduced; }
+        if root.icon-image.width == 0: Text {
+            text: root.icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-value-size; horizontal-alignment: center; vertical-alignment: center; accessible-role: none;
+            // Shown only once loading has ended without an image.
+            opacity: root.icon-loading ? 0 : 1;
+            animate opacity { duration: Motion.reduced ? 0ms : 160ms; easing: ease-out; }
+        }
     }
 
     HorizontalLayout {
@@ -3049,7 +3056,7 @@ export component AppWindow inherits Window {
                                         padding: 2px;
                                         spacing: 2px;
                                         for group in root.catalog-groups: Rectangle {
-                                            min-width: max(96px, measure-label.preferred-width + Theme.space-3 * 2 + (group.icon == "" ? 0px : 22px)) + 10px;
+                                            min-width: max(96px, measure-label.preferred-width + Theme.space-3 * 2 + (group.icon != "" || group.icon-image.width > 0 || group.icon-loading ? 22px : 0px)) + 10px;
                                             measure-label := Text {
                                                 text: group.label;
                                                 font-family: Theme.font-family;
@@ -3086,6 +3093,8 @@ export component AppWindow inherits Window {
                                             height: 32px;
                                             icon: group.icon;
                                             icon-image: group.icon-image;
+                                            icon-loading: group.icon-loading;
+                                            reduced-motion: root.reduced-motion;
                                             label: group.label;
                                             selected: group.selected;
                                             natural-sizing: route-group-track.overflowing;
@@ -3235,6 +3244,8 @@ export component AppWindow inherits Window {
                                         show-separator: index < root.catalog-nodes.length - 1;
                                         icon: node.icon;
                                         icon-image: node.icon-image;
+                                        icon-loading: node.icon-loading;
+                                        reduced-motion: root.reduced-motion;
                                         label: node.label;
                                         supporting-text: "";
                                         trailing-text: node.latency-text;
@@ -3306,6 +3317,7 @@ export component AppWindow inherits Window {
                                             for hit[index] in root.route-search-hits: RouteSearchRow {
                                                 icon: hit.icon;
                                                 icon-image: hit.icon-image;
+                                                icon-loading: hit.icon-loading;
                                                 prefix: hit.prefix;
                                                 matched: hit.matched;
                                                 suffix: hit.suffix;
