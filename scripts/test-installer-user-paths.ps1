@@ -33,6 +33,7 @@ try {
     New-Item -ItemType Directory -Path $hostile | Out-Null
     $probeSource = @"
 #define AppExeName "MultiCore.exe"
+#define Arch "x64"
 [Setup]
 AppName=MultiCore installer probe
 AppVersion=0.0.0

@@ -49,6 +49,13 @@ foreach ($token in @(
     '#if Arch == "x64"',
     'ArchitecturesAllowed=x86compatible',
     'OutputBaseFilename=MultiCore-Setup-x86',
+    # The ARM64 flavour: ARM64 Windows only (an x64 or x86 PC refuses it), 64-bit install mode,
+    # so it shares Program Files and the 64-bit uninstall entry with x64.
+    '#elif Arch == "arm64"',
+    'ArchitecturesAllowed=arm64',
+    'ArchitecturesInstallIn64BitMode=arm64',
+    'OutputBaseFilename=MultiCore-Setup-arm64',
+    '#error Arch must be x64, x86 or arm64',
     'CloseApplications=yes',
     'UninstallDisplayIcon={app}\current\MultiCore.exe',
     'DestDir: "{app}\current"',
@@ -90,7 +97,7 @@ foreach ($forbiddenToken in @(
 foreach ($token in @(
     '[switch]$ValidateOnly',
     'SHA256SUMS.txt',
-    "[ValidateSet('x64', 'x86')]",
+    "[ValidateSet('x64', 'x86', 'arm64')]",
     '"MultiCore-Setup-$Architecture.exe"',
     '"/DArch=$Architecture"',
     '[string]$payloadManifest.platform -cne "windows-$Architecture"',
@@ -169,6 +176,37 @@ try {
     $failed = $false
     try { & $BuilderPath -PackagePath $dashboardPayload -AppVersion '0.1.0' -ValidateOnly } catch { $failed = $true }
     Assert-True $failed 'dropping a required core file from the manifest must fail installer validation'
+
+    # Every flavour compiles from the one definition, named after its architecture, and refuses
+    # another flavour's payload. (Compiling runs nothing; skipped without Inno Setup 6.)
+    $compilerCandidates = @((Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'), (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'))
+    $compiler = $compilerCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+    if (-not $compiler) {
+        Write-Output 'SKIP: ISCC.exe not found; installer flavours not compiled'
+    } else {
+        foreach ($arch in @('x64', 'x86', 'arm64')) {
+            $flavourPayload = Join-Path $testRoot "payload-$arch"
+            foreach ($directory in @($flavourPayload, (Join-Path $flavourPayload 'cores'), (Join-Path $flavourPayload 'licenses'), (Join-Path $flavourPayload 'runtime'))) {
+                New-Item -ItemType Directory -Path $directory | Out-Null
+            }
+            $flavourLines = foreach ($relative in $files) {
+                $path = Join-Path $flavourPayload $relative
+                $content = if ($relative -ceq 'versions.json') { "{`"platform`": `"windows-$arch`"}" } else { "fixture:$relative" }
+                [IO.File]::WriteAllText($path, $content, [Text.UTF8Encoding]::new($false))
+                $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+                "$hash *$($relative.Replace('\', '/'))"
+            }
+            [IO.File]::WriteAllLines((Join-Path $flavourPayload 'SHA256SUMS.txt'), $flavourLines, [Text.UTF8Encoding]::new($false))
+            $flavourOutput = Join-Path $testRoot "installer-$arch"
+            & $BuilderPath -Architecture $arch -PackagePath $flavourPayload -OutputDirectory $flavourOutput -AppVersion '0.1.0' -CompilerPath $compiler | Out-Null
+            Assert-True (Test-Path -LiteralPath (Join-Path $flavourOutput "MultiCore-Setup-$arch.exe") -PathType Leaf) "the $arch installer must compile as MultiCore-Setup-$arch.exe"
+            $other = if ($arch -ceq 'x64') { 'arm64' } else { 'x64' }
+            $failed = $false
+            try { & $BuilderPath -Architecture $other -PackagePath $flavourPayload -OutputDirectory $flavourOutput -AppVersion '0.1.0' -CompilerPath $compiler | Out-Null } catch { $failed = $true }
+            Assert-True $failed "the $other installer must refuse the $arch payload"
+        }
+    }
 
     & (Join-Path $PSScriptRoot 'test-service-installer-contract.ps1')
     & (Join-Path $PSScriptRoot 'test-installer-user-paths.ps1')
