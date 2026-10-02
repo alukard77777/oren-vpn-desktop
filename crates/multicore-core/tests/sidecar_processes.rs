@@ -410,6 +410,13 @@ async fn runtime_readiness_requires_declared_xray_loopback_ports() {
     child.stop().await.unwrap();
 
     drop(listener);
+    // Not the dropped port: a parallel test or an ephemeral source port can take it over at
+    // once. Port 1 is privileged and outside the ephemeral range, so nothing listens there.
+    std::fs::write(
+        root.join("xray.json"),
+        r#"{"inbounds":[{"listen":"127.0.0.1","port":1}]}"#,
+    )
+    .unwrap();
     let mut child = launcher.launch(command.clone()).await.unwrap();
     assert_eq!(
         launcher.wait_until_ready(&command, &mut child).await,
