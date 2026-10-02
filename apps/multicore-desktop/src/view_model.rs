@@ -1701,7 +1701,8 @@ impl DesktopViewModel {
                 self.state = self.apply_daemon_status(status);
                 self.subscription_refresh_error = None;
                 self.catalog_revision = None;
-                self.queued_selections.clear();
+                // Queued choices follow the refreshed catalog by their labels
+                // (`replace_catalog`).
                 self.latency_queued = true;
             }
             Err(error) => {
@@ -2606,10 +2607,19 @@ impl DesktopViewModel {
     /// a status refresh or a catalog reload never locks the list in the warm (`Ready`)
     /// state, because nothing is sent to the daemon until connect.
     fn selection_accepts_taps(&self) -> bool {
+        // A subscription refresh downloads without holding the daemon's lock, and the daemon
+        // carries a choice made meanwhile into the refreshed subscription: it never locks
+        // the list (a slow provider used to leave it unclickable for the whole download).
+        let subscription_refresh_only = self
+            .active_mutation
+            .is_none_or(|active| active.kind == MutationKind::SubscriptionRefresh);
         let background_only = matches!(self.state, UiState::Ready { .. })
-            && self
-                .active_mutation
-                .is_none_or(|active| active.kind == MutationKind::Refresh);
+            && self.active_mutation.is_none_or(|active| {
+                matches!(
+                    active.kind,
+                    MutationKind::Refresh | MutationKind::SubscriptionRefresh
+                )
+            });
         self.active_selection.is_none()
             && !self.profile_mutation_pending()
             && !self.profile_reconciliation_required()
@@ -2620,7 +2630,7 @@ impl DesktopViewModel {
                 UiState::Connected { .. } | UiState::Ready { .. }
             )
             && (background_only
-                || (self.catalog_request_pending.is_none() && self.active_mutation.is_none()))
+                || (self.catalog_request_pending.is_none() && subscription_refresh_only))
     }
 
     pub(crate) fn begin_node_selection(&mut self, node_id: &str) -> Option<NodeSelectionRequest> {
@@ -2987,14 +2997,41 @@ impl DesktopViewModel {
         // A queued choice survives a newer revision when its node still exists (ids are
         // opaque and stable); otherwise it is dropped with a notice.
         let before = self.queued_selections.len();
-        self.queued_selections.retain(|queued| {
-            queued.revision == catalog.revision
-                || catalog
+        let previous_catalog = std::mem::take(&mut self.catalog_groups);
+        self.queued_selections = std::mem::take(&mut self.queued_selections)
+            .into_iter()
+            .filter_map(|queued| {
+                let ids_still_exist = catalog
                     .groups
                     .iter()
                     .find(|group| group.id == queued.group_id)
-                    .is_some_and(|group| group.nodes.iter().any(|node| node.id == queued.node_id))
-        });
+                    .is_some_and(|group| group.nodes.iter().any(|node| node.id == queued.node_id));
+                if queued.revision == catalog.revision || ids_still_exist {
+                    return Some(queued);
+                }
+                // A refresh renumbers every route: find the same one by its labels.
+                let group = previous_catalog
+                    .iter()
+                    .find(|group| group.id == queued.group_id)?;
+                let node = group.nodes.iter().find(|node| node.id == queued.node_id)?;
+                let mut groups = catalog
+                    .groups
+                    .iter()
+                    .filter(|candidate| safe_catalog_label(&candidate.label) == group.label);
+                let target_group = groups.next().filter(|_| groups.next().is_none())?;
+                let mut nodes = target_group
+                    .nodes
+                    .iter()
+                    .filter(|candidate| safe_catalog_label(&candidate.label) == node.label);
+                let target_node = nodes.next().filter(|_| nodes.next().is_none())?;
+                Some(QueuedNodeSelection {
+                    group_id: target_group.id.clone(),
+                    revision: catalog.revision,
+                    node_id: target_node.id.clone(),
+                })
+            })
+            .collect();
+        self.catalog_groups = previous_catalog;
         if self.queued_selections.len() != before && self.catalog_notice_after_refresh.is_none() {
             self.catalog_notice_after_refresh =
                 Some("Каталог маршрутов обновлён. Повторите выбор.".into());
@@ -7462,6 +7499,131 @@ mod tests {
             .expect("accepted completion");
         assert!(outcome.refresh_catalog);
         assert!(!view_model.catalog_presentation().nodes[0].measuring);
+    }
+
+    #[test]
+    fn a_slow_launch_refresh_keeps_the_route_list_usable_while_connected() {
+        // The launch refresh can wait on the provider for a long time; the daemon no longer
+        // holds its lock meanwhile, so the routes stay clickable (they used to be disabled
+        // without looking disabled: clicks "did nothing").
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Первый".into()),
+                subscription: Some(DaemonSubscriptionInfo {
+                    refresh_available: true,
+                    ..DaemonSubscriptionInfo::default()
+                }),
+                ..DaemonStatus::default()
+            }),
+        );
+        let request = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(request.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+        let refresh = view_model
+            .begin_subscription_refresh()
+            .expect("launch refresh starts");
+        assert!(view_model.catalog_presentation().selection_enabled);
+        let selection = view_model
+            .begin_node_selection("opaque:node-c")
+            .expect("the click goes to the daemon at once");
+        assert_eq!(selection.node_id, "opaque:node-c");
+        // The refresh ends while the choice is still in flight; neither undoes the other.
+        assert!(view_model.finish_subscription_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Первый".into()),
+                ..DaemonStatus::default()
+            })
+        ));
+        let mut applied = catalog_fixture();
+        for node in &mut applied.groups[1].nodes {
+            node.selected = node.id == "opaque:node-c";
+        }
+        let outcome = view_model
+            .finish_node_selection(selection.token, Ok(applied))
+            .expect("selection completion");
+        assert!(outcome.refresh_catalog);
+        assert!(
+            view_model
+                .catalog_presentation()
+                .nodes
+                .iter()
+                .any(|node| node.id == "opaque:node-c" && node.selected)
+        );
+    }
+
+    #[test]
+    fn a_route_tapped_while_ready_during_a_refresh_follows_the_new_revision() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Первый".into()),
+                subscription: Some(DaemonSubscriptionInfo {
+                    refresh_available: true,
+                    ..DaemonSubscriptionInfo::default()
+                }),
+                ..DaemonStatus::default()
+            }),
+        );
+        let request = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(request.token, Ok(catalog_fixture()))
+            .expect("catalog completion");
+        let subscription_refresh = view_model
+            .begin_subscription_refresh()
+            .expect("refresh starts");
+        assert!(view_model.catalog_presentation().selection_enabled);
+        // Ready: the choice is queued for the next connect.
+        assert!(view_model.begin_node_selection("opaque:node-c").is_none());
+        assert!(view_model.finish_subscription_refresh(
+            subscription_refresh,
+            Ok(DaemonStatus {
+                state: "ready".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Первый".into()),
+                ..DaemonStatus::default()
+            })
+        ));
+        // The refreshed catalog renumbers every id; the queued choice follows its labels.
+        let mut refreshed = catalog_fixture();
+        refreshed.revision = 92;
+        for group in &mut refreshed.groups {
+            group.id = group.id.replace("opaque:", "fresh:");
+            for node in &mut group.nodes {
+                node.id = node.id.replace("opaque:", "fresh:");
+            }
+        }
+        let request = view_model.begin_catalog_request().expect("catalog reload");
+        view_model
+            .finish_catalog(request.token, Ok(refreshed))
+            .expect("catalog completion");
+        assert_eq!(
+            view_model.queued_node_selections(),
+            [QueuedNodeSelection {
+                group_id: "fresh:selected".into(),
+                revision: 92,
+                node_id: "fresh:node-c".into(),
+            }]
+        );
+        assert!(
+            view_model
+                .catalog_presentation()
+                .nodes
+                .iter()
+                .any(|node| node.id == "fresh:node-c" && node.selected)
+        );
     }
 
     #[test]

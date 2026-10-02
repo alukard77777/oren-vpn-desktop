@@ -3699,9 +3699,10 @@ where
         C: 'static,
     {
         self.require_refresh_delete_mutation().await?;
+        let prefetched = self.prefetch_profile(id).await?;
         let _operation = self.operation.lock().await;
         self.require_refresh_delete_mutation().await?;
-        self.refresh_profile_locked(id).await
+        self.refresh_profile_locked(id, Some(prefetched)).await
     }
 
     pub async fn replace_subscription_source_profile(
@@ -3714,7 +3715,8 @@ where
     {
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
-        self.replace_profile_source_locked(id, &request.url).await
+        self.replace_profile_source_locked(id, &request.url, None)
+            .await
     }
 
     pub async fn import_subscription_profile(
@@ -3970,13 +3972,8 @@ where
         }
     }
 
-    async fn refresh_profile_locked(
-        &self,
-        id: &ProfileId,
-    ) -> Result<StatusDto, ProfileMutationError>
-    where
-        C: 'static,
-    {
+    /// The source link of profile `id`.
+    async fn profile_source_url(&self, id: &ProfileId) -> Result<String, ProfileMutationError> {
         let (_, previous) = match run_blocking(|| self.store.profile_snapshot(id)) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -3985,17 +3982,54 @@ where
                     .await);
             }
         };
-        let source_url = previous
+        previous
             .subscription_source_url()
-            .ok_or(ProfileMutationError::Storage)?
-            .to_owned();
-        self.replace_profile_source_locked(id, &source_url).await
+            .map(ToOwned::to_owned)
+            .ok_or(ProfileMutationError::Storage)
+    }
+
+    /// Downloads, parses and sanitizes profile `id`'s subscription without the operation
+    /// lock: route selections and other requests stay served while the provider answers.
+    /// The lock is taken only to commit (`refresh_profile_locked`).
+    async fn prefetch_profile(&self, id: &ProfileId) -> Result<Prefetched, ProfileMutationError> {
+        let source_url = self.profile_source_url(id).await?;
+        let staging = AtomicSnapshot::default();
+        let (snapshot, _) = self
+            .fetch_subscription(&source_url, &staging)
+            .await?
+            .into_parts();
+        Ok(Prefetched {
+            source_url,
+            snapshot,
+        })
+    }
+
+    /// Refreshes profile `id` under the operation lock. A `prefetched` download is committed
+    /// when it still belongs to the profile's current link; otherwise (the link was replaced
+    /// meanwhile) the subscription is downloaded again here. Everything else (the previous
+    /// generation, saved selections, the connection state) is read now, at commit time, so
+    /// a selection made during the download is carried over.
+    async fn refresh_profile_locked(
+        &self,
+        id: &ProfileId,
+        prefetched: Option<Prefetched>,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let source_url = self.profile_source_url(id).await?;
+        let prefetched = prefetched
+            .filter(|prefetched| prefetched.source_url == source_url)
+            .map(|prefetched| prefetched.snapshot);
+        self.replace_profile_source_locked(id, &source_url, prefetched)
+            .await
     }
 
     async fn replace_profile_source_locked(
         &self,
         id: &ProfileId,
         source_url: &str,
+        prefetched: Option<Arc<Snapshot>>,
     ) -> Result<StatusDto, ProfileMutationError>
     where
         C: 'static,
@@ -4015,9 +4049,17 @@ where
         let active = self.store.active_id().as_ref() == Some(id);
         let connected =
             active && self.inner.read().await.state.current() == CoreConnectionState::Connected;
-        let staging = AtomicSnapshot::default();
-        let fetched = self.fetch_subscription(source_url, &staging).await?;
-        let (snapshot, _) = fetched.into_parts();
+        let snapshot = match prefetched {
+            Some(snapshot) => snapshot,
+            None => {
+                let staging = AtomicSnapshot::default();
+                let (snapshot, _) = self
+                    .fetch_subscription(source_url, &staging)
+                    .await?
+                    .into_parts();
+                snapshot
+            }
+        };
         // A different source is a different provider; its logo is not ours to keep.
         let snapshot = if previous.subscription_source_url() == Some(source_url) {
             snapshot.with_service_logo_carried_from(&previous)
@@ -4753,15 +4795,26 @@ where
         self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
+        let id = self
+            .store
+            .active_id()
+            .ok_or_else(|| BackendError::from_profile_mutation(ProfileMutationError::NotFound))?;
+        // The download runs without the operation lock: selections stay instant meanwhile.
+        let prefetched = self
+            .prefetch_profile(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
         let result = {
             let _operation = self.operation.lock().await;
             self.require_refresh_delete_mutation()
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
-            let id = self.store.active_id().ok_or_else(|| {
+            // Another subscription became active meanwhile: refresh that one instead.
+            let active = self.store.active_id().ok_or_else(|| {
                 BackendError::from_profile_mutation(ProfileMutationError::NotFound)
             })?;
-            self.refresh_profile_locked(&id)
+            let prefetched = (active == id).then_some(prefetched);
+            self.refresh_profile_locked(&active, prefetched)
                 .await
                 .map_err(BackendError::from_profile_mutation)
         };
@@ -4820,12 +4873,16 @@ where
         self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
+        let prefetched = self
+            .prefetch_profile(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
         let result = {
             let _operation = self.operation.lock().await;
             self.require_refresh_delete_mutation()
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
-            self.refresh_profile_locked(&id)
+            self.refresh_profile_locked(&id, Some(prefetched))
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
             self.subscription_list_dto()
@@ -4854,7 +4911,7 @@ where
             self.require_disconnected_mutation()
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
-            self.replace_profile_source_locked(&id, &request.url)
+            self.replace_profile_source_locked(&id, &request.url, None)
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
             self.subscription_list_dto()
@@ -5556,6 +5613,12 @@ fn build_catalog(
         })
         .collect();
     CatalogDto { revision, groups }
+}
+
+/// A subscription downloaded without the operation lock, waiting to be committed.
+struct Prefetched {
+    source_url: String,
+    snapshot: Arc<Snapshot>,
 }
 
 struct SelectableGroup<'a> {
