@@ -17,6 +17,11 @@ param(
     # Holds skia-binaries-<key>.tar.gz for this architecture, built by scripts/build-skia-binaries.ps1
     # and pinned in versions.json (build.skiaBinaries). Defaults to MULTICORE_SKIA_BINARIES_DIR.
     [string]$SkiaBinariesDirectory = $env:MULTICORE_SKIA_BINARIES_DIR,
+    # Production only. A persistent, caller-owned Cargo target directory (use one per architecture)
+    # so local release builds reuse compiled dependencies instead of building every crate from
+    # scratch. The default is an isolated directory inside the stage that is deleted afterwards.
+    # The build flags, toolchain check and pinned-Skia proof are identical in both modes.
+    [string]$CargoTargetDirectory,
     [Parameter(DontShow = $true)]
     [switch]$FixtureContractMode
 )
@@ -144,7 +149,7 @@ function Assert-LinkedPinnedSkia {
     param([string]$TargetDirectory, [string]$Target, [string]$Key)
     $buildRoot = if ($Target) { Join-Path $TargetDirectory (Join-Path $Target 'release\build') } else { Join-Path $TargetDirectory 'release\build' }
     $keys = @(Get-ChildItem -Path $buildRoot -Directory -Filter 'skia-bindings-*' | ForEach-Object { Join-Path $_.FullName 'out\skia\key.txt' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
-    if ($keys.Count -ne 1) { throw "Expected one skia-bindings output with key.txt, found $($keys.Count)" }
+    if ($keys.Count -ne 1) { throw "Expected one skia-bindings output with key.txt, found $($keys.Count) in $buildRoot (delete a persistent -CargoTargetDirectory that outlived a Skia upgrade)" }
     $linked = (Get-Content -Raw -LiteralPath $keys[0]).Trim()
     if ($linked -cne $Key) { throw "The build linked Skia binaries $linked instead of the pinned $Key" }
 }
@@ -713,6 +718,7 @@ $isProductionManifest = $manifestFull.Equals($defaultManifestFull, [StringCompar
 if (-not $OfflineSourceDirectory -and -not $isProductionManifest) {
     throw 'A custom manifest is permitted only with OfflineSourceDirectory fixture mode'
 }
+if ($CargoTargetDirectory -and -not $isProductionManifest) { throw 'CargoTargetDirectory applies only to production packaging' }
 
 $destination = Get-FullPath $DestinationPath
 Assert-NoReparseAncestor $destination
@@ -789,7 +795,19 @@ try {
         if ($DesktopExecutablePath -or $DaemonExecutablePath -or $UpdaterExecutablePath -or $CoreHostExecutablePath) {
             throw 'Production packaging builds all Rust executables internally; executable overrides are fixture-only'
         }
-        $rustTarget = Join-Path $stage '.rust-target'
+        $persistentRustTarget = [bool]$CargoTargetDirectory
+        if ($persistentRustTarget) {
+            $rustTarget = Get-FullPath $CargoTargetDirectory
+            Assert-NoReparseAncestor $rustTarget
+            foreach ($forbidden in @($destination, $stage)) {
+                $forbiddenPrefix = $forbidden.TrimEnd('\') + '\'
+                if ($rustTarget.Equals($forbidden, [StringComparison]::OrdinalIgnoreCase) -or $rustTarget.StartsWith($forbiddenPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'CargoTargetDirectory must lie outside the package and its stage'
+                }
+            }
+        } else {
+            $rustTarget = Join-Path $stage '.rust-target'
+        }
         Invoke-PinnedRustBuild $manifest.build $rustTarget $UpdateRepository $CargoBuildTarget
         $rustRelease = if ($CargoBuildTarget) { Join-Path $rustTarget "$CargoBuildTarget\release" } else { Join-Path $rustTarget 'release' }
         $DesktopExecutablePath = Join-Path $rustRelease 'multicore-desktop.exe'
@@ -816,11 +834,13 @@ try {
         Assert-NoPrivateBuildPaths $stagedDaemon 'Staged daemon executable'
         Assert-NoPrivateBuildPaths $stagedUpdater 'Staged updater executable'
         Assert-NoPrivateBuildPaths $stagedCoreHost 'Staged core-host executable'
-        $rustTargetFull = Get-FullPath $rustTarget
-        if ((Split-Path -Parent $rustTargetFull) -cne (Get-FullPath $stage) -or (Split-Path -Leaf $rustTargetFull) -cne '.rust-target') {
-            throw 'Refusing unsafe isolated Rust target cleanup'
+        if (-not $persistentRustTarget) {
+            $rustTargetFull = Get-FullPath $rustTarget
+            if ((Split-Path -Parent $rustTargetFull) -cne (Get-FullPath $stage) -or (Split-Path -Leaf $rustTargetFull) -cne '.rust-target') {
+                throw 'Refusing unsafe isolated Rust target cleanup'
+            }
+            Remove-Item -LiteralPath $rustTargetFull -Recurse -Force
         }
-        Remove-Item -LiteralPath $rustTargetFull -Recurse -Force
     }
 
     foreach ($componentName in @('xray', 'mihomo')) {

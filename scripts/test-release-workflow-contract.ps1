@@ -246,6 +246,17 @@ foreach ($token in @(
 }
 Assert-True ($linuxDockerScript.Contains('-e MULTICORE_UPDATE_REPOSITORY')) `
     'Docker packaging must forward the compiled update repository into the container'
+# The optional local build cache must reuse the exact in-container paths of a cache-less build
+# (same --remap-path-prefix inputs, same staged files), and CI must keep building without it.
+foreach ($cacheMount in @(
+    '-v "$CACHE_DIR/cargo-registry:/opt/cargo/registry"',
+    '-v "$CACHE_DIR/target:/build/multicore/target/linux-release-ubuntu"',
+    '-v "$CACHE_DIR/downloads:/build/multicore/target/linux-downloads"',
+    '-e CARGO_TARGET_DIR=/build/multicore/target/linux-release-ubuntu'
+)) {
+    Assert-True ($linuxDockerScript.Contains($cacheMount)) "Docker packaging cache must keep the in-container path: $cacheMount"
+}
+Assert-True (-not $linuxWorkflow.Contains('--cache-dir')) 'CI Linux packages must be built without the local build cache'
 Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats deb,appimage')) `
     'Debian and AppImage artifacts must be inspected before upload'
 Assert-True ($linuxWorkflow.Contains('./scripts/test-linux-package-contract.sh --stage target/linux-stage-ubuntu --packages dist/linux --formats arch')) `
