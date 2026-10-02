@@ -3376,12 +3376,15 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { height: 14px; background: transparent; }
 
+                    // Each section: its caption, an optional one-line description right under
+                    // it, then the card 8px below.
                     HorizontalLayout {
-                        height: 22px;
+                        height: 16px;
                         padding-left: 4px;
                         SectionCaption { text: "ЯДРА"; }
                         if root.diagnostics-loading: Text { text: "Обновляем…"; color: Theme.text-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                     }
+                    Rectangle { height: 8px; background: transparent; }
                     cores-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
                         animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
@@ -3398,9 +3401,11 @@ export component AppWindow inherits Window {
                             HealthRow { label: "Туннель TUN"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
                         }
                     }
-                    Rectangle { height: 18px; background: transparent; }
+                    Rectangle { height: 20px; background: transparent; }
 
-                    HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "МАППИНГ"; } }
+                    HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "МАППИНГ"; } }
+                    HorizontalLayout { padding-left: 4px; padding-top: 2px; Footnote { text: "Локальные прокси-адреса для сторонних приложений"; } }
+                    Rectangle { height: 8px; background: transparent; }
                     mapping-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
                         animate opacity { duration: 280ms; delay: 48ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
@@ -3436,10 +3441,10 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    HorizontalLayout { padding-left: 4px; padding-top: 6px; Footnote { text: "Локальные прокси-адреса для сторонних приложений"; } }
-                    Rectangle { height: 14px; background: transparent; }
+                    Rectangle { height: 20px; background: transparent; }
 
-                    HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ЖУРНАЛ"; } }
+                    HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ЖУРНАЛ"; } }
+                    Rectangle { height: 8px; background: transparent; }
                     event-filter-track := Rectangle {
                         height: 38px;
                         background: #0a0c0f;
