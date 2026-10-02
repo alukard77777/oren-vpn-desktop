@@ -14,6 +14,7 @@ Name:           multicore
 Version:        @VERSION@
 Release:        1
 Summary:        Native network client combining Mihomo routing with Xray transports
+Summary(ru):    Сетевой клиент: маршрутизация Mihomo и транспорты Xray
 License:        (MIT OR Apache-2.0) AND MPL-2.0 AND GPL-3.0-only
 URL:            https://github.com/fatyzzz/multicore
 Source0:        %{name}-%{version}-stage.tar.gz
@@ -41,6 +42,10 @@ Requires(postun): systemd
 %description
 MULTICORE starts Mihomo and Xray behind one desktop interface. Mihomo owns
 TUN, DNS, rules, and selectors; Xray provides the outbound transports.
+
+%description -l ru
+MULTICORE запускает Mihomo и Xray в одном приложении. Mihomo отвечает
+за TUN, DNS, правила и селекторы; Xray даёт исходящие транспорты.
 
 %prep
 %setup -q -c

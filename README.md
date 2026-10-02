@@ -25,6 +25,7 @@ elevation.
 - Portable: keep the generated directory intact and run `MultiCore.exe`.
 - Installer: run `MultiCore-Setup-x64.exe`. It installs to
   `%LOCALAPPDATA%\Programs\MultiCore\current` and can add an HKCU autostart entry.
+  Setup speaks Russian on a Russian Windows UI and English on any other.
 - Source checkout: build with the commands below, then use the packaging script;
   a bare Cargo executable is not a complete runtime package.
 
@@ -148,7 +149,10 @@ headers. Mihomo `proxy-groups` entries may name an HTTPS image in `icon:`;
 those group icons are fetched the same way (`multicore-group-icon`) on each
 refresh and kept with the subscription. A `dumb-mode: on` header (or
 `<vendor>-dumb-mode`) makes the app show only the first proxy group, without
-group tabs. A
+group tabs. The active subscription's `app-language: ru|en` header (or
+`<vendor>-app-language`, any case, regional tags such as `en-US` accepted) sets
+the interface language; by default the app follows the system language, and a
+language the user picks in Settings always wins over the header. A
 successful HTTP response to `multicore-json-massive` is authoritative: parsing
 failure is reported and does not fall back. Only an unavailable or explicitly
 unsupported massive response triggers the atomic Mihomo + Xray fallback pair.

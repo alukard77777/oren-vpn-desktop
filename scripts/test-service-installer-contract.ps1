@@ -18,7 +18,8 @@ foreach ($token in @(
     'russian.PrivilegesRequiredOverrideCurrentUser=Без службы',
     'Один запрос прав администратора сейчас',
     'TUN будет запрашивать права при каждом подключении',
-    'Name: "cleandata"; Description: "Удалить старые подписки и настройки"',
+    'Name: "cleandata"; Description: "{cm:CleanDataTask}"',
+    'russian.CleanDataTask=Удалить старые подписки и настройки',
     "WizardIsTaskSelected('cleandata')",
     "SafeDelTree(UserLocalAppData + '\MultiCore')",
     "'create ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem",
@@ -28,7 +29,8 @@ foreach ($token in @(
     "ExpandConstant('{sys}\net.exe'), 'stop ' + ServiceName",
     "Result := Result + '\Programs\MultiCore';",
     "PerUserInstallDir + '\unins000.exe'",
-    "SuppressibleMsgBox('Удалить подписки и настройки?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO)",
+    "SuppressibleMsgBox(CustomMessage('DeleteDataPrompt'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO)",
+    'russian.DeleteDataPrompt=Удалить подписки и настройки?',
     'not UninstallSilent',
     "SafeDelTree(ExpandConstant('{commonappdata}\MultiCore'))",
     'IsAdminInstallMode',
@@ -71,6 +73,7 @@ foreach ($token in @(
     'if RegKeyExists(HKLM64, UninstallKey) then',
     '(Pos(''"platform": "windows-x64"'', Manifest) > 0)',
     'уже установлен 64-битный MULTICORE',
+    "FmtMessage(CustomMessage('X64InstallPresent'), [Native64BitSetupName])",
     # On Windows on ARM the 64-bit installer to recommend is the ARM64 one.
     'function Native64BitSetupName: String;',
     'if IsArm64 then',
@@ -84,6 +87,7 @@ foreach ($token in @(
     "LoadStringFromFile(ExpandConstant('{commonpf64}\MultiCore\current\versions.json'), Manifest)",
     'function WarnX64SetupOnArm64: Boolean;',
     'уже установлен MULTICORE для ARM64',
+    "Result := CustomMessage('Arm64InstallPresent');",
     # x64 over an x86 install on 64-bit Windows: migrate it, keeping the user's data.
     'function X86ServiceUninstaller: String;',
     "RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', X86Uninstaller)",
@@ -98,6 +102,7 @@ foreach ($token in @(
     "if WizardIsTaskSelected('autostart') or MoveAutostartFromServiceInstall then",
     "ShellExec('', ServiceUninstaller, '/SILENT /SUPPRESSMSGBOXES /NORESTART'",
     'MULTICORE уже установлен со службой',
+    "SuppressibleMsgBox(CustomMessage('ServiceInstallPresent'),",
     'Result := RemoveServiceInstall;',
     'MoveAutostartFromServiceInstall',
     # The uninstaller touches the service only for the service install itself.
@@ -114,7 +119,14 @@ foreach ($token in @(
     "'create ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE Service""'",
     # An upgraded service (registered by 1.1.1 as "MultiCore") gets the new display name too.
     "'config ' + ServiceName + ' binPath= ""\""' + ServiceBinaryPath + '\"" --service"" start= auto obj= LocalSystem DisplayName= ""MULTICORE Service""'",
-    "' ""MULTICORE: ядра Mihomo и Xray для мгновенного подключения""'",
+    "'description ' + ServiceName + ' ""' + CustomMessage('ServiceDescription') + '""'",
+    'russian.ServiceDescription=MULTICORE: ядра Mihomo и Xray для мгновенного подключения',
+    # The language is the Windows UI language: Russian UI gets Russian, any other English (the
+    # first [Languages] entry is the fallback), with no dialog and no memory of an earlier install.
+    'ShowLanguageDialog=no',
+    'LanguageDetectionMethod=uilanguage',
+    'UsePreviousLanguage=no',
+    "[Languages]`r`nName: ""english""; MessagesFile: ""compiler:Default.isl""`r`nName: ""russian""; MessagesFile: ""compiler:Languages\Russian.isl""`r`n",
     # Launch at sign-in keeps its value name, so an upgrade never adds a second entry.
     'ValueName: "MultiCore"; ValueData: """{app}\current\MultiCore.exe"" --background"',
     # NTFS keeps the old casing on overwrite: 1.1.1's MultiCore.lnk shortcuts are deleted first.
@@ -218,4 +230,47 @@ if (-not $lookup.Contains('if not IsAdminInstallMode then')) {
 }
 $sid = Get-Body 'function IsSidString('
 if (-not $sid.Contains("'0'..'9', '-'")) { throw 'FAIL: the SID used in a registry path must be validated' }
+
+# Every text the user sees comes in Russian and English: [Messages] and [CustomMessages] hold each
+# name for both languages, and everything the script uses is defined.
+$messages = @{}
+foreach ($match in [regex]::Matches($definition, '(?m)^(russian|english)\.(\w+)=(.*?)\r?$')) {
+    $name = $match.Groups[2].Value
+    if (-not $messages.ContainsKey($name)) { $messages[$name] = @{} }
+    if ($messages[$name].ContainsKey($match.Groups[1].Value)) { throw "FAIL: $($match.Groups[1].Value).$name is defined twice" }
+    if (-not $match.Groups[3].Value.Trim()) { throw "FAIL: $($match.Groups[1].Value).$name is empty" }
+    $messages[$name][$match.Groups[1].Value] = $match.Groups[3].Value
+}
+if ($messages.Count -lt 20) { throw 'FAIL: the installer texts must live in [Messages] and [CustomMessages]' }
+foreach ($name in $messages.Keys) {
+    foreach ($language in @('russian', 'english')) {
+        if (-not $messages[$name].ContainsKey($language)) { throw "FAIL: $name has no $language text" }
+    }
+    if ($messages[$name]['english'] -match '[\u0400-\u04FF]') { throw "FAIL: english.$name is not in English" }
+    if ($messages[$name]['russian'] -notmatch '[\u0400-\u04FF]') { throw "FAIL: russian.$name is not in Russian" }
+    $placeholders = { param($text) (([regex]::Matches($text, '%[1-9n]') | ForEach-Object Value | Sort-Object) -join ',') }
+    if ((& $placeholders $messages[$name]['russian']) -cne (& $placeholders $messages[$name]['english'])) {
+        throw "FAIL: $name has different placeholders in Russian and English"
+    }
+}
+$used = @([regex]::Matches($definition, "CustomMessage\('(\w+)'\)") | ForEach-Object { $_.Groups[1].Value }) +
+    @([regex]::Matches($definition, '\{cm:(\w+)\}') | ForEach-Object { $_.Groups[1].Value })
+if ($used.Count -lt 20) { throw 'FAIL: the script must read its texts with CustomMessage and {cm:...}' }
+foreach ($name in $used) {
+    if (-not $messages.ContainsKey($name)) { throw "FAIL: custom message $name is not defined" }
+}
+# No Russian outside the message sections: in [Code] only comments may hold it, elsewhere only
+# comment lines.
+$codeStart = $definition.IndexOf("`r`n[Code]`r`n")
+$section = ''
+foreach ($line in ($definition.Substring(0, $codeStart) -split "`r`n")) {
+    if ($line -match '^\[(\w+)\]') { $section = $Matches[1]; continue }
+    if ($section -in @('Messages', 'CustomMessages') -or $line.TrimStart().StartsWith(';')) { continue }
+    if ($line -match '[\u0400-\u04FF]') { throw "FAIL: [$section] holds a Russian text outside the message sections: $line" }
+}
+foreach ($token in [regex]::Matches($definition.Substring($codeStart), "'(?:[^']|'')*'|\{[^}]*\}|//[^\r\n]*")) {
+    if ($token.Value.StartsWith("'") -and $token.Value -match '[\u0400-\u04FF]') {
+        throw "FAIL: [Code] holds a Russian string; use CustomMessage: $($token.Value)"
+    }
+}
 Write-Output 'PASS: service installer contract'

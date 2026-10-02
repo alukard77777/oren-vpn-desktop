@@ -25,6 +25,10 @@ $compiler = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -Pat
 if (-not $compiler) { Write-Output 'SKIP: ISCC.exe not found'; return }
 
 $code = $definition.Substring($definition.IndexOf("[Code]`r`n") + "[Code]`r`n".Length)
+# [Code] reads its texts with CustomMessage: the probe carries the same languages and messages.
+$languages = [regex]::Match($definition, '(?ms)^\[Languages\]\r\n.*?(?=^\[)').Value
+$customMessages = [regex]::Match($definition, '(?ms)^\[CustomMessages\]\r\n.*?(?=^\[)').Value
+if (-not $languages -or -not $customMessages) { throw 'FAIL: [Languages] or [CustomMessages] not found' }
 $root = Join-Path ([IO.Path]::GetTempPath()) ('multicore-installer-paths-' + [Guid]::NewGuid().ToString('N'))
 $hostile = Join-Path $root ("Иван" + [char]0x2019 + "s 'q' & %PATH% ^! x")
 $probeExe = Join-Path $hostile 'multicore-probe.exe'
@@ -45,7 +49,10 @@ OutputDir=$root
 OutputBaseFilename=probe
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+ShowLanguageDialog=no
 
+$languages
+$customMessages
 [Tasks]
 Name: "cleandata"; Description: "probe"
 Name: "autostart"; Description: "probe"

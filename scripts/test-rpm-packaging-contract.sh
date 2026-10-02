@@ -44,6 +44,12 @@ for macro in debug_package __brp_strip __brp_strip_static_archive __brp_strip_co
     grep -Eq "^%global $macro[[:space:]]+%\{nil\}$" "$spec"
 done
 grep -qx '%global _build_id_links none' "$spec"
+# English summary and description, each with its Russian translation.
+grep -Eq '^Summary:[[:space:]]+[A-Z]' "$spec" && grep -Eq '^Summary\(ru\):[[:space:]]+\S' "$spec" &&
+    grep -qx '%description' "$spec" && grep -qx '%description -l ru' "$spec" || {
+    echo 'FAIL: RPM spec must carry an English summary and description with Russian translations' >&2
+    exit 1
+}
 if grep -Eq '^%(pre|pretrans|posttrans|trigger[a-z]*|filetrigger[a-z]*|transfiletrigger[a-z]*)([[:space:]]|$)|^AutoReq(Prov)?:[[:space:]]*(no|0)|^%global (__os_install_post|__spec_install_post)' "$spec"; then
     echo 'FAIL: RPM must retain normal dependency/metadata processing and ship no scriptlets other than the service %post/%preun/%postun' >&2
     exit 1
