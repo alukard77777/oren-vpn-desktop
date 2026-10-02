@@ -337,6 +337,11 @@ where
         loop {
             requests.notified().await;
             backend.fetch_group_icons().await;
+            if backend.fetch_service_logos().await {
+                // An import was still being stored: try its logo again shortly.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                requests.notify_one();
+            }
         }
     });
 }

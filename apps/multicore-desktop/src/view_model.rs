@@ -2818,6 +2818,39 @@ impl DesktopViewModel {
         }
     }
 
+    /// The daemon still downloads the active subscription's provider logo.
+    pub(crate) fn subscription_logo_pending(&self) -> bool {
+        self.subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.service_logo_pending)
+    }
+
+    /// Takes only the provider-logo fields of a status re-read while the logo downloads (the
+    /// title chip swaps the letter avatar or the old logo for it); nothing else of the status
+    /// is applied. Returns whether the logo changed.
+    pub(crate) fn apply_service_logo(&mut self, status: &DaemonStatus) -> bool {
+        let (Some(current), Some(incoming)) = (self.subscription.as_mut(), &status.subscription)
+        else {
+            return false;
+        };
+        if status.active_profile_id != self.active_profile_id
+            || current.source_name != incoming.source_name
+        {
+            return false;
+        }
+        let changed = current.service_logo_path != incoming.service_logo_path
+            || current.service_logo_pending != incoming.service_logo_pending;
+        if current.service_logo_path != incoming.service_logo_path {
+            // The subscription list shows the same logo.
+            self.profile_reload_needed = true;
+        }
+        current
+            .service_logo_path
+            .clone_from(&incoming.service_logo_path);
+        current.service_logo_pending = incoming.service_logo_pending;
+        changed
+    }
+
     /// Some icon of the loaded catalog is still being downloaded by the daemon.
     pub(crate) fn catalog_icons_pending(&self) -> bool {
         self.catalog_groups
@@ -7624,6 +7657,45 @@ mod tests {
                 .iter()
                 .any(|node| node.id == "fresh:node-c" && node.selected)
         );
+    }
+
+    #[test]
+    fn a_provider_logo_downloaded_later_replaces_the_letter_avatar_only() {
+        let status = |path: Option<&str>, pending: bool| DaemonStatus {
+            state: "connected".into(),
+            active_profile_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            profile: Some("Тестовый".into()),
+            current_node: Some("Первый".into()),
+            subscription: Some(DaemonSubscriptionInfo {
+                source_name: "provider.example".into(),
+                display_name: "Provider".into(),
+                service_logo_path: path.map(str::to_owned),
+                service_logo_pending: pending,
+                ..DaemonSubscriptionInfo::default()
+            }),
+            ..DaemonStatus::default()
+        };
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(refresh, Ok(status(None, true)));
+        assert!(view_model.subscription_logo_pending());
+        let path = if cfg!(windows) {
+            r"C:\data\profiles\logo-1.png"
+        } else {
+            "/data/profiles/logo-1.png"
+        };
+        let mut arrived = status(Some(path), false);
+        // Only the logo is taken: not a state change.
+        arrived.state = "ready".into();
+        assert!(view_model.apply_service_logo(&arrived));
+        assert!(!view_model.subscription_logo_pending());
+        assert!(view_model.presentation().is_connected);
+        assert!(view_model.take_profile_list_reload_needed());
+        assert!(!view_model.apply_service_logo(&arrived), "nothing new");
+        // Another subscription's status is ignored.
+        let mut other = status(None, false);
+        other.active_profile_id = Some("00000000-0000-4000-8000-000000000002".into());
+        assert!(!view_model.apply_service_logo(&other));
     }
 
     #[test]

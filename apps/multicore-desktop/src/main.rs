@@ -4920,19 +4920,20 @@ const ICON_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const ICON_POLL_LIMIT: Duration = Duration::from_secs(60);
 static ICON_POLL_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// While the daemon still downloads group icons (`icon_pending` in the catalog), re-reads the
-/// catalog every `ICON_POLL_INTERVAL` and takes only its icon fields, so the loading
-/// placeholders turn into icons (or fall back to their glyphs) without a catalog reload,
-/// which would hold the route list for a moment each time. One poller at a time.
+/// While the daemon still downloads group icons (`icon_pending` in the catalog) or the
+/// provider logo (`service_logo_pending` in the status), re-reads the catalog / status every
+/// `ICON_POLL_INTERVAL` and takes only those fields, so placeholders turn into images without
+/// a catalog reload, which would hold the route list for a moment each time. One poller at a
+/// time.
 fn poll_catalog_icons(
     client: &Arc<dyn daemon::DaemonClient>,
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
 ) {
-    if !model
-        .lock()
-        .expect("view model lock")
-        .catalog_icons_pending()
+    let images_pending = |model: &DesktopViewModel| {
+        model.catalog_icons_pending() || model.subscription_logo_pending()
+    };
+    if !images_pending(&model.lock().expect("view model lock"))
         || ICON_POLL_RUNNING.swap(true, Ordering::SeqCst)
     {
         return;
@@ -4942,22 +4943,30 @@ fn poll_catalog_icons(
         let started = Instant::now();
         loop {
             thread::sleep(ICON_POLL_INTERVAL);
-            if !model
-                .lock()
-                .expect("view model lock")
-                .catalog_icons_pending()
-                || started.elapsed() > ICON_POLL_LIMIT
-            {
+            let (icons, logo) = {
+                let model = model.lock().expect("view model lock");
+                (
+                    model.catalog_icons_pending(),
+                    model.subscription_logo_pending(),
+                )
+            };
+            if !(icons || logo) || started.elapsed() > ICON_POLL_LIMIT {
                 break;
             }
-            let Ok(catalog) = client.catalog() else {
-                continue;
-            };
-            if !model
-                .lock()
-                .expect("view model lock")
-                .apply_catalog_icons(&catalog)
-            {
+            let mut changed = false;
+            if icons && let Ok(catalog) = client.catalog() {
+                changed |= model
+                    .lock()
+                    .expect("view model lock")
+                    .apply_catalog_icons(&catalog);
+            }
+            if logo && let Ok(status) = client.status() {
+                changed |= model
+                    .lock()
+                    .expect("view model lock")
+                    .apply_service_logo(&status);
+            }
+            if !changed {
                 continue;
             }
             fetch_missing_group_icons(&client, weak.clone(), model.clone());

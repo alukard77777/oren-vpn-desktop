@@ -34,8 +34,8 @@ use multicore_core::{
     AtomicSnapshot, AttemptOutcome, Component, ConnectionState as CoreConnectionState,
     DiagnosticStream, Engine, Event, FetchDiagnostics, FetchError, HttpClient, MAX_PROFILES,
     ProcessController, ProcessDiagnostics, ProfileError, ProfileId, ProfileStore, ProfileSummary,
-    RuntimeCheckState, ServiceLogoLease, Severity, Snapshot, SnapshotCommit, StagedRuntime,
-    StateMachine, SubscriptionFetcher, Supervisor,
+    RuntimeCheckState, ServiceLogoDownload, ServiceLogoLease, Severity, Snapshot, SnapshotCommit,
+    StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -163,6 +163,10 @@ pub struct SubscriptionInfoDto {
     pub announcement_action_available: bool,
     #[serde(default)]
     pub service_logo_path: Option<String>,
+    /// The provider logo is being downloaded in the background: `service_logo_path` still
+    /// names the previous one (or none) until it arrives.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_logo_pending: bool,
     pub refresh_available: bool,
     /// The provider's `dumb-mode` header: clients show only the first route group.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2258,6 +2262,10 @@ where
     shut_down: AtomicBool,
     list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
     profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
+    /// Provider logos (shared with the runtime for the status).
+    service_logos: Arc<ServiceLogos>,
+    /// Wakes the background image task (group icons and provider logos).
+    group_icons_requests: Arc<tokio::sync::Notify>,
     inner: RwLock<CoreRuntime<P>>,
 }
 
@@ -2283,6 +2291,8 @@ struct CoreRuntime<P: ProcessController> {
     readiness: Option<Arc<dyn CoresReadiness>>,
     /// Downloaded group icons; every installed snapshot gets the cached ones attached.
     group_icons: Arc<GroupIconCache>,
+    /// Provider logos downloaded in the background, by profile.
+    service_logos: Arc<ServiceLogos>,
     /// Catalog revision whose background icon download has finished (successfully or not).
     icons_settled_revision: Option<u64>,
 }
@@ -2296,6 +2306,63 @@ struct GroupIconCache {
     icons: std::sync::Mutex<BTreeMap<String, multicore_core::CachedGroupIcon>>,
     /// Wakes the background download after a snapshot with icons was installed.
     requests: Arc<tokio::sync::Notify>,
+}
+
+/// Provider logos are downloaded after the subscription was saved, never during the fetch:
+/// the subscription keeps showing its previous logo (or the letter avatar) meanwhile.
+#[derive(Default)]
+struct ServiceLogos {
+    /// The newest logo (or its removal) per profile, overriding the snapshot generation's.
+    shown: std::sync::Mutex<HashMap<ProfileId, multicore_core::CachedServiceLogo>>,
+    /// Downloads to do, by subscription link (an import has no profile id yet).
+    jobs: std::sync::Mutex<Vec<ServiceLogoJob>>,
+}
+
+struct ServiceLogoJob {
+    source_url: String,
+    /// `None`: the refreshed subscription names no logo any more.
+    logo_url: Option<String>,
+    /// The profile was not stored yet (the import is still committing).
+    attempts: u8,
+}
+
+const SERVICE_LOGO_JOB_ATTEMPTS: u8 = 5;
+
+impl ServiceLogos {
+    fn shown(&self, id: &ProfileId) -> Option<multicore_core::CachedServiceLogo> {
+        self.shown
+            .lock()
+            .expect("service logo lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    fn pending(&self, source_url: Option<&str>) -> bool {
+        source_url.is_some_and(|source_url| {
+            self.jobs
+                .lock()
+                .expect("service logo job lock poisoned")
+                .iter()
+                .any(|job| job.source_url == source_url && job.logo_url.is_some())
+        })
+    }
+
+    /// The logo path to show for profile `id` whose generation carries `generation_logo`.
+    fn path_for(
+        &self,
+        id: &ProfileId,
+        generation_logo: Option<&std::path::Path>,
+    ) -> Option<String> {
+        match self.shown(id) {
+            Some(multicore_core::CachedServiceLogo::Logo(path)) => {
+                path.to_str().map(ToOwned::to_owned)
+            }
+            Some(multicore_core::CachedServiceLogo::Removed) => None,
+            None => generation_logo
+                .and_then(std::path::Path::to_str)
+                .map(ToOwned::to_owned),
+        }
+    }
 }
 
 /// A cached icon older than this is downloaded again in the background (the cached copy stays
@@ -2409,6 +2476,7 @@ impl<P: ProcessController> CoreRuntime<P> {
             warm_revision: None,
             readiness: None,
             group_icons: Arc::default(),
+            service_logos: Arc::default(),
             icons_settled_revision: None,
         }
     }
@@ -2509,10 +2577,18 @@ impl<P: ProcessController> CoreRuntime<P> {
                             announcement_action_available: snapshot
                                 .subscription_announcement_url()
                                 .is_some(),
-                            service_logo_path: snapshot
-                                .service_logo_path()
-                                .and_then(std::path::Path::to_str)
-                                .map(ToOwned::to_owned),
+                            service_logo_path: match &self.active_profile_id {
+                                Some(id) => self
+                                    .service_logos
+                                    .path_for(id, snapshot.service_logo_path()),
+                                None => snapshot
+                                    .service_logo_path()
+                                    .and_then(std::path::Path::to_str)
+                                    .map(ToOwned::to_owned),
+                            },
+                            service_logo_pending: self
+                                .service_logos
+                                .pending(snapshot.subscription_source_url()),
                             refresh_available: snapshot.subscription_source_url().is_some(),
                             dumb_mode: info.dumb_mode,
                         })
@@ -2821,6 +2897,20 @@ where
         inner.group_icons = Arc::new(GroupIconCache::new(run_blocking(|| {
             store.group_icon_cache()
         })));
+        let service_logos = Arc::new(ServiceLogos::default());
+        if let Ok(profiles) = run_blocking(|| store.list()) {
+            let mut shown = service_logos
+                .shown
+                .lock()
+                .expect("service logo lock poisoned");
+            for profile in profiles {
+                if let Some(logo) = store.cached_service_logo(&profile.id) {
+                    shown.insert(profile.id, logo);
+                }
+            }
+        }
+        inner.service_logos = service_logos.clone();
+        let group_icons_requests = inner.group_icons.requests.clone();
         inner.active_profile_id = store.active_id();
         if let Ok(Some((id, revision, physical_generation, snapshot))) =
             store.active_snapshot_generation()
@@ -2860,6 +2950,8 @@ where
             shut_down: AtomicBool::new(false),
             list_logo_publish_hook: std::sync::Mutex::new(None),
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
+            service_logos,
+            group_icons_requests,
             inner: RwLock::new(inner),
         })
     }
@@ -2919,6 +3011,72 @@ where
         let before = state.catalog.clone();
         state.rebuild_catalog();
         settled_now || state.catalog != before
+    }
+
+    /// Downloads the provider logos of subscriptions fetched since the last call and keeps
+    /// them as their profiles' logos (a logo the provider dropped is removed). Returns whether
+    /// a job must be retried shortly (its import was still being stored).
+    pub async fn fetch_service_logos(&self) -> bool {
+        let jobs = std::mem::take(
+            &mut *self
+                .service_logos
+                .jobs
+                .lock()
+                .expect("service logo job lock poisoned"),
+        );
+        let mut retry = Vec::new();
+        for job in jobs {
+            let download = match &job.logo_url {
+                Some(url) => Some(self.fetcher.download_service_logo(url).await),
+                None => None,
+            };
+            let id = match run_blocking(|| self.store.find_exact_source(&job.source_url)) {
+                Ok(Some(id)) => id,
+                _ => {
+                    if job.attempts + 1 < SERVICE_LOGO_JOB_ATTEMPTS {
+                        retry.push(ServiceLogoJob {
+                            attempts: job.attempts + 1,
+                            ..job
+                        });
+                    }
+                    continue;
+                }
+            };
+            let stored = match download {
+                Some(ServiceLogoDownload::Logo(png)) => run_blocking(|| {
+                    self.store
+                        .save_service_logo(&id, &png)
+                        .map(multicore_core::CachedServiceLogo::Logo)
+                }),
+                Some(ServiceLogoDownload::Gone) | None => run_blocking(|| {
+                    self.store
+                        .mark_service_logo_removed(&id)
+                        .map(|()| multicore_core::CachedServiceLogo::Removed)
+                }),
+                // Unreachable this time: the logo shown stays.
+                Some(ServiceLogoDownload::Failed) => continue,
+            };
+            if let Ok(logo) = stored {
+                self.service_logos
+                    .shown
+                    .lock()
+                    .expect("service logo lock poisoned")
+                    .insert(id, logo);
+            }
+        }
+        let mut jobs = self
+            .service_logos
+            .jobs
+            .lock()
+            .expect("service logo job lock poisoned");
+        // A newer fetch of the same subscription queued its own job meanwhile.
+        retry.retain(|job| {
+            jobs.iter()
+                .all(|queued| queued.source_url != job.source_url)
+        });
+        let retry_later = !retry.is_empty();
+        jobs.extend(retry);
+        retry_later
     }
 
     /// Always-ready mode: from now on the cores are kept running while Ready (whenever the
@@ -3524,12 +3682,16 @@ where
                     || format!("Профиль {}", profile_index + 1),
                     |info| safe_catalog_label(&info.display_name, "Профиль", profile_index),
                 );
-                let service_logo_path = loaded.snapshot.as_ref().and_then(|snapshot| {
+                let generation_logo = loaded.snapshot.as_ref().and_then(|snapshot| {
                     loaded.physical_generation.and_then(|physical_generation| {
                         self.wait_for_list_logo_publish_hook();
                         self.retain_profile_logo(&loaded.summary.id, physical_generation, snapshot)
                     })
                 });
+                let service_logo_path = self.service_logos.path_for(
+                    &loaded.summary.id,
+                    generation_logo.as_deref().map(std::path::Path::new),
+                );
                 SubscriptionProfileDto {
                     id: loaded.summary.id.as_str().to_owned(),
                     active: loaded.summary.active,
@@ -3791,13 +3953,31 @@ where
         };
         let (result, diagnostics) = match tokio::time::timeout(
             SUBSCRIPTION_FETCH_DEADLINE,
-            self.fetcher.refresh_with_diagnostics(url, staging),
+            self.fetcher.refresh_deferring_logo(url, staging),
         )
         .await
         {
             Ok((result, diagnostics)) => (result, diagnostics),
             Err(_) => (Err(FetchError::Timeout), deadline_diagnostics),
         };
+        if let Ok(commit) = &result {
+            // The provider logo is downloaded in the background once the subscription is
+            // stored (`fetch_service_logos`); the previous one stays on screen meanwhile.
+            let logo_url = commit
+                .committed()
+                .subscription_logo_url()
+                .map(ToOwned::to_owned);
+            let logos = self.service_logos.clone();
+            let mut jobs = logos.jobs.lock().expect("service logo job lock poisoned");
+            jobs.retain(|job| job.source_url != url.trim());
+            jobs.push(ServiceLogoJob {
+                source_url: url.trim().to_owned(),
+                logo_url,
+                attempts: 0,
+            });
+            drop(jobs);
+            self.group_icons_requests.notify_one();
+        }
         match result {
             Ok(commit) => Ok(commit),
             Err(error) => {

@@ -333,6 +333,60 @@ async fn valid_native_bundle_is_terminal_and_fetches_logo_once_after_parsing() {
 }
 
 #[tokio::test]
+async fn a_deferred_logo_is_not_downloaded_during_the_refresh_and_the_previous_one_is_kept() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let logo = Ok(HttpResponse::new(
+        200,
+        encoded(ImageFormat::Png),
+        [] as [(&str, &str); 0],
+    ));
+    let root = temp_root("deferred");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    let fetcher = SubscriptionFetcher::new(LogoHttp {
+        calls: calls.clone(),
+        logo,
+    });
+    let previous = fetcher
+        .refresh("https://subscription.example/private", &store)
+        .await
+        .unwrap()
+        .into_committed();
+    calls.lock().unwrap().clear();
+
+    let staging = multicore_core::AtomicSnapshot::default();
+    let (deferred, _) = fetcher
+        .refresh_deferring_logo("https://subscription.example/private", &staging)
+        .await;
+    let deferred = deferred.unwrap().into_committed();
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[("https://subscription.example/private".to_owned(), UA_NATIVE)]
+    );
+    // The URL waits in memory for the background download...
+    assert_eq!(
+        deferred.subscription_logo_url(),
+        Some("https://logos.example/logo.any")
+    );
+    // ...and the previous logo is kept meanwhile.
+    let carried = deferred.clone().with_service_logo_carried_from(&previous);
+    let persisted = multicore_core::SnapshotSink::save(&store, (*carried).clone())
+        .unwrap()
+        .into_committed();
+    assert_eq!(
+        std::fs::read(persisted.service_logo_path().unwrap()).unwrap(),
+        std::fs::read(previous.service_logo_path().unwrap()).unwrap()
+    );
+    assert!(matches!(
+        fetcher
+            .download_service_logo("https://logos.example/logo.any")
+            .await,
+        multicore_core::ServiceLogoDownload::Logo(_)
+    ));
+    drop((previous, carried, deferred, persisted, store));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn arbitrary_vendor_prefix_is_accepted_only_for_safe_service_logo_suffix() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let root = temp_root("vendor-prefix");

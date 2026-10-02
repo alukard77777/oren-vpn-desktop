@@ -316,6 +316,12 @@ impl Snapshot {
             .as_deref()
     }
 
+    /// The provider logo URL of a just-downloaded subscription (never persisted: a reloaded
+    /// snapshot has none).
+    pub fn subscription_logo_url(&self) -> Option<&str> {
+        self.subscription.as_ref()?.targets.logo_url.as_deref()
+    }
+
     pub(crate) fn take_subscription_logo_url(&mut self) -> Option<String> {
         self.subscription.as_mut()?.targets.logo_url.take()
     }

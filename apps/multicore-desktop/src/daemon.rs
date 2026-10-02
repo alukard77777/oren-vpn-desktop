@@ -264,6 +264,9 @@ pub struct DaemonSubscriptionInfo {
     pub announcement_action_available: bool,
     #[serde(default)]
     pub service_logo_path: Option<String>,
+    /// The daemon still downloads the provider logo (`service_logo_path` is the previous one).
+    #[serde(default)]
+    pub service_logo_pending: bool,
     #[serde(default)]
     pub refresh_available: bool,
     /// The provider's `dumb-mode` header: only the first route group is shown.
