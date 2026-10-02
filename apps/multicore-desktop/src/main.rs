@@ -60,10 +60,10 @@ use updater::{UpdateAction, UpdateState};
 use view_model::{
     CatalogDisplayKind, CatalogPresentation, ConflictingAppsPresentation, DesktopViewModel,
     DiagnosticsPresentation, LatencyPresentation, LatencyRequest, MutationToken,
-    NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken, QueuedNodeSelection,
-    SemanticTone, SessionLine, SessionTraffic, StatePresentation, SubscriptionPresentation,
-    SubscriptionProfileOperation, SubscriptionProfilesPresentation, derive_catalog_display,
-    exit_now_display, search_routes, split_leading_symbol,
+    NodeLatencyRequest, NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken,
+    QueuedNodeSelection, SemanticTone, SessionLine, SessionTraffic, StatePresentation,
+    SubscriptionPresentation, SubscriptionProfileOperation, SubscriptionProfilesPresentation,
+    derive_catalog_display, exit_now_display, search_routes, split_leading_symbol,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -4129,13 +4129,17 @@ fn wire_catalog_node(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     });
     let weak = ui.as_weak();
     ui.on_select_catalog_node(move |id| {
-        let (request, current) = {
+        let (request, current, sweep_running) = {
             let mut model = model.lock().expect("view model lock");
             let request = model.begin_node_selection(id.as_str());
-            (request, snapshot(&model))
+            (request, snapshot(&model), model.latency_sweep_running())
         };
         if let Some(ui) = weak.upgrade() {
             apply_snapshot(&ui, &current);
+        }
+        // The route just picked is measured at once rather than waiting its turn in the sweep.
+        if sweep_running {
+            measure_catalog_node(weak.clone(), model.clone(), id.as_str());
         }
         let Some(request) = request else {
             return;
@@ -5431,8 +5435,13 @@ fn fetch_missing_group_icons(
 fn run_latency_check(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
-    request: LatencyRequest,
+    mut request: LatencyRequest,
 ) {
+    // The swept groups' selected routes are asked on their own first, so their rows update
+    // as soon as they are measured rather than when the whole sweep answers.
+    if let Some(priority) = request.priority.take() {
+        run_node_latency(weak.clone(), model.clone(), priority);
+    }
     thread::spawn(move || {
         let result = request
             .client
@@ -5459,8 +5468,9 @@ fn run_latency_check(
     });
 }
 
-/// Right click on a route (home or tray): re-measures only that node. Each row shows its own
-/// placeholder while its request runs; several rows may be measured at once.
+/// Right click on a route (home or tray), or a route picked while a sweep runs: measures only
+/// that node, at once (the daemon's priority lane does not queue behind a sweep). Each row
+/// shows its own placeholder while its request runs; several rows may be measured at once.
 fn measure_catalog_node(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
@@ -5477,17 +5487,25 @@ fn measure_catalog_node(
     if let Some(ui) = weak.upgrade() {
         apply_snapshot(&ui, &current);
     }
+    run_node_latency(weak, model, request);
+}
+
+/// Sends a priority measurement of particular routes and shows each value when it arrives.
+fn run_node_latency(
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+    request: NodeLatencyRequest,
+) {
     thread::spawn(move || {
-        let result = request.client.node_latencies(
-            Some(request.catalog_revision),
-            std::slice::from_ref(&request.node_id),
-        );
+        let result = request
+            .client
+            .node_latencies(Some(request.catalog_revision), &request.node_ids);
         let completion = {
             let mut model = model.lock().expect("view model lock");
             model
                 .finish_node_latency(
                     request.catalog_revision,
-                    &request.node_id,
+                    &request.node_ids,
                     request.token,
                     result,
                 )

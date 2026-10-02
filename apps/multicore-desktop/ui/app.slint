@@ -3522,7 +3522,9 @@ export component AppWindow inherits Window {
                                         label: node.label;
                                         supporting-text: "";
                                         trailing-text: node.latency-text;
-                                        trailing-measuring: root.latency-check-loading || node.measuring;
+                                        // Per row: a sweep marks the rows still waiting; a row measured
+                                        // on its own shows its value as soon as it is in.
+                                        trailing-measuring: node.measuring;
                                         trailing-tone: node.latency-tone;
                                         selected: node.selected;
                                         pending: root.catalog-selection-pending && node.selected;

@@ -145,17 +145,21 @@ pub(crate) struct LatencyRequest {
     pub(crate) token: LatencyRequestToken,
     pub(crate) catalog_revision: Option<u64>,
     pub(crate) group_ids: Vec<String>,
+    /// Sent alongside the sweep: the selected node of every swept group, measured first and
+    /// shown as soon as it is done instead of when the whole sweep completes.
+    pub(crate) priority: Option<NodeLatencyRequest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NodeLatencyToken(u64);
 
-/// Re-measures exactly one route (a right-click on its row).
+/// Measures particular routes ahead of any sweep: a right-click on a row, a route picked while
+/// a sweep runs, or the swept groups' selected routes.
 pub(crate) struct NodeLatencyRequest {
     pub(crate) client: Arc<dyn DaemonClient>,
     pub(crate) token: NodeLatencyToken,
     pub(crate) catalog_revision: u64,
-    pub(crate) node_id: String,
+    pub(crate) node_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -817,6 +821,11 @@ pub struct DesktopViewModel {
     next_node_latency_generation: u64,
     /// Single-route measurements in flight, by node id (each row shows its own placeholder).
     node_latency_pending: BTreeMap<String, NodeLatencyToken>,
+    /// Routes measured on their own while the current sweep runs: they already show a fresh
+    /// value, which the sweep's (older or equal) answer does not overwrite.
+    latency_sweep_fresh: BTreeSet<String>,
+    /// The current sweep's own request for its groups' selected routes.
+    latency_sweep_priority: Option<NodeLatencyToken>,
     /// The daemon reports running cores (connected, or warm through the service).
     cores_ready: bool,
     service_mode: bool,
@@ -899,6 +908,8 @@ impl DesktopViewModel {
             latency_queued: false,
             next_node_latency_generation: 0,
             node_latency_pending: BTreeMap::new(),
+            latency_sweep_fresh: BTreeSet::new(),
+            latency_sweep_priority: None,
             cores_ready: false,
             service_mode: false,
             latency_error: None,
@@ -1562,6 +1573,8 @@ impl DesktopViewModel {
         self.latency_request_pending = None;
         self.latency_request_revision = None;
         self.node_latency_pending.clear();
+        self.latency_sweep_fresh.clear();
+        self.latency_sweep_priority = None;
         self.latency_request_group_ids.clear();
         self.latency_queued = false;
         self.latency_error = None;
@@ -2327,7 +2340,7 @@ impl DesktopViewModel {
             self.latency_queued = true;
             return None;
         }
-        let group_ids = if all_groups {
+        let group_ids: Vec<String> = if all_groups {
             self.visible_catalog_groups()
                 .iter()
                 .map(|group| group.id.clone())
@@ -2335,18 +2348,35 @@ impl DesktopViewModel {
         } else {
             vec![self.selected_catalog_group.clone()?]
         };
+        // The route each swept group uses goes first, on its own.
+        let selected_nodes: Vec<String> = self
+            .catalog_groups
+            .iter()
+            .filter(|group| group_ids.contains(&group.id))
+            .flat_map(|group| group.nodes.iter().filter(|node| node.selected))
+            .map(|node| node.id.clone())
+            .collect();
         self.next_latency_generation = self.next_latency_generation.wrapping_add(1);
         let token = LatencyRequestToken(self.next_latency_generation);
         self.latency_request_pending = Some(token);
         self.latency_request_revision = self.catalog_revision;
         self.latency_request_group_ids.clone_from(&group_ids);
+        self.latency_sweep_fresh.clear();
         self.latency_queued = false;
+        let priority = self.begin_nodes_latency_request(&selected_nodes);
+        self.latency_sweep_priority = priority.as_ref().map(|request| request.token);
         Some(LatencyRequest {
             client: self.client.clone(),
             token,
             catalog_revision: self.catalog_revision,
             group_ids,
+            priority,
         })
+    }
+
+    /// A whole-group latency sweep is running.
+    pub(crate) fn latency_sweep_running(&self) -> bool {
+        self.latency_request_pending.is_some()
     }
 
     pub(crate) fn finish_latencies(
@@ -2359,7 +2389,15 @@ impl DesktopViewModel {
         }
         self.latency_request_pending = None;
         let targeted_group_ids = std::mem::take(&mut self.latency_request_group_ids);
+        // Routes measured on their own during the sweep keep that newer value; routes still
+        // measuring on their own get theirs when it arrives.
+        let fresh = std::mem::take(&mut self.latency_sweep_fresh);
+        let sweep_priority = self.latency_sweep_priority.take();
         if self.latency_request_revision.take() != self.catalog_revision {
+            // The catalog changed under the sweep: its own priority rows stop waiting too
+            // (their answer would be for the old catalog); the rerun measures them again.
+            self.node_latency_pending
+                .retain(|_, token| Some(*token) != sweep_priority);
             self.latency_queued = true;
             return Some(LatencyOutcome {
                 refresh_catalog: false,
@@ -2370,8 +2408,20 @@ impl DesktopViewModel {
         match result {
             Ok(latencies) => {
                 for entry in &latencies.entries {
-                    if !targeted_group_ids.iter().any(|id| id == &entry.group_id) {
+                    if !targeted_group_ids.iter().any(|id| id == &entry.group_id)
+                        || fresh.contains(&entry.node_id)
+                    {
                         continue;
+                    }
+                    match self.node_latency_pending.get(&entry.node_id) {
+                        // The daemon measured the sweep's own priority routes once for both
+                        // requests: this answer settles them too.
+                        Some(token) if Some(*token) == sweep_priority => {
+                            self.node_latency_pending.remove(&entry.node_id);
+                        }
+                        // A route re-measured on its own since: its answer is the newer one.
+                        Some(_) => continue,
+                        None => {}
                     }
                     if let Some(node) = self
                         .catalog_groups
@@ -2418,43 +2468,70 @@ impl DesktopViewModel {
         &mut self,
         node_id: &str,
     ) -> Option<NodeLatencyRequest> {
+        self.begin_nodes_latency_request(&[node_id.to_owned()])
+    }
+
+    /// Measures `node_ids` on the daemon's priority lane, ahead of (and alongside) any sweep.
+    /// Routes already measuring on their own, or not in the visible catalog, are left out; the
+    /// daemon joins a route the sweep is measuring right now instead of measuring it twice.
+    pub(crate) fn begin_nodes_latency_request(
+        &mut self,
+        node_ids: &[String],
+    ) -> Option<NodeLatencyRequest> {
         let cores_live = matches!(self.state, UiState::Connected { .. })
             || (matches!(self.state, UiState::Ready { .. }) && self.cores_ready);
         let catalog_revision = self.catalog_revision?;
-        if !cores_live
-            || self.node_latency_pending.contains_key(node_id)
-            || self.profile_mutation_pending()
-            || self.profile_reconciliation_required()
-            || !self
-                .visible_catalog_groups()
-                .iter()
-                .any(|group| group.nodes.iter().any(|node| node.id == node_id))
+        if !cores_live || self.profile_mutation_pending() || self.profile_reconciliation_required()
         {
+            return None;
+        }
+        let visible = self.visible_catalog_groups();
+        let mut wanted: Vec<String> = Vec::new();
+        for node_id in node_ids {
+            if !self.node_latency_pending.contains_key(node_id)
+                && !wanted.contains(node_id)
+                && visible
+                    .iter()
+                    .any(|group| group.nodes.iter().any(|node| &node.id == node_id))
+            {
+                wanted.push(node_id.clone());
+            }
+        }
+        if wanted.is_empty() {
             return None;
         }
         self.next_node_latency_generation = self.next_node_latency_generation.wrapping_add(1);
         let token = NodeLatencyToken(self.next_node_latency_generation);
-        self.node_latency_pending.insert(node_id.to_owned(), token);
+        for node_id in &wanted {
+            self.node_latency_pending.insert(node_id.clone(), token);
+        }
         self.latency_error = None;
         Some(NodeLatencyRequest {
             client: self.client.clone(),
             token,
             catalog_revision,
-            node_id: node_id.to_owned(),
+            node_ids: wanted,
         })
     }
 
     pub(crate) fn finish_node_latency(
         &mut self,
         request_revision: u64,
-        node_id: &str,
+        node_ids: &[String],
         token: NodeLatencyToken,
         result: Result<DaemonLatencies, crate::daemon::DaemonError>,
     ) -> Option<LatencyOutcome> {
-        if self.node_latency_pending.get(node_id) != Some(&token) {
+        // Rows this request still owns (a newer request for a row takes it over).
+        let owned: Vec<&String> = node_ids
+            .iter()
+            .filter(|node_id| self.node_latency_pending.get(*node_id) == Some(&token))
+            .collect();
+        if owned.is_empty() {
             return None;
         }
-        self.node_latency_pending.remove(node_id);
+        for node_id in &owned {
+            self.node_latency_pending.remove(*node_id);
+        }
         if self.catalog_revision != Some(request_revision) {
             return Some(LatencyOutcome {
                 refresh_catalog: false,
@@ -2464,11 +2541,15 @@ impl DesktopViewModel {
         let mut refresh_catalog = false;
         match result {
             Ok(latencies) => {
+                let sweep_running = self.latency_request_pending.is_some();
                 for entry in latencies
                     .entries
                     .iter()
-                    .filter(|entry| entry.node_id == node_id)
+                    .filter(|entry| owned.contains(&&entry.node_id))
                 {
+                    if sweep_running {
+                        self.latency_sweep_fresh.insert(entry.node_id.clone());
+                    }
                     let (text, tone) = latency_display(&entry.status, entry.latency_ms);
                     // The same node can appear in several groups; every copy shows the value.
                     for node in self
@@ -2937,8 +3018,18 @@ impl DesktopViewModel {
         }
     }
 
-    /// `nodes` as displayed: a route being re-measured on its own shows the placeholder.
-    fn present_nodes(&self, nodes: &[CatalogNodePresentation]) -> Vec<CatalogNodePresentation> {
+    /// `nodes` of `group_id` as displayed: a route being re-measured on its own shows the
+    /// placeholder; during a sweep of its group a route measures until its own value is in.
+    fn present_nodes(
+        &self,
+        group_id: &str,
+        nodes: &[CatalogNodePresentation],
+    ) -> Vec<CatalogNodePresentation> {
+        let swept = self.latency_request_pending.is_some()
+            && self
+                .latency_request_group_ids
+                .iter()
+                .any(|id| id == group_id);
         nodes
             .iter()
             .map(|node| {
@@ -2947,6 +3038,8 @@ impl DesktopViewModel {
                     node.measuring = true;
                     node.latency_text.clear();
                     node.latency_tone = "neutral".into();
+                } else if swept && !self.latency_sweep_fresh.contains(&node.id) {
+                    node.measuring = true;
                 }
                 node
             })
@@ -2974,14 +3067,14 @@ impl DesktopViewModel {
             .collect();
         let nodes = selected
             .and_then(|id| visible.iter().find(|group| group.id == id))
-            .map(|group| self.present_nodes(&group.nodes))
+            .map(|group| self.present_nodes(&group.id, &group.nodes))
             .unwrap_or_default();
         let search_groups = visible
             .iter()
             .map(|group| CatalogSearchGroup {
                 id: group.id.clone(),
                 label: group.label.clone(),
-                nodes: self.present_nodes(&group.nodes),
+                nodes: self.present_nodes(&group.id, &group.nodes),
             })
             .collect();
         CatalogPresentation {
@@ -3026,8 +3119,10 @@ impl DesktopViewModel {
             .iter()
             .take(max_groups)
             .map(|group| {
-                let nodes =
-                    self.present_nodes(&group.nodes[..group.nodes.len().min(remaining_nodes)]);
+                let nodes = self.present_nodes(
+                    &group.id,
+                    &group.nodes[..group.nodes.len().min(remaining_nodes)],
+                );
                 remaining_nodes = remaining_nodes.saturating_sub(nodes.len());
                 TrayCatalogGroupPresentation {
                     id: group.id.clone(),
@@ -7539,7 +7634,7 @@ mod tests {
         let first = view_model
             .begin_node_latency_request("opaque:node-c")
             .expect("node latency request");
-        assert_eq!(first.node_id, "opaque:node-c");
+        assert_eq!(first.node_ids, ["opaque:node-c"]);
         assert_eq!(first.catalog_revision, 91);
         // A second click on the same row while it measures is ignored; another row may start.
         assert!(
@@ -7571,7 +7666,7 @@ mod tests {
         let outcome = view_model
             .finish_node_latency(
                 91,
-                "opaque:node-c",
+                &["opaque:node-c".to_owned()],
                 first.token,
                 Ok(DaemonLatencies {
                     entries: vec![DaemonLatencyEntry {
@@ -7605,7 +7700,7 @@ mod tests {
             view_model
                 .finish_node_latency(
                     91,
-                    "opaque:node-c",
+                    &["opaque:node-c".to_owned()],
                     first.token,
                     Ok(DaemonLatencies::default())
                 )
@@ -7616,7 +7711,7 @@ mod tests {
         view_model
             .finish_node_latency(
                 91,
-                "opaque:node-b",
+                &["opaque:node-b".to_owned()],
                 second.token,
                 Ok(DaemonLatencies {
                     entries: vec![DaemonLatencyEntry {
@@ -7638,6 +7733,158 @@ mod tests {
         assert_eq!(node_b.latency_text, latency_display("timeout", None).0);
     }
 
+    fn latency_entry(group_id: &str, node_id: &str, latency_ms: u64) -> DaemonLatencyEntry {
+        DaemonLatencyEntry {
+            group_id: group_id.into(),
+            node_id: node_id.into(),
+            latency_ms: Some(latency_ms),
+            status: "ok".into(),
+        }
+    }
+
+    fn presented_node(view_model: &DesktopViewModel, node_id: &str) -> CatalogNodePresentation {
+        view_model
+            .catalog_presentation()
+            .nodes
+            .into_iter()
+            .find(|node| node.id == node_id)
+            .expect("presented node")
+    }
+
+    #[test]
+    fn a_sweep_measures_the_selected_route_first_and_shows_it_before_the_sweep_ends() {
+        let mut view_model = connected_view_model_with_catalog();
+        let mut sweep = view_model
+            .begin_latency_request()
+            .expect("sweep of the viewed group");
+        assert_eq!(sweep.group_ids, ["opaque:selected"]);
+        // The viewed group's selected route goes on its own, alongside the sweep.
+        let priority = sweep.priority.take().expect("selected route request");
+        assert_eq!(priority.node_ids, ["opaque:node-b"]);
+        assert!(view_model.latency_sweep_running());
+        // Every row of the swept group waits; the selected one shows its own placeholder.
+        assert!(presented_node(&view_model, "opaque:node-b").measuring);
+        assert_eq!(
+            presented_node(&view_model, "opaque:node-b").latency_text,
+            ""
+        );
+        assert!(presented_node(&view_model, "opaque:node-c").measuring);
+        assert_eq!(
+            presented_node(&view_model, "opaque:node-c").latency_text,
+            "51 ms",
+            "a sweep keeps the old value on screen"
+        );
+
+        // The selected route answers first: shown at once, the sweep still running.
+        view_model
+            .finish_node_latency(
+                91,
+                &priority.node_ids,
+                priority.token,
+                Ok(DaemonLatencies {
+                    entries: vec![latency_entry("opaque:selected", "opaque:node-b", 12)],
+                }),
+            )
+            .expect("priority completion");
+        assert!(view_model.latency_presentation().loading);
+        let node_b = presented_node(&view_model, "opaque:node-b");
+        assert!(!node_b.measuring);
+        assert_eq!(node_b.latency_text, "12 ms");
+        assert!(presented_node(&view_model, "opaque:node-c").measuring);
+
+        // The sweep's own answer for that route does not overwrite the newer one.
+        view_model
+            .finish_latencies(
+                sweep.token,
+                Ok(DaemonLatencies {
+                    entries: vec![
+                        latency_entry("opaque:selected", "opaque:node-b", 300),
+                        latency_entry("opaque:selected", "opaque:node-c", 44),
+                    ],
+                }),
+            )
+            .expect("sweep completion");
+        assert_eq!(
+            presented_node(&view_model, "opaque:node-b").latency_text,
+            "12 ms"
+        );
+        let node_c = presented_node(&view_model, "opaque:node-c");
+        assert!(!node_c.measuring);
+        assert_eq!(node_c.latency_text, "44 ms");
+        assert!(!view_model.latency_sweep_running());
+    }
+
+    #[test]
+    fn a_route_picked_or_re_measured_during_a_sweep_gets_its_own_request_once() {
+        let mut view_model = connected_view_model_with_catalog();
+        let mut sweep = view_model.begin_latency_request().expect("sweep");
+        let _selected = sweep.priority.take().expect("selected route request");
+        let picked = view_model
+            .begin_node_latency_request("opaque:node-c")
+            .expect("picked route request");
+        assert_eq!(picked.node_ids, ["opaque:node-c"]);
+        // Already measuring on its own: no duplicate request.
+        assert!(
+            view_model
+                .begin_node_latency_request("opaque:node-c")
+                .is_none()
+        );
+        assert!(
+            view_model
+                .begin_nodes_latency_request(&["opaque:node-c".into(), "opaque:node-b".into()])
+                .is_none(),
+            "both routes are already being measured"
+        );
+        assert!(presented_node(&view_model, "opaque:node-c").measuring);
+
+        // The sweep finishing first does not cut the picked route's own measurement short.
+        view_model
+            .finish_latencies(
+                sweep.token,
+                Ok(DaemonLatencies {
+                    entries: vec![latency_entry("opaque:selected", "opaque:node-c", 90)],
+                }),
+            )
+            .expect("sweep completion");
+        assert!(presented_node(&view_model, "opaque:node-c").measuring);
+        view_model
+            .finish_node_latency(
+                91,
+                &picked.node_ids,
+                picked.token,
+                Ok(DaemonLatencies {
+                    entries: vec![latency_entry("opaque:selected", "opaque:node-c", 33)],
+                }),
+            )
+            .expect("picked completion");
+        let node_c = presented_node(&view_model, "opaque:node-c");
+        assert!(!node_c.measuring);
+        assert_eq!(node_c.latency_text, "33 ms");
+    }
+
+    #[test]
+    fn priority_measurement_is_wired_into_the_sweep_the_pick_and_the_rows() {
+        let main = include_str!("main.rs");
+        let app = include_str!("../ui/app.slint");
+        let check = main
+            .split("fn run_latency_check(")
+            .nth(1)
+            .and_then(|source| source.split("thread::spawn").next())
+            .expect("latency check");
+        assert!(check.contains("if let Some(priority) = request.priority.take() {"));
+        assert!(check.contains("run_node_latency(weak.clone(), model.clone(), priority);"));
+        let select = main
+            .split("ui.on_select_catalog_node(move |id| {")
+            .nth(1)
+            .and_then(|source| source.split("run_node_selection(").next())
+            .expect("select handler");
+        assert!(select.contains("model.latency_sweep_running()"));
+        assert!(select.contains("measure_catalog_node(weak.clone(), model.clone(), id.as_str());"));
+        // A row measures on its own state, not on the sweep as a whole.
+        assert!(app.contains("trailing-measuring: node.measuring;"));
+        assert!(!app.contains("trailing-measuring: root.latency-check-loading"));
+    }
+
     #[test]
     fn node_measurement_needs_live_cores_and_a_stale_catalog_refreshes() {
         let mut cold = warm_view_model_with_catalog(false);
@@ -7650,7 +7897,7 @@ mod tests {
         let outcome = view_model
             .finish_node_latency(
                 91,
-                "opaque:node-b",
+                &["opaque:node-b".to_owned()],
                 request.token,
                 Err(crate::daemon::DaemonError::stale_revision()),
             )

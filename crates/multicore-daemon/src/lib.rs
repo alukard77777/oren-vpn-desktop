@@ -54,9 +54,15 @@ pub const MAX_CATALOG_NODES_PER_GROUP: usize = 256;
 pub const MAX_CATALOG_NAME_CHARS: usize = 256;
 /// Maximum number of latency results accepted and returned by one request.
 pub const MAX_LATENCY_RESULTS: usize = 256;
-/// Maximum number of in-flight requests to the Mihomo controller per latency operation.
+/// Maximum number of in-flight sweep probes (whole groups) to the Mihomo controller.
 pub const MAX_CONCURRENT_LATENCY_PROBES: usize = 8;
+/// Maximum number of in-flight priority probes: explicitly requested nodes (a clicked, selected
+/// or re-measured row) and each swept group's selected node. They have their own budget so
+/// they never queue behind a sweep.
+pub const MAX_PRIORITY_LATENCY_PROBES: usize = 4;
 const LATENCY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a finished probe stays available to requests that were already waiting for it.
+const LATENCY_RESULT_RETENTION: Duration = Duration::from_secs(60);
 const LATENCY_BATCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// Maximum number of Mihomo-to-Xray loopback bridge mappings exposed in diagnostics.
 pub const MAX_DIAGNOSTIC_MAPPINGS: usize = 256;
@@ -873,26 +879,134 @@ impl MihomoSelector for MihomoHttpSelector {
     }
 }
 
-async fn probe_latency_target(
+type ProbeOutcome = Result<u64, LatencyProbeError>;
+
+/// Probes in flight and recently finished, by raw Mihomo proxy name, shared by every latency
+/// request: a node already being measured is joined instead of measured twice, and a sweep that
+/// reaches a node measured since it began reuses that result.
+#[derive(Default)]
+struct LatencyFlights {
+    in_flight: HashMap<String, tokio::sync::watch::Receiver<Option<ProbeOutcome>>>,
+    finished: HashMap<String, (tokio::time::Instant, ProbeOutcome)>,
+}
+
+impl LatencyFlights {
+    /// A finished result no older than `since`, or the receiver of a probe in flight.
+    fn join(
+        &mut self,
+        raw_node: &str,
+        since: tokio::time::Instant,
+    ) -> Option<Result<ProbeOutcome, tokio::sync::watch::Receiver<Option<ProbeOutcome>>>> {
+        if let Some((finished_at, outcome)) = self.finished.get(raw_node)
+            && *finished_at >= since
+        {
+            return Some(Ok(*outcome));
+        }
+        let receiver = self.in_flight.get(raw_node)?;
+        // A probe whose task is gone (runtime shutting down) is no probe to wait for.
+        if receiver.has_changed().is_err() {
+            self.in_flight.remove(raw_node);
+            return None;
+        }
+        Some(Err(receiver.clone()))
+    }
+}
+
+/// Where a latency target is measured.
+#[derive(Clone)]
+struct LatencyLane {
     selector: Arc<dyn MihomoSelector>,
     permits: Arc<tokio::sync::Semaphore>,
+    flights: Arc<std::sync::Mutex<LatencyFlights>>,
+}
+
+async fn wait_for_probe(
+    mut receiver: tokio::sync::watch::Receiver<Option<ProbeOutcome>>,
+) -> ProbeOutcome {
+    match receiver.wait_for(Option::is_some).await {
+        Ok(outcome) => outcome.unwrap_or(Err(LatencyProbeError::Unavailable)),
+        Err(_) => Err(LatencyProbeError::Unavailable),
+    }
+}
+
+/// Measures `raw_node` once for everybody asking: joins a probe in flight, reuses one finished
+/// since `since`, or takes a permit of `lane` and starts it. The probe itself runs detached and
+/// bounded by `LATENCY_PROBE_TIMEOUT`, so a request that gives up (its batch deadline) never
+/// cancels a measurement another request is waiting for.
+async fn measure_latency(
+    lane: LatencyLane,
+    raw_node: String,
+    since: tokio::time::Instant,
+) -> ProbeOutcome {
+    let joined = lane
+        .flights
+        .lock()
+        .expect("latency flights lock")
+        .join(&raw_node, since);
+    match joined {
+        Some(Ok(outcome)) => return outcome,
+        Some(Err(receiver)) => return wait_for_probe(receiver).await,
+        None => {}
+    }
+    let permit = lane
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| LatencyProbeError::Unavailable)?;
+    let receiver = {
+        let mut flights = lane.flights.lock().expect("latency flights lock");
+        // Somebody may have started or finished it while this request queued for a permit.
+        match flights.join(&raw_node, since) {
+            Some(Ok(outcome)) => return outcome,
+            Some(Err(receiver)) => Err(receiver),
+            None => {
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                flights.in_flight.insert(raw_node.clone(), receiver.clone());
+                Ok((sender, receiver))
+            }
+        }
+    };
+    let (sender, receiver) = match receiver {
+        Ok(started) => started,
+        Err(joined) => {
+            drop(permit);
+            return wait_for_probe(joined).await;
+        }
+    };
+    let (selector, flights) = (lane.selector, lane.flights);
+    tokio::spawn(async move {
+        let outcome =
+            tokio::time::timeout(LATENCY_PROBE_TIMEOUT, selector.probe_latency(&raw_node))
+                .await
+                .unwrap_or(Err(LatencyProbeError::Timeout));
+        drop(permit);
+        {
+            let mut flights = flights.lock().expect("latency flights lock");
+            let now = tokio::time::Instant::now();
+            flights.in_flight.remove(&raw_node);
+            flights.finished.retain(|_, (finished_at, _)| {
+                now.saturating_duration_since(*finished_at) < LATENCY_RESULT_RETENTION
+            });
+            flights.finished.insert(raw_node, (now, outcome));
+        }
+        let _ = sender.send(Some(outcome));
+    });
+    wait_for_probe(receiver).await
+}
+
+async fn probe_latency_target(
+    lane: LatencyLane,
+    since: tokio::time::Instant,
     index: usize,
     group_id: String,
     node_id: String,
     raw_node: String,
 ) -> (usize, LatencyResultDto) {
-    let outcome = tokio::time::timeout(LATENCY_PROBE_TIMEOUT, async {
-        let _permit = permits
-            .acquire_owned()
-            .await
-            .map_err(|_| LatencyProbeError::Unavailable)?;
-        selector.probe_latency(&raw_node).await
-    })
-    .await;
-    let (latency_ms, status) = match outcome {
-        Ok(Ok(latency_ms)) => (Some(latency_ms), LatencyStatus::Ok),
-        Ok(Err(LatencyProbeError::Timeout)) | Err(_) => (None, LatencyStatus::Timeout),
-        Ok(Err(LatencyProbeError::Unavailable)) => (None, LatencyStatus::Error),
+    let (latency_ms, status) = match measure_latency(lane, raw_node, since).await {
+        Ok(latency_ms) => (Some(latency_ms), LatencyStatus::Ok),
+        Err(LatencyProbeError::Timeout) => (None, LatencyStatus::Timeout),
+        Err(LatencyProbeError::Unavailable) => (None, LatencyStatus::Error),
     };
     (
         index,
@@ -2459,6 +2573,8 @@ where
     factory_type: PhantomData<fn() -> F>,
     selector: Arc<dyn MihomoSelector>,
     latency_permits: Arc<tokio::sync::Semaphore>,
+    priority_latency_permits: Arc<tokio::sync::Semaphore>,
+    latency_flights: Arc<std::sync::Mutex<LatencyFlights>>,
     exit_now_cache: std::sync::Mutex<Option<ExitNowCache>>,
     operation: tokio::sync::Mutex<()>,
     /// Held by a subscription switch or refresh across its disconnect, switch and reconnect,
@@ -3154,6 +3270,10 @@ where
             factory_type: PhantomData,
             selector,
             latency_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES)),
+            priority_latency_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_PRIORITY_LATENCY_PROBES,
+            )),
+            latency_flights: Arc::default(),
             exit_now_cache: std::sync::Mutex::new(None),
             operation: tokio::sync::Mutex::new(()),
             generation_change: tokio::sync::Mutex::new(()),
@@ -5672,8 +5792,13 @@ where
         })
     }
 
+    /// Measures the requested groups (a sweep) and nodes. Explicitly requested nodes and each
+    /// swept group's selected node go first, on the priority lane with its own small budget, so
+    /// they never wait behind the sweep; a node another request is already measuring is joined,
+    /// and one measured since this request began is not measured again.
     async fn latencies(&self, request: LatencyRequest) -> Result<LatencyResponseDto, LatencyError> {
-        let batch_deadline = tokio::time::Instant::now() + LATENCY_BATCH_TIMEOUT;
+        let started = tokio::time::Instant::now();
+        let batch_deadline = started + LATENCY_BATCH_TIMEOUT;
         if request
             .group_ids
             .len()
@@ -5683,7 +5808,7 @@ where
             return Err(LatencyError::TooManyTargets);
         }
 
-        let mut targets = {
+        let targets = {
             let state = self.inner.read().await;
             if !state.cores_live() {
                 return Err(LatencyError::NotConnected);
@@ -5729,21 +5854,24 @@ where
             }
 
             let probe_all = requested_groups.is_empty() && requested_nodes.is_empty();
-            let mut targets: VecDeque<_> = groups
+            let selected_nodes = &state.selected_nodes;
+            let mut targets: Vec<_> = groups
                 .iter()
                 .enumerate()
                 .flat_map(|(group_index, group)| {
                     let group_id = catalog_group_id(revision, group_index);
                     let group_requested = requested_groups.contains(group_id.as_str());
                     let requested_nodes = &requested_nodes;
+                    let selected = selected_nodes.get(group_index).cloned().flatten();
                     group
                         .offered_nodes()
                         .filter_map(move |(node_index, raw_node)| {
                             let node_id = catalog_node_id(revision, group_index, node_index);
-                            (probe_all
-                                || group_requested
-                                || requested_nodes.contains(node_id.as_str()))
-                            .then(|| (group_id.clone(), node_id, raw_node.to_owned()))
+                            let explicit = requested_nodes.contains(node_id.as_str());
+                            (probe_all || group_requested || explicit).then(|| {
+                                let priority = explicit || selected.as_deref() == Some(raw_node);
+                                (group_id.clone(), node_id, raw_node.to_owned(), priority)
+                            })
                         })
                 })
                 .collect();
@@ -5757,22 +5885,36 @@ where
             targets
         };
 
-        let all_targets: Vec<_> = targets.iter().cloned().collect();
+        // Priority targets start first; within each lane the catalog order is kept. Every
+        // target waits for its lane's permit, so the sweep never holds more than its budget.
+        let mut order: Vec<usize> = (0..targets.len()).collect();
+        order.sort_by_key(|index| !targets[*index].3);
         let mut probes = tokio::task::JoinSet::new();
-        let mut next_index = 0_usize;
-        while probes.len() < MAX_CONCURRENT_LATENCY_PROBES {
-            let Some((group_id, node_id, raw_node)) = targets.pop_front() else {
-                break;
+        for index in order {
+            let (_, node_id, raw_node, priority) = &targets[index];
+            let lane = LatencyLane {
+                selector: self.selector.clone(),
+                permits: if *priority {
+                    self.priority_latency_permits.clone()
+                } else {
+                    self.latency_permits.clone()
+                },
+                flights: self.latency_flights.clone(),
             };
-            let selector = self.selector.clone();
-            let permits = self.latency_permits.clone();
-            let index = next_index;
-            next_index += 1;
             probes.spawn(probe_latency_target(
-                selector, permits, index, group_id, node_id, raw_node,
+                lane,
+                started,
+                index,
+                targets[index].0.clone(),
+                node_id.clone(),
+                raw_node.clone(),
             ));
         }
 
+        let all_targets: Vec<_> = targets
+            .into_iter()
+            .map(|(group_id, node_id, _, _)| (group_id, node_id, ()))
+            .collect();
         let mut completed = vec![None; all_targets.len()];
         while !probes.is_empty() {
             match tokio::time::timeout_at(batch_deadline, probes.join_next()).await {
@@ -5780,20 +5922,11 @@ where
                 Ok(Some(Err(_))) => {}
                 Ok(None) => break,
                 Err(_) => {
+                    // Waiting requests stop here; probes already running finish on their own
+                    // (bounded by the probe timeout) for anybody else waiting on them.
                     probes.abort_all();
                     break;
                 }
-            }
-            if tokio::time::Instant::now() < batch_deadline
-                && let Some((group_id, node_id, raw_node)) = targets.pop_front()
-            {
-                let selector = self.selector.clone();
-                let permits = self.latency_permits.clone();
-                let index = next_index;
-                next_index += 1;
-                probes.spawn(probe_latency_target(
-                    selector, permits, index, group_id, node_id, raw_node,
-                ));
             }
         }
         let entries = all_targets

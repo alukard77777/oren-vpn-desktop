@@ -23,7 +23,7 @@ use multicore_core::{
 };
 use multicore_daemon::{
     Backend, BackendError, CoreBackend, LatencyProbeError, LatencyRequest, LatencyStatus,
-    MihomoHttpSelector, MihomoSelector, SelectorError, router,
+    MihomoHttpSelector, MihomoSelector, SelectionRequest, SelectorError, router,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -351,7 +351,11 @@ async fn probe_all_caps_controller_concurrency() {
     let response = backend.latencies(LatencyRequest::default()).await.unwrap();
 
     assert_eq!(response.entries.len(), 20);
-    assert!(controller.maximum.load(Ordering::SeqCst) <= 8);
+    // The sweep's budget, plus the group's selected node on the priority lane.
+    assert!(
+        controller.maximum.load(Ordering::SeqCst)
+            <= multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES + 1
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -420,4 +424,233 @@ async fn probe_all_deterministically_caps_large_catalog_instead_of_rejecting_it(
     let probes = controller.probes.lock().unwrap();
     assert_eq!(probes.len(), 256);
     assert!(probes.iter().all(|raw_name| raw_name.starts_with("first-")));
+}
+
+/// Every probe takes `delay`; records which node was probed, in order.
+struct SleepyController {
+    delay: Duration,
+    probes: Mutex<Vec<String>>,
+    active: AtomicUsize,
+    maximum: AtomicUsize,
+}
+
+impl SleepyController {
+    fn new(delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            delay,
+            probes: Mutex::new(Vec::new()),
+            active: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+        })
+    }
+
+    fn probes(&self) -> Vec<String> {
+        self.probes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MihomoSelector for SleepyController {
+    async fn select(&self, _: &str, _: &str) -> Result<(), SelectorError> {
+        Ok(())
+    }
+
+    async fn probe_latency(&self, raw_name: &str) -> Result<u64, LatencyProbeError> {
+        self.probes.lock().unwrap().push(raw_name.to_owned());
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(50)
+    }
+}
+
+fn slow_group(count: usize) -> String {
+    let nodes = (0..count)
+        .map(|index| format!("slow-{index:02}"))
+        .collect::<Vec<_>>();
+    let proxies = nodes
+        .iter()
+        .map(|node| format!("  - {{name: {node}, type: socks5}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "proxies:\n{proxies}\nproxy-groups:\n  - name: Main\n    type: select\n    proxies: [{}]\n",
+        nodes.join(", ")
+    )
+}
+
+fn assert_each_probed_once(probes: &[String]) {
+    let mut unique = probes.to_vec();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        probes.len(),
+        "a node was measured twice: {probes:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_priority_node_is_answered_while_a_sweep_of_slow_nodes_still_runs() {
+    let controller = SleepyController::new(Duration::from_secs(1));
+    let backend = Arc::new(backend_with_mihomo(controller.clone(), &slow_group(40)));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let group = &catalog.groups[0];
+    let last = group.nodes.last().unwrap().id.clone();
+    let started = tokio::time::Instant::now();
+
+    let sweep = tokio::spawn({
+        let backend = backend.clone();
+        let request = LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: vec![group.id.clone()],
+            node_ids: Vec::new(),
+        };
+        async move { backend.latencies(request).await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The last node of the sweep queue: measured at once, outside the sweep's budget.
+    let priority = backend
+        .latencies(LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: Vec::new(),
+            node_ids: vec![last.clone()],
+        })
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "answered after {:?}",
+        started.elapsed()
+    );
+    assert!(!sweep.is_finished(), "the sweep is still running");
+    assert_eq!(priority.entries.len(), 1);
+    assert_eq!(priority.entries[0].node_id, last);
+    assert_eq!(priority.entries[0].status, LatencyStatus::Ok);
+
+    let sweep = sweep.await.unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert_eq!(sweep.entries.len(), 40);
+    assert!(
+        sweep
+            .entries
+            .iter()
+            .all(|entry| entry.status == LatencyStatus::Ok)
+    );
+    // The sweep reused the priority result instead of measuring that node again.
+    let probes = controller.probes();
+    assert_eq!(probes.len(), 40);
+    assert_each_probed_once(&probes);
+    // Sweep budget plus the priority lane, never more.
+    assert!(
+        controller.maximum.load(Ordering::SeqCst)
+            <= multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES
+                + multicore_daemon::MAX_PRIORITY_LATENCY_PROBES
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_node_already_in_flight_is_joined_not_measured_twice() {
+    let controller = SleepyController::new(Duration::from_secs(1));
+    let backend = Arc::new(backend_with_mihomo(controller.clone(), &slow_group(12)));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let group = &catalog.groups[0];
+    // Started by the sweep in its first wave.
+    let early = group.nodes[2].id.clone();
+
+    let sweep = tokio::spawn({
+        let backend = backend.clone();
+        let request = LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: vec![group.id.clone()],
+            node_ids: Vec::new(),
+        };
+        async move { backend.latencies(request).await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = tokio::time::Instant::now();
+    let joined = backend
+        .latencies(LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: Vec::new(),
+            node_ids: vec![early],
+        })
+        .await
+        .unwrap();
+    // It got the sweep's probe, which had 0.7 s left.
+    assert!(started.elapsed() < Duration::from_millis(900));
+    assert_eq!(joined.entries[0].status, LatencyStatus::Ok);
+    sweep.await.unwrap();
+    let probes = controller.probes();
+    assert_eq!(probes.len(), 12);
+    assert_each_probed_once(&probes);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sweep_measures_each_groups_selected_node_first() {
+    let controller = SleepyController::new(Duration::from_millis(200));
+    let backend = backend_with_mihomo(controller.clone(), &slow_group(20));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let group = &catalog.groups[0];
+    let last = group.nodes.last().unwrap();
+    backend
+        .select(SelectionRequest {
+            revision: catalog.revision,
+            node_id: last.id.clone(),
+            group_id: group.id.clone(),
+        })
+        .await
+        .unwrap();
+    let catalog = backend.catalog().await.unwrap();
+
+    let response = backend
+        .latencies(LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: vec![catalog.groups[0].id.clone()],
+            node_ids: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.entries.len(), 20);
+    // Entries keep the catalog order; the probes started with the selected node.
+    assert_eq!(response.entries[19].node_id, catalog.groups[0].nodes[19].id);
+    assert_eq!(controller.probes()[0], "slow-19");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_request_leaves_its_probe_to_whoever_waits_and_nothing_stale() {
+    let controller = SleepyController::new(Duration::from_secs(1));
+    let backend = backend_with_mihomo(controller.clone(), &slow_group(3));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let node = catalog.groups[0].nodes[1].id.clone();
+    let request = || LatencyRequest {
+        revision: Some(catalog.revision),
+        group_ids: Vec::new(),
+        node_ids: vec![node.clone()],
+    };
+
+    // The caller gives up after 100 ms (a closed window, a timed-out client).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backend.latencies(request()))
+            .await
+            .is_err()
+    );
+    // The probe keeps running; a new request joins it instead of starting another.
+    let started = tokio::time::Instant::now();
+    let joined = backend.latencies(request()).await.unwrap();
+    assert!(started.elapsed() < Duration::from_millis(950));
+    assert_eq!(joined.entries[0].status, LatencyStatus::Ok);
+    assert_eq!(controller.probes().len(), 1);
+
+    // A later request measures afresh: a finished result from before it was asked is stale.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let fresh = backend.latencies(request()).await.unwrap();
+    assert_eq!(fresh.entries[0].status, LatencyStatus::Ok);
+    assert_eq!(controller.probes().len(), 2);
 }
