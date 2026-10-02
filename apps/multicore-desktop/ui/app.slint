@@ -1279,6 +1279,9 @@ export component AppWindow inherits Window {
     in-out property <bool> service-offer-dismissed: false;
     // A new notice nobody has opened yet: the bell shows its dot only then.
     in-out property <bool> announcement-unread: false;
+    // Opened by a subscription switch: the popover closes itself after 15 s unless the
+    // pointer rests on it (or it is closed or reopened by hand).
+    in-out property <bool> announcement-auto-hide: false;
     // Window growth from the expanded rail (logical px; 0 = none), persisted so a
     // collapse after a restart still shrinks the window back.
     in-out property <int> rail-growth-delta: 0;
@@ -1552,7 +1555,14 @@ export component AppWindow inherits Window {
     changed announcement-open => {
         if (root.announcement-open) {
             root.announcement-unread = false;
+        } else {
+            root.announcement-auto-hide = false;
         }
+    }
+    Timer {
+        interval: 15s;
+        running: root.announcement-open && root.announcement-auto-hide;
+        triggered => { root.announcement-open = false; }
     }
 
     changed visible-page => {
@@ -4750,6 +4760,16 @@ export component AppWindow inherits Window {
                 animate y { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                 animate transform-scale { duration: 240ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
 
+                // Resting the pointer on the notice keeps it open; a click still dismisses it.
+                TouchArea {
+                    enabled: announcement-popover.shown;
+                    changed has-hover => {
+                        if (self.has-hover) {
+                            root.announcement-auto-hide = false;
+                        }
+                    }
+                    clicked => { root.announcement-open = false; }
+                }
                 Image {
                     x: 14px;
                     y: 14px;

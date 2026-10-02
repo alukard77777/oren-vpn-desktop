@@ -5287,6 +5287,52 @@ fn used_fraction(quota: &view_model::QuotaPresentation) -> f32 {
         .map_or(0.0, |permille| f32::from(permille) / 1000.0)
 }
 
+/// Notices a subscription switch between snapshots, so the new subscription's provider
+/// notice opens once and hides itself again (see `announcement-auto-hide`).
+#[derive(Debug, Default)]
+struct SwitchNotice {
+    active: Option<String>,
+    pending_since: Option<Instant>,
+}
+
+impl SwitchNotice {
+    /// How long after a switch its notice may still arrive (a refresh can bring it).
+    const WINDOW: Duration = Duration::from_secs(30);
+
+    /// Feeds one snapshot's active profile; true when this snapshot should open its notice
+    /// as the switch notice. The first profile after launch is not a switch, and a moment
+    /// without an active profile (a reload, a deleted profile) keeps the last one.
+    fn observe(&mut self, active: Option<&str>, has_notice: bool, now: Instant) -> bool {
+        if let Some(current) = active {
+            if self
+                .active
+                .as_deref()
+                .is_some_and(|previous| previous != current)
+            {
+                self.pending_since = Some(now);
+            }
+            self.active = Some(current.to_owned());
+        }
+        match self.pending_since {
+            Some(since) if now.duration_since(since) <= Self::WINDOW => {
+                if has_notice {
+                    self.pending_since = None;
+                }
+                has_notice
+            }
+            Some(_) => {
+                self.pending_since = None;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+thread_local! {
+    static SWITCH_NOTICE: RefCell<SwitchNotice> = RefCell::new(SwitchNotice::default());
+}
+
 /// Stable 64-bit FNV-1a fingerprint of a provider notice (`None` when there is
 /// none). Stable across Rust versions, unlike `DefaultHasher`.
 fn announcement_fingerprint(text: &str) -> Option<String> {
@@ -5370,11 +5416,26 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
     // A notice the user has not seen yet opens its popover once, on launch or
     // when a refresh brings a new one; an unchanged notice stays behind the bell.
-    if let Some(fingerprint) = announcement_fingerprint(&snapshot.subscription.announcement_text)
+    let fingerprint = announcement_fingerprint(&snapshot.subscription.announcement_text);
+    if let Some(fingerprint) = &fingerprint
         && ui.get_announcement_seen().as_str() != fingerprint
     {
-        ui.set_announcement_seen(fingerprint.into());
+        ui.set_announcement_seen(fingerprint.as_str().into());
         ui.set_announcement_unread(true);
+        ui.set_announcement_open(true);
+    }
+    // Switching subscriptions shows the new one's notice, which hides itself after 15 s
+    // unless the pointer rests on it; the bell still reopens it.
+    let switched = SWITCH_NOTICE.with(|notice| {
+        notice.borrow_mut().observe(
+            snapshot.profiles.active_id.as_deref(),
+            fingerprint.is_some(),
+            Instant::now(),
+        )
+    });
+    if switched && let Some(fingerprint) = fingerprint {
+        ui.set_announcement_seen(fingerprint.into());
+        ui.set_announcement_auto_hide(true);
         ui.set_announcement_open(true);
     }
     ui.set_subscription_announcement_tone(snapshot.subscription.announcement_tone.clone().into());
@@ -7706,6 +7767,26 @@ mod window_tests {
             .find("windows_settings::migrate_legacy_brand();")
             .expect("installed copies rename the 1.1.1 entry and shortcuts on startup");
         assert!(forwarding < migration);
+    }
+
+    #[test]
+    fn a_subscription_switch_opens_the_new_notice_once() {
+        let start = Instant::now();
+        let mut notice = super::SwitchNotice::default();
+        // Launch: the first profile is not a switch, even with a notice.
+        assert!(!notice.observe(Some("a"), true, start));
+        assert!(!notice.observe(Some("a"), true, start));
+        // A switch to a subscription with a notice opens it once.
+        assert!(notice.observe(Some("b"), true, start));
+        assert!(!notice.observe(Some("b"), true, start));
+        // A notice that arrives with a later snapshot (a refresh) still counts...
+        assert!(!notice.observe(Some("a"), false, start));
+        assert!(!notice.observe(None, false, start));
+        assert!(notice.observe(Some("a"), true, start + Duration::from_secs(5)));
+        // ...but not long after the switch.
+        assert!(!notice.observe(Some("b"), false, start));
+        assert!(!notice.observe(Some("b"), true, start + Duration::from_secs(31)));
+        assert!(!notice.observe(Some("b"), true, start + Duration::from_secs(32)));
     }
 
     #[test]

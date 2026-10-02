@@ -1244,6 +1244,24 @@ fn render_ui_previews() {
     ui.set_active_panel(s("subscription"));
     capture_hover(&ui, "chip-tooltip-menu-ring", 840, 720, (82.0, 185.0));
 
+    // A subscription switch opens the new notice and hides it again after 15 s.
+    for (name, steps) in [
+        ("home-announcement-switch-1-shown", 8),
+        ("home-announcement-switch-2-hidden", 140),
+    ] {
+        if wanted(name) {
+            let ui = AppWindow::new().expect("create app window");
+            ready(&ui);
+            ui.set_reduced_motion(false);
+            ui.set_subscription_announcement_text(s(
+                "Новые серверы в Финляндии и Польше уже доступны в группе «Сервер».",
+            ));
+            ui.set_announcement_auto_hide(true);
+            ui.set_announcement_open(true);
+            capture_after(&ui, name, 840, 720, steps);
+        }
+    }
+
     let popup = TrayPopup::new().expect("create tray popup");
     tray_connected(&popup);
     capture(&popup, "tray-connected", 304, 460);
