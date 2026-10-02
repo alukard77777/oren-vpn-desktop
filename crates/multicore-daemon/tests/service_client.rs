@@ -568,6 +568,17 @@ fn a_tunnel_the_service_rolled_back_is_an_adapter_failure() {
 }
 
 #[test]
+fn a_prepare_that_switches_a_live_tunnel_back_on_has_room_for_it() {
+    // The service re-prepares a generation whose tunnel was on by starting both cores and
+    // switching TUN on again (with its rollback), all inside this one exchange.
+    assert!(
+        service_response_timeout(&ServiceCommand::Prepare { generation_id: 1 })
+            >= multicore_core::CORE_READINESS_TIMEOUT * 2
+                + multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT
+    );
+}
+
+#[test]
 fn read_only_commands_get_a_generous_timeout() {
     assert!(
         service_response_timeout(&ServiceCommand::Status) >= std::time::Duration::from_secs(15)
