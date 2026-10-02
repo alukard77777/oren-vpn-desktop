@@ -214,10 +214,10 @@ Assert-True ($PackagerSource.Contains('$PrivilegedBrokerReleaseReady = $true')) 
 Assert-True ($PackagerSource.Contains('$AssertReleaseReady')) 'packager must expose the explicit CI readiness check'
 Assert-True ($PackagerSource.Contains("fixtureContract -ceq 'multicore-package-test-v1'")) 'fixture authorization must require the synthetic manifest marker'
 Assert-True ($PackagerSource.Contains("'-Ctarget-feature=+crt-static'")) 'release builds must link the C runtime statically (clean Windows has no vcruntime140.dll)'
-Assert-True ($PackagerSource.Contains('$skia = Resolve-PinnedSkiaBinaries $Build')) 'release builds must link the SHA-256-pinned Skia binaries (no prebuilt exists for +crt-static or x86)'
+Assert-True ($PackagerSource.Contains('$skia = Resolve-PinnedSkiaBinaries $Build')) 'release builds must link the SHA-256-pinned Skia binaries (no prebuilt exists for +crt-static, x86 or arm64)'
 Assert-True ($PackagerSource.Contains('$env:SKIA_BINARIES_URL = $skia.Url')) 'skia-bindings must read the pinned archive instead of downloading or building Skia'
 Assert-True ($PackagerSource.Contains('Assert-LinkedPinnedSkia $TargetDirectory $Target $skia.Key')) 'release builds must prove they linked the pinned Skia key'
-foreach ($skiaArchitecture in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'))) {
+foreach ($skiaArchitecture in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'), @('arm64', 'aarch64-pc-windows-msvc'))) {
     $skiaManifest = Get-Content -Raw -LiteralPath (Join-Path $RepositoryRoot "packaging\windows-$($skiaArchitecture[0])\versions.json") | ConvertFrom-Json
     $skiaPin = $skiaManifest.build.skiaBinaries
     Assert-True ([string]$skiaPin.key -cmatch "^[0-9a-f]{20}-$($skiaArchitecture[1])-d3d-gl-jpegd-jpege-pdf-textlayout-static$") "windows-$($skiaArchitecture[0]) must pin a static-CRT Direct3D Skia build"
@@ -665,6 +665,57 @@ try {
     $failed = $false
     try { Invoke-Package (Join-Path $x86Root 'x64-with-x86-manifest') $x86Input $x86Manifest $Desktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
     Assert-True $failed 'x64 packaging must refuse the x86 manifest'
+
+    # The arm64 flavour: PE32+ ARM64 executables, platform windows-arm64, multicore-windows-arm64.zip.
+    $arm64Root = Join-Path $TestRoot 'arm64'; New-Item -ItemType Directory -Path $arm64Root | Out-Null
+    $arm64Exes = @{}
+    foreach ($name in @('desktop', 'daemon', 'core-host', 'updater', 'xray', 'mihomo')) {
+        $arm64Exes[$name] = Join-Path $arm64Root "$name.exe"; New-TestPe $arm64Exes[$name] -Machine 0xaa64
+    }
+    $arm64Input = Join-Path $arm64Root 'input'; New-Item -ItemType Directory -Path $arm64Input | Out-Null
+    New-TestZip (Join-Path $arm64Input 'xray-fixture.zip') @(@{ Name = 'xray.exe'; Data = [IO.File]::ReadAllBytes($arm64Exes['xray']); Attributes = $null })
+    New-TestZip (Join-Path $arm64Input 'mihomo-fixture.zip') @(@{ Name = 'mihomo.exe'; Data = [IO.File]::ReadAllBytes($arm64Exes['mihomo']); Attributes = $null })
+    Copy-Item -LiteralPath (Join-Path $MetadataRoot 'licenses\Xray-core-MPL-2.0.txt') -Destination $arm64Input
+    Copy-Item -LiteralPath (Join-Path $MetadataRoot 'licenses\mihomo-GPL-3.0.txt') -Destination $arm64Input
+    $arm64Manifest = Join-Path $arm64Root 'versions.json'
+    Write-TestManifest $arm64Manifest $arm64Input (Get-Sha256 $arm64Exes['xray']) (Get-Sha256 $arm64Exes['mihomo']) -Platform 'windows-arm64'
+    $arm64Out = Join-Path $arm64Root 'package'
+    $arm64Asset = Join-Path $arm64Root 'multicore-windows-arm64.zip'
+    Invoke-Package $arm64Out $arm64Input $arm64Manifest $arm64Exes['desktop'] $arm64Exes['daemon'] $arm64Exes['core-host'] $arm64Asset 'arm64' $arm64Exes['updater'] | Out-Null
+    Assert-True (Test-Path -LiteralPath $arm64Asset -PathType Leaf) 'arm64 packaging must publish multicore-windows-arm64.zip'
+    Assert-True ((Get-Sha256 (Join-Path $arm64Out 'runtime\multicore-core-host.exe')) -eq (Get-Sha256 $arm64Exes['core-host'])) 'arm64 core host must be staged unmodified'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $arm64Out 'README.md')).Contains('Windows ARM64')) 'arm64 package must carry the arm64 README'
+
+    $arm64Failures = @(
+        # arm64 packaging must refuse x64 executables (which Windows on ARM would only emulate),
+        # x86 cores, the x64 manifest and the x64 asset name.
+        @{ Name = 'arm64-with-x64-desktop'; Desktop = $Desktop; Input = $arm64Input; Manifest = $arm64Manifest; Asset = $null },
+        @{ Name = 'arm64-with-x86-cores'; Desktop = $arm64Exes['desktop']; Input = $x86Input; Manifest = $null; Asset = $null },
+        @{ Name = 'arm64-with-x64-manifest'; Desktop = $arm64Exes['desktop']; Input = $arm64Input; Manifest = $manifest; Asset = $null },
+        @{ Name = 'arm64-with-x64-asset-name'; Desktop = $arm64Exes['desktop']; Input = $arm64Input; Manifest = $arm64Manifest; Asset = (Join-Path $arm64Root 'wrong\multicore-windows-x64.zip') }
+    )
+    foreach ($case in $arm64Failures) {
+        $destination = Join-Path $arm64Root $case.Name
+        $caseManifest = $case.Manifest
+        if (-not $caseManifest) {
+            # An otherwise valid arm64 manifest pinning the x86 cores of $case.Input.
+            $caseManifest = Join-Path $arm64Root "$($case.Name).json"
+            Write-TestManifest $caseManifest $case.Input (Get-Sha256 $x86Exes['xray']) (Get-Sha256 $x86Exes['mihomo']) -Platform 'windows-arm64'
+        }
+        $failed = $false
+        try { Invoke-Package $destination $case.Input $caseManifest $case.Desktop $arm64Exes['daemon'] $arm64Exes['core-host'] $case.Asset 'arm64' $arm64Exes['updater'] | Out-Null } catch { $failed = $true }
+        Assert-True $failed "$($case.Name) must fail"
+        Assert-True (-not (Test-Path -LiteralPath $destination)) "$($case.Name) must not publish a partial destination"
+        Assert-NoStageResidue $arm64Root $case.Name
+    }
+    # And x64 packaging must refuse ARM64 executables (the arm64-pe case above covers a core) and
+    # the arm64 manifest.
+    $failed = $false
+    try { Invoke-Package (Join-Path $arm64Root 'x64-with-arm64-manifest') $arm64Input $arm64Manifest $Desktop $Daemon $CoreHost | Out-Null } catch { $failed = $true }
+    Assert-True $failed 'x64 packaging must refuse the arm64 manifest'
+    $failed = $false
+    try { Invoke-Package (Join-Path $arm64Root 'x64-with-arm64-desktop') $BaseInput $manifest $arm64Exes['desktop'] $Daemon $CoreHost | Out-Null } catch { $failed = $true }
+    Assert-True $failed 'x64 packaging must refuse an ARM64 desktop executable'
 
     Write-Output 'PASS: Windows release package contract and failure atomicity'
 } finally {

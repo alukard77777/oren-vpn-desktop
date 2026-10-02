@@ -66,6 +66,21 @@ try {
     $ErrorActionPreference = $savedErrorPreference
     Assert-True ($x86ExitCode -ne 0 -and $x86Output.Contains('is not i386')) 'x86 validation must reject AMD64 images'
 
+    # The arm64 flavour accepts only ARM64 PE32+ and rejects AMD64 (which Windows on ARM would
+    # only emulate) and PE32.
+    $validArm64 = Join-Path $root 'valid-arm64.exe'; New-PeHeaderFixture $validArm64 -Machine 0xaa64 -OptionalMagic 0x020b
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Checker -Architecture arm64 -DesktopExecutablePath $validArm64 -DaemonExecutablePath $validArm64 -UpdaterExecutablePath $validArm64 -CoreHostExecutablePath $validArm64 -PeHeadersOnly | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'synthetic ARM64 PE32+ executable header must pass arm64 header-only validation'
+    $arm64Pe32 = Join-Path $root 'arm64-pe32.exe'; New-PeHeaderFixture $arm64Pe32 -Machine 0xaa64 -OptionalMagic 0x010b
+    foreach ($arm64Case in @(@($valid, 'is not ARM64'), @($valid32, 'is not ARM64'), @($arm64Pe32, 'is not PE32+'))) {
+        $savedErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $arm64Output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Checker -Architecture arm64 -DesktopExecutablePath $arm64Case[0] -DaemonExecutablePath $arm64Case[0] -UpdaterExecutablePath $arm64Case[0] -CoreHostExecutablePath $arm64Case[0] -PeHeadersOnly 2>&1 | Out-String
+        $arm64ExitCode = $LASTEXITCODE
+        $ErrorActionPreference = $savedErrorPreference
+        Assert-True ($arm64ExitCode -ne 0 -and $arm64Output.Contains($arm64Case[1])) "arm64 validation must reject $([IO.Path]::GetFileName($arm64Case[0])): $($arm64Case[1])"
+    }
+
     foreach ($case in @(
         @{ Name = 'x86'; Machine = [uint16]0x014c; Magic = [uint16]0x020b; Dll = $false; Malformed = $false; Expected = 'is not AMD64' },
         @{ Name = 'arm64'; Machine = [uint16]0xaa64; Magic = [uint16]0x020b; Dll = $false; Malformed = $false; Expected = 'is not AMD64' },

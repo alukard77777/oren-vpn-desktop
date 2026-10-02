@@ -7,7 +7,7 @@ reaches full contrast, especially at 125% scaling.
 
 | Platform | GPU path | When it can't start |
 | --- | --- | --- |
-| Windows x64 and x86 | Skia on Direct3D 12: a hardware adapter with feature level 11, else Microsoft's WARP software adapter | restart with Slint's software renderer |
+| Windows x64, x86 and arm64 | Skia on Direct3D 12: a hardware adapter with feature level 11, else Microsoft's WARP software adapter | restart with Slint's software renderer |
 | Linux | Skia on OpenGL (glutin, EGL/GLX); Skia itself drops to its CPU raster surface without a GL context | restart with Slint's software renderer |
 
 Windows selects Direct3D explicitly (`renderer_fallback::select_gpu_renderer`); without
@@ -33,7 +33,7 @@ platform's `packaging/*/versions.json`) and hand it to `skia-bindings` through
   `libfontconfig.so.1` and `libstdc++.so.6` (package dependencies list them).
 - **Windows**: rust-skia publishes no prebuilt Skia for the static C runtime
   (`+crt-static`, which the release needs: clean Windows has no `vcruntime140.dll`) and
-  none for 32-bit Windows. `scripts/build-skia-binaries.ps1 -Architecture x64|x86
+  none for 32-bit or ARM64 Windows. `scripts/build-skia-binaries.ps1 -Architecture x64|x86|arm64
   -OutputDirectory <cache> -LlvmHome <LLVM>` builds the pinned Skia source
   (`rust-skia/skia` `m150-0.98.1`) with `skia-bindings`' own offline build (clang-cl
   from LLVM 23.1.2, about 3 minutes per architecture on 12-16 cores; needs git, Python 3
@@ -42,6 +42,17 @@ platform's `packaging/*/versions.json`) and hand it to `skia-bindings` through
   `-SkiaBinariesDirectory` or `MULTICORE_SKIA_BINARIES_DIR` and refuses an archive
   whose SHA-256 differs from the pin. The Skia build is not bit-reproducible: building
   the archive again means updating `build.skiaBinaries.sha256`.
+- **Windows on ARM (arm64)**: cross-compiled on an x64 host for `aarch64-pc-windows-msvc`.
+  The Skia archive is built like the others (`-Architecture arm64`); clang-cl compiles
+  Skia and skia-bindings' `bindings.cpp` and llvm-lib archives it, so building the archive
+  needs no MSVC ARM64 compiler, only the architecture-neutral MSVC headers. Linking
+  MultiCore for ARM64 (`package-windows-release.ps1 -Architecture arm64`, `cargo test
+  --no-run`) needs the Visual Studio component "MSVC v143 - VS 2022 C++ ARM64 build tools"
+  (`Microsoft.VisualStudio.Component.VC.Tools.ARM64`) and LLVM `clang.exe` on `PATH`:
+  `ring` compiles its ARM64 code only with clang, so the packager points
+  `CC_aarch64_pc_windows_msvc` at it with clang's path-remapping flags. An x64 build host
+  cannot run the ARM64 tests or executables; they are built and linted there and need an
+  ARM64 Windows machine to run.
 
 Bumping Slint or `skia-safe` changes the key and the archives: rebuild/download them
-and update all three pins.
+and update all four pins (Linux, Windows x64, x86 and arm64).

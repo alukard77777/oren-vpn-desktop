@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "platform": "windows-arm64",
+  "build": {
+    "rustToolchain": "1.98.1",
+    "desktopPackage": "multicore-desktop",
+    "daemonPackage": "multicore-daemon",
+    "updaterPackage": "multicore-updater",
+    "coreHostPackage": "multicore-core-host",
+    "skiaBinaries": {
+      "skiaBindings": "0.99.0",
+      "key": "a25a0fdb7d90429aa2d1-aarch64-pc-windows-msvc-d3d-gl-jpegd-jpege-pdf-textlayout-static",
+      "sha256": "537745382c4c4e4c4a26964ff60905e77d1c2ff06afff2f61addc2dfea9bc9e0",
+      "source": {
+        "repository": "rust-skia/skia",
+        "tag": "m150-0.98.1",
+        "commit": "90af6f5c5a3ed8788b805fe6ca3fcdf28c2c2bc9"
+      },
+      "builtWith": "scripts/build-skia-binaries.ps1 -Architecture arm64 (cross-compiled on x64), LLVM 23.1.2 clang-cl, +crt-static",
+      "license": "BSD-3-Clause"
+    }
+  },
+  "components": {
+    "xray": {
+      "project": "XTLS/Xray-core",
+      "version": "v26.9.30",
+      "commit": "b26a91de4f3294e26a0ad0a970b81a386a41f789",
+      "license": "MPL-2.0",
+      "asset": {
+        "name": "Xray-windows-arm64-v8a.zip",
+        "url": "https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-windows-arm64-v8a.zip",
+        "sha256": "5cf7ad4fd9aac5aa248ae7e598f3f0a0d0f79a6195089d611ddef9653830f1b0",
+        "entry": "xray.exe",
+        "executableSha256": "9b38318d22f0abb2a64aa8030e59e606f6048ffc45c193d68998ac5d08d55416",
+        "maximumExpandedBytes": 268435456
+      },
+      "licenseFile": {
+        "name": "Xray-core-MPL-2.0.txt",
+        "url": "https://raw.githubusercontent.com/XTLS/Xray-core/b26a91de4f3294e26a0ad0a970b81a386a41f789/LICENSE",
+        "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+      },
+      "source": {
+        "url": "https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip",
+        "sha256": "eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b"
+      }
+    },
+    "mihomo": {
+      "project": "MetaCubeX/mihomo",
+      "version": "v1.19.32",
+      "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
+      "license": "GPL-3.0-only",
+      "asset": {
+        "name": "mihomo-windows-arm64-v1.19.32.zip",
+        "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-arm64-v1.19.32.zip",
+        "sha256": "7a4f6e58af9a120920935f2150cf642d945085fdb3e753314505b334234e1d1e",
+        "entry": "mihomo-windows-arm64.exe",
+        "executableSha256": "7211487d8e4092cf6cf6fbbdbc10a10fbde462847e36fb8a43479b0e4cad4b33",
+        "maximumExpandedBytes": 268435456,
+        "note": "Mihomo embeds Wintun (sing-tun): this arm64 build carries the ARM64 wintun.dll and the ARM64 wintun driver, so no wintun.dll is shipped separately (same as x64)."
+      },
+      "licenseFile": {
+        "name": "mihomo-GPL-3.0.txt",
+        "url": "https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE",
+        "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+      },
+      "source": {
+        "url": "https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip",
+        "sha256": "63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30"
+      }
+    },
+    "dashboard": {
+      "project": "Zephyruso/zashboard",
+      "version": "v3.29.1",
+      "commit": "50717b02dac68425cdc5b80cb754bea768ee4fc9",
+      "license": "MIT",
+      "asset": {
+        "name": "dist-no-fonts.zip",
+        "url": "https://github.com/Zephyruso/zashboard/releases/download/v3.29.1/dist-no-fonts.zip",
+        "sha256": "21371cd111b6b3d87774f3ea3ddeacdcb0f6aff8690a16d652daa3ea6e3b0145",
+        "rootPrefix": "dist/",
+        "maximumEntryBytes": 8388608,
+        "maximumExpandedBytes": 33554432,
+        "maximumEntryCount": 64,
+        "indexHtmlSha256": "70bb3dc4057cbc0feaff524672f2b0fbafa52279b757dbdc8cb8fdc3e6a73510",
+        "note": "dist-no-fonts is used (not dist-cdn-fonts/dist) so the vendored static UI never references a runtime font CDN. Verified empirically against the pinned Mihomo v1.19.30 binary: Mihomo requires an external-ui directory to be a subpath of its own home directory or listed in the SAFE_PATHS environment variable of the process that spawns it, and otherwise attempts a live download of a dashboard from the internet -- this package must always stage this directory and set SAFE_PATHS before launching Mihomo. indexHtmlSha256 pins the exact unpatched upstream index.html the packaging scripts know how to CSP-patch; a future re-vendor must review and re-pin it deliberately."
+      },
+      "licenseFile": {
+        "name": "zashboard-MIT.txt",
+        "url": "https://raw.githubusercontent.com/Zephyruso/zashboard/50717b02dac68425cdc5b80cb754bea768ee4fc9/LICENSE",
+        "sha256": "ffc390eec51f16b58506b1a42c99fe0cd9ffea1e3081aab443100fd8c20182d9"
+      },
+      "contentSecurityPolicy": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' data: https:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+    }
+  }
+}

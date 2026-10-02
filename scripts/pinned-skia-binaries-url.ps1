@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('x64', 'x86')]
+    [ValidateSet('x64', 'x86', 'arm64')]
     [string]$Architecture = 'x64',
     [string]$SkiaBinariesDirectory = $env:MULTICORE_SKIA_BINARIES_DIR
 )
@@ -8,7 +8,7 @@ param(
 # Prints the SKIA_BINARIES_URL for the SHA-256-pinned Skia archive of this architecture
 # (packaging/windows-<arch>/versions.json, build.skiaBinaries), after verifying the archive.
 # For cargo runs outside package-windows-release.ps1 that need Skia but have no prebuilt
-# download, e.g. the 32-bit test/clippy step of the release workflow; such runs must also
+# download, e.g. the 32-bit and ARM64 test/clippy steps of the release workflow; such runs must also
 # link the static C runtime (+crt-static), which the archive is built for.
 
 $ErrorActionPreference = 'Stop'

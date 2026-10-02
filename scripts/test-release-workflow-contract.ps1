@@ -151,6 +151,18 @@ foreach ($token in @(
     '-CoreHostExecutablePath dist/release/multicore-windows-x86/runtime/multicore-core-host.exe',
     "`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'x86'",
     '-PackagePath dist/release/multicore-windows-x86',
+    # Windows on ARM flavour: cross-compiled, tests built but not run on the x64 runner.
+    'rustup target add aarch64-pc-windows-msvc --toolchain 1.98.1-x86_64-pc-windows-msvc',
+    "if (-not (Get-Command clang.exe -CommandType Application -ErrorAction SilentlyContinue)) { throw 'The ARM64 build needs LLVM clang.exe on PATH' }",
+    '$env:SKIA_BINARIES_URL = powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pinned-skia-binaries-url.ps1 -Architecture arm64',
+    "`$env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'",
+    'cargo test --workspace --locked --target aarch64-pc-windows-msvc --no-run',
+    'cargo clippy --workspace --all-targets --locked --target aarch64-pc-windows-msvc -- -D warnings',
+    '-Architecture arm64',
+    '-ReleaseAssetPath dist/release/multicore-windows-arm64.zip',
+    '-CoreHostExecutablePath dist/release/multicore-windows-arm64/runtime/multicore-core-host.exe',
+    "`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'arm64'",
+    '-PackagePath dist/release/multicore-windows-arm64',
     'test-windows-installer-contract.ps1',
     'test-smoke-test-one-click-contract.ps1',
     'test-packaged-daemon-smoke-contract.ps1',
@@ -243,6 +255,16 @@ foreach ($x86Asset in @("'dist/release/multicore-windows-x86.zip',", "'dist/rele
     Assert-True ([regex]::Matches($workflow, [regex]::Escape($x86Asset)).Count -eq 2) `
         "x86 asset must appear in the release checksums and the publication stage: $x86Asset"
 }
+foreach ($arm64Asset in @("'dist/release/multicore-windows-arm64.zip',", "'dist/release/MultiCore-Setup-arm64.exe',")) {
+    Assert-True ([regex]::Matches($workflow, [regex]::Escape($arm64Asset)).Count -eq 2) `
+        "arm64 asset must appear in the release checksums and the publication stage: $arm64Asset"
+}
+$arm64PackageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-arm64.zip', [StringComparison]::Ordinal)
+$arm64BundleArchIndex = $workflow.IndexOf("`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'arm64'", [StringComparison]::Ordinal)
+Assert-True ($arm64PackageIndex -ge 0 -and $arm64BundleArchIndex -gt $arm64PackageIndex) 'arm64 updater bundle contract must run after the arm64 release ZIP is created'
+# The x64 runner cannot run ARM64 executables: never execute the ARM64 tests or packaged daemon.
+Assert-True (-not ($workflow -match '(?m)cargo test [^\r\n]*--target aarch64-pc-windows-msvc(?![^\r\n]*--no-run)')) 'ARM64 tests must be built with --no-run, not executed on the x64 runner'
+Assert-True (-not ($workflow -match 'smoke-test-packaged-daemon\.ps1 `\r?\n\s*-PackagePath dist/release/multicore-windows-arm64')) 'the packaged-daemon smoke test must not run the ARM64 package on the x64 runner'
 $x86PackageIndex = $workflow.IndexOf('-ReleaseAssetPath dist/release/multicore-windows-x86.zip', [StringComparison]::Ordinal)
 $x86BundleArchIndex = $workflow.IndexOf("`$env:MULTICORE_RELEASE_BUNDLE_ARCH = 'x86'", [StringComparison]::Ordinal)
 Assert-True ($x86PackageIndex -ge 0 -and $x86BundleArchIndex -gt $x86PackageIndex) 'x86 updater bundle contract must run after the x86 release ZIP is created'

@@ -13,8 +13,8 @@ param(
 
     [switch]$PeHeadersOnly,
 
-    # x64 (default): AMD64 PE32+. x86: i386 PE32.
-    [ValidateSet('x64', 'x86')]
+    # x64 (default): AMD64 PE32+. x86: i386 PE32. arm64: ARM64 PE32+.
+    [ValidateSet('x64', 'x86', 'arm64')]
     [string]$Architecture = 'x64',
 
     [Parameter(DontShow = $true)]
@@ -58,8 +58,8 @@ function Assert-Amd64PeExecutable {
     $optionalSize = [BitConverter]::ToUInt16($bytes, $coff + 16)
     $characteristics = [BitConverter]::ToUInt16($bytes, $coff + 18)
     $optional = $coff + 20
-    $expectedMachine = if ($Architecture -ceq 'x86') { 0x014c } else { 0x8664 }
-    $machineName = if ($Architecture -ceq 'x86') { 'i386' } else { 'AMD64' }
+    $expectedMachine = switch -CaseSensitive ($Architecture) { 'x86' { 0x014c } 'arm64' { 0xaa64 } default { 0x8664 } }
+    $machineName = switch -CaseSensitive ($Architecture) { 'x86' { 'i386' } 'arm64' { 'ARM64' } default { 'AMD64' } }
     if ($machine -ne $expectedMachine) { throw "$Description is not $machineName" }
     if ($optionalSize -lt 2 -or ([uint64]$optional + $optionalSize) -gt $bytes.Length) {
         throw "$Description has a truncated optional header"
