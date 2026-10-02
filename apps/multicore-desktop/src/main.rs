@@ -3814,8 +3814,8 @@ fn wire_service_install(ui: &AppWindow) {
 fn present_troubleshoot_run(ui: &AppWindow, run: &troubleshoot::TroubleshootRun) {
     let card = |finding: &multicore_core::troubleshoot::Finding, badge: &str| UiTroubleshootCard {
         tone: troubleshoot::tone_name(finding.tone).into(),
-        title: finding.title.as_str().into(),
-        detail: finding.detail.as_str().into(),
+        title: finding.localized_title().into(),
+        detail: finding.localized_detail().into(),
         badge: badge.into(),
     };
     let summary = troubleshoot::summary(run.findings());
@@ -3842,8 +3842,8 @@ fn present_troubleshoot_run(ui: &AppWindow, run: &troubleshoot::TroubleshootRun)
             .iter()
             .map(|(offer, checked)| UiTroubleshootFix {
                 id: offer.id.as_str().into(),
-                title: offer.title.as_str().into(),
-                detail: offer.detail.as_str().into(),
+                title: offer.localized_title().into(),
+                detail: offer.localized_detail().into(),
                 needs_admin: offer.needs_admin,
                 needs_reboot: offer.needs_reboot,
                 checked: *checked,

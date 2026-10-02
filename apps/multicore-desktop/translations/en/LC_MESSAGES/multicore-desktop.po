@@ -168,6 +168,7 @@ msgstr "MULTICORE is already running for another user."
 
 msgid "Подключение отменено: не выдано разрешение администратора."
 msgstr "Connection cancelled: administrator permission was not granted."
+
 # Daemon messages (multicore_i18n::daemon_messages).
 msgid "Запускается подключение."
 msgstr "Connecting."
@@ -247,9 +248,6 @@ msgstr "Mihomo didn't apply the route choice."
 msgid "Устранение неполадок: {0}; ошибок: {1}."
 msgstr "Troubleshooting: {0}; errors: {1}."
 
-msgid "Подключение отменено: не выдано разрешение администратора."
-msgstr "Connection cancelled: administrator permission not granted."
-
 msgid "Не удалось запустить службу подключения с правами администратора."
 msgstr "Couldn't start the connection service as administrator."
 
@@ -276,6 +274,7 @@ msgstr "The TUN adapter didn't come up in time. Try again; if that fails, restar
 
 msgid "Не удалось включить системный прокси. Повторите попытку."
 msgstr "Couldn't enable the system proxy. Try again."
+
 msgid "Не удалось запустить {0}. Подробности — в логе на странице «Состояние»."
 msgstr "Couldn't start {0}. See the log on the Status page."
 
@@ -287,18 +286,6 @@ msgstr "{0} exited right after starting. See the log on the Status page."
 
 msgid "{0} не успел запуститься вовремя. Повторите попытку."
 msgstr "{0} didn't start in time. Try again."
-
-msgid "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
-msgstr "Couldn't turn on the TUN adapter. Try again; if that fails, restart the PC or connect without TUN."
-
-msgid "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
-msgstr "The TUN adapter didn't turn on in time. Try again; if that fails, restart the PC or connect without TUN."
-
-msgid "Не удалось включить системный прокси. Повторите попытку."
-msgstr "Couldn't turn on the system proxy. Try again."
-
-msgid "MULTICORE уже запущен у другого пользователя."
-msgstr "MULTICORE is already running for another user."
 
 msgid "Не удалось запустить подключение. Повторите попытку."
 msgstr "Couldn't start the connection. Try again."
@@ -400,7 +387,7 @@ msgid "системный прокси"
 msgstr "system proxy"
 
 msgid "Подключение"
-msgstr "Connection"
+msgstr "Connecting"
 
 msgid "Время подключения"
 msgstr "Connected for"
@@ -1019,7 +1006,6 @@ msgid "Антивирусы…"
 msgstr "Antivirus…"
 
 msgid "Программы обхода блокировок…"
-msgstr "Censorship bypass tools…"
 msgstr "Bypass tools…"
 
 msgid "Порты…"
@@ -1036,8 +1022,6 @@ msgstr "Discord…"
 
 msgid "Файл hosts…"
 msgstr "Hosts file…"
-msgid "Файл hosts…"
-msgstr "hosts file…"
 
 msgid "Групповые политики…"
 msgstr "Group policies…"
@@ -1062,7 +1046,7 @@ msgid "{n} дн. назад"
 msgid_plural "{n} дн. назад"
 msgstr[0] "{n} day ago"
 msgstr[1] "{n} days ago"
-msgstr "Network & DNS…"
+
 msgid "Подписка добавлена. Переключиться на неё можно после отключения VPN."
 msgstr "Subscription added. You can switch to it after disconnecting the VPN."
 
@@ -1105,9 +1089,6 @@ msgstr "Ready"
 msgid "Можно подключаться"
 msgstr "Ready to connect"
 
-msgid "Подключение"
-msgstr "Connecting"
-
 msgid "Устанавливаем соединение…"
 msgstr "Establishing connection…"
 
@@ -1137,9 +1118,6 @@ msgstr "Stopping the local route."
 
 msgid "Отключаем…"
 msgstr "Stopping…"
-
-msgid "Не удалось подключиться"
-msgstr "Couldn't connect"
 
 msgid "Что-то пошло не так"
 msgstr "Something went wrong"
@@ -1201,9 +1179,6 @@ msgstr "Checking"
 msgid "Проверяем состояние…"
 msgstr "Checking status…"
 
-msgid "Проверяем…"
-msgstr "Checking…"
-
 msgid "Не удалось загрузить подписки. Повторите попытку."
 msgstr "Couldn't load subscriptions. Try again."
 
@@ -1221,9 +1196,6 @@ msgstr "Couldn't change the subscription link. Try again."
 
 msgid "Не удалось удалить подписку. Повторите попытку."
 msgstr "Couldn't delete the subscription. Try again."
-
-msgid "Отключитесь перед изменением подписки."
-msgstr "Disconnect to change the subscription."
 
 msgid "Дождитесь восстановления фонового сервиса."
 msgstr "Wait for the background service to recover."

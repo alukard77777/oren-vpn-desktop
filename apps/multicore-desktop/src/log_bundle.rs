@@ -495,7 +495,12 @@ pub(crate) fn system_report(ui: &UiFacts) -> String {
             tr!("системный прокси")
         },
     );
-    line(&mut out, tr!("Подключение"), &ui.connection);
+    // «Подключение» is also the connecting state ("Connecting") in the catalog.
+    let connection = match multicore_i18n::current() {
+        multicore_i18n::Lang::Ru => "Подключение", // i18n-ru-only
+        multicore_i18n::Lang::En => "Connection",
+    };
+    line(&mut out, connection, &ui.connection);
     if !ui.session_uptime.is_empty() {
         line(&mut out, tr!("Время подключения"), &ui.session_uptime);
     }

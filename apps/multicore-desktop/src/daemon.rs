@@ -192,6 +192,10 @@ pub struct DaemonStatus {
     pub current_node: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    /// The stable code of `message` (`multicore_i18n::daemon_messages`), shown in the
+    /// interface language; `message` is the Russian fallback for an unknown code.
+    #[serde(default)]
+    pub message_key: Option<multicore_i18n::MessageKey>,
     #[serde(default)]
     pub degraded: bool,
     #[serde(default)]
@@ -299,6 +303,10 @@ pub struct DaemonEvent {
     pub component: String,
     #[serde(default, alias = "summary")]
     pub message: String,
+    /// The stable code of `message` for the events MULTICORE writes itself; provider and core
+    /// lines have none and are shown as they are.
+    #[serde(default)]
+    pub message_key: Option<multicore_i18n::MessageKey>,
     #[serde(default)]
     pub details: Option<serde_json::Value>,
 }
@@ -2458,6 +2466,7 @@ mod http_tests {
                     level: "info".into(),
                     component: String::new(),
                     message: "Подключение установлено.".into(),
+                    message_key: None,
                     details: None,
                 }],
             }
