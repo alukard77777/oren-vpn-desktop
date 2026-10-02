@@ -971,7 +971,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     );
     wire_dashboard_action(&ui, model.clone());
     wire_service_install(&ui);
-    wire_troubleshoot(&ui, model.clone());
+    let _troubleshoot_clock = wire_troubleshoot(&ui, model.clone());
     wire_data_reset(&ui);
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
@@ -3758,20 +3758,30 @@ fn wire_service_install(ui: &AppWindow) {
 
 /// Draws a troubleshooting run's cards, fix offers and fix results.
 fn present_troubleshoot_run(ui: &AppWindow, run: &troubleshoot::TroubleshootRun) {
-    let card = |finding: &multicore_core::troubleshoot::Finding| UiTroubleshootCard {
+    let card = |finding: &multicore_core::troubleshoot::Finding, badge: &str| UiTroubleshootCard {
         tone: troubleshoot::tone_name(finding.tone).into(),
         title: finding.title.as_str().into(),
         detail: finding.detail.as_str().into(),
+        badge: badge.into(),
     };
     let summary = troubleshoot::summary(run.findings());
     ui.set_troubleshoot_summary_tone(troubleshoot::tone_name(summary.tone).into());
     ui.set_troubleshoot_summary_title(summary.title.into());
     ui.set_troubleshoot_summary_detail(summary.detail.into());
+    let (status_text, status_tone) = troubleshoot::status_pill(run.findings());
+    ui.set_troubleshoot_status_text(status_text.into());
+    ui.set_troubleshoot_status_tone(troubleshoot::tone_name(status_tone).into());
     ui.set_troubleshoot_cards(ModelRc::new(VecModel::from(
-        run.findings().iter().map(card).collect::<Vec<_>>(),
+        run.findings()
+            .iter()
+            .map(|finding| card(finding, troubleshoot::finding_badge(finding.tone)))
+            .collect::<Vec<_>>(),
     )));
     ui.set_troubleshoot_fix_results(ModelRc::new(VecModel::from(
-        run.fix_results().iter().map(card).collect::<Vec<_>>(),
+        run.fix_results()
+            .iter()
+            .map(|finding| card(finding, ""))
+            .collect::<Vec<_>>(),
     )));
     ui.set_troubleshoot_fixes(ModelRc::new(VecModel::from(
         run.offers()
@@ -3820,12 +3830,29 @@ fn present_troubleshoot_steps(
 
 /// «Устранить неполадки»: the checks run one by one through the daemon (the page names each
 /// step), then only the fixes the user ticked, or one of the two separate repair actions.
-fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+///
+/// The last run stays in memory for the session: reopening the page shows its results (with
+/// «Проверить заново») instead of the start screen. It is not saved across restarts: findings
+/// name processes, ports and paths that are stale by then, and a new check takes seconds.
+fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
     use multicore_core::troubleshoot::{CheckStep, PrivilegedFix};
     ui.set_troubleshoot_windows(cfg!(windows));
     let run = Arc::new(Mutex::new(troubleshoot::TroubleshootRun::default()));
+    // When the last check finished, for «последняя проверка N мин назад».
+    let checked_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let ago_timer = Timer::default();
+    {
+        let (weak, checked_at) = (ui.as_weak(), checked_at.clone());
+        ago_timer.start(TimerMode::Repeated, Duration::from_secs(20), move || {
+            let at = *checked_at.lock().expect("troubleshoot clock lock");
+            if let (Some(ui), Some(at)) = (weak.upgrade(), at) {
+                ui.set_troubleshoot_checked_ago(troubleshoot::checked_ago(at.elapsed()).into());
+            }
+        });
+    }
 
-    let (weak, start_run, start_model) = (ui.as_weak(), run.clone(), model.clone());
+    let (weak, start_run, start_model, start_checked_at) =
+        (ui.as_weak(), run.clone(), model.clone(), checked_at.clone());
     ui.on_troubleshoot_start(move || {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -3843,7 +3870,7 @@ fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         ui.set_troubleshoot_repair_confirm("".into());
         ui.set_troubleshoot_phase("running".into());
         let client = start_model.lock().expect("view model lock").daemon_client();
-        let (weak, run) = (weak.clone(), start_run.clone());
+        let (weak, run, checked_at) = (weak.clone(), start_run.clone(), start_checked_at.clone());
         thread::spawn(move || {
             for (index, step) in steps.iter().enumerate() {
                 let (progress_weak, progress_steps) = (weak.clone(), steps.clone());
@@ -3866,10 +3893,15 @@ fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
                     }
                 }
             }
+            let finished_at = Instant::now();
+            *checked_at.lock().expect("troubleshoot clock lock") = Some(finished_at);
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = weak.upgrade() {
                     present_troubleshoot_steps(&ui, &steps, steps.len());
                     present_troubleshoot_run(&ui, &run.lock().expect("troubleshoot run lock"));
+                    ui.set_troubleshoot_checked_ago(
+                        troubleshoot::checked_ago(finished_at.elapsed()).into(),
+                    );
                     ui.set_troubleshoot_phase("results".into());
                 }
             });
@@ -3954,6 +3986,7 @@ fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
             ui.invoke_primary_action();
         }
     });
+    ago_timer
 }
 
 /// "Удалить все данные" (second click): start the resetting process, then quit. Leaving

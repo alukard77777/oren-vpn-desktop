@@ -67,6 +67,69 @@ pub(crate) fn summary(findings: &[Finding]) -> Summary {
     }
 }
 
+/// The right-aligned label of a finding row: only what blocks VPN gets one.
+pub(crate) fn finding_badge(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Error => "Критично",
+        Tone::Warning | Tone::Info | Tone::Success => "",
+    }
+}
+
+/// Russian noun form for `count`: «1 проблема», «2 проблемы», «5 проблем».
+fn plural<'a>(count: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    match (count % 10, count % 100) {
+        (1, rem) if rem != 11 => one,
+        (2..=4, rem) if !(12..=14).contains(&rem) => few,
+        _ => many,
+    }
+}
+
+/// The header pill of a finished check: errors, else warnings, else all clear.
+pub(crate) fn status_pill(findings: &[Finding]) -> (String, Tone) {
+    let count = |tone: Tone| {
+        findings
+            .iter()
+            .filter(|finding| finding.tone == tone)
+            .count()
+    };
+    let (errors, warnings) = (count(Tone::Error), count(Tone::Warning));
+    if errors > 0 {
+        (
+            format!(
+                "{errors} {}",
+                plural(errors, "проблема", "проблемы", "проблем")
+            ),
+            Tone::Error,
+        )
+    } else if warnings > 0 {
+        (
+            format!(
+                "{warnings} {}",
+                plural(
+                    warnings,
+                    "предупреждение",
+                    "предупреждения",
+                    "предупреждений"
+                )
+            ),
+            Tone::Warning,
+        )
+    } else {
+        ("Всё в порядке".to_owned(), Tone::Success)
+    }
+}
+
+/// «последняя проверка …» in the page subtitle.
+pub(crate) fn checked_ago(elapsed: std::time::Duration) -> String {
+    let minutes = elapsed.as_secs() / 60;
+    match minutes {
+        0 => "только что".to_owned(),
+        1..=59 => format!("{minutes} мин назад"),
+        60..=1439 => format!("{} ч назад", minutes / 60),
+        _ => format!("{} дн. назад", minutes / 1440),
+    }
+}
+
 fn severity(tone: Tone) -> u8 {
     match tone {
         Tone::Error => 0,
@@ -251,6 +314,109 @@ mod tests {
             summary(&[finding(Tone::Warning, "a"), finding(Tone::Error, "b")]).title,
             "Найдены проблемы"
         );
+    }
+
+    #[test]
+    fn the_header_pill_counts_problems_then_warnings_in_russian() {
+        let many = |tone: Tone, count: usize| {
+            (0..count)
+                .map(|index| finding(tone, &index.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            status_pill(&many(Tone::Error, 1)),
+            ("1 проблема".to_owned(), Tone::Error)
+        );
+        assert_eq!(status_pill(&many(Tone::Error, 2)).0, "2 проблемы");
+        assert_eq!(status_pill(&many(Tone::Error, 5)).0, "5 проблем");
+        assert_eq!(status_pill(&many(Tone::Error, 11)).0, "11 проблем");
+        assert_eq!(status_pill(&many(Tone::Error, 22)).0, "22 проблемы");
+        let mut mixed = many(Tone::Warning, 3);
+        mixed.extend(many(Tone::Info, 2));
+        assert_eq!(
+            status_pill(&mixed),
+            ("3 предупреждения".to_owned(), Tone::Warning)
+        );
+        assert_eq!(
+            status_pill(&many(Tone::Info, 2)),
+            ("Всё в порядке".to_owned(), Tone::Success)
+        );
+        assert_eq!(finding_badge(Tone::Error), "Критично");
+        assert_eq!(finding_badge(Tone::Warning), "");
+    }
+
+    #[test]
+    fn the_page_lives_under_settings_with_a_fixed_header_and_a_sticky_action_bar() {
+        let page = include_str!("../ui/troubleshoot.slint").replace(
+            "
+", "
+",
+        );
+        let app = include_str!("../ui/app.slint").replace(
+            "
+", "
+",
+        );
+        // No «‹ Назад»: a breadcrumb to Settings, a status pill, «Проверить заново» and ✕.
+        assert!(!page.contains("‹ Назад"));
+        assert!(page.contains("text: \"Настройки\";"));
+        assert!(page.contains("crumb-touch := TouchArea { mouse-cursor: pointer; clicked => { root.open-settings(); } }"));
+        assert!(page.contains("label: \"Проверить заново\";"));
+        assert!(page.contains("accessible-label: \"Закрыть\";"));
+        // Header, then the scrolling body, then the action bar.
+        let header = page.find("// ---- Header").expect("header");
+        let body = page.find("scroll := OverlayScroll").expect("body");
+        let bar = page.find("// ---- Action bar").expect("action bar");
+        assert!(header < body && body < bar);
+        assert!(page.contains("\"Исправить выбранное (\" + root.checked-count + \")\""));
+        assert!(page.contains("label: \"Повторить подключение\";"));
+        // ✕ and «Повторить подключение» go back where the page was opened from; the
+        // breadcrumb always goes to Settings, which stays lit in the rail.
+        let usage = app
+            .split("if root.visible-page == \"troubleshoot\": TroubleshootPage {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.visible-page == \"subscriptions\"")
+                    .next()
+            })
+            .expect("troubleshoot page usage");
+        let close = usage
+            .split("close => {")
+            .nth(1)
+            .expect("close")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(close.contains("root.local-page = root.troubleshoot-return-page;"));
+        let settings = usage
+            .split("open-settings => {")
+            .nth(1)
+            .expect("crumb")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(settings.contains("root.local-page = \"settings\";"));
+        let retry = usage
+            .split("retry-connect => {")
+            .nth(1)
+            .expect("retry")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(retry.contains("root.local-page = root.troubleshoot-return-page;"));
+        assert!(app.contains(
+            "active: root.visible-page == \"settings\" || root.visible-page == \"troubleshoot\";"
+        ));
+    }
+
+    #[test]
+    fn the_last_check_time_reads_as_minutes_hours_or_days() {
+        use std::time::Duration;
+        assert_eq!(checked_ago(Duration::from_secs(59)), "только что");
+        assert_eq!(checked_ago(Duration::from_secs(120)), "2 мин назад");
+        assert_eq!(checked_ago(Duration::from_secs(3 * 3600)), "3 ч назад");
+        assert_eq!(checked_ago(Duration::from_secs(2 * 86_400)), "2 дн. назад");
     }
 
     #[test]

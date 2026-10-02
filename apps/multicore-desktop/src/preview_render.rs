@@ -691,11 +691,13 @@ fn scenarios() -> Vec<Scenario> {
             run.toggle(0);
             crate::present_troubleshoot_run(ui, &run);
             ui.set_troubleshoot_phase(s("results"));
+            ui.set_troubleshoot_checked_ago(s("2 мин назад"));
         }),
         ("troubleshoot-results-min", 700, 620, |ui| {
             troubleshoot_page(ui);
             crate::present_troubleshoot_run(ui, &troubleshoot_mixed_run());
             ui.set_troubleshoot_phase(s("results"));
+            ui.set_troubleshoot_checked_ago(s("2 мин назад"));
         }),
         ("troubleshoot-fixed", 840, 720, |ui| {
             troubleshoot_page(ui);
@@ -723,6 +725,7 @@ fn scenarios() -> Vec<Scenario> {
             );
             crate::present_troubleshoot_run(ui, &run);
             ui.set_troubleshoot_phase(s("results"));
+            ui.set_troubleshoot_checked_ago(s("2 мин назад"));
         }),
         ("troubleshoot-clear", 840, 720, |ui| {
             troubleshoot_page(ui);
@@ -737,10 +740,28 @@ fn scenarios() -> Vec<Scenario> {
             });
             crate::present_troubleshoot_run(ui, &run);
             ui.set_troubleshoot_phase(s("results"));
+            ui.set_troubleshoot_checked_ago(s("2 мин назад"));
         }),
         ("troubleshoot-settings", 840, 720, |ui| {
             ready(ui);
             ui.set_local_page(s("settings"));
+        }),
+        // Opened from Home's failed-connect offer: ✕ and «Повторить подключение» lead back home.
+        ("troubleshoot-from-home-min", 700, 620, |ui| {
+            troubleshoot_home_offer(ui);
+            ui.set_troubleshoot_return_page(s("home"));
+            ui.set_local_page(s("troubleshoot"));
+        }),
+        ("troubleshoot-running-min", 700, 620, |ui| {
+            troubleshoot_page(ui);
+            let steps = multicore_core::troubleshoot::CheckStep::for_platform(true);
+            crate::present_troubleshoot_steps(ui, &steps, 4);
+            ui.set_troubleshoot_phase(s("running"));
+        }),
+        ("troubleshoot-tool-confirm", 840, 720, |ui| {
+            troubleshoot_page(ui);
+            ui.set_troubleshoot_phase(s("start"));
+            ui.set_troubleshoot_repair_confirm(s("service"));
         }),
         ("chip-normal", 840, 720, chip_normal),
         ("chip-warning", 840, 720, |ui| {
@@ -1628,6 +1649,7 @@ fn tall_troubleshoot(ui: &AppWindow) {
     run.toggle(0);
     crate::present_troubleshoot_run(ui, &run);
     ui.set_troubleshoot_phase(s("results"));
+    ui.set_troubleshoot_checked_ago(s("2 мин назад"));
 }
 
 fn tall_status(ui: &AppWindow) {

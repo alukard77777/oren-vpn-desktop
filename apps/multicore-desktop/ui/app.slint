@@ -1371,6 +1371,10 @@ export component AppWindow inherits Window {
     in property <string> troubleshoot-summary-tone: "success";
     in property <string> troubleshoot-summary-title;
     in property <string> troubleshoot-summary-detail;
+    // Header pill of the last finished check and how long ago it finished («2 мин назад»).
+    in property <string> troubleshoot-status-text;
+    in property <string> troubleshoot-status-tone: "success";
+    in property <string> troubleshoot-checked-ago;
     in property <bool> troubleshoot-reboot: false;
     in property <string> troubleshoot-error;
     in property <bool> troubleshoot-windows: true;
@@ -2220,7 +2224,7 @@ export component AppWindow inherits Window {
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
                 NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/subscriptions.svg"); label: "Подписки"; badge: root.subscription-profiles.length > 1 ? "" + root.subscription-profiles.length : ""; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings" || root.visible-page == "troubleshoot"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
 
@@ -4095,6 +4099,9 @@ export component AppWindow inherits Window {
                 summary-tone: root.troubleshoot-summary-tone;
                 summary-title: root.troubleshoot-summary-title;
                 summary-detail: root.troubleshoot-summary-detail;
+                status-text: root.troubleshoot-status-text;
+                status-tone: root.troubleshoot-status-tone;
+                checked-ago: root.troubleshoot-checked-ago;
                 reboot-recommended: root.troubleshoot-reboot;
                 error-text: root.troubleshoot-error;
                 connected: root.toggle-on || root.toggle-busy;
@@ -4103,16 +4110,23 @@ export component AppWindow inherits Window {
                 repair-busy: root.troubleshoot-repair-busy;
                 reduced-motion: root.reduced-motion;
                 repair-confirm <=> root.troubleshoot-repair-confirm;
-                back => {
+                // ✕ goes back where the page was opened from (Home's failed-connect offer or
+                // Settings); the breadcrumb always goes to Settings.
+                close => {
                     root.troubleshoot-repair-confirm = "";
                     root.local-page = root.troubleshoot-return-page;
+                }
+                open-settings => {
+                    root.troubleshoot-repair-confirm = "";
+                    root.local-page = "settings";
                 }
                 begin-run => { root.troubleshoot-start(); }
                 toggle-fix(index) => { root.troubleshoot-toggle-fix(index); }
                 apply-fixes => { root.troubleshoot-apply(); }
                 repair(kind) => { root.troubleshoot-repair(kind); }
                 retry-connect => {
-                    root.local-page = "home";
+                    root.troubleshoot-repair-confirm = "";
+                    root.local-page = root.troubleshoot-return-page;
                     root.troubleshoot-retry-connect();
                 }
             }
