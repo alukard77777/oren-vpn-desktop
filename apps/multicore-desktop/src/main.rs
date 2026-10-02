@@ -2573,6 +2573,7 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                     TRAY_SEGMENT_ICON_PX,
                     scale,
                 ),
+                icon_loading: entry.icon_pending,
                 label: entry.label.clone().into(),
                 detail: entry.detail.clone().into(),
                 tone: "".into(),
@@ -2601,6 +2602,7 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                         TRAY_ROW_ICON_PX,
                         scale,
                     ),
+                    icon_loading: entry.icon_pending,
                     label: entry.label.clone().into(),
                     detail: entry.detail.clone().into(),
                     tone: entry.tone.clone().into(),
@@ -3115,6 +3117,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                             label: display.label,
                             icon: display.icon,
                             icon_id: node.icon_id,
+                            icon_pending: node.icon_pending,
                             selected: node.selected,
                             latency_text: node.latency_text,
                             latency_tone: node.latency_tone,
@@ -3128,6 +3131,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                     label: group_display.label,
                     icon: group_display.icon,
                     icon_id: group.icon_id,
+                    icon_pending: group.icon_pending,
                     selected_node_label: selected_node.label,
                     nodes,
                 }
@@ -4125,6 +4129,7 @@ fn apply_route_search(ui: &AppWindow, catalog: &CatalogPresentation, query: &str
                 scale,
             ),
             icon: hit.icon.into(),
+            icon_loading: hit.icon_pending,
             group_id: hit.group_id.into(),
             group_label: hit.group_label.into(),
             node_id: hit.node_id.into(),
@@ -5264,7 +5269,75 @@ fn load_catalog_impl(
                 begin_latency_check(weak, model);
             }
         });
-        fetch_missing_group_icons(&request.client, icon_weak, icon_model);
+        fetch_missing_group_icons(&request.client, icon_weak.clone(), icon_model.clone());
+        poll_catalog_icons(&request.client, icon_weak, icon_model);
+    });
+}
+
+/// How often the catalog is re-read while the daemon still downloads group icons.
+const ICON_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
+/// The daemon gives its icon downloads 20 s; polling stops well after that regardless.
+const ICON_POLL_LIMIT: Duration = Duration::from_secs(60);
+static ICON_POLL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// While the daemon still downloads group icons (`icon_pending` in the catalog) or the
+/// provider logo (`service_logo_pending` in the status), re-reads the catalog / status every
+/// `ICON_POLL_INTERVAL` and takes only those fields, so placeholders turn into images without
+/// a catalog reload, which would hold the route list for a moment each time. One poller at a
+/// time.
+fn poll_catalog_icons(
+    client: &Arc<dyn daemon::DaemonClient>,
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+) {
+    let images_pending = |model: &DesktopViewModel| {
+        model.catalog_icons_pending() || model.subscription_logo_pending()
+    };
+    if !images_pending(&model.lock().expect("view model lock"))
+        || ICON_POLL_RUNNING.swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let client = client.clone();
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            thread::sleep(ICON_POLL_INTERVAL);
+            let (icons, logo) = {
+                let model = model.lock().expect("view model lock");
+                (
+                    model.catalog_icons_pending(),
+                    model.subscription_logo_pending(),
+                )
+            };
+            if !(icons || logo) || started.elapsed() > ICON_POLL_LIMIT {
+                break;
+            }
+            let mut changed = false;
+            if icons && let Ok(catalog) = client.catalog() {
+                changed |= model
+                    .lock()
+                    .expect("view model lock")
+                    .apply_catalog_icons(&catalog);
+            }
+            if logo && let Ok(status) = client.status() {
+                changed |= model
+                    .lock()
+                    .expect("view model lock")
+                    .apply_service_logo(&status);
+            }
+            if !changed {
+                continue;
+            }
+            fetch_missing_group_icons(&client, weak.clone(), model.clone());
+            let (weak, model) = (weak.clone(), model.clone());
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_latest_snapshot(&ui, &model);
+                }
+            });
+        }
+        ICON_POLL_RUNNING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -5828,6 +5901,33 @@ fn catalog_icon_image(
         .unwrap_or_else(|| emoji_images::image_for(emoji))
 }
 
+/// Updates `current` row by row when it already shows the same rows (same ids, same order):
+/// the row components are kept, so their own transitions (an icon cross-fading in when its
+/// download finishes) can run. Otherwise (another group, rows added or removed) returns a new
+/// model to set; replacing the model rebuilds every row.
+fn sync_rows<T: Clone + PartialEq + 'static>(
+    current: ModelRc<T>,
+    rows: Vec<T>,
+    id: impl Fn(&T) -> SharedString,
+) -> Option<ModelRc<T>> {
+    use slint::Model as _;
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<T>>()
+        && model.row_count() == rows.len()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(index, row)| model.row_data(index).is_some_and(|old| id(&old) == id(row)))
+    {
+        for (index, row) in rows.into_iter().enumerate() {
+            if model.row_data(index).as_ref() != Some(&row) {
+                model.set_row_data(index, row);
+            }
+        }
+        return None;
+    }
+    Some(ModelRc::new(VecModel::from(rows)))
+}
+
 /// Latency of the exit shown on the home toggle, when the visible catalog holds
 /// it as the selected node; empty otherwise (never a placeholder like "—").
 fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
@@ -5850,6 +5950,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
                     scale,
                 ),
                 icon: display.icon.into(),
+                icon_loading: group.icon_pending,
                 label: display.label.into(),
                 selected: group.selected,
             }
@@ -5869,6 +5970,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
                     scale,
                 ),
                 icon: display.icon.into(),
+                icon_loading: node.icon_pending,
                 label: display.label.into(),
                 selected: node.selected,
                 latency_text: node.latency_text.clone().into(),
@@ -5879,12 +5981,55 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
         .collect::<Vec<_>>();
     ui.set_catalog_dumb_mode(catalog.dumb_mode);
     ui.set_node_latency(catalog.exit_latency_text.clone().into());
-    ui.set_catalog_groups(ModelRc::new(VecModel::from(groups)));
-    ui.set_catalog_nodes(ModelRc::new(VecModel::from(nodes)));
+    if let Some(groups) = sync_rows(ui.get_catalog_groups(), groups, |group| group.id.clone()) {
+        ui.set_catalog_groups(groups);
+    }
+    if let Some(nodes) = sync_rows(ui.get_catalog_nodes(), nodes, |node| node.id.clone()) {
+        ui.set_catalog_nodes(nodes);
+    }
     ui.set_catalog_loading(catalog.loading);
     ui.set_catalog_selection_enabled(catalog.selection_enabled);
     ui.set_catalog_selection_pending(catalog.selection_pending);
     ui.set_catalog_error(catalog.error.clone().unwrap_or_default().into());
+}
+
+#[cfg(test)]
+mod row_sync_tests {
+    use slint::{Model, ModelRc, VecModel};
+
+    use super::{UiCatalogNode, sync_rows};
+
+    fn node(id: &str, loading: bool) -> UiCatalogNode {
+        UiCatalogNode {
+            id: id.into(),
+            icon_loading: loading,
+            ..UiCatalogNode::default()
+        }
+    }
+
+    #[test]
+    fn the_same_rows_are_updated_in_place_and_other_rows_replace_the_model() {
+        let current = ModelRc::new(VecModel::from(vec![node("a", true), node("b", false)]));
+        // An icon arrived: same rows, so the row components stay (their cross-fade runs).
+        assert!(
+            sync_rows(
+                current.clone(),
+                vec![node("a", false), node("b", false)],
+                |row| row.id.clone()
+            )
+            .is_none()
+        );
+        assert!(!current.row_data(0).unwrap().icon_loading);
+        // Another group's rows: a new model.
+        let replaced = sync_rows(
+            current.clone(),
+            vec![node("c", false), node("d", false)],
+            |row| row.id.clone(),
+        )
+        .expect("other rows");
+        assert_eq!(replaced.row_data(0).unwrap().id, "c");
+        assert!(sync_rows(current, vec![node("a", false)], |row| row.id.clone()).is_some());
+    }
 }
 
 #[cfg(test)]
@@ -6495,6 +6640,7 @@ mod window_tests {
                     label: "Primary".into(),
                     selected: true,
                     icon_id: None,
+                    icon_pending: false,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "node-a-default".into(),
@@ -6502,6 +6648,7 @@ mod window_tests {
                             selected: true,
                             delay_ms: None,
                             icon_id: None,
+                            icon_pending: false,
                         },
                         DaemonCatalogNode {
                             id: "node-a-saved".into(),
@@ -6509,6 +6656,7 @@ mod window_tests {
                             selected: false,
                             delay_ms: None,
                             icon_id: None,
+                            icon_pending: false,
                         },
                     ],
                 }],

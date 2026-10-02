@@ -333,6 +333,60 @@ async fn valid_native_bundle_is_terminal_and_fetches_logo_once_after_parsing() {
 }
 
 #[tokio::test]
+async fn a_deferred_logo_is_not_downloaded_during_the_refresh_and_the_previous_one_is_kept() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let logo = Ok(HttpResponse::new(
+        200,
+        encoded(ImageFormat::Png),
+        [] as [(&str, &str); 0],
+    ));
+    let root = temp_root("deferred");
+    let store = PersistentSnapshotStore::open(&root).unwrap();
+    let fetcher = SubscriptionFetcher::new(LogoHttp {
+        calls: calls.clone(),
+        logo,
+    });
+    let previous = fetcher
+        .refresh("https://subscription.example/private", &store)
+        .await
+        .unwrap()
+        .into_committed();
+    calls.lock().unwrap().clear();
+
+    let staging = multicore_core::AtomicSnapshot::default();
+    let (deferred, _) = fetcher
+        .refresh_deferring_logo("https://subscription.example/private", &staging)
+        .await;
+    let deferred = deferred.unwrap().into_committed();
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[("https://subscription.example/private".to_owned(), UA_NATIVE)]
+    );
+    // The URL waits in memory for the background download...
+    assert_eq!(
+        deferred.subscription_logo_url(),
+        Some("https://logos.example/logo.any")
+    );
+    // ...and the previous logo is kept meanwhile.
+    let carried = deferred.clone().with_service_logo_carried_from(&previous);
+    let persisted = multicore_core::SnapshotSink::save(&store, (*carried).clone())
+        .unwrap()
+        .into_committed();
+    assert_eq!(
+        std::fs::read(persisted.service_logo_path().unwrap()).unwrap(),
+        std::fs::read(previous.service_logo_path().unwrap()).unwrap()
+    );
+    assert!(matches!(
+        fetcher
+            .download_service_logo("https://logos.example/logo.any")
+            .await,
+        multicore_core::ServiceLogoDownload::Logo(_)
+    ));
+    drop((previous, carried, deferred, persisted, store));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn arbitrary_vendor_prefix_is_accepted_only_for_safe_service_logo_suffix() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let root = temp_root("vendor-prefix");
@@ -646,6 +700,8 @@ const ICON_MIHOMO: &str = "proxies:\n  - {name: A, type: socks5, server: 127.0.0
 struct IconHttp {
     calls: Arc<Mutex<Vec<(String, &'static str)>>>,
     broken_fails: bool,
+    /// Icon requests never answer (a dead icon host).
+    icons_hang: bool,
 }
 
 impl HttpClient for IconHttp {
@@ -667,6 +723,9 @@ impl HttpClient for IconHttp {
                     [] as [(&str, &str); 0],
                 ));
             }
+            if self.icons_hang {
+                std::future::pending::<()>().await;
+            }
             if url.ends_with("auto.svg") {
                 return Ok(HttpResponse::new(
                     200,
@@ -687,20 +746,54 @@ impl HttpClient for IconHttp {
 }
 
 #[tokio::test]
-async fn group_icons_are_fetched_once_per_https_url_persisted_and_carried_over() {
-    use multicore_core::{UA_GROUP_ICON, group_icon_key};
+async fn a_refresh_never_waits_for_group_icons() {
+    // A user waited "forever" for a new subscription: every refresh downloaded up to 32 group
+    // icons (20 s budget) before the subscription was saved.
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let root = temp_root("group-icons");
-    let store = PersistentSnapshotStore::open(&root).unwrap();
-    let first = SubscriptionFetcher::new(IconHttp {
-        calls: calls.clone(),
-        broken_fails: false,
-    })
-    .refresh("https://subscription.example/private", &store)
+    let staging = multicore_core::AtomicSnapshot::default();
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        SubscriptionFetcher::new(IconHttp {
+            calls: calls.clone(),
+            broken_fails: false,
+            icons_hang: true,
+        })
+        .refresh("https://subscription.example/private", &staging),
+    )
     .await
+    .expect("the refresh does not wait for icon hosts")
     .unwrap()
     .into_committed();
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, agent)| *agent != multicore_core::UA_GROUP_ICON)
+    );
+    // The icons are named, just not downloaded yet.
+    assert_eq!(snapshot.group_icon_urls().len(), 3);
+    assert!(snapshot.group_icon_id("Main").is_none());
+}
 
+#[tokio::test]
+async fn group_icons_are_downloaded_once_per_https_url_and_attached_by_content_id() {
+    use multicore_core::{UA_GROUP_ICON, group_icon_key};
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let staging = multicore_core::AtomicSnapshot::default();
+    let fetcher = SubscriptionFetcher::new(IconHttp {
+        calls: calls.clone(),
+        broken_fails: true,
+        icons_hang: false,
+    });
+    let snapshot = fetcher
+        .refresh("https://subscription.example/private", &staging)
+        .await
+        .unwrap()
+        .into_committed();
+
+    let urls = snapshot.group_icon_urls();
+    let downloaded = fetcher.download_group_icons(&urls).await;
     let mut icon_calls: Vec<_> = calls
         .lock()
         .unwrap()
@@ -717,47 +810,42 @@ async fn group_icons_are_fetched_once_per_https_url_persisted_and_carried_over()
             "https://icons.example/main.png",
         ]
     );
-    let main = first.group_icon_id("Main").expect("main icon");
+    // The failed download is simply missing.
+    assert_eq!(downloaded.len(), 2);
+    assert!(
+        downloaded
+            .keys()
+            .all(|key| *key != group_icon_key("https://icons.example/broken.png"))
+    );
+
+    let with_icons = snapshot.clone().with_group_icons(&downloaded);
+    let main = with_icons.group_icon_id("Main").expect("main icon");
     assert_eq!(main.len(), 32);
     assert_ne!(main, group_icon_key("https://icons.example/main.png"));
-    assert_eq!(first.group_icon_id("Dup").as_deref(), Some(main.as_str()));
-    assert!(first.group_icon_id("Auto").is_some());
-    assert!(first.group_icon_id("Plain").is_none());
-    assert!(first.group_icon_id("Missing").is_none());
-    let svg_icon = first
-        .group_icon_png(&first.group_icon_id("Auto").unwrap())
+    assert_eq!(
+        with_icons.group_icon_id("Dup").as_deref(),
+        Some(main.as_str())
+    );
+    assert!(with_icons.group_icon_id("Auto").is_some());
+    assert!(with_icons.group_icon_id("Plain").is_none());
+    assert!(with_icons.group_icon_id("Broken").is_none());
+    assert!(with_icons.group_icon_id("Missing").is_none());
+    let svg_icon = with_icons
+        .group_icon_png(&with_icons.group_icon_id("Auto").unwrap())
         .unwrap();
     let decoded = image::load_from_memory_with_format(svg_icon, ImageFormat::Png).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (128, 128));
-
-    // Reopening reads the icons back from disk: no refetch on launch.
-    drop(first);
-    drop(store);
-    let reopened = PersistentSnapshotStore::open(&root).unwrap();
-    let loaded = reopened.current().unwrap();
-    assert_eq!(loaded.group_icon_id("Main").as_deref(), Some(main.as_str()));
-    let broken = loaded
-        .group_icon_id("Broken")
-        .expect("broken icon fetched the first time");
-
-    // A refresh whose download fails keeps the previous copy of that icon.
-    let staging = multicore_core::AtomicSnapshot::default();
-    let refreshed = SubscriptionFetcher::new(IconHttp {
-        calls: Arc::default(),
-        broken_fails: true,
-    })
-    .refresh("https://subscription.example/private", &staging)
-    .await
-    .unwrap()
-    .into_committed();
-    assert!(refreshed.group_icon_id("Broken").is_none());
-    let carried = refreshed.with_service_logo_carried_from(&loaded);
-    assert_eq!(
-        carried.group_icon_id("Broken").as_deref(),
-        Some(broken.as_str())
+    // Only the icons the config names are attached, and the original is untouched.
+    let mut foreign = downloaded.clone();
+    foreign.insert(
+        group_icon_key("https://elsewhere.example/x.png"),
+        Vec::new(),
     );
-
-    drop(loaded);
-    drop(reopened);
-    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(
+        snapshot.clone().with_group_icons(&foreign).group_icon_ids(),
+        with_icons.group_icon_ids()
+    );
+    assert!(snapshot.group_icon_id("Main").is_none());
+    // What the snapshot shows can seed an icon cache (key -> canonical PNG).
+    assert_eq!(with_icons.group_icon_pngs().len(), 2);
 }

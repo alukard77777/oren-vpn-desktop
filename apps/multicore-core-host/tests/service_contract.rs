@@ -514,10 +514,21 @@ mod rest {
         net::TcpListener,
         sync::mpsc,
         thread,
+        time::{Duration, Instant},
     };
 
     /// Serves one canned response per connection and reports each raw request.
     fn fake_mihomo(responses: Vec<&'static str>) -> (u16, mpsc::Receiver<String>) {
+        fake_mihomo_answering_after(responses, Duration::ZERO)
+    }
+
+    /// Like `fake_mihomo`, but each answer comes `delay` after its request: Mihomo answers a
+    /// TUN `PATCH /configs` only once sing-tun has created the Wintun adapter, which takes
+    /// seconds on some machines.
+    fn fake_mihomo_answering_after(
+        responses: Vec<&'static str>,
+        delay: Duration,
+    ) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (sender, receiver) = mpsc::channel();
@@ -548,7 +559,8 @@ mod rest {
                 sender
                     .send(String::from_utf8_lossy(&request).into_owned())
                     .unwrap();
-                stream.write_all(response.as_bytes()).unwrap();
+                thread::sleep(delay);
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         (port, receiver)
@@ -557,7 +569,7 @@ mod rest {
     #[test]
     fn patch_sends_the_exact_tun_body_with_the_secret() {
         let (port, requests) = fake_mihomo(vec!["HTTP/1.1 204 No Content\r\n\r\n"]);
-        mihomo_rest::set_tun_enabled(port, "s3cret", true).unwrap();
+        mihomo_rest::set_tun_enabled(port, "s3cret", true, Duration::from_secs(3)).unwrap();
         let request = requests.recv().unwrap();
         assert!(request.starts_with("PATCH /configs HTTP/1.1\r\n"));
         assert!(request.contains("Authorization: Bearer s3cret\r\n"));
@@ -569,7 +581,7 @@ mod rest {
         let (port, _requests) = fake_mihomo(vec![
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
         ]);
-        assert!(mihomo_rest::set_tun_enabled(port, "wrong", true).is_err());
+        assert!(mihomo_rest::set_tun_enabled(port, "wrong", true, Duration::from_secs(3)).is_err());
     }
 
     #[test]
@@ -580,8 +592,57 @@ mod rest {
             "HTTP/1.1 204 No Content\r\n\r\n",
             "HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\n{\"tun\":{\"enable\":false}}",
         ]);
-        mihomo_rest::set_tun_enabled(port, "s", true).unwrap();
+        mihomo_rest::set_tun_enabled(port, "s", true, Duration::from_secs(3)).unwrap();
         assert!(!mihomo_rest::tun_enabled(port, "s").unwrap());
+    }
+
+    #[test]
+    fn a_tun_patch_slower_than_the_old_three_seconds_still_succeeds() {
+        // Live failure: Mihomo answered the TUN PATCH only after ~3-6 s (Wintun adapter
+        // creation), the service gave up at its 3 s read timeout and Connect failed with
+        // "could not start Mihomo" while the adapter came up a moment later.
+        let (port, _requests) = fake_mihomo_answering_after(
+            vec!["HTTP/1.1 204 No Content\r\n\r\n"],
+            Duration::from_millis(3_600),
+        );
+        mihomo_rest::set_tun_enabled(port, "s", true, Duration::from_secs(10))
+            .expect("a slow but successful switch is not a failure");
+    }
+
+    #[test]
+    fn a_tun_patch_that_outlives_its_budget_reports_a_timeout() {
+        let (port, _requests) = fake_mihomo_answering_after(
+            vec!["HTTP/1.1 204 No Content\r\n\r\n"],
+            Duration::from_millis(1_500),
+        );
+        let started = Instant::now();
+        let error = mihomo_rest::set_tun_enabled(port, "s", true, Duration::from_millis(300))
+            .expect_err("the answer comes after the budget");
+        assert!(mihomo_rest::is_timeout(&error), "{error:?}");
+        assert!(started.elapsed() < Duration::from_millis(1_400));
+    }
+
+    #[test]
+    fn a_refused_tun_patch_is_not_a_timeout() {
+        // Nothing listens: Mihomo is not running.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = mihomo_rest::set_tun_enabled(port, "s", true, Duration::from_secs(1))
+            .expect_err("nothing listens");
+        assert!(!mihomo_rest::is_timeout(&error), "{error:?}");
+    }
+
+    #[test]
+    fn a_failed_switch_on_and_its_rollback_fit_the_daemon_set_tun_budget() {
+        use super::service::cores::{TUN_OFF_TIMEOUT, TUN_READY_TIMEOUT};
+        // Phantom-adapter cleanup and the rollback's own overhead get two seconds.
+        assert!(
+            TUN_READY_TIMEOUT + TUN_OFF_TIMEOUT + Duration::from_secs(2)
+                <= multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT
+        );
     }
 
     #[test]

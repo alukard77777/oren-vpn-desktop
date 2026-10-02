@@ -6,7 +6,7 @@ pub mod system_proxy;
 pub mod troubleshoot;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fmt,
     fs::{self, File, OpenOptions},
@@ -17,7 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -35,8 +35,8 @@ use multicore_core::{
     AtomicSnapshot, AttemptOutcome, Component, ConnectionState as CoreConnectionState,
     DiagnosticStream, Engine, Event, FetchDiagnostics, FetchError, HttpClient, MAX_PROFILES,
     ProcessController, ProcessDiagnostics, ProfileError, ProfileId, ProfileStore, ProfileSummary,
-    RuntimeCheckState, ServiceLogoLease, Severity, Snapshot, SnapshotCommit, StagedRuntime,
-    StateMachine, SubscriptionFetcher, Supervisor,
+    RuntimeCheckState, ServiceLogoDownload, ServiceLogoLease, Severity, Snapshot, SnapshotCommit,
+    StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -164,6 +164,10 @@ pub struct SubscriptionInfoDto {
     pub announcement_action_available: bool,
     #[serde(default)]
     pub service_logo_path: Option<String>,
+    /// The provider logo is being downloaded in the background: `service_logo_path` still
+    /// names the previous one (or none) until it arrives.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_logo_pending: bool,
     pub refresh_available: bool,
     /// The provider's `dumb-mode` header: clients show only the first route group.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -345,6 +349,10 @@ pub struct GroupDto {
     /// Opaque id of the group's downloaded `icon` image (`GET /v1/group-icons/{id}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_id: Option<String>,
+    /// The group names an icon image that is still being downloaded: the UI shows a loading
+    /// placeholder until the catalog carries `icon_id` (or settles without one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -357,6 +365,9 @@ pub struct NodeDto {
     /// When the node is itself a proxy group (e.g. a url-test "Auto"), that group's icon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_id: Option<String>,
+    /// That icon is still being downloaded (see `GroupDto::icon_pending`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -410,6 +421,7 @@ pub struct ApiErrorBody {
 #[derive(Clone, Debug)]
 pub struct BackendError {
     profile_mutation: Option<ProfileMutationError>,
+    start_failure: Option<(Engine, multicore_core::StartFailureCause)>,
 }
 
 impl BackendError {
@@ -417,6 +429,7 @@ impl BackendError {
     pub const fn new() -> Self {
         Self {
             profile_mutation: None,
+            start_failure: None,
         }
     }
 
@@ -424,12 +437,30 @@ impl BackendError {
     pub const fn from_profile_mutation(error: ProfileMutationError) -> Self {
         Self {
             profile_mutation: Some(error),
+            start_failure: None,
+        }
+    }
+
+    /// A Connect whose cores did not start: which core, and why.
+    #[must_use]
+    pub const fn from_start_failure(
+        engine: Engine,
+        cause: multicore_core::StartFailureCause,
+    ) -> Self {
+        Self {
+            profile_mutation: None,
+            start_failure: Some((engine, cause)),
         }
     }
 
     #[must_use]
     pub const fn profile_mutation(&self) -> Option<ProfileMutationError> {
         self.profile_mutation
+    }
+
+    #[must_use]
+    pub const fn start_failure(&self) -> Option<(Engine, multicore_core::StartFailureCause)> {
+        self.start_failure
     }
 }
 
@@ -1693,7 +1724,16 @@ async fn connect(State(state): State<AppState>, body: Bytes) -> Result<Json<Stat
         .connect_with(options)
         .await
         .map(Json)
-        .map_err(|_| ApiError::backend("Не удалось подключиться. Повторите попытку."))
+        .map_err(|error| match error.start_failure() {
+            // The cores did not start: say which and why (the desktop shows a message per
+            // code), instead of a bare 500 "backend_error".
+            Some((engine, cause)) => ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                start_failure_code(cause),
+                &start_failure_message(engine, cause),
+            ),
+            None => ApiError::backend("Не удалось подключиться. Повторите попытку."),
+        })
 }
 
 async fn shutdown(State(state): State<AppState>, body: Bytes) -> Result<StatusCode, ApiError> {
@@ -2436,6 +2476,10 @@ where
     shut_down: AtomicBool,
     list_logo_publish_hook: std::sync::Mutex<Option<ListLogoPublishHook>>,
     profile_logo_leases: std::sync::Mutex<HashMap<ProfileId, ProfileLogoLease>>,
+    /// Provider logos (shared with the runtime for the status).
+    service_logos: Arc<ServiceLogos>,
+    /// Wakes the background image task (group icons and provider logos).
+    group_icons_requests: Arc<tokio::sync::Notify>,
     inner: RwLock<CoreRuntime<P>>,
 }
 
@@ -2459,9 +2503,171 @@ struct CoreRuntime<P: ProcessController> {
     /// Catalog revision whose cores the always-ready service already runs while Ready.
     warm_revision: Option<u64>,
     readiness: Option<Arc<dyn CoresReadiness>>,
+    /// Downloaded group icons; every installed snapshot gets the cached ones attached.
+    group_icons: Arc<GroupIconCache>,
+    /// Provider logos downloaded in the background, by profile.
+    service_logos: Arc<ServiceLogos>,
+    /// Catalog revision whose background icon download has finished (successfully or not).
+    icons_settled_revision: Option<u64>,
+}
+
+/// Downloaded Mihomo group icons by icon URL key, shared by every profile and persisted in
+/// the profile store. A subscription is saved without waiting for its icons: they are
+/// downloaded in the background (`CoreBackend::fetch_group_icons`), and the next start shows
+/// them at once without the icon host.
+#[derive(Default)]
+struct GroupIconCache {
+    icons: std::sync::Mutex<BTreeMap<String, multicore_core::CachedGroupIcon>>,
+    /// Wakes the background download after a snapshot with icons was installed.
+    requests: Arc<tokio::sync::Notify>,
+}
+
+/// Provider logos are downloaded after the subscription was saved, never during the fetch:
+/// the subscription keeps showing its previous logo (or the letter avatar) meanwhile.
+#[derive(Default)]
+struct ServiceLogos {
+    /// The newest logo (or its removal) per profile, overriding the snapshot generation's.
+    shown: std::sync::Mutex<HashMap<ProfileId, multicore_core::CachedServiceLogo>>,
+    /// Downloads to do, by subscription link (an import has no profile id yet).
+    jobs: std::sync::Mutex<Vec<ServiceLogoJob>>,
+}
+
+struct ServiceLogoJob {
+    source_url: String,
+    /// `None`: the refreshed subscription names no logo any more.
+    logo_url: Option<String>,
+    /// The profile was not stored yet (the import is still committing).
+    attempts: u8,
+}
+
+const SERVICE_LOGO_JOB_ATTEMPTS: u8 = 5;
+
+impl ServiceLogos {
+    fn shown(&self, id: &ProfileId) -> Option<multicore_core::CachedServiceLogo> {
+        self.shown
+            .lock()
+            .expect("service logo lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    fn pending(&self, source_url: Option<&str>) -> bool {
+        source_url.is_some_and(|source_url| {
+            self.jobs
+                .lock()
+                .expect("service logo job lock poisoned")
+                .iter()
+                .any(|job| job.source_url == source_url && job.logo_url.is_some())
+        })
+    }
+
+    /// The logo path to show for profile `id` whose generation carries `generation_logo`.
+    fn path_for(
+        &self,
+        id: &ProfileId,
+        generation_logo: Option<&std::path::Path>,
+    ) -> Option<String> {
+        match self.shown(id) {
+            Some(multicore_core::CachedServiceLogo::Logo(path)) => {
+                path.to_str().map(ToOwned::to_owned)
+            }
+            Some(multicore_core::CachedServiceLogo::Removed) => None,
+            None => generation_logo
+                .and_then(std::path::Path::to_str)
+                .map(ToOwned::to_owned),
+        }
+    }
+}
+
+/// A cached icon older than this is downloaded again in the background (the cached copy stays
+/// on screen meanwhile), so a provider swapping the image behind a URL is picked up.
+const GROUP_ICON_REFRESH_AFTER_SECS: u64 = 12 * 60 * 60;
+
+impl GroupIconCache {
+    fn new(icons: BTreeMap<String, multicore_core::CachedGroupIcon>) -> Self {
+        Self {
+            icons: std::sync::Mutex::new(icons),
+            requests: Arc::default(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, multicore_core::CachedGroupIcon>> {
+        self.icons.lock().expect("group icon cache lock poisoned")
+    }
+
+    /// `snapshot` with the cached images of the icons its config names.
+    fn fill(&self, snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
+        let images: BTreeMap<String, Vec<u8>> = {
+            let icons = self.lock();
+            snapshot
+                .group_icon_urls()
+                .into_iter()
+                .filter_map(|(key, _)| icons.get(&key).map(|icon| (key, icon.png.clone())))
+                .collect()
+        };
+        if images.is_empty() {
+            snapshot
+        } else {
+            snapshot.with_group_icons(&images)
+        }
+    }
+
+    fn needs_download(&self, key: &str, now: u64) -> bool {
+        self.lock().get(key).is_none_or(|icon| {
+            icon.fetched_at_unix
+                .saturating_add(GROUP_ICON_REFRESH_AFTER_SECS)
+                <= now
+        })
+    }
+
+    /// Adds `images` (by key) downloaded at `fetched_at_unix`, or copies a snapshot carried
+    /// when the cache has none (`fetched_at_unix` 0: downloaded again soon). Returns whether
+    /// the cache changed.
+    fn store(&self, images: BTreeMap<String, Vec<u8>>, fetched_at_unix: u64, keep: bool) -> bool {
+        let mut icons = self.lock();
+        let mut changed = false;
+        for (key, png) in images {
+            if keep && icons.contains_key(&key) {
+                continue;
+            }
+            icons.insert(
+                key,
+                multicore_core::CachedGroupIcon {
+                    png,
+                    fetched_at_unix,
+                },
+            );
+            changed = true;
+        }
+        changed
+    }
 }
 
 impl<P: ProcessController> CoreRuntime<P> {
+    /// The catalog of the installed snapshot, rebuilt in place (same revision).
+    fn rebuild_catalog(&mut self) {
+        if let Some(snapshot) = &self.snapshot {
+            let revision = self.catalog.revision;
+            self.catalog = build_catalog(
+                snapshot,
+                revision,
+                self.profile.as_deref(),
+                &self.selected_nodes,
+                self.icons_pending(revision),
+            );
+        }
+    }
+
+    /// Icons of the installed snapshot are missing and their background download for this
+    /// revision has not finished yet.
+    fn icons_pending(&self, revision: u64) -> bool {
+        self.icons_settled_revision != Some(revision)
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.missing_group_icon_urls().is_empty())
+    }
+
     fn empty() -> Self {
         Self {
             active_profile_id: None,
@@ -2483,6 +2689,9 @@ impl<P: ProcessController> CoreRuntime<P> {
             events: EventBuffer::default(),
             warm_revision: None,
             readiness: None,
+            group_icons: Arc::default(),
+            service_logos: Arc::default(),
+            icons_settled_revision: None,
         }
     }
 
@@ -2582,10 +2791,18 @@ impl<P: ProcessController> CoreRuntime<P> {
                             announcement_action_available: snapshot
                                 .subscription_announcement_url()
                                 .is_some(),
-                            service_logo_path: snapshot
-                                .service_logo_path()
-                                .and_then(std::path::Path::to_str)
-                                .map(ToOwned::to_owned),
+                            service_logo_path: match &self.active_profile_id {
+                                Some(id) => self
+                                    .service_logos
+                                    .path_for(id, snapshot.service_logo_path()),
+                                None => snapshot
+                                    .service_logo_path()
+                                    .and_then(std::path::Path::to_str)
+                                    .map(ToOwned::to_owned),
+                            },
+                            service_logo_pending: self
+                                .service_logos
+                                .pending(snapshot.subscription_source_url()),
                             refresh_available: snapshot.subscription_source_url().is_some(),
                             dumb_mode: info.dumb_mode,
                         })
@@ -2665,17 +2882,20 @@ impl<P: ProcessController> CoreRuntime<P> {
             let _ = self.state.transition(CoreConnectionState::Ready);
         }
         let selectable = selectable_groups(&snapshot);
-        self.profile = selectable.first().map(|group| group.name.to_owned());
+        let primary = primary_group_index(&selectable);
+        self.profile = primary.map(|index| selectable[index].name.to_owned());
         self.selected_nodes = selected_nodes;
         self.explicit_selected_nodes = explicit_selected_nodes;
-        self.current_node = self.selected_nodes.first().cloned().flatten();
-        self.catalog = build_catalog(
-            &snapshot,
-            revision,
-            self.profile.as_deref(),
-            &self.selected_nodes,
-        );
-        self.snapshot = Some(snapshot);
+        self.current_node = primary
+            .and_then(|index| self.selected_nodes.get(index).cloned())
+            .flatten();
+        let names_icons = !snapshot.group_icon_urls().is_empty();
+        self.snapshot = Some(self.group_icons.fill(snapshot));
+        self.catalog.revision = revision;
+        self.rebuild_catalog();
+        if names_icons && self.icons_settled_revision != Some(revision) {
+            self.group_icons.requests.notify_one();
+        }
         self.pending_snapshot = None;
         self.message = None;
         self.degraded = false;
@@ -2888,6 +3108,23 @@ where
             None => CoreRuntime::empty(),
         };
         let mut profile_logo_leases = HashMap::new();
+        inner.group_icons = Arc::new(GroupIconCache::new(run_blocking(|| {
+            store.group_icon_cache()
+        })));
+        let service_logos = Arc::new(ServiceLogos::default());
+        if let Ok(profiles) = run_blocking(|| store.list()) {
+            let mut shown = service_logos
+                .shown
+                .lock()
+                .expect("service logo lock poisoned");
+            for profile in profiles {
+                if let Some(logo) = store.cached_service_logo(&profile.id) {
+                    shown.insert(profile.id, logo);
+                }
+            }
+        }
+        inner.service_logos = service_logos.clone();
+        let group_icons_requests = inner.group_icons.requests.clone();
         inner.active_profile_id = store.active_id();
         if let Ok(Some((id, revision, physical_generation, snapshot))) =
             store.active_snapshot_generation()
@@ -2927,8 +3164,133 @@ where
             shut_down: AtomicBool::new(false),
             list_logo_publish_hook: std::sync::Mutex::new(None),
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
+            service_logos,
+            group_icons_requests,
             inner: RwLock::new(inner),
         })
+    }
+
+    /// Signalled whenever group icons of the installed snapshot should be downloaded; the
+    /// daemon's icon task waits on it and runs `fetch_group_icons`.
+    pub async fn group_icon_requests(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.read().await.group_icons.requests.clone()
+    }
+
+    /// Downloads the group icons the installed snapshot names but the cache lacks (or holds
+    /// an old copy of), caches and persists them, and attaches them to the catalog. Runs in
+    /// the background: imports, refreshes and switches never wait for icon hosts. Returns
+    /// whether the catalog changed.
+    pub async fn fetch_group_icons(&self) -> bool {
+        let (snapshot, revision, cache) = {
+            let state = self.inner.read().await;
+            let Some(snapshot) = state.snapshot.clone() else {
+                return false;
+            };
+            (snapshot, state.catalog.revision, state.group_icons.clone())
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        // Icons a 1.1.2 snapshot carried seed the cache (and are re-checked soon).
+        let mut changed = cache.store(snapshot.group_icon_pngs(), 0, true);
+        let wanted: Vec<(String, String)> = snapshot
+            .group_icon_urls()
+            .into_iter()
+            .filter(|(key, _)| cache.needs_download(key, now))
+            .collect();
+        let downloaded = self.fetcher.download_group_icons(&wanted).await;
+        changed |= cache.store(downloaded, now, false);
+        if changed {
+            let icons = cache.lock().clone();
+            if run_blocking(|| self.store.save_group_icon_cache(&icons)).is_err() {
+                self.inner.write().await.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "group_icon_cache",
+                    "Group icons could not be saved; they are downloaded again next start.",
+                );
+            }
+        }
+        let mut state = self.inner.write().await;
+        // A newer snapshot was installed meanwhile: it queued its own pass.
+        if state.catalog.revision != revision {
+            return false;
+        }
+        let Some(current) = state.snapshot.clone() else {
+            return false;
+        };
+        state.snapshot = Some(cache.fill(current));
+        let settled_now = state.icons_settled_revision != Some(revision);
+        state.icons_settled_revision = Some(revision);
+        let before = state.catalog.clone();
+        state.rebuild_catalog();
+        settled_now || state.catalog != before
+    }
+
+    /// Downloads the provider logos of subscriptions fetched since the last call and keeps
+    /// them as their profiles' logos (a logo the provider dropped is removed). Returns whether
+    /// a job must be retried shortly (its import was still being stored).
+    pub async fn fetch_service_logos(&self) -> bool {
+        let jobs = std::mem::take(
+            &mut *self
+                .service_logos
+                .jobs
+                .lock()
+                .expect("service logo job lock poisoned"),
+        );
+        let mut retry = Vec::new();
+        for job in jobs {
+            let download = match &job.logo_url {
+                Some(url) => Some(self.fetcher.download_service_logo(url).await),
+                None => None,
+            };
+            let id = match run_blocking(|| self.store.find_exact_source(&job.source_url)) {
+                Ok(Some(id)) => id,
+                _ => {
+                    if job.attempts + 1 < SERVICE_LOGO_JOB_ATTEMPTS {
+                        retry.push(ServiceLogoJob {
+                            attempts: job.attempts + 1,
+                            ..job
+                        });
+                    }
+                    continue;
+                }
+            };
+            let stored = match download {
+                Some(ServiceLogoDownload::Logo(png)) => run_blocking(|| {
+                    self.store
+                        .save_service_logo(&id, &png)
+                        .map(multicore_core::CachedServiceLogo::Logo)
+                }),
+                Some(ServiceLogoDownload::Gone) | None => run_blocking(|| {
+                    self.store
+                        .mark_service_logo_removed(&id)
+                        .map(|()| multicore_core::CachedServiceLogo::Removed)
+                }),
+                // Unreachable this time: the logo shown stays.
+                Some(ServiceLogoDownload::Failed) => continue,
+            };
+            if let Ok(logo) = stored {
+                self.service_logos
+                    .shown
+                    .lock()
+                    .expect("service logo lock poisoned")
+                    .insert(id, logo);
+            }
+        }
+        let mut jobs = self
+            .service_logos
+            .jobs
+            .lock()
+            .expect("service logo job lock poisoned");
+        // A newer fetch of the same subscription queued its own job meanwhile.
+        retry.retain(|job| {
+            jobs.iter()
+                .all(|queued| queued.source_url != job.source_url)
+        });
+        let retry_later = !retry.is_empty();
+        jobs.extend(retry);
+        retry_later
     }
 
     /// Always-ready mode: from now on the cores are kept running while Ready (whenever the
@@ -3297,6 +3659,12 @@ where
                 }
             }
         }
+        let core_log_tail = match &result {
+            Err(multicore_core::SupervisorError::StartFailed { engine, .. }) => {
+                failed_core_log_tail(controller.as_ref(), *engine).await
+            }
+            _ => Vec::new(),
+        };
         let mut state = self.inner.write().await;
         abandoned.disarm();
         match result {
@@ -3361,9 +3729,11 @@ where
                         "rollback_failed": rollback_failed,
                         "shown": shown,
                         "os": std::env::consts::OS,
+                        // What the failed core itself printed last: usually the actual reason.
+                        "core_log_tail": core_log_tail,
                     }),
                 );
-                Err(BackendError::new())
+                Err(BackendError::from_start_failure(engine, cause))
             }
             Err(multicore_core::SupervisorError::StopFailed) => {
                 state.mark_error(
@@ -3526,12 +3896,16 @@ where
                     || format!("Профиль {}", profile_index + 1),
                     |info| safe_catalog_label(&info.display_name, "Профиль", profile_index),
                 );
-                let service_logo_path = loaded.snapshot.as_ref().and_then(|snapshot| {
+                let generation_logo = loaded.snapshot.as_ref().and_then(|snapshot| {
                     loaded.physical_generation.and_then(|physical_generation| {
                         self.wait_for_list_logo_publish_hook();
                         self.retain_profile_logo(&loaded.summary.id, physical_generation, snapshot)
                     })
                 });
+                let service_logo_path = self.service_logos.path_for(
+                    &loaded.summary.id,
+                    generation_logo.as_deref().map(std::path::Path::new),
+                );
                 SubscriptionProfileDto {
                     id: loaded.summary.id.as_str().to_owned(),
                     active: loaded.summary.active,
@@ -3721,9 +4095,10 @@ where
         C: 'static,
     {
         self.require_refresh_delete_mutation().await?;
+        let prefetched = self.prefetch_profile(id).await?;
         let _operation = self.operation.lock().await;
         self.require_refresh_delete_mutation().await?;
-        self.refresh_profile_locked(id).await
+        self.refresh_profile_locked(id, Some(prefetched)).await
     }
 
     pub async fn replace_subscription_source_profile(
@@ -3736,7 +4111,8 @@ where
     {
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
-        self.replace_profile_source_locked(id, &request.url).await
+        self.replace_profile_source_locked(id, &request.url, None)
+            .await
     }
 
     pub async fn import_subscription_profile(
@@ -3811,13 +4187,31 @@ where
         };
         let (result, diagnostics) = match tokio::time::timeout(
             SUBSCRIPTION_FETCH_DEADLINE,
-            self.fetcher.refresh_with_diagnostics(url, staging),
+            self.fetcher.refresh_deferring_logo(url, staging),
         )
         .await
         {
             Ok((result, diagnostics)) => (result, diagnostics),
             Err(_) => (Err(FetchError::Timeout), deadline_diagnostics),
         };
+        if let Ok(commit) = &result {
+            // The provider logo is downloaded in the background once the subscription is
+            // stored (`fetch_service_logos`); the previous one stays on screen meanwhile.
+            let logo_url = commit
+                .committed()
+                .subscription_logo_url()
+                .map(ToOwned::to_owned);
+            let logos = self.service_logos.clone();
+            let mut jobs = logos.jobs.lock().expect("service logo job lock poisoned");
+            jobs.retain(|job| job.source_url != url.trim());
+            jobs.push(ServiceLogoJob {
+                source_url: url.trim().to_owned(),
+                logo_url,
+                attempts: 0,
+            });
+            drop(jobs);
+            self.group_icons_requests.notify_one();
+        }
         match result {
             Ok(commit) => Ok(commit),
             Err(error) => {
@@ -3992,13 +4386,8 @@ where
         }
     }
 
-    async fn refresh_profile_locked(
-        &self,
-        id: &ProfileId,
-    ) -> Result<StatusDto, ProfileMutationError>
-    where
-        C: 'static,
-    {
+    /// The source link of profile `id`.
+    async fn profile_source_url(&self, id: &ProfileId) -> Result<String, ProfileMutationError> {
         let (_, previous) = match run_blocking(|| self.store.profile_snapshot(id)) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -4007,17 +4396,54 @@ where
                     .await);
             }
         };
-        let source_url = previous
+        previous
             .subscription_source_url()
-            .ok_or(ProfileMutationError::Storage)?
-            .to_owned();
-        self.replace_profile_source_locked(id, &source_url).await
+            .map(ToOwned::to_owned)
+            .ok_or(ProfileMutationError::Storage)
+    }
+
+    /// Downloads, parses and sanitizes profile `id`'s subscription without the operation
+    /// lock: route selections and other requests stay served while the provider answers.
+    /// The lock is taken only to commit (`refresh_profile_locked`).
+    async fn prefetch_profile(&self, id: &ProfileId) -> Result<Prefetched, ProfileMutationError> {
+        let source_url = self.profile_source_url(id).await?;
+        let staging = AtomicSnapshot::default();
+        let (snapshot, _) = self
+            .fetch_subscription(&source_url, &staging)
+            .await?
+            .into_parts();
+        Ok(Prefetched {
+            source_url,
+            snapshot,
+        })
+    }
+
+    /// Refreshes profile `id` under the operation lock. A `prefetched` download is committed
+    /// when it still belongs to the profile's current link; otherwise (the link was replaced
+    /// meanwhile) the subscription is downloaded again here. Everything else (the previous
+    /// generation, saved selections, the connection state) is read now, at commit time, so
+    /// a selection made during the download is carried over.
+    async fn refresh_profile_locked(
+        &self,
+        id: &ProfileId,
+        prefetched: Option<Prefetched>,
+    ) -> Result<StatusDto, ProfileMutationError>
+    where
+        C: 'static,
+    {
+        let source_url = self.profile_source_url(id).await?;
+        let prefetched = prefetched
+            .filter(|prefetched| prefetched.source_url == source_url)
+            .map(|prefetched| prefetched.snapshot);
+        self.replace_profile_source_locked(id, &source_url, prefetched)
+            .await
     }
 
     async fn replace_profile_source_locked(
         &self,
         id: &ProfileId,
         source_url: &str,
+        prefetched: Option<Arc<Snapshot>>,
     ) -> Result<StatusDto, ProfileMutationError>
     where
         C: 'static,
@@ -4037,9 +4463,17 @@ where
         let active = self.store.active_id().as_ref() == Some(id);
         let connected =
             active && self.inner.read().await.state.current() == CoreConnectionState::Connected;
-        let staging = AtomicSnapshot::default();
-        let fetched = self.fetch_subscription(source_url, &staging).await?;
-        let (snapshot, _) = fetched.into_parts();
+        let snapshot = match prefetched {
+            Some(snapshot) => snapshot,
+            None => {
+                let staging = AtomicSnapshot::default();
+                let (snapshot, _) = self
+                    .fetch_subscription(source_url, &staging)
+                    .await?
+                    .into_parts();
+                snapshot
+            }
+        };
         // A different source is a different provider; its logo is not ours to keep.
         let snapshot = if previous.subscription_source_url() == Some(source_url) {
             snapshot.with_service_logo_carried_from(&previous)
@@ -4595,7 +5029,12 @@ mod error_chain_tests {
 fn default_selections(snapshot: &Snapshot) -> Vec<Option<String>> {
     selectable_groups(snapshot)
         .iter()
-        .map(|group| group.nodes.first().map(|node| (*node).to_owned()))
+        .map(|group| {
+            group
+                .offered_nodes()
+                .next()
+                .map(|(_, node)| node.to_owned())
+        })
         .collect()
 }
 
@@ -4643,14 +5082,10 @@ fn restored_selections(
         .map(|(group_index, group)| {
             let group_id = catalog_group_id(revision, group_index);
             saved.get(&group_id).and_then(|node_id| {
-                group
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(node_index, node)| {
-                        (catalog_node_id(revision, group_index, node_index) == *node_id)
-                            .then(|| (*node).to_owned())
-                    })
+                group.offered_nodes().find_map(|(node_index, node)| {
+                    (catalog_node_id(revision, group_index, node_index) == *node_id)
+                        .then(|| node.to_owned())
+                })
             })
         })
         .collect()
@@ -4717,7 +5152,7 @@ fn selection_ids_for_names(
         .enumerate()
         .filter(|(_, node)| **node == node_name);
     let (node_index, _) = matching_nodes.next()?;
-    if matching_nodes.next().is_some() {
+    if matching_nodes.next().is_some() || !group.offers(node_index) {
         return None;
     }
     Some((
@@ -4792,15 +5227,26 @@ where
         self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
+        let id = self
+            .store
+            .active_id()
+            .ok_or_else(|| BackendError::from_profile_mutation(ProfileMutationError::NotFound))?;
+        // The download runs without the operation lock: selections stay instant meanwhile.
+        let prefetched = self
+            .prefetch_profile(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
         let result = {
             let _operation = self.operation.lock().await;
             self.require_refresh_delete_mutation()
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
-            let id = self.store.active_id().ok_or_else(|| {
+            // Another subscription became active meanwhile: refresh that one instead.
+            let active = self.store.active_id().ok_or_else(|| {
                 BackendError::from_profile_mutation(ProfileMutationError::NotFound)
             })?;
-            self.refresh_profile_locked(&id)
+            let prefetched = (active == id).then_some(prefetched);
+            self.refresh_profile_locked(&active, prefetched)
                 .await
                 .map_err(BackendError::from_profile_mutation)
         };
@@ -4884,12 +5330,16 @@ where
         self.require_refresh_delete_mutation()
             .await
             .map_err(BackendError::from_profile_mutation)?;
+        let prefetched = self
+            .prefetch_profile(&id)
+            .await
+            .map_err(BackendError::from_profile_mutation)?;
         let result = {
             let _operation = self.operation.lock().await;
             self.require_refresh_delete_mutation()
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
-            self.refresh_profile_locked(&id)
+            self.refresh_profile_locked(&id, Some(prefetched))
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
             self.subscription_list_dto()
@@ -4918,7 +5368,7 @@ where
             self.require_disconnected_mutation()
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
-            self.replace_profile_source_locked(&id, &request.url)
+            self.replace_profile_source_locked(&id, &request.url, None)
                 .await
                 .map_err(BackendError::from_profile_mutation)?;
             self.subscription_list_dto()
@@ -4980,6 +5430,7 @@ where
             active_profile_id,
             live,
             group_index,
+            is_primary,
             raw_group,
             raw_node,
             previous_raw_node,
@@ -5014,15 +5465,17 @@ where
                 })
                 .ok_or(SelectionError::UnknownGroup)?;
             let group = &groups[group_index];
+            if group.hidden {
+                return Err(SelectionError::UnknownGroup);
+            }
             let node_index = group
-                .nodes
-                .iter()
-                .enumerate()
+                .offered_nodes()
                 .find_map(|(index, _)| {
                     (catalog_node_id(request.revision, group_index, index) == request.node_id)
                         .then_some(index)
                 })
                 .ok_or(SelectionError::UnknownNode)?;
+            let is_primary = primary_group_index(&groups) == Some(group_index);
             let raw_group = group.name.to_owned();
             let raw_node = group.nodes[node_index].to_owned();
             let previous_raw_node = state.selected_nodes[group_index].clone();
@@ -5031,6 +5484,7 @@ where
                 active_profile_id,
                 live,
                 group_index,
+                is_primary,
                 raw_group,
                 raw_node,
                 previous_raw_node,
@@ -5038,11 +5492,14 @@ where
             )
         };
 
-        if live {
-            self.selector
-                .select(&raw_group, &raw_node)
-                .await
-                .map_err(|_| SelectionError::SelectorFailed)?;
+        if live && self.selector.select(&raw_group, &raw_node).await.is_err() {
+            self.inner.write().await.push_event(
+                Severity::Warning,
+                Component::Mihomo,
+                "selection_failed",
+                "Mihomo не применил выбор маршрута.",
+            );
+            return Err(SelectionError::SelectorFailed);
         }
 
         let save_target = if let Some((pending_revision, pending)) = &pending_snapshot {
@@ -5106,20 +5563,17 @@ where
             });
             state.selected_nodes = selected_nodes;
             state.explicit_selected_nodes = explicit_selected_nodes;
-            state.current_node = state.selected_nodes.first().cloned().flatten();
+            state.current_node = primary_group_index(&selectable_groups(&snapshot))
+                .and_then(|index| state.selected_nodes.get(index).cloned())
+                .flatten();
         } else {
             state.selected_nodes[group_index] = Some(raw_node.clone());
             state.explicit_selected_nodes[group_index] = Some(raw_node.clone());
-            if group_index == 0 {
+            if is_primary {
                 state.current_node = Some(raw_node);
             }
         }
-        state.catalog = build_catalog(
-            &snapshot,
-            request.revision,
-            state.profile.as_deref(),
-            &state.selected_nodes,
-        );
+        state.rebuild_catalog();
         state.push_event(
             Severity::Info,
             Component::Mihomo,
@@ -5143,14 +5597,8 @@ where
             if !state.cores_live() {
                 return Err(SessionError::NotConnected);
             }
-            // The raw name behind the exit the status reports: the selected group's node.
-            let exit_start = state
-                .catalog
-                .groups
-                .iter()
-                .position(|group| group.selected)
-                .and_then(|index| state.selected_nodes.get(index).cloned().flatten())
-                .or_else(|| state.current_node.clone());
+            // The raw name behind the exit the status reports: the primary group's node.
+            let exit_start = state.current_node.clone();
             (
                 state.state.current() == CoreConnectionState::Connected,
                 state.connected_since_unix_ms,
@@ -5233,6 +5681,7 @@ where
                 request.node_ids.iter().map(String::as_str).collect();
 
             let known_groups: HashSet<String> = (0..groups.len())
+                .filter(|group_index| !groups[*group_index].hidden)
                 .map(|group_index| catalog_group_id(revision, group_index))
                 .collect();
             if !requested_groups
@@ -5245,8 +5694,9 @@ where
                 .iter()
                 .enumerate()
                 .flat_map(|(group_index, group)| {
-                    (0..group.nodes.len())
-                        .map(move |node_index| catalog_node_id(revision, group_index, node_index))
+                    group.offered_nodes().map(move |(node_index, _)| {
+                        catalog_node_id(revision, group_index, node_index)
+                    })
                 })
                 .collect();
             if !requested_nodes
@@ -5265,15 +5715,13 @@ where
                     let group_requested = requested_groups.contains(group_id.as_str());
                     let requested_nodes = &requested_nodes;
                     group
-                        .nodes
-                        .iter()
-                        .enumerate()
+                        .offered_nodes()
                         .filter_map(move |(node_index, raw_node)| {
                             let node_id = catalog_node_id(revision, group_index, node_index);
                             (probe_all
                                 || group_requested
                                 || requested_nodes.contains(node_id.as_str()))
-                            .then(|| (group_id.clone(), node_id, (*raw_node).to_owned()))
+                            .then(|| (group_id.clone(), node_id, raw_node.to_owned()))
                         })
                 })
                 .collect();
@@ -5469,6 +5917,59 @@ impl<P: ProcessController> Drop for AbandonedConnectGuard<'_, P> {
     }
 }
 
+/// At most this many of the failed core's last log lines go into the failure event.
+const FAILED_CORE_LOG_TAIL_LINES: usize = 8;
+const FAILED_CORE_LOG_LINE_CHARS: usize = 300;
+/// The service answers `Diagnostics` within seconds; a failure report must not wait longer.
+const FAILED_CORE_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The last lines the failed core wrote (its own explanation of the failure), oldest first.
+async fn failed_core_log_tail<P: ProcessController + ?Sized>(
+    controller: &P,
+    engine: Engine,
+) -> Vec<String> {
+    let Ok(diagnostics) =
+        tokio::time::timeout(FAILED_CORE_DIAGNOSTICS_TIMEOUT, controller.diagnostics()).await
+    else {
+        return Vec::new();
+    };
+    let mut tail: Vec<String> = diagnostics
+        .logs
+        .iter()
+        .rev()
+        .filter(|record| record.engine == engine)
+        .take(FAILED_CORE_LOG_TAIL_LINES)
+        .map(|record| {
+            record
+                .message
+                .chars()
+                .take(FAILED_CORE_LOG_LINE_CHARS)
+                .collect()
+        })
+        .collect();
+    tail.reverse();
+    tail
+}
+
+/// The API error code of a failed Connect: the desktop maps each to its own message.
+fn start_failure_code(cause: multicore_core::StartFailureCause) -> &'static str {
+    use multicore_core::StartFailureCause as Cause;
+    match cause {
+        Cause::ElevationCancelled => "elevation_cancelled",
+        Cause::ElevationFailed => "elevation_failed",
+        Cause::BrokerFailed => "broker_failed",
+        Cause::CoreFailed => "core_failed",
+        Cause::CoreMissing => "core_missing",
+        Cause::CoreExited => "core_exited",
+        Cause::ReadinessTimedOut => "core_timed_out",
+        Cause::TunFailed => "tun_failed",
+        Cause::TunTimedOut => "tun_timed_out",
+        Cause::SystemProxyFailed => "system_proxy_failed",
+        Cause::ServiceBusy => "service_busy",
+        Cause::Unknown => "connect_failed",
+    }
+}
+
 fn start_failure_message(
     engine: multicore_core::Engine,
     cause: multicore_core::StartFailureCause,
@@ -5486,14 +5987,23 @@ fn start_failure_message(
             "Не удалось запустить службу подключения с правами администратора.".to_owned()
         }
         Cause::BrokerFailed => "Служба подключения не ответила. Повторите попытку.".to_owned(),
-        Cause::CoreFailed => format!("Не удалось запустить {core}. Проверьте исполняемые файлы."),
+        Cause::CoreFailed => format!("Не удалось запустить {core}. Подробности — в логе на странице «Состояние»."),
+        Cause::CoreMissing => format!(
+            "Не удалось запустить {core}: файл ядра не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+        ),
+        Cause::CoreExited => {
+            format!("{core} завершился сразу после запуска. Причина — в логе на странице «Состояние».")
+        }
         Cause::ReadinessTimedOut => {
             format!("{core} не успел запуститься вовремя. Повторите попытку.")
         }
-        Cause::ServiceBusy => "MULTICORE уже запущен у другого пользователя.".to_owned(),
-        Cause::Unknown => {
-            "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
+        Cause::TunFailed => "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.".to_owned(),
+        Cause::TunTimedOut => "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.".to_owned(),
+        Cause::SystemProxyFailed => {
+            "Не удалось включить системный прокси. Повторите попытку.".to_owned()
         }
+        Cause::ServiceBusy => "MULTICORE уже запущен у другого пользователя.".to_owned(),
+        Cause::Unknown => "Не удалось запустить подключение. Повторите попытку.".to_owned(),
     }
 }
 
@@ -5512,13 +6022,22 @@ fn build_catalog(
     revision: u64,
     profile: Option<&str>,
     selected_nodes: &[Option<String>],
+    icons_pending: bool,
 ) -> CatalogDto {
+    let icon = |name: &str| {
+        let id = snapshot.group_icon_id(name);
+        let pending = icons_pending && id.is_none() && snapshot.names_group_icon(name);
+        (id, pending)
+    };
     let source_groups = selectable_groups(snapshot);
     let selected_group_index =
         profile.and_then(|profile| source_groups.iter().position(|group| group.name == profile));
+    // Hidden groups and members Mihomo drops are left out; ids keep their positions in the
+    // full lists, so every id maps to the same raw name whatever is shown.
     let groups = source_groups
         .iter()
         .enumerate()
+        .filter(|(_, group)| !group.hidden)
         .map(|(group_index, group)| {
             let selected = selected_group_index == Some(group_index);
             let selected_node_index = selected_nodes
@@ -5526,32 +6045,61 @@ fn build_catalog(
                 .and_then(Option::as_deref)
                 .and_then(|current_node| group.nodes.iter().position(|node| *node == current_node));
             let nodes = group
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(node_index, node)| NodeDto {
-                    id: catalog_node_id(revision, group_index, node_index),
-                    label: safe_catalog_label(node, "Узел", node_index),
-                    selected: selected_node_index == Some(node_index),
-                    delay_ms: None,
-                    icon_id: snapshot.group_icon_id(node),
+                .offered_nodes()
+                .map(|(node_index, node)| {
+                    let (icon_id, icon_pending) = icon(node);
+                    NodeDto {
+                        id: catalog_node_id(revision, group_index, node_index),
+                        label: safe_catalog_label(node, "Узел", node_index),
+                        selected: selected_node_index == Some(node_index),
+                        delay_ms: None,
+                        icon_id,
+                        icon_pending,
+                    }
                 })
                 .collect();
+            let (icon_id, icon_pending) = icon(group.name);
             GroupDto {
                 id: catalog_group_id(revision, group_index),
                 label: safe_catalog_label(group.name, "Группа", group_index),
                 selected,
                 nodes,
-                icon_id: snapshot.group_icon_id(group.name),
+                icon_id,
+                icon_pending,
             }
         })
         .collect();
     CatalogDto { revision, groups }
 }
 
+/// A subscription downloaded without the operation lock, waiting to be committed.
+struct Prefetched {
+    source_url: String,
+    snapshot: Arc<Snapshot>,
+}
+
 struct SelectableGroup<'a> {
     name: &'a str,
     nodes: Vec<&'a str>,
+    /// `offered[i]`: Mihomo keeps `nodes[i]` in the group, so it can be listed and selected.
+    offered: Vec<bool>,
+    /// `hidden: true`: the provider keeps this group out of the UI.
+    hidden: bool,
+}
+
+impl SelectableGroup<'_> {
+    fn offers(&self, node_index: usize) -> bool {
+        !self.hidden && self.offered.get(node_index).copied().unwrap_or(false)
+    }
+
+    /// The selectable nodes with their positions in `nodes`.
+    fn offered_nodes(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.offers(*index))
+            .map(|(index, node)| (index, *node))
+    }
 }
 
 /// The exact name-addressable namespace exposed by Mihomo's controller. Only interactive
@@ -5566,20 +6114,22 @@ fn selectable_groups(snapshot: &Snapshot) -> Vec<SelectableGroup<'_>> {
         .filter(|group| group.group_type.eq_ignore_ascii_case("select"))
         .take(MAX_CATALOG_GROUPS)
         .map(|group| {
-            let mut node_names = HashSet::new();
-            let nodes = group
-                .proxies
-                .iter()
-                .map(String::as_str)
-                .filter(|node| node_names.insert(*node))
-                .take(MAX_CATALOG_NODES_PER_GROUP)
-                .collect();
+            // Mihomo's members, in its order; ids index into this list, so members excluded
+            // by `exclude-filter` / `exclude-type` keep their place but are never offered.
+            let members = group.members.iter().take(MAX_CATALOG_NODES_PER_GROUP);
             SelectableGroup {
                 name: &group.name,
-                nodes,
+                nodes: members.clone().map(|member| member.name.as_str()).collect(),
+                offered: members.map(|member| member.offered).collect(),
+                hidden: group.hidden,
             }
         })
         .collect()
+}
+
+/// The group the connection card names: the first select group the provider did not hide.
+fn primary_group_index(groups: &[SelectableGroup<'_>]) -> Option<usize> {
+    groups.iter().position(|group| !group.hidden)
 }
 
 fn catalog_group_id(revision: u64, group_index: usize) -> String {
@@ -5590,8 +6140,9 @@ fn catalog_node_id(revision: u64, group_index: usize, node_index: usize) -> Stri
     format!("n-{revision:016x}-{group_index:04x}-{node_index:04x}")
 }
 
-/// Accepts only Unicode letters/numbers, ASCII space and this harmless punctuation:
-/// `- _ . , ( ) [ ] + # !`. Everything else receives a positional generic label.
+/// Accepts Unicode letters/numbers, ASCII space, the punctuation and symbols server names use
+/// (see `is_safe_catalog_label_char`) and emoji. Anything else, an address or `user:secret`
+/// form, a UUID or a recognizable credential gets a positional generic label instead.
 fn safe_catalog_label(source: &str, kind: &str, index: usize) -> String {
     // Nothing after this boundary can be published, so no presentation safety scan may spend
     // time or memory proportional to the rest of an untrusted (up to 32 MiB) YAML scalar.
@@ -5602,6 +6153,7 @@ fn safe_catalog_label(source: &str, kind: &str, index: usize) -> String {
     let published = &source[..published_end];
     if published.is_empty()
         || contains_uuid_like(published)
+        || contains_address_or_userinfo(published)
         || contains_structured_credential(published)
         || !published.chars().all(is_safe_catalog_label_char)
     {
@@ -5817,6 +6369,9 @@ fn decoded_contains_credential(decoded: &[u8], allow_short_pair: bool) -> bool {
     })
 }
 
+/// Everything a provider writes in an ordinary server name. Deliberately absent: control and
+/// format characters (bidi overrides, line/paragraph separators), `=`, `\` and backquotes;
+/// `:`, `@` and `/` are allowed here and checked structurally (`contains_address_or_userinfo`).
 fn is_safe_catalog_label_char(character: char) -> bool {
     if character.is_control() {
         return false;
@@ -5835,12 +6390,69 @@ fn is_safe_catalog_label_char(character: char) -> bool {
                 | '+'
                 | '#'
                 | '!'
+                | '|'
+                | '*'
+                | '/'
+                | ':'
+                | '@'
+                | '&'
+                | '%'
+                | '~'
+                | '?'
+                | ';'
+                | '\''
+                | '"'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                // Typographic dashes, quotes, bullets and signs.
+                | '\u{2010}'..='\u{2015}'
+                | '\u{2018}'..='\u{201f}'
+                | '\u{2022}'
+                | '\u{2026}'
+                | '\u{00b7}'
+                | '\u{00ab}'
+                | '\u{00bb}'
+                | '\u{00b0}'
+                | '\u{00a9}'
+                | '\u{00ae}'
+                | '\u{2116}'
+                | '\u{2122}'
+                | '\u{203c}'
+                | '\u{2049}'
+                | '\u{2139}'
+                // Arrows, technical symbols, enclosed numbers, shapes, symbols, dingbats.
                 | '\u{2190}'..='\u{21ff}'
-                | '\u{2600}'..='\u{27bf}'
-                | '\u{1f1e6}'..='\u{1f1ff}'
-                | '\u{1f300}'..='\u{1faff}'
+                | '\u{2300}'..='\u{23ff}'
+                | '\u{2460}'..='\u{24ff}'
+                | '\u{25a0}'..='\u{27bf}'
+                | '\u{2b00}'..='\u{2bff}'
+                | '\u{3030}'
+                | '\u{303d}'
+                | '\u{3297}'
+                | '\u{3299}'
+                // Emoji: pictographs, flags, skin tones, keycaps, ZWJ and tag sequences.
+                | '\u{1f000}'..='\u{1faff}'
                 | '\u{fe0f}'
+                | '\u{200d}'
+                | '\u{20e3}'
+                | '\u{e0020}'..='\u{e007f}'
         )
+}
+
+/// A URL (`scheme://`) or a `user:secret` / `user@host` form: `:` or `@` directly between two
+/// non-space characters. "Германия: Франкфурт" and "Nodes @ 10 Gbps" stay readable.
+fn contains_address_or_userinfo(source: &str) -> bool {
+    if source.contains("://") {
+        return true;
+    }
+    let characters: Vec<char> = source.chars().collect();
+    characters.windows(3).any(|window| {
+        matches!(window[1], ':' | '@') && !window[0].is_whitespace() && !window[2].is_whitespace()
+    })
 }
 
 fn contains_uuid_like(source: &str) -> bool {

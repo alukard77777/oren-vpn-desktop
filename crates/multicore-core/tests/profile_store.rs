@@ -1069,3 +1069,111 @@ fn assert_protected_single_principal_dacl(path: &Path) {
     unsafe { CloseHandle(token) };
     unsafe { LocalFree(descriptor.cast()) };
 }
+
+#[test]
+fn the_group_icon_cache_survives_reopening_and_drops_what_it_cannot_trust() {
+    use multicore_core::{CachedGroupIcon, MAX_CACHED_GROUP_ICONS, group_icon_key};
+    let directory = TempDirectory::new();
+    let png = multicore_core::normalize_group_icon(
+        br#"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='#0f0'/></svg>"#,
+    )
+    .unwrap();
+    {
+        let store = ProfileStore::open(directory.profiles(), None).unwrap();
+        assert!(store.group_icon_cache().is_empty());
+        let mut icons = BTreeMap::new();
+        for index in 0..MAX_CACHED_GROUP_ICONS + 3 {
+            icons.insert(
+                group_icon_key(&format!("https://icons.example/{index}.png")),
+                CachedGroupIcon {
+                    png: png.clone(),
+                    fetched_at_unix: index as u64,
+                },
+            );
+        }
+        // Not a canonical icon, and not a key: never written.
+        icons.insert(
+            group_icon_key("https://icons.example/raw.png"),
+            CachedGroupIcon {
+                png: b"not a png".to_vec(),
+                fetched_at_unix: u64::MAX,
+            },
+        );
+        icons.insert(
+            "https://icons.example/plain".into(),
+            CachedGroupIcon {
+                png: png.clone(),
+                fetched_at_unix: u64::MAX,
+            },
+        );
+        store.save_group_icon_cache(&icons).unwrap();
+    }
+    let store = ProfileStore::open(directory.profiles(), None).unwrap();
+    let cached = store.group_icon_cache();
+    assert_eq!(cached.len(), MAX_CACHED_GROUP_ICONS);
+    // The newest downloads are kept.
+    assert!(cached.contains_key(&group_icon_key(&format!(
+        "https://icons.example/{}.png",
+        MAX_CACHED_GROUP_ICONS + 2
+    ))));
+    assert!(!cached.contains_key(&group_icon_key("https://icons.example/0.png")));
+    assert!(cached.values().all(|icon| icon.png == png));
+    // The cache file is not a profile and survives the orphan cleanup on open.
+    assert_eq!(store.list().unwrap().len(), 0);
+
+    // A damaged cache reads as empty.
+    fs::write(directory.profiles().join("group-icons.json"), b"{not json").unwrap();
+    drop(store);
+    let store = ProfileStore::open(directory.profiles(), None).unwrap();
+    assert!(store.group_icon_cache().is_empty());
+}
+
+#[test]
+fn a_background_logo_replaces_the_shown_one_under_a_new_path_and_goes_with_its_profile() {
+    use multicore_core::CachedServiceLogo;
+    let directory = TempDirectory::new();
+    let store = ProfileStore::open(directory.profiles(), None).unwrap();
+    let id = store
+        .create_profile(snapshot("https://one.invalid/sub", "One"))
+        .unwrap();
+    assert_eq!(store.cached_service_logo(&id), None);
+    let logo = |color: &str| {
+        normalize_service_logo(
+            format!("<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='{color}'/></svg>").as_bytes(),
+        )
+        .unwrap()
+    };
+    let first = store.save_service_logo(&id, &logo("#00ff00")).unwrap();
+    assert_eq!(
+        store.cached_service_logo(&id),
+        Some(CachedServiceLogo::Logo(first.clone()))
+    );
+    assert!(store.save_service_logo(&id, b"not a logo").is_err());
+    // A new image gets a new path; the old file goes.
+    let second = store.save_service_logo(&id, &logo("#ff0000")).unwrap();
+    assert_ne!(first, second);
+    assert!(!first.exists());
+    assert_eq!(fs::read(&second).unwrap(), logo("#ff0000"));
+    // Reopening keeps it; the cache files are not profiles.
+    drop(store);
+    let store = ProfileStore::open(directory.profiles(), None).unwrap();
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(
+        store.cached_service_logo(&id),
+        Some(CachedServiceLogo::Logo(second.clone()))
+    );
+    store.mark_service_logo_removed(&id).unwrap();
+    assert_eq!(
+        store.cached_service_logo(&id),
+        Some(CachedServiceLogo::Removed)
+    );
+    assert!(!second.exists());
+    let third = store.save_service_logo(&id, &logo("#0000ff")).unwrap();
+    assert_eq!(
+        store.cached_service_logo(&id),
+        Some(CachedServiceLogo::Logo(third.clone()))
+    );
+    store.delete(&id).unwrap();
+    assert!(!third.exists());
+    assert_eq!(store.cached_service_logo(&id), None);
+}

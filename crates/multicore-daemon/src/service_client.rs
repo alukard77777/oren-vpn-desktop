@@ -157,6 +157,8 @@ pub enum ServiceError {
     TimedOut,
     Protocol,
     Rejected(BrokerErrorCode),
+    /// The service refused to switch the TUN adapter on (`SetTun{on:true}` during Connect).
+    TunRejected(BrokerErrorCode),
 }
 
 impl fmt::Display for ServiceError {
@@ -174,6 +176,8 @@ impl ServiceError {
             Self::Busy => StartFailureCause::ServiceBusy,
             Self::Rejected(BrokerErrorCode::TimedOut) => StartFailureCause::ReadinessTimedOut,
             Self::Rejected(_) => StartFailureCause::CoreFailed,
+            Self::TunRejected(BrokerErrorCode::TimedOut) => StartFailureCause::TunTimedOut,
+            Self::TunRejected(_) => StartFailureCause::TunFailed,
             _ => StartFailureCause::BrokerFailed,
         }
     }
@@ -194,8 +198,13 @@ pub trait ServiceConnector: Send + Sync + 'static {
 #[must_use]
 pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
     match command {
-        ServiceCommand::Prepare { .. } => CORE_READINESS_TIMEOUT * 2 + Duration::from_secs(10),
-        ServiceCommand::SetTun { .. } => Duration::from_secs(25),
+        // Both cores' readiness, plus the TUN switch a re-prepare of a live tunnel performs.
+        ServiceCommand::Prepare { .. } => {
+            CORE_READINESS_TIMEOUT * 2
+                + multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT
+                + Duration::from_secs(10)
+        }
+        ServiceCommand::SetTun { .. } => multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT,
         ServiceCommand::Update { .. } | ServiceCommand::StageUpdate { .. } => {
             Duration::from_secs(15 * 60)
         }
@@ -890,7 +899,12 @@ impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
                 Engine::Xray if warm_up => session.prepare_idle(generation),
                 Engine::Xray => claim_and_prepare(session, generation),
                 Engine::Mihomo => {
-                    session.set_tun(true)?;
+                    // In this mode starting Mihomo means switching its TUN adapter on: a refusal
+                    // here is an adapter problem, not a missing or crashed core.
+                    session.set_tun(true).map_err(|error| match error {
+                        ServiceError::Rejected(code) => ServiceError::TunRejected(code),
+                        other => other,
+                    })?;
                     session.set_in_use(IN_USE_TUN);
                     Ok(())
                 }

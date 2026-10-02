@@ -273,6 +273,9 @@ pub struct DaemonSubscriptionInfo {
     pub announcement_action_available: bool,
     #[serde(default)]
     pub service_logo_path: Option<String>,
+    /// The daemon still downloads the provider logo (`service_logo_path` is the previous one).
+    #[serde(default)]
+    pub service_logo_pending: bool,
     #[serde(default)]
     pub refresh_available: bool,
     /// The provider's `dumb-mode` header: only the first route group is shown.
@@ -384,6 +387,9 @@ pub struct DaemonCatalogGroup {
     /// Opaque id of the group's downloaded icon image (`GET /v1/group-icons/{id}`).
     #[serde(default)]
     pub icon_id: Option<String>,
+    /// The daemon is still downloading the group's icon (show a loading placeholder).
+    #[serde(default)]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -395,6 +401,9 @@ pub struct DaemonCatalogNode {
     /// Set when the node is itself a proxy group with a downloaded icon.
     #[serde(default)]
     pub icon_id: Option<String>,
+    /// That group's icon is still being downloaded.
+    #[serde(default)]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1167,6 +1176,26 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         "not_connected" => "Подключитесь, чтобы открыть панель Mihomo.",
         "dashboard_unavailable" => "Панель Mihomo недоступна в этой сборке.",
         "service_busy" => "MULTICORE уже запущен у другого пользователя.",
+        // Why a Connect's cores did not start (the daemon's start-failure codes).
+        "elevation_cancelled" => "Подключение отменено: не выдано разрешение администратора.",
+        "elevation_failed" => "Не удалось запустить службу подключения с правами администратора.",
+        "broker_failed" => "Служба подключения не ответила. Повторите попытку.",
+        "core_failed" => "Не удалось запустить ядро. Подробности — в логе на странице «Состояние».",
+        "core_missing" => {
+            "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+        }
+        "core_exited" => {
+            "Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние»."
+        }
+        "core_timed_out" => "Ядро не успело запуститься вовремя. Повторите попытку.",
+        "tun_failed" => {
+            "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+        }
+        "tun_timed_out" => {
+            "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+        }
+        "system_proxy_failed" => "Не удалось включить системный прокси. Повторите попытку.",
+        "connect_failed" => "Не удалось запустить подключение. Повторите попытку.",
         "service_update_failed" => "Служба не смогла загрузить или проверить обновление.",
         "service_unavailable" => "Служба MULTICORE недоступна.",
         "disconnect_first" => "Сначала отключитесь: проверка меняет сетевые настройки.",
@@ -1486,20 +1515,23 @@ impl DaemonClient for HttpDaemonClient {
             .json(&SelectionRequest { revision, node_id })
             .send()
             .map_err(map_error)?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            let stale_revision =
-                decode_bounded_json::<ApiErrorBody>(response, API_ERROR_RESPONSE_LIMIT_BYTES)
-                    .is_ok_and(|body| body.code == "stale_revision");
-            return Err(if stale_revision {
-                DaemonError::stale_revision()
-            } else {
-                DaemonError::definitive_http("Не удалось изменить маршрут.")
-            });
-        }
         if !response.status().is_success() {
-            return Err(DaemonError::definitive_http(
-                "Фоновый сервис отклонил изменение маршрута.",
-            ));
+            // A refused route change used to leave no trace in the client log.
+            let status = response.status();
+            let code = error_code(response);
+            record_low_level(
+                "daemon_selection_error",
+                format!("status={status} code={code:?}"),
+            );
+            return Err(if status == reqwest::StatusCode::CONFLICT {
+                if code == "stale_revision" {
+                    DaemonError::stale_revision()
+                } else {
+                    DaemonError::definitive_http("Не удалось изменить маршрут.")
+                }
+            } else {
+                DaemonError::definitive_http("Фоновый сервис отклонил изменение маршрута.")
+            });
         }
         decode_bounded_json(response, CATALOG_RESPONSE_LIMIT_BYTES)
     }
@@ -1697,6 +1729,53 @@ mod http_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_failed_connect_shows_why_the_cores_did_not_start() {
+        for (code, expected) in [
+            (
+                "tun_failed",
+                "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.",
+            ),
+            (
+                "core_missing",
+                "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE.",
+            ),
+            (
+                "core_exited",
+                "Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние».",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind connect server");
+            let address = listener.local_addr().expect("connect server address");
+            let body = format!(r#"{{"code":"{code}","message":"x"}}"#);
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept connect request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                    let read = stream.read(&mut buffer).expect("read connect request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write connect response");
+            });
+            let client = HttpDaemonClient::new(format!("http://{address}"), "token")
+                .expect("loopback client");
+            let error = client
+                .connect_with_tun(true)
+                .expect_err("cores did not start");
+            server.join().expect("connect server");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     #[test]
     fn service_updates_are_posted_and_busy_is_explained() {
@@ -2186,6 +2265,7 @@ mod http_tests {
                     label: "Авто".into(),
                     selected: true,
                     icon_id: None,
+                    icon_pending: false,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "node:a".into(),
@@ -2193,6 +2273,7 @@ mod http_tests {
                             selected: true,
                             delay_ms: Some(42),
                             icon_id: None,
+                            icon_pending: false,
                         },
                         DaemonCatalogNode {
                             id: "node:b".into(),
@@ -2200,6 +2281,7 @@ mod http_tests {
                             selected: false,
                             delay_ms: None,
                             icon_id: None,
+                            icon_pending: false,
                         },
                     ],
                 }],

@@ -29,16 +29,18 @@ pub use device_identity::{DeviceIdentity, DeviceIdentityError, derive_incy_hwid,
 pub use event::{Component, Event, Severity};
 pub use fetch::{
     AttemptOutcome, FetchDiagnostics, FetchError, HttpClient, HttpResponse, ReqwestHttpClient,
-    SubscriptionFetcher, UA_GROUP_ICON, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO, UA_XRAY,
+    ServiceLogoDownload, SubscriptionFetcher, UA_GROUP_ICON, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO,
+    UA_XRAY,
 };
 pub use input::{
-    ConfigError, IDLE_XRAY_CONFIG, IDLE_XRAY_OUTBOUND_TAG, MAX_CONFIG_BYTES, MihomoConfig,
-    MihomoSocksMapping, ProxyGroup, XrayConfig, parse_mihomo, parse_xray,
+    ConfigError, GroupMember, IDLE_XRAY_CONFIG, IDLE_XRAY_OUTBOUND_TAG, MAX_CONFIG_BYTES,
+    MihomoConfig, MihomoSocksMapping, ProxyGroup, XrayConfig, parse_mihomo, parse_xray,
 };
 pub use network::default_ipv4_interface;
 pub use profile::{
-    LoadedProfile, MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, MAX_SELECTIONS, MAX_SELECTIONS_BYTES,
-    ProfileError, ProfileId, ProfileStore, ProfileSummary,
+    CachedGroupIcon, CachedServiceLogo, LoadedProfile, MAX_CACHED_GROUP_ICONS,
+    MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, MAX_SELECTIONS, MAX_SELECTIONS_BYTES, ProfileError,
+    ProfileId, ProfileStore, ProfileSummary,
 };
 pub use service_logo::{
     MAX_GROUP_ICON_DIMENSION, MAX_GROUP_ICON_OUTPUT_BYTES, MAX_SERVICE_LOGO_BYTES,

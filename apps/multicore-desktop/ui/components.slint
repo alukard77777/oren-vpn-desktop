@@ -73,12 +73,56 @@ export component PrimaryAction inherits Rectangle {
     }
 }
 
+// Icon slot whose image may still be downloading. While it loads, a muted
+// circle of the slot's size pulses slowly; the image cross-fades in when it
+// arrives. animation-tick() is read only while the placeholder is pulsing, so
+// a settled slot schedules no frames. A row re-created with its image already
+// loaded shows it at once (an animated binding does not animate its first value).
+export component IconLoadingSlot inherits Rectangle {
+    in property <image> icon-image;
+    in property <bool> icon-loading: false;
+    in property <bool> reduced-motion: false;
+    property <bool> has-image: root.icon-image.width > 0;
+    property <bool> placeholder-shown: root.icon-loading && !root.has-image;
+    property <bool> pulsing: root.placeholder-shown && !root.reduced-motion;
+    property <float> placeholder-fade: root.placeholder-shown ? 1 : 0;
+    animate placeholder-fade { duration: root.reduced-motion ? 0ms : 160ms; easing: ease-out; }
+    background: transparent;
+    accessible-role: none;
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: min(self.width, self.height) / 2;
+        background: Theme.text-muted.with-alpha(0.24);
+        // 0.35 <-> 0.6, each way over 1.8 s (a sine is already ease-in-out).
+        opacity: root.placeholder-fade * (root.pulsing
+            ? 0.35 + 0.25 * (1 - Math.cos(animation-tick() / 3600ms * 360deg)) / 2
+            : 0.45);
+    }
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.icon-image;
+        image-fit: contain;
+        opacity: root.has-image ? 1 : 0;
+        animate opacity { duration: root.reduced-motion ? 0ms : 160ms; easing: ease-out; }
+        accessible-role: none;
+    }
+}
+
 export component QuietChip inherits Rectangle {
     in property <string> icon;
     in property <image> icon-image;
+    // The icon image is still downloading: a placeholder holds the icon's place.
+    in property <bool> icon-loading: false;
+    in property <bool> reduced-motion: false;
+    // The tab has an icon slot: an image, a loading placeholder or a glyph.
+    property <bool> has-icon-slot: root.icon != "" || root.icon-image.width > 0 || root.icon-loading;
     // The icon and label are centred as one group; a centred label with a
     // left-pinned icon left a gap that varied with the label's length.
-    property <length> content-x: root.icon == "" ? Theme.space-4 : max(Theme.space-3, (root.width - 22px - chip-label.preferred-width) / 2);
+    property <length> content-x: !root.has-icon-slot ? Theme.space-4 : max(Theme.space-3, (root.width - 22px - chip-label.preferred-width) / 2);
     in property <string> label;
     in property <string> selected-state-label: "выбрано";
     in property <string> state-label:
@@ -93,7 +137,7 @@ export component QuietChip inherits Rectangle {
     // Icon and full label with 16px on each side: the track scrolls rather than
     // squeeze a tab below this.
     out property <length> natural-width: min(root.max-natural-width,
-        chip-label.preferred-width + 2 * Theme.space-4 + (root.icon == "" ? 0px : 22px) + 2px);
+        chip-label.preferred-width + 2 * Theme.space-4 + (root.has-icon-slot ? 22px : 0px) + 2px);
     callback activated();
     // The tab became the selected one (or was created selected): its track may scroll it into view.
     callback selected-shown();
@@ -143,7 +187,7 @@ export component QuietChip inherits Rectangle {
     min-height: 32px;
     preferred-width: root.natural-sizing
         ? root.natural-width
-        : chip-label.preferred-width + Theme.space-3 * 2 + (root.icon == "" ? 0px : 22px);
+        : chip-label.preferred-width + Theme.space-3 * 2 + (root.has-icon-slot ? 22px : 0px);
     preferred-height: 32px;
     background: root.selected ? Theme.elevated : chip-touch.has-hover && root.enabled && root.modal-enabled ? #ffffff08 : transparent;
     border-color: Theme.focus;
@@ -174,14 +218,14 @@ export component QuietChip inherits Rectangle {
         animate opacity { duration: 160ms; easing: ease-out; }
     }
 
-    if root.icon-image.width > 0: Image {
+    if root.has-icon-slot: IconLoadingSlot {
         x: root.content-x + 1px;
         y: (parent.height - self.height) / 2;
         width: 15px;
         height: 15px;
-        source: root.icon-image;
-        image-fit: contain;
-        accessible-role: none;
+        icon-image: root.icon-image;
+        icon-loading: root.icon-loading;
+        reduced-motion: root.reduced-motion;
     }
 
     if root.icon != "" && root.icon-image.width == 0: Text {
@@ -194,11 +238,14 @@ export component QuietChip inherits Rectangle {
         font-size: Theme.type-label-size;
         horizontal-alignment: center;
         vertical-alignment: center;
+        // Shown only once loading has ended without an image.
+        opacity: root.icon-loading ? 0 : 1;
+        animate opacity { duration: root.reduced-motion ? 0ms : 160ms; easing: ease-out; }
         accessible-role: none;
     }
 
     chip-label := Text {
-        x: root.icon == "" ? Theme.space-4 : root.content-x + 22px;
+        x: !root.has-icon-slot ? Theme.space-4 : root.content-x + 22px;
         width: parent.width - self.x - Theme.space-4;
         height: parent.height;
         text: root.label;
@@ -206,7 +253,7 @@ export component QuietChip inherits Rectangle {
         font-family: Theme.font-family;
         font-size: Theme.type-metadata-size;
         font-weight: root.selected ? Theme.weight-semibold : Theme.weight-medium;
-        horizontal-alignment: root.icon == "" ? center : left;
+        horizontal-alignment: !root.has-icon-slot ? center : left;
         animate color { duration: 140ms; easing: ease-out; }
         vertical-alignment: center;
         overflow: elide;
@@ -236,6 +283,9 @@ export component QuietChip inherits Rectangle {
 export component RouteNodeRow inherits Rectangle {
     in property <string> icon;
     in property <image> icon-image;
+    // The icon image is still downloading: a placeholder holds the flag's place.
+    in property <bool> icon-loading: false;
+    in property <bool> reduced-motion: false;
     in property <string> label;
     in property <string> supporting-text;
     in property <string> trailing-text;
@@ -315,14 +365,14 @@ export component RouteNodeRow inherits Rectangle {
         height: 30px;
         background: transparent;
 
-        if root.icon-image.width > 0: Image {
+        IconLoadingSlot {
             x: 4px;
             y: 4px;
             width: 22px;
             height: 22px;
-            source: root.icon-image;
-            image-fit: contain;
-            accessible-role: none;
+            icon-image: root.icon-image;
+            icon-loading: root.icon-loading;
+            reduced-motion: root.reduced-motion;
         }
 
         if root.icon-image.width == 0: Text {
@@ -332,6 +382,9 @@ export component RouteNodeRow inherits Rectangle {
             font-size: Theme.type-value-size;
             horizontal-alignment: center;
             vertical-alignment: center;
+            // Shown only once loading has ended without an image.
+            opacity: root.icon-loading ? 0 : 1;
+            animate opacity { duration: root.reduced-motion ? 0ms : 160ms; easing: ease-out; }
             accessible-role: none;
         }
     }

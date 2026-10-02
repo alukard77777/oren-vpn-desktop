@@ -11,7 +11,8 @@ use multicore_core::{
 };
 use multicore_daemon::{
     Backend, CatalogDto, CoreBackend, ImportSubscriptionRequest, MAX_CATALOG_GROUPS,
-    MAX_CATALOG_NAME_CHARS, MAX_CATALOG_NODES_PER_GROUP, MemoryBackend, router,
+    MAX_CATALOG_NAME_CHARS, MAX_CATALOG_NODES_PER_GROUP, MemoryBackend, SelectionError,
+    SelectionRequest, router,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -416,6 +417,142 @@ proxy-groups:
     }
     assert_eq!(labels[9], "Singapore Premium");
     assert_eq!(labels[10], "Tokyo 01");
+}
+
+/// The structure of a real provider config (names, hosts and keys replaced) that showed
+/// "⚙ Узел 18", "Узел 19", ... in 1.1.2: ordinary server names with `|` and `*` fell back
+/// to positional labels; a url-test group with `exclude-filter`; an `include-all-proxies`
+/// group with `filter`.
+const PROVIDER_STRUCTURE: &str = r#"
+proxies:
+  - {name: " 🇩🇪 ⚡ Германия", type: vless}
+  - {name: "🇩🇪 Hysteria 2 | Германия", type: hysteria2}
+  - {name: "🇨🇳 Китай *", type: vless}
+  - {name: "🇷🇺 Россия Москва ", type: vless}
+  - {name: "🇩🇪 Германия Torrent ", type: vless}
+  - {name: "🇨🇾 Кипр*", type: vless}
+proxy-groups:
+  - name: "⚡️ Fastest"
+    type: url-test
+    exclude-filter: (?i)(backup|torrent|Россия Москва)
+    proxies: [" 🇩🇪 ⚡ Германия", "🇩🇪 Hysteria 2 | Германия", "🇨🇳 Китай *", "🇷🇺 Россия Москва ", "🇩🇪 Германия Torrent ", "🇨🇾 Кипр*"]
+  - name: Internal
+    type: select
+    hidden: true
+    proxies: [DIRECT]
+  - name: Зарубежные сайты
+    type: select
+    proxies: ["⚡️ Fastest", DIRECT, " 🇩🇪 ⚡ Германия", "🇩🇪 Hysteria 2 | Германия", "🇨🇳 Китай *", "🇷🇺 Россия Москва ", "🇩🇪 Германия Torrent ", "🇨🇾 Кипр*"]
+  - name: Без рекламы
+    type: select
+    exclude-type: Hysteria2
+    exclude-filter: Torrent
+    proxies: [DIRECT, " 🇩🇪 ⚡ Германия", "🇩🇪 Hysteria 2 | Германия", "🇩🇪 Германия Torrent "]
+  - name: 🧲 Торрент
+    type: select
+    include-all-proxies: true
+    filter: (?i)(torrent|торрент)
+    proxies: [DIRECT]
+"#;
+
+#[tokio::test]
+async fn catalog_lists_what_mihomo_offers_with_the_providers_own_names() {
+    let backend = core_backend(PROVIDER_STRUCTURE);
+    let catalog = backend.catalog().await.unwrap();
+    let labels = |group: &multicore_daemon::GroupDto| {
+        group
+            .nodes
+            .iter()
+            .map(|node| node.label.clone())
+            .collect::<Vec<_>>()
+    };
+    // The hidden group is not listed; the first visible select group is the primary one.
+    assert_eq!(
+        catalog
+            .groups
+            .iter()
+            .map(|group| (group.label.as_str(), group.selected))
+            .collect::<Vec<_>>(),
+        [
+            ("Зарубежные сайты", true),
+            ("Без рекламы", false),
+            ("🧲 Торрент", false)
+        ]
+    );
+    // `|` and `*` are ordinary punctuation, not a reason for "Узел N".
+    assert_eq!(
+        labels(&catalog.groups[0]),
+        [
+            "⚡️ Fastest",
+            "DIRECT",
+            "🇩🇪 ⚡ Германия",
+            "🇩🇪 Hysteria 2 | Германия",
+            "🇨🇳 Китай *",
+            "🇷🇺 Россия Москва",
+            "🇩🇪 Германия Torrent",
+            "🇨🇾 Кипр*",
+        ]
+    );
+    // What Mihomo drops (`exclude-type`, `exclude-filter`) is not offered.
+    assert_eq!(labels(&catalog.groups[1]), ["DIRECT", "🇩🇪 ⚡ Германия"]);
+    // `include-all-proxies` + `filter` adds the matching servers after the explicit ones.
+    assert_eq!(
+        labels(&catalog.groups[2]),
+        ["DIRECT", "🇩🇪 Германия Torrent"]
+    );
+    // The status names the primary group and its default node.
+    let status = backend.status().await.unwrap();
+    assert_eq!(status.profile.as_deref(), Some("Зарубежные сайты"));
+    assert_eq!(status.current_node.as_deref(), Some("⚡️ Fastest"));
+    assert!(catalog.groups[0].nodes[0].selected);
+}
+
+#[tokio::test]
+async fn hidden_groups_and_excluded_nodes_cannot_be_selected_by_id() {
+    let backend = core_backend(PROVIDER_STRUCTURE);
+    let catalog = backend.catalog().await.unwrap();
+    let revision = catalog.revision;
+    // Ids keep their positions among all select groups and in Mihomo's full member lists:
+    // the hidden group is index 0 and the excluded "Hysteria" member of "Без рекламы" is 2.
+    let hidden_group = format!("g-{revision:016x}-0000");
+    let ad_free = format!("g-{revision:016x}-0002");
+    assert!(catalog.groups.iter().all(|group| group.id != hidden_group));
+    assert_eq!(catalog.groups[1].id, ad_free);
+    let offered: Vec<_> = catalog.groups[1]
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect();
+    assert_eq!(
+        offered,
+        [
+            format!("n-{revision:016x}-0002-0000"),
+            format!("n-{revision:016x}-0002-0001"),
+        ]
+    );
+    for (group_id, node_id, expected) in [
+        (
+            hidden_group.clone(),
+            format!("n-{revision:016x}-0000-0000"),
+            SelectionError::UnknownGroup,
+        ),
+        (
+            ad_free.clone(),
+            format!("n-{revision:016x}-0002-0002"),
+            SelectionError::UnknownNode,
+        ),
+    ] {
+        assert_eq!(
+            backend
+                .select(SelectionRequest {
+                    group_id,
+                    revision,
+                    node_id,
+                })
+                .await,
+            Err(expected)
+        );
+    }
 }
 
 #[tokio::test]
@@ -934,7 +1071,13 @@ async fn reconstructed_daemon_uses_persisted_generation_for_revision_and_ids() {
     );
 }
 
-struct IconFixtureHttp;
+#[derive(Clone, Default)]
+struct IconFixtureHttp {
+    /// Icon requests seen.
+    icon_calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Icon requests fail (an icon host that is down).
+    icons_down: bool,
+}
 
 impl HttpClient for IconFixtureHttp {
     fn get<'a>(
@@ -971,7 +1114,14 @@ proxy-groups:
                 UA_XRAY => {
                     HttpResponse::new(200, br#"{}"#.to_vec(), std::iter::empty::<(&str, &str)>())
                 }
-                UA_GROUP_ICON if !url.ends_with("missing.svg") => HttpResponse::new(
+                UA_GROUP_ICON if {
+                    self.icon_calls.lock().unwrap().push(url.to_owned());
+                    self.icons_down || url.ends_with("missing.svg")
+                } =>
+                {
+                    return Err(FetchError::Network);
+                }
+                UA_GROUP_ICON => HttpResponse::new(
                     200,
                     format!(
                         "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='{}'/></svg>",
@@ -987,12 +1137,12 @@ proxy-groups:
 }
 
 #[tokio::test]
-async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
+async fn group_icons_load_in_the_background_and_are_cached_for_the_next_start() {
     let directory = tempfile::tempdir().unwrap();
-    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let http = IconFixtureHttp::default();
     let backend = CoreBackend::new(
-        store,
-        SubscriptionFetcher::new(IconFixtureHttp),
+        ProfileStore::open(directory.path().join("profiles"), None).unwrap(),
+        SubscriptionFetcher::new(http.clone()),
         |_snapshot| Ok(Arc::new(NoopController)),
     )
     .unwrap();
@@ -1002,6 +1152,77 @@ async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
         })
         .await
         .unwrap();
+    // The import did not wait for any icon: they are still loading.
+    assert!(http.icon_calls.lock().unwrap().is_empty());
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(catalog.groups[0].icon_id, None);
+    assert!(catalog.groups[0].icon_pending);
+    assert!(
+        catalog.groups[0].nodes[0].icon_pending,
+        "Auto is a group with an icon"
+    );
+    assert!(
+        !catalog.groups[0].nodes[1].icon_pending,
+        "a server names no icon"
+    );
+    let revision = catalog.revision;
+
+    assert!(backend.fetch_group_icons().await);
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(
+        catalog.revision, revision,
+        "icons do not invalidate selections"
+    );
+    assert!(catalog.groups[0].icon_id.is_some());
+    assert!(!catalog.groups[0].icon_pending);
+    assert!(catalog.groups[0].nodes[0].icon_id.is_some());
+    // A failed icon settles too: the UI shows its fallback glyph instead of a placeholder.
+    assert_eq!(catalog.groups[1].icon_id, None);
+    assert!(!catalog.groups[1].icon_pending);
+    let main_icon = catalog.groups[0].icon_id.clone();
+    drop(backend);
+
+    // The next start shows the cached icons at once, without the icon host.
+    let offline = IconFixtureHttp {
+        icons_down: true,
+        ..IconFixtureHttp::default()
+    };
+    let backend = CoreBackend::new(
+        ProfileStore::open(directory.path().join("profiles"), None).unwrap(),
+        SubscriptionFetcher::new(offline.clone()),
+        |_snapshot| Ok(Arc::new(NoopController)),
+    )
+    .unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(catalog.groups[0].icon_id, main_icon);
+    assert!(!catalog.groups[0].icon_pending);
+    // Only the icon that never arrived is still being tried.
+    assert!(catalog.groups[1].icon_pending);
+    backend.fetch_group_icons().await;
+    assert_eq!(
+        offline.icon_calls.lock().unwrap().as_slice(),
+        ["https://icons.example/missing.svg"]
+    );
+    assert!(!backend.catalog().await.unwrap().groups[1].icon_pending);
+}
+
+#[tokio::test]
+async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let backend = CoreBackend::new(
+        store,
+        SubscriptionFetcher::new(IconFixtureHttp::default()),
+        |_snapshot| Ok(Arc::new(NoopController)),
+    )
+    .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://example.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    backend.fetch_group_icons().await;
 
     let catalog = backend.catalog().await.unwrap();
     let main = &catalog.groups[0];

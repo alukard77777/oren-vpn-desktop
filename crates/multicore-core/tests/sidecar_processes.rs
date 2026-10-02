@@ -201,9 +201,19 @@ fn sidecar_start_failures_distinguish_readiness_timeout_from_core_failure() {
         controller.start_failure_cause(&ProcessError::ReadinessTimedOut(Engine::Mihomo)),
         StartFailureCause::ReadinessTimedOut
     );
+    // The shown message differs for each: a core that cannot be launched at all (missing,
+    // quarantined, access denied) is not the same problem as one that exits while starting.
+    assert_eq!(
+        controller.start_failure_cause(&ProcessError::LaunchFailed(Engine::Xray)),
+        StartFailureCause::CoreMissing
+    );
+    assert_eq!(
+        controller.start_failure_cause(&ProcessError::ReadinessFailed(Engine::Xray)),
+        StartFailureCause::CoreExited
+    );
     for error in [
-        ProcessError::ReadinessFailed(Engine::Xray),
-        ProcessError::LaunchFailed(Engine::Xray),
+        ProcessError::InspectFailed(Engine::Mihomo),
+        ProcessError::StopFailed(Engine::Mihomo),
     ] {
         assert_eq!(
             controller.start_failure_cause(&error),

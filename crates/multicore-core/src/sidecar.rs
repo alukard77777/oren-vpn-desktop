@@ -572,9 +572,14 @@ impl ProcessLauncher for TokioProcessLauncher {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            let mut child = process
-                .spawn()
-                .map_err(|_| ProcessError::LaunchFailed(command.engine))?;
+            let mut child = process.spawn().map_err(|error| {
+                self.logs.push(
+                    command.engine,
+                    DiagnosticStream::Stderr,
+                    &launch_failure_line(&command.program, &error),
+                );
+                ProcessError::LaunchFailed(command.engine)
+            })?;
             if let Some(stdout) = child.stdout.take() {
                 spawn_log_reader(
                     self.logs.clone(),
@@ -712,6 +717,16 @@ pub(crate) fn spawn_blocking_log_reader(
             }
         }
     });
+}
+
+/// The diagnostics line for a core that could not be launched: its file name (never the full
+/// path, which names the user) and the OS error, e.g. "file not found" after an antivirus
+/// quarantined it, or "access denied".
+pub(crate) fn launch_failure_line(program: &std::path::Path, error: &std::io::Error) -> String {
+    let name = program
+        .file_name()
+        .map_or_else(|| "core".into(), |name| name.to_string_lossy());
+    format!("could not launch {name}: {error}")
 }
 
 pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
@@ -1231,7 +1246,8 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
             let command = self.paths.command(engine);
             let mut child = self.launcher.launch(command.clone()).await?;
             if child.has_exited()? {
-                return Err(ProcessError::LaunchFailed(engine));
+                // Launched, but gone at once: an early exit, not a missing executable.
+                return Err(ProcessError::ReadinessFailed(engine));
             }
             if let Err(error) = self.launcher.wait_until_ready(&command, &mut child).await {
                 let _ = child.stop().await;
@@ -1245,7 +1261,11 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
     fn start_failure_cause(&self, error: &Self::Error) -> crate::StartFailureCause {
         match error {
             ProcessError::ReadinessTimedOut(_) => crate::StartFailureCause::ReadinessTimedOut,
-            _ => crate::StartFailureCause::CoreFailed,
+            ProcessError::LaunchFailed(_) => crate::StartFailureCause::CoreMissing,
+            ProcessError::ReadinessFailed(_) => crate::StartFailureCause::CoreExited,
+            ProcessError::InspectFailed(_) | ProcessError::StopFailed(_) => {
+                crate::StartFailureCause::CoreFailed
+            }
         }
     }
 

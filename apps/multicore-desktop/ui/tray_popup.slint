@@ -1,5 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { IconLoadingSlot } from "components.slint";
 import "../assets/fonts/Twemoji.Mozilla.ttf";
 
 export struct TrayMenuRow {
@@ -7,6 +8,8 @@ export struct TrayMenuRow {
     group-id: string,
     icon: string,
     icon-image: image,
+    // The daemon is still downloading the icon image: show the loading placeholder.
+    icon-loading: bool,
     label: string,
     // Groups: the selected node's label. Nodes: the latency text.
     detail: string,
@@ -78,9 +81,12 @@ component TrayTextAction inherits Rectangle {
 component TraySegment inherits Rectangle {
     in property <string> label;
     in property <image> icon-image;
+    // The icon image is still downloading: a placeholder holds the icon's place.
+    in property <bool> icon-loading: false;
+    in property <bool> reduced-motion: false;
     in property <bool> selected;
     in property <bool> enabled: true;
-    property <bool> has-icon: root.icon-image.width > 0;
+    property <bool> has-icon: root.icon-image.width > 0 || root.icon-loading;
     property <length> icon-space: root.has-icon ? 19px : 0px;
     // Icon and full name with 10px on each side; the track scrolls rather than squeeze below it.
     out property <length> natural-width: min(180px, segment-label.preferred-width + 20px + root.icon-space + 2px);
@@ -131,14 +137,14 @@ component TraySegment inherits Rectangle {
     // With an icon, icon and name are centred as one group.
     property <length> label-width: min(segment-label.preferred-width, self.width - 20px - root.icon-space);
     property <length> content-x: max(10px, (self.width - root.icon-space - self.label-width) / 2);
-    if root.has-icon: Image {
+    if root.has-icon: IconLoadingSlot {
         x: root.content-x;
         y: (parent.height - self.height) / 2;
         width: 14px;
         height: 14px;
-        source: root.icon-image;
-        image-fit: contain;
-        accessible-role: none;
+        icon-image: root.icon-image;
+        icon-loading: root.icon-loading;
+        reduced-motion: root.reduced-motion;
     }
 
     segment-label := Text {
@@ -176,6 +182,8 @@ component TraySegment inherits Rectangle {
 component TrayNodeRow inherits Rectangle {
     in property <string> icon;
     in property <image> icon-image;
+    // The icon image is still downloading: a placeholder holds the flag's place.
+    in property <bool> icon-loading: false;
     in property <string> label;
     in property <string> latency;
     in property <string> tone: "neutral";
@@ -210,14 +218,14 @@ component TrayNodeRow inherits Rectangle {
         animate opacity, height { duration: 180ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
     }
 
-    if root.icon-image.width > 0: Image {
+    IconLoadingSlot {
         x: 12px;
         y: (parent.height - self.height) / 2;
         width: 20px;
         height: 20px;
-        source: root.icon-image;
-        image-fit: contain;
-        accessible-role: none;
+        icon-image: root.icon-image;
+        icon-loading: root.icon-loading;
+        reduced-motion: root.reduced-motion;
     }
     if root.icon != "" && root.icon-image.width == 0: Text {
         x: 10px;
@@ -229,6 +237,9 @@ component TrayNodeRow inherits Rectangle {
         font-size: 15px;
         horizontal-alignment: center;
         vertical-alignment: center;
+        // Shown only once loading has ended without an image.
+        opacity: root.icon-loading ? 0 : 1;
+        animate opacity { duration: root.reduced-motion ? 0ms : 160ms; easing: ease-out; }
         accessible-role: none;
     }
 
@@ -887,7 +898,7 @@ export component TrayPopup inherits Window {
                     height: 0px;
                     group-measure := VerticalLayout {
                         for group in root.group-rows: Rectangle {
-                            min-width: min(180px, measure-label.preferred-width + 20px + (group.icon-image.width > 0 ? 19px : 0px) + 2px);
+                            min-width: min(180px, measure-label.preferred-width + 20px + (group.icon-image.width > 0 || group.icon-loading ? 19px : 0px) + 2px);
                             measure-label := Text {
                                 text: group.label;
                                 font-size: 12px;
@@ -922,6 +933,8 @@ export component TrayPopup inherits Window {
                         for group in root.group-rows: TraySegment {
                             label: group.label;
                             icon-image: group.icon-image;
+                            icon-loading: group.icon-loading;
+                            reduced-motion: root.reduced-motion;
                             selected: group.selected;
                             natural-sizing: group-track.overflowing;
                             enabled: group.enabled;
@@ -1008,6 +1021,7 @@ export component TrayPopup inherits Window {
                         for node[index] in root.node-rows: TrayNodeRow {
                             icon: node.icon;
                             icon-image: node.icon-image;
+                            icon-loading: node.icon-loading;
                             label: node.label;
                             latency: node.detail;
                             tone: node.tone;

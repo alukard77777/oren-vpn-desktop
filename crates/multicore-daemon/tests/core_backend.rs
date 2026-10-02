@@ -873,15 +873,26 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
     assert!(info.home_available);
     assert!(info.support_available);
     assert!(info.announcement_action_available);
-    let first_logo = info.service_logo_path.as_deref().unwrap();
+    // The logo arrives in the background, after the import answered.
+    assert_eq!(info.service_logo_path, None);
+    assert!(info.service_logo_pending);
+    backend.fetch_service_logos().await;
+    let with_logo = backend.status().await.unwrap();
+    let first_logo = with_logo
+        .subscription
+        .as_ref()
+        .unwrap()
+        .service_logo_path
+        .clone()
+        .unwrap();
     assert!(
-        std::fs::read(first_logo)
+        std::fs::read(&first_logo)
             .unwrap()
             .starts_with(b"\x89PNG\r\n\x1a\n")
     );
     #[cfg(windows)]
-    assert!(first_logo.ends_with("service-logo.png"));
-    assert!(std::path::Path::new(first_logo).is_file());
+    assert!(first_logo.ends_with(".png"));
+    assert!(std::path::Path::new(&first_logo).is_file());
     assert!(info.refresh_available);
 
     let serialized = serde_json::to_string(&imported).unwrap();
@@ -914,9 +925,22 @@ async fn imported_source_exposes_safe_metadata_and_can_refresh_without_resubmitt
     assert!(refreshed.subscription.as_ref().unwrap().refresh_available);
     assert_eq!(refreshed.profile, imported.profile);
     assert_eq!(refreshed.current_node, imported.current_node);
-    assert_ne!(
+    // The refresh keeps showing the logo while its new copy downloads; the same image keeps
+    // its path.
+    assert_eq!(
         refreshed.subscription.as_ref().unwrap().service_logo_path,
-        imported.subscription.as_ref().unwrap().service_logo_path
+        Some(first_logo.clone())
+    );
+    backend.fetch_service_logos().await;
+    assert_eq!(
+        backend
+            .status()
+            .await
+            .unwrap()
+            .subscription
+            .unwrap()
+            .service_logo_path,
+        Some(first_logo)
     );
     assert_eq!(
         *calls.lock().unwrap(),
@@ -1068,12 +1092,14 @@ async fn refresh_keeps_the_logo_when_only_its_download_fails() {
         |_snapshot| Ok(Arc::new(RecordingController::default())),
     )
     .unwrap();
-    let imported = backend
+    backend
         .import_subscription(ImportSubscriptionRequest {
             url: "https://provider.example/sub".into(),
         })
         .await
         .unwrap();
+    backend.fetch_service_logos().await;
+    let imported = backend.status().await.unwrap();
     let logo_of = |status: &multicore_daemon::StatusDto| {
         status
             .subscription
@@ -1087,12 +1113,16 @@ async fn refresh_keeps_the_logo_when_only_its_download_fails() {
 
     // A network blip or a fake-ip VPN makes only the logo download fail.
     logo_download_fails.store(true, std::sync::atomic::Ordering::SeqCst);
-    let refreshed = backend.refresh_subscription().await.unwrap();
+    backend.refresh_subscription().await.unwrap();
+    backend.fetch_service_logos().await;
+    let refreshed = backend.status().await.unwrap();
     assert_eq!(logo_of(&refreshed), Some(original));
 
     // A provider that stops naming a logo does drop it.
     include_logo.store(false, std::sync::atomic::Ordering::SeqCst);
-    let refreshed = backend.refresh_subscription().await.unwrap();
+    backend.refresh_subscription().await.unwrap();
+    backend.fetch_service_logos().await;
+    let refreshed = backend.status().await.unwrap();
     assert_eq!(logo_of(&refreshed), None);
 }
 
@@ -1105,12 +1135,14 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
         |_snapshot| Ok(Arc::new(RecordingController::default())),
     )
     .unwrap();
-    let first = backend
+    backend
         .import_subscription(ImportSubscriptionRequest {
             url: "https://user:password@one.invalid/sub?token=first".into(),
         })
         .await
         .unwrap();
+    backend.fetch_service_logos().await;
+    let first = backend.status().await.unwrap();
     let first_id = ProfileId::parse(first.active_profile_id.as_deref().unwrap()).unwrap();
     let expected_logo = std::fs::read(
         first
@@ -1128,6 +1160,7 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
         })
         .await
         .unwrap();
+    backend.fetch_service_logos().await;
 
     let listed = Backend::list_subscriptions(&backend).await.unwrap();
     assert_eq!(listed.profiles.len(), 2);
@@ -1141,12 +1174,6 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
     assert_eq!(inactive.total_bytes, Some(20));
     let inactive_logo = inactive.service_logo_path.as_ref().unwrap().clone();
     assert_eq!(std::fs::read(&inactive_logo).unwrap(), expected_logo);
-    assert_eq!(
-        backend
-            .retained_profile_logo_path_for_testing(&first_id)
-            .as_deref(),
-        Some(std::path::Path::new(&inactive_logo))
-    );
 
     let serialized = serde_json::to_string(&listed).unwrap();
     assert!(serialized.len() < 16 * 1024);
@@ -1161,19 +1188,15 @@ async fn profile_list_sanitizes_hostile_metadata_and_retains_inactive_logo() {
         assert!(!serialized.contains(forbidden), "leaked {forbidden}");
     }
 
-    let refreshed = Backend::refresh_subscription_profile(&backend, first_id.clone())
+    Backend::refresh_subscription_profile(&backend, first_id.clone())
         .await
         .unwrap();
+    backend.fetch_service_logos().await;
+    let refreshed = Backend::list_subscriptions(&backend).await.unwrap();
     let refreshed_logo = refreshed.profiles[0].service_logo_path.as_ref().unwrap();
-    #[cfg(windows)]
-    assert_ne!(refreshed_logo, &inactive_logo);
+    // The same image keeps its file.
+    assert_eq!(refreshed_logo, &inactive_logo);
     assert_eq!(std::fs::read(refreshed_logo).unwrap(), expected_logo);
-    assert_eq!(
-        backend
-            .retained_profile_logo_path_for_testing(&first_id)
-            .as_deref(),
-        Some(std::path::Path::new(refreshed_logo))
-    );
 
     backend.delete_subscription(&first_id).await.unwrap();
     assert_eq!(
@@ -1201,12 +1224,14 @@ async fn deleting_active_logo_drops_all_leases_before_cleanup_and_recovers_capac
         |_snapshot| Ok(Arc::new(RecordingController::default())),
     )
     .unwrap();
-    let imported = backend
+    backend
         .import_subscription(ImportSubscriptionRequest {
             url: "https://active-logo.invalid/sub".into(),
         })
         .await
         .unwrap();
+    backend.fetch_service_logos().await;
+    let imported = backend.status().await.unwrap();
     let id = ProfileId::parse(imported.active_profile_id.as_deref().unwrap()).unwrap();
     let profile_directory = root.path().join(id.as_str());
     let logo_path = imported
@@ -1764,9 +1789,22 @@ async fn successful_fetch_persists_snapshot_and_updates_status_before_supervisio
     assert_eq!(imported.profile.as_deref(), Some("Main"));
     assert_eq!(imported.current_node.as_deref(), Some("Test Node"));
     assert!(!imported.degraded);
+    // The provider logo is not part of the import: it is downloaded in the background.
+    assert_eq!(*http_calls.lock().unwrap(), vec![UA_NATIVE]);
+    assert!(imported.subscription.as_ref().unwrap().service_logo_pending);
+    backend.fetch_service_logos().await;
     assert_eq!(
         *http_calls.lock().unwrap(),
         vec![UA_NATIVE, UA_SERVICE_LOGO]
+    );
+    assert!(
+        !backend
+            .status()
+            .await
+            .unwrap()
+            .subscription
+            .unwrap()
+            .service_logo_pending
     );
 
     assert_eq!(
@@ -2112,12 +2150,42 @@ async fn connect_failure_message_explains_the_classified_cause() {
         (
             Engine::Mihomo,
             StartFailureCause::CoreFailed,
-            "Не удалось запустить Mihomo. Проверьте исполняемые файлы.",
+            "Не удалось запустить Mihomo. Подробности — в логе на странице «Состояние».",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::CoreMissing,
+            "Не удалось запустить Mihomo: файл ядра не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE.",
+        ),
+        (
+            Engine::Xray,
+            StartFailureCause::CoreExited,
+            "Xray завершился сразу после запуска. Причина — в логе на странице «Состояние».",
         ),
         (
             Engine::Mihomo,
             StartFailureCause::ReadinessTimedOut,
             "Mihomo не успел запуститься вовремя. Повторите попытку.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::TunFailed,
+            "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::TunTimedOut,
+            "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::SystemProxyFailed,
+            "Не удалось включить системный прокси. Повторите попытку.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::Unknown,
+            "Не удалось запустить подключение. Повторите попытку.",
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -2137,11 +2205,127 @@ async fn connect_failure_message_explains_the_classified_cause() {
             .await
             .unwrap();
 
-        assert!(backend.connect().await.is_err());
+        let error = backend.connect().await.unwrap_err();
+        // The HTTP layer answers with the cause, not a bare "backend_error".
+        assert_eq!(error.start_failure(), Some((engine, cause)));
         let status = backend.status().await.unwrap();
         assert_eq!(status.state, ConnectionState::Ready);
         assert_eq!(status.message.as_deref(), Some(expected));
     }
+}
+
+/// Fails `engine`'s start; its diagnostics log alternates lines of `engine` and Xray.
+struct LoggingFailureController {
+    engine: Engine,
+    lines: Vec<String>,
+}
+
+impl ProcessController for LoggingFailureController {
+    type Error = StartFailureCause;
+
+    fn start<'a>(
+        &'a self,
+        engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if engine == self.engine {
+                Err(StartFailureCause::CoreExited)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn diagnostics<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = multicore_core::ProcessDiagnostics> + Send + 'a>> {
+        Box::pin(async move {
+            let logs = self
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| multicore_core::CoreLogRecord {
+                    id: index as u64,
+                    timestamp_ms: 0,
+                    engine: if index % 2 == 0 {
+                        self.engine
+                    } else {
+                        Engine::Xray
+                    },
+                    stream: multicore_core::DiagnosticStream::Stderr,
+                    message: line.clone(),
+                })
+                .collect();
+            multicore_core::ProcessDiagnostics {
+                logs,
+                ..Default::default()
+            }
+        })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
+        *error
+    }
+}
+
+#[tokio::test]
+async fn a_failed_start_logs_the_last_lines_of_the_failed_core() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let mut lines: Vec<String> = (0..20).map(|index| format!("line {index}")).collect();
+    lines.push("level=fatal msg=\"Start TUN listening error: configure tun interface\"".into());
+    let backend = test_backend(
+        store,
+        SubscriptionFetcher::new(FixtureHttp::default()),
+        move |_snapshot: &Snapshot| -> Result<Arc<LoggingFailureController>, BackendError> {
+            Ok(Arc::new(LoggingFailureController {
+                engine: Engine::Mihomo,
+                lines: lines.clone(),
+            }))
+        },
+    )
+    .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://example.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    assert!(backend.connect().await.is_err());
+
+    let events = backend.events_after(0).await.unwrap();
+    let failure = events
+        .iter()
+        .rev()
+        .find(|event| event.message == "Запуск подключения завершился ошибкой.")
+        .expect("failure event");
+    let tail: Vec<String> = failure.details.as_ref().unwrap()["core_log_tail"]
+        .as_array()
+        .expect("core log tail")
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect();
+    // Only the failed core's lines, oldest first, the newest eight of them.
+    assert_eq!(
+        tail,
+        [
+            "line 6",
+            "line 8",
+            "line 10",
+            "line 12",
+            "line 14",
+            "line 16",
+            "line 18",
+            "level=fatal msg=\"Start TUN listening error: configure tun interface\"",
+        ]
+    );
 }
 
 #[tokio::test]

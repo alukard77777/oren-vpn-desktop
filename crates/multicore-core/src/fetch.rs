@@ -707,6 +707,17 @@ fn is_global_ipv6(ip: Ipv6Addr) -> bool {
         && !(segments[0] == 0x3fff && segments[1] < 0x1000)
 }
 
+/// What a provider-logo download gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceLogoDownload {
+    /// The canonical PNG.
+    Logo(Vec<u8>),
+    /// The image host answers with its "image unavailable" placeholder: the logo is gone.
+    Gone,
+    /// Not reachable or not an image this time: keep what is shown.
+    Failed,
+}
+
 pub struct SubscriptionFetcher<C> {
     client: C,
 }
@@ -738,6 +749,33 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         Result<SnapshotCommit<Arc<Snapshot>>, FetchError>,
         FetchDiagnostics,
     ) {
+        self.refresh_impl(url, store, false).await
+    }
+
+    /// `refresh_with_diagnostics` without the provider-logo download: a named logo is only
+    /// marked as not fetched (so `Snapshot::with_service_logo_carried_from` keeps the previous
+    /// one) and its URL stays readable in memory (`Snapshot::subscription_logo_url`) for a
+    /// background `download_service_logo`. A slow logo host never holds a refresh up.
+    pub async fn refresh_deferring_logo<S: SnapshotSink>(
+        &self,
+        url: &str,
+        store: &S,
+    ) -> (
+        Result<SnapshotCommit<Arc<Snapshot>>, FetchError>,
+        FetchDiagnostics,
+    ) {
+        self.refresh_impl(url, store, true).await
+    }
+
+    async fn refresh_impl<S: SnapshotSink>(
+        &self,
+        url: &str,
+        store: &S,
+        defer_logo: bool,
+    ) -> (
+        Result<SnapshotCommit<Arc<Snapshot>>, FetchError>,
+        FetchDiagnostics,
+    ) {
         let started = std::time::Instant::now();
         let host = safe_host(url);
         let native_response = self.client.get(url, UA_NATIVE).await;
@@ -760,8 +798,7 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
                     });
                     let outcome = match outcome {
                         Ok(mut snapshot) => {
-                            self.fetch_optional_logo(&mut snapshot).await;
-                            self.fetch_group_icons(&mut snapshot).await;
+                            self.logo_for(&mut snapshot, defer_logo).await;
                             store.save(snapshot).map_err(|_| FetchError::Persistence)
                         }
                         Err(error) => Err(error),
@@ -794,8 +831,7 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             .map_err(|error| prefer_informative(native_error, error))
         {
             Ok(mut snapshot) => {
-                self.fetch_optional_logo(&mut snapshot).await;
-                self.fetch_group_icons(&mut snapshot).await;
+                self.logo_for(&mut snapshot, defer_logo).await;
                 store.save(snapshot).map_err(|_| FetchError::Persistence)
             }
             Err(error) => Err(error),
@@ -810,38 +846,59 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         (outcome, diagnostics)
     }
 
-    async fn fetch_optional_logo(&self, snapshot: &mut Snapshot) {
+    async fn logo_for(&self, snapshot: &mut Snapshot, defer: bool) {
+        if defer {
+            if snapshot.subscription_logo_url().is_some() {
+                snapshot.mark_service_logo_unfetched();
+            }
+            return;
+        }
         let Some(url) = snapshot.take_subscription_logo_url() else {
             return;
         };
-        let Ok(response) = self.client.get(&url, UA_SERVICE_LOGO).await else {
-            snapshot.mark_service_logo_unfetched();
-            return;
+        match self.download_service_logo(&url).await {
+            ServiceLogoDownload::Logo(png) => snapshot.set_service_logo_png(png),
+            // Show no logo rather than the placeholder or a stale copy of it.
+            ServiceLogoDownload::Gone => {}
+            ServiceLogoDownload::Failed => snapshot.mark_service_logo_unfetched(),
+        }
+    }
+
+    /// Downloads and normalizes a provider logo (`Snapshot::subscription_logo_url`) through
+    /// the pinned, global-address-only, size- and time-bounded image path.
+    pub async fn download_service_logo(&self, url: &str) -> ServiceLogoDownload {
+        let Ok(response) = self.client.get(url, UA_SERVICE_LOGO).await else {
+            return ServiceLogoDownload::Failed;
         };
-        // A host placeholder ("image unavailable") means the provider's logo is gone:
-        // show no logo rather than the placeholder or a stale copy of it.
+        // A host placeholder ("image unavailable") means the provider's logo is gone.
         if response.status_is_success()
             && crate::service_logo::is_image_host_placeholder(&response.body)
         {
-            return;
+            return ServiceLogoDownload::Gone;
         }
         if response.status_is_success()
             && let Some(png) = normalize_service_logo(&response.body)
         {
-            snapshot.set_service_logo_png(png);
+            ServiceLogoDownload::Logo(png)
         } else {
-            snapshot.mark_service_logo_unfetched();
+            ServiceLogoDownload::Failed
         }
     }
 
-    /// Downloads the images named by Mihomo `proxy-groups[].icon` through the same pinned,
-    /// global-address-only, size- and time-bounded path as the service logo, a few at a time
-    /// and within one overall budget. An icon that fails is marked unfetched, so a refresh
-    /// keeps the previous copy (`Snapshot::with_service_logo_carried_from`).
-    async fn fetch_group_icons(&self, snapshot: &mut Snapshot) {
-        let pending = snapshot.group_icon_urls();
+    /// Downloads Mihomo `proxy-groups[].icon` images (`(group_icon_key, url)` pairs from
+    /// `Snapshot::group_icon_urls`) through the same pinned, global-address-only, size- and
+    /// time-bounded path as the service logo, a few at a time and within one overall budget.
+    /// Returns the canonical PNG of each icon that arrived, by key; failures are left out.
+    ///
+    /// Never part of a subscription refresh: the daemon runs it in the background after the
+    /// subscription is saved, so a slow or dead icon host cannot hold an import up.
+    pub async fn download_group_icons(
+        &self,
+        pending: &[(String, String)],
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut downloaded = std::collections::BTreeMap::new();
         if pending.is_empty() {
-            return;
+            return downloaded;
         }
         let mut outcomes: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(pending.len());
         let fetch_one = |url: Option<String>| async move {
@@ -869,14 +926,12 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             }
         };
         let _ = tokio::time::timeout(GROUP_ICONS_TOTAL_TIMEOUT, fetch_all).await;
-        for (key, _) in &pending {
-            match outcomes.iter_mut().find(|(done, _)| done == key) {
-                Some((_, png @ Some(_))) => {
-                    snapshot.set_group_icon_png(key.clone(), png.take().expect("checked"));
-                }
-                _ => snapshot.mark_group_icon_unfetched(key.clone()),
+        for (key, png) in outcomes {
+            if let Some(png) = png {
+                downloaded.insert(key, png);
             }
         }
+        downloaded
     }
 }
 

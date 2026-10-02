@@ -44,10 +44,21 @@ pub enum StartFailureCause {
     ElevationFailed,
     /// The privileged host session failed or stopped responding.
     BrokerFailed,
-    /// The core process could not be launched or exited during startup.
+    /// The core failed to start for a reason not classified below.
     CoreFailed,
+    /// The core executable could not be launched at all: missing (e.g. quarantined by an
+    /// antivirus), blocked, or access denied.
+    CoreMissing,
+    /// The core process exited while starting (its log says why).
+    CoreExited,
     /// The core stayed alive but did not become ready in time.
     ReadinessTimedOut,
+    /// The TUN adapter could not be switched on (the service's `SetTun` failed).
+    TunFailed,
+    /// The TUN adapter did not come up in time.
+    TunTimedOut,
+    /// Mihomo started, but the OS proxy settings could not be pointed at it.
+    SystemProxyFailed,
     /// The always-ready service is held by another interactive user's session.
     ServiceBusy,
 }

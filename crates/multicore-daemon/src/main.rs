@@ -222,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // service available.
     backend.enable_always_ready(service.clone()).await;
     spawn_service_watch(backend.clone(), service.clone());
+    spawn_group_icon_fetch(backend.clone()).await;
 
     // Read-only dashboard on its own loopback port with its own per-session token. The URL
     // embeds that token and must never be logged; it only leaves this process through the
@@ -349,6 +350,29 @@ where
             } else {
                 (delay * 2).clamp(WATCH_INTERVAL, WATCH_BACKOFF_MAX)
             };
+        }
+    });
+}
+
+/// Downloads group icons whenever an installed snapshot names some the cache lacks (or holds
+/// an old copy of): imports, refreshes and switches never wait for icon hosts.
+async fn spawn_group_icon_fetch<C, P, F>(backend: Arc<CoreBackend<C, P, F>>)
+where
+    C: multicore_core::HttpClient + 'static,
+    P: multicore_core::ProcessController + 'static,
+    F: 'static,
+    CoreBackend<C, P, F>: Send + Sync,
+{
+    let requests = backend.group_icon_requests().await;
+    tokio::spawn(async move {
+        loop {
+            requests.notified().await;
+            backend.fetch_group_icons().await;
+            if backend.fetch_service_logos().await {
+                // An import was still being stored: try its logo again shortly.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                requests.notify_one();
+            }
         }
     });
 }

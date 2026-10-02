@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsStr,
     fmt, fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -211,6 +211,7 @@ pub struct ProfileStore {
     _lock: StoreLock,
     index: RwLock<ProfileIndex>,
     selection_lock: Mutex<()>,
+    group_icon_cache_lock: Mutex<()>,
     maintenance_debt: AtomicBool,
     #[cfg(test)]
     index_fault: std::sync::atomic::AtomicU8,
@@ -285,6 +286,7 @@ impl ProfileStore {
             _lock: lock,
             index: RwLock::new(index),
             selection_lock: Mutex::new(()),
+            group_icon_cache_lock: Mutex::new(()),
             maintenance_debt: AtomicBool::new(false),
             #[cfg(test)]
             index_fault: std::sync::atomic::AtomicU8::new(0),
@@ -304,6 +306,165 @@ impl ProfileStore {
         cleanup_unindexed_profile_directories(&store.root, &index)?;
         drop(index);
         Ok(store)
+    }
+
+    /// The provider logo downloaded in the background for profile `id` (newer than the one its
+    /// snapshot generation may carry), or that the provider removed it. `None`: nothing
+    /// cached, the generation's logo (if any) stands.
+    pub fn cached_service_logo(&self, id: &ProfileId) -> Option<CachedServiceLogo> {
+        let names = self.service_logo_names(id);
+        if names.iter().any(|name| *name == removed_logo_name(id)) {
+            return Some(CachedServiceLogo::Removed);
+        }
+        names
+            .into_iter()
+            .filter(|name| name.ends_with(".png"))
+            .find_map(|name| {
+                let (png, file) = self.read_service_logo(&name)?;
+                crate::service_logo::is_canonical_service_logo(&png)
+                    .then(|| file.path().map(Path::to_owned))
+                    .flatten()
+            })
+            .map(CachedServiceLogo::Logo)
+    }
+
+    fn read_service_logo(
+        &self,
+        name: &str,
+    ) -> Option<(Vec<u8>, crate::store_root::CapabilityFile)> {
+        let max = crate::MAX_SERVICE_LOGO_OUTPUT_BYTES as u64;
+        matches!(
+            self.root.file_metadata(OsStr::new(name)),
+            Ok(Some((true, len))) if len <= max
+        )
+        .then(|| self.root.read_file_retained(OsStr::new(name), max).ok())
+        .flatten()
+    }
+
+    /// Keeps `png` (a canonical service logo) as profile `id`'s logo. Each image gets its own
+    /// file name, so a path a client already holds never changes its content.
+    pub fn save_service_logo(&self, id: &ProfileId, png: &[u8]) -> Result<PathBuf, ProfileError> {
+        if !crate::service_logo::is_canonical_service_logo(png) {
+            return Err(ProfileError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a canonical service logo",
+            )));
+        }
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let digest: String = Sha256::digest(png)
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let name = format!("{SERVICE_LOGO_PREFIX}{}-{digest}.png", id.as_str());
+        if self.root.file_metadata(OsStr::new(&name))?.is_none() {
+            let temp = format!("{SERVICE_LOGO_PREFIX}{}.tmp", id.as_str());
+            if self.root.file_metadata(OsStr::new(&temp))?.is_some() {
+                self.root.remove_file(OsStr::new(&temp))?;
+            }
+            self.root.write_file(OsStr::new(&temp), png)?;
+            self.root
+                .replace_file(OsStr::new(&temp), OsStr::new(&name))?;
+        }
+        for other in self.service_logo_names(id) {
+            if other != name {
+                let _ = self.root.remove_file(OsStr::new(&other));
+            }
+        }
+        self.read_service_logo(&name)
+            .and_then(|(_, file)| file.path().map(Path::to_owned))
+            .ok_or_else(|| ProfileError::Io(io::Error::other("service logo has no stable path")))
+    }
+
+    /// The provider no longer has a logo for profile `id`: none is shown, whatever an older
+    /// snapshot generation carries.
+    pub fn mark_service_logo_removed(&self, id: &ProfileId) -> Result<(), ProfileError> {
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let marker = removed_logo_name(id);
+        if self.root.file_metadata(OsStr::new(&marker))?.is_none() {
+            self.root.write_file(OsStr::new(&marker), b"")?;
+        }
+        for other in self.service_logo_names(id) {
+            if other != marker {
+                let _ = self.root.remove_file(OsStr::new(&other));
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_service_logos(&self, id: &ProfileId) {
+        for name in self.service_logo_names(id) {
+            let _ = self.root.remove_file(OsStr::new(&name));
+        }
+    }
+
+    fn service_logo_names(&self, id: &ProfileId) -> Vec<String> {
+        let prefix = format!("{SERVICE_LOGO_PREFIX}{}", id.as_str());
+        self.root
+            .entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.name.into_string().ok())
+            .filter(|name| {
+                name.strip_prefix(&prefix)
+                    .is_some_and(|rest| rest.starts_with('-') || rest == ".tmp")
+            })
+            .collect()
+    }
+
+    /// Downloaded Mihomo group icons by `group_icon_key`, shared by all profiles (an icon URL
+    /// is downloaded once whichever subscription names it). A missing or damaged cache reads
+    /// as empty; every entry is validated again.
+    pub fn group_icon_cache(&self) -> BTreeMap<String, CachedGroupIcon> {
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let Ok(Some((true, len))) = self.root.file_metadata(OsStr::new(GROUP_ICON_CACHE_FILE))
+        else {
+            return BTreeMap::new();
+        };
+        if len > MAX_GROUP_ICON_CACHE_BYTES {
+            return BTreeMap::new();
+        }
+        self.root
+            .read_file(
+                OsStr::new(GROUP_ICON_CACHE_FILE),
+                MAX_GROUP_ICON_CACHE_BYTES,
+            )
+            .map(|bytes| decode_group_icon_cache(&bytes))
+            .unwrap_or_default()
+    }
+
+    /// Replaces the group icon cache with `icons`, keeping the most recently fetched
+    /// `MAX_CACHED_GROUP_ICONS` valid entries.
+    pub fn save_group_icon_cache(
+        &self,
+        icons: &BTreeMap<String, CachedGroupIcon>,
+    ) -> Result<(), ProfileError> {
+        let bytes = encode_group_icon_cache(icons)?;
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let temp = OsStr::new(GROUP_ICON_CACHE_TEMP_FILE);
+        if self.root.file_metadata(temp)?.is_some() {
+            self.root.remove_file(temp)?;
+        }
+        let result = self.root.write_file(temp, &bytes).and_then(|()| {
+            self.root
+                .replace_file(temp, OsStr::new(GROUP_ICON_CACHE_FILE))
+        });
+        if result.is_err() {
+            let _ = self.root.remove_file(temp);
+        }
+        Ok(result?)
     }
 
     pub fn list(&self) -> Result<Vec<ProfileSummary>, ProfileError> {
@@ -605,6 +766,7 @@ impl ProfileStore {
                 source,
             });
         }
+        self.remove_service_logos(id);
         match self.remove_profile_directory(id) {
             Ok(()) => Ok(active),
             Err(source) => {
@@ -954,6 +1116,94 @@ fn profile_entry_ids(root: &DirectoryCapability) -> Result<Vec<ProfileId>, Profi
         .collect::<Vec<_>>();
     ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     Ok(ids)
+}
+
+const SERVICE_LOGO_PREFIX: &str = "logo-";
+
+fn removed_logo_name(id: &ProfileId) -> String {
+    format!("{SERVICE_LOGO_PREFIX}{}-none", id.as_str())
+}
+
+/// A profile's provider logo as the background download left it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CachedServiceLogo {
+    /// The newest logo, at this path (its content never changes).
+    Logo(PathBuf),
+    /// The provider removed its logo.
+    Removed,
+}
+
+const GROUP_ICON_CACHE_FILE: &str = "group-icons.json";
+const GROUP_ICON_CACHE_TEMP_FILE: &str = "group-icons.json.tmp";
+/// At most this many icons are kept (the most recently downloaded ones).
+pub const MAX_CACHED_GROUP_ICONS: usize = 64;
+const MAX_GROUP_ICON_CACHE_BYTES: u64 =
+    (MAX_CACHED_GROUP_ICONS * crate::MAX_GROUP_ICON_OUTPUT_BYTES * 4 / 3 + 64 * 1024) as u64;
+
+/// One cached group icon: its canonical PNG and when it was downloaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedGroupIcon {
+    pub png: Vec<u8>,
+    pub fetched_at_unix: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedGroupIconRecord {
+    png: String,
+    fetched_at_unix: u64,
+}
+
+fn encode_group_icon_cache(
+    icons: &BTreeMap<String, CachedGroupIcon>,
+) -> Result<Vec<u8>, ProfileError> {
+    use base64::Engine as _;
+    let mut newest: Vec<(&String, &CachedGroupIcon)> = icons
+        .iter()
+        .filter(|(key, icon)| {
+            crate::snapshot::is_group_icon_key(key)
+                && crate::service_logo::is_canonical_group_icon(&icon.png)
+        })
+        .collect();
+    newest.sort_by_key(|(_, icon)| std::cmp::Reverse(icon.fetched_at_unix));
+    newest.truncate(MAX_CACHED_GROUP_ICONS);
+    let records: BTreeMap<&str, CachedGroupIconRecord> = newest
+        .into_iter()
+        .map(|(key, icon)| {
+            (
+                key.as_str(),
+                CachedGroupIconRecord {
+                    png: base64::engine::general_purpose::STANDARD.encode(&icon.png),
+                    fetched_at_unix: icon.fetched_at_unix,
+                },
+            )
+        })
+        .collect();
+    serde_json::to_vec(&records).map_err(|error| ProfileError::Io(io::Error::other(error)))
+}
+
+fn decode_group_icon_cache(bytes: &[u8]) -> BTreeMap<String, CachedGroupIcon> {
+    use base64::Engine as _;
+    let Ok(records) = serde_json::from_slice::<BTreeMap<String, CachedGroupIconRecord>>(bytes)
+    else {
+        return BTreeMap::new();
+    };
+    records
+        .into_iter()
+        .filter(|(key, _)| crate::snapshot::is_group_icon_key(key))
+        .filter_map(|(key, record)| {
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(record.png)
+                .ok()?;
+            crate::service_logo::is_canonical_group_icon(&png).then_some((
+                key,
+                CachedGroupIcon {
+                    png,
+                    fetched_at_unix: record.fetched_at_unix,
+                },
+            ))
+        })
+        .take(MAX_CACHED_GROUP_ICONS)
+        .collect()
 }
 
 fn cleanup_unindexed_profile_directories(

@@ -14,6 +14,8 @@ pub(crate) struct TrayGroup {
     pub(crate) icon: String,
     /// Downloaded group icon image, drawn instead of `icon` when present.
     pub(crate) icon_id: Option<String>,
+    /// That image is still being downloaded.
+    pub(crate) icon_pending: bool,
     pub(crate) selected_node_label: String,
     /// The group the popup shows (the one selected on the home screen).
     pub(crate) selected: bool,
@@ -26,6 +28,7 @@ pub(crate) struct TrayNode {
     pub(crate) label: String,
     pub(crate) icon: String,
     pub(crate) icon_id: Option<String>,
+    pub(crate) icon_pending: bool,
     pub(crate) selected: bool,
     pub(crate) latency_text: String,
     /// "success" | "warning" | "danger" | "neutral", as on the home route list.
@@ -51,6 +54,7 @@ pub(crate) struct TrayInput {
 pub(crate) struct TrayMenuEntry {
     pub(crate) icon: String,
     pub(crate) icon_id: Option<String>,
+    pub(crate) icon_pending: bool,
     pub(crate) measuring: bool,
     pub(crate) label: String,
     /// Groups: the selected node's label. Nodes: the latency text.
@@ -101,6 +105,7 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
             nodes.extend(group.nodes.into_iter().map(|node| TrayMenuEntry {
                 icon: node.icon,
                 icon_id: node.icon_id,
+                icon_pending: node.icon_pending,
                 measuring: node.measuring,
                 label: node.label,
                 detail: node.latency_text,
@@ -115,6 +120,7 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
             TrayMenuEntry {
                 icon: group.icon,
                 icon_id: group.icon_id,
+                icon_pending: group.icon_pending,
                 measuring: false,
                 label: group.label,
                 detail: group.selected_node_label,
@@ -299,6 +305,7 @@ mod tests {
                     label: "Сервер".into(),
                     icon: "🌍".into(),
                     icon_id: None,
+                    icon_pending: false,
                     selected_node_label: "Швеция".into(),
                     selected: true,
                     nodes: vec![TrayNode {
@@ -309,6 +316,7 @@ mod tests {
                         latency_text: "42 ms".into(),
                         latency_tone: "success".into(),
                         icon_id: None,
+                        icon_pending: false,
                         measuring: false,
                     }],
                 },
@@ -317,6 +325,7 @@ mod tests {
                     label: "Игры".into(),
                     icon: "🎮".into(),
                     icon_id: None,
+                    icon_pending: false,
                     selected_node_label: "Direct".into(),
                     selected: false,
                     nodes: vec![TrayNode {
@@ -327,6 +336,7 @@ mod tests {
                         latency_text: String::new(),
                         latency_tone: "neutral".into(),
                         icon_id: None,
+                        icon_pending: false,
                         measuring: false,
                     }],
                 },
@@ -658,6 +668,7 @@ mod native_menu_tests {
                     label: "Сервер".into(),
                     icon: "🌍".into(),
                     icon_id: None,
+                    icon_pending: false,
                     selected_node_label: "Швеция".into(),
                     selected: true,
                     nodes: vec![
@@ -688,6 +699,7 @@ mod native_menu_tests {
                     label: "Пусто".into(),
                     icon: String::new(),
                     icon_id: None,
+                    icon_pending: false,
                     selected_node_label: String::new(),
                     selected: false,
                     nodes: Vec::new(),

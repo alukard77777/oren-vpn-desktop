@@ -21,6 +21,105 @@ rules:
   - MATCH,Proxy
 "#;
 
+/// Group members the way Mihomo v1.19.32 builds them (adapter/outboundgroup/parser.go and
+/// groupbase.go): explicit `proxies`, then with `include-all`/`include-all-proxies` every
+/// config proxy (sorted by name) matching `filter`; `exclude-filter` and `exclude-type` then
+/// drop members, explicit ones included. Checked against a running Mihomo.
+const MIHOMO_GROUP_RULES: &str = r#"
+proxies:
+  - {name: b-node, type: vless}
+  - {name: "a-node Torrent ", type: vless}
+  - {name: C ss, type: ss}
+  - {name: "🇨🇳 Китай *", type: vless}
+proxy-groups:
+  - name: Auto
+    type: url-test
+    exclude-filter: (?i)torrent
+    proxies: [b-node, "a-node Torrent "]
+  - name: Main
+    type: select
+    exclude-type: Shadowsocks
+    proxies: [Auto, DIRECT, b-node, b-node, "🇨🇳 Китай *"]
+  - name: Torrent
+    type: select
+    include-all-proxies: true
+    filter: (?i)(torrent|торрент)
+    proxies: [DIRECT]
+  - name: All
+    type: select
+    include-all: true
+    exclude-type: shadowsocks|Hysteria2
+  - name: Internal
+    type: select
+    hidden: true
+    proxies: [b-node]
+  - name: Excluded
+    type: select
+    exclude-filter: "Torrent`^b-"
+    proxies: [b-node, "a-node Torrent "]
+  - name: Unsupported pattern
+    type: select
+    exclude-filter: (?<=x)b
+    proxies: [b-node]
+"#;
+
+#[test]
+fn group_members_follow_mihomo_include_and_exclude_rules() {
+    let parsed = parse_mihomo(MIHOMO_GROUP_RULES.as_bytes()).unwrap();
+    let members = |name: &str| {
+        let group = parsed
+            .groups()
+            .iter()
+            .find(|group| group.name == name)
+            .unwrap();
+        group
+            .members
+            .iter()
+            .map(|member| (member.name.as_str(), member.offered))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        members("Auto"),
+        [("b-node", true), ("a-node Torrent ", false)]
+    );
+    assert_eq!(
+        members("Main"),
+        [
+            ("Auto", true),
+            ("DIRECT", true),
+            ("b-node", true),
+            ("🇨🇳 Китай *", true)
+        ]
+    );
+    assert_eq!(
+        members("Torrent"),
+        [("DIRECT", true), ("a-node Torrent ", true)]
+    );
+    // Byte order, like Go's slices.Sort; `ss` is Mihomo's "Shadowsocks".
+    assert_eq!(
+        members("All"),
+        [
+            ("C ss", false),
+            ("a-node Torrent ", true),
+            ("b-node", true),
+            ("🇨🇳 Китай *", true)
+        ]
+    );
+    assert_eq!(
+        members("Excluded"),
+        [("b-node", false), ("a-node Torrent ", false)]
+    );
+    // A pattern Mihomo's regexp2 accepts but Rust's regex does not excludes nothing.
+    assert_eq!(members("Unsupported pattern"), [("b-node", true)]);
+    let hidden: Vec<_> = parsed
+        .groups()
+        .iter()
+        .filter(|group| group.hidden)
+        .map(|group| group.name.as_str())
+        .collect();
+    assert_eq!(hidden, ["Internal"]);
+}
+
 #[test]
 fn mihomo_is_utf8_yaml_mapping_and_extracts_ui_catalog() {
     let parsed = parse_mihomo(MIHOMO.as_bytes()).unwrap();
