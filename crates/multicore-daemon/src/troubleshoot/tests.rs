@@ -176,7 +176,7 @@ fn our_loopback_proxy_is_recognised_and_every_proxy_outcome_is_explained() {
         &ProxyOutcome::ForeignDisabled {
             server: "127.0.0.1:8080".into(),
         },
-        Some("wpad.corp"),
+        Some(PacHost::Named("wpad.corp")),
     );
     assert_eq!(tones(&foreign), [Tone::Info, Tone::Warning]);
     assert!(foreign[0].detail.contains("127.0.0.1:8080"));
@@ -491,4 +491,222 @@ fn wintun_and_service_reinstall_outcomes_have_their_own_cards() {
         PrivilegedFix::WinsockReset,
         FixOutcome::Failed
     ));
+}
+
+/// Every card and offer the checks and fixes can produce, with representative arguments.
+fn every_report() -> (Vec<Finding>, Vec<FixOffer>) {
+    let mut findings = Vec::new();
+    let mut fixes = Vec::new();
+    findings.extend(antivirus_findings(&[
+        Antivirus {
+            name: "Kaspersky",
+            severe: true,
+        },
+        Antivirus {
+            name: "ESET",
+            severe: false,
+        },
+    ]));
+    for running in [true, false] {
+        let report = dpi_report(
+            &[
+                DpiServiceState {
+                    service: DpiService::WinDivert,
+                    running,
+                },
+                DpiServiceState {
+                    service: DpiService::Zapret,
+                    running,
+                },
+            ],
+            &["C:\\zapret".into()],
+        );
+        findings.extend(report.findings);
+        fixes.extend(report.fixes);
+    }
+    let wanted = [
+        ListenPort {
+            port: 7890,
+            udp: false,
+            mihomo: true,
+        },
+        ListenPort {
+            port: 7891,
+            udp: true,
+            mihomo: true,
+        },
+    ];
+    findings.extend(port_findings(
+        &wanted,
+        &[
+            PortOwner {
+                port: 7890,
+                udp: false,
+                process_name: Some("clash.exe".into()),
+                image: None,
+            },
+            PortOwner {
+                port: 7891,
+                udp: true,
+                process_name: None,
+                image: None,
+            },
+        ],
+        None,
+    ));
+    for outcome in [
+        ProxyOutcome::StaleOursCleared,
+        ProxyOutcome::ForeignDisabled {
+            server: "127.0.0.1:8080".into(),
+        },
+        ProxyOutcome::DisableFailed {
+            server: "127.0.0.1:8080".into(),
+        },
+    ] {
+        findings.extend(proxy_findings(&outcome, Some(PacHost::Named("wpad.corp"))));
+    }
+    findings.extend(proxy_findings(
+        &ProxyOutcome::Direct,
+        Some(PacHost::Unrecognized),
+    ));
+    findings.extend(proxy_environment_findings(&["https_proxy".into()]));
+    findings.extend(vpn_findings(&["Work".into()]));
+    for discord_running in [true, false] {
+        let report = drover_report(Some(&DroverState {
+            files: 2,
+            discord_running,
+        }));
+        findings.extend(report.findings);
+        fixes.extend(report.fixes);
+    }
+    findings.extend(hosts_findings("C:\\hosts", &["1.2.3.4 a.example".into()]));
+    findings.extend(policy_findings(&NETWORK_POLICY_VALUES));
+    for state in [
+        ClockState::Skewed(600),
+        ClockState::Skewed(-600),
+        ClockState::Skewed(4 * 3600),
+        ClockState::Skewed(-4 * 3600),
+        ClockState::Unknown,
+    ] {
+        let report = clock_report(state, true);
+        findings.extend(report.findings);
+        fixes.extend(report.fixes);
+    }
+    for dns in [Some(true), Some(false)] {
+        let report = network_report(dns, Some("proxy.corp:3128"));
+        findings.extend(report.findings);
+        fixes.extend(report.fixes);
+    }
+    for error in [
+        BatchError::Cancelled,
+        BatchError::ServiceTooOld,
+        BatchError::Busy,
+        BatchError::TunnelUp,
+        BatchError::Failed,
+    ] {
+        findings.push(batch_error_finding(error));
+    }
+    for fix in [
+        PrivilegedFix::WinsockReset,
+        PrivilegedFix::WinhttpResetProxy,
+        PrivilegedFix::ResyncTime,
+        PrivilegedFix::RemoveDpiService {
+            service: DpiService::GoodbyeDpi,
+        },
+        PrivilegedFix::ReinstallWintun,
+        PrivilegedFix::ReinstallService,
+    ] {
+        for outcome in [
+            FixOutcome::Done,
+            FixOutcome::NothingToDo,
+            FixOutcome::Failed,
+        ] {
+            findings.push(privileged_finding(fix, outcome));
+        }
+    }
+    for removal in [
+        DroverRemoval::Removed,
+        DroverRemoval::NothingFound,
+        DroverRemoval::DiscordRunning,
+        DroverRemoval::Failed,
+    ] {
+        findings.push(drover_removal_finding(removal));
+    }
+    (findings, fixes)
+}
+
+#[test]
+fn every_card_carries_codes_and_reads_in_english() {
+    let (findings, fixes) = every_report();
+    let texts = findings
+        .iter()
+        .map(|finding| {
+            (
+                finding.title_key.is_some() && finding.detail_key.is_some(),
+                finding.localized_title(),
+                finding.localized_detail(),
+                finding.title.clone(),
+            )
+        })
+        .chain(fixes.iter().map(|offer| {
+            (
+                offer.title_key.is_some() && offer.detail_key.is_some(),
+                offer.localized_title(),
+                offer.localized_detail(),
+                offer.title.clone(),
+            )
+        }))
+        .collect::<Vec<_>>();
+    for (keyed, title, detail, russian) in &texts {
+        assert!(keyed, "card without codes: {russian}");
+        // Russian is the default language: the localized text is the text sent before.
+        assert_eq!(title, russian);
+        assert!(!detail.is_empty());
+    }
+    let _english = multicore_i18n::ThreadLanguage::set(multicore_i18n::Lang::En);
+    let cyrillic = |text: &str| text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+    for finding in &findings {
+        for text in [finding.localized_title(), finding.localized_detail()] {
+            assert!(!cyrillic(&text), "untranslated card text: {text}");
+        }
+    }
+    for offer in &fixes {
+        for text in [offer.localized_title(), offer.localized_detail()] {
+            assert!(!cyrillic(&text), "untranslated offer text: {text}");
+        }
+    }
+}
+
+#[test]
+fn the_unparsed_script_address_keeps_its_russian_text() {
+    let findings = proxy_findings(&ProxyOutcome::Direct, Some(PacHost::Unrecognized));
+    assert!(
+        findings[0]
+            .detail
+            .starts_with("Адрес сценария: (адрес не распознан). ")
+    );
+    let clock = clock_report(ClockState::Skewed(-4 * 3600), false);
+    assert_eq!(clock.findings[0].title, "Часы отстают на 4 ч");
+    let clock = clock_report(ClockState::Skewed(150), false);
+    assert_eq!(clock.findings[0].title, "Часы спешат на 3 мин");
+    let ports = port_findings(
+        &[ListenPort {
+            port: 53,
+            udp: true,
+            mihomo: true,
+        }],
+        &[PortOwner {
+            port: 53,
+            udp: true,
+            process_name: None,
+            image: None,
+        }],
+        None,
+    );
+    assert_eq!(ports[0].title, "Порт 53 (UDP) занят");
+    assert!(
+        ports[0]
+            .detail
+            .starts_with("Его занимает другая программа, а он нужен подписке.")
+    );
 }

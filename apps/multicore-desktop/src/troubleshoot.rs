@@ -223,6 +223,8 @@ mod tests {
             detail: String::new(),
             needs_admin: true,
             needs_reboot: false,
+            title_key: None,
+            detail_key: None,
         }
     }
 

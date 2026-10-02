@@ -608,6 +608,8 @@ fn winsock_offer() -> multicore_core::troubleshoot::FixOffer {
         detail: "Восстанавливает сетевой стек Windows, если его испортила другая программа. Нужна перезагрузка ПК; некоторые VPN и антивирусы после сброса придётся переустановить.".into(),
         needs_admin: true,
         needs_reboot: true,
+        title_key: None,
+        detail_key: None,
     }
 }
 
@@ -631,6 +633,8 @@ fn troubleshoot_mixed_run() -> crate::troubleshoot::TroubleshootRun {
             detail: "Служба будет остановлена и удалена из Windows. Файлы программы останутся — при необходимости её можно установить снова.".into(),
             needs_admin: true,
             needs_reboot: false,
+            title_key: None,
+            detail_key: None,
         }],
     });
     run.add_step(StepReport {
@@ -649,6 +653,8 @@ fn troubleshoot_mixed_run() -> crate::troubleshoot::TroubleshootRun {
             detail: "Будут удалены version.dll и drover.ini (файлов: 2). Сам Discord продолжит работать.".into(),
             needs_admin: false,
             needs_reboot: false,
+            title_key: None,
+            detail_key: None,
         }],
     });
     run.add_step(StepReport {
@@ -1170,7 +1176,7 @@ fn scenarios() -> Vec<Scenario> {
             connected(ui);
             ui.set_local_page(s("subscriptions"));
             ui.set_subscription_profiles(profiles(3));
-            ui.set_import_notice(s(crate::view_model::IMPORT_KEPT_NOTICE_RU));
+            ui.set_import_notice(s(crate::view_model::import_kept_notice()));
         }),
         ("subscriptions-editor-error", 840, 720, |ui| {
             ready(ui);

@@ -25,6 +25,7 @@ fn status() -> StatusDto {
         profile: None,
         current_node: None,
         message: None,
+        message_key: None,
         degraded: false,
         subscription: None,
         cores_ready: false,

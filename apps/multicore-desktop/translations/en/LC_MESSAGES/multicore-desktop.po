@@ -31,6 +31,465 @@ msgstr "Selected filter"
 
 msgid ", выбрано"
 msgstr ", selected"
+# Daemon messages (multicore_i18n::daemon_messages).
+msgid "Запускается подключение."
+msgstr "Connecting."
+
+msgid "Запускается подключение. Подтвердите права администратора в системном окне."
+msgstr "Connecting. Confirm administrator rights in the system prompt."
+
+msgid "Включается туннель…"
+msgstr "Starting tunnel…"
+
+msgid "Подключение установлено."
+msgstr "Connected."
+
+msgid "Запуск подключения завершился ошибкой."
+msgstr "Connection failed to start."
+
+msgid "Запуск подключения был прерван."
+msgstr "Connection start was interrupted."
+
+msgid "Подключение прервано. Выполните отключение для очистки."
+msgstr "Connection interrupted. Disconnect to clean up."
+
+msgid "Не удалось полностью отменить запуск. Выполните отключение для очистки."
+msgstr "Couldn't fully cancel the start. Disconnect to clean up."
+
+msgid "Состояние процессов неизвестно. Выполните отключение для очистки."
+msgstr "Process state unknown. Disconnect to clean up."
+
+msgid "Не удалось подготовить сетевой интерфейс и адреса узлов."
+msgstr "Couldn't prepare the network interface and server addresses."
+
+msgid "Подготовка конфигурации перед подключением завершилась ошибкой."
+msgstr "Preparing the configuration before connecting failed."
+
+msgid "Прогретая конфигурация не подошла, запуск подготовлен заново."
+msgstr "The warm configuration didn't fit; the start was prepared again."
+
+msgid "Не удалось активировать конфигурацию запуска."
+msgstr "Couldn't activate the startup configuration."
+
+msgid "Активация конфигурации перед подключением завершилась ошибкой."
+msgstr "Activating the configuration before connecting failed."
+
+msgid "Подготовка к подключению отложена до подключения."
+msgstr "Preparation is postponed until you connect."
+
+msgid "Подключение остановлено."
+msgstr "Disconnected."
+
+msgid "Не удалось полностью остановить подключение. Повторите попытку."
+msgstr "Couldn't fully stop the connection. Try again."
+
+msgid "Остановка подключения завершилась ошибкой."
+msgstr "Disconnecting failed."
+
+msgid "Ядра не удалось запустить заранее. Они запустятся при подключении."
+msgstr "The cores couldn't start in advance. They'll start when you connect."
+
+msgid "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова."
+msgstr "The MULTICORE service lost its cores — disconnected. Connect again."
+
+msgid "Служба MULTICORE недоступна — права администратора будут запрошены при подключении."
+msgstr "MULTICORE service unavailable — admin rights will be requested on connect."
+
+msgid "Подписка переключена."
+msgstr "Subscription switched."
+
+msgid "Не удалось сохранить изменение подписки."
+msgstr "Couldn't save the subscription change."
+
+msgid "Маршрут Mihomo изменён."
+msgstr "Mihomo route changed."
+
+msgid "Mihomo не применил выбор маршрута."
+msgstr "Mihomo didn't apply the route choice."
+
+msgid "Устранение неполадок: {0}; ошибок: {1}."
+msgstr "Troubleshooting: {0}; errors: {1}."
+
+msgid "Подключение отменено: не выдано разрешение администратора."
+msgstr "Connection cancelled: administrator permission not granted."
+
+msgid "Не удалось запустить службу подключения с правами администратора."
+msgstr "Couldn't start the connection service as administrator."
+
+msgid "Служба подключения не ответила. Повторите попытку."
+msgstr "The connection service didn't respond. Try again."
+
+msgid "Не удалось запустить {0}. Подробности — в логе на странице «Состояние»."
+msgstr "Couldn't start {0}. See the log on the Status page."
+
+msgid "Не удалось запустить {0}: файл ядра не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+msgstr "Couldn't start {0}: the core file is missing or blocked. Check antivirus quarantine and reinstall MULTICORE."
+
+msgid "{0} завершился сразу после запуска. Причина — в логе на странице «Состояние»."
+msgstr "{0} exited right after starting. See the log on the Status page."
+
+msgid "{0} не успел запуститься вовремя. Повторите попытку."
+msgstr "{0} didn't start in time. Try again."
+
+msgid "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+msgstr "Couldn't turn on the TUN adapter. Try again; if that fails, restart the PC or connect without TUN."
+
+msgid "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+msgstr "The TUN adapter didn't turn on in time. Try again; if that fails, restart the PC or connect without TUN."
+
+msgid "Не удалось включить системный прокси. Повторите попытку."
+msgstr "Couldn't turn on the system proxy. Try again."
+
+msgid "MULTICORE уже запущен у другого пользователя."
+msgstr "MULTICORE is already running for another user."
+
+msgid "Не удалось запустить подключение. Повторите попытку."
+msgstr "Couldn't start the connection. Try again."
+
+msgid "Обнаружен {0}"
+msgstr "{0} detected"
+
+msgid "{0} часто блокирует VPN. Если подключение не работает — выключите его или добавьте MULTICORE в исключения."
+msgstr "{0} often blocks VPNs. If the connection fails, turn it off or add MULTICORE to its exclusions."
+
+msgid "Антивирус может мешать VPN. Если подключение не работает — добавьте MULTICORE в исключения или временно отключите защиту."
+msgstr "Antivirus software may interfere with VPNs. If the connection fails, add MULTICORE to exclusions or pause protection."
+
+msgid "Работает {0}"
+msgstr "{0} running"
+
+msgid "Установлена служба {0}"
+msgstr "{0} service installed"
+
+msgid "Драйвер перехвата пакетов (его используют zapret и GoodbyeDPI) перехватывает трафик и мешает VPN."
+msgstr "A packet capture driver (used by zapret and GoodbyeDPI) intercepts traffic and breaks the VPN."
+
+msgid "Программа обхода блокировок перехватывает трафик и мешает VPN."
+msgstr "A censorship bypass tool intercepts traffic and breaks the VPN."
+
+msgid "Драйвер перехвата пакетов (его используют zapret и GoodbyeDPI): служба остановлена, но может запуститься снова."
+msgstr "A packet capture driver (used by zapret and GoodbyeDPI): stopped, but it may start again."
+
+msgid "Программа обхода блокировок: служба остановлена, но может запуститься снова."
+msgstr "A censorship bypass tool: its service is stopped, but may start again."
+
+msgid "Остановить и удалить службу {0}"
+msgstr "Stop and remove the {0} service"
+
+msgid "Служба будет остановлена и удалена из Windows. Файлы программы останутся — при необходимости её можно установить снова."
+msgstr "The service will be stopped and removed from Windows. Its files stay, so you can reinstall it if needed."
+
+msgid "Найдены программы обхода блокировок"
+msgstr "Censorship bypass tools found"
+
+msgid "{0}. Если они запущены — закройте их. MULTICORE эти папки не трогает."
+msgstr "{0}. If they're running, close them. MULTICORE leaves these folders alone."
+
+msgid "Порт {0} занят"
+msgstr "Port {0} busy"
+
+msgid "Порт {0} (UDP) занят"
+msgstr "Port {0} (UDP) busy"
+
+msgid "Его занимает «{0}», а он нужен подписке. Закройте эту программу и повторите подключение."
+msgstr "“{0}” holds it, but the subscription needs it. Close that program and connect again."
+
+msgid "Его занимает другая программа, а он нужен подписке. Закройте эту программу и повторите подключение."
+msgstr "Another program holds it, but the subscription needs it. Close it and connect again."
+
+msgid "Убран прокси от прошлого подключения"
+msgstr "Leftover proxy removed"
+
+msgid "MULTICORE не успел выключить системный прокси. Прежние настройки восстановлены."
+msgstr "MULTICORE didn't turn off the system proxy. Previous settings restored."
+
+msgid "Системный прокси отключён"
+msgstr "System proxy turned off"
+
+msgid "Был включён прокси {0} — он мешает подключению. Включить снова: Параметры → Сеть и Интернет → Прокси."
+msgstr "Proxy {0} was on and blocked the connection. To turn it back on: Settings → Network & internet → Proxy."
+
+msgid "Не удалось отключить системный прокси"
+msgstr "Couldn't turn off the system proxy"
+
+msgid "Включён прокси {0}. Отключите его вручную: Параметры → Сеть и Интернет → Прокси."
+msgstr "Proxy {0} is on. Turn it off manually: Settings → Network & internet → Proxy."
+
+msgid "Включён сценарий настройки прокси"
+msgstr "Proxy setup script is on"
+
+msgid "Адрес сценария: {0}. Если подключение не работает, выключите «Использовать сценарий настройки» в Параметры → Сеть и Интернет → Прокси."
+msgstr "Script address: {0}. If the connection fails, turn off “Use setup script” in Settings → Network & internet → Proxy."
+
+msgid "Адрес сценария: (адрес не распознан). Если подключение не работает, выключите «Использовать сценарий настройки» в Параметры → Сеть и Интернет → Прокси."
+msgstr "Script address: (unrecognized). If the connection fails, turn off “Use setup script” in Settings → Network & internet → Proxy."
+
+msgid "Прокси задан в переменных окружения"
+msgstr "Proxy set in environment variables"
+
+msgid "{0}. Программы могут отправлять трафик мимо VPN — уберите эти переменные, если подключение не работает."
+msgstr "{0}. Programs may send traffic around the VPN — remove these variables if the connection fails."
+
+msgid "Активно VPN-подключение «{0}»"
+msgstr "VPN connection “{0}” is active"
+
+msgid "Два VPN одновременно конфликтуют. Отключите его: Параметры → Сеть и Интернет → VPN."
+msgstr "Two VPNs at once conflict. Disconnect it: Settings → Network & internet → VPN."
+
+msgid "Найден Drover для Discord"
+msgstr "Drover for Discord found"
+
+msgid "Подменная version.dll в папке Discord пускает его трафик мимо VPN. Закройте Discord и повторите проверку — тогда её можно будет удалить."
+msgstr "A fake version.dll in the Discord folder sends its traffic around the VPN. Close Discord and check again to remove it."
+
+msgid "Подменная version.dll в папке Discord пускает его трафик мимо VPN и может мешать подключению."
+msgstr "A fake version.dll in the Discord folder sends its traffic around the VPN."
+
+msgid "Удалить Drover из папки Discord"
+msgstr "Remove Drover from Discord"
+
+msgid "Будут удалены version.dll и drover.ini (файлов: {0}). Сам Discord продолжит работать."
+msgstr "version.dll and drover.ini will be deleted (files: {0}). Discord itself keeps working."
+
+msgid "Drover удалён"
+msgstr "Drover removed"
+
+msgid "Файлы удалены из папок Discord."
+msgstr "Deleted from Discord folders."
+
+msgid "Drover не найден"
+msgstr "Drover not found"
+
+msgid "Удалять нечего."
+msgstr "Nothing to do."
+
+msgid "Закройте Discord и повторите"
+msgstr "Close Discord and retry"
+
+msgid "Пока Discord запущен, его файлы удалить нельзя."
+msgstr "Discord's files can't be deleted while it runs."
+
+msgid "Не удалось удалить Drover"
+msgstr "Couldn't remove Drover"
+
+msgid "Закройте Discord и повторите."
+msgstr "Close Discord and retry."
+
+msgid "В файле hosts есть записи: {0}"
+msgstr "Entries in the hosts file: {0}"
+
+msgid "{0}: {1}. Они могут перенаправлять сайты. MULTICORE этот файл не меняет — проверьте его вручную."
+msgstr "{0}: {1}. They may redirect websites. MULTICORE doesn't change this file — check it manually."
+
+msgid "Ограничения сети"
+msgstr "Network locked"
+
+msgid "Групповые политики запрещают менять сетевые настройки ({0}). Возможно, это корпоративный или школьный ПК — обратитесь к его администратору."
+msgstr "Group policies forbid changing network settings ({0}). This may be a work or school PC — contact its administrator."
+
+msgid "Часы спешат на {0} мин"
+msgstr "Clock is {0} min ahead"
+
+msgid "Часы спешат на {0} ч"
+msgstr "Clock is {0} h ahead"
+
+msgid "Часы отстают на {0} мин"
+msgstr "Clock is {0} min behind"
+
+msgid "Часы отстают на {0} ч"
+msgstr "Clock is {0} h behind"
+
+msgid "Неверное время ломает защищённые подключения. Включите «Установить время автоматически» или синхронизируйте часы."
+msgstr "Wrong time breaks secure connections. Turn on “Set time automatically” or sync the clock."
+
+msgid "Не удалось сверить время"
+msgstr "Couldn't check the time"
+
+msgid "Сервер проверки времени не ответил — возможно, нет доступа в интернет."
+msgstr "The time server didn't respond — maybe there's no internet access."
+
+msgid "Синхронизировать время"
+msgstr "Sync time"
+
+msgid "Запустит службу времени Windows и сверит часы с сервером времени."
+msgstr "Starts the Windows Time service and syncs the clock with a time server."
+
+msgid "DNS-кэш очищен"
+msgstr "DNS flushed"
+
+msgid "Устаревшие записи DNS больше не помешают подключению."
+msgstr "Stale DNS records won't get in the way anymore."
+
+msgid "Не удалось очистить DNS-кэш"
+msgstr "Couldn't clear the DNS cache"
+
+msgid "Это не критично: кэш обновится сам или после перезагрузки."
+msgstr "Not critical: the cache refreshes itself or after a restart."
+
+msgid "Задан прокси WinHTTP"
+msgstr "WinHTTP proxy is set"
+
+msgid "Системные службы Windows ходят через {0}. Это может мешать VPN."
+msgstr "Windows services go through {0}. This may break the VPN."
+
+msgid "Сбросить прокси WinHTTP"
+msgstr "Reset WinHTTP proxy"
+
+msgid "То же, что «netsh winhttp reset proxy»: службы Windows снова будут подключаться напрямую."
+msgstr "Same as “netsh winhttp reset proxy”: Windows services connect directly again."
+
+msgid "Сбросить сетевые настройки (Winsock)"
+msgstr "Reset network settings (Winsock)"
+
+msgid "Восстанавливает сетевой стек Windows, если его испортила другая программа. Нужна перезагрузка ПК; некоторые VPN и антивирусы после сброса придётся переустановить."
+msgstr "Repairs the Windows network stack if another program broke it. Needs a PC restart; some VPNs and antivirus software will need reinstalling."
+
+msgid "Исправления отменены"
+msgstr "Fixes cancelled"
+
+msgid "Без разрешения администратора их не выполнить."
+msgstr "They can't run without administrator permission."
+
+msgid "Служба MULTICORE устарела"
+msgstr "Service is outdated"
+
+msgid "Обновите MULTICORE — тогда служба сможет выполнять эти исправления."
+msgstr "Update MULTICORE so the service can run these fixes."
+
+msgid "MULTICORE запущен у другого пользователя"
+msgstr "MULTICORE is running for another user"
+
+msgid "Исправления можно выполнить, когда он отключится."
+msgstr "Fixes can run once they disconnect."
+
+msgid "Сначала отключитесь"
+msgstr "Disconnect first"
+
+msgid "Пока работает подключение, адаптер Wintun удалять нельзя."
+msgstr "The Wintun adapter can't be removed while connected."
+
+msgid "Не удалось выполнить исправления"
+msgstr "Couldn't apply the fixes"
+
+msgid "Запуск с правами администратора не удался. Повторите попытку."
+msgstr "Running as administrator failed. Try again."
+
+msgid "Служба {0} удалена"
+msgstr "{0} service removed"
+
+msgid "Если она не успела остановиться, то исчезнет после перезагрузки."
+msgstr "If it didn't stop in time, it will be gone after a restart."
+
+msgid "Службы {0} уже нет"
+msgstr "No {0} service"
+
+msgid "Не удалось удалить службу {0}"
+msgstr "Couldn't remove the {0} service"
+
+msgid "Удалите программу через «Установка и удаление программ»."
+msgstr "Uninstall the program in “Add or remove programs”."
+
+msgid "Прокси WinHTTP сброшен"
+msgstr "WinHTTP proxy reset"
+
+msgid "Службы Windows подключаются напрямую."
+msgstr "Windows services connect directly."
+
+msgid "Не удалось сбросить прокси WinHTTP"
+msgstr "Couldn't reset the WinHTTP proxy"
+
+msgid "Выполните «netsh winhttp reset proxy» от имени администратора."
+msgstr "Run “netsh winhttp reset proxy” as administrator."
+
+msgid "Время синхронизировано"
+msgstr "Time synced"
+
+msgid "Часы сверены с сервером времени."
+msgstr "The clock matches the time server."
+
+msgid "Не удалось синхронизировать время"
+msgstr "Couldn't sync the time"
+
+msgid "Включите «Установить время автоматически» в Параметры → Время и язык."
+msgstr "Turn on “Set time automatically” in Settings → Time & language."
+
+msgid "Настройки Winsock сброшены"
+msgstr "Winsock settings reset"
+
+msgid "Перезагрузите ПК, чтобы изменения вступили в силу."
+msgstr "Restart the PC for the changes to take effect."
+
+msgid "Не удалось сбросить Winsock"
+msgstr "Couldn't reset Winsock"
+
+msgid "Выполните «netsh winsock reset» от имени администратора."
+msgstr "Run “netsh winsock reset” as administrator."
+
+msgid "Адаптер Wintun удалён"
+msgstr "Wintun adapter removed"
+
+msgid "MULTICORE создаст его заново при следующем подключении."
+msgstr "MULTICORE recreates it on the next connection."
+
+msgid "Адаптера Wintun нет"
+msgstr "No Wintun adapter"
+
+msgid "Он будет создан заново при следующем подключении."
+msgstr "It will be recreated on the next connection."
+
+msgid "Не удалось удалить адаптер Wintun"
+msgstr "Couldn't remove the Wintun adapter"
+
+msgid "Перезагрузите ПК и повторите."
+msgstr "Restart the PC and try again."
+
+msgid "Служба MULTICORE переустановлена"
+msgstr "MULTICORE service reinstalled"
+
+msgid "Служба зарегистрирована заново и запущена."
+msgstr "The service is registered again and running."
+
+msgid "Не удалось переустановить службу"
+msgstr "Couldn't reinstall the service"
+
+msgid "Перезагрузите ПК и повторите или переустановите MULTICORE установщиком."
+msgstr "Restart the PC and retry, or reinstall MULTICORE with the installer."
+
+msgid "Доступно только в Windows"
+msgstr "Windows only"
+
+msgid "В Linux исправления выполняются вручную."
+msgstr "On Linux, fixes are done manually."
+
+# Troubleshooting steps (multicore_core::troubleshoot::CheckStep::label).
+msgid "Антивирусы…"
+msgstr "Antivirus…"
+
+msgid "Программы обхода блокировок…"
+msgstr "Bypass tools…"
+
+msgid "Порты…"
+msgstr "Ports…"
+
+msgid "Системный прокси…"
+msgstr "System proxy…"
+
+msgid "VPN-подключения…"
+msgstr "VPN connections…"
+
+msgid "Файл hosts…"
+msgstr "hosts file…"
+
+msgid "Групповые политики…"
+msgstr "Group policies…"
+
+msgid "Системное время…"
+msgstr "System time…"
+
+msgid "Сеть и DNS…"
+msgstr "Network & DNS…"
+msgid "Подписка добавлена. Переключиться на неё можно после отключения VPN."
+msgstr "Subscription added. You can switch to it after disconnecting the VPN."
 
 msgid "Профиль не добавлен"
 msgstr "No profile yet"
@@ -49,6 +508,173 @@ msgstr "Connect"
 
 msgid "Защита выключена"
 msgstr "Protection off"
+msgid "Нет профиля"
+msgstr "No profile"
+
+msgid "Маршрут не выбран"
+msgstr "No route selected"
+
+msgid "Подключиться"
+msgstr "Connect"
+
+msgid "Импорт"
+msgstr "Import"
+
+msgid "Добавляем профиль…"
+msgstr "Adding profile…"
+
+msgid "Проверяем подписку и доступные маршруты."
+msgstr "Checking the subscription and its routes."
+
+msgid "Новый профиль"
+msgstr "New profile"
+
+msgid "Добавляем…"
+msgstr "Adding…"
+
+msgid "Готово"
+msgstr "Ready"
+
+msgid "Можно подключаться"
+msgstr "Ready to connect"
+
+msgid "Подключение"
+msgstr "Connecting"
+
+msgid "Устанавливаем соединение…"
+msgstr "Establishing connection…"
+
+msgid "Подключаем…"
+msgstr "Connecting…"
+
+msgid "Подключено"
+msgstr "Connected"
+
+msgid "Соединение защищено"
+msgstr "Connection secured"
+
+msgid "Текущий маршрут"
+msgstr "Current route"
+
+msgid "Отключиться"
+msgstr "Disconnect"
+
+msgid "Отключение"
+msgstr "Stopping"
+
+msgid "Завершаем соединение…"
+msgstr "Closing connection…"
+
+msgid "Отключаем локальный маршрут."
+msgstr "Stopping the local route."
+
+msgid "Отключаем…"
+msgstr "Stopping…"
+
+msgid "Не удалось подключиться"
+msgstr "Couldn't connect"
+
+msgid "Что-то пошло не так"
+msgstr "Something went wrong"
+
+msgid "Авто"
+msgstr "Auto"
+
+msgid "Проверить снова"
+msgstr "Check again"
+
+msgid "Нет связи с сервисом"
+msgstr "Service unreachable"
+
+msgid "Сервис не отвечает"
+msgstr "Service is down"
+
+msgid "Состояние неизвестно"
+msgstr "Status unknown"
+
+msgid "Сервис недоступен"
+msgstr "Service offline"
+
+msgid "Ограниченный режим"
+msgstr "Limited mode"
+
+msgid "Остановить туннель"
+msgstr "Stop tunnel"
+
+msgid "Обнаружены другие VPN-приложения ({}): они могут конфликтовать с MULTICORE. Закройте их перед подключением."
+msgstr "Other VPN apps found ({}): they may conflict with MULTICORE. Close them before connecting."
+
+msgid "Обнаружено другое VPN-приложение ({}): оно может конфликтовать с MULTICORE. Закройте его перед подключением."
+msgstr "Another VPN app found ({}): it may conflict with MULTICORE. Close it before connecting."
+
+msgid "Закрыть удалось не всё: {} запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows»."
+msgstr "Not everything closed: {} runs its engine as a Windows service, which this button can't stop without admin rights. Disconnect in that app before closing it, or stop its service in Windows Services."
+
+msgid "Фоновый сервис отвечает не полностью."
+msgstr "Background service is degraded."
+
+msgid "Основной"
+msgstr "Main"
+
+msgid "Проверяем доступность маршрута…"
+msgstr "Checking the route…"
+
+msgid "Повторите попытку через несколько секунд."
+msgstr "Try again in a few seconds."
+
+msgid "Фоновый сервис вернул неизвестное состояние."
+msgstr "Background service reported an unknown state."
+
+msgid "Проверяем фоновый сервис…"
+msgstr "Checking the service…"
+
+msgid "Проверка"
+msgstr "Checking"
+
+msgid "Проверяем состояние…"
+msgstr "Checking status…"
+
+msgid "Проверяем…"
+msgstr "Checking…"
+
+msgid "Не удалось загрузить подписки. Повторите попытку."
+msgstr "Couldn't load subscriptions. Try again."
+
+msgid "Не удалось активировать подписку. Повторите попытку."
+msgstr "Couldn't activate the subscription. Try again."
+
+msgid "Не удалось обновить подписку. Повторите попытку."
+msgstr "Couldn't update the subscription. Try again."
+
+msgid "Введите корректный HTTP(S) URL."
+msgstr "Enter a valid HTTP(S) URL."
+
+msgid "Не удалось изменить ссылку подписку. Повторите попытку."
+msgstr "Couldn't change the subscription link. Try again."
+
+msgid "Не удалось удалить подписку. Повторите попытку."
+msgstr "Couldn't delete the subscription. Try again."
+
+msgid "Отключитесь перед изменением подписки."
+msgstr "Disconnect to change the subscription."
+
+msgid "Дождитесь восстановления фонового сервиса."
+msgstr "Wait for the background service to recover."
+
+msgid "Дождитесь завершения текущей операции."
+msgstr "Wait for the current operation to finish."
+
+msgid "Подписка больше недоступна. Обновите список."
+msgstr "Subscription is gone. Refresh the list."
+
+msgid "Эту подписку сейчас нельзя обновить."
+msgstr "This subscription can't be updated now."
+
+msgid "Проверяем состояние подписок…"
+msgstr "Checking subscriptions…"
+
+msgid "Не удалось подтвердить изменение. Обновляем состояние подписок."
+msgstr "Couldn't confirm the change. Refreshing subscriptions."
 
 msgid "Подписка"
 msgstr "Subscription"
@@ -684,3 +1310,148 @@ msgid "Найдено {n} · поиск по всем группам"
 msgid_plural "Найдено {n} · поиск по всем группам"
 msgstr[0] "{n} result · all groups"
 msgstr[1] "{n} results · all groups"
+msgid "Не удалось обновить. Рабочий профиль сохранён."
+msgstr "Update failed. The working profile is kept."
+
+msgid "Запускаем локальный маршрут…"
+msgstr "Starting the local route…"
+
+msgid "Дождитесь завершения операции подключения."
+msgstr "Wait until connecting finishes."
+
+msgid "Не удалось добавить подписку. Проверьте URL и повторите попытку."
+msgstr "Couldn't add the subscription. Check the URL and try again."
+
+msgid "Не удалось подтвердить завершение соединения. Проверяем состояние…"
+msgstr "Couldn't confirm the disconnect. Checking status…"
+
+msgid "Не удалось отключиться. Соединение остаётся активным."
+msgstr "Couldn't disconnect. The connection is still active."
+
+msgid "Не удалось отключиться. Повторите попытку."
+msgstr "Couldn't disconnect. Try again."
+
+msgid "Не удалось подтвердить состояние соединения. Повторите проверку."
+msgstr "Couldn't confirm the connection status. Check again."
+
+msgid "Не удалось обновить диагностику. Повторно откройте экран."
+msgstr "Couldn't refresh diagnostics. Reopen this page."
+
+msgid "Не удалось загрузить события. Повторите попытку."
+msgstr "Couldn't load events. Try again."
+
+msgid "Каталог маршрутов изменился. Обновляем задержку…"
+msgstr "Routes changed. Updating latency…"
+
+msgid "Не удалось проверить задержку. Повторите попытку."
+msgstr "Couldn't check latency. Try again."
+
+msgid "Не удалось загрузить маршруты. Повторите попытку."
+msgstr "Couldn't load routes. Try again."
+
+msgid "Подключено, но часть маршрутов не применилась. Проверьте выбор ещё раз."
+msgstr "Connected, but some routes weren't applied. Check your selection."
+
+msgid "Каталог маршрутов изменился. Обновляем его; повторите выбор."
+msgstr "Routes changed. Refreshing them; pick again."
+
+msgid "Каталог маршрутов обновлён. Повторите выбор."
+msgstr "Routes updated. Pick again."
+
+msgid "Не удалось подтвердить изменение маршрута. Каталог обновляется; повторите попытку."
+msgstr "Couldn't confirm the route change. Refreshing routes; try again."
+
+msgid "Не удалось изменить маршрут. Повторите попытку."
+msgstr "Couldn't change the route. Try again."
+
+msgid "Не выбран"
+msgstr "None"
+
+msgid "Событий пока нет."
+msgstr "No events yet."
+
+msgid "Готов"
+msgstr "Ready"
+
+msgid "Запуск"
+msgstr "Starting"
+
+msgid "Сбой"
+msgstr "Failed"
+
+msgid "Без проверки"
+msgstr "Unchecked"
+
+msgid "Выключен"
+msgstr "Off"
+
+msgid "Выкл"
+msgstr "Off"
+
+msgid "Неизвестно"
+msgstr "Unknown"
+
+msgid "таймаут"
+msgstr "timeout"
+
+msgid "нет связи"
+msgstr "offline"
+
+msgid "нет данных"
+msgstr "no data"
+
+msgid "Без названия"
+msgstr "Untitled"
+
+msgid "Срок неизвестен"
+msgstr "Expiry unknown"
+
+msgid "Срок истёк"
+msgstr "Expired"
+
+msgid "Бессрочно"
+msgstr "No expiry"
+
+msgid "Осталось {0} {1}"
+msgstr "{0} {1} left"
+
+msgid "{n} дн."
+msgid_plural "{n} дн."
+msgstr[0] "{n} day"
+msgstr[1] "{n} days"
+
+msgid "Подписка истекла {}"
+msgstr "Expired {}"
+
+msgid "Подписка истекла"
+msgstr "Expired"
+
+msgid "трафик {}"
+msgstr "data {}"
+
+msgid "Трафик исчерпан: {}"
+msgstr "Data used up: {}"
+
+msgid "Трафик: {} · осталось {}"
+msgstr "Data: {} · {} left"
+
+msgid "Трафик без лимита"
+msgstr "Unlimited data"
+
+msgid "до {}"
+msgstr "until {}"
+
+msgid "бессрочно"
+msgstr "no expiry"
+
+msgid "Б/с"
+msgstr "B/s"
+
+msgid "КБ/с"
+msgstr "KB/s"
+
+msgid "МБ/с"
+msgstr "MB/s"
+
+msgid "ГБ/с"
+msgstr "GB/s"

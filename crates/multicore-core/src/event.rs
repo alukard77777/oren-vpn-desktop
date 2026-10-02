@@ -51,6 +51,10 @@ pub struct Event {
     correlation_id: String,
     safe_message: String,
     structured_details: Value,
+    /// The stable code of `safe_message` (a daemon message the desktop shows in its own
+    /// language). Absent for events written before it existed and for untranslated ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_key: Option<multicore_i18n::MessageKey>,
 }
 
 impl Event {
@@ -75,7 +79,18 @@ impl Event {
             correlation_id: redact_text(&correlation_id.into()),
             safe_message: redact_text(message),
             structured_details,
+            message_key: None,
         }
+    }
+
+    /// Attaches the stable code `message` was rendered from (its arguments are redacted
+    /// like the message).
+    pub fn with_message_key(mut self, mut key: multicore_i18n::MessageKey) -> Self {
+        for arg in &mut key.args {
+            *arg = redact_text(arg);
+        }
+        self.message_key = Some(key);
+        self
     }
 
     pub fn with_profile_id(mut self, profile_id: &str) -> Self {
