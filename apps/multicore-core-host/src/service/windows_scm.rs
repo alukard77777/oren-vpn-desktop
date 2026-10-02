@@ -32,7 +32,7 @@ use windows_sys::{
     core::PWSTR,
 };
 
-use super::core_loop::ServiceLoop;
+use super::core_loop::{ServiceLoop, Troubleshooter};
 use super::cores::ProductionCores;
 use super::state_dir;
 use super::update::ProductionUpdater;
@@ -139,10 +139,17 @@ fn run_body() -> io::Result<()> {
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| io::Error::other("service executable has no package root"))?;
     let branding = (directory.clone(), package_root.clone());
+    let troubleshooter = Arc::new(ServiceTroubleshooter {
+        directory: directory.clone(),
+    });
     let service = Arc::new(Mutex::new(
-        ServiceLoop::new(ProductionCores::new(directory.clone())?).with_updater(Box::new(
-            ProductionUpdater::new(directory, package_root, stop.clone()),
-        )),
+        ServiceLoop::new(ProductionCores::new(directory.clone())?)
+            .with_updater(Box::new(ProductionUpdater::new(
+                directory,
+                package_root,
+                stop.clone(),
+            )))
+            .with_troubleshooter(troubleshooter),
     ));
     let ticker = {
         let (service, stop) = (service.clone(), stop.clone());
@@ -176,6 +183,23 @@ fn run_body() -> io::Result<()> {
         .unwrap_or_else(PoisonError::into_inner)
         .stop_everything();
     result
+}
+
+/// `ServiceCommand::Troubleshoot`: the fixed fixes of `crate::troubleshoot`, each logged to
+/// `logs/service.log`.
+struct ServiceTroubleshooter {
+    directory: std::path::PathBuf,
+}
+
+impl Troubleshooter for ServiceTroubleshooter {
+    fn run(
+        &self,
+        fixes: &[multicore_core::troubleshoot::PrivilegedFix],
+    ) -> Vec<multicore_core::troubleshoot::FixOutcome> {
+        crate::troubleshoot::run_batch(fixes, &mut |line| {
+            super::service_log::append(&self.directory, line);
+        })
+    }
 }
 
 unsafe extern "system" fn control_handler(

@@ -18,8 +18,9 @@ use windows_sys::Win32::{
     Security::{
         Authorization::ConvertSidToStringSidW, CreateWellKnownSid, EqualSid, GetTokenInformation,
         RevertToSelf, SECURITY_MAX_SID_SIZE, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
-        TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenSessionId, TokenUser,
-        WinInteractiveSid,
+        TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenElevationType,
+        TokenElevationTypeDefault, TokenGroups, TokenSessionId, TokenUser, WELL_KNOWN_SID_TYPE,
+        WinBuiltinAdministratorsSid, WinInteractiveSid,
     },
     System::{
         Com::CoTaskMemFree,
@@ -53,6 +54,9 @@ pub(crate) struct ClientFacts {
     pub(crate) user_sid: String,
     /// The token carries the enabled INTERACTIVE group (`S-1-5-4`): a console or RDP logon.
     pub(crate) interactive: bool,
+    /// The user is an administrator: a UAC-split (filtered or elevated) token, or an enabled
+    /// Administrators group (UAC off).
+    pub(crate) administrator: bool,
 }
 
 /// `<install>\current\runtime\multicore-core-host.exe` → `<install>\current\runtime\multicore-daemon.exe`.
@@ -148,6 +152,7 @@ pub(crate) fn client_facts(pipe: HANDLE) -> Result<(ClientFacts, OwnedHandle), I
     let session_id = token_session(token.as_raw_handle())?;
     let user_sid = token_user_sid(token.as_raw_handle())?;
     let interactive = token_is_interactive(token.as_raw_handle())?;
+    let administrator = token_is_administrator(token.as_raw_handle())?;
     // The PID may have been recycled since the client connected: the process we opened must
     // run as the same user, in the same session, as the token the client connected with.
     let (connected_sid, connected_session) = connection_token_facts(pipe)?;
@@ -161,6 +166,7 @@ pub(crate) fn client_facts(pipe: HANDLE) -> Result<(ClientFacts, OwnedHandle), I
             session_id,
             user_sid,
             interactive,
+            administrator,
         },
         token,
     ))
@@ -250,11 +256,41 @@ fn token_user_sid(token: HANDLE) -> Result<String, IdentityError> {
 
 /// The token's groups contain INTERACTIVE (`S-1-5-4`), enabled and not deny-only.
 fn token_is_interactive(token: HANDLE) -> Result<bool, IdentityError> {
+    token_has_enabled_group(token, WinInteractiveSid)
+}
+
+/// Only users UAC splits a token for (administrators) have a non-default elevation type; with
+/// UAC off an administrator's token simply has the Administrators group enabled.
+fn token_is_administrator(token: HANDLE) -> Result<bool, IdentityError> {
+    let mut elevation_type = 0_i32;
+    let mut needed = 0;
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevationType,
+            (&mut elevation_type as *mut i32).cast(),
+            size_of::<i32>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(IdentityError::Unavailable);
+    }
+    if elevation_type != TokenElevationTypeDefault {
+        return Ok(true);
+    }
+    token_has_enabled_group(token, WinBuiltinAdministratorsSid)
+}
+
+fn token_has_enabled_group(
+    token: HANDLE,
+    group: WELL_KNOWN_SID_TYPE,
+) -> Result<bool, IdentityError> {
     let mut interactive = [0_usize; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<usize>())];
     let mut size = SECURITY_MAX_SID_SIZE;
     if unsafe {
         CreateWellKnownSid(
-            WinInteractiveSid,
+            group,
             ptr::null_mut(),
             interactive.as_mut_ptr().cast(),
             &mut size,

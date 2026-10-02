@@ -8,6 +8,10 @@ mod runtime_host;
 #[path = "../src/runtime_paths.rs"]
 mod runtime_paths;
 #[path = "../src/wintun_cleanup.rs"]
+#[allow(
+    dead_code,
+    reason = "the troubleshooting adapter removal is not used by the broker"
+)]
 mod wintun_cleanup;
 
 #[path = "../src/windows_pipe.rs"]

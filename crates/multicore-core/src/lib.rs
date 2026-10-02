@@ -13,6 +13,7 @@ mod snapshot;
 mod state;
 mod store_root;
 mod supervisor;
+pub mod troubleshoot;
 #[cfg(unix)]
 mod unix_group;
 #[cfg(windows)]

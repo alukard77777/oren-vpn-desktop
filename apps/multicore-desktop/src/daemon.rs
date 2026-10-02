@@ -169,6 +169,11 @@ const DASHBOARD_URL_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 const SESSION_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 // The daemon serves canonical group icons of at most 128 KiB.
 const GROUP_ICON_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
+const TROUBLESHOOT_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
+/// One check: the clock check tries three servers at six seconds each.
+const TROUBLESHOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
+/// Fixes wait for the administrator prompt and for services to stop.
+const TROUBLESHOOT_FIX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DaemonStatus {
@@ -656,6 +661,22 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::new("Служба MULTICORE недоступна."))
     }
 
+    /// POST /v1/troubleshoot/check: one check of «Устранить неполадки».
+    fn troubleshoot_check(
+        &self,
+        _step: multicore_core::troubleshoot::CheckStep,
+    ) -> Result<multicore_core::troubleshoot::StepReport, DaemonError> {
+        Err(DaemonError::new("Устранение неполадок недоступно."))
+    }
+
+    /// POST /v1/troubleshoot/fix: the fixes the user confirmed (ids from the check results).
+    fn troubleshoot_fix(
+        &self,
+        _fixes: &[String],
+    ) -> Result<multicore_core::troubleshoot::FixReport, DaemonError> {
+        Err(DaemonError::new("Устранение неполадок недоступно."))
+    }
+
     /// GET /v1/catalog. IDs are opaque daemon values; labels are presentation data.
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError>;
 
@@ -1121,6 +1142,8 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         "service_busy" => "MULTICORE уже запущен у другого пользователя.",
         "service_update_failed" => "Служба не смогла загрузить или проверить обновление.",
         "service_unavailable" => "Служба MULTICORE недоступна.",
+        "disconnect_first" => "Сначала отключитесь: проверка меняет сетевые настройки.",
+        "troubleshoot_unavailable" => "Устранение неполадок недоступно в этой сборке.",
         _ => return None,
     })
 }
@@ -1321,6 +1344,32 @@ impl DaemonClient for HttpDaemonClient {
 
     fn stage_update_via_service(&self, version: &str) -> Result<(), DaemonError> {
         self.post_service_update("/v1/service/update/stage", version, 200)
+    }
+
+    fn troubleshoot_check(
+        &self,
+        step: multicore_core::troubleshoot::CheckStep,
+    ) -> Result<multicore_core::troubleshoot::StepReport, DaemonError> {
+        let request = self
+            .http
+            .post(self.endpoint("/v1/troubleshoot/check"))
+            .timeout(TROUBLESHOOT_CHECK_TIMEOUT)
+            .json(&multicore_core::troubleshoot::CheckRequest { step });
+        self.send_json(request, TROUBLESHOOT_RESPONSE_LIMIT_BYTES)
+    }
+
+    fn troubleshoot_fix(
+        &self,
+        fixes: &[String],
+    ) -> Result<multicore_core::troubleshoot::FixReport, DaemonError> {
+        let request = self
+            .http
+            .post(self.endpoint("/v1/troubleshoot/fix"))
+            .timeout(TROUBLESHOOT_FIX_TIMEOUT)
+            .json(&multicore_core::troubleshoot::FixRequest {
+                fixes: fixes.to_vec(),
+            });
+        self.send_json(request, TROUBLESHOOT_RESPONSE_LIMIT_BYTES)
     }
 
     fn catalog(&self) -> Result<DaemonCatalog, DaemonError> {

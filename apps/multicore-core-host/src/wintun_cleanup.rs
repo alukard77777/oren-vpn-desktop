@@ -15,7 +15,8 @@
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_Locate_DevNodeW, CM_Uninstall_DevNode,
-    CR_SUCCESS,
+    CR_SUCCESS, DiUninstallDevice, SP_DEVINFO_DATA, SetupDiCreateDeviceInfoList,
+    SetupDiDestroyDeviceInfoList, SetupDiOpenDeviceInfoW,
 };
 
 /// `SWD\WINTUN\{GUID}` for the adapter named `MultiCore` (the `tun.device`
@@ -54,6 +55,66 @@ pub(crate) fn remove_phantom_tun_adapter() -> PhantomCleanup {
     match unsafe { CM_Uninstall_DevNode(node, 0) } {
         CR_SUCCESS => PhantomCleanup::Removed,
         code => PhantomCleanup::Failed(code),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AdapterRemoval {
+    NothingToDo,
+    Removed,
+    Failed,
+}
+
+/// «Переустановить Wintun»: removes MULTICORE's own adapter whether it is present or a
+/// phantom, so Mihomo creates it from scratch on the next TUN connect. Only this exact
+/// instance ID is touched; other products' Wintun adapters and the shared Wintun driver
+/// package stay. Callers make sure no MULTICORE tunnel is up.
+pub(crate) fn remove_tun_adapter() -> AdapterRemoval {
+    let instance_id = MULTICORE_TUN_INSTANCE_ID
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let mut node = 0_u32;
+    // SAFETY: `instance_id` is NUL-terminated and outlives the call; `node` is a valid out
+    // pointer.
+    let present =
+        unsafe { CM_Locate_DevNodeW(&mut node, instance_id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) }
+            == CR_SUCCESS;
+    if !present {
+        return match remove_phantom_tun_adapter() {
+            PhantomCleanup::NothingToDo => AdapterRemoval::NothingToDo,
+            PhantomCleanup::Removed => AdapterRemoval::Removed,
+            PhantomCleanup::Failed(_) => AdapterRemoval::Failed,
+        };
+    }
+    // SAFETY: an empty device information set; destroyed below on every path.
+    let set = unsafe { SetupDiCreateDeviceInfoList(std::ptr::null(), std::ptr::null_mut()) };
+    if set == -1 {
+        return AdapterRemoval::Failed;
+    }
+    let mut data: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+    data.cbSize = size_of::<SP_DEVINFO_DATA>() as u32;
+    // SAFETY: `set` is valid, `instance_id` NUL-terminated, `data` sized.
+    let removed = unsafe {
+        SetupDiOpenDeviceInfoW(
+            set,
+            instance_id.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut data,
+        ) != 0
+            && {
+                let mut reboot = 0;
+                DiUninstallDevice(std::ptr::null_mut(), set, &data, 0, &mut reboot) != 0
+            }
+    };
+    unsafe { SetupDiDestroyDeviceInfoList(set) };
+    if removed {
+        // The removal can leave the node behind as a phantom; that goes too.
+        let _ = remove_phantom_tun_adapter();
+        AdapterRemoval::Removed
+    } else {
+        AdapterRemoval::Failed
     }
 }
 

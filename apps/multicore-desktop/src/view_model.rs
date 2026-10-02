@@ -1763,6 +1763,18 @@ impl DesktopViewModel {
         true
     }
 
+    /// «Повторить подключение» after troubleshooting: a failed connect is left for a fresh
+    /// Connect instead of the status refresh its «Проверить снова» runs.
+    pub(crate) fn prepare_retry_connect(&mut self) {
+        if matches!(self.state, UiState::Error { .. }) && self.active_mutation.is_none() {
+            self.state = UiState::Ready {
+                profile: "Основной".into(),
+                node: "Авто".into(),
+            };
+            self.connection_notice = None;
+        }
+    }
+
     pub fn begin_primary_action(&mut self) -> Option<(PrimaryAction, MutationToken)> {
         if self.active_mutation.is_some()
             || self.import_pending

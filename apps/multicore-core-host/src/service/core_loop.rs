@@ -3,11 +3,12 @@
 
 use std::{
     path::PathBuf,
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use multicore_core::elevation_protocol::{BrokerErrorCode, ElevatedRuntimeState};
 use multicore_core::service_protocol::{ControllerEndpoint, ServiceCommand, ServiceResponse};
+use multicore_core::troubleshoot::{FixOutcome, PrivilegedFix};
 
 /// Who is on the other end of one connection, as established by the platform server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +19,10 @@ pub(crate) struct ClientIdentity {
     pub(crate) data_root: PathBuf,
     /// Unix: the uid whose ownership the runtime resolver enforces. Windows: 0.
     pub(crate) uid: u32,
+    /// Windows: the client's user is an administrator (a UAC-filtered token counts). Only
+    /// such clients may run troubleshooting fixes through the service; others are sent to
+    /// the UAC prompt, which asks for an administrator's consent. Unix: false.
+    pub(crate) administrator: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -69,6 +74,12 @@ pub(crate) trait ServiceUpdater: Send {
     fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode>;
 }
 
+/// Service-side «Устранить неполадки»: runs a validated batch of fixed fixes and reports one
+/// outcome per fix in request order.
+pub(crate) trait Troubleshooter: Send + Sync {
+    fn run(&self, fixes: &[PrivilegedFix]) -> Vec<FixOutcome>;
+}
+
 struct Owner {
     user_key: String,
     connection: ConnectionId,
@@ -87,6 +98,9 @@ pub(crate) struct ServiceLoop<C: Cores> {
     updater: Option<Box<dyn ServiceUpdater>>,
     /// An `Update` is downloading outside the lock; its updater is taken out meanwhile.
     updating: bool,
+    troubleshooter: Option<Arc<dyn Troubleshooter>>,
+    /// A `Troubleshoot` batch is running outside the lock.
+    troubleshooting: bool,
 }
 
 /// An `Update` that passed the ownership check and holds the updater while it downloads
@@ -106,7 +120,16 @@ impl<C: Cores> ServiceLoop<C> {
             failure: None,
             updater: None,
             updating: false,
+            troubleshooter: None,
+            troubleshooting: false,
         }
+    }
+
+    /// Windows only: Linux has no service-side troubleshooting.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn with_troubleshooter(mut self, troubleshooter: Arc<dyn Troubleshooter>) -> Self {
+        self.troubleshooter = Some(troubleshooter);
+        self
     }
 
     /// Windows only: Linux packages are updated by the package manager.
@@ -161,6 +184,62 @@ impl<C: Cores> ServiceLoop<C> {
             }
             ServiceCommand::Update { version } => self.update(client, &version, false),
             ServiceCommand::StageUpdate { version } => self.update(client, &version, true),
+            ServiceCommand::Troubleshoot { fixes } => match self.start_troubleshoot(client, &fixes)
+            {
+                Ok(troubleshooter) => {
+                    let outcomes = troubleshooter.run(&fixes);
+                    self.finish_troubleshoot(&fixes, outcomes)
+                }
+                Err(response) => response,
+            },
+        }
+    }
+
+    /// Phase 1 of `Troubleshoot`, under the lock: another user's cores, an update or another
+    /// batch in progress → `Busy`; a client that is not an administrator → `AuthenticationFailed`
+    /// (the daemon then asks through UAC); the Wintun adapter while this service's tunnel is
+    /// up → `NotReady`; no troubleshooter → `Unsupported`.
+    pub(crate) fn start_troubleshoot(
+        &mut self,
+        client: &ClientIdentity,
+        fixes: &[PrivilegedFix],
+    ) -> Result<Arc<dyn Troubleshooter>, ServiceResponse> {
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.user_key != client.user_key)
+            || self.updating
+            || self.troubleshooting
+        {
+            return Err(ServiceResponse::Busy);
+        }
+        let refuse = |code| Err(ServiceResponse::Error { code });
+        if !client.administrator {
+            return refuse(BrokerErrorCode::AuthenticationFailed);
+        }
+        if self.tun_on && fixes.contains(&PrivilegedFix::ReinstallWintun) {
+            return refuse(BrokerErrorCode::NotReady);
+        }
+        let Some(troubleshooter) = self.troubleshooter.clone() else {
+            return refuse(BrokerErrorCode::Unsupported);
+        };
+        self.troubleshooting = true;
+        Ok(troubleshooter)
+    }
+
+    /// Phase 3 of `Troubleshoot`, under the lock again.
+    pub(crate) fn finish_troubleshoot(
+        &mut self,
+        fixes: &[PrivilegedFix],
+        outcomes: Vec<FixOutcome>,
+    ) -> ServiceResponse {
+        self.troubleshooting = false;
+        if outcomes.len() == fixes.len() {
+            ServiceResponse::Troubleshot { outcomes }
+        } else {
+            ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest,
+            }
         }
     }
 
@@ -416,7 +495,7 @@ impl<C: Cores> ServiceLoop<C> {
 }
 
 /// Runs one command for a server connection thread. `Update` and `StageUpdate` download and
-/// verify without holding the lock, so the owner's `Status`/`SetTun`, crash restarts, a dropped
+/// verify without holding the lock (and `Troubleshoot` runs its fixes without it), so the owner's `Status`/`SetTun`, crash restarts, a dropped
 /// owner and a service stop are all served meanwhile; every other command runs under the lock.
 pub(crate) fn execute_shared<C: Cores>(
     service: &Mutex<ServiceLoop<C>>,
@@ -428,6 +507,15 @@ pub(crate) fn execute_shared<C: Cores>(
     let (version, stage_only) = match command {
         ServiceCommand::Update { version } => (version, false),
         ServiceCommand::StageUpdate { version } => (version, true),
+        // Fixes run tools and wait for services to stop: outside the lock, like a download.
+        ServiceCommand::Troubleshoot { fixes } => {
+            let troubleshooter = match lock().start_troubleshoot(client, &fixes) {
+                Ok(troubleshooter) => troubleshooter,
+                Err(response) => return response,
+            };
+            let outcomes = troubleshooter.run(&fixes);
+            return lock().finish_troubleshoot(&fixes, outcomes);
+        }
         command => return lock().execute(connection, client, command),
     };
     let mut pending = match lock().start_update(client) {

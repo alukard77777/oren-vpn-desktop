@@ -25,6 +25,7 @@ mod service_install;
 mod service_logo;
 mod single_instance;
 mod tray;
+mod troubleshoot;
 mod updater;
 mod view_model;
 mod windows_settings;
@@ -970,6 +971,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     );
     wire_dashboard_action(&ui, model.clone());
     wire_service_install(&ui);
+    wire_troubleshoot(&ui, model.clone());
     wire_data_reset(&ui);
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
@@ -3747,6 +3749,206 @@ fn wire_service_install(ui: &AppWindow) {
     });
 }
 
+/// Draws a troubleshooting run's cards, fix offers and fix results.
+fn present_troubleshoot_run(ui: &AppWindow, run: &troubleshoot::TroubleshootRun) {
+    let card = |finding: &multicore_core::troubleshoot::Finding| UiTroubleshootCard {
+        tone: troubleshoot::tone_name(finding.tone).into(),
+        title: finding.title.as_str().into(),
+        detail: finding.detail.as_str().into(),
+    };
+    let summary = troubleshoot::summary(run.findings());
+    ui.set_troubleshoot_summary_tone(troubleshoot::tone_name(summary.tone).into());
+    ui.set_troubleshoot_summary_title(summary.title.into());
+    ui.set_troubleshoot_summary_detail(summary.detail.into());
+    ui.set_troubleshoot_cards(ModelRc::new(VecModel::from(
+        run.findings().iter().map(card).collect::<Vec<_>>(),
+    )));
+    ui.set_troubleshoot_fix_results(ModelRc::new(VecModel::from(
+        run.fix_results().iter().map(card).collect::<Vec<_>>(),
+    )));
+    ui.set_troubleshoot_fixes(ModelRc::new(VecModel::from(
+        run.offers()
+            .iter()
+            .map(|(offer, checked)| UiTroubleshootFix {
+                id: offer.id.as_str().into(),
+                title: offer.title.as_str().into(),
+                detail: offer.detail.as_str().into(),
+                needs_admin: offer.needs_admin,
+                needs_reboot: offer.needs_reboot,
+                checked: *checked,
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_troubleshoot_checked_count(run.checked_count() as i32);
+    ui.set_troubleshoot_reboot(run.reboot_recommended());
+}
+
+fn present_troubleshoot_steps(
+    ui: &AppWindow,
+    steps: &[multicore_core::troubleshoot::CheckStep],
+    active: usize,
+) {
+    ui.set_troubleshoot_step_index(active as i32);
+    ui.set_troubleshoot_steps(ModelRc::new(VecModel::from(
+        steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| UiTroubleshootStep {
+                // A finished step drops its ellipsis.
+                label: if index < active {
+                    step.label().trim_end_matches('…').into()
+                } else {
+                    step.label().into()
+                },
+                state: match index.cmp(&active) {
+                    std::cmp::Ordering::Less => "done",
+                    std::cmp::Ordering::Equal => "active",
+                    std::cmp::Ordering::Greater => "pending",
+                }
+                .into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+}
+
+/// «Устранить неполадки»: the checks run one by one through the daemon (the page names each
+/// step), then only the fixes the user ticked, or one of the two separate repair actions.
+fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
+    use multicore_core::troubleshoot::{CheckStep, PrivilegedFix};
+    ui.set_troubleshoot_windows(cfg!(windows));
+    let run = Arc::new(Mutex::new(troubleshoot::TroubleshootRun::default()));
+
+    let (weak, start_run, start_model) = (ui.as_weak(), run.clone(), model.clone());
+    ui.on_troubleshoot_start(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if matches!(ui.get_troubleshoot_phase().as_str(), "running" | "fixing")
+            || !ui.get_troubleshoot_repair_busy().is_empty()
+        {
+            return;
+        }
+        *start_run.lock().expect("troubleshoot run lock") =
+            troubleshoot::TroubleshootRun::default();
+        let steps = CheckStep::for_platform(cfg!(windows));
+        present_troubleshoot_steps(&ui, &steps, 0);
+        ui.set_troubleshoot_error("".into());
+        ui.set_troubleshoot_repair_confirm("".into());
+        ui.set_troubleshoot_phase("running".into());
+        let client = start_model.lock().expect("view model lock").daemon_client();
+        let (weak, run) = (weak.clone(), start_run.clone());
+        thread::spawn(move || {
+            for (index, step) in steps.iter().enumerate() {
+                let (progress_weak, progress_steps) = (weak.clone(), steps.clone());
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = progress_weak.upgrade() {
+                        present_troubleshoot_steps(&ui, &progress_steps, index);
+                    }
+                });
+                match client.troubleshoot_check(*step) {
+                    Ok(report) => run.lock().expect("troubleshoot run lock").add_step(report),
+                    Err(error) => {
+                        let weak = weak.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_troubleshoot_error(error.to_string().into());
+                                ui.set_troubleshoot_phase("start".into());
+                            }
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    present_troubleshoot_steps(&ui, &steps, steps.len());
+                    present_troubleshoot_run(&ui, &run.lock().expect("troubleshoot run lock"));
+                    ui.set_troubleshoot_phase("results".into());
+                }
+            });
+        });
+    });
+
+    let (weak, toggle_run) = (ui.as_weak(), run.clone());
+    ui.on_troubleshoot_toggle_fix(move |index| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let mut run = toggle_run.lock().expect("troubleshoot run lock");
+        run.toggle(usize::try_from(index).unwrap_or(usize::MAX));
+        present_troubleshoot_run(&ui, &run);
+    });
+
+    // The confirmed fixes, or one separate action ("wintun" / "service").
+    let run_fixes = {
+        let (weak, run, model) = (ui.as_weak(), run.clone(), model.clone());
+        move |ids: Vec<String>, repair: &'static str| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ids.is_empty() {
+                return;
+            }
+            ui.set_troubleshoot_error("".into());
+            if repair.is_empty() {
+                ui.set_troubleshoot_phase("fixing".into());
+            } else {
+                ui.set_troubleshoot_repair_busy(repair.into());
+            }
+            let client = model.lock().expect("view model lock").daemon_client();
+            let (weak, run) = (weak.clone(), run.clone());
+            thread::spawn(move || {
+                let result = client.troubleshoot_fix(&ids);
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    let mut run = run.lock().expect("troubleshoot run lock");
+                    match result {
+                        Ok(report) => run.apply_report(&ids, report),
+                        Err(error) => ui.set_troubleshoot_error(error.to_string().into()),
+                    }
+                    present_troubleshoot_run(&ui, &run);
+                    if repair.is_empty() {
+                        ui.set_troubleshoot_phase("results".into());
+                    } else {
+                        ui.set_troubleshoot_repair_busy("".into());
+                    }
+                });
+            });
+        }
+    };
+    let (apply_fixes, apply_run) = (run_fixes.clone(), run.clone());
+    ui.on_troubleshoot_apply(move || {
+        let ids = apply_run
+            .lock()
+            .expect("troubleshoot run lock")
+            .checked_ids();
+        apply_fixes(ids, "");
+    });
+    ui.on_troubleshoot_repair(move |kind| {
+        let (fix, repair) = match kind.as_str() {
+            "wintun" => (PrivilegedFix::ReinstallWintun, "wintun"),
+            "service" => (PrivilegedFix::ReinstallService, "service"),
+            _ => return,
+        };
+        run_fixes(vec![fix.token()], repair);
+    });
+
+    let weak = ui.as_weak();
+    ui.on_troubleshoot_retry_connect(move || {
+        let current = {
+            let mut model = model.lock().expect("view model lock");
+            model.prepare_retry_connect();
+            snapshot(&model)
+        };
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+            ui.invoke_primary_action();
+        }
+    });
+}
+
 /// "Удалить все данные" (second click): start the resetting process, then quit. Leaving
 /// `run_desktop` drops the bootstrap (disconnect, stop and reap the owned daemon) and then the
 /// single-instance guard, which is what the resetting process waits for.
@@ -5386,6 +5588,13 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     // Never offer the service while the daemon already runs on it (or it is registered).
     ui.set_service_card_visible(service_install::card_visible(
         snapshot.service_mode || service_install::service_installed(),
+    ));
+    ui.set_troubleshoot_offer_visible(troubleshoot::offered_after_failure(presentation));
+    ui.set_troubleshoot_service_reinstall(troubleshoot::service_reinstall_available(
+        cfg!(windows),
+        service_install::per_user_install(),
+        snapshot.service_mode,
+        service_install::service_installed(),
     ));
     ui.set_status_tone(
         match presentation.semantic_tone {

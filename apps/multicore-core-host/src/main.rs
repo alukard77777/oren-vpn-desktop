@@ -5,6 +5,9 @@ mod runtime_paths;
 /// `multicore-core-host --service`: the always-ready Windows service / systemd unit.
 #[cfg(any(windows, unix))]
 mod service;
+/// `multicore-core-host --troubleshoot <fix>...`: the UAC-elevated troubleshooting helper.
+#[cfg(windows)]
+mod troubleshoot;
 #[cfg(unix)]
 mod unix_runtime_paths;
 #[cfg(unix)]
@@ -16,6 +19,13 @@ mod wintun_cleanup;
 
 #[cfg(any(windows, unix))]
 fn main() {
+    #[cfg(windows)]
+    {
+        let arguments = service::process_arguments();
+        if troubleshoot::wants_helper(&arguments) {
+            std::process::exit(troubleshoot::helper_main(&arguments) as i32);
+        }
+    }
     if service::wants_service_mode(&service::process_arguments()) {
         if service::run().is_err() {
             eprintln!("MultiCore core host: service stopped safely.");

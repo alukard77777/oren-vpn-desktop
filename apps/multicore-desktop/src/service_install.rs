@@ -22,14 +22,18 @@ fn card_visible_on(windows: bool, per_user_install: bool, service_mode: bool) ->
 /// `service_mode` is true when the daemon reports it runs on the service or the service is
 /// registered at all. Called on every snapshot, so the install location is read once.
 pub(crate) fn card_visible(service_mode: bool) -> bool {
+    card_visible_on(cfg!(windows), per_user_install(), service_mode)
+}
+
+/// This copy runs from `%LOCALAPPDATA%\Programs\MultiCore` (read once).
+pub(crate) fn per_user_install() -> bool {
     static PER_USER_INSTALL: OnceLock<bool> = OnceLock::new();
-    let per_user_install = *PER_USER_INSTALL.get_or_init(|| {
+    *PER_USER_INSTALL.get_or_init(|| {
         match (std::env::current_exe(), std::env::var_os("LOCALAPPDATA")) {
             (Ok(executable), Some(local)) => is_per_user_install(&executable, Path::new(&local)),
             _ => false,
         }
-    });
-    card_visible_on(cfg!(windows), per_user_install, service_mode)
+    })
 }
 
 /// Whether the MultiCore service is registered, asked of the service manager once per run:

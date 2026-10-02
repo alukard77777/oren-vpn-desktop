@@ -3,6 +3,7 @@ pub mod dashboard_proxy;
 pub mod elevated_controller;
 pub mod service_client;
 pub mod system_proxy;
+pub mod troubleshoot;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -898,6 +899,12 @@ pub trait Backend: Send + Sync + 'static {
     async fn group_icon(&self, _icon_id: &str) -> Option<Vec<u8>> {
         None
     }
+    /// The ports the active subscription's cores listen on (troubleshooting's port check).
+    async fn listen_ports(&self) -> Vec<multicore_core::troubleshoot::ListenPort> {
+        Vec::new()
+    }
+    /// Records which troubleshooting fixes ran in the event log.
+    async fn record_troubleshoot(&self, _message: &str) {}
 }
 
 #[derive(Clone)]
@@ -911,6 +918,8 @@ struct AppState {
     dashboard_url: Option<Arc<str>>,
     /// Present when updates go through the always-ready service (Windows service install).
     service_updates: Option<Arc<dyn ServiceUpdates>>,
+    /// «Устранить неполадки»; absent in tests and embedders that do not offer it.
+    troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
 }
 
 /// Updates performed by the always-ready service (see `service_client::ServiceSession`).
@@ -989,12 +998,14 @@ fn build_router_shared(
     event_epoch: impl Into<String>,
     dashboard_url: Option<Arc<str>>,
     service_updates: Option<Arc<dyn ServiceUpdates>>,
+    troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
 ) -> Router {
     let app_state = AppState {
         backend,
         event_epoch: Arc::from(event_epoch.into()),
         dashboard_url,
         service_updates,
+        troubleshooting,
     };
     let auth_state = AuthState {
         token_hash: Sha256::digest(bearer_token.as_ref().as_bytes()).into(),
@@ -1031,6 +1042,8 @@ fn build_router_shared(
         .route("/session", get(session))
         .route("/service/update", post(service_update))
         .route("/service/update/stage", post(service_update_stage))
+        .route("/troubleshoot/check", post(troubleshoot_check))
+        .route("/troubleshoot/fix", post(troubleshoot_fix))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1055,6 +1068,7 @@ where
         event_epoch,
         dashboard_url,
         None,
+        None,
     )
 }
 
@@ -1065,12 +1079,24 @@ pub fn try_router_shared(
     dashboard_url: Option<Arc<str>>,
     service_updates: Option<Arc<dyn ServiceUpdates>>,
 ) -> Result<Router, getrandom::Error> {
+    try_router_with_troubleshooting(backend, bearer_token, dashboard_url, service_updates, None)
+}
+
+/// [`try_router_shared`] that also serves `/v1/troubleshoot/*`.
+pub fn try_router_with_troubleshooting(
+    backend: Arc<dyn Backend>,
+    bearer_token: impl AsRef<str>,
+    dashboard_url: Option<Arc<str>>,
+    service_updates: Option<Arc<dyn ServiceUpdates>>,
+    troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
+) -> Result<Router, getrandom::Error> {
     Ok(build_router_shared(
         backend,
         bearer_token,
         generate_event_epoch()?,
         dashboard_url,
         service_updates,
+        troubleshooting,
     ))
 }
 
@@ -1789,6 +1815,78 @@ async fn run_service_update(
             "Служба не смогла загрузить или проверить обновление.",
         )),
     }
+}
+
+/// Troubleshooting checks and fixes only run while nothing is connected: the proxy check
+/// switches the system proxy off and the fixes reset networking.
+async fn troubleshoot_ready(
+    state: &AppState,
+) -> Result<Arc<dyn troubleshoot::Troubleshooting>, ApiError> {
+    let Some(troubleshooting) = state.troubleshooting.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "troubleshoot_unavailable",
+            "Устранение неполадок недоступно.",
+        ));
+    };
+    let status = state
+        .backend
+        .status()
+        .await
+        .map_err(|_| ApiError::backend("Не удалось проверить состояние подключения."))?;
+    if matches!(
+        status.state,
+        ConnectionState::Connected | ConnectionState::Connecting
+    ) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "disconnect_first",
+            "Сначала отключитесь.",
+        ));
+    }
+    Ok(troubleshooting)
+}
+
+async fn troubleshoot_check(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<multicore_core::troubleshoot::StepReport>, ApiError> {
+    let request: multicore_core::troubleshoot::CheckRequest = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("Некорректный запрос проверки."))?;
+    let troubleshooting = troubleshoot_ready(&state).await?;
+    let ports = state.backend.listen_ports().await;
+    Ok(Json(troubleshooting.check(request.step, ports).await))
+}
+
+async fn troubleshoot_fix(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<multicore_core::troubleshoot::FixReport>, ApiError> {
+    let request: multicore_core::troubleshoot::FixRequest = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("Некорректный запрос исправления."))?;
+    let fixes = troubleshoot::parse_fix_request(&request.fixes)
+        .ok_or_else(|| ApiError::bad_request("Неизвестное исправление."))?;
+    let troubleshooting = troubleshoot_ready(&state).await?;
+    let report = troubleshooting.fix(fixes.clone()).await;
+    {
+        let summary = fixes
+            .iter()
+            .map(|fix| fix.as_text())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let failed = report
+            .findings
+            .iter()
+            .filter(|finding| finding.tone == multicore_core::troubleshoot::Tone::Error)
+            .count();
+        state
+            .backend
+            .record_troubleshoot(&format!(
+                "Устранение неполадок: {summary}; ошибок: {failed}."
+            ))
+            .await;
+    }
+    Ok(Json(report))
 }
 
 fn service_unavailable() -> ApiError {
@@ -4566,6 +4664,24 @@ where
             .as_ref()?
             .group_icon_png(icon_id)
             .map(<[u8]>::to_vec)
+    }
+
+    async fn listen_ports(&self) -> Vec<multicore_core::troubleshoot::ListenPort> {
+        let runtime = self.inner.read().await;
+        runtime
+            .snapshot
+            .as_deref()
+            .map(multicore_core::troubleshoot::snapshot_listen_ports)
+            .unwrap_or_default()
+    }
+
+    async fn record_troubleshoot(&self, message: &str) {
+        self.inner.write().await.push_event(
+            Severity::Info,
+            Component::Core,
+            "troubleshoot",
+            message,
+        );
     }
 
     async fn import_subscription(

@@ -135,5 +135,6 @@ pub(crate) fn production_identity(stream: &UnixStream) -> Result<ClientIdentity,
         user_key: format!("uid:{}", facts.uid),
         data_root,
         uid: facts.uid,
+        administrator: false,
     })
 }

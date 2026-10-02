@@ -486,6 +486,99 @@ fn mappings() -> ModelRc<UiProxyMapping> {
 
 type Scenario = (&'static str, u32, u32, fn(&AppWindow));
 
+fn finding(tone: &str, title: &str, detail: &str) -> multicore_core::troubleshoot::Finding {
+    use multicore_core::troubleshoot::Tone;
+    let tone = match tone {
+        "error" => Tone::Error,
+        "warning" => Tone::Warning,
+        "success" => Tone::Success,
+        _ => Tone::Info,
+    };
+    multicore_core::troubleshoot::Finding::new(tone, title, detail)
+}
+
+fn winsock_offer() -> multicore_core::troubleshoot::FixOffer {
+    multicore_core::troubleshoot::FixOffer {
+        id: "winsock-reset".into(),
+        title: "Сбросить сетевые настройки (Winsock)".into(),
+        detail: "Восстанавливает сетевой стек Windows, если его испортила другая программа. Нужна перезагрузка ПК; некоторые VPN и антивирусы после сброса придётся переустановить.".into(),
+        needs_admin: true,
+        needs_reboot: true,
+    }
+}
+
+/// The copy the daemon writes for a machine with Kaspersky, zapret, a busy port, a foreign proxy
+/// and Drover (see crates/multicore-daemon/src/troubleshoot).
+fn troubleshoot_mixed_run() -> crate::troubleshoot::TroubleshootRun {
+    use multicore_core::troubleshoot::{FixOffer, StepReport};
+    let mut run = crate::troubleshoot::TroubleshootRun::default();
+    run.add_step(StepReport {
+        findings: vec![finding("error", "Обнаружен Kaspersky", "Kaspersky часто блокирует VPN. Если подключение не работает — выключите его или добавьте MULTICORE в исключения.")],
+        fixes: Vec::new(),
+    });
+    run.add_step(StepReport {
+        findings: vec![
+            finding("error", "Работает zapret", "Программа обхода блокировок перехватывает трафик и мешает VPN."),
+            finding("warning", "Найдены программы обхода блокировок", "C:\\Users\\user\\Downloads\\zapret. Если они запущены — закройте их. MULTICORE эти папки не трогает."),
+        ],
+        fixes: vec![FixOffer {
+            id: "remove-dpi-service:zapret".into(),
+            title: "Остановить и удалить службу zapret".into(),
+            detail: "Служба будет остановлена и удалена из Windows. Файлы программы останутся — при необходимости её можно установить снова.".into(),
+            needs_admin: true,
+            needs_reboot: false,
+        }],
+    });
+    run.add_step(StepReport {
+        findings: vec![finding("warning", "Порт 10808 занят", "Его занимает «v2rayN.exe», а он нужен подписке. Закройте эту программу и повторите подключение.")],
+        fixes: Vec::new(),
+    });
+    run.add_step(StepReport {
+        findings: vec![finding("info", "Системный прокси отключён", "Был включён прокси 127.0.0.1:8080 — он мешает подключению. Включить снова: Параметры → Сеть и Интернет → Прокси.")],
+        fixes: Vec::new(),
+    });
+    run.add_step(StepReport {
+        findings: vec![finding("warning", "Найден Drover для Discord", "Подменная version.dll в папке Discord пускает его трафик мимо VPN и может мешать подключению.")],
+        fixes: vec![FixOffer {
+            id: "delete-drover".into(),
+            title: "Удалить Drover из папки Discord".into(),
+            detail: "Будут удалены version.dll и drover.ini (файлов: 2). Сам Discord продолжит работать.".into(),
+            needs_admin: false,
+            needs_reboot: false,
+        }],
+    });
+    run.add_step(StepReport {
+        findings: vec![finding(
+            "info",
+            "DNS-кэш очищен",
+            "Устаревшие записи DNS больше не помешают подключению.",
+        )],
+        fixes: vec![winsock_offer()],
+    });
+    run
+}
+
+fn troubleshoot_page(ui: &AppWindow) {
+    ready(ui);
+    ui.set_troubleshoot_service_reinstall(true);
+    ui.set_troubleshoot_return_page(s("home"));
+    ui.set_local_page(s("troubleshoot"));
+}
+
+fn troubleshoot_home_offer(ui: &AppWindow) {
+    ready(ui);
+    ui.set_status_eyebrow(s("Не удалось подключиться"));
+    ui.set_headline(s("Что-то пошло не так"));
+    ui.set_supporting(s(
+        "Не удалось запустить Mihomo. Проверьте исполняемые файлы.",
+    ));
+    ui.set_toggle_title(s("Не удалось подключиться"));
+    ui.set_toggle_detail_is_exit(false);
+    ui.set_primary_label(s("Проверить снова"));
+    ui.set_status_tone(s("danger"));
+    ui.set_troubleshoot_offer_visible(true);
+}
+
 fn scenarios() -> Vec<Scenario> {
     vec![
         ("home-empty", 840, 720, |ui| {
@@ -501,6 +594,77 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_import_error(s(
                 "Не удалось добавить подписку. Проверьте URL и повторите попытку.",
             ));
+        }),
+        ("troubleshoot-home-offer", 840, 720, troubleshoot_home_offer),
+        ("troubleshoot-start", 840, 720, |ui| {
+            troubleshoot_page(ui);
+        }),
+        ("troubleshoot-start-confirm", 840, 720, |ui| {
+            troubleshoot_page(ui);
+            ui.set_troubleshoot_repair_confirm(s("wintun"));
+        }),
+        ("troubleshoot-running", 840, 720, |ui| {
+            troubleshoot_page(ui);
+            let steps = multicore_core::troubleshoot::CheckStep::for_platform(true);
+            crate::present_troubleshoot_steps(ui, &steps, 4);
+            ui.set_troubleshoot_phase(s("running"));
+        }),
+        ("troubleshoot-results", 840, 1180, |ui| {
+            troubleshoot_page(ui);
+            let mut run = troubleshoot_mixed_run();
+            run.toggle(0);
+            crate::present_troubleshoot_run(ui, &run);
+            ui.set_troubleshoot_phase(s("results"));
+        }),
+        ("troubleshoot-results-min", 700, 620, |ui| {
+            troubleshoot_page(ui);
+            crate::present_troubleshoot_run(ui, &troubleshoot_mixed_run());
+            ui.set_troubleshoot_phase(s("results"));
+        }),
+        ("troubleshoot-fixed", 840, 1080, |ui| {
+            troubleshoot_page(ui);
+            let mut run = troubleshoot_mixed_run();
+            run.toggle(0);
+            run.toggle(2);
+            let ids = run.checked_ids();
+            run.apply_report(
+                &ids,
+                multicore_core::troubleshoot::FixReport {
+                    findings: vec![
+                        finding(
+                            "success",
+                            "Служба zapret удалена",
+                            "Если она не успела остановиться, то исчезнет после перезагрузки.",
+                        ),
+                        finding(
+                            "success",
+                            "Настройки Winsock сброшены",
+                            "Перезагрузите ПК, чтобы изменения вступили в силу.",
+                        ),
+                    ],
+                    reboot_recommended: true,
+                },
+            );
+            crate::present_troubleshoot_run(ui, &run);
+            ui.set_troubleshoot_phase(s("results"));
+        }),
+        ("troubleshoot-clear", 840, 720, |ui| {
+            troubleshoot_page(ui);
+            let mut run = crate::troubleshoot::TroubleshootRun::default();
+            run.add_step(multicore_core::troubleshoot::StepReport {
+                findings: vec![finding(
+                    "info",
+                    "DNS-кэш очищен",
+                    "Устаревшие записи DNS больше не помешают подключению.",
+                )],
+                fixes: vec![winsock_offer()],
+            });
+            crate::present_troubleshoot_run(ui, &run);
+            ui.set_troubleshoot_phase(s("results"));
+        }),
+        ("troubleshoot-settings", 840, 1000, |ui| {
+            ready(ui);
+            ui.set_local_page(s("settings"));
         }),
         ("chip-normal", 840, 720, chip_normal),
         ("chip-warning", 840, 720, |ui| {
