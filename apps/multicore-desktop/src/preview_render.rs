@@ -116,6 +116,62 @@ fn capture_after(
     println!("{}", path.display());
 }
 
+/// Like `capture`, with the pointer resting at `pointer` (logical px) long enough for hover
+/// tooltips to appear.
+fn capture_hover(
+    component: &impl ComponentHandle,
+    name: &str,
+    width: u32,
+    height: u32,
+    pointer: (f32, f32),
+) {
+    if !wanted(name) {
+        return;
+    }
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let scale: f32 = std::env::var("MULTICORE_PREVIEW_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let (width, height) = (
+        (width as f32 * scale) as u32,
+        (height as f32 * scale) as u32,
+    );
+    window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+        scale_factor: scale,
+    });
+    window.set_size(PhysicalSize::new(width, height));
+    component.show().expect("show preview component");
+    settle(2);
+    window.request_redraw();
+    let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (width * height) as usize];
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, width as usize);
+    });
+    window.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(pointer.0, pointer.1),
+    });
+    // 400 ms delay plus the fade.
+    settle(6);
+    window.request_redraw();
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, width as usize);
+    });
+    component.hide().expect("hide preview component");
+    let bytes = buffer
+        .iter()
+        .flat_map(|pixel| [pixel.r, pixel.g, pixel.b])
+        .collect::<Vec<_>>();
+    let image = image::RgbImage::from_raw(width, height, bytes).expect("preview buffer size");
+    let directory = output_dir();
+    std::fs::create_dir_all(&directory).expect("create preview directory");
+    let path = directory.join(format!("{name}-{width}x{height}.png"));
+    image.save(&path).expect("save preview png");
+    println!("{}", path.display());
+}
+
 fn s(value: &str) -> SharedString {
     value.into()
 }
@@ -253,6 +309,13 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
                 unlimited: used < 0.0,
                 quota_tone: s(tone),
                 expired,
+                quota_tooltip: s(if expired {
+                    "Подписка истекла 30 сент. · трафик 100 / 100 GiB"
+                } else if used < 0.0 {
+                    "Трафик без лимита · бессрочно"
+                } else {
+                    "Трафик: 12.4 / 100 GiB · осталось 87.6 GiB · до 14 окт."
+                }),
             }
         },
     )
@@ -312,6 +375,13 @@ fn connected(ui: &AppWindow) {
 /// Title chip on Fjord VPN with a quota (remaining, days, share used, tone).
 fn chip(ui: &AppWindow, remaining: &str, days: &str, used: f32, tone: &str) {
     connected(ui);
+    ui.set_subscription_quota_tooltip(s(if tone == "danger" {
+        "Подписка истекла 30 сент. · трафик 60 / 100 GiB"
+    } else if used < 0.0 {
+        "Трафик без лимита · бессрочно"
+    } else {
+        "Трафик: 12.4 / 100 GiB · осталось 87.6 GiB · до 14 окт."
+    }));
     ui.set_subscription_title(s("Fjord VPN"));
     ui.set_subscription_initial(s("F"));
     ui.set_subscription_remaining(s(remaining));
@@ -1149,6 +1219,30 @@ fn render_ui_previews() {
     ui.set_traffic_up(s("0 Б/с"));
     ui.set_session_uptime(s("00:00:32"));
     capture(&ui, "home-long-exit-min", 700, 620);
+
+    // Quota tooltips: the pointer rests on the chip's ring, its quota line, a dropdown row's
+    // quota column, and the chip at the narrowest window.
+    let ui = AppWindow::new().expect("create app window");
+    chip_normal(&ui);
+    capture_hover(&ui, "chip-tooltip-ring", 840, 720, (71.0, 19.0));
+    let ui = AppWindow::new().expect("create app window");
+    chip(&ui, "∞ GiB", "Бессрочно", -1.0, "accent");
+    capture_hover(&ui, "chip-tooltip-unlimited-meta", 840, 720, (190.0, 19.0));
+    let ui = AppWindow::new().expect("create app window");
+    chip(&ui, "40.0 GiB", "Срок истёк", 0.6, "danger");
+    capture_hover(&ui, "chip-tooltip-expired-min", 700, 620, (71.0, 19.0));
+    let ui = AppWindow::new().expect("create app window");
+    chip_normal(&ui);
+    ui.set_profile_switch_locked(false);
+    ui.set_subscription_profiles(profiles(5));
+    ui.set_active_panel(s("subscription"));
+    capture_hover(&ui, "chip-tooltip-menu-row", 840, 720, (350.0, 145.0));
+    let ui = AppWindow::new().expect("create app window");
+    chip_normal(&ui);
+    ui.set_profile_switch_locked(false);
+    ui.set_subscription_profiles(profiles(5));
+    ui.set_active_panel(s("subscription"));
+    capture_hover(&ui, "chip-tooltip-menu-ring", 840, 720, (82.0, 185.0));
 
     let popup = TrayPopup::new().expect("create tray popup");
     tray_connected(&popup);

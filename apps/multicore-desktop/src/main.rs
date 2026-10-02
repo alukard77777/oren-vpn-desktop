@@ -5364,6 +5364,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_subscription_used_fraction(used_fraction(quota));
     ui.set_subscription_unlimited(quota.used_permille.is_none());
     ui.set_subscription_quota_tone(quota.tone.into());
+    ui.set_subscription_quota_tooltip(quota.tooltip.as_str().into());
     ui.set_subscription_updated(snapshot.subscription.updated.clone().into());
     ui.set_subscription_updated_stale(snapshot.subscription.updated_stale);
     ui.set_subscription_announcement_text(snapshot.subscription.announcement_text.clone().into());
@@ -5431,6 +5432,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
                     unlimited: profile.quota.used_permille.is_none(),
                     quota_tone: profile.quota.tone.into(),
                     expired: profile.quota.expired,
+                    quota_tooltip: profile.quota.tooltip.as_str().into(),
                 }
             })
             .collect::<Vec<_>>();

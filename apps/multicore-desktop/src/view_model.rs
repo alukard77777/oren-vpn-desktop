@@ -317,6 +317,9 @@ pub(crate) struct QuotaPresentation {
     /// "accent", "warning" (≥80 % used or ≤3 days left) or "danger" (expired/exhausted).
     pub(crate) tone: &'static str,
     pub(crate) expired: bool,
+    /// The hover explanation of the ring: «Трафик: 75 / 100 GiB · осталось 25.0 GiB · до 13 окт.»;
+    /// empty when there is no subscription.
+    pub(crate) tooltip: String,
 }
 
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
@@ -1575,7 +1578,10 @@ impl DesktopViewModel {
                 refresh_available: false,
                 refresh_pending: false,
                 error: self.subscription_refresh_error.clone(),
-                quota: quota_presentation(None, None, None, now_unix),
+                quota: QuotaPresentation {
+                    tooltip: String::new(),
+                    ..quota_presentation(None, None, None, now_unix)
+                },
             };
         };
         let used_bytes =
@@ -3494,12 +3500,115 @@ fn quota_presentation(
     } else {
         "accent"
     };
+    let tooltip = quota_tooltip(
+        used_bytes,
+        total,
+        expires_at_unix,
+        now_unix,
+        &remaining,
+        days_left.is_some(),
+    );
     QuotaPresentation {
         remaining,
         days,
         used_permille,
         tone,
         expired,
+        tooltip,
+    }
+}
+
+/// The ring's hover text. `total` is `None` without a traffic limit; `dated` is false for a
+/// subscription without a real end date (none, or one decades away).
+fn quota_tooltip(
+    used_bytes: Option<u64>,
+    total: Option<u64>,
+    expires_at_unix: Option<u64>,
+    now_unix: u64,
+    remaining: &str,
+    dated: bool,
+) -> String {
+    let used = used_bytes.unwrap_or(0);
+    let date = expires_at_unix.map(|expires| short_local_date(expires, now_unix));
+    if let Some(expires) = expires_at_unix
+        && expires <= now_unix
+    {
+        let mut text = match &date {
+            Some(date) => format!("Подписка истекла {date}"),
+            None => "Подписка истекла".to_owned(),
+        };
+        if let Some(total) = total {
+            text.push_str(&format!(" · трафик {}", traffic_pair(used, total)));
+        }
+        return text;
+    }
+    let mut text = match total {
+        Some(total) if used >= total => format!("Трафик исчерпан: {}", traffic_pair(used, total)),
+        Some(total) => format!(
+            "Трафик: {} · осталось {remaining}",
+            traffic_pair(used, total)
+        ),
+        None => "Трафик без лимита".to_owned(),
+    };
+    match date.filter(|_| dated) {
+        Some(date) => text.push_str(&format!(" · до {date}")),
+        None => text.push_str(" · бессрочно"),
+    }
+    text
+}
+
+/// "75 / 100 GiB" (or MiB under a 1 GiB limit): one decimal under 100, whole numbers above.
+fn traffic_pair(used: u64, total: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let (unit, scale) = if total as f64 >= GIB {
+        ("GiB", GIB)
+    } else {
+        ("MiB", MIB)
+    };
+    let number = |bytes: u64| {
+        let value = bytes as f64 / scale;
+        if value >= 100.0 {
+            format!("{}", value.round() as u64)
+        } else {
+            let text = format!("{:.1}", (value * 10.0).round() / 10.0);
+            text.strip_suffix(".0").map(str::to_owned).unwrap_or(text)
+        }
+    };
+    format!("{} / {} {unit}", number(used.min(total)), number(total))
+}
+
+/// "13 окт." in the local time zone; "13 окт. 2027" outside the current year.
+fn short_local_date(unix: u64, now_unix: u64) -> String {
+    use chrono::{Datelike, TimeZone};
+    const MONTHS: [&str; 12] = [
+        "янв.",
+        "февр.",
+        "мар.",
+        "апр.",
+        "мая",
+        "июн.",
+        "июл.",
+        "авг.",
+        "сент.",
+        "окт.",
+        "нояб.",
+        "дек.",
+    ];
+    let local = |seconds: u64| {
+        chrono::Local
+            .timestamp_opt(i64::try_from(seconds).unwrap_or(i64::MAX), 0)
+            .single()
+    };
+    let (Some(date), Some(now)) = (local(unix), local(now_unix)) else {
+        return String::new();
+    };
+    let month = MONTHS[date.month0() as usize];
+    // No-break spaces keep a date on one line when the tooltip wraps.
+    if date.year() == now.year() {
+        format!("{}\u{a0}{month}", date.day())
+    } else {
+        format!("{}\u{a0}{month}\u{a0}{}", date.day(), date.year())
     }
 }
 
@@ -7649,6 +7758,61 @@ mod tests {
             quota_presentation(None, Some(GIB / 2), None, now).remaining,
             "512 MiB"
         );
+    }
+
+    #[test]
+    fn the_quota_ring_explains_itself_on_hover() {
+        use chrono::TimeZone;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let day = 86_400;
+        // Noon UTC stays on the same calendar day in every time zone the tests may run in.
+        let noon = |year, month, day| {
+            chrono::Utc
+                .with_ymd_and_hms(year, month, day, 12, 0, 0)
+                .unwrap()
+                .timestamp() as u64
+        };
+        let now = noon(2026, 10, 2);
+
+        let normal = quota_presentation(
+            Some(75 * GIB),
+            Some(100 * GIB),
+            Some(noon(2026, 10, 13)),
+            now,
+        );
+        assert_eq!(
+            normal.tooltip,
+            "Трафик: 75 / 100 GiB · осталось 25.0 GiB · до 13\u{a0}окт."
+        );
+        let fractional = quota_presentation(Some(GIB / 2), Some(GIB * 3 / 2), None, now);
+        assert_eq!(
+            fractional.tooltip,
+            "Трафик: 0.5 / 1.5 GiB · осталось 1.0 GiB · бессрочно"
+        );
+        let next_year = quota_presentation(None, None, Some(noon(2027, 1, 5)), now);
+        assert_eq!(
+            next_year.tooltip,
+            "Трафик без лимита · до 5\u{a0}янв.\u{a0}2027"
+        );
+        let forever = quota_presentation(Some(GIB), Some(0), Some(now + 12_073 * day), now);
+        assert_eq!(forever.tooltip, "Трафик без лимита · бессрочно");
+        let expired = quota_presentation(
+            Some(3 * GIB),
+            Some(500 * 1024 * 1024),
+            Some(noon(2026, 9, 30)),
+            now,
+        );
+        assert_eq!(
+            expired.tooltip,
+            "Подписка истекла 30\u{a0}сент. · трафик 500 / 500 MiB"
+        );
+        let exhausted = quota_presentation(Some(120 * GIB), Some(100 * GIB), None, now);
+        assert_eq!(
+            exhausted.tooltip,
+            "Трафик исчерпан: 100 / 100 GiB · бессрочно"
+        );
+        let big = quota_presentation(Some(1234 * GIB), Some(2000 * GIB), None, now);
+        assert!(big.tooltip.starts_with("Трафик: 1234 / 2000 GiB"));
     }
 
     #[test]

@@ -73,6 +73,8 @@ export struct UiSubscriptionProfile {
     unlimited: bool,
     quota-tone: string,
     expired: bool,
+    // Hover explanation of the ring: «Трафик: 75 / 100 GiB · осталось 25.0 GiB · до 13 окт.».
+    quota-tooltip: string,
 }
 
 component NavItem inherits Rectangle {
@@ -1002,6 +1004,37 @@ component QuotaRing inherits Rectangle {
     }
 }
 
+// Small hover explanation (the quota ring): a quiet elevated label that fades in. The window
+// places it (see AppWindow.show-tooltip) so it never leaves the window.
+component HoverTooltip inherits Rectangle {
+    in property <string> text;
+    in property <bool> shown;
+    in property <length> text-limit: 360px;
+    width: Math.min(tip-text.preferred-width, root.text-limit - 20px) + 20px;
+    height: tip-text.preferred-height + 12px;
+    border-radius: 8px;
+    background: Theme.elevated;
+    border-width: 1px;
+    border-color: #ffffff14;
+    drop-shadow-blur: 16px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: #00000073;
+    opacity: root.shown ? 1 : 0;
+    visible: self.opacity > 0;
+    accessible-role: none;
+    animate opacity { duration: Motion.reduced ? 0ms : 120ms; easing: ease-out; }
+    tip-text := Text {
+        x: 10px;
+        y: 6px;
+        width: parent.width - 20px;
+        text: root.text;
+        color: Theme.text-secondary;
+        font-size: 12px;
+        wrap: word-wrap;
+        vertical-alignment: center;
+    }
+}
+
 // 16px provider mark in the ring's spot: the cached logo, else the letter avatar.
 component QuotaLogo inherits Rectangle {
     in property <bool> has-logo;
@@ -1118,6 +1151,41 @@ export component AppWindow inherits Window {
     // spinner still takes its place while refreshing).
     private property <bool> chip-shows-logo: root.chip-celebrating
         || (root.subscription-unlimited && root.chip-phase != "refreshing");
+    // Hover explanation of the title chip's ring and quota line.
+    in property <string> subscription-quota-tooltip;
+    // Hover tooltip: a hovered source requests it (owner "chip" or "row:<profile id>") with its
+    // anchor in window coordinates; it shows after 400 ms and hides as soon as the pointer
+    // leaves, the owner disappears or the pointer is pressed.
+    in-out property <string> tooltip-owner;
+    in-out property <string> tooltip-text;
+    in-out property <length> tooltip-anchor-x;
+    in-out property <length> tooltip-anchor-y;
+    in-out property <length> tooltip-anchor-height;
+    // Right-align the tooltip with tooltip-anchor-x instead of starting there.
+    in-out property <bool> tooltip-align-end: false;
+    in-out property <bool> tooltip-ready: false;
+    private property <bool> tooltip-visible: root.tooltip-ready && root.tooltip-owner != ""
+        && (root.tooltip-owner == "chip" ? root.has-profile && !root.profile-menu-open : root.profile-menu-open);
+    function show-tooltip(owner: string, text: string, anchor-x: length, anchor-y: length, anchor-height: length, align-end: bool) {
+        if (text == "") {
+            return;
+        }
+        if (root.tooltip-owner != owner) {
+            root.tooltip-ready = false;
+        }
+        root.tooltip-owner = owner;
+        root.tooltip-text = text;
+        root.tooltip-anchor-x = anchor-x;
+        root.tooltip-anchor-y = anchor-y;
+        root.tooltip-anchor-height = anchor-height;
+        root.tooltip-align-end = align-end;
+    }
+    function hide-tooltip(owner: string) {
+        if (root.tooltip-owner == owner) {
+            root.tooltip-owner = "";
+            root.tooltip-ready = false;
+        }
+    }
     private property <color> chip-tone-color: root.subscription-quota-tone == "danger" ? Theme.error
         : root.subscription-quota-tone == "warning" ? Theme.warning
         : Theme.accent-blue;
@@ -1454,6 +1522,11 @@ export component AppWindow inherits Window {
         interval: 1600ms;
         running: root.chip-phase == "hold";
         triggered => { root.chip-phase = "idle"; }
+    }
+    Timer {
+        interval: 400ms;
+        running: root.tooltip-owner != "" && !root.tooltip-ready;
+        triggered => { root.tooltip-ready = true; }
     }
     init => { Motion.reduced = root.reduced-motion; }
     changed reduced-motion => { Motion.reduced = root.reduced-motion; }
@@ -1854,6 +1927,19 @@ export component AppWindow inherits Window {
                                 return reject;
                             }
                             chip-touch := TouchArea {
+                                // The ring's slot and the quota line explain themselves on hover.
+                                property <bool> over-quota: self.has-hover && !self.pressed
+                                    && (self.mouse-x < chip-title.x
+                                        || (self.mouse-x >= chip-meta.x && self.mouse-x < chip-meta.x + chip-meta.width));
+                                changed over-quota => {
+                                    if (self.over-quota) {
+                                        root.show-tooltip("chip", root.subscription-quota-tooltip,
+                                            subscription-chip.absolute-position.x + chip-slot.x - 3px,
+                                            subscription-chip.absolute-position.y, subscription-chip.height, false);
+                                    } else {
+                                        root.hide-tooltip("chip");
+                                    }
+                                }
                                 clicked => { shelf-open-focus.toggle-menu(false); }
                             }
                         }
@@ -4522,7 +4608,33 @@ export component AppWindow inherits Window {
                                         }
                                         return reject;
                                     }
-                                    profile-row-touch := TouchArea { enabled: parent.enabled; clicked => { if (profile.active) { root.close-profile-menu(); } else { root.activate-profile(profile.id); } } }
+                                    profile-row-touch := TouchArea {
+                                        // Hover works on every row (an expired or locked one still explains its
+                                        // quota); only a switchable row acts on a click.
+                                        enabled: root.profile-menu-open;
+                                        // The ring (left) and the quota column (right) explain themselves on hover.
+                                        property <bool> over-ring: self.mouse-x < row-name.x;
+                                        property <bool> over-quota: self.has-hover && !self.pressed
+                                            && (self.over-ring || self.mouse-x >= row-quota.x - 4px);
+                                        changed over-quota => {
+                                            if (self.over-quota) {
+                                                // From the scroll view: a repeated row's own absolute-position counts its
+                                                // y twice (Slint 1.17).
+                                                root.show-tooltip("row:" + profile.id, profile.quota-tooltip,
+                                                    profile-scroll.absolute-position.x + profile-row.x + (self.over-ring ? 8px : row-quota.x + row-quota.width + 4px),
+                                                    profile-scroll.absolute-position.y + profile-scroll.viewport-y + profile-row.y + 4px,
+                                                    profile-row.height - 8px, !self.over-ring);
+                                            } else {
+                                                root.hide-tooltip("row:" + profile.id);
+                                            }
+                                        }
+                                        clicked => {
+                                            if (!parent.enabled) {
+                                                return;
+                                            }
+                                            if (profile.active) { root.close-profile-menu(); } else { root.activate-profile(profile.id); }
+                                        }
+                                    }
                                     Rectangle { x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px; border-radius: 8px; border-width: parent.has-focus && root.profile-menu-keyboard-open ? 1px : 0px; border-color: Theme.focus; background: transparent; }
                                 }
                             }
@@ -4877,6 +4989,19 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    quota-tooltip := HoverTooltip {
+        property <length> margin: root.resize-border + 8px;
+        property <length> below: root.tooltip-anchor-y + root.tooltip-anchor-height + 6px;
+        text: root.tooltip-owner == "chip" ? root.subscription-quota-tooltip : root.tooltip-text;
+        shown: root.tooltip-visible;
+        text-limit: Math.min(360px, root.width - 2 * self.margin);
+        x: Math.max(self.margin, Math.min(root.width - self.margin - self.width,
+            root.tooltip-align-end ? root.tooltip-anchor-x - self.width : root.tooltip-anchor-x));
+        // Below the anchor; above it when there is no room underneath.
+        y: self.below + self.height <= root.height - self.margin ? self.below
+            : Math.max(self.margin, root.tooltip-anchor-y - 6px - self.height);
     }
 
     // A taskbar restore has no application callback; the native minimized property
