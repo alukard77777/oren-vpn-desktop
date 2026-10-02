@@ -108,7 +108,9 @@ fn backend_with_mihomo(
     NoopController,
     impl Fn(&Snapshot) -> Result<Arc<NoopController>, BackendError> + use<>,
 > {
-    let root = tempfile::tempdir().unwrap();
+    // Kept for the whole test: a dropped TempDir deletes the directory, which Windows refuses
+    // while the store holds it open but Linux allows, failing later writes (StorageFailed).
+    let root: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let store = ProfileStore::open(root.path().join("profiles"), None).unwrap();
     store
         .create_profile(Arc::new(

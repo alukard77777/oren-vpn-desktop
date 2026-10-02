@@ -343,7 +343,8 @@ pub(crate) fn is_rate_limited(status: u16) -> bool {
     matches!(status, 403 | 429)
 }
 
-/// The latest-release JSON of the pinned repository, bounded in size.
+/// The latest-release JSON of the pinned repository, bounded in size (the service-install card).
+#[cfg(windows)]
 pub(crate) fn fetch_latest_release_body(repository: &Repository) -> Result<Vec<u8>, String> {
     fetch_latest_release_body_checked(repository).map_err(|error| match error {
         ApiError::RateLimited => {
