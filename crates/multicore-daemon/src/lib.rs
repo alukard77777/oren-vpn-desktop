@@ -2119,6 +2119,37 @@ mod event_persistence_tests {
     }
 }
 
+/// Whether a refresh made while connected left a pending snapshot the cores would run
+/// differently. A refresh that only changed metadata (traffic, expiry, the provider notice, the
+/// logo) keeps the connection: moving it would stop and restart the same configuration. The
+/// pending snapshot is still what `status` reports, and it becomes current at the next
+/// disconnect.
+fn pending_changes_runtime<P: ProcessController>(state: &CoreRuntime<P>) -> bool {
+    state.pending_snapshot.as_ref().is_some_and(|(_, pending)| {
+        state
+            .snapshot
+            .as_ref()
+            .is_none_or(|current| !same_runtime_payload(current, pending))
+    })
+}
+
+/// Both snapshots stage the same runtime: identical Mihomo and Xray payloads.
+fn same_runtime_payload(left: &Snapshot, right: &Snapshot) -> bool {
+    left.mihomo.raw_yaml() == right.mihomo.raw_yaml()
+        && left.xray.raw_bytes() == right.xray.raw_bytes()
+}
+
+/// Phases of an activation, in milliseconds, for the `subscription_switch` event.
+#[derive(Clone, Copy, Debug, Default)]
+struct ActivationTimings {
+    /// Loading the profile's snapshot from the store.
+    load_ms: u128,
+    /// The controller factory: probing the service, staging the runtime generation.
+    prepare_ms: u128,
+    /// Committing the active profile and applying its catalog.
+    commit_ms: u128,
+}
+
 pub struct PreparedController<P: ProcessController> {
     controller: Arc<P>,
     runtime: Option<StagedRuntime>,
@@ -3406,9 +3437,20 @@ where
         &self,
         id: &ProfileId,
     ) -> Result<StatusDto, ProfileMutationError> {
+        self.activate_subscription_timed(id, &mut ActivationTimings::default())
+            .await
+    }
+
+    /// `activate_subscription`, recording where the time went (see `subscription_switch`).
+    async fn activate_subscription_timed(
+        &self,
+        id: &ProfileId,
+        timings: &mut ActivationTimings,
+    ) -> Result<StatusDto, ProfileMutationError> {
         self.require_disconnected_mutation().await?;
         let _operation = self.operation.lock().await;
         self.require_disconnected_mutation().await?;
+        let started = std::time::Instant::now();
         let (mut revision, physical_generation, mut snapshot) =
             match run_blocking(|| self.store.profile_snapshot_generation(id)) {
                 Ok(loaded) => loaded,
@@ -3419,9 +3461,14 @@ where
                 }
             };
         self.retain_profile_logo(id, physical_generation, &snapshot);
+        timings.load_ms = started.elapsed().as_millis();
         let prepared = self
             .prepare_controller_or_defer("activate_prepare_deferred", &snapshot)
             .await;
+        timings.prepare_ms = started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(timings.load_ms);
         let maintenance_debt = match run_blocking(|| self.store.activate(id)) {
             Ok(_) => false,
             Err(error) if error.mutation_committed() => {
@@ -3476,6 +3523,10 @@ where
             self.reconcile_authoritative().await;
             return Err(ProfileMutationError::Storage);
         }
+        timings.commit_ms = started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(timings.load_ms + timings.prepare_ms);
         Ok(self.current_status().await)
     }
 
@@ -4556,7 +4607,7 @@ where
         // the connection moves to it right away.
         let switch = self.generation_change.lock().await;
         let resume = self
-            .pause_for_generation_change(|state| state.pending_snapshot.is_some())
+            .pause_for_generation_change(pending_changes_runtime)
             .await;
         if let Some(options) = resume {
             self.resume_after_generation_change(options).await;
@@ -4579,18 +4630,43 @@ where
             .map_err(BackendError::from_profile_mutation)?;
         // Switching while connected in always-ready mode: stop, switch, reconnect on the new
         // generation (spec 6). Otherwise switching while connected stays refused.
+        let started = std::time::Instant::now();
         let switch = self.generation_change.lock().await;
+        let waited_ms = started.elapsed().as_millis();
         let resume = self
             .pause_for_generation_change(|state| state.active_profile_id.as_ref() != Some(&id))
             .await;
+        let paused_ms = started.elapsed().as_millis();
+        let mut timings = ActivationTimings::default();
         let result = self
-            .activate_subscription(&id)
+            .activate_subscription_timed(&id, &mut timings)
             .await
             .map_err(BackendError::from_profile_mutation);
+        let activated_ms = started.elapsed().as_millis();
         if let Some(options) = resume {
             self.resume_after_generation_change(options).await;
         }
         drop(switch);
+        if result.is_ok() {
+            // Where a slow switch spends its time: waiting for another switch, stopping the
+            // old connection, loading/staging/committing the new profile, reconnecting.
+            self.inner.write().await.push_event_with_details(
+                Severity::Debug,
+                Component::Core,
+                "subscription_switch",
+                "Подписка переключена.",
+                json!({
+                    "wait_ms": waited_ms,
+                    "pause_ms": paused_ms.saturating_sub(waited_ms),
+                    "load_ms": timings.load_ms,
+                    "prepare_ms": timings.prepare_ms,
+                    "commit_ms": timings.commit_ms,
+                    "resume_ms": started.elapsed().as_millis().saturating_sub(activated_ms),
+                    "switch_ms": started.elapsed().as_millis(),
+                    "reconnected": resume.is_some(),
+                }),
+            );
+        }
         let result = self.rewarm_after(result).await;
         match result {
             Ok(_) if resume.is_some() => Ok(self.current_status().await),
@@ -4620,7 +4696,7 @@ where
         };
         let switch = self.generation_change.lock().await;
         let resume = self
-            .pause_for_generation_change(|state| state.pending_snapshot.is_some())
+            .pause_for_generation_change(pending_changes_runtime)
             .await;
         if let Some(options) = resume {
             self.resume_after_generation_change(options).await;

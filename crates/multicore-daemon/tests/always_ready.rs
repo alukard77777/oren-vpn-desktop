@@ -1263,3 +1263,23 @@ async fn a_connect_during_an_import_switch_waits_and_ends_on_the_new_subscriptio
     assert_eq!(connected.active_profile_id.as_deref(), Some(added.as_str()));
     assert_eq!(h.seen.lock().unwrap().last(), Some(&"c"));
 }
+
+#[tokio::test]
+async fn a_refresh_that_changes_only_metadata_keeps_the_connection() {
+    let h = harness(&[]);
+    enable(&h, true).await;
+    import(&h, NEW_SUBSCRIPTION).await.unwrap();
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let before = h.recording.calls.lock().unwrap().clone();
+
+    // The provider serves the same configuration again: nothing to move the connection to.
+    let status = Backend::refresh_subscription(&*h.backend).await.unwrap();
+
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(*h.recording.calls.lock().unwrap(), before);
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Connected
+    );
+}
