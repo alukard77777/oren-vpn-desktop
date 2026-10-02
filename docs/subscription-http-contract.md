@@ -101,9 +101,10 @@ Metadata may be returned on the successful combined response. In fallback mode, 
 | Announcement label | `sub-info-button-text`, then `banner-button-text` | Sanitized plain text, maximum 32 characters. |
 | Announcement tone | `sub-info-color` | Only `blue`, `green`, or `red`, mapped to semantic info/success/danger styling. |
 | Simplified routes (dumb mode) | `dumb-mode` or any name ending in `-dumb-mode` (for example `flclashx-dumb-mode`) | `on`/`off` (also `true`/`false`, `yes`/`no`, `1`/`0`), case-insensitive; default `off`. When `on`, the home screen and the tray show no group tabs and only the first `proxy-groups` entry of the Mihomo config (its nodes, selection and latency). Every other group keeps working in the core; it is only not shown. Saved with the subscription and re-read on each refresh. |
+| Interface language | `app-language` or any name ending in `-app-language` (for example `flclashx-app-language`) | `ru` or `en`, case-insensitive; a regional tag counts as its base language (`en-US`, `ru_RU`). Other values are ignored. The active subscription's value sets the app language until the user picks one in Settings: the user's choice always wins and the header never overrides it. Without the header the app follows the system language (Russian for `ru`, `be`, `kk`, `ky`, `tg`, `uz`; English for any other, `uk` included; Russian if it cannot be detected). Saved with the subscription and re-read on each refresh. |
 
 Unknown metadata headers are ignored. Generalized vendor prefixes apply only to
-`servicename`, `servicelogo`, `dumb-mode`, and the already supported
+`servicename`, `servicelogo`, `dumb-mode`, `app-language`, and the already supported
 `subscription-userinfo` suffix. A bare `servicelogo` header is not accepted: the name must contain a
 non-empty vendor prefix followed by `-servicelogo`. Remote styling/behavior
 headers such as `flclashx-background`, `ajsdjddj-background`, widgets, settings,
@@ -144,6 +145,7 @@ MyProvider-ServiceLogo: https://cdn.example.com/logo.png
 Announce: Плановое обслуживание 20 сентября
 Sub-Info-Color: blue
 Dumb-Mode: off
+App-Language: ru
 X-Multicore-Revision: revision-42
 Cache-Control: private, no-cache
 
