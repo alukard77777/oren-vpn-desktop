@@ -18,7 +18,8 @@ use slint::winit_030::WinitWindowAccessor;
 
 use crate::AppWindow;
 
-/// How long the main window stays hidden in the tray before its renderer is released.
+/// How long the main window stays hidden in the tray before its renderer is released;
+/// the tray popup is dropped after staying closed about as long (`TrayPopupSlot`).
 pub(crate) const RELEASE_AFTER: Duration = Duration::from_secs(60);
 
 /// Slint 1.17 destroys a window on `hide()` when this variable is set.
