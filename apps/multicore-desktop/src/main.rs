@@ -20,6 +20,8 @@ mod preferences;
 #[cfg(all(test, feature = "preview-render"))]
 mod preview_render;
 mod renderer_fallback;
+#[cfg(windows)]
+mod renderer_release;
 mod save_dialog;
 mod service_install;
 mod service_logo;
@@ -1953,13 +1955,18 @@ fn wire_preference_persistence(
         if scale_factor != last_scale_factor.replace(scale_factor) {
             apply_latest_snapshot(&ui, &model);
         }
-        if let Some(current) = ui.window().with_winit_window(current_monitor_signature) {
-            let previous = last_monitor_signature.get();
-            if monitor_cap_changed(previous, current)
-                && let Some(applied) = ui.window().with_winit_window(set_current_monitor_max_size)
-            {
-                last_monitor_signature.set(applied);
+        match ui.window().with_winit_window(current_monitor_signature) {
+            Some(current) => {
+                let previous = last_monitor_signature.get();
+                if monitor_cap_changed(previous, current)
+                    && let Some(applied) =
+                        ui.window().with_winit_window(set_current_monitor_max_size)
+                {
+                    last_monitor_signature.set(applied);
+                }
             }
+            // Released while hidden in the tray: cap the recreated window again.
+            None => last_monitor_signature.set(None),
         }
         process_writer_results(
             &ui,
@@ -2512,7 +2519,8 @@ fn close_window(weak: &slint::Weak<AppWindow>, tray_available: bool) {
 /// Wayland cannot hide a native Winit window: Slint must destroy its surface
 /// and recreate it on show(). The explicit run_event_loop_until_quit() keeps
 /// tray events and timers alive while there are no visible windows.
-/// Preserve the native-only hide path on Windows.
+/// Windows hides only the native window, so reopening is instant, and releases its
+/// renderer once it stays hidden (`renderer_release`).
 fn hide_window_to_tray(ui: &AppWindow) {
     #[cfg(target_os = "linux")]
     {
@@ -2542,6 +2550,8 @@ fn hide_window_to_tray(ui: &AppWindow) {
         let _ = ui.window().with_winit_window(|window| {
             window.set_visible(false);
         });
+        #[cfg(windows)]
+        renderer_release::release_when_left_hidden(ui);
     }
 }
 
@@ -2882,9 +2892,11 @@ fn toggle_tray_popup(
     );
     sync_tray_live_state(&popup, &main);
     let _ = popup.show();
+    // The main window has no native window while it is released in the tray.
     let monitors = main
         .window()
         .with_winit_window(monitor_rects)
+        .or_else(|| popup.window().with_winit_window(monitor_rects))
         .unwrap_or_default();
     // The remembered size, fitted to this monitor, anchored at the tray corner;
     // the edges away from that corner resize it.
