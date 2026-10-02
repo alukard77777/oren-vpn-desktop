@@ -24,7 +24,7 @@ pub(crate) enum SaveTarget {
 
 /// The owner window, as a raw handle that can cross threads (Windows `HWND`; unused elsewhere).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct OwnerWindow(pub(crate) isize);
+pub(crate) struct OwnerWindow(#[cfg_attr(not(windows), allow(dead_code))] pub(crate) isize);
 
 impl OwnerWindow {
     #[cfg(windows)]
@@ -210,7 +210,8 @@ mod platform {
         let request_path = format!("{PORTAL_PATH}/request/{sender}/{token}");
 
         let main_loop = glib::MainLoop::new(Some(context), false);
-        let answer: Rc<RefCell<Option<Result<Option<PathBuf>, String>>>> = Rc::default();
+        type PortalAnswer = Rc<RefCell<Option<Result<Option<PathBuf>, String>>>>;
+        let answer: PortalAnswer = Rc::default();
         // Subscribed before the call, so an instant answer is not missed.
         let subscription = {
             let answer = answer.clone();
