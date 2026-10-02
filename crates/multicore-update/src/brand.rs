@@ -15,6 +15,10 @@ pub const LEGACY_PRODUCT_NAME: &str = "MultiCore";
 /// name instead of a display name that matches it case-insensitively.
 pub const SERVICE_DISPLAY_NAME: &str = "MULTICORE Service";
 pub const SERVICE_DESCRIPTION: &str = "MULTICORE: ядра Mihomo и Xray для мгновенного подключения";
+/// The 1.1.1 description, the only one the startup migration replaces: since 1.1.4 the
+/// installer writes it in the Windows UI language, and an English one must stay English.
+const LEGACY_SERVICE_DESCRIPTION: &str =
+    "MultiCore: ядра Mihomo и Xray для мгновенного подключения";
 /// Inno Setup's uninstall entry for AppId {D95AB954-248C-44C9-9E3A-952398802A2D}.
 pub const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{D95AB954-248C-44C9-9E3A-952398802A2D}_is1";
 pub const SHORTCUT_FILE_NAME: &str = "MULTICORE.lnk";
@@ -142,14 +146,15 @@ pub fn uninstall_entry_updates(
 }
 
 /// What the service registration still needs: (display name, description) to set, each
-/// `None` when already current. `None` inputs (could not be read) are set again.
+/// `None` when already current. A display name that could not be read is set again; the
+/// description only replaces the 1.1.1 one (the installer localizes it).
 pub fn service_updates(
     display_name: Option<&str>,
     description: Option<&str>,
 ) -> (Option<&'static str>, Option<&'static str>) {
     (
         (display_name != Some(SERVICE_DISPLAY_NAME)).then_some(SERVICE_DISPLAY_NAME),
-        (description != Some(SERVICE_DESCRIPTION)).then_some(SERVICE_DESCRIPTION),
+        (description == Some(LEGACY_SERVICE_DESCRIPTION)).then_some(SERVICE_DESCRIPTION),
     )
 }
 
@@ -816,7 +821,15 @@ mod tests {
         );
         assert_eq!(
             service_updates(None, None),
-            (Some(SERVICE_DISPLAY_NAME), Some(SERVICE_DESCRIPTION))
+            (Some(SERVICE_DISPLAY_NAME), None)
+        );
+        // An English installer's description is not turned back into Russian.
+        assert_eq!(
+            service_updates(
+                Some(SERVICE_DISPLAY_NAME),
+                Some("MULTICORE: Mihomo and Xray cores for instant connection")
+            ),
+            (None, None)
         );
         assert_eq!(
             service_updates(Some(SERVICE_DISPLAY_NAME), Some(SERVICE_DESCRIPTION)),
@@ -999,7 +1012,7 @@ mod tests {
         assert!(installer.contains(&format!("#define AppName \"{PRODUCT_NAME}\"")));
         assert!(installer.contains(&format!("#define AppPublisher \"{PRODUCT_NAME}\"")));
         assert!(installer.contains(&format!("DisplayName= \"{SERVICE_DISPLAY_NAME}\"")));
-        assert!(installer.contains(&format!("\"{SERVICE_DESCRIPTION}\"")));
+        assert!(installer.contains(&format!("russian.ServiceDescription={SERVICE_DESCRIPTION}")));
         assert!(installer.contains(&format!("ValueData: \"{PROTOCOL_DESCRIPTION}\"")));
         assert!(installer.contains("AppId={{D95AB954-248C-44C9-9E3A-952398802A2D}"));
         assert!(UNINSTALL_KEY.ends_with(r"\{D95AB954-248C-44C9-9E3A-952398802A2D}_is1"));

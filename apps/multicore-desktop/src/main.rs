@@ -1113,7 +1113,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         &ui,
         model.clone(),
         update_state.clone(),
-        tray_popup.as_weak(),
+        tray_popup_slot.clone(),
     );
     let _preference_timer = wire_preference_persistence(
         &ui,
@@ -5972,7 +5972,7 @@ fn wire_language(
     ui: &AppWindow,
     model: Arc<Mutex<DesktopViewModel>>,
     update_state: Arc<Mutex<UpdateState>>,
-    tray_popup: slint::Weak<TrayPopup>,
+    tray_popup: Rc<TrayPopupSlot>,
 ) {
     let weak = ui.as_weak();
     ui.on_select_language(move |code| {
@@ -5987,7 +5987,8 @@ fn wire_language(
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        refresh_localized_texts(&ui, &model, &update_state, &tray_popup);
+        // The tray popup exists only while it is in use; a new one is built in the current language.
+        refresh_localized_texts(&ui, &model, &update_state, &tray_popup.weak());
     });
 }
 
