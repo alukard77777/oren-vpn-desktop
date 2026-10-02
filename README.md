@@ -112,7 +112,7 @@ Settings offers separate launch-at-sign-in and auto-connect switches. Auto-conne
 defaults off; when enabled, a background sign-in launch waits for a ready profile
 and network route, then makes one connection attempt. Home shows a dismissible
 update banner only when a newer release is found. MULTICORE checks for releases
-at startup and every 24 hours while it remains open.
+at startup and every 4 hours while it remains open.
 
 The desktop talks only to authenticated loopback `/v1/*` endpoints on its private
 daemon. Requests use a random per-launch bearer token, bounded bodies, no proxy,

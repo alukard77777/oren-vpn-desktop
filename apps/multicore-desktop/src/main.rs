@@ -2069,8 +2069,11 @@ fn wire_updater(
     });
 }
 
+/// How long after the last update check the hourly timer starts another one.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
+
 fn update_check_due(elapsed: Duration, busy: bool) -> bool {
-    elapsed >= Duration::from_secs(24 * 60 * 60) && !busy
+    elapsed >= UPDATE_CHECK_INTERVAL && !busy
 }
 
 fn wire_periodic_update_check(
@@ -8043,9 +8046,11 @@ mod window_tests {
     }
 
     #[test]
-    fn update_check_is_due_once_per_day_but_not_during_an_update_operation() {
-        assert!(!update_check_due(Duration::from_secs(86_399), false));
-        assert!(!update_check_due(Duration::from_secs(86_400), true));
+    fn update_check_is_due_every_four_hours_but_not_during_an_update_operation() {
+        assert_eq!(super::UPDATE_CHECK_INTERVAL, Duration::from_secs(14_400));
+        assert!(!update_check_due(Duration::from_secs(14_399), false));
+        assert!(!update_check_due(Duration::from_secs(14_400), true));
+        assert!(update_check_due(Duration::from_secs(14_400), false));
         assert!(update_check_due(Duration::from_secs(86_400), false));
     }
 
