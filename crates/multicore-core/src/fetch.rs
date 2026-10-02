@@ -761,7 +761,6 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
                     let outcome = match outcome {
                         Ok(mut snapshot) => {
                             self.fetch_optional_logo(&mut snapshot).await;
-                            self.fetch_group_icons(&mut snapshot).await;
                             store.save(snapshot).map_err(|_| FetchError::Persistence)
                         }
                         Err(error) => Err(error),
@@ -795,7 +794,6 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         {
             Ok(mut snapshot) => {
                 self.fetch_optional_logo(&mut snapshot).await;
-                self.fetch_group_icons(&mut snapshot).await;
                 store.save(snapshot).map_err(|_| FetchError::Persistence)
             }
             Err(error) => Err(error),
@@ -834,14 +832,20 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         }
     }
 
-    /// Downloads the images named by Mihomo `proxy-groups[].icon` through the same pinned,
-    /// global-address-only, size- and time-bounded path as the service logo, a few at a time
-    /// and within one overall budget. An icon that fails is marked unfetched, so a refresh
-    /// keeps the previous copy (`Snapshot::with_service_logo_carried_from`).
-    async fn fetch_group_icons(&self, snapshot: &mut Snapshot) {
-        let pending = snapshot.group_icon_urls();
+    /// Downloads Mihomo `proxy-groups[].icon` images (`(group_icon_key, url)` pairs from
+    /// `Snapshot::group_icon_urls`) through the same pinned, global-address-only, size- and
+    /// time-bounded path as the service logo, a few at a time and within one overall budget.
+    /// Returns the canonical PNG of each icon that arrived, by key; failures are left out.
+    ///
+    /// Never part of a subscription refresh: the daemon runs it in the background after the
+    /// subscription is saved, so a slow or dead icon host cannot hold an import up.
+    pub async fn download_group_icons(
+        &self,
+        pending: &[(String, String)],
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut downloaded = std::collections::BTreeMap::new();
         if pending.is_empty() {
-            return;
+            return downloaded;
         }
         let mut outcomes: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(pending.len());
         let fetch_one = |url: Option<String>| async move {
@@ -869,14 +873,12 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
             }
         };
         let _ = tokio::time::timeout(GROUP_ICONS_TOTAL_TIMEOUT, fetch_all).await;
-        for (key, _) in &pending {
-            match outcomes.iter_mut().find(|(done, _)| done == key) {
-                Some((_, png @ Some(_))) => {
-                    snapshot.set_group_icon_png(key.clone(), png.take().expect("checked"));
-                }
-                _ => snapshot.mark_group_icon_unfetched(key.clone()),
+        for (key, png) in outcomes {
+            if let Some(png) = png {
+                downloaded.insert(key, png);
             }
         }
+        downloaded
     }
 }
 

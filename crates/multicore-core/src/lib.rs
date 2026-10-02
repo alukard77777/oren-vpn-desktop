@@ -36,8 +36,8 @@ pub use input::{
 };
 pub use network::default_ipv4_interface;
 pub use profile::{
-    LoadedProfile, MAX_PROFILE_INDEX_BYTES, MAX_PROFILES, MAX_SELECTIONS, MAX_SELECTIONS_BYTES,
-    ProfileError, ProfileId, ProfileStore, ProfileSummary,
+    CachedGroupIcon, LoadedProfile, MAX_CACHED_GROUP_ICONS, MAX_PROFILE_INDEX_BYTES, MAX_PROFILES,
+    MAX_SELECTIONS, MAX_SELECTIONS_BYTES, ProfileError, ProfileId, ProfileStore, ProfileSummary,
 };
 pub use service_logo::{
     MAX_GROUP_ICON_DIMENSION, MAX_GROUP_ICON_OUTPUT_BYTES, MAX_SERVICE_LOGO_BYTES,

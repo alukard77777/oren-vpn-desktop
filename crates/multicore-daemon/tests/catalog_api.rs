@@ -1071,7 +1071,13 @@ async fn reconstructed_daemon_uses_persisted_generation_for_revision_and_ids() {
     );
 }
 
-struct IconFixtureHttp;
+#[derive(Clone, Default)]
+struct IconFixtureHttp {
+    /// Icon requests seen.
+    icon_calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Icon requests fail (an icon host that is down).
+    icons_down: bool,
+}
 
 impl HttpClient for IconFixtureHttp {
     fn get<'a>(
@@ -1108,7 +1114,14 @@ proxy-groups:
                 UA_XRAY => {
                     HttpResponse::new(200, br#"{}"#.to_vec(), std::iter::empty::<(&str, &str)>())
                 }
-                UA_GROUP_ICON if !url.ends_with("missing.svg") => HttpResponse::new(
+                UA_GROUP_ICON if {
+                    self.icon_calls.lock().unwrap().push(url.to_owned());
+                    self.icons_down || url.ends_with("missing.svg")
+                } =>
+                {
+                    return Err(FetchError::Network);
+                }
+                UA_GROUP_ICON => HttpResponse::new(
                     200,
                     format!(
                         "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='{}'/></svg>",
@@ -1124,12 +1137,12 @@ proxy-groups:
 }
 
 #[tokio::test]
-async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
+async fn group_icons_load_in_the_background_and_are_cached_for_the_next_start() {
     let directory = tempfile::tempdir().unwrap();
-    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let http = IconFixtureHttp::default();
     let backend = CoreBackend::new(
-        store,
-        SubscriptionFetcher::new(IconFixtureHttp),
+        ProfileStore::open(directory.path().join("profiles"), None).unwrap(),
+        SubscriptionFetcher::new(http.clone()),
         |_snapshot| Ok(Arc::new(NoopController)),
     )
     .unwrap();
@@ -1139,6 +1152,77 @@ async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
         })
         .await
         .unwrap();
+    // The import did not wait for any icon: they are still loading.
+    assert!(http.icon_calls.lock().unwrap().is_empty());
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(catalog.groups[0].icon_id, None);
+    assert!(catalog.groups[0].icon_pending);
+    assert!(
+        catalog.groups[0].nodes[0].icon_pending,
+        "Auto is a group with an icon"
+    );
+    assert!(
+        !catalog.groups[0].nodes[1].icon_pending,
+        "a server names no icon"
+    );
+    let revision = catalog.revision;
+
+    assert!(backend.fetch_group_icons().await);
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(
+        catalog.revision, revision,
+        "icons do not invalidate selections"
+    );
+    assert!(catalog.groups[0].icon_id.is_some());
+    assert!(!catalog.groups[0].icon_pending);
+    assert!(catalog.groups[0].nodes[0].icon_id.is_some());
+    // A failed icon settles too: the UI shows its fallback glyph instead of a placeholder.
+    assert_eq!(catalog.groups[1].icon_id, None);
+    assert!(!catalog.groups[1].icon_pending);
+    let main_icon = catalog.groups[0].icon_id.clone();
+    drop(backend);
+
+    // The next start shows the cached icons at once, without the icon host.
+    let offline = IconFixtureHttp {
+        icons_down: true,
+        ..IconFixtureHttp::default()
+    };
+    let backend = CoreBackend::new(
+        ProfileStore::open(directory.path().join("profiles"), None).unwrap(),
+        SubscriptionFetcher::new(offline.clone()),
+        |_snapshot| Ok(Arc::new(NoopController)),
+    )
+    .unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    assert_eq!(catalog.groups[0].icon_id, main_icon);
+    assert!(!catalog.groups[0].icon_pending);
+    // Only the icon that never arrived is still being tried.
+    assert!(catalog.groups[1].icon_pending);
+    backend.fetch_group_icons().await;
+    assert_eq!(
+        offline.icon_calls.lock().unwrap().as_slice(),
+        ["https://icons.example/missing.svg"]
+    );
+    assert!(!backend.catalog().await.unwrap().groups[1].icon_pending);
+}
+
+#[tokio::test]
+async fn catalog_exposes_downloaded_group_icons_by_opaque_id_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let backend = CoreBackend::new(
+        store,
+        SubscriptionFetcher::new(IconFixtureHttp::default()),
+        |_snapshot| Ok(Arc::new(NoopController)),
+    )
+    .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://example.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    backend.fetch_group_icons().await;
 
     let catalog = backend.catalog().await.unwrap();
     let main = &catalog.groups[0];

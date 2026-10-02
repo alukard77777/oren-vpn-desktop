@@ -15,6 +15,8 @@ export struct UiCatalogGroup {
     id: string,
     icon: string,
     icon-image: image,
+    // The daemon is still downloading the group's icon image: show the loading placeholder.
+    icon-loading: bool,
     label: string,
     selected: bool,
 }
@@ -23,6 +25,7 @@ export struct UiCatalogNode {
     id: string,
     icon: string,
     icon-image: image,
+    icon-loading: bool,
     label: string,
     selected: bool,
     latency-text: string,
@@ -37,6 +40,7 @@ export struct UiRouteSearchHit {
     node-id: string,
     icon: string,
     icon-image: image,
+    icon-loading: bool,
     prefix: string,
     matched: string,
     suffix: string,

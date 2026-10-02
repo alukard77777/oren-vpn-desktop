@@ -211,6 +211,8 @@ pub(crate) struct CatalogGroupPresentation {
     pub(crate) selected_node_label: String,
     /// The group's downloaded icon image (`crisp_image::group_icon`), if any.
     pub(crate) icon_id: Option<String>,
+    /// The icon is still being downloaded: the slot shows a loading placeholder.
+    pub(crate) icon_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +222,7 @@ pub(crate) struct TrayCatalogGroupPresentation {
     pub(crate) selected_node_label: String,
     pub(crate) nodes: Vec<CatalogNodePresentation>,
     pub(crate) icon_id: Option<String>,
+    pub(crate) icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -232,6 +235,8 @@ pub(crate) struct CatalogNodePresentation {
     pub(crate) latency_tone: String,
     /// The node is a proxy group with a downloaded icon image.
     pub(crate) icon_id: Option<String>,
+    /// That icon is still being downloaded: the slot shows a loading placeholder.
+    pub(crate) icon_pending: bool,
     /// Its latency is being re-measured on its own (right-click): the row shows the
     /// placeholder pill instead of the previous value.
     pub(crate) measuring: bool,
@@ -256,6 +261,7 @@ pub(crate) struct RouteSearchHit {
     pub(crate) icon: String,
     /// The node is a proxy group with a downloaded icon image.
     pub(crate) icon_id: Option<String>,
+    pub(crate) icon_pending: bool,
     pub(crate) prefix: String,
     pub(crate) matched: String,
     pub(crate) suffix: String,
@@ -286,6 +292,8 @@ pub(crate) struct CatalogPresentation {
     pub(crate) error: Option<String>,
     /// The provider's `dumb-mode`: only the first group is shown and there are no group tabs.
     pub(crate) dumb_mode: bool,
+    /// Some group icon is still being downloaded by the daemon (`poll_catalog_icons`).
+    pub(crate) icons_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -377,6 +385,7 @@ struct CatalogGroup {
     is_primary: bool,
     nodes: Vec<CatalogNodePresentation>,
     icon_id: Option<String>,
+    icon_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2799,6 +2808,51 @@ impl DesktopViewModel {
         }
     }
 
+    /// Some icon of the loaded catalog is still being downloaded by the daemon.
+    pub(crate) fn catalog_icons_pending(&self) -> bool {
+        self.catalog_groups
+            .iter()
+            .any(|group| group.icon_pending || group.nodes.iter().any(|node| node.icon_pending))
+    }
+
+    /// Takes only the icon fields of `catalog` (a background re-read while icons load) for the
+    /// same revision: selection, latency and loading state are left alone, so the route list
+    /// stays usable. Returns whether anything changed; a different revision is ignored (the
+    /// regular catalog reload handles it).
+    pub(crate) fn apply_catalog_icons(&mut self, catalog: &DaemonCatalog) -> bool {
+        if self.catalog_revision != Some(catalog.revision) {
+            return false;
+        }
+        let mut changed = false;
+        for incoming in &catalog.groups {
+            let Some(group) = self
+                .catalog_groups
+                .iter_mut()
+                .find(|group| group.id == incoming.id)
+            else {
+                continue;
+            };
+            let icon_id = incoming.icon_id.clone().filter(|id| is_icon_id(id));
+            changed |= group.icon_id != icon_id || group.icon_pending != incoming.icon_pending;
+            group.icon_id = icon_id;
+            group.icon_pending = incoming.icon_pending;
+            for incoming_node in &incoming.nodes {
+                if let Some(node) = group
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == incoming_node.id)
+                {
+                    let icon_id = incoming_node.icon_id.clone().filter(|id| is_icon_id(id));
+                    changed |=
+                        node.icon_id != icon_id || node.icon_pending != incoming_node.icon_pending;
+                    node.icon_id = icon_id;
+                    node.icon_pending = incoming_node.icon_pending;
+                }
+            }
+        }
+        changed
+    }
+
     /// Every icon id the loaded catalog refers to (groups and group-nodes), deduplicated.
     pub(crate) fn catalog_icon_ids(&self) -> Vec<String> {
         let mut ids = BTreeSet::new();
@@ -2850,6 +2904,7 @@ impl DesktopViewModel {
                     .map(|node| node.label.clone())
                     .unwrap_or_else(|| "Не выбран".into()),
                 icon_id: group.icon_id.clone(),
+                icon_pending: group.icon_pending,
             })
             .collect();
         let nodes = selected
@@ -2892,6 +2947,7 @@ impl DesktopViewModel {
             selection_queued: !self.queued_selections.is_empty(),
             error: self.catalog_error.clone(),
             dumb_mode: self.dumb_mode(),
+            icons_pending: self.catalog_icons_pending(),
         }
     }
 
@@ -2919,6 +2975,7 @@ impl DesktopViewModel {
                         .unwrap_or_else(|| "Не выбран".into()),
                     nodes,
                     icon_id: group.icon_id.clone(),
+                    icon_pending: group.icon_pending,
                 }
             })
             .collect()
@@ -2971,6 +3028,7 @@ impl DesktopViewModel {
                     id: group.id,
                     label: safe_catalog_label(&group.label),
                     icon_id: group.icon_id.filter(|id| is_icon_id(id)),
+                    icon_pending: group.icon_pending,
                     nodes: group
                         .nodes
                         .into_iter()
@@ -3002,6 +3060,7 @@ impl DesktopViewModel {
                                 latency_text,
                                 latency_tone,
                                 icon_id: node.icon_id.filter(|id| is_icon_id(id)),
+                                icon_pending: node.icon_pending,
                                 measuring: false,
                             }
                         })
@@ -3537,6 +3596,7 @@ pub(crate) fn search_routes(groups: &[CatalogSearchGroup], query: &str) -> Vec<R
                 node_id: node.id.clone(),
                 icon: display.icon.clone(),
                 icon_id: node.icon_id.clone(),
+                icon_pending: node.icon_pending,
                 prefix: prefix.to_owned(),
                 matched: matched.to_owned(),
                 suffix: suffix.to_owned(),
@@ -3590,6 +3650,7 @@ mod route_search_tests {
             latency_text: "42 мс".into(),
             latency_tone: "success".into(),
             icon_id: None,
+            icon_pending: false,
             measuring: false,
         }
     }
@@ -6911,12 +6972,14 @@ mod tests {
                     label: "Резерв https://private.invalid/path".into(),
                     selected: false,
                     icon_id: None,
+                    icon_pending: false,
                     nodes: vec![DaemonCatalogNode {
                         id: "opaque:node-a".into(),
                         label: "Север".into(),
                         selected: false,
                         delay_ms: None,
                         icon_id: None,
+                        icon_pending: false,
                     }],
                 },
                 DaemonCatalogGroup {
@@ -6924,6 +6987,7 @@ mod tests {
                     label: "Основной".into(),
                     selected: true,
                     icon_id: None,
+                    icon_pending: false,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "opaque:node-b".into(),
@@ -6931,6 +6995,7 @@ mod tests {
                             selected: true,
                             delay_ms: Some(37),
                             icon_id: None,
+                            icon_pending: false,
                         },
                         DaemonCatalogNode {
                             id: "opaque:node-c".into(),
@@ -6938,6 +7003,7 @@ mod tests {
                             selected: false,
                             delay_ms: Some(51),
                             icon_id: None,
+                            icon_pending: false,
                         },
                     ],
                 },
@@ -7396,6 +7462,71 @@ mod tests {
             .expect("accepted completion");
         assert!(outcome.refresh_catalog);
         assert!(!view_model.catalog_presentation().nodes[0].measuring);
+    }
+
+    #[test]
+    fn loading_icons_arrive_without_reloading_the_route_list() {
+        let mut catalog = catalog_fixture();
+        catalog.groups[1].icon_pending = true;
+        catalog.groups[1].nodes[0].icon_pending = true;
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = view_model.begin_refresh();
+        view_model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                profile: Some("Тестовый".into()),
+                current_node: Some("Первый".into()),
+                ..DaemonStatus::default()
+            }),
+        );
+        let request = view_model.begin_catalog_request().expect("catalog request");
+        view_model
+            .finish_catalog(request.token, Ok(catalog.clone()))
+            .expect("catalog completion");
+        let before = view_model.catalog_presentation();
+        assert!(before.icons_pending);
+        assert!(before.groups[1].icon_pending);
+        assert!(before.nodes[0].icon_pending);
+        assert!(before.selection_enabled);
+
+        // Another revision is the regular reload's business.
+        let mut newer = catalog.clone();
+        newer.revision += 1;
+        newer.groups[1].icon_pending = false;
+        assert!(!view_model.apply_catalog_icons(&newer));
+        assert!(view_model.catalog_icons_pending());
+
+        let mut arrived = catalog;
+        arrived.groups[1].icon_pending = false;
+        arrived.groups[1].icon_id = Some("0123456789abcdef0123456789abcdef".into());
+        arrived.groups[1].nodes[0].icon_pending = false;
+        // Nothing else of the re-read is taken: not a selection, not a label.
+        arrived.groups[1].nodes[1].selected = true;
+        arrived.groups[1].nodes[0].label = "Другой".into();
+        assert!(view_model.apply_catalog_icons(&arrived));
+        assert!(!view_model.apply_catalog_icons(&arrived), "nothing new");
+        let after = view_model.catalog_presentation();
+        assert!(!after.icons_pending);
+        assert_eq!(
+            after.groups[1].icon_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(!after.nodes[0].icon_pending);
+        assert_eq!(
+            after.nodes,
+            before
+                .nodes
+                .iter()
+                .cloned()
+                .map(|mut node| {
+                    node.icon_pending = false;
+                    node
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(after.selection_enabled);
+        assert!(!after.loading);
     }
 
     #[test]

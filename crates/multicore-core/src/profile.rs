@@ -211,6 +211,7 @@ pub struct ProfileStore {
     _lock: StoreLock,
     index: RwLock<ProfileIndex>,
     selection_lock: Mutex<()>,
+    group_icon_cache_lock: Mutex<()>,
     maintenance_debt: AtomicBool,
     #[cfg(test)]
     index_fault: std::sync::atomic::AtomicU8,
@@ -285,6 +286,7 @@ impl ProfileStore {
             _lock: lock,
             index: RwLock::new(index),
             selection_lock: Mutex::new(()),
+            group_icon_cache_lock: Mutex::new(()),
             maintenance_debt: AtomicBool::new(false),
             #[cfg(test)]
             index_fault: std::sync::atomic::AtomicU8::new(0),
@@ -304,6 +306,55 @@ impl ProfileStore {
         cleanup_unindexed_profile_directories(&store.root, &index)?;
         drop(index);
         Ok(store)
+    }
+
+    /// Downloaded Mihomo group icons by `group_icon_key`, shared by all profiles (an icon URL
+    /// is downloaded once whichever subscription names it). A missing or damaged cache reads
+    /// as empty; every entry is validated again.
+    pub fn group_icon_cache(&self) -> BTreeMap<String, CachedGroupIcon> {
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let Ok(Some((true, len))) = self.root.file_metadata(OsStr::new(GROUP_ICON_CACHE_FILE))
+        else {
+            return BTreeMap::new();
+        };
+        if len > MAX_GROUP_ICON_CACHE_BYTES {
+            return BTreeMap::new();
+        }
+        self.root
+            .read_file(
+                OsStr::new(GROUP_ICON_CACHE_FILE),
+                MAX_GROUP_ICON_CACHE_BYTES,
+            )
+            .map(|bytes| decode_group_icon_cache(&bytes))
+            .unwrap_or_default()
+    }
+
+    /// Replaces the group icon cache with `icons`, keeping the most recently fetched
+    /// `MAX_CACHED_GROUP_ICONS` valid entries.
+    pub fn save_group_icon_cache(
+        &self,
+        icons: &BTreeMap<String, CachedGroupIcon>,
+    ) -> Result<(), ProfileError> {
+        let bytes = encode_group_icon_cache(icons)?;
+        let _guard = self
+            .group_icon_cache_lock
+            .lock()
+            .expect("group icon cache lock poisoned");
+        let temp = OsStr::new(GROUP_ICON_CACHE_TEMP_FILE);
+        if self.root.file_metadata(temp)?.is_some() {
+            self.root.remove_file(temp)?;
+        }
+        let result = self.root.write_file(temp, &bytes).and_then(|()| {
+            self.root
+                .replace_file(temp, OsStr::new(GROUP_ICON_CACHE_FILE))
+        });
+        if result.is_err() {
+            let _ = self.root.remove_file(temp);
+        }
+        Ok(result?)
     }
 
     pub fn list(&self) -> Result<Vec<ProfileSummary>, ProfileError> {
@@ -954,6 +1005,79 @@ fn profile_entry_ids(root: &DirectoryCapability) -> Result<Vec<ProfileId>, Profi
         .collect::<Vec<_>>();
     ids.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     Ok(ids)
+}
+
+const GROUP_ICON_CACHE_FILE: &str = "group-icons.json";
+const GROUP_ICON_CACHE_TEMP_FILE: &str = "group-icons.json.tmp";
+/// At most this many icons are kept (the most recently downloaded ones).
+pub const MAX_CACHED_GROUP_ICONS: usize = 64;
+const MAX_GROUP_ICON_CACHE_BYTES: u64 =
+    (MAX_CACHED_GROUP_ICONS * crate::MAX_GROUP_ICON_OUTPUT_BYTES * 4 / 3 + 64 * 1024) as u64;
+
+/// One cached group icon: its canonical PNG and when it was downloaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedGroupIcon {
+    pub png: Vec<u8>,
+    pub fetched_at_unix: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedGroupIconRecord {
+    png: String,
+    fetched_at_unix: u64,
+}
+
+fn encode_group_icon_cache(
+    icons: &BTreeMap<String, CachedGroupIcon>,
+) -> Result<Vec<u8>, ProfileError> {
+    use base64::Engine as _;
+    let mut newest: Vec<(&String, &CachedGroupIcon)> = icons
+        .iter()
+        .filter(|(key, icon)| {
+            crate::snapshot::is_group_icon_key(key)
+                && crate::service_logo::is_canonical_group_icon(&icon.png)
+        })
+        .collect();
+    newest.sort_by_key(|(_, icon)| std::cmp::Reverse(icon.fetched_at_unix));
+    newest.truncate(MAX_CACHED_GROUP_ICONS);
+    let records: BTreeMap<&str, CachedGroupIconRecord> = newest
+        .into_iter()
+        .map(|(key, icon)| {
+            (
+                key.as_str(),
+                CachedGroupIconRecord {
+                    png: base64::engine::general_purpose::STANDARD.encode(&icon.png),
+                    fetched_at_unix: icon.fetched_at_unix,
+                },
+            )
+        })
+        .collect();
+    serde_json::to_vec(&records).map_err(|error| ProfileError::Io(io::Error::other(error)))
+}
+
+fn decode_group_icon_cache(bytes: &[u8]) -> BTreeMap<String, CachedGroupIcon> {
+    use base64::Engine as _;
+    let Ok(records) = serde_json::from_slice::<BTreeMap<String, CachedGroupIconRecord>>(bytes)
+    else {
+        return BTreeMap::new();
+    };
+    records
+        .into_iter()
+        .filter(|(key, _)| crate::snapshot::is_group_icon_key(key))
+        .filter_map(|(key, record)| {
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(record.png)
+                .ok()?;
+            crate::service_logo::is_canonical_group_icon(&png).then_some((
+                key,
+                CachedGroupIcon {
+                    png,
+                    fetched_at_unix: record.fetched_at_unix,
+                },
+            ))
+        })
+        .take(MAX_CACHED_GROUP_ICONS)
+        .collect()
 }
 
 fn cleanup_unindexed_profile_directories(

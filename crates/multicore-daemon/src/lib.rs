@@ -5,7 +5,7 @@ pub mod service_client;
 pub mod system_proxy;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     fmt,
     fs::{self, File, OpenOptions},
@@ -16,7 +16,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -304,6 +304,10 @@ pub struct GroupDto {
     /// Opaque id of the group's downloaded `icon` image (`GET /v1/group-icons/{id}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_id: Option<String>,
+    /// The group names an icon image that is still being downloaded: the UI shows a loading
+    /// placeholder until the catalog carries `icon_id` (or settles without one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -316,6 +320,9 @@ pub struct NodeDto {
     /// When the node is itself a proxy group (e.g. a url-test "Auto"), that group's icon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_id: Option<String>,
+    /// That icon is still being downloaded (see `GroupDto::icon_pending`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2274,9 +2281,112 @@ struct CoreRuntime<P: ProcessController> {
     /// Catalog revision whose cores the always-ready service already runs while Ready.
     warm_revision: Option<u64>,
     readiness: Option<Arc<dyn CoresReadiness>>,
+    /// Downloaded group icons; every installed snapshot gets the cached ones attached.
+    group_icons: Arc<GroupIconCache>,
+    /// Catalog revision whose background icon download has finished (successfully or not).
+    icons_settled_revision: Option<u64>,
+}
+
+/// Downloaded Mihomo group icons by icon URL key, shared by every profile and persisted in
+/// the profile store. A subscription is saved without waiting for its icons: they are
+/// downloaded in the background (`CoreBackend::fetch_group_icons`), and the next start shows
+/// them at once without the icon host.
+#[derive(Default)]
+struct GroupIconCache {
+    icons: std::sync::Mutex<BTreeMap<String, multicore_core::CachedGroupIcon>>,
+    /// Wakes the background download after a snapshot with icons was installed.
+    requests: Arc<tokio::sync::Notify>,
+}
+
+/// A cached icon older than this is downloaded again in the background (the cached copy stays
+/// on screen meanwhile), so a provider swapping the image behind a URL is picked up.
+const GROUP_ICON_REFRESH_AFTER_SECS: u64 = 12 * 60 * 60;
+
+impl GroupIconCache {
+    fn new(icons: BTreeMap<String, multicore_core::CachedGroupIcon>) -> Self {
+        Self {
+            icons: std::sync::Mutex::new(icons),
+            requests: Arc::default(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, multicore_core::CachedGroupIcon>> {
+        self.icons.lock().expect("group icon cache lock poisoned")
+    }
+
+    /// `snapshot` with the cached images of the icons its config names.
+    fn fill(&self, snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
+        let images: BTreeMap<String, Vec<u8>> = {
+            let icons = self.lock();
+            snapshot
+                .group_icon_urls()
+                .into_iter()
+                .filter_map(|(key, _)| icons.get(&key).map(|icon| (key, icon.png.clone())))
+                .collect()
+        };
+        if images.is_empty() {
+            snapshot
+        } else {
+            snapshot.with_group_icons(&images)
+        }
+    }
+
+    fn needs_download(&self, key: &str, now: u64) -> bool {
+        self.lock().get(key).is_none_or(|icon| {
+            icon.fetched_at_unix
+                .saturating_add(GROUP_ICON_REFRESH_AFTER_SECS)
+                <= now
+        })
+    }
+
+    /// Adds `images` (by key) downloaded at `fetched_at_unix`, or copies a snapshot carried
+    /// when the cache has none (`fetched_at_unix` 0: downloaded again soon). Returns whether
+    /// the cache changed.
+    fn store(&self, images: BTreeMap<String, Vec<u8>>, fetched_at_unix: u64, keep: bool) -> bool {
+        let mut icons = self.lock();
+        let mut changed = false;
+        for (key, png) in images {
+            if keep && icons.contains_key(&key) {
+                continue;
+            }
+            icons.insert(
+                key,
+                multicore_core::CachedGroupIcon {
+                    png,
+                    fetched_at_unix,
+                },
+            );
+            changed = true;
+        }
+        changed
+    }
 }
 
 impl<P: ProcessController> CoreRuntime<P> {
+    /// The catalog of the installed snapshot, rebuilt in place (same revision).
+    fn rebuild_catalog(&mut self) {
+        if let Some(snapshot) = &self.snapshot {
+            let revision = self.catalog.revision;
+            self.catalog = build_catalog(
+                snapshot,
+                revision,
+                self.profile.as_deref(),
+                &self.selected_nodes,
+                self.icons_pending(revision),
+            );
+        }
+    }
+
+    /// Icons of the installed snapshot are missing and their background download for this
+    /// revision has not finished yet.
+    fn icons_pending(&self, revision: u64) -> bool {
+        self.icons_settled_revision != Some(revision)
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.missing_group_icon_urls().is_empty())
+    }
+
     fn empty() -> Self {
         Self {
             active_profile_id: None,
@@ -2298,6 +2408,8 @@ impl<P: ProcessController> CoreRuntime<P> {
             events: EventBuffer::default(),
             warm_revision: None,
             readiness: None,
+            group_icons: Arc::default(),
+            icons_settled_revision: None,
         }
     }
 
@@ -2487,13 +2599,13 @@ impl<P: ProcessController> CoreRuntime<P> {
         self.current_node = primary
             .and_then(|index| self.selected_nodes.get(index).cloned())
             .flatten();
-        self.catalog = build_catalog(
-            &snapshot,
-            revision,
-            self.profile.as_deref(),
-            &self.selected_nodes,
-        );
-        self.snapshot = Some(snapshot);
+        let names_icons = !snapshot.group_icon_urls().is_empty();
+        self.snapshot = Some(self.group_icons.fill(snapshot));
+        self.catalog.revision = revision;
+        self.rebuild_catalog();
+        if names_icons && self.icons_settled_revision != Some(revision) {
+            self.group_icons.requests.notify_one();
+        }
         self.pending_snapshot = None;
         self.message = None;
         self.degraded = false;
@@ -2706,6 +2818,9 @@ where
             None => CoreRuntime::empty(),
         };
         let mut profile_logo_leases = HashMap::new();
+        inner.group_icons = Arc::new(GroupIconCache::new(run_blocking(|| {
+            store.group_icon_cache()
+        })));
         inner.active_profile_id = store.active_id();
         if let Ok(Some((id, revision, physical_generation, snapshot))) =
             store.active_snapshot_generation()
@@ -2747,6 +2862,63 @@ where
             profile_logo_leases: std::sync::Mutex::new(profile_logo_leases),
             inner: RwLock::new(inner),
         })
+    }
+
+    /// Signalled whenever group icons of the installed snapshot should be downloaded; the
+    /// daemon's icon task waits on it and runs `fetch_group_icons`.
+    pub async fn group_icon_requests(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.read().await.group_icons.requests.clone()
+    }
+
+    /// Downloads the group icons the installed snapshot names but the cache lacks (or holds
+    /// an old copy of), caches and persists them, and attaches them to the catalog. Runs in
+    /// the background: imports, refreshes and switches never wait for icon hosts. Returns
+    /// whether the catalog changed.
+    pub async fn fetch_group_icons(&self) -> bool {
+        let (snapshot, revision, cache) = {
+            let state = self.inner.read().await;
+            let Some(snapshot) = state.snapshot.clone() else {
+                return false;
+            };
+            (snapshot, state.catalog.revision, state.group_icons.clone())
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        // Icons a 1.1.2 snapshot carried seed the cache (and are re-checked soon).
+        let mut changed = cache.store(snapshot.group_icon_pngs(), 0, true);
+        let wanted: Vec<(String, String)> = snapshot
+            .group_icon_urls()
+            .into_iter()
+            .filter(|(key, _)| cache.needs_download(key, now))
+            .collect();
+        let downloaded = self.fetcher.download_group_icons(&wanted).await;
+        changed |= cache.store(downloaded, now, false);
+        if changed {
+            let icons = cache.lock().clone();
+            if run_blocking(|| self.store.save_group_icon_cache(&icons)).is_err() {
+                self.inner.write().await.push_event(
+                    Severity::Warning,
+                    Component::Subscription,
+                    "group_icon_cache",
+                    "Group icons could not be saved; they are downloaded again next start.",
+                );
+            }
+        }
+        let mut state = self.inner.write().await;
+        // A newer snapshot was installed meanwhile: it queued its own pass.
+        if state.catalog.revision != revision {
+            return false;
+        }
+        let Some(current) = state.snapshot.clone() else {
+            return false;
+        };
+        state.snapshot = Some(cache.fill(current));
+        let settled_now = state.icons_settled_revision != Some(revision);
+        state.icons_settled_revision = Some(revision);
+        let before = state.catalog.clone();
+        state.rebuild_catalog();
+        settled_now || state.catalog != before
     }
 
     /// Always-ready mode: from now on the cores are kept running while Ready (whenever the
@@ -4884,12 +5056,7 @@ where
                 state.current_node = Some(raw_node);
             }
         }
-        state.catalog = build_catalog(
-            &snapshot,
-            request.revision,
-            state.profile.as_deref(),
-            &state.selected_nodes,
-        );
+        state.rebuild_catalog();
         state.push_event(
             Severity::Info,
             Component::Mihomo,
@@ -5338,7 +5505,13 @@ fn build_catalog(
     revision: u64,
     profile: Option<&str>,
     selected_nodes: &[Option<String>],
+    icons_pending: bool,
 ) -> CatalogDto {
+    let icon = |name: &str| {
+        let id = snapshot.group_icon_id(name);
+        let pending = icons_pending && id.is_none() && snapshot.names_group_icon(name);
+        (id, pending)
+    };
     let source_groups = selectable_groups(snapshot);
     let selected_group_index =
         profile.and_then(|profile| source_groups.iter().position(|group| group.name == profile));
@@ -5356,20 +5529,26 @@ fn build_catalog(
                 .and_then(|current_node| group.nodes.iter().position(|node| *node == current_node));
             let nodes = group
                 .offered_nodes()
-                .map(|(node_index, node)| NodeDto {
-                    id: catalog_node_id(revision, group_index, node_index),
-                    label: safe_catalog_label(node, "Узел", node_index),
-                    selected: selected_node_index == Some(node_index),
-                    delay_ms: None,
-                    icon_id: snapshot.group_icon_id(node),
+                .map(|(node_index, node)| {
+                    let (icon_id, icon_pending) = icon(node);
+                    NodeDto {
+                        id: catalog_node_id(revision, group_index, node_index),
+                        label: safe_catalog_label(node, "Узел", node_index),
+                        selected: selected_node_index == Some(node_index),
+                        delay_ms: None,
+                        icon_id,
+                        icon_pending,
+                    }
                 })
                 .collect();
+            let (icon_id, icon_pending) = icon(group.name);
             GroupDto {
                 id: catalog_group_id(revision, group_index),
                 label: safe_catalog_label(group.name, "Группа", group_index),
                 selected,
                 nodes,
-                icon_id: snapshot.group_icon_id(group.name),
+                icon_id,
+                icon_pending,
             }
         })
         .collect();

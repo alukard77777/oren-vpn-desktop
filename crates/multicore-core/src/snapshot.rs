@@ -38,11 +38,10 @@ pub struct Snapshot {
     /// time (never persisted); see `with_service_logo_carried_from`.
     service_logo_unfetched: bool,
     /// Normalized PNGs of Mihomo `proxy-groups[].icon` images, keyed by `group_icon_key`
-    /// of the icon URL. Persisted as `group-icons.json` in the snapshot generation.
+    /// of the icon URL. Attached after the subscription is saved (`with_group_icons`; the
+    /// daemon downloads and caches them in the background); generations written by 1.1.2
+    /// also carry a `group-icons.json`, which is still read.
     group_icons: BTreeMap<String, GroupIcon>,
-    /// Icon URLs that could not be downloaded this time (never persisted); see
-    /// `with_service_logo_carried_from`.
-    group_icons_unfetched: BTreeSet<String>,
 }
 
 /// At most this many distinct group icon URLs are downloaded per subscription.
@@ -83,7 +82,7 @@ fn group_icon_key_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn is_group_icon_key(key: &str) -> bool {
+pub(crate) fn is_group_icon_key(key: &str) -> bool {
     key.len() == 32
         && key
             .bytes()
@@ -205,7 +204,6 @@ impl Snapshot {
             service_logo_file: None,
             service_logo_unfetched: false,
             group_icons: BTreeMap::new(),
-            group_icons_unfetched: BTreeSet::new(),
         })
     }
 
@@ -337,35 +335,23 @@ impl Snapshot {
     /// (a network blip, or a fake-ip VPN answering DNS) the refreshed profile
     /// used to be saved without any logo. Keeps `previous`'s logo in that
     /// case only - a subscription that no longer names a logo drops it.
-    ///
-    /// Group icons follow the same rule per icon URL: one that could not be downloaded keeps
-    /// `previous`'s copy for the same URL; an icon the config no longer names is not kept.
     pub fn with_service_logo_carried_from(self: Arc<Self>, previous: &Snapshot) -> Arc<Self> {
         let carry_logo = self.service_logo_unfetched
             && self.service_logo_png.is_none()
             && previous.service_logo_png.is_some();
-        let carry_icons = self
-            .group_icons_unfetched
-            .iter()
-            .any(|key| previous.group_icons.contains_key(key));
-        if !carry_logo && !carry_icons {
+        if !carry_logo {
             return self;
         }
         let mut carried = Arc::unwrap_or_clone(self);
-        if carry_logo && let Some(png) = previous.service_logo_png.clone() {
+        if let Some(png) = previous.service_logo_png.clone() {
             carried.set_service_logo_png(png);
-        }
-        for key in std::mem::take(&mut carried.group_icons_unfetched) {
-            if let Some(png) = previous.group_icons.get(&key) {
-                carried.group_icons.insert(key, png.clone());
-            }
         }
         Arc::new(carried)
     }
 
     /// The distinct, fetchable (absolute HTTPS) group icon URLs of the Mihomo config, in
     /// config order, at most `MAX_GROUP_ICONS`, each with its `group_icon_key`.
-    pub(crate) fn group_icon_urls(&self) -> Vec<(String, String)> {
+    pub fn group_icon_urls(&self) -> Vec<(String, String)> {
         let mut seen = BTreeSet::new();
         self.mihomo
             .groups()
@@ -378,14 +364,73 @@ impl Snapshot {
             .collect()
     }
 
-    pub(crate) fn set_group_icon_png(&mut self, key: String, png: Vec<u8>) {
-        self.group_icons_unfetched.remove(&key);
-        self.group_icons.insert(key, GroupIcon::new(png));
+    /// This snapshot with the canonical icon PNGs `icons` (by `group_icon_key`) attached for
+    /// the icon URLs its config names; other entries are ignored, as are images that are not
+    /// canonical group icons. The original is left untouched.
+    #[must_use]
+    pub fn with_group_icons(
+        self: Arc<Self>,
+        icons: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Arc<Self> {
+        let attach: Vec<(String, Vec<u8>)> = self
+            .group_icon_urls()
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let png = icons.get(&key)?;
+                let unchanged = self
+                    .group_icons
+                    .get(&key)
+                    .is_some_and(|current| current.png == *png);
+                (!unchanged && is_canonical_group_icon(png)).then(|| (key, png.clone()))
+            })
+            .collect();
+        if attach.is_empty() {
+            return self;
+        }
+        let mut updated = Arc::unwrap_or_clone(self);
+        for (key, png) in attach {
+            updated.set_group_icon_png(key, png);
+        }
+        Arc::new(updated)
     }
 
-    pub(crate) fn mark_group_icon_unfetched(&mut self, key: String) {
-        self.group_icons.remove(&key);
-        self.group_icons_unfetched.insert(key);
+    /// The icon URLs the config names whose image this snapshot does not hold.
+    pub fn missing_group_icon_urls(&self) -> Vec<(String, String)> {
+        self.group_icon_urls()
+            .into_iter()
+            .filter(|(key, _)| !self.group_icons.contains_key(key))
+            .collect()
+    }
+
+    /// The icons this snapshot holds, by `group_icon_key` (to seed an icon cache).
+    pub fn group_icon_pngs(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        self.group_icons
+            .iter()
+            .map(|(key, icon)| (key.clone(), icon.png.clone()))
+            .collect()
+    }
+
+    /// The content ids of the icons this snapshot holds.
+    pub fn group_icon_ids(&self) -> BTreeSet<String> {
+        self.group_icons
+            .values()
+            .map(|icon| icon.id.clone())
+            .collect()
+    }
+
+    /// The first proxy group named `group_name` names a fetchable icon image.
+    pub fn names_group_icon(&self, group_name: &str) -> bool {
+        self.mihomo
+            .groups()
+            .iter()
+            .find(|group| group.name == group_name)
+            .and_then(|group| group.icon.as_deref())
+            .and_then(|icon| validate_url(icon, false, true))
+            .is_some()
+    }
+
+    fn set_group_icon_png(&mut self, key: String, png: Vec<u8>) {
+        self.group_icons.insert(key, GroupIcon::new(png));
     }
 
     /// The opaque content id of the downloaded icon of the first proxy group named

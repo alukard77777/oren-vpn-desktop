@@ -2567,6 +2567,7 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                     TRAY_SEGMENT_ICON_PX,
                     scale,
                 ),
+                icon_loading: entry.icon_pending,
                 label: entry.label.clone().into(),
                 detail: entry.detail.clone().into(),
                 tone: "".into(),
@@ -2595,6 +2596,7 @@ fn apply_tray_popup_model(popup: &TrayPopup, model: TrayMenuModel) {
                         TRAY_ROW_ICON_PX,
                         scale,
                     ),
+                    icon_loading: entry.icon_pending,
                     label: entry.label.clone().into(),
                     detail: entry.detail.clone().into(),
                     tone: entry.tone.clone().into(),
@@ -3109,6 +3111,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                             label: display.label,
                             icon: display.icon,
                             icon_id: node.icon_id,
+                            icon_pending: node.icon_pending,
                             selected: node.selected,
                             latency_text: node.latency_text,
                             latency_tone: node.latency_tone,
@@ -3122,6 +3125,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
                     label: group_display.label,
                     icon: group_display.icon,
                     icon_id: group.icon_id,
+                    icon_pending: group.icon_pending,
                     selected_node_label: selected_node.label,
                     nodes,
                 }
@@ -3919,6 +3923,7 @@ fn apply_route_search(ui: &AppWindow, catalog: &CatalogPresentation, query: &str
                 scale,
             ),
             icon: hit.icon.into(),
+            icon_loading: hit.icon_pending,
             group_id: hit.group_id.into(),
             group_label: hit.group_label.into(),
             node_id: hit.node_id.into(),
@@ -4904,7 +4909,66 @@ fn load_catalog_impl(
                 begin_latency_check(weak, model);
             }
         });
-        fetch_missing_group_icons(&request.client, icon_weak, icon_model);
+        fetch_missing_group_icons(&request.client, icon_weak.clone(), icon_model.clone());
+        poll_catalog_icons(&request.client, icon_weak, icon_model);
+    });
+}
+
+/// How often the catalog is re-read while the daemon still downloads group icons.
+const ICON_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
+/// The daemon gives its icon downloads 20 s; polling stops well after that regardless.
+const ICON_POLL_LIMIT: Duration = Duration::from_secs(60);
+static ICON_POLL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// While the daemon still downloads group icons (`icon_pending` in the catalog), re-reads the
+/// catalog every `ICON_POLL_INTERVAL` and takes only its icon fields, so the loading
+/// placeholders turn into icons (or fall back to their glyphs) without a catalog reload,
+/// which would hold the route list for a moment each time. One poller at a time.
+fn poll_catalog_icons(
+    client: &Arc<dyn daemon::DaemonClient>,
+    weak: slint::Weak<AppWindow>,
+    model: Arc<Mutex<DesktopViewModel>>,
+) {
+    if !model
+        .lock()
+        .expect("view model lock")
+        .catalog_icons_pending()
+        || ICON_POLL_RUNNING.swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let client = client.clone();
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            thread::sleep(ICON_POLL_INTERVAL);
+            if !model
+                .lock()
+                .expect("view model lock")
+                .catalog_icons_pending()
+                || started.elapsed() > ICON_POLL_LIMIT
+            {
+                break;
+            }
+            let Ok(catalog) = client.catalog() else {
+                continue;
+            };
+            if !model
+                .lock()
+                .expect("view model lock")
+                .apply_catalog_icons(&catalog)
+            {
+                continue;
+            }
+            fetch_missing_group_icons(&client, weak.clone(), model.clone());
+            let (weak, model) = (weak.clone(), model.clone());
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    apply_latest_snapshot(&ui, &model);
+                }
+            });
+        }
+        ICON_POLL_RUNNING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -5420,6 +5484,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
                     scale,
                 ),
                 icon: display.icon.into(),
+                icon_loading: group.icon_pending,
                 label: display.label.into(),
                 selected: group.selected,
             }
@@ -5439,6 +5504,7 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
                     scale,
                 ),
                 icon: display.icon.into(),
+                icon_loading: node.icon_pending,
                 label: display.label.into(),
                 selected: node.selected,
                 latency_text: node.latency_text.clone().into(),
@@ -6065,6 +6131,7 @@ mod window_tests {
                     label: "Primary".into(),
                     selected: true,
                     icon_id: None,
+                    icon_pending: false,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "node-a-default".into(),
@@ -6072,6 +6139,7 @@ mod window_tests {
                             selected: true,
                             delay_ms: None,
                             icon_id: None,
+                            icon_pending: false,
                         },
                         DaemonCatalogNode {
                             id: "node-a-saved".into(),
@@ -6079,6 +6147,7 @@ mod window_tests {
                             selected: false,
                             delay_ms: None,
                             icon_id: None,
+                            icon_pending: false,
                         },
                     ],
                 }],

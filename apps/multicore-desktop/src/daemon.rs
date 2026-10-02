@@ -357,6 +357,9 @@ pub struct DaemonCatalogGroup {
     /// Opaque id of the group's downloaded icon image (`GET /v1/group-icons/{id}`).
     #[serde(default)]
     pub icon_id: Option<String>,
+    /// The daemon is still downloading the group's icon (show a loading placeholder).
+    #[serde(default)]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -368,6 +371,9 @@ pub struct DaemonCatalogNode {
     /// Set when the node is itself a proxy group with a downloaded icon.
     #[serde(default)]
     pub icon_id: Option<String>,
+    /// That group's icon is still being downloaded.
+    #[serde(default)]
+    pub icon_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -2168,6 +2174,7 @@ mod http_tests {
                     label: "Авто".into(),
                     selected: true,
                     icon_id: None,
+                    icon_pending: false,
                     nodes: vec![
                         DaemonCatalogNode {
                             id: "node:a".into(),
@@ -2175,6 +2182,7 @@ mod http_tests {
                             selected: true,
                             delay_ms: Some(42),
                             icon_id: None,
+                            icon_pending: false,
                         },
                         DaemonCatalogNode {
                             id: "node:b".into(),
@@ -2182,6 +2190,7 @@ mod http_tests {
                             selected: false,
                             delay_ms: None,
                             icon_id: None,
+                            icon_pending: false,
                         },
                     ],
                 }],

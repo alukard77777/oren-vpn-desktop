@@ -7,6 +7,8 @@ export struct TrayMenuRow {
     group-id: string,
     icon: string,
     icon-image: image,
+    // The daemon is still downloading the icon image: show the loading placeholder.
+    icon-loading: bool,
     label: string,
     // Groups: the selected node's label. Nodes: the latency text.
     detail: string,
