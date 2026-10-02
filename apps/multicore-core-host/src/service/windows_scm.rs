@@ -144,6 +144,7 @@ fn run_body() -> io::Result<()> {
     });
     let service = Arc::new(Mutex::new(
         ServiceLoop::new(ProductionCores::new(directory.clone())?)
+            .with_log_directory(directory.clone())
             .with_updater(Box::new(ProductionUpdater::new(
                 directory,
                 package_root,

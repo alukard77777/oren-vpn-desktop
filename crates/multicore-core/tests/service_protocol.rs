@@ -3,8 +3,9 @@ use multicore_core::elevation_protocol::{
     decode_command, encode_frame,
 };
 use multicore_core::service_protocol::{
-    ControllerEndpoint, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceResponse,
-    decode_service_command, decode_service_frame, encode_service_frame, service_response_matches,
+    ControllerEndpoint, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceLogFile, ServiceResponse,
+    decode_service_command, decode_service_frame, encode_service_frame, redact_service_log,
+    service_response_matches,
 };
 
 fn raw(payload: &[u8]) -> Vec<u8> {
@@ -31,6 +32,14 @@ fn every_v2_command_round_trips() {
         },
         ServiceCommand::StageUpdate {
             version: "1.1.0".into(),
+        },
+        ServiceCommand::ServiceLog {
+            file: ServiceLogFile::Current,
+            before: None,
+        },
+        ServiceCommand::ServiceLog {
+            file: ServiceLogFile::Previous,
+            before: Some(4096),
         },
     ] {
         let frame = encode_service_frame(&command).unwrap();
@@ -218,4 +227,124 @@ fn responses_pair_with_their_commands_and_busy_or_error_pair_with_all() {
         &ServiceCommand::Shutdown,
         &ServiceResponse::UpdateStarted
     ));
+}
+
+/// The service log is additive like `StageUpdate`: a fixed wire form a newer service decodes,
+/// a file chosen from an enum (never a path), and a response that pairs only with its file and
+/// never claims bytes past the requested end.
+#[test]
+fn the_service_log_is_an_additive_read_only_v2_command() {
+    assert_eq!(
+        decode_service_command(&raw(
+            br#"{"version":2,"body":{"service_log":{"file":"previous","before":10}}}"#
+        )),
+        Ok(ServiceCommand::ServiceLog {
+            file: ServiceLogFile::Previous,
+            before: Some(10)
+        })
+    );
+    for body in [
+        br#"{"version":2,"body":{"service_log":{"file":"C:\\Windows\\win.ini","before":null}}}"#
+            .as_slice(),
+        br#"{"version":2,"body":{"service_log":{"file":"current","before":null,"path":"x"}}}"#,
+        br#"{"version":2,"body":{"service_log":{"file":"current","before":-1}}}"#,
+    ] {
+        assert_eq!(
+            decode_service_command(&raw(body)),
+            Err(ProtocolError::InvalidSchema)
+        );
+    }
+    let chunk = ServiceResponse::ServiceLog {
+        file: ServiceLogFile::Current,
+        start: 100,
+        end: 200,
+        text: "1 prepare ok\n".into(),
+    };
+    let frame = encode_service_frame(&chunk).unwrap();
+    assert_eq!(
+        decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+        chunk
+    );
+    let ask = |file, before| ServiceCommand::ServiceLog { file, before };
+    assert!(service_response_matches(
+        &ask(ServiceLogFile::Current, None),
+        &chunk
+    ));
+    assert!(service_response_matches(
+        &ask(ServiceLogFile::Current, Some(200)),
+        &chunk
+    ));
+    assert!(!service_response_matches(
+        &ask(ServiceLogFile::Current, Some(150)),
+        &chunk
+    ));
+    assert!(!service_response_matches(
+        &ask(ServiceLogFile::Previous, None),
+        &chunk
+    ));
+    assert!(!service_response_matches(
+        &ask(ServiceLogFile::Current, None),
+        &ServiceResponse::ServiceLog {
+            file: ServiceLogFile::Current,
+            start: 9,
+            end: 8,
+            text: String::new(),
+        }
+    ));
+    assert!(!service_response_matches(
+        &ServiceCommand::Diagnostics,
+        &chunk
+    ));
+    assert!(service_response_matches(
+        &ask(ServiceLogFile::Current, None),
+        &ServiceResponse::Error {
+            code: BrokerErrorCode::InvalidRequest
+        }
+    ));
+    assert_eq!(ServiceLogFile::Current.file_name(), "service.log");
+    assert_eq!(ServiceLogFile::Previous.file_name(), "service.log.1");
+}
+
+#[test]
+fn the_service_log_never_shows_links_secrets_ids_or_user_names() {
+    let planted = [
+        // `{error:?}` of a path doubles its backslashes.
+        "1700000000 prepare generation 3 refused (NotReady) at resolve: Owner(\"C:\\\\Users\\\\alice\\\\AppData\\\\Local\\\\MultiCore\") C:\\Users\\dave\\x",
+        "1700000001 fetch https://panel.example.net/api/sub/Zx9QpLm2Kd7Vb4Ns failed",
+        "1700000002 share vless://0f8e6a1c-1111-2222-3333-444455556666@node.example.org:443?sni=x#Name",
+        "1700000003 token=Zx9QpLm2Kd7Vb4Ns secret: \"3f9a1c7e5b2d8f60\" subscription_url=abc",
+        "1700000004 Authorization: Bearer 3f9a1c7e5b2d8f604a1e9c3b7d5f2a86",
+        "1700000005 client 1:S-1-5-21-1111111111-2222222222-3333333333-1001 busy",
+        "1700000006 path /home/bob/.local/share/multicore and C:/Users/carol/x",
+        "1700000007 config proxies: [{name: a, server: hidden.example.com}]",
+        "1700000008 bell\u{7}\r ok",
+    ]
+    .join("\n");
+    let redacted = redact_service_log(&planted);
+    for secret in [
+        "panel.example.net",
+        "Zx9QpLm2Kd7Vb4Ns",
+        "vless://",
+        "node.example.org",
+        "0f8e6a1c-1111-2222-3333-444455556666",
+        "3f9a1c7e5b2d8f60",
+        "alice",
+        "dave",
+        "bob",
+        "carol",
+        "1111111111",
+        "hidden.example.com",
+        "abc",
+        "\u{7}",
+        "\r",
+    ] {
+        assert!(!redacted.contains(secret), "leaks {secret}: {redacted}");
+    }
+    assert_eq!(redacted.lines().count(), 9, "one line per line: {redacted}");
+    assert!(redacted.contains("1700000000 prepare generation 3 refused (NotReady) at resolve"));
+    assert!(redacted.contains("C:\\\\Users\\\\[user]\\\\AppData"));
+    assert!(redacted.contains("C:\\Users\\[user]\\x"));
+    assert!(redacted.contains("/home/[user]/.local"));
+    assert!(redacted.contains("1700000007 [redacted privileged diagnostic]"));
+    assert!(redacted.contains("1700000008 bell"));
 }

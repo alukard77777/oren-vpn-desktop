@@ -64,6 +64,7 @@ async fn all_v1_routes_require_bearer_authentication() {
         ("GET", "/v1/events?after=0", Body::empty()),
         ("GET", "/v1/diagnostics", Body::empty()),
         ("GET", "/v1/dashboard-url", Body::empty()),
+        ("GET", "/v1/service-log", Body::empty()),
     ];
 
     for (method, uri, body) in routes {
@@ -97,6 +98,58 @@ async fn diagnostics_route_is_authenticated_and_has_stable_safe_shape() {
     assert_eq!(diagnostics.tun, RuntimeCheckDto::Stopped);
     assert!(diagnostics.logs.is_empty());
     assert!(diagnostics.mappings.is_empty());
+}
+
+struct FakeServiceLog;
+
+impl multicore_daemon::ServiceLogSource for FakeServiceLog {
+    fn service_log(&self) -> multicore_daemon::ServiceLogDto {
+        multicore_daemon::ServiceLogDto {
+            status: multicore_daemon::ServiceLogStatus::Included,
+            files: vec![multicore_daemon::ServiceLogFileDto {
+                name: "service.log".into(),
+                text: "1700000000 prepare ok\n".into(),
+                truncated: false,
+            }],
+        }
+    }
+}
+
+#[tokio::test]
+async fn service_log_route_says_why_there_is_no_log_or_returns_the_service_files() {
+    let response = app()
+        .oneshot(request("GET", "/v1/service-log", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "status": "no_service", "files": [] })
+    );
+
+    let backend: std::sync::Arc<dyn multicore_daemon::Backend> =
+        std::sync::Arc::new(MemoryBackend::default());
+    let app = multicore_daemon::try_router_with_service_log(
+        backend,
+        TOKEN,
+        None,
+        None,
+        None,
+        Some(std::sync::Arc::new(FakeServiceLog)),
+    )
+    .unwrap();
+    let response = app
+        .oneshot(request("GET", "/v1/service-log", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({
+            "status": "included",
+            "files": [{ "name": "service.log", "text": "1700000000 prepare ok\n", "truncated": false }]
+        })
+    );
 }
 
 #[tokio::test]

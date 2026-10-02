@@ -21,7 +21,10 @@ use multicore_core::{
     elevation_protocol::{
         BrokerErrorCode, ElevatedDiagnosticStream, ElevatedEngine, ElevatedRuntimeState,
     },
-    service_protocol::{ServiceCommand, ServiceResponse},
+    service_protocol::{
+        MAX_SERVICE_LOG_TAIL_BYTES, ServiceCommand, ServiceLogFile, ServiceResponse,
+        service_response_matches,
+    },
 };
 use sha2::{Digest, Sha256};
 
@@ -199,6 +202,8 @@ pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
         ServiceCommand::Status | ServiceCommand::Diagnostics => Duration::from_secs(15),
         // Each fix waits at most a minute (a tool, a service stop); a batch has at most eight.
         ServiceCommand::Troubleshoot { .. } => Duration::from_secs(10 * 60),
+        // One small file read, but it may wait behind a `Prepare` holding the service's lock.
+        ServiceCommand::ServiceLog { .. } => Duration::from_secs(30),
         _ => Duration::from_secs(5),
     }
 }
@@ -625,6 +630,65 @@ impl<C: ServiceConnector> ServiceSession<C> {
         }
     }
 
+    /// «Сохранить лог…»: the newest redacted lines of the service's own log, `service.log`
+    /// then its predecessor, at most [`MAX_SERVICE_LOG_TAIL_BYTES`] of text in all. On a
+    /// channel of its own, like `troubleshoot`: an older service rejects the unknown command
+    /// (`Rejected(InvalidRequest)`) and closes only that channel, and reading claims nothing.
+    pub fn service_log(&self) -> Result<Vec<ServiceLogText>, ServiceError> {
+        let transport = self.connector.connect()?;
+        let mut budget = usize::try_from(MAX_SERVICE_LOG_TAIL_BYTES).unwrap_or(usize::MAX);
+        let mut files = Vec::new();
+        for file in [ServiceLogFile::Current, ServiceLogFile::Previous] {
+            let mut pieces = Vec::new();
+            let mut before = None;
+            let mut complete = false;
+            for _ in 0..MAX_SERVICE_LOG_PAGES {
+                if budget == 0 {
+                    break;
+                }
+                let command = ServiceCommand::ServiceLog { file, before };
+                let response = transport.request(&command)?;
+                let (start, end, text) = match response {
+                    ServiceResponse::Busy => return Err(ServiceError::Busy),
+                    ServiceResponse::Error { code } => return Err(ServiceError::Rejected(code)),
+                    ref chunk if !service_response_matches(&command, chunk) => {
+                        return Err(ServiceError::Protocol);
+                    }
+                    ServiceResponse::ServiceLog {
+                        start, end, text, ..
+                    } => (start, end, text),
+                    _ => return Err(ServiceError::Protocol),
+                };
+                // The file was rotated while it was paged: what came before is another file.
+                if before.is_some_and(|before| end != before) {
+                    break;
+                }
+                if text.len() > budget {
+                    pieces.push(newest_lines(&text, budget).to_owned());
+                    budget = 0;
+                    break;
+                }
+                budget -= text.len();
+                pieces.push(text);
+                if start == 0 {
+                    complete = true;
+                    break;
+                }
+                if start == end {
+                    break;
+                }
+                before = Some(start);
+            }
+            pieces.reverse();
+            files.push(ServiceLogText {
+                file,
+                text: pieces.concat(),
+                truncated: !complete,
+            });
+        }
+        Ok(files)
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> ProcessDiagnostics {
         match self.request(&ServiceCommand::Diagnostics, false) {
@@ -684,6 +748,70 @@ impl<C: ServiceConnector> crate::ServiceUpdates for ServiceSession<C> {
 
     fn stage(&self, version: &str) -> Result<(), ServiceError> {
         ServiceSession::stage_update(self, version)
+    }
+}
+
+/// Requests per file before the daemon stops paging: a 512 KiB tail is about 35 chunks.
+const MAX_SERVICE_LOG_PAGES: usize = 128;
+
+/// One file of the service's own log as `ServiceSession::service_log` collected it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceLogText {
+    pub file: ServiceLogFile,
+    /// Whole, redacted lines, oldest first.
+    pub text: String,
+    /// Older lines exist that are not in `text`.
+    pub truncated: bool,
+}
+
+/// The whole lines at the end of `text` that fit in `budget` bytes.
+fn newest_lines(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        return text;
+    }
+    let mut start = text.len() - budget;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+    // Unless the cut fell exactly on a line start, drop the partial first line.
+    if text.as_bytes()[start - 1] == b'\n' {
+        tail
+    } else {
+        tail.find('\n').map_or("", |newline| &tail[newline + 1..])
+    }
+}
+
+impl<C: ServiceConnector> crate::ServiceLogSource for ServiceSession<C> {
+    fn service_log(&self) -> crate::ServiceLogDto {
+        use crate::{ServiceLogDto, ServiceLogFileDto, ServiceLogStatus};
+        let status = |status| ServiceLogDto {
+            status,
+            files: Vec::new(),
+        };
+        match ServiceSession::service_log(self) {
+            Ok(files) => ServiceLogDto {
+                status: ServiceLogStatus::Included,
+                files: files
+                    .into_iter()
+                    .filter(|file| !file.text.is_empty())
+                    .map(|file| ServiceLogFileDto {
+                        name: file.file.file_name().to_owned(),
+                        text: file.text,
+                        truncated: file.truncated,
+                    })
+                    .collect(),
+            },
+            Err(
+                ServiceError::NotInstalled
+                | ServiceError::Rejected(BrokerErrorCode::AuthenticationFailed),
+            ) => status(ServiceLogStatus::NoService),
+            Err(ServiceError::Rejected(BrokerErrorCode::InvalidRequest)) => {
+                status(ServiceLogStatus::TooOld)
+            }
+            Err(ServiceError::Busy) => status(ServiceLogStatus::Busy),
+            Err(_) => status(ServiceLogStatus::Unavailable),
+        }
     }
 }
 

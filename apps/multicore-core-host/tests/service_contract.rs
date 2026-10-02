@@ -233,6 +233,48 @@ fn a_second_user_is_busy_until_the_owner_leaves() {
 }
 
 #[test]
+fn the_service_log_is_served_redacted_to_its_user_but_never_to_another_users_session() {
+    use multicore_core::service_protocol::ServiceLogFile;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("logs")).unwrap();
+    std::fs::write(
+        directory.path().join("logs").join("service.log"),
+        "1700000000 prepare refused token=Zx9QpLm2Kd7Vb4Ns at https://panel.example.net/sub\n",
+    )
+    .unwrap();
+    let mut service =
+        ServiceLoop::new(FakeCores::default()).with_log_directory(directory.path().to_path_buf());
+    let (alice, bob) = (user("1:alice"), user("2:bob"));
+    let ask = ServiceCommand::ServiceLog {
+        file: ServiceLogFile::Current,
+        before: None,
+    };
+    let text_of = |response: ServiceResponse| match response {
+        ServiceResponse::ServiceLog { text, .. } => text,
+        other => panic!("not a service log chunk: {other:?}"),
+    };
+    // Nobody holds the cores: an identified user reads the redacted log.
+    let text = text_of(service.execute(B, &bob, ask.clone()));
+    assert!(text.contains("1700000000 prepare refused"));
+    assert!(!text.contains("Zx9QpLm2Kd7Vb4Ns") && !text.contains("panel.example.net"));
+    assert_eq!(service.owner_key(), None, "reading claims nothing");
+    // Alice's session holds the cores: Bob is turned away, Alice reads on another channel
+    // whose end stops nothing.
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    assert_eq!(service.execute(B, &bob, ask.clone()), ServiceResponse::Busy);
+    assert!(text_of(service.execute(A2, &alice, ask.clone())).contains("prepare refused"));
+    service.client_gone(A2);
+    assert!(service.cores_mut().running);
+    assert_eq!(service.cores_mut().calls, ["prepare:1"]);
+    assert_eq!(
+        ServiceLoop::new(FakeCores::default()).execute(A, &alice, ask),
+        ServiceResponse::Error {
+            code: BrokerErrorCode::NotReady
+        }
+    );
+}
+
+#[test]
 fn owner_channel_drop_stops_the_cores() {
     let mut service = ServiceLoop::new(FakeCores::default());
     let alice = user("alice");
@@ -1559,6 +1601,46 @@ mod windows_pipe_server {
             "the pipe is closed after the refusal"
         );
         assert!(service.lock().unwrap().cores_mut().calls.is_empty());
+        unsafe { SetEvent(stop.as_raw_handle()) };
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_unidentified_client_never_reads_the_service_log() {
+        use multicore_core::service_protocol::ServiceLogFile;
+        let name = unique_name();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("logs")).unwrap();
+        std::fs::write(
+            directory.path().join("logs").join("service.log"),
+            "1700000000 secret line\n",
+        )
+        .unwrap();
+        let service = Arc::new(Mutex::new(
+            ServiceLoop::new(FakeCores::default())
+                .with_log_directory(directory.path().to_path_buf()),
+        ));
+        let verifier = Arc::new(|_pipe: windows_sys::Win32::Foundation::HANDLE| {
+            Err::<ClientIdentity, _>(IdentityError::WrongImage)
+        });
+        let stop = manual_event();
+        let server = {
+            let (name, service, stop) = (name.clone(), service.clone(), stop.clone());
+            thread::spawn(move || serve_with(&name, TEST_SDDL, service, verifier, stop).unwrap())
+        };
+        let intruder = connect_to_server(&name);
+        assert_eq!(
+            request(
+                &intruder,
+                &ServiceCommand::ServiceLog {
+                    file: ServiceLogFile::Current,
+                    before: None,
+                }
+            ),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::AuthenticationFailed
+            }
+        );
         unsafe { SetEvent(stop.as_raw_handle()) };
         server.join().unwrap();
     }

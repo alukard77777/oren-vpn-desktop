@@ -151,9 +151,10 @@ pub(crate) fn on_termination_signal(on_signal: impl FnOnce() + Send + 'static) -
 pub(crate) fn run_service() -> Result<(), ()> {
     let directory = state_dir::service_directory().map_err(drop)?;
     state_dir::ensure_private_directory(&directory).map_err(drop)?;
-    let service = Arc::new(Mutex::new(ServiceLoop::new(
-        ProductionCores::new(directory).map_err(drop)?,
-    )));
+    let service = Arc::new(Mutex::new(
+        ServiceLoop::new(ProductionCores::new(directory.clone()).map_err(drop)?)
+            .with_log_directory(directory),
+    ));
     {
         let service = service.clone();
         on_termination_signal(move || {

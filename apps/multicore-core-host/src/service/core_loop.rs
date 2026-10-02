@@ -101,6 +101,8 @@ pub(crate) struct ServiceLoop<C: Cores> {
     troubleshooter: Option<Arc<dyn Troubleshooter>>,
     /// A `Troubleshoot` batch is running outside the lock.
     troubleshooting: bool,
+    /// The service directory whose `logs/service.log*` `ServiceLog` serves.
+    log_directory: Option<PathBuf>,
 }
 
 /// An `Update` that passed the ownership check and holds the updater while it downloads
@@ -122,7 +124,14 @@ impl<C: Cores> ServiceLoop<C> {
             updating: false,
             troubleshooter: None,
             troubleshooting: false,
+            log_directory: None,
         }
+    }
+
+    /// Serves `ServiceLog` from `<service_directory>/logs`.
+    pub(crate) fn with_log_directory(mut self, service_directory: PathBuf) -> Self {
+        self.log_directory = Some(service_directory);
+        self
     }
 
     /// Windows only: Linux has no service-side troubleshooting.
@@ -178,6 +187,14 @@ impl<C: Cores> ServiceLoop<C> {
                 ServiceResponse::Stopped { engine }
             }
             ServiceCommand::Diagnostics => self.cores.diagnostics(),
+            // Read-only and redacted; another user's session was turned away above, like for
+            // every other command.
+            ServiceCommand::ServiceLog { file, before } => match &self.log_directory {
+                Some(directory) => super::service_log::read_chunk(directory, file, before),
+                None => ServiceResponse::Error {
+                    code: BrokerErrorCode::NotReady,
+                },
+            },
             ServiceCommand::Shutdown => {
                 self.stop_everything();
                 ServiceResponse::ShuttingDown

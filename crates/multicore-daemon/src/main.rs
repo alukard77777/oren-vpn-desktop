@@ -18,7 +18,7 @@ use multicore_daemon::service_client::{
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, CoreBackend, PreparedController, bind_loopback,
-    options_controller_factory, publish_readiness_if_enabled, try_router_with_troubleshooting,
+    options_controller_factory, publish_readiness_if_enabled, try_router_with_service_log,
 };
 #[cfg(not(windows))]
 use multicore_daemon::{
@@ -276,12 +276,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(windows))]
     let troubleshooting: Arc<dyn multicore_daemon::troubleshoot::Troubleshooting> =
         Arc::new(multicore_daemon::troubleshoot::SystemTroubleshooting);
-    let app = try_router_with_troubleshooting(
+    // «Сохранить лог…»: the service's own log on every platform; without a service the
+    // route says so.
+    let service_log = service.clone() as Arc<dyn multicore_daemon::ServiceLogSource>;
+    let app = try_router_with_service_log(
         shared,
         token,
         dashboard_url,
         service_updates,
         Some(troubleshooting),
+        Some(service_log),
     )?;
     let listener = bind_loopback(address).await?;
     let resolved_address = listener.local_addr()?;

@@ -276,6 +276,46 @@ pub struct DiagnosticsDto {
     pub mappings: Vec<ProxyMappingDto>,
 }
 
+/// `/v1/service-log`: the always-ready service's own log for «Сохранить лог…».
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ServiceLogDto {
+    pub status: ServiceLogStatus,
+    /// `service.log`, then `service.log.1`; only files with text. Redacted by the service.
+    #[serde(default)]
+    pub files: Vec<ServiceLogFileDto>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceLogStatus {
+    /// The service answered; `files` is what it has.
+    Included,
+    /// No service is used by this copy (per-user mode, or none installed).
+    NoService,
+    /// The service predates `ServiceLog`.
+    TooOld,
+    /// Another user's session holds the service.
+    Busy,
+    /// The service did not answer.
+    #[default]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ServiceLogFileDto {
+    pub name: String,
+    pub text: String,
+    /// Older lines exist that are not in `text`.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// The always-ready service's own log (see `service_client::ServiceSession::service_log`).
+pub trait ServiceLogSource: Send + Sync + 'static {
+    /// Blocking.
+    fn service_log(&self) -> ServiceLogDto;
+}
+
 /// The live connection's session: when it started and Mihomo's cumulative byte counters,
 /// from which a client derives uptime and current speed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -920,6 +960,8 @@ struct AppState {
     service_updates: Option<Arc<dyn ServiceUpdates>>,
     /// «Устранить неполадки»; absent in tests and embedders that do not offer it.
     troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
+    /// «Сохранить лог…»: the service's own log; absent means no service is used.
+    service_log: Option<Arc<dyn ServiceLogSource>>,
 }
 
 /// Updates performed by the always-ready service (see `service_client::ServiceSession`).
@@ -999,6 +1041,7 @@ fn build_router_shared(
     dashboard_url: Option<Arc<str>>,
     service_updates: Option<Arc<dyn ServiceUpdates>>,
     troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
+    service_log: Option<Arc<dyn ServiceLogSource>>,
 ) -> Router {
     let app_state = AppState {
         backend,
@@ -1006,6 +1049,7 @@ fn build_router_shared(
         dashboard_url,
         service_updates,
         troubleshooting,
+        service_log,
     };
     let auth_state = AuthState {
         token_hash: Sha256::digest(bearer_token.as_ref().as_bytes()).into(),
@@ -1044,6 +1088,7 @@ fn build_router_shared(
         .route("/service/update/stage", post(service_update_stage))
         .route("/troubleshoot/check", post(troubleshoot_check))
         .route("/troubleshoot/fix", post(troubleshoot_fix))
+        .route("/service-log", get(service_log_handler))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -1069,6 +1114,7 @@ where
         dashboard_url,
         None,
         None,
+        None,
     )
 }
 
@@ -1090,6 +1136,25 @@ pub fn try_router_with_troubleshooting(
     service_updates: Option<Arc<dyn ServiceUpdates>>,
     troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
 ) -> Result<Router, getrandom::Error> {
+    try_router_with_service_log(
+        backend,
+        bearer_token,
+        dashboard_url,
+        service_updates,
+        troubleshooting,
+        None,
+    )
+}
+
+/// [`try_router_with_troubleshooting`] that also serves `/v1/service-log`.
+pub fn try_router_with_service_log(
+    backend: Arc<dyn Backend>,
+    bearer_token: impl AsRef<str>,
+    dashboard_url: Option<Arc<str>>,
+    service_updates: Option<Arc<dyn ServiceUpdates>>,
+    troubleshooting: Option<Arc<dyn troubleshoot::Troubleshooting>>,
+    service_log: Option<Arc<dyn ServiceLogSource>>,
+) -> Result<Router, getrandom::Error> {
     Ok(build_router_shared(
         backend,
         bearer_token,
@@ -1097,6 +1162,7 @@ pub fn try_router_with_troubleshooting(
         dashboard_url,
         service_updates,
         troubleshooting,
+        service_log,
     ))
 }
 
@@ -1815,6 +1881,25 @@ async fn run_service_update(
             "Служба не смогла загрузить или проверить обновление.",
         )),
     }
+}
+
+/// «Сохранить лог…»: the service's own log, redacted by the service. Never an error: the
+/// status says why there is no log (no service, a service too old to serve it, …).
+async fn service_log_handler(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<ServiceLogDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let Some(source) = state.service_log.clone() else {
+        return Ok(Json(ServiceLogDto {
+            status: ServiceLogStatus::NoService,
+            files: Vec::new(),
+        }));
+    };
+    let log = tokio::task::spawn_blocking(move || source.service_log())
+        .await
+        .unwrap_or_default();
+    Ok(Json(log))
 }
 
 /// Troubleshooting checks and fixes only run while nothing is connected: the proxy check

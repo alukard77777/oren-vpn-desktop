@@ -8,7 +8,10 @@ use std::{
 use multicore_core::{
     Engine, ProcessController, Snapshot, StartFailureCause, Supervisor,
     elevation_protocol::{BrokerErrorCode, ElevatedRuntimeState},
-    service_protocol::{ControllerEndpoint, ServiceCommand, ServiceResponse},
+    service_protocol::{
+        ControllerEndpoint, MAX_SERVICE_LOG_TAIL_BYTES, ServiceCommand, ServiceLogFile,
+        ServiceResponse,
+    },
 };
 use multicore_daemon::MihomoSelector;
 use multicore_daemon::connection_mode::{ProxySwitch, SystemProxyController};
@@ -43,6 +46,15 @@ struct FakeService {
     generation: Option<u64>,
     /// `Troubleshoot` is answered like a service older than troubleshooting.
     troubleshoot_unknown: bool,
+    /// The service's own log: `service.log`, `service.log.1`.
+    logs: [String; 2],
+    /// Bytes per `ServiceLog` chunk (64 when unset).
+    log_chunk: usize,
+    /// `ServiceLog` is answered like a service older than it.
+    service_log_unknown: bool,
+    /// `service.log` is rotated (replaced by a short file) once this many chunks were served.
+    rotate_after: Option<usize>,
+    log_requests: usize,
 }
 
 #[derive(Clone, Default)]
@@ -125,6 +137,37 @@ impl ServiceTransport for FakeTransport {
             ServiceCommand::Troubleshoot { .. } if service.troubleshoot_unknown => {
                 ServiceResponse::Error {
                     code: BrokerErrorCode::InvalidRequest,
+                }
+            }
+            ServiceCommand::ServiceLog { .. } if service.service_log_unknown => {
+                ServiceResponse::Error {
+                    code: BrokerErrorCode::InvalidRequest,
+                }
+            }
+            ServiceCommand::ServiceLog { file, before } => {
+                service.log_requests += 1;
+                if service.rotate_after == Some(service.log_requests) {
+                    service.logs[0] = "1 rotated\n".into();
+                }
+                let text = &service.logs[usize::from(*file == ServiceLogFile::Previous)];
+                let chunk = if service.log_chunk == 0 {
+                    64
+                } else {
+                    service.log_chunk
+                };
+                let end = before.map_or(text.len(), |before| (before as usize).min(text.len()));
+                let mut start = end.saturating_sub(chunk);
+                if start > 0
+                    && let Some(newline) = text[start..end].find('\n')
+                    && start + newline + 1 < end
+                {
+                    start += newline + 1;
+                }
+                ServiceResponse::ServiceLog {
+                    file: *file,
+                    start: start as u64,
+                    end: end as u64,
+                    text: text[start..end].to_owned(),
                 }
             }
             ServiceCommand::Troubleshoot { fixes } => ServiceResponse::Troubleshot {
@@ -834,5 +877,147 @@ fn troubleshooting_runs_on_its_own_channel_and_an_old_service_is_told_apart() {
         service_response_timeout(&ServiceCommand::Troubleshoot {
             fixes: fixes.to_vec()
         }) >= std::time::Duration::from_secs(5 * 60)
+    );
+}
+
+fn numbered_lines(prefix: &str, count: usize, width: usize) -> String {
+    (0..count)
+        .map(|index| format!("{prefix} {index:06} {}\n", "x".repeat(width)))
+        .collect()
+}
+
+#[test]
+fn the_service_log_is_paged_on_its_own_channel_and_claims_nothing() {
+    use multicore_daemon::{ServiceLogSource, ServiceLogStatus};
+    let (session, connector, _slot) = session();
+    session.prepare(3).unwrap();
+    let current = numbered_lines("current", 40, 10);
+    let previous = numbered_lines("previous", 25, 10);
+    connector.0.lock().unwrap().logs = [current.clone(), previous.clone()];
+    let files = session.service_log().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].file, ServiceLogFile::Current);
+    assert_eq!(files[0].text, current);
+    assert!(!files[0].truncated);
+    assert_eq!(files[1].file, ServiceLogFile::Previous);
+    assert_eq!(files[1].text, previous);
+    assert!(!files[1].truncated);
+    {
+        let service = connector.0.lock().unwrap();
+        assert_eq!(
+            service.connects, 2,
+            "the log was read on a channel of its own"
+        );
+        assert!(service.log_requests > 10, "paged in chunks");
+    }
+    assert!(
+        session.cores_ready(),
+        "the connection channel was left alone"
+    );
+    let dto = ServiceLogSource::service_log(session.as_ref());
+    assert_eq!(dto.status, ServiceLogStatus::Included);
+    let names = dto
+        .files
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["service.log", "service.log.1"]);
+
+    // Only `service.log` exists: the missing predecessor is left out.
+    connector.0.lock().unwrap().logs[1].clear();
+    let dto = ServiceLogSource::service_log(session.as_ref());
+    assert_eq!(dto.files.len(), 1);
+    assert_eq!(dto.files[0].name, "service.log");
+}
+
+#[test]
+fn the_service_log_keeps_its_newest_lines_within_the_size_cap() {
+    let (session, connector, _slot) = session();
+    let current = numbered_lines("current", 6000, 100);
+    let previous = numbered_lines("previous", 1000, 100);
+    assert!(current.len() as u64 > MAX_SERVICE_LOG_TAIL_BYTES);
+    {
+        let mut service = connector.0.lock().unwrap();
+        service.logs = [current.clone(), previous];
+        service.log_chunk = 16 * 1024;
+    }
+    let files = session.service_log().unwrap();
+    let total = files.iter().map(|file| file.text.len() as u64).sum::<u64>();
+    assert!(total <= MAX_SERVICE_LOG_TAIL_BYTES, "{total}");
+    assert!(total > MAX_SERVICE_LOG_TAIL_BYTES - 1024, "{total}");
+    assert!(files[0].truncated);
+    assert!(
+        files[0]
+            .text
+            .ends_with(&format!("current {:06} {}\n", 5999, "x".repeat(100)))
+    );
+    assert!(
+        files[0].text.starts_with("current "),
+        "starts at a whole line"
+    );
+    assert!(
+        !files[0].text.contains("current 000000 "),
+        "the oldest lines are left out"
+    );
+    assert!(files[1].text.is_empty() && files[1].truncated);
+}
+
+#[test]
+fn a_log_rotated_while_it_is_paged_stops_at_the_rotation() {
+    let (session, connector, _slot) = session();
+    {
+        let mut service = connector.0.lock().unwrap();
+        service.logs = [numbered_lines("current", 40, 10), String::new()];
+        service.rotate_after = Some(2);
+    }
+    let files = session.service_log().unwrap();
+    assert!(files[0].truncated);
+    assert!(
+        files[0]
+            .text
+            .ends_with(&format!("current {:06} {}\n", 39, "x".repeat(10)))
+    );
+    assert!(!files[0].text.contains("rotated"));
+}
+
+#[test]
+fn an_old_busy_or_missing_service_is_told_apart_for_the_service_log() {
+    use multicore_daemon::{ServiceLogSource, ServiceLogStatus};
+    let (session, connector, _slot) = session();
+    connector.0.lock().unwrap().service_log_unknown = true;
+    assert_eq!(
+        session.service_log(),
+        Err(ServiceError::Rejected(BrokerErrorCode::InvalidRequest))
+    );
+    let dto = ServiceLogSource::service_log(session.as_ref());
+    assert_eq!(dto.status, ServiceLogStatus::TooOld);
+    assert!(dto.files.is_empty());
+    {
+        let mut service = connector.0.lock().unwrap();
+        service.service_log_unknown = false;
+        service.busy = true;
+    }
+    assert_eq!(
+        ServiceLogSource::service_log(session.as_ref()).status,
+        ServiceLogStatus::Busy
+    );
+    {
+        let mut service = connector.0.lock().unwrap();
+        service.busy = false;
+        service.connect_errors = vec![ServiceError::NotInstalled, ServiceError::Unavailable];
+    }
+    assert_eq!(
+        ServiceLogSource::service_log(session.as_ref()).status,
+        ServiceLogStatus::NoService
+    );
+    assert_eq!(
+        ServiceLogSource::service_log(session.as_ref()).status,
+        ServiceLogStatus::Unavailable
+    );
+    assert!(
+        service_response_timeout(&ServiceCommand::ServiceLog {
+            file: ServiceLogFile::Current,
+            before: None,
+        }) >= std::time::Duration::from_secs(15)
     );
 }
