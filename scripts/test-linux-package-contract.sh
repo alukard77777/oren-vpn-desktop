@@ -102,6 +102,24 @@ grep -qx 'MimeType=x-scheme-handler/multicore;' "$desktop_file" || {
   echo 'Linux desktop entry must advertise the multicore URL scheme' >&2
   exit 1
 }
+# English base strings with Russian translations (freedesktop Key[ru]); the name stays MULTICORE.
+grep -qx 'Name=MULTICORE' "$desktop_file" && ! grep -q '^Name\[' "$desktop_file" || {
+  echo 'Linux desktop entry must be named MULTICORE in every language' >&2
+  exit 1
+}
+for key in GenericName Comment Keywords; do
+  LC_ALL=C grep -Eq "^$key=[ -~]+\$" "$desktop_file" && grep -q "^$key\[ru\]=" "$desktop_file" || {
+    echo "Linux desktop entry must carry an English $key and its Russian translation" >&2
+    exit 1
+  }
+done
+policy_file="$STAGE/usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy"
+for element in description message; do
+  LC_ALL=C grep -Eq "^    <$element>[ -~]+</$element>\$" "$policy_file" && grep -q "<$element xml:lang=\"ru\">" "$policy_file" || {
+    echo "polkit action must carry an English <$element> and its Russian translation" >&2
+    exit 1
+  }
+done
 grep -Fxq 'exec "$HERE/usr/lib/multicore/multicore" "$@"' "$ROOT/packaging/linux/appimage/AppRun" || {
   echo 'AppImage launcher must forward the protocol URL unchanged' >&2
   exit 1

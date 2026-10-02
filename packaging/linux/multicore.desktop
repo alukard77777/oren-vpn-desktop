@@ -2,7 +2,11 @@
 Type=Application
 Name=MULTICORE
 GenericName=Network client
+GenericName[ru]=Сетевой клиент
 Comment=Mihomo routing with Xray transports
+Comment[ru]=Маршрутизация Mihomo с транспортами Xray
+Keywords=VPN;Proxy;Mihomo;Xray;TUN;
+Keywords[ru]=VPN;Прокси;Mihomo;Xray;TUN;
 Exec=multicore %u
 Icon=multicore
 Terminal=false
