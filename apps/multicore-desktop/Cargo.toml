@@ -47,6 +47,7 @@ x11rb = "0.13"
 tray-icon = { version = "=0.25.1", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_Security_Authorization",

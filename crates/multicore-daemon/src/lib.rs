@@ -38,6 +38,7 @@ use multicore_core::{
     RuntimeCheckState, ServiceLogoDownload, ServiceLogoLease, Severity, Snapshot, SnapshotCommit,
     StagedRuntime, StateMachine, SubscriptionFetcher, Supervisor,
 };
+pub use multicore_i18n::MessageKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -78,16 +79,66 @@ pub const MAX_EVENT_PAGE_SIZE: usize = 256;
 pub const MAX_READINESS_LINE_BYTES: usize = 80;
 
 #[cfg(windows)]
-const CONNECTING_MESSAGE: &str = "Запускается подключение.";
+const CONNECTING_MESSAGE: &str = "connect.starting";
 #[cfg(not(windows))]
-const CONNECTING_MESSAGE: &str =
-    "Запускается подключение. Подтвердите права администратора в системном окне.";
-const TUNNEL_ON_MESSAGE: &str = "Включается туннель…";
-const WARM_UP_FAILED_MESSAGE: &str =
-    "Ядра не удалось запустить заранее. Они запустятся при подключении.";
+const CONNECTING_MESSAGE: &str = "connect.starting_confirm_admin";
+const TUNNEL_ON_MESSAGE: &str = "connect.tunnel_on";
+const WARM_UP_FAILED_MESSAGE: &str = "cores.warm_up_failed";
+const CORES_LOST_MESSAGE: &str = "cores.lost";
 
-const CORES_LOST_MESSAGE: &str =
-    "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова.";
+/// A user-facing daemon message: the Russian text every client gets, and, for registered
+/// messages, the stable code the desktop shows in its own language
+/// (`multicore_i18n::daemon_messages`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonText {
+    pub text: String,
+    pub key: Option<MessageKey>,
+}
+
+impl DaemonText {
+    /// A registered message without arguments.
+    ///
+    /// # Panics
+    /// When `code` is not registered (a programming error, covered by tests).
+    #[must_use]
+    pub fn code(code: &str) -> Self {
+        MessageKey::new(code).into()
+    }
+
+    /// A registered message with arguments.
+    #[must_use]
+    pub fn with_args(code: &str, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        MessageKey::with_args(code, args).into()
+    }
+}
+
+impl From<MessageKey> for DaemonText {
+    fn from(key: MessageKey) -> Self {
+        let text = key
+            .russian()
+            .unwrap_or_else(|| panic!("unregistered daemon message code {}", key.code));
+        Self {
+            text,
+            key: Some(key),
+        }
+    }
+}
+
+impl From<String> for DaemonText {
+    fn from(text: String) -> Self {
+        Self { text, key: None }
+    }
+}
+
+/// Text without a code (diagnostic English the desktop shows as is).
+impl From<&str> for DaemonText {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            key: None,
+        }
+    }
+}
 
 /// Always-ready mode: the state of the always-ready service as the daemon last saw it.
 pub trait CoresReadiness: Send + Sync + 'static {
@@ -126,6 +177,9 @@ pub struct StatusDto {
     pub profile: Option<String>,
     pub current_node: Option<String>,
     pub message: Option<String>,
+    /// The stable code of `message` (see `multicore_i18n::daemon_messages`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<MessageKey>,
     pub degraded: bool,
     pub subscription: Option<SubscriptionInfoDto>,
     /// Mihomo and Xray are running (connected, or warm through the always-ready service).
@@ -214,6 +268,9 @@ pub struct EventDto {
     pub level: String,
     pub component: String,
     pub message: String,
+    /// The stable code of `message` (see `multicore_i18n::daemon_messages`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_key: Option<MessageKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
 }
@@ -1093,7 +1150,7 @@ pub trait Backend: Send + Sync + 'static {
         Vec::new()
     }
     /// Records which troubleshooting fixes ran in the event log.
-    async fn record_troubleshoot(&self, _message: &str) {}
+    async fn record_troubleshoot(&self, _message: DaemonText) {}
 }
 
 #[derive(Clone)]
@@ -1848,7 +1905,7 @@ async fn connect(State(state): State<AppState>, body: Bytes) -> Result<Json<Stat
             Some((engine, cause)) => ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 start_failure_code(cause),
-                &start_failure_message(engine, cause),
+                &start_failure_message(engine, cause).text,
             ),
             None => ApiError::backend("Не удалось подключиться. Повторите попытку."),
         })
@@ -2124,8 +2181,9 @@ async fn troubleshoot_fix(
             .count();
         state
             .backend
-            .record_troubleshoot(&format!(
-                "Устранение неполадок: {summary}; ошибок: {failed}."
+            .record_troubleshoot(DaemonText::with_args(
+                "troubleshoot.fixes_applied",
+                [summary, failed.to_string()],
             ))
             .await;
     }
@@ -2614,7 +2672,7 @@ struct CoreRuntime<P: ProcessController> {
     current_node: Option<String>,
     selected_nodes: Vec<Option<String>>,
     explicit_selected_nodes: Vec<Option<String>>,
-    message: Option<String>,
+    message: Option<DaemonText>,
     degraded: bool,
     /// Set on every transition into Connected (the only one is `connect`); only read while
     /// Connected, so a value left from an earlier session is never reported.
@@ -2879,7 +2937,11 @@ impl<P: ProcessController> CoreRuntime<P> {
                 .map(|id| id.as_str().to_owned()),
             profile,
             current_node,
-            message: self.message.clone(),
+            message: self.message.as_ref().map(|message| message.text.clone()),
+            message_key: self
+                .message
+                .as_ref()
+                .and_then(|message| message.key.clone()),
             degraded: self.degraded,
             subscription: self
                 .pending_snapshot
@@ -3044,7 +3106,7 @@ impl<P: ProcessController> CoreRuntime<P> {
         self.warm_revision = None;
     }
 
-    fn mark_error(&mut self, message: &str, degraded: bool) {
+    fn mark_error(&mut self, message: impl Into<DaemonText>, degraded: bool) {
         match self.state.current() {
             CoreConnectionState::Ready => {
                 let _ = self.state.transition(CoreConnectionState::Empty);
@@ -3057,11 +3119,17 @@ impl<P: ProcessController> CoreRuntime<P> {
             }
             CoreConnectionState::Error => {}
         }
-        self.message = Some(message.to_owned());
+        self.message = Some(message.into());
         self.degraded = degraded;
     }
 
-    fn push_event(&mut self, severity: Severity, component: Component, phase: &str, message: &str) {
+    fn push_event(
+        &mut self,
+        severity: Severity,
+        component: Component,
+        phase: &str,
+        message: impl Into<DaemonText>,
+    ) {
         self.push_event_with_details(severity, component, phase, message, json!({}));
     }
 
@@ -3075,19 +3143,24 @@ impl<P: ProcessController> CoreRuntime<P> {
         severity: Severity,
         component: Component,
         phase: &str,
-        message: &str,
+        message: impl Into<DaemonText>,
         details: serde_json::Value,
     ) {
+        let message = message.into();
         self.events.push_event_with(|id| {
-            Event::new(
+            let event = Event::new(
                 unix_timestamp_ms(),
                 severity,
                 component,
                 phase,
                 format!("daemon-{id:016x}"),
-                message,
+                &message.text,
                 details,
-            )
+            );
+            match message.key {
+                Some(key) => event.with_message_key(key),
+                None => event,
+            }
         });
     }
 }
@@ -3535,7 +3608,7 @@ where
                         Severity::Warning,
                         Component::Core,
                         "warm_up",
-                        WARM_UP_FAILED_MESSAGE,
+                        DaemonText::code(WARM_UP_FAILED_MESSAGE),
                     );
                 }
                 Err(error)
@@ -3612,18 +3685,15 @@ where
             // Like a disconnect: drop the controller and apply a snapshot left pending.
             self.reconcile_authoritative().await;
             state = self.inner.write().await;
-            state.message = Some(CORES_LOST_MESSAGE.to_owned());
+            state.message = Some(DaemonText::code(CORES_LOST_MESSAGE));
         } else {
-            state.mark_error(
-                "Не удалось полностью остановить подключение. Повторите попытку.",
-                true,
-            );
+            state.mark_error(DaemonText::code("disconnect.incomplete"), true);
         }
         state.push_event(
             Severity::Error,
             Component::Core,
             "service_lost",
-            CORES_LOST_MESSAGE,
+            DaemonText::code(CORES_LOST_MESSAGE),
         );
         drop(state);
         self.request_warm();
@@ -3640,11 +3710,11 @@ where
     }
 
     /// A one-time user-facing notice (for example the fallback to on-demand elevation).
-    pub async fn record_notice(&self, phase: &str, message: &str) {
+    pub async fn record_notice(&self, phase: &str, message: DaemonText) {
         let mut state = self.inner.write().await;
-        state.push_event(Severity::Warning, Component::Core, phase, message);
+        state.push_event(Severity::Warning, Component::Core, phase, message.clone());
         if state.message.is_none() {
-            state.message = Some(message.to_owned());
+            state.message = Some(message);
         }
     }
 
@@ -3655,9 +3725,9 @@ where
 
     /// Clears a notice from `record_notice` once it no longer applies (for example the
     /// service became available).
-    pub async fn clear_notice(&self, message: &str) {
+    pub async fn clear_notice(&self, message: &DaemonText) {
         let mut state = self.inner.write().await;
-        if state.message.as_deref() == Some(message) {
+        if state.message.as_ref() == Some(message) {
             state.message = None;
         }
     }
@@ -3706,13 +3776,12 @@ where
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut state = self.inner.write().await;
-                state.message =
-                    Some("Не удалось подготовить сетевой интерфейс и адреса узлов.".to_owned());
+                state.message = Some(DaemonText::code("connect.prepare_failed"));
                 state.push_event(
                     Severity::Error,
                     Component::Core,
                     "runtime_publish",
-                    "Подготовка конфигурации перед подключением завершилась ошибкой.",
+                    DaemonText::code("connect.prepare_failed_event"),
                 );
                 return Err(error);
             }
@@ -3728,18 +3797,18 @@ where
                 Severity::Debug,
                 Component::Core,
                 "connect",
-                "Прогретая конфигурация не подошла, запуск подготовлен заново.",
+                DaemonText::code("connect.restaged"),
                 json!({ "reason": reason, "prepare_ms": prepared_ms }),
             );
         }
         if prepared.activate().is_err() {
             let mut state = self.inner.write().await;
-            state.message = Some("Не удалось активировать конфигурацию запуска.".to_owned());
+            state.message = Some(DaemonText::code("connect.activate_failed"));
             state.push_event(
                 Severity::Error,
                 Component::Core,
                 "runtime_publish",
-                "Активация конфигурации перед подключением завершилась ошибкой.",
+                DaemonText::code("connect.activate_failed_event"),
             );
             return Err(BackendError::new());
         }
@@ -3750,19 +3819,16 @@ where
                 .state
                 .transition(CoreConnectionState::Connecting)
                 .map_err(|_| BackendError::new())?;
-            state.message = Some(
-                if state.service_active() {
-                    TUNNEL_ON_MESSAGE
-                } else {
-                    CONNECTING_MESSAGE
-                }
-                .to_owned(),
-            );
+            state.message = Some(DaemonText::code(if state.service_active() {
+                TUNNEL_ON_MESSAGE
+            } else {
+                CONNECTING_MESSAGE
+            }));
             state.push_event(
                 Severity::Info,
                 Component::Core,
                 "connect",
-                "Запускается подключение.",
+                DaemonText::code("connect.starting"),
             );
         }
         // If this future is dropped before the outcome is recorded, leave a cleanable error.
@@ -3781,10 +3847,9 @@ where
                             .state
                             .transition(CoreConnectionState::Ready)
                             .map_err(|_| BackendError::new())?;
-                        state.message = Some(
-                            "Mihomo did not apply the queued route selection; connection was rolled back."
-                                .to_owned(),
-                        );
+                        state.message = Some(DaemonText::from(
+                            "Mihomo did not apply the queued route selection; connection was rolled back.",
+                        ));
                         state.degraded = false;
                     } else {
                         state.mark_error(
@@ -3826,7 +3891,7 @@ where
                     Severity::Info,
                     Component::Core,
                     "connect",
-                    "Подключение установлено.",
+                    DaemonText::code("connect.established"),
                     json!({
                         "prepare_ms": prepared_ms,
                         "restaged": restage_reason.is_some(),
@@ -3846,10 +3911,7 @@ where
             }) => {
                 self.request_warm();
                 if rollback_failed {
-                    state.mark_error(
-                        "Не удалось полностью отменить запуск. Выполните отключение для очистки.",
-                        true,
-                    );
+                    state.mark_error(DaemonText::code("connect.rollback_incomplete"), true);
                 } else {
                     state
                         .state
@@ -3860,12 +3922,12 @@ where
                 }
                 // The cause used to reach only the status line, so a copied
                 // log said "connect failed" with nothing to act on.
-                let shown = start_failure_message(engine, cause);
+                let shown = start_failure_message(engine, cause).text;
                 state.push_event_with_details(
                     Severity::Error,
                     Component::Core,
                     "connect",
-                    "Запуск подключения завершился ошибкой.",
+                    DaemonText::code("connect.failed"),
                     json!({
                         "engine": format!("{engine:?}"),
                         "cause": format!("{cause:?}"),
@@ -3879,15 +3941,12 @@ where
                 Err(BackendError::from_start_failure(engine, cause))
             }
             Err(multicore_core::SupervisorError::StopFailed) => {
-                state.mark_error(
-                    "Состояние процессов неизвестно. Выполните отключение для очистки.",
-                    true,
-                );
+                state.mark_error(DaemonText::code("connect.processes_unknown"), true);
                 state.push_event_with_details(
                     Severity::Error,
                     Component::Core,
                     "connect",
-                    "Запуск подключения завершился ошибкой.",
+                    DaemonText::code("connect.failed"),
                     json!({ "cause": "stop_failed_during_start", "os": std::env::consts::OS }),
                 );
                 Err(BackendError::new())
@@ -3954,7 +4013,7 @@ where
                     Severity::Info,
                     Component::Core,
                     "disconnect",
-                    "Подключение остановлено.",
+                    DaemonText::code("disconnect.done"),
                     json!({
                         "stop_ms": stopped_ms,
                         "reconcile_ms": started.elapsed().as_millis().saturating_sub(stopped_ms),
@@ -3964,15 +4023,12 @@ where
                 Ok(self.current_status().await)
             }
             Err(_) => {
-                state.mark_error(
-                    "Не удалось полностью остановить подключение. Повторите попытку.",
-                    true,
-                );
+                state.mark_error(DaemonText::code("disconnect.incomplete"), true);
                 state.push_event(
                     Severity::Error,
                     Component::Core,
                     "disconnect",
-                    "Остановка подключения завершилась ошибкой.",
+                    DaemonText::code("disconnect.failed_event"),
                 );
                 Err(BackendError::new())
             }
@@ -4369,7 +4425,7 @@ where
                     Severity::Warning,
                     Component::Subscription,
                     "subscription_fetch_failed",
-                    &format!("Subscription download failed: {reason}."),
+                    format!("Subscription download failed: {reason}.").as_str(),
                     json!({
                         "host": diagnostics.host,
                         "native": diagnostics.native.to_string(),
@@ -4758,7 +4814,7 @@ where
                     Severity::Warning,
                     Component::Core,
                     phase,
-                    "Подготовка к подключению отложена до подключения.",
+                    DaemonText::code("connect.prepare_deferred"),
                     json!({ "phase": phase, "os": std::env::consts::OS }),
                 );
                 None
@@ -4805,7 +4861,7 @@ where
             Severity::Warning,
             Component::Subscription,
             phase,
-            "Не удалось сохранить изменение подписки.",
+            DaemonText::code("subscription.save_failed"),
             json!({ "phase": phase, "detail": detail.to_string(), "os": std::env::consts::OS }),
         );
     }
@@ -5344,7 +5400,7 @@ where
             .unwrap_or_default()
     }
 
-    async fn record_troubleshoot(&self, message: &str) {
+    async fn record_troubleshoot(&self, message: DaemonText) {
         self.inner.write().await.push_event(
             Severity::Info,
             Component::Core,
@@ -5450,7 +5506,7 @@ where
                 Severity::Debug,
                 Component::Core,
                 "subscription_switch",
-                "Подписка переключена.",
+                DaemonText::code("subscription.switched"),
                 json!({
                     "wait_ms": waited_ms,
                     "pause_ms": paused_ms.saturating_sub(waited_ms),
@@ -5646,7 +5702,7 @@ where
                 Severity::Warning,
                 Component::Mihomo,
                 "selection_failed",
-                "Mihomo не применил выбор маршрута.",
+                DaemonText::code("route.select_failed"),
             );
             return Err(SelectionError::SelectorFailed);
         }
@@ -5727,7 +5783,7 @@ where
             Severity::Info,
             Component::Mihomo,
             "selection",
-            "Маршрут Mihomo изменён.",
+            DaemonText::code("route.selected"),
         );
         if maintenance_debt {
             state.push_event(
@@ -6061,15 +6117,12 @@ impl<P: ProcessController> Drop for AbandonedConnectGuard<'_, P> {
         for _ in 0..10_000 {
             if let Ok(mut state) = self.inner.try_write() {
                 if state.state.current() == CoreConnectionState::Connecting {
-                    state.mark_error(
-                        "Подключение прервано. Выполните отключение для очистки.",
-                        true,
-                    );
+                    state.mark_error(DaemonText::code("connect.interrupted"), true);
                     state.push_event(
                         Severity::Error,
                         Component::Core,
                         "connect",
-                        "Запуск подключения был прерван.",
+                        DaemonText::code("connect.aborted"),
                     );
                 }
                 return;
@@ -6135,37 +6188,26 @@ fn start_failure_code(cause: multicore_core::StartFailureCause) -> &'static str 
 fn start_failure_message(
     engine: multicore_core::Engine,
     cause: multicore_core::StartFailureCause,
-) -> String {
+) -> DaemonText {
     use multicore_core::{Engine, StartFailureCause as Cause};
     let core = match engine {
         Engine::Xray => "Xray",
         Engine::Mihomo => "Mihomo",
     };
+    let with_core = |code| DaemonText::with_args(code, [core]);
     match cause {
-        Cause::ElevationCancelled => {
-            "Подключение отменено: не выдано разрешение администратора.".to_owned()
-        }
-        Cause::ElevationFailed => {
-            "Не удалось запустить службу подключения с правами администратора.".to_owned()
-        }
-        Cause::BrokerFailed => "Служба подключения не ответила. Повторите попытку.".to_owned(),
-        Cause::CoreFailed => format!("Не удалось запустить {core}. Подробности — в логе на странице «Состояние»."),
-        Cause::CoreMissing => format!(
-            "Не удалось запустить {core}: файл ядра не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
-        ),
-        Cause::CoreExited => {
-            format!("{core} завершился сразу после запуска. Причина — в логе на странице «Состояние».")
-        }
-        Cause::ReadinessTimedOut => {
-            format!("{core} не успел запуститься вовремя. Повторите попытку.")
-        }
-        Cause::TunFailed => "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.".to_owned(),
-        Cause::TunTimedOut => "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.".to_owned(),
-        Cause::SystemProxyFailed => {
-            "Не удалось включить системный прокси. Повторите попытку.".to_owned()
-        }
-        Cause::ServiceBusy => "MULTICORE уже запущен у другого пользователя.".to_owned(),
-        Cause::Unknown => "Не удалось запустить подключение. Повторите попытку.".to_owned(),
+        Cause::ElevationCancelled => DaemonText::code("start.elevation_cancelled"),
+        Cause::ElevationFailed => DaemonText::code("start.elevation_failed"),
+        Cause::BrokerFailed => DaemonText::code("start.broker_failed"),
+        Cause::CoreFailed => with_core("start.core_failed"),
+        Cause::CoreMissing => with_core("start.core_missing"),
+        Cause::CoreExited => with_core("start.core_exited"),
+        Cause::ReadinessTimedOut => with_core("start.core_timed_out"),
+        Cause::TunFailed => DaemonText::code("start.tun_failed"),
+        Cause::TunTimedOut => DaemonText::code("start.tun_timed_out"),
+        Cause::SystemProxyFailed => DaemonText::code("start.system_proxy_failed"),
+        Cause::ServiceBusy => DaemonText::code("start.service_busy"),
+        Cause::Unknown => DaemonText::code("start.unknown"),
     }
 }
 
@@ -6659,6 +6701,10 @@ fn core_event_to_dto(id: u64, event: &Event) -> EventDto {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Событие недоступно.")
             .to_owned(),
+        message_key: value
+            .get("message_key")
+            .cloned()
+            .and_then(|key| serde_json::from_value(key).ok()),
         details,
     }
 }
@@ -6716,6 +6762,7 @@ impl MemoryState {
             profile: active.map(|profile| profile.display_name.clone()),
             current_node: active.map(|_| "Авто".to_owned()),
             message: None,
+            message_key: None,
             degraded: false,
             subscription: None,
             cores_ready: false,
@@ -6767,6 +6814,7 @@ impl MemoryState {
             level: level.to_owned(),
             component: "system".to_owned(),
             message: message.to_owned(),
+            message_key: None,
             details: None,
         });
     }

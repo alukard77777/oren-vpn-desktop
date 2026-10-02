@@ -1417,6 +1417,8 @@ export component AppWindow inherits Window {
     // bundled translation; `language-set-by-user` once the user picked it in Settings.
     in property <string> language: "ru";
     in property <bool> language-set-by-user: false;
+    // The language follows the active subscription's `app-language` header.
+    in property <bool> language-from-provider: false;
     // Icon-only navigation rail; collapsed on first run, remembered after.
     in-out property <bool> navigation-collapsed: true;
     in-out property <bool> shell-active: true;
@@ -4112,7 +4114,7 @@ export component AppWindow inherits Window {
                                 }
                                 LanguageRow {
                                     label: "Язык / Language";
-                                    description: !root.language-set-by-user && root.language == "en" ? @tr("Выбран провайдером подписки") : "";
+                                    description: root.language-from-provider ? @tr("Выбран провайдером подписки") : "";
                                     language: root.language;
                                     enabled: !root.profile-menu-open;
                                     show-separator: true;

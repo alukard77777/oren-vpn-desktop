@@ -33,6 +33,7 @@ impl Backend for FakeBackend {
             profile: None,
             current_node: None,
             message: None,
+            message_key: None,
             degraded: false,
             subscription: None,
             cores_ready: false,
@@ -72,8 +73,8 @@ impl Backend for FakeBackend {
         }]
     }
 
-    async fn record_troubleshoot(&self, message: &str) {
-        self.recorded.lock().unwrap().push(message.to_owned());
+    async fn record_troubleshoot(&self, message: multicore_daemon::DaemonText) {
+        self.recorded.lock().unwrap().push(message.text);
     }
 }
 
