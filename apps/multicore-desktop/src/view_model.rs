@@ -8362,7 +8362,7 @@ mod tests {
             "multicore://install-sub?url=…",
             "QuietChip",
             "RouteNodeRow",
-            "ScrollView",
+            "OverlayScroll",
             "DetailsSurface",
             "Диагностика",
             "root.open-panel(\"events\")",
@@ -8549,11 +8549,18 @@ mod tests {
         for padding in [
             "padding-left: 28px;",
             "padding-right: 28px;",
-            "padding-top: 22px;",
             "padding-bottom: 24px;",
         ] {
             assert!(status.contains(padding), "status missing {padding}");
         }
+        // The title row sits in the shared page header, 22px from the top like before.
+        assert!(status.contains("PageHeader {"));
+        let header = source
+            .split("component PageHeader inherits Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("component TextAction").next())
+            .expect("page header");
+        assert!(header.contains("padding-top: 22px;"));
 
         assert!(!source.contains("Mihomo 1.19.30"));
         let settings = source
@@ -8598,7 +8605,8 @@ mod tests {
             })
             .expect("subscriptions page block");
 
-        // Each page scrolls as one column at the minimum window height.
+        // Each page body scrolls as one column under its fixed title at the minimum window
+        // height.
         for (page, scroll, content) in [
             (settings, "settings-scroll", "settings-content"),
             (
@@ -8607,16 +8615,40 @@ mod tests {
                 "subscriptions-content",
             ),
         ] {
-            assert!(page.contains(&format!("{scroll} := ScrollView")));
+            assert!(page.contains(&format!("{scroll} := OverlayScroll")));
             assert!(page.contains(&format!("{content} := VerticalLayout")));
             assert!(page.contains(&format!("width: {scroll}.visible-width;")));
-            assert!(page.contains(&format!("min-height: {scroll}.visible-height;")));
-            assert!(page.contains("vertical-stretch: 1;"));
+            // Pinning the content's min-height to the visible height capped the scroll
+            // range at one screen: nothing below the fold could be reached.
+            assert!(!page.contains(&format!("min-height: {scroll}.visible-height;")));
+            assert!(page.contains(&format!("scrolled: {scroll}.scrolled;")));
             assert!(page.contains("padding-left: 28px;"));
             assert!(
-                page.find(&format!("{scroll} := ScrollView")).unwrap()
+                page.find("PageHeader {").unwrap()
+                    < page.find(&format!("{scroll} := OverlayScroll")).unwrap()
+            );
+            assert!(
+                page.find(&format!("{scroll} := OverlayScroll")).unwrap()
                     < page.find(&format!("{content} := VerticalLayout")).unwrap()
             );
+        }
+        for (file, ui) in [
+            ("app.slint", source),
+            (
+                "troubleshoot.slint",
+                include_str!("../ui/troubleshoot.slint"),
+            ),
+        ] {
+            assert!(
+                !ui.contains("ScrollView"),
+                "{file}: every scroll area uses OverlayScroll"
+            );
+            for line in ui.lines().filter(|line| line.contains("min-height:")) {
+                assert!(
+                    !line.contains(".visible-height"),
+                    "{file}: content pinned to the visible height cannot scroll: {line}"
+                );
+            }
         }
         // Settings is one iOS page: captioned grouped cards, no sub-navigation.
         assert!(!source.contains("SettingsNavItem"));
@@ -8636,9 +8668,9 @@ mod tests {
         ));
         // Subscriptions header: title + quiet "Добавить", the inline add editor keeps the draft.
         let header = subscriptions
-            .split("subscriptions-content := VerticalLayout")
+            .split("PageHeader {")
             .nth(1)
-            .and_then(|source| source.split("if root.replace-editor-open").next())
+            .and_then(|source| source.split("subscriptions-scroll := OverlayScroll").next())
             .expect("subscription header");
         assert!(header.contains("label: root.import-pending ? \"Добавляем…\" : \"Добавить\";"));
         assert!(header.contains(
@@ -8756,12 +8788,14 @@ mod tests {
         ));
         assert!(app.contains("entering: root.route-search-entering;"));
         // Results replace the list; skeletons pulse only while loading and motion is allowed.
-        assert!(app.contains("if !root.route-search-results-shown: ScrollView {"));
         assert!(
             app.contains(
-                "if root.route-search-results-shown: route-search-results := ScrollView {"
+                "if !root.route-search-results-shown: route-list-scroll := OverlayScroll {"
             )
         );
+        assert!(app.contains(
+            "if root.route-search-results-shown: route-search-results := OverlayScroll {"
+        ));
         assert!(app.contains("pulsing: !root.reduced-motion;"));
         assert!(app.contains("property <float> phase: self.pulsing ? (1 + Math.sin(animation-tick() / 1200ms * 360deg)) / 2 : 0.5;"));
         assert!(app.contains("if root.route-search-loading: route-search-skeleton := Rectangle {"));

@@ -1,8 +1,7 @@
 // «Устранить неполадки»: a check run with step labels, result cards, confirmed fixes and the
 // two separate repair actions. Every destructive fix is a ticked box or a second click.
-import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { PrimaryAction } from "components.slint";
+import { OverlayScroll, PrimaryAction } from "components.slint";
 
 export struct UiTroubleshootCard {
     // "error" | "warning" | "info" | "success"
@@ -330,10 +329,12 @@ export component TroubleshootPage inherits Rectangle {
 
     background: transparent;
 
-    scroll := ScrollView {
+    // The whole page scrolls (its own redesign will settle what stays put). The content is
+    // never pinned to the visible height: that would cap the scroll range at one screen.
+    scroll := OverlayScroll {
+        reduced-motion: root.reduced-motion;
         content := VerticalLayout {
             width: scroll.visible-width;
-            min-height: scroll.visible-height;
             padding-left: 28px;
             padding-right: 28px;
             padding-top: 14px;

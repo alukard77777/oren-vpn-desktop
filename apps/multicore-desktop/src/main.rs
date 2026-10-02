@@ -6823,7 +6823,7 @@ mod window_tests {
             "callback add-subscription();",
             "callback retry-profile-menu();",
             "profile-menu := Rectangle",
-            "profile-scroll := ScrollView",
+            "profile-scroll := OverlayScroll",
             "Подписок пока нет",
             "Удалить подписку?",
             "До 16 подписок · активна только одна",

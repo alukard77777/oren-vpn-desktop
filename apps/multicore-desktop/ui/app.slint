@@ -1,6 +1,6 @@
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { IconLoadingSlot, PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
+import { IconLoadingSlot, OverlayScroll, PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
 import { TroubleshootPage, UiTroubleshootCard, UiTroubleshootFix, UiTroubleshootStep } from "troubleshoot.slint";
 import "../assets/fonts/Twemoji.Mozilla.ttf";
 export { TrayPopup, TrayMenuRow } from "tray_popup.slint";
@@ -378,6 +378,43 @@ component Footnote inherits Text {
     font-family: Theme.font-family;
     font-size: Theme.type-metadata-size;
     wrap: word-wrap;
+}
+
+// A page's title area: it stays put while the page body scrolls under it, and a hairline
+// appears along its bottom edge once the body has moved. Trailing actions go in as children.
+component PageHeader inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> scrolled: false;
+    in property <bool> reduced-motion: false;
+    // Room between the title (or subtitle) and the first section of the body.
+    in property <length> gap: 14px;
+
+    background: transparent;
+
+    VerticalLayout {
+        padding-left: 28px;
+        padding-right: 28px;
+        padding-top: 22px;
+        padding-bottom: root.gap;
+        spacing: 0px;
+        HorizontalLayout {
+            height: 36px;
+            spacing: 4px;
+            Text { text: root.title; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; accessible-role: text; }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            @children
+        }
+        if root.subtitle != "": Footnote { text: root.subtitle; }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: #ffffff0f;
+        opacity: root.scrolled ? 1 : 0;
+        animate opacity { duration: root.reduced-motion ? 0ms : 160ms; easing: ease-out; }
+    }
 }
 
 // Quiet iOS-style text button: a tinted label, no chrome; ring only on focus.
@@ -3420,8 +3457,9 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if root.catalog-error == "" && root.latency-check-error != "": Text { min-height: 28px; text: root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                            if !root.route-search-results-shown: ScrollView {
+                            if !root.route-search-results-shown: route-list-scroll := OverlayScroll {
                                 vertical-stretch: 1;
+                                reduced-motion: root.reduced-motion;
                                 VerticalLayout {
                                     // Full width: the card lines up with the connect module and
                                     // its latency column with the switch's right edge.
@@ -3476,8 +3514,9 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.route-search-results-shown: route-search-results := ScrollView {
+                            if root.route-search-results-shown: route-search-results := OverlayScroll {
                                 vertical-stretch: 1;
+                                reduced-motion: root.reduced-motion;
                                 opacity: root.route-search-entering ? 0 : 1;
                                 animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
                                 VerticalLayout {
@@ -3561,192 +3600,201 @@ export component AppWindow inherits Window {
                 animate y { duration: 220ms; easing: ease-out; }
                 background: transparent;
                 VerticalLayout {
-                    padding-left: 28px;
-                    padding-right: 28px;
-                    padding-top: 22px;
-                    padding-bottom: 24px;
-                    spacing: 0px;
-                    HorizontalLayout {
-                        height: 36px;
-                        spacing: 4px;
-                        Text { text: "Состояние"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; }
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-                        VerticalLayout {
-                            alignment: center;
-                            TextAction {
-                                label: "Открыть дашборд";
-                                enabled: root.dashboard-available && !root.profile-menu-open;
-                                disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
-                                activated => { root.open-dashboard(); }
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            TextAction {
-                                label: "Копировать лог";
-                                swap-label: "Скопировано ✓";
-                                swapped: root.diagnostics-copied;
-                                enabled: !root.profile-menu-open;
-                                activated => { root.copy-diagnostics(); }
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            TextAction {
-                                label: "Сохранить лог…";
-                                swap-label: root.diagnostics-save-state == "saving" ? "Сохраняем…"
-                                    : root.diagnostics-save-state == "failed" ? "Не сохранено"
-                                    : root.diagnostics-save-state == "saved-downloads" ? "В Загрузках ✓"
-                                    : "Сохранено ✓";
-                                swap-tone: root.diagnostics-save-state == "failed" ? "danger"
-                                    : root.diagnostics-save-state == "saving" ? "neutral"
-                                    : "success";
-                                swapped: root.diagnostics-save-state != "";
-                                enabled: !root.profile-menu-open;
-                                activated => { root.save-diagnostics(); }
-                            }
+                spacing: 0px;
+                // Title and log actions stay put; the cards scroll under them when the window is short.
+                PageHeader {
+                    title: "Состояние";
+                    scrolled: status-scroll.scrolled;
+                    reduced-motion: root.reduced-motion;
+                    VerticalLayout {
+                        alignment: center;
+                        TextAction {
+                            label: "Открыть дашборд";
+                            enabled: root.dashboard-available && !root.profile-menu-open;
+                            disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
+                            activated => { root.open-dashboard(); }
                         }
                     }
-                    Rectangle { height: 14px; background: transparent; }
+                    VerticalLayout {
+                        alignment: center;
+                        TextAction {
+                            label: "Копировать лог";
+                            swap-label: "Скопировано ✓";
+                            swapped: root.diagnostics-copied;
+                            enabled: !root.profile-menu-open;
+                            activated => { root.copy-diagnostics(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        TextAction {
+                            label: "Сохранить лог…";
+                            swap-label: root.diagnostics-save-state == "saving" ? "Сохраняем…"
+                                : root.diagnostics-save-state == "failed" ? "Не сохранено"
+                                : root.diagnostics-save-state == "saved-downloads" ? "В Загрузках ✓"
+                                : "Сохранено ✓";
+                            swap-tone: root.diagnostics-save-state == "failed" ? "danger"
+                                : root.diagnostics-save-state == "saving" ? "neutral"
+                                : "success";
+                            swapped: root.diagnostics-save-state != "";
+                            enabled: !root.profile-menu-open;
+                            activated => { root.save-diagnostics(); }
+                        }
+                    }
+                }
+                status-scroll := OverlayScroll {
+                    reduced-motion: root.reduced-motion;
+                    // Inside the log or the mapping list only their own bar shows.
+                    suppress-hover: mapping-scroll.hovered || event-log-scroll.hovered;
+                    status-content := VerticalLayout {
+                        width: status-scroll.visible-width;
+                        padding-left: 28px;
+                        padding-right: 28px;
+                        padding-bottom: 24px;
+                        spacing: 0px;
 
-                    // Each section: its caption, an optional one-line description right under
-                    // it, then the card 8px below.
-                    HorizontalLayout {
-                        height: 16px;
-                        padding-left: 4px;
-                        SectionCaption { text: "ЯДРА"; }
-                        if root.diagnostics-loading: Text { text: "Обновляем…"; color: Theme.text-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
-                    }
-                    Rectangle { height: 8px; background: transparent; }
-                    cores-card := Rectangle {
-                        opacity: root.page-entering ? 0 : 1;
-                        animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                        height: 132px;
-                        background: Theme.surface;
-                        border-color: #ffffff0a;
-                        border-width: 1px;
-                        border-radius: 14px;
-                        clip: true;
-                        VerticalLayout {
-                            spacing: 0px;
-                            HealthRow { label: "Транспорт Xray"; value: root.diagnostics-xray-value; tone: root.diagnostics-xray-tone; show-separator: true; }
-                            HealthRow { label: "Политики Mihomo"; value: root.diagnostics-mihomo-value; tone: root.diagnostics-mihomo-tone; show-separator: true; }
-                            HealthRow { label: "Туннель TUN"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
-                        }
-                    }
-                    Rectangle { height: 20px; background: transparent; }
-
-                    HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "МАППИНГ"; } }
-                    HorizontalLayout { padding-left: 4px; padding-top: 2px; Footnote { text: "Локальные прокси-адреса для сторонних приложений"; } }
-                    Rectangle { height: 8px; background: transparent; }
-                    mapping-card := Rectangle {
-                        opacity: root.page-entering ? 0 : 1;
-                        animate opacity { duration: 280ms; delay: 48ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                        // Up to three rows show at once; more scroll inside the card.
-                        height: root.diagnostic-mappings.length == 0 ? 44px : Math.min(3, root.diagnostic-mappings.length) * 44px;
-                        background: Theme.surface;
-                        border-color: #ffffff0a;
-                        border-width: 1px;
-                        border-radius: 14px;
-                        clip: true;
-                        ScrollView {
-                            VerticalLayout {
-                                spacing: 0px;
-                                for mapping[index] in root.diagnostic-mappings: Rectangle {
-                                    height: 44px;
-                                    background: mapping-touch.has-hover ? #ffffff06 : transparent;
-                                    mapping-touch := TouchArea { }
-                                    HorizontalLayout {
-                                        padding-left: 16px;
-                                        padding-right: 16px;
-                                        spacing: 12px;
-                                        if mapping.icon-image.width > 0: VerticalLayout {
-                                            alignment: center;
-                                            Image { width: 18px; height: 18px; source: mapping.icon-image; image-fit: contain; accessible-role: none; }
-                                        }
-                                        Text { text: mapping.proxy-name; color: Theme.text-primary; font-size: Theme.type-label-size; vertical-alignment: center; overflow: elide; }
-                                        Text { width: 128px; text: mapping.address; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; }
-                                        Text { width: 132px; text: mapping.xray-label; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-                                    }
-                                    if index < root.diagnostic-mappings.length - 1: Rectangle { x: 46px; y: parent.height - 1px; width: parent.width - 46px; height: 1px; background: #ffffff0f; }
-                                }
-                                if root.diagnostic-mappings.length == 0: Text { height: 44px; text: "Маппинги появятся после загрузки подписки"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
-                            }
-                        }
-                    }
-                    Rectangle { height: 20px; background: transparent; }
-
-                    HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ЖУРНАЛ"; } }
-                    Rectangle { height: 8px; background: transparent; }
-                    event-filter-track := Rectangle {
-                        height: 38px;
-                        background: #0a0c0f;
-                        border-color: Theme.line;
-                        border-width: 1px;
-                        border-radius: 10px;
+                        // Each section: its caption, an optional one-line description right under
+                        // it, then the card 8px below.
                         HorizontalLayout {
-                            padding: 2px;
-                            spacing: 2px;
-                            QuietChip { min-width: 0px; label: "Все"; selected: root.event-filter == "Все"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
-                            QuietChip { min-width: 0px; label: "Система"; selected: root.event-filter == "Система"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
-                            QuietChip { min-width: 0px; label: "Ошибки"; selected: root.event-filter == "Ошибки"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
-                            QuietChip { min-width: 0px; label: "Ядра"; selected: root.event-filter == "Ядра"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
+                            height: 16px;
+                            padding-left: 4px;
+                            SectionCaption { text: "ЯДРА"; }
+                            if root.diagnostics-loading: Text { text: "Обновляем…"; color: Theme.text-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                         }
-                    }
-                    Rectangle { height: 10px; background: transparent; }
-                    // One grouped card of log rows: time, a severity dot and the message.
-                    event-log-card := Rectangle {
-                        opacity: root.page-entering ? 0 : 1;
-                        animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
-                        vertical-stretch: 1;
-                        min-height: 88px;
-                        background: Theme.surface;
-                        border-color: #ffffff0a;
-                        border-width: 1px;
-                        border-radius: 14px;
-                        clip: true;
-                        ScrollView {
+                        Rectangle { height: 8px; background: transparent; }
+                        cores-card := Rectangle {
+                            opacity: root.page-entering ? 0 : 1;
+                            animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            height: 132px;
+                            background: Theme.surface;
+                            border-color: #ffffff0a;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            clip: true;
                             VerticalLayout {
-                                alignment: start;
                                 spacing: 0px;
-                                for event[index] in root.events: Rectangle {
-                                    height: Math.max(40px, event-row.preferred-height);
-                                    background: event-touch.has-hover ? #ffffff05 : transparent;
-                                    event-touch := TouchArea { }
-                                    event-row := HorizontalLayout {
-                                        padding-left: 16px;
-                                        padding-right: 16px;
-                                        padding-top: 11px;
-                                        padding-bottom: 11px;
-                                        spacing: 12px;
-                                        alignment: start;
-                                        Text { width: 58px; text: event.timestamp; color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: Theme.type-metadata-size; }
-                                        VerticalLayout {
-                                            width: 6px;
-                                            padding-top: 6px;
+                                HealthRow { label: "Транспорт Xray"; value: root.diagnostics-xray-value; tone: root.diagnostics-xray-tone; show-separator: true; }
+                                HealthRow { label: "Политики Mihomo"; value: root.diagnostics-mihomo-value; tone: root.diagnostics-mihomo-tone; show-separator: true; }
+                                HealthRow { label: "Туннель TUN"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
+                            }
+                        }
+                        Rectangle { height: 20px; background: transparent; }
+
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "МАППИНГ"; } }
+                        HorizontalLayout { padding-left: 4px; padding-top: 2px; Footnote { text: "Локальные прокси-адреса для сторонних приложений"; } }
+                        Rectangle { height: 8px; background: transparent; }
+                        mapping-card := Rectangle {
+                            opacity: root.page-entering ? 0 : 1;
+                            animate opacity { duration: 280ms; delay: 48ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            // Up to three rows show at once; more scroll inside the card.
+                            height: root.diagnostic-mappings.length == 0 ? 44px : Math.min(3, root.diagnostic-mappings.length) * 44px;
+                            background: Theme.surface;
+                            border-color: #ffffff0a;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            clip: true;
+                            mapping-scroll := OverlayScroll {
+                                reduced-motion: root.reduced-motion;
+                                VerticalLayout {
+                                    spacing: 0px;
+                                    for mapping[index] in root.diagnostic-mappings: Rectangle {
+                                        height: 44px;
+                                        background: mapping-touch.has-hover ? #ffffff06 : transparent;
+                                        mapping-touch := TouchArea { }
+                                        HorizontalLayout {
+                                            padding-left: 16px;
+                                            padding-right: 16px;
+                                            spacing: 12px;
+                                            if mapping.icon-image.width > 0: VerticalLayout {
+                                                alignment: center;
+                                                Image { width: 18px; height: 18px; source: mapping.icon-image; image-fit: contain; accessible-role: none; }
+                                            }
+                                            Text { text: mapping.proxy-name; color: Theme.text-primary; font-size: Theme.type-label-size; vertical-alignment: center; overflow: elide; }
+                                            Text { width: 128px; text: mapping.address; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; }
+                                            Text { width: 132px; text: mapping.xray-label; color: Theme.text-secondary; font-size: Theme.type-metadata-size; horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
+                                        }
+                                        if index < root.diagnostic-mappings.length - 1: Rectangle { x: 46px; y: parent.height - 1px; width: parent.width - 46px; height: 1px; background: #ffffff0f; }
+                                    }
+                                    if root.diagnostic-mappings.length == 0: Text { height: 44px; text: "Маппинги появятся после загрузки подписки"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
+                                }
+                            }
+                        }
+                        Rectangle { height: 20px; background: transparent; }
+
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ЖУРНАЛ"; } }
+                        Rectangle { height: 8px; background: transparent; }
+                        event-filter-track := Rectangle {
+                            height: 38px;
+                            background: #0a0c0f;
+                            border-color: Theme.line;
+                            border-width: 1px;
+                            border-radius: 10px;
+                            HorizontalLayout {
+                                padding: 2px;
+                                spacing: 2px;
+                                QuietChip { min-width: 0px; label: "Все"; selected: root.event-filter == "Все"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
+                                QuietChip { min-width: 0px; label: "Система"; selected: root.event-filter == "Система"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
+                                QuietChip { min-width: 0px; label: "Ошибки"; selected: root.event-filter == "Ошибки"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
+                                QuietChip { min-width: 0px; label: "Ядра"; selected: root.event-filter == "Ядра"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
+                            }
+                        }
+                        Rectangle { height: 10px; background: transparent; }
+                        // One grouped card of log rows: time, a severity dot and the message.
+                        event-log-card := Rectangle {
+                            opacity: root.page-entering ? 0 : 1;
+                            animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                            vertical-stretch: 1;
+                            min-height: 88px;
+                            background: Theme.surface;
+                            border-color: #ffffff0a;
+                            border-width: 1px;
+                            border-radius: 14px;
+                            clip: true;
+                            event-log-scroll := OverlayScroll {
+                                reduced-motion: root.reduced-motion;
+                                VerticalLayout {
+                                    alignment: start;
+                                    spacing: 0px;
+                                    for event[index] in root.events: Rectangle {
+                                        height: Math.max(40px, event-row.preferred-height);
+                                        background: event-touch.has-hover ? #ffffff05 : transparent;
+                                        event-touch := TouchArea { }
+                                        event-row := HorizontalLayout {
+                                            padding-left: 16px;
+                                            padding-right: 16px;
+                                            padding-top: 11px;
+                                            padding-bottom: 11px;
+                                            spacing: 12px;
                                             alignment: start;
-                                            Rectangle {
+                                            Text { width: 58px; text: event.timestamp; color: event.level == "error" ? Theme.error : Theme.text-muted; font-size: Theme.type-metadata-size; }
+                                            VerticalLayout {
                                                 width: 6px;
-                                                height: 6px;
-                                                border-radius: 3px;
-                                                background: event.level == "error" ? Theme.error : event.level == "warning" ? Theme.warning : Theme.accent-green;
+                                                padding-top: 6px;
+                                                alignment: start;
+                                                Rectangle {
+                                                    width: 6px;
+                                                    height: 6px;
+                                                    border-radius: 3px;
+                                                    background: event.level == "error" ? Theme.error : event.level == "warning" ? Theme.warning : Theme.accent-green;
+                                                }
+                                            }
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: event.message;
+                                                color: event.level == "error" ? #f3c5c5 : Theme.text-secondary;
+                                                font-size: Theme.type-metadata-size;
+                                                wrap: word-wrap;
+                                                accessible-label: (event.level == "error" ? "Ошибка" : "Событие") + (event.component == "" ? "" : ", " + event.component) + (event.timestamp == "" ? "" : ", " + event.timestamp) + ": " + event.message;
                                             }
                                         }
-                                        Text {
-                                            horizontal-stretch: 1;
-                                            text: event.message;
-                                            color: event.level == "error" ? #f3c5c5 : Theme.text-secondary;
-                                            font-size: Theme.type-metadata-size;
-                                            wrap: word-wrap;
-                                            accessible-label: (event.level == "error" ? "Ошибка" : "Событие") + (event.component == "" ? "" : ", " + event.component) + (event.timestamp == "" ? "" : ", " + event.timestamp) + ": " + event.message;
-                                        }
+                                        if index < root.events.length - 1: Rectangle { x: 86px; y: parent.height - 1px; width: parent.width - 86px; height: 1px; background: #ffffff0f; }
                                     }
-                                    if index < root.events.length - 1: Rectangle { x: 86px; y: parent.height - 1px; width: parent.width - 86px; height: 1px; background: #ffffff0f; }
+                                    if root.events.length == 0: Text { height: 64px; text: "Событий пока нет"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                                 }
-                                if root.events.length == 0: Text { height: 64px; text: "Событий пока нет"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                             }
                         }
                     }
+                }
                 }
             }
 
@@ -3756,8 +3804,16 @@ export component AppWindow inherits Window {
                 animate opacity { duration: 180ms; easing: ease-out; }
                 animate y { duration: 220ms; easing: ease-out; }
                 background: transparent;
-                settings-scroll := ScrollView {
-                    vertical-stretch: 1;
+                VerticalLayout {
+                spacing: 0px;
+                // The title stays put; the sections scroll under it.
+                PageHeader {
+                    title: "Настройки";
+                    scrolled: settings-scroll.scrolled;
+                    reduced-motion: root.reduced-motion;
+                }
+                settings-scroll := OverlayScroll {
+                    reduced-motion: root.reduced-motion;
                     // Arriving from the update banner lands on the updates section.
                     init => {
                         if (root.settings-section == "updates") {
@@ -3766,15 +3822,10 @@ export component AppWindow inherits Window {
                     }
                     settings-content := VerticalLayout {
                         width: settings-scroll.visible-width;
-                        min-height: settings-scroll.visible-height;
                         padding-left: 28px;
                         padding-right: 28px;
-                        padding-top: 22px;
                         padding-bottom: 24px;
                         spacing: 0px;
-                        Text { height: 36px; text: "Настройки"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; }
-                        Rectangle { height: 14px; background: transparent; }
-
                         HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "ПОДКЛЮЧЕНИЕ"; } }
                         connection-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
@@ -3992,6 +4043,7 @@ export component AppWindow inherits Window {
                         Text { height: 24px; text: root.runtime-versions; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
+                }
             }
 
             if root.visible-page == "troubleshoot": TroubleshootPage {
@@ -4037,35 +4089,35 @@ export component AppWindow inherits Window {
                 animate opacity { duration: 180ms; easing: ease-out; }
                 animate y { duration: 220ms; easing: ease-out; }
                 background: transparent;
-                subscriptions-scroll := ScrollView {
-                    vertical-stretch: 1;
+                VerticalLayout {
+                spacing: 0px;
+                // Title, "Добавить" and the note stay put; the list scrolls under them.
+                PageHeader {
+                    title: "Подписки";
+                    subtitle: "До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве";
+                    gap: 16px;
+                    scrolled: subscriptions-scroll.scrolled;
+                    reduced-motion: root.reduced-motion;
+                    VerticalLayout {
+                        alignment: center;
+                        TextAction {
+                            label: root.import-pending ? "Добавляем…" : "Добавить";
+                            icon: @image-url("../assets/plus.svg");
+                            has-icon: true;
+                            enabled: !root.import-pending;
+                            focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0;
+                            activated => { root.add-subscription(); }
+                        }
+                    }
+                }
+                subscriptions-scroll := OverlayScroll {
+                    reduced-motion: root.reduced-motion;
                     subscriptions-content := VerticalLayout {
                         width: subscriptions-scroll.visible-width;
-                        min-height: subscriptions-scroll.visible-height;
                         padding-left: 28px;
                         padding-right: 28px;
-                        padding-top: 22px;
                         padding-bottom: 24px;
                         spacing: 0px;
-                        HorizontalLayout {
-                            height: 36px;
-                            Text { text: "Подписки"; color: Theme.text-primary; font-size: 20px; font-weight: Theme.weight-semibold; vertical-alignment: center; }
-                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                            VerticalLayout {
-                                alignment: center;
-                                TextAction {
-                                    label: root.import-pending ? "Добавляем…" : "Добавить";
-                                    icon: @image-url("../assets/plus.svg");
-                                    has-icon: true;
-                                    enabled: !root.import-pending;
-                                    focus-epoch: root.profile-management-focus-id == "" ? root.profile-management-focus-serial : 0;
-                                    activated => { root.add-subscription(); }
-                                }
-                            }
-                        }
-                        Footnote { text: "До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве"; }
-                        Rectangle { height: 16px; background: transparent; }
-
                         if root.deep-link-import-host != "": Text {
                             min-height: 24px;
                             text: root.import-pending ? "Добавляем подписку с " + root.deep-link-import-host + "…" : "Подписка с " + root.deep-link-import-host + " ожидает добавления…";
@@ -4341,6 +4393,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { vertical-stretch: 1; background: transparent; }
                     }
+                }
                 }
             }
 
@@ -4687,9 +4740,10 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if !root.profile-menu-loading && root.profile-menu-error == "": profile-scroll := ScrollView {
+                    if !root.profile-menu-loading && root.profile-menu-error == "": profile-scroll := OverlayScroll {
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
+                        reduced-motion: root.reduced-motion;
                         VerticalLayout {
                             padding-top: 4px;
                             padding-bottom: 4px;

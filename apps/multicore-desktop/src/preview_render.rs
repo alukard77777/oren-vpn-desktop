@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{PlatformError, WindowAdapter};
-use slint::{ComponentHandle, ModelRc, PhysicalSize, Rgb8Pixel, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, PhysicalSize, Rgb8Pixel, SharedString, VecModel};
 
 use crate::{
     AppWindow, TrayMenuRow, TrayPopup, UiCatalogGroup, UiCatalogNode, UiEvent, UiProxyMapping,
@@ -156,6 +156,58 @@ fn capture_hover(
     // 400 ms delay plus the fade.
     settle(6);
     window.request_redraw();
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, width as usize);
+    });
+    component.hide().expect("hide preview component");
+    let bytes = buffer
+        .iter()
+        .flat_map(|pixel| [pixel.r, pixel.g, pixel.b])
+        .collect::<Vec<_>>();
+    let image = image::RgbImage::from_raw(width, height, bytes).expect("preview buffer size");
+    let directory = output_dir();
+    std::fs::create_dir_all(&directory).expect("create preview directory");
+    let path = directory.join(format!("{name}-{width}x{height}.png"));
+    image.save(&path).expect("save preview png");
+    println!("{}", path.display());
+}
+
+/// Like `capture`, after a long wheel scroll at `pointer` (logical px): the page lands on its
+/// end, with the overlay scrollbar still showing from the movement.
+fn capture_scrolled(
+    component: &impl ComponentHandle,
+    name: &str,
+    width: u32,
+    height: u32,
+    pointer: (f32, f32),
+) {
+    if !wanted(name) {
+        return;
+    }
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let scale = preview_scale();
+    let (width, height) = (
+        (width as f32 * scale) as u32,
+        (height as f32 * scale) as u32,
+    );
+    window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+        scale_factor: scale,
+    });
+    window.set_size(PhysicalSize::new(width, height));
+    component.show().expect("show preview component");
+    settle(3);
+    let position = slint::LogicalPosition::new(pointer.0, pointer.1);
+    window.dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: -40_000.0,
+    });
+    settle(2);
+    window.request_redraw();
+    let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (width * height) as usize];
     window.draw_if_needed(|renderer| {
         renderer.render(&mut buffer, width as usize);
     });
@@ -612,7 +664,7 @@ fn scenarios() -> Vec<Scenario> {
             crate::present_troubleshoot_steps(ui, &steps, 4);
             ui.set_troubleshoot_phase(s("running"));
         }),
-        ("troubleshoot-results", 840, 1180, |ui| {
+        ("troubleshoot-results", 840, 720, |ui| {
             troubleshoot_page(ui);
             let mut run = troubleshoot_mixed_run();
             run.toggle(0);
@@ -624,7 +676,7 @@ fn scenarios() -> Vec<Scenario> {
             crate::present_troubleshoot_run(ui, &troubleshoot_mixed_run());
             ui.set_troubleshoot_phase(s("results"));
         }),
-        ("troubleshoot-fixed", 840, 1080, |ui| {
+        ("troubleshoot-fixed", 840, 720, |ui| {
             troubleshoot_page(ui);
             let mut run = troubleshoot_mixed_run();
             run.toggle(0);
@@ -665,7 +717,7 @@ fn scenarios() -> Vec<Scenario> {
             crate::present_troubleshoot_run(ui, &run);
             ui.set_troubleshoot_phase(s("results"));
         }),
-        ("troubleshoot-settings", 840, 1000, |ui| {
+        ("troubleshoot-settings", 840, 720, |ui| {
             ready(ui);
             ui.set_local_page(s("settings"));
         }),
@@ -1511,6 +1563,99 @@ fn render_ui_previews() {
 
     v112_previews();
     icon_loading_previews();
+    scroll_previews();
+}
+
+/// Sixteen subscriptions (the maximum): the five sample rows over and over with unique ids.
+fn many_profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
+    let base = profiles(5);
+    let rows = (0..count)
+        .map(|index| {
+            let mut row = base.row_data(index % 5).expect("sample profile");
+            row.id = s(&format!("p{}", index + 1));
+            row.active = index == 0;
+            if index >= 5 {
+                row.title = s(&format!("{} {}", row.title, index / 5 + 1));
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn tall_settings(ui: &AppWindow) {
+    ready(ui);
+    ui.set_local_page(s("settings"));
+    ui.set_tun_toggle_available(true);
+    ui.set_service_card_visible(true);
+    ui.set_launch_at_sign_in_error(s(
+        "Не удалось изменить автозапуск. Проверьте права доступа к реестру и повторите попытку.",
+    ));
+    ui.set_preference_error(s(
+        "Не удалось сохранить настройки. Изменения применятся только до перезапуска.",
+    ));
+    ui.set_update_status(s("MULTICORE 0.4.0 доступна"));
+    ui.set_update_detail(s(
+        "Загрузим подписанный пакет и перезапустим клиент. Активный туннель будет корректно остановлен.",
+    ));
+    ui.set_update_action_label(s("Обновить"));
+    ui.set_update_action_enabled(true);
+}
+
+fn tall_troubleshoot(ui: &AppWindow) {
+    troubleshoot_page(ui);
+    let mut run = troubleshoot_mixed_run();
+    run.toggle(0);
+    crate::present_troubleshoot_run(ui, &run);
+    ui.set_troubleshoot_phase(s("results"));
+}
+
+fn tall_status(ui: &AppWindow) {
+    connected(ui);
+    ui.set_local_page(s("status"));
+    ui.set_diagnostic_mappings(mappings());
+    ui.set_events(events());
+}
+
+fn tall_subscriptions(ui: &AppWindow) {
+    ready(ui);
+    ui.set_profile_switch_locked(false);
+    ui.set_subscription_profiles(many_profiles(16));
+    ui.set_local_page(s("subscriptions"));
+}
+
+/// Every page taller than the window, at the default and the minimum size: once as opened
+/// (top) and once wheel-scrolled to its end.
+fn scroll_previews() {
+    type Setup = fn(&AppWindow);
+    let pages: &[(&str, Setup)] = &[
+        ("scroll-settings", tall_settings),
+        ("scroll-subscriptions", tall_subscriptions),
+        ("scroll-troubleshoot", tall_troubleshoot),
+        ("scroll-status", tall_status),
+    ];
+    for (name, setup) in pages {
+        for (suffix, width, height) in [("", 840, 720), ("-min", 700, 620)] {
+            let top = format!("{name}{suffix}-top");
+            if wanted(&top) {
+                let ui = AppWindow::new().expect("create app window");
+                setup(&ui);
+                capture(&ui, &top, width, height);
+            }
+            let end = format!("{name}{suffix}-end");
+            if wanted(&end) {
+                let ui = AppWindow::new().expect("create app window");
+                setup(&ui);
+                capture_scrolled(
+                    &ui,
+                    &end,
+                    width,
+                    height,
+                    (width as f32 * 0.55, height as f32 * 0.5),
+                );
+            }
+        }
+    }
 }
 
 // ---- 1.1.2: scrolling group tabs, image group icons, dumb mode, per-row latency, crisp logos.

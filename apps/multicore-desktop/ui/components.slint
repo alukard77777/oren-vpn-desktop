@@ -504,3 +504,109 @@ export component RouteNodeRow inherits Rectangle {
         }
     }
 }
+
+// Vertical scroll area with a thin overlay scrollbar. The bar takes no room: it stays hidden
+// at rest, fades in while the pointer is over the area or the content moves, and widens under
+// the pointer (drag it, or click the track to page). Wheel and touchpad scroll the content;
+// Slint itself scrolls a control that gains keyboard focus into view.
+export component OverlayScroll inherits Rectangle {
+    in property <bool> reduced-motion: false;
+    // An inner scroll area owns the pointer: show only its bar, never two at once.
+    in property <bool> suppress-hover: false;
+    // Gap between the thumb's travel and the area's top and bottom edges.
+    in property <length> bar-inset: 4px;
+    out property <length> visible-width: flick.width;
+    out property <length> visible-height: flick.height;
+    in-out property <length> viewport-y <=> flick.viewport-y;
+    out property <length> viewport-height: flick.viewport-height;
+    out property <length> max-scroll: Math.max(0px, flick.viewport-height - flick.height);
+    // Content has moved up under whatever sits above the area (a header hairline can show).
+    out property <bool> scrolled: flick.viewport-y < -0.5px;
+    out property <bool> hovered: hover.has-hover;
+
+    private property <bool> scrollable: root.max-scroll > 0.5px;
+    private property <bool> moving: false;
+    private property <int> idle-ticks: 0;
+    private property <bool> bar-shown: root.scrollable
+        && (root.moving || bar-touch.pressed || bar-touch.has-hover || (hover.has-hover && !root.suppress-hover));
+    private property <length> track: root.height - 2 * root.bar-inset;
+    private property <length> thumb-height: Math.min(root.track, Math.max(32px, root.track * flick.height / Math.max(1px, flick.viewport-height)));
+    private property <length> drag-start-offset;
+
+    vertical-stretch: 1;
+    horizontal-stretch: 1;
+    min-height: 0px;
+    background: transparent;
+
+    // Content that shrank (a shorter phase, a removed row) must not leave the view past its end.
+    changed max-scroll => {
+        if (-flick.viewport-y > root.max-scroll) {
+            flick.viewport-y = -root.max-scroll;
+        }
+    }
+    changed viewport-y => {
+        root.moving = true;
+        root.idle-ticks = 0;
+    }
+
+    Timer {
+        interval: 300ms;
+        running: root.moving;
+        triggered => {
+            root.idle-ticks += 1;
+            if (root.idle-ticks >= 3) {
+                root.moving = false;
+            }
+        }
+    }
+
+    // Wraps the content, so it stays hovered over child controls while they still get every click.
+    hover := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        flick := Flickable {
+            width: parent.width;
+            height: parent.height;
+            interactive: false;
+            @children
+        }
+    }
+
+    thumb := Rectangle {
+        width: bar-touch.has-hover || bar-touch.pressed ? 6px : 4px;
+        height: root.thumb-height;
+        x: parent.width - 3px - self.width;
+        y: root.bar-inset + (root.track - self.height) * (-flick.viewport-y / Math.max(1px, root.max-scroll));
+        border-radius: self.width / 2;
+        background: #ffffff;
+        opacity: !root.bar-shown ? 0 : bar-touch.pressed ? 0.40 : bar-touch.has-hover ? 0.30 : 0.18;
+        animate opacity { duration: root.reduced-motion ? 0ms : root.bar-shown ? 120ms : 360ms; easing: ease-out; }
+        animate width { duration: root.reduced-motion ? 0ms : 120ms; easing: ease-out; }
+    }
+
+    bar-touch := TouchArea {
+        x: parent.width - self.width;
+        width: 10px;
+        height: parent.height;
+        enabled: root.scrollable;
+        pointer-event(event) => {
+            if (event.button != PointerEventButton.left || event.kind != PointerEventKind.down) {
+                return;
+            }
+            if (self.mouse-y >= thumb.y && self.mouse-y <= thumb.y + thumb.height) {
+                root.drag-start-offset = -flick.viewport-y;
+            } else {
+                // Track click: one page towards the pointer, then drag from there.
+                flick.viewport-y = -Math.max(0px, Math.min(root.max-scroll,
+                    -flick.viewport-y + (self.mouse-y < thumb.y ? -1 : 1) * flick.height * 0.9));
+                root.drag-start-offset = -flick.viewport-y;
+            }
+        }
+        moved => {
+            if (self.pressed && root.track > root.thumb-height) {
+                flick.viewport-y = -Math.max(0px, Math.min(root.max-scroll,
+                    root.drag-start-offset + (self.mouse-y - self.pressed-y) * root.max-scroll / (root.track - root.thumb-height)));
+            }
+        }
+    }
+}
