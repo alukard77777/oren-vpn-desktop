@@ -11581,7 +11581,7 @@ mod tests {
 
     #[test]
     fn a_status_with_app_language_switches_this_threads_language() {
-        crate::language::initialize(Lang::Ru, false);
+        crate::language::initialize(Lang::Ru, false, Lang::Ru);
         let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
         let status = |language: Option<&str>| DaemonStatus {
             state: "ready".into(),
@@ -11597,7 +11597,7 @@ mod tests {
         assert_eq!(multicore_i18n::current(), Lang::En);
         assert_eq!(model.presentation().headline, "Ready to connect");
 
-        // Without the header the provider's language no longer applies: Russian again.
+        // Without the header the provider's language no longer applies: the system's again.
         let refresh = model.begin_refresh();
         model.finish_refresh(refresh, Ok(status(None)));
         assert_eq!(multicore_i18n::current(), Lang::Ru);
