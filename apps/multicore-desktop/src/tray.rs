@@ -538,7 +538,7 @@ pub(crate) fn native_menu_plan(model: &TrayMenuModel) -> Vec<NativeMenuItem> {
         NativeMenuItem::Separator,
         NativeMenuItem::Action {
             id: "show".into(),
-            label: "Открыть MULTICORE".into(),
+            label: multicore_i18n::tr!("Открыть MULTICORE").into(),
             enabled: true,
             command: TrayCommand::ShowWindow,
         },
@@ -587,7 +587,7 @@ pub(crate) fn native_menu_plan(model: &TrayMenuModel) -> Vec<NativeMenuItem> {
     items.push(NativeMenuItem::Separator);
     items.push(NativeMenuItem::Action {
         id: "exit".into(),
-        label: "Выйти".into(),
+        label: multicore_i18n::tr!("Выйти").into(),
         enabled: true,
         command: TrayCommand::Exit,
     });

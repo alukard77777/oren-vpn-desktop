@@ -3,6 +3,7 @@
 //! data, so MultiCore quits first and the installer starts only after the app has let go of
 //! its files (see `launch_pending_installer`, called by `main` after the event loop ends).
 
+use multicore_i18n::tr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -97,17 +98,17 @@ pub(crate) fn download_installer() -> Result<PathBuf, String> {
     use multicore_release::{GitHubRelease, verify_archive_file};
 
     let repository = crate::updater::configured_repository()?
-        .ok_or_else(|| "Канал обновлений не настроен".to_owned())?;
+        .ok_or_else(|| tr!("Канал обновлений не настроен").to_owned())?;
     let body = crate::updater::fetch_latest_release_body(&repository)?;
     let release = GitHubRelease::parse_installer_for_repository(&repository, &body)
-        .map_err(|_| "В релизе нет установщика со службой".to_owned())?;
+        .map_err(|_| tr!("В релизе нет установщика со службой").to_owned())?;
     let directory = crate::updater::update_directory()?;
     std::fs::create_dir_all(&directory)
-        .map_err(|_| "Не удалось создать папку обновлений".to_owned())?;
+        .map_err(|_| tr!("Не удалось создать папку обновлений").to_owned())?;
     let installer = directory.join(format!("MultiCore-Setup-{}.exe", release.version()));
     if installer.exists() {
         std::fs::remove_file(&installer)
-            .map_err(|_| "Не удалось очистить прошлую загрузку".to_owned())?;
+            .map_err(|_| tr!("Не удалось очистить прошлую загрузку").to_owned())?;
     }
     crate::updater::download_release_to(&release, &installer)?;
     verify_archive_file(
@@ -115,13 +116,13 @@ pub(crate) fn download_installer() -> Result<PathBuf, String> {
         release.asset().size(),
         release.asset().sha256_hex(),
     )
-    .map_err(|_| "Установщик не прошёл SHA-256 проверку".to_owned())?;
+    .map_err(|_| tr!("Установщик не прошёл SHA-256 проверку").to_owned())?;
     Ok(installer)
 }
 
 #[cfg(not(windows))]
 pub(crate) fn download_installer() -> Result<PathBuf, String> {
-    Err("Служба устанавливается пакетом".into())
+    Err(tr!("Служба устанавливается пакетом").into())
 }
 
 /// Remember the verified installer; `main` starts it after MultiCore has shut down.

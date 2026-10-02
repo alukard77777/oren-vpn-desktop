@@ -126,8 +126,10 @@ mod platform {
             *slot = unit;
         }
         // Pairs of display name and pattern, double-NUL terminated.
-        let filter: Vec<u16> = "ZIP-архив (*.zip)\0*.zip\0\0".encode_utf16().collect();
-        let title = wide("Сохранить лог MULTICORE");
+        let filter: Vec<u16> = format!("{}\0*.zip\0\0", multicore_i18n::tr!("ZIP-архив (*.zip)"))
+            .encode_utf16()
+            .collect();
+        let title = wide(multicore_i18n::tr!("Сохранить лог MULTICORE"));
         let extension = wide("zip");
         let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
         dialog.lStructSize = size_of::<OPENFILENAMEW>() as u32;
@@ -146,7 +148,8 @@ mod platform {
         if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
             return match unsafe { CommDlgExtendedError() } {
                 0 => Ok(SaveTarget::Cancelled),
-                code => Err(format!("диалог сохранения не открылся (код {code:#x})")),
+                // Logged (`diagnostics_archive_failed`), never shown.
+                code => Err(format!("диалог сохранения не открылся (код {code:#x})")), // i18n-ignore: log only
             };
         }
         let length = buffer
@@ -182,7 +185,8 @@ mod platform {
                 eprintln!("file chooser portal unavailable ({error}); saving to Downloads");
                 fallback_directory()
                     .map(|directory| SaveTarget::Fallback(directory.join(default_name)))
-                    .ok_or_else(|| format!("нет диалога сохранения и папки «Загрузки»: {error}"))
+                    // Logged (`diagnostics_archive_failed`), never shown.
+                    .ok_or_else(|| format!("нет диалога сохранения и папки «Загрузки»: {error}")) // i18n-ignore: log only
             }
         }
     }
@@ -236,7 +240,7 @@ mod platform {
         options.insert_value("modal", &glib::ToVariant::to_variant(&true));
         let parameters = glib::Variant::tuple_from_iter([
             glib::ToVariant::to_variant(""),
-            glib::ToVariant::to_variant("Сохранить лог MULTICORE"),
+            glib::ToVariant::to_variant(multicore_i18n::tr!("Сохранить лог MULTICORE")),
             options.end(),
         ]);
         let call = connection.call_sync(
@@ -303,7 +307,7 @@ mod platform {
     pub(super) fn choose(_owner: OwnerWindow, default_name: &str) -> Result<SaveTarget, String> {
         fallback_directory()
             .map(|directory| SaveTarget::Fallback(directory.join(default_name)))
-            .ok_or_else(|| "нет папки для сохранения".into())
+            .ok_or_else(|| "нет папки для сохранения".into()) // i18n-ignore: log only
     }
 }
 

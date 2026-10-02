@@ -6968,6 +6968,7 @@ mod tests {
                 level: "info".into(),
                 component: String::new(),
                 message: format!("event {id}"),
+                message_key: None,
                 details: None,
             })
             .collect();
@@ -6999,6 +7000,7 @@ mod tests {
                         level: "warning".into(),
                         component: String::new(),
                         message: "new epoch".into(),
+                        message_key: None,
                         details: None,
                     }],
                 }),
@@ -7037,6 +7039,7 @@ mod tests {
                             level: "info".into(),
                             component: String::new(),
                             message: "info".into(),
+                            message_key: None,
                             details: None,
                         },
                         DaemonEvent {
@@ -7045,6 +7048,7 @@ mod tests {
                             level: "error".into(),
                             component: String::new(),
                             message: "error".into(),
+                            message_key: None,
                             details: None,
                         },
                     ],
@@ -7098,6 +7102,7 @@ mod tests {
                         level: "warning".into(),
                         component: "subscription".into(),
                         message: "Subscription download failed: timed_out.".into(),
+                        message_key: None,
                         details: Some(serde_json::json!({
                             "host": "provider.example",
                             "native": "http_status(404)",
@@ -10694,6 +10699,7 @@ mod tests {
                 level: "info".into(),
                 component: String::new(),
                 message: "Started".into(),
+                message_key: None,
                 details: None,
             },
             DaemonEvent {
@@ -10702,6 +10708,7 @@ mod tests {
                 level: "warning".into(),
                 component: String::new(),
                 message: "Updated".into(),
+                message_key: None,
                 details: None,
             },
         ];
@@ -10826,6 +10833,7 @@ mod tests {
             component: String::new(),
             message: "import url=https://user:pass@example.test/sub?token=abc token=xyz password: hunter2"
                 .into(),
+            message_key: None,
             details: None,
         };
 
@@ -10913,6 +10921,7 @@ mod tests {
                         level: "info".into(),
                         component: String::new(),
                         message: "cached".into(),
+                        message_key: None,
                         details: None,
                     }],
                 }),
@@ -10981,6 +10990,7 @@ mod tests {
                 level: "info".into(),
                 component: String::new(),
                 message: "Started".into(),
+                message_key: None,
                 details: None,
             },
             DaemonEvent {
@@ -10989,6 +10999,7 @@ mod tests {
                 level: "warning".into(),
                 component: String::new(),
                 message: "Degraded".into(),
+                message_key: None,
                 details: None,
             },
             DaemonEvent {
@@ -10997,6 +11008,7 @@ mod tests {
                 level: "error".into(),
                 component: String::new(),
                 message: "Failed".into(),
+                message_key: None,
                 details: None,
             },
         ];

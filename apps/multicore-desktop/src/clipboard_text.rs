@@ -1,3 +1,4 @@
+use multicore_i18n::tr;
 use std::cell::RefCell;
 
 use copypasta::{ClipboardContext, ClipboardProvider};
@@ -12,11 +13,11 @@ pub(crate) enum ClipboardTextError {
 }
 
 impl ClipboardTextError {
-    pub(crate) const fn user_message(self) -> &'static str {
+    pub(crate) fn user_message(self) -> &'static str {
         match self {
-            Self::Empty => "В буфере обмена нет ссылки",
-            Self::TooLong => "Ссылка из буфера слишком длинная",
-            Self::Unavailable => "Не удалось прочитать буфер обмена",
+            Self::Empty => tr!("В буфере обмена нет ссылки"),
+            Self::TooLong => tr!("Ссылка из буфера слишком длинная"),
+            Self::Unavailable => tr!("Не удалось прочитать буфер обмена"),
         }
     }
 }

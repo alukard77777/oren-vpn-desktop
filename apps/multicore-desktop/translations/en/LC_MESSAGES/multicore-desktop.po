@@ -15,6 +15,160 @@ msgstr ""
 msgid "Выбран провайдером подписки"
 msgstr "Set by your provider"
 
+# Desktop messages built in Rust (daemon client, updater, log archive, troubleshooting, tray)
+msgid "Проверьте настройки подключения к фоновому сервису."
+msgstr "Check the background service connection settings."
+
+msgid "Файлы приложения повреждены или отсутствуют. Распакуйте пакет заново."
+msgstr "App files are damaged or missing. Unpack the package again."
+
+msgid "Не удалось безопасно подготовить запуск фонового сервиса."
+msgstr "Couldn't safely prepare the background service."
+
+msgid "Не удалось запустить фоновый сервис."
+msgstr "Couldn't start the background service."
+
+msgid "Фоновый сервис запустился некорректно."
+msgstr "The background service failed to start."
+
+msgid "Фоновый сервис не прошёл проверку подлинности."
+msgstr "The background service failed authentication."
+
+msgid "В буфере обмена нет ссылки"
+msgstr "No link in the clipboard"
+
+msgid "Ссылка из буфера слишком длинная"
+msgstr "The copied link is too long"
+
+msgid "Не удалось прочитать буфер обмена"
+msgstr "Couldn't read the clipboard"
+
+msgid "Каталог маршрутов изменился."
+msgstr "The route list has changed."
+
+msgid "Фоновый сервис ответил ошибкой (HTTP {})."
+msgstr "Background service error (HTTP {})."
+
+msgid "Обновление подписки недоступно."
+msgstr "Subscription refresh unavailable."
+
+msgid "Диагностика недоступна."
+msgstr "Diagnostics unavailable."
+
+msgid "Журнал службы недоступен."
+msgstr "Service log unavailable."
+
+msgid "Панель Mihomo недоступна."
+msgstr "Dashboard unavailable."
+
+msgid "Данные сессии недоступны."
+msgstr "Session data unavailable."
+
+msgid "Служба MULTICORE недоступна."
+msgstr "MULTICORE service unavailable."
+
+msgid "Устранение неполадок недоступно."
+msgstr "Troubleshooting is unavailable."
+
+msgid "Проверка задержки недоступна."
+msgstr "Latency check is unavailable."
+
+msgid "Значок группы недоступен."
+msgstr "Group icon unavailable."
+
+msgid "Служба не смогла установить обновление."
+msgstr "The service couldn't install the update."
+
+msgid "Подписка не найдена. Обновите список подписок."
+msgstr "Subscription not found. Refresh the list."
+
+msgid "Сейчас подписку изменить нельзя."
+msgstr "Can't change the subscription now."
+
+msgid "Изменение могло сохраниться. Обновляем состояние подписок."
+msgstr "The change may have been saved. Refreshing subscriptions."
+
+msgid "Фоновый сервис не смог изменить подписку."
+msgstr "Couldn't change the subscription."
+
+msgid "Не удалось проверить задержку."
+msgstr "Couldn't check latency."
+
+msgid "Фоновый сервис отклонил проверку задержки."
+msgstr "Latency check was rejected."
+
+msgid "Некорректный адрес фонового сервиса."
+msgstr "Invalid background service address."
+
+msgid "Не удалось прочитать ответ фонового сервиса."
+msgstr "Couldn't read the background service's response."
+
+msgid "Фоновый сервис вернул некорректный ответ."
+msgstr "Background service sent an invalid reply."
+
+msgid "Ответ фонового сервиса превышает допустимый размер."
+msgstr "The background service's response is too large."
+
+msgid "Отключитесь перед изменением подписки."
+msgstr "Disconnect before editing subscriptions."
+
+msgid "Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите."
+msgstr "Limit reached: up to 16 subscriptions. Delete one and try again."
+
+msgid "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
+msgstr "The subscription server is unreachable. Check your internet connection and try again."
+
+msgid "Сервер подписки не ответил вовремя. Повторите попытку чуть позже."
+msgstr "The subscription server timed out. Try again a bit later."
+
+msgid "Сертификат сервера подписки не принят. Проверьте ссылку или обратитесь к провайдеру."
+msgstr "The subscription server's certificate was rejected. Check the link or contact your provider."
+
+msgid "Сервер подписки перенаправил запрос небезопасно или слишком много раз."
+msgstr "The subscription server redirected insecurely or too many times."
+
+msgid "Сервер подписки отказал в доступе. Проверьте ссылку и срок действия подписки."
+msgstr "The subscription server denied access. Check the link and expiry date."
+
+msgid "Подписка не найдена. Проверьте, что ссылка скопирована полностью."
+msgstr "Subscription not found. Make sure the whole link was copied."
+
+msgid "Сервер подписки временно ограничил запросы. Повторите попытку через минуту."
+msgstr "The subscription server is rate-limiting requests. Try again in a minute."
+
+msgid "Сервер подписки временно не работает. Повторите попытку позже."
+msgstr "The subscription server is temporarily down. Try again later."
+
+msgid "Сервер подписки ответил ошибкой."
+msgstr "Subscription server error."
+
+msgid "По ссылке пришла веб-страница или список ссылок, а не подписка MULTICORE. Скопируйте ссылку подписки для приложения у провайдера."
+msgstr "The link returned a web page or a list of links, not a MULTICORE subscription. Copy the app subscription link from your provider."
+
+msgid "Провайдер прислал повреждённую или неподдерживаемую конфигурацию."
+msgstr "The provider sent a damaged or unsupported configuration."
+
+msgid "Ответ сервера подписки слишком большой."
+msgstr "Subscription server response too large."
+
+msgid "Не удалось сохранить подписку на диск. Проверьте свободное место."
+msgstr "Couldn't save the subscription to disk. Check free space."
+
+msgid "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение."
+msgstr "The subscription downloaded but couldn't be prepared. Check your network connection."
+
+msgid "Подключитесь, чтобы открыть панель Mihomo."
+msgstr "Connect to open the Mihomo dashboard."
+
+msgid "Панель Mihomo недоступна в этой сборке."
+msgstr "The dashboard isn't in this build."
+
+msgid "MULTICORE уже запущен у другого пользователя."
+msgstr "MULTICORE is already running for another user."
+
+msgid "Подключение отменено: не выдано разрешение администратора."
+msgstr "Connection cancelled: administrator permission was not granted."
+
 # Daemon messages (multicore_i18n::daemon_messages).
 msgid "Запускается подключение."
 msgstr "Connecting."
@@ -94,14 +248,32 @@ msgstr "Mihomo didn't apply the route choice."
 msgid "Устранение неполадок: {0}; ошибок: {1}."
 msgstr "Troubleshooting: {0}; errors: {1}."
 
-msgid "Подключение отменено: не выдано разрешение администратора."
-msgstr "Connection cancelled: administrator permission not granted."
-
 msgid "Не удалось запустить службу подключения с правами администратора."
 msgstr "Couldn't start the connection service as administrator."
 
 msgid "Служба подключения не ответила. Повторите попытку."
 msgstr "The connection service didn't respond. Try again."
+
+msgid "Не удалось запустить ядро. Подробности — в логе на странице «Состояние»."
+msgstr "Couldn't start a core. See the log on the Status page."
+
+msgid "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+msgstr "Couldn't start a core: the file is missing or blocked. Check your antivirus quarantine and reinstall MULTICORE."
+
+msgid "Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние»."
+msgstr "A core exited right after starting. See the log on the Status page."
+
+msgid "Ядро не успело запуститься вовремя. Повторите попытку."
+msgstr "A core didn't start in time. Try again."
+
+msgid "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+msgstr "Couldn't enable the TUN adapter. Try again; if that fails, restart your computer or connect without TUN."
+
+msgid "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+msgstr "The TUN adapter didn't come up in time. Try again; if that fails, restart your computer or connect without TUN."
+
+msgid "Не удалось включить системный прокси. Повторите попытку."
+msgstr "Couldn't enable the system proxy. Try again."
 
 msgid "Не удалось запустить {0}. Подробности — в логе на странице «Состояние»."
 msgstr "Couldn't start {0}. See the log on the Status page."
@@ -115,20 +287,404 @@ msgstr "{0} exited right after starting. See the log on the Status page."
 msgid "{0} не успел запуститься вовремя. Повторите попытку."
 msgstr "{0} didn't start in time. Try again."
 
-msgid "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
-msgstr "Couldn't turn on the TUN adapter. Try again; if that fails, restart the PC or connect without TUN."
-
-msgid "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
-msgstr "The TUN adapter didn't turn on in time. Try again; if that fails, restart the PC or connect without TUN."
-
-msgid "Не удалось включить системный прокси. Повторите попытку."
-msgstr "Couldn't turn on the system proxy. Try again."
-
-msgid "MULTICORE уже запущен у другого пользователя."
-msgstr "MULTICORE is already running for another user."
-
 msgid "Не удалось запустить подключение. Повторите попытку."
 msgstr "Couldn't start the connection. Try again."
+
+msgid "Служба не смогла загрузить или проверить обновление."
+msgstr "The service couldn't download or verify the update."
+
+msgid "Сначала отключитесь: проверка меняет сетевые настройки."
+msgstr "Disconnect first: the check changes network settings."
+
+msgid "Устранение неполадок недоступно в этой сборке."
+msgstr "Troubleshooting isn't available in this build."
+
+msgid "Не удалось остановить ядра службы."
+msgstr "Couldn't stop the service's cores."
+
+msgid "Панель Mihomo сейчас недоступна."
+msgstr "Dashboard unavailable right now."
+
+msgid "Не удалось изменить маршрут."
+msgstr "Couldn't change the route."
+
+msgid "Фоновый сервис отклонил изменение маршрута."
+msgstr "The route change was rejected."
+
+msgid "Фоновый сервис не ответил вовремя."
+msgstr "Background service timed out."
+
+msgid "Фоновый сервис не запущен."
+msgstr "Background service is down."
+
+msgid "Не удалось выполнить запрос к фоновому сервису."
+msgstr "The request to the background service failed."
+
+msgid "[… начало файла не поместилось в архив …]"
+msgstr "[… file start didn't fit in the archive …]"
+
+msgid "Журнал службы"
+msgstr "Service log"
+
+msgid "недоступен: фоновый сервис не ответил"
+msgstr "unavailable: no background service reply"
+
+msgid "нет: служба не используется (режим без службы)"
+msgstr "none: no service in use (service-free mode)"
+
+msgid "недоступен: служба слишком старая (service too old)"
+msgstr "unavailable: service too old"
+
+msgid "недоступен: службой пользуется другой пользователь"
+msgstr "unavailable: another user is using the service"
+
+msgid "недоступен: служба не ответила"
+msgstr "unavailable: no service reply"
+
+msgid "пуст"
+msgstr "empty"
+
+msgid "ОС"
+msgstr "OS"
+
+msgid "Процессор"
+msgstr "CPU"
+
+msgid "Язык"
+msgstr "Locale"
+
+msgid "Масштаб экрана"
+msgstr "Display scale"
+
+msgid "Отрисовка"
+msgstr "Renderer"
+
+msgid "Установка"
+msgstr "Install"
+
+msgid "Путь установки"
+msgstr "Install path"
+
+msgid "Служба"
+msgstr "Service"
+
+msgid "используется, ядра запущены"
+msgstr "in use, cores running"
+
+msgid "используется, ядра не запущены"
+msgstr "in use, cores stopped"
+
+msgid "не используется"
+msgstr "not in use"
+
+msgid "Режим"
+msgstr "Mode"
+
+msgid "TUN (весь трафик)"
+msgstr "TUN (all traffic)"
+
+msgid "системный прокси"
+msgstr "system proxy"
+
+msgid "Подключение"
+msgstr "Connecting"
+
+msgid "Время подключения"
+msgstr "Connected for"
+
+msgid "Приложение работает"
+msgstr "App running for"
+
+msgid "Архив создан"
+msgstr "Created"
+
+msgid "программная (резервная: GPU-отрисовка не запустилась)"
+msgstr "software (fallback: GPU rendering failed)"
+
+msgid " · задан SLINT_BACKEND"
+msgstr " · SLINT_BACKEND set"
+
+msgid "служба установлена"
+msgstr "service installed"
+
+msgid "без службы"
+msgstr "no service"
+
+msgid "для текущего пользователя"
+msgstr "for the current user"
+
+msgid "для всех пользователей"
+msgstr "for all users"
+
+msgid "системный пакет"
+msgstr "system package"
+
+msgid "другое"
+msgstr "other"
+
+msgid "сборка {}"
+msgstr "build {}"
+
+msgid "{} · ядро {} · {} {}"
+msgstr "{} · kernel {} · {} {}"
+
+msgid "Не удалось сохранить настройки."
+msgstr "Couldn't save settings."
+
+msgid "Не удалось открыть ссылку подписки. Проверьте её и повторите попытку."
+msgstr "Couldn't open the subscription link. Check it and try again."
+
+msgid "Подключение не остановилось, обновление не установлено. Повторите установку."
+msgstr "The connection didn't stop, so the update wasn't installed. Try again."
+
+msgid "В сети · {}"
+msgstr "Online · {}"
+
+msgid "Не удалось изменить автозапуск. Проверьте права пользователя."
+msgstr "Couldn't change autostart. Check your user permissions."
+
+msgid "Отключение…"
+msgstr "Disconnecting…"
+
+msgid "Подключение…"
+msgstr "Connecting…"
+
+msgid "Защита включена"
+msgstr "Protected"
+
+msgid "Защита выключена"
+msgstr "Not protected"
+
+msgid "П"
+msgstr "S"
+
+msgid "ZIP-архив (*.zip)"
+msgstr "ZIP file (*.zip)"
+
+msgid "Сохранить лог MULTICORE"
+msgstr "Save MULTICORE log"
+
+msgid "Канал обновлений не настроен"
+msgstr "No update channel configured"
+
+msgid "В релизе нет установщика со службой"
+msgstr "The release has no service installer"
+
+msgid "Не удалось создать папку обновлений"
+msgstr "Couldn't create the updates folder"
+
+msgid "Не удалось очистить прошлую загрузку"
+msgstr "Couldn't clear the previous download"
+
+msgid "Установщик не прошёл SHA-256 проверку"
+msgstr "The installer failed the SHA-256 check"
+
+msgid "Служба устанавливается пакетом"
+msgstr "The package installs the service"
+
+msgid "Открыть MULTICORE"
+msgstr "Open MULTICORE"
+
+msgid "Выйти"
+msgstr "Quit"
+
+msgid "Не удалось подключиться"
+msgstr "Couldn't connect"
+
+msgid "Найдены проблемы"
+msgstr "Problems found"
+
+msgid "Они мешают VPN. Ниже — что именно нашли и что можно исправить."
+msgstr "They interfere with VPN. Below: what we found and what can be fixed."
+
+msgid "Есть предупреждения"
+msgstr "Warnings found"
+
+msgid "Это может мешать подключению. Посмотрите подробности ниже."
+msgstr "This may affect the connection. See details below."
+
+msgid "Проблем не обнаружено"
+msgstr "No problems found"
+
+msgid "Система готова к подключению."
+msgstr "Ready to connect."
+
+msgid "Критично"
+msgstr "Critical"
+
+msgid "Всё в порядке"
+msgstr "All good"
+
+msgid "только что"
+msgstr "just now"
+
+msgid "{} мин назад"
+msgstr "{} min ago"
+
+msgid "{} ч назад"
+msgstr "{} h ago"
+
+msgid "Будет заменён файл AppImage"
+msgstr "Replaces the AppImage file"
+
+msgid "Будет заменена установленная версия"
+msgstr "Replaces the installed version"
+
+msgid "Канал обновлений задаётся при сборке"
+msgstr "The update channel is set at build time"
+
+msgid "Проверяем обновления…"
+msgstr "Checking for updates…"
+
+msgid "Установлена версия {}"
+msgstr "Version {} installed"
+
+msgid "Проверяем…"
+msgstr "Checking…"
+
+msgid "Проверим обновления чуть позже"
+msgstr "We'll check again later"
+
+msgid "Проверить"
+msgstr "Check"
+
+msgid "Установлена актуальная версия"
+msgstr "You're up to date"
+
+msgid "Доступна версия {}"
+msgstr "Update {} available"
+
+msgid "После загрузки туннель будет остановлен, а клиент перезапущен"
+msgstr "After the download the tunnel stops and the app restarts"
+
+msgid "Установить"
+msgstr "Install"
+
+msgid "Обновите пакет через менеджер пакетов"
+msgstr "Update via your package manager"
+
+msgid "Загружаем версию {}…"
+msgstr "Downloading {}…"
+
+msgid "Проверяем размер и SHA-256 перед установкой"
+msgstr "Checking size and SHA-256 before installing"
+
+msgid "Загружаем…"
+msgstr "Downloading…"
+
+msgid "Не удалось установить версию {}"
+msgstr "Couldn't install version {}"
+
+msgid "Повторить"
+msgstr "Retry"
+
+msgid "Не удалось проверить обновления"
+msgstr "Couldn't check for updates"
+
+msgid "В сборке указан неверный GitHub-репозиторий"
+msgstr "This build names an invalid GitHub repository"
+
+msgid "Версия клиента собрана неверно"
+msgstr "App version built incorrectly"
+
+msgid "Не удалось создать защищённое соединение"
+msgstr "Couldn't create a secure connection"
+
+msgid "Релиз не соответствует контракту MULTICORE"
+msgstr "Release doesn't match the MULTICORE contract"
+
+msgid "GitHub временно ограничил запросы. Повторите позже"
+msgstr "GitHub is rate-limiting requests. Try again later"
+
+msgid "GitHub сейчас недоступен"
+msgstr "GitHub is unavailable"
+
+msgid "GitHub ответил HTTP {}"
+msgstr "GitHub returned HTTP {}"
+
+msgid "Ответ GitHub слишком большой"
+msgstr "GitHub's response is too large"
+
+msgid "Не удалось прочитать ответ GitHub"
+msgstr "Couldn't read GitHub's response"
+
+msgid "Загруженное обновление изменилось до установки — повторите загрузку"
+msgstr "The downloaded update changed before install — download it again"
+
+msgid "Обновите MULTICORE через менеджер пакетов"
+msgstr "Update MULTICORE via your package manager"
+
+msgid "Некорректный путь AppImage"
+msgstr "Invalid AppImage path"
+
+msgid "Некорректное имя AppImage"
+msgstr "Invalid AppImage name"
+
+msgid "Загруженный AppImage не прошёл SHA-256 проверку"
+msgstr "The downloaded AppImage failed the SHA-256 check"
+
+msgid "Не удалось заменить файл AppImage"
+msgstr "Couldn't replace the AppImage file"
+
+msgid "Не удалось перезапустить MULTICORE"
+msgstr "Couldn't restart MULTICORE"
+
+msgid "Загруженный архив не прошёл SHA-256 проверку"
+msgstr "The downloaded archive failed the SHA-256 check"
+
+msgid "Не удалось зафиксировать загруженный архив"
+msgstr "Couldn't finalize the downloaded archive"
+
+msgid "Не удалось определить путь MULTICORE"
+msgstr "Couldn't find the MULTICORE path"
+
+msgid "Некорректный путь MULTICORE"
+msgstr "Invalid MULTICORE path"
+
+msgid "В установке нет программы обновления (runtime/multicore-updater.exe)"
+msgstr "The install has no updater (runtime/multicore-updater.exe)"
+
+msgid "Не удалось подготовить программу обновления"
+msgstr "Couldn't prepare the updater"
+
+msgid "Не удалось запустить программу обновления"
+msgstr "Couldn't start the updater"
+
+msgid "Не удалось создать соединение для загрузки"
+msgstr "Couldn't create a download connection"
+
+msgid "Не удалось загрузить обновление"
+msgstr "Couldn't download the update"
+
+msgid "Загрузка обновления вернула HTTP {}"
+msgstr "The update download returned HTTP {}"
+
+msgid "Размер обновления не совпал с релизом"
+msgstr "Update size doesn't match the release"
+
+msgid "Не удалось создать временный архив"
+msgstr "Couldn't create a temporary archive"
+
+msgid "Загрузка обновления прервалась"
+msgstr "Update download interrupted"
+
+msgid "Обновление загрузилось не полностью"
+msgstr "The update didn't download completely"
+
+msgid "Не удалось записать обновление"
+msgstr "Couldn't write the update"
+
+msgid "Ошибка завершения загрузки"
+msgstr "Couldn't finish the download"
+
+msgid "Обновление больше заявленного размера"
+msgstr "The update is larger than stated"
+
+msgid "Не удалось сохранить обновление"
+msgstr "Couldn't save the update"
+
+msgid "Каталог данных MULTICORE недоступен"
+msgstr "MULTICORE data folder unavailable"
 
 msgid "Обнаружен {0}"
 msgstr "{0} detected"
@@ -461,8 +1017,11 @@ msgstr "System proxy…"
 msgid "VPN-подключения…"
 msgstr "VPN connections…"
 
+msgid "Discord…"
+msgstr "Discord…"
+
 msgid "Файл hosts…"
-msgstr "hosts file…"
+msgstr "Hosts file…"
 
 msgid "Групповые политики…"
 msgstr "Group policies…"
@@ -471,7 +1030,23 @@ msgid "Системное время…"
 msgstr "System time…"
 
 msgid "Сеть и DNS…"
-msgstr "Network & DNS…"
+msgstr "Network/DNS…"
+
+msgid "{n} проблема"
+msgid_plural "{n} проблем"
+msgstr[0] "{n} problem"
+msgstr[1] "{n} problems"
+
+msgid "{n} предупреждение"
+msgid_plural "{n} предупреждений"
+msgstr[0] "{n} warning"
+msgstr[1] "{n} warnings"
+
+msgid "{n} дн. назад"
+msgid_plural "{n} дн. назад"
+msgstr[0] "{n} day ago"
+msgstr[1] "{n} days ago"
+
 msgid "Подписка добавлена. Переключиться на неё можно после отключения VPN."
 msgstr "Subscription added. You can switch to it after disconnecting the VPN."
 
@@ -514,9 +1089,6 @@ msgstr "Ready"
 msgid "Можно подключаться"
 msgstr "Ready to connect"
 
-msgid "Подключение"
-msgstr "Connecting"
-
 msgid "Устанавливаем соединение…"
 msgstr "Establishing connection…"
 
@@ -546,9 +1118,6 @@ msgstr "Stopping the local route."
 
 msgid "Отключаем…"
 msgstr "Stopping…"
-
-msgid "Не удалось подключиться"
-msgstr "Couldn't connect"
 
 msgid "Что-то пошло не так"
 msgstr "Something went wrong"
@@ -610,9 +1179,6 @@ msgstr "Checking"
 msgid "Проверяем состояние…"
 msgstr "Checking status…"
 
-msgid "Проверяем…"
-msgstr "Checking…"
-
 msgid "Не удалось загрузить подписки. Повторите попытку."
 msgstr "Couldn't load subscriptions. Try again."
 
@@ -630,9 +1196,6 @@ msgstr "Couldn't change the subscription link. Try again."
 
 msgid "Не удалось удалить подписку. Повторите попытку."
 msgstr "Couldn't delete the subscription. Try again."
-
-msgid "Отключитесь перед изменением подписки."
-msgstr "Disconnect to change the subscription."
 
 msgid "Дождитесь восстановления фонового сервиса."
 msgstr "Wait for the background service to recover."

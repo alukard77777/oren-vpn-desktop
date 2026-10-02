@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use multicore_i18n::tr;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -191,6 +192,10 @@ pub struct DaemonStatus {
     pub current_node: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    /// The stable code of `message` (`multicore_i18n::daemon_messages`), shown in the
+    /// interface language; `message` is the Russian fallback for an unknown code.
+    #[serde(default)]
+    pub message_key: Option<multicore_i18n::MessageKey>,
     #[serde(default)]
     pub degraded: bool,
     #[serde(default)]
@@ -298,6 +303,10 @@ pub struct DaemonEvent {
     pub component: String,
     #[serde(default, alias = "summary")]
     pub message: String,
+    /// The stable code of `message` for the events MULTICORE writes itself; provider and core
+    /// lines have none and are shown as they are.
+    #[serde(default)]
+    pub message_key: Option<multicore_i18n::MessageKey>,
     #[serde(default)]
     pub details: Option<serde_json::Value>,
 }
@@ -477,7 +486,7 @@ impl DaemonError {
 
     pub(crate) fn stale_revision() -> Self {
         Self {
-            message: "Каталог маршрутов изменился.".into(),
+            message: tr!("Каталог маршрутов изменился.").into(),
             kind: DaemonErrorKind::StaleRevision,
             specific: false,
         }
@@ -528,7 +537,7 @@ impl DaemonError {
     /// fallback that names no real cause.
     fn definitive_http_with_status(status: reqwest::StatusCode) -> Self {
         Self {
-            message: format!("Фоновый сервис ответил ошибкой (HTTP {}).", status.as_u16()),
+            message: tr!("Фоновый сервис ответил ошибкой (HTTP {}).", status.as_u16()),
             kind: DaemonErrorKind::DefinitiveHttp,
             specific: true,
         }
@@ -597,7 +606,7 @@ pub trait DaemonClient: Send + Sync {
 
     /// POST /v1/subscriptions/refresh. The saved source URL never leaves the daemon.
     fn refresh_subscription(&self) -> Result<DaemonStatus, DaemonError> {
-        Err(DaemonError::new("Обновление подписки недоступно."))
+        Err(DaemonError::new(tr!("Обновление подписки недоступно.")))
     }
 
     /// GET /v1/subscriptions. The response intentionally contains no source URL.
@@ -668,37 +677,37 @@ pub trait DaemonClient: Send + Sync {
 
     /// GET /v1/diagnostics. Contains only bounded, redacted runtime data.
     fn diagnostics(&self) -> Result<DaemonDiagnostics, DaemonError> {
-        Err(DaemonError::new("Диагностика недоступна."))
+        Err(DaemonError::new(tr!("Диагностика недоступна.")))
     }
 
     /// GET /v1/service-log («Сохранить лог…»). Daemons without the route answer 404.
     fn service_log(&self) -> Result<DaemonServiceLog, DaemonError> {
-        Err(DaemonError::new("Журнал службы недоступен."))
+        Err(DaemonError::new(tr!("Журнал службы недоступен.")))
     }
 
     /// GET /v1/dashboard-url. The returned URL embeds the ephemeral Mihomo controller secret for
     /// this session; callers must open it directly (e.g. in the default browser) and must never
     /// log it, persist it, or surface it in diagnostics.
     fn dashboard_url(&self) -> Result<String, DaemonError> {
-        Err(DaemonError::new("Панель Mihomo недоступна."))
+        Err(DaemonError::new(tr!("Панель Mihomo недоступна.")))
     }
 
     /// GET /v1/session. Polled about once a second while connected, so a refusal (the session
     /// just ended) is not recorded in the low-level log.
     fn session(&self) -> Result<DaemonSession, DaemonError> {
-        Err(DaemonError::new("Данные сессии недоступны."))
+        Err(DaemonError::new(tr!("Данные сессии недоступны.")))
     }
 
     /// POST /v1/service/update: the always-ready service downloads and installs `version`
     /// (reusing a release staged by `stage_update_via_service`).
     fn update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
-        Err(DaemonError::new("Служба MULTICORE недоступна."))
+        Err(DaemonError::new(tr!("Служба MULTICORE недоступна.")))
     }
 
     /// POST /v1/service/update/stage: the service only downloads and verifies `version`; the
     /// tunnel keeps running.
     fn stage_update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
-        Err(DaemonError::new("Служба MULTICORE недоступна."))
+        Err(DaemonError::new(tr!("Служба MULTICORE недоступна.")))
     }
 
     /// POST /v1/troubleshoot/check: one check of «Устранить неполадки».
@@ -706,7 +715,7 @@ pub trait DaemonClient: Send + Sync {
         &self,
         _step: multicore_core::troubleshoot::CheckStep,
     ) -> Result<multicore_core::troubleshoot::StepReport, DaemonError> {
-        Err(DaemonError::new("Устранение неполадок недоступно."))
+        Err(DaemonError::new(tr!("Устранение неполадок недоступно.")))
     }
 
     /// POST /v1/troubleshoot/fix: the fixes the user confirmed (ids from the check results).
@@ -714,7 +723,7 @@ pub trait DaemonClient: Send + Sync {
         &self,
         _fixes: &[String],
     ) -> Result<multicore_core::troubleshoot::FixReport, DaemonError> {
-        Err(DaemonError::new("Устранение неполадок недоступно."))
+        Err(DaemonError::new(tr!("Устранение неполадок недоступно.")))
     }
 
     /// GET /v1/catalog. IDs are opaque daemon values; labels are presentation data.
@@ -726,7 +735,7 @@ pub trait DaemonClient: Send + Sync {
         _revision: Option<u64>,
         _group_ids: &[String],
     ) -> Result<DaemonLatencies, DaemonError> {
-        Err(DaemonError::new("Проверка задержки недоступна."))
+        Err(DaemonError::new(tr!("Проверка задержки недоступна.")))
     }
 
     /// POST /v1/latencies for exactly these nodes (a right-click on one route row).
@@ -735,12 +744,12 @@ pub trait DaemonClient: Send + Sync {
         _revision: Option<u64>,
         _node_ids: &[String],
     ) -> Result<DaemonLatencies, DaemonError> {
-        Err(DaemonError::new("Проверка задержки недоступна."))
+        Err(DaemonError::new(tr!("Проверка задержки недоступна.")))
     }
 
     /// GET /v1/group-icons/{icon_id}: the canonical PNG of a catalog group icon.
     fn group_icon(&self, _icon_id: &str) -> Result<Vec<u8>, DaemonError> {
-        Err(DaemonError::new("Значок группы недоступен."))
+        Err(DaemonError::new(tr!("Значок группы недоступен.")))
     }
 
     /// PUT /v1/selections/{group_id} with `{ "revision", "node_id" }`.
@@ -868,7 +877,7 @@ impl HttpDaemonClient {
         }
         let code = error_code(response);
         Err(
-            DaemonError::definitive_http("Служба не смогла установить обновление.")
+            DaemonError::definitive_http(tr!("Служба не смогла установить обновление."))
                 .with_known_code(&code),
         )
     }
@@ -947,26 +956,26 @@ impl HttpDaemonClient {
         match response.status() {
             reqwest::StatusCode::NOT_FOUND => Err(DaemonError::profile_http(
                 DaemonErrorKind::ProfileNotFound,
-                "Подписка не найдена. Обновите список подписок.",
+                tr!("Подписка не найдена. Обновите список подписок."),
             )),
             reqwest::StatusCode::CONFLICT => {
                 let code = error_code(response);
                 Err(DaemonError::profile_http(
                     DaemonErrorKind::ProfileConflict,
-                    "Сейчас подписку изменить нельзя.",
+                    tr!("Сейчас подписку изменить нельзя."),
                 )
                 .with_known_code(&code))
             }
             status if status.is_server_error() => {
                 let code = error_code(response);
                 Err(if code == "profile_mutation_ambiguous" {
-                    DaemonError::transport(
-                        "Изменение могло сохраниться. Обновляем состояние подписок.",
-                    )
+                    DaemonError::transport(tr!(
+                        "Изменение могло сохраниться. Обновляем состояние подписок."
+                    ))
                 } else {
                     DaemonError::profile_http(
                         DaemonErrorKind::ProfileServer,
-                        "Фоновый сервис не смог изменить подписку.",
+                        tr!("Фоновый сервис не смог изменить подписку."),
                     )
                     .with_known_code(&code)
                 })
@@ -1019,20 +1028,20 @@ impl HttpDaemonClient {
             return Err(if stale_revision {
                 DaemonError::stale_revision()
             } else {
-                DaemonError::definitive_http("Не удалось проверить задержку.")
+                DaemonError::definitive_http(tr!("Не удалось проверить задержку."))
             });
         }
         if !response.status().is_success() {
-            return Err(DaemonError::definitive_http(
-                "Фоновый сервис отклонил проверку задержки.",
-            ));
+            return Err(DaemonError::definitive_http(tr!(
+                "Фоновый сервис отклонил проверку задержки."
+            )));
         }
         decode_bounded_json(response, LATENCIES_RESPONSE_LIMIT_BYTES)
     }
 }
 
 fn parse_daemon_base_url(value: &str) -> Result<reqwest::Url, DaemonError> {
-    let invalid = || DaemonError::new("Некорректный адрес фонового сервиса.");
+    let invalid = || DaemonError::new(tr!("Некорректный адрес фонового сервиса."));
     let url = reqwest::Url::parse(value.trim()).map_err(|_| invalid())?;
     if url.scheme() != "http"
         || !url.username().is_empty()
@@ -1079,7 +1088,7 @@ fn decode_bounded_json<T: DeserializeOwned>(
         .read_to_end(&mut bytes)
         .map_err(|error| {
             record_low_level("daemon_response_read_failed", &error);
-            DaemonError::transport("Не удалось прочитать ответ фонового сервиса.")
+            DaemonError::transport(tr!("Не удалось прочитать ответ фонового сервиса."))
         })?;
     if bytes.len() > response_limit {
         return Err(response_too_large());
@@ -1090,12 +1099,12 @@ fn decode_bounded_json<T: DeserializeOwned>(
             "daemon_response_decode_failed",
             format!("{error}; body={snippet:?}"),
         );
-        DaemonError::transport("Фоновый сервис вернул некорректный ответ.")
+        DaemonError::transport(tr!("Фоновый сервис вернул некорректный ответ."))
     })
 }
 
 fn response_too_large() -> DaemonError {
-    DaemonError::transport("Ответ фонового сервиса превышает допустимый размер.")
+    DaemonError::transport(tr!("Ответ фонового сервиса превышает допустимый размер."))
 }
 
 #[derive(Serialize)]
@@ -1137,73 +1146,93 @@ struct DashboardUrlResponse {
 /// displayed, so provider URLs or tokens can never be reflected into the UI.
 fn known_error_message(code: &str) -> Option<&'static str> {
     Some(match code {
-        "profile_busy" => "Отключитесь перед изменением подписки.",
-        "profile_limit" => "Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите.",
+        "profile_busy" => tr!("Отключитесь перед изменением подписки."),
+        "profile_limit" => {
+            tr!("Достигнут предел: не больше 16 подписок. Удалите ненужную и повторите.")
+        }
         "subscription_unreachable" => {
-            "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
+            tr!(
+                "Сервер подписки недоступен. Проверьте подключение к интернету и повторите попытку."
+            )
         }
         "subscription_timeout" => {
-            "Сервер подписки не ответил вовремя. Повторите попытку чуть позже."
+            tr!("Сервер подписки не ответил вовремя. Повторите попытку чуть позже.")
         }
         "subscription_tls" => {
-            "Сертификат сервера подписки не принят. Проверьте ссылку или обратитесь к провайдеру."
+            tr!(
+                "Сертификат сервера подписки не принят. Проверьте ссылку или обратитесь к провайдеру."
+            )
         }
         "subscription_redirect" => {
-            "Сервер подписки перенаправил запрос небезопасно или слишком много раз."
+            tr!("Сервер подписки перенаправил запрос небезопасно или слишком много раз.")
         }
         "subscription_forbidden" => {
-            "Сервер подписки отказал в доступе. Проверьте ссылку и срок действия подписки."
+            tr!("Сервер подписки отказал в доступе. Проверьте ссылку и срок действия подписки.")
         }
         "subscription_not_found" => {
-            "Подписка не найдена. Проверьте, что ссылка скопирована полностью."
+            tr!("Подписка не найдена. Проверьте, что ссылка скопирована полностью.")
         }
         "subscription_rate_limited" => {
-            "Сервер подписки временно ограничил запросы. Повторите попытку через минуту."
+            tr!("Сервер подписки временно ограничил запросы. Повторите попытку через минуту.")
         }
         "subscription_server_error" => {
-            "Сервер подписки временно не работает. Повторите попытку позже."
+            tr!("Сервер подписки временно не работает. Повторите попытку позже.")
         }
-        "subscription_http_status" => "Сервер подписки ответил ошибкой.",
+        "subscription_http_status" => tr!("Сервер подписки ответил ошибкой."),
         "subscription_not_multicore" => {
-            "По ссылке пришла веб-страница или список ссылок, а не подписка MULTICORE. Скопируйте ссылку подписки для приложения у провайдера."
+            tr!(
+                "По ссылке пришла веб-страница или список ссылок, а не подписка MULTICORE. Скопируйте ссылку подписки для приложения у провайдера."
+            )
         }
         "subscription_invalid" => {
-            "Провайдер прислал повреждённую или неподдерживаемую конфигурацию."
+            tr!("Провайдер прислал повреждённую или неподдерживаемую конфигурацию.")
         }
-        "subscription_too_large" => "Ответ сервера подписки слишком большой.",
+        "subscription_too_large" => tr!("Ответ сервера подписки слишком большой."),
         "subscription_storage" => {
-            "Не удалось сохранить подписку на диск. Проверьте свободное место."
+            tr!("Не удалось сохранить подписку на диск. Проверьте свободное место.")
         }
         "subscription_prepare_failed" => {
-            "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение."
+            tr!(
+                "Подписка загружена, но подготовить её к запуску не удалось. Проверьте сетевое подключение."
+            )
         }
-        "not_connected" => "Подключитесь, чтобы открыть панель Mihomo.",
-        "dashboard_unavailable" => "Панель Mihomo недоступна в этой сборке.",
-        "service_busy" => "MULTICORE уже запущен у другого пользователя.",
+        "not_connected" => tr!("Подключитесь, чтобы открыть панель Mihomo."),
+        "dashboard_unavailable" => tr!("Панель Mihomo недоступна в этой сборке."),
+        "service_busy" => tr!("MULTICORE уже запущен у другого пользователя."),
         // Why a Connect's cores did not start (the daemon's start-failure codes).
-        "elevation_cancelled" => "Подключение отменено: не выдано разрешение администратора.",
-        "elevation_failed" => "Не удалось запустить службу подключения с правами администратора.",
-        "broker_failed" => "Служба подключения не ответила. Повторите попытку.",
-        "core_failed" => "Не удалось запустить ядро. Подробности — в логе на странице «Состояние».",
+        "elevation_cancelled" => tr!("Подключение отменено: не выдано разрешение администратора."),
+        "elevation_failed" => {
+            tr!("Не удалось запустить службу подключения с правами администратора.")
+        }
+        "broker_failed" => tr!("Служба подключения не ответила. Повторите попытку."),
+        "core_failed" => {
+            tr!("Не удалось запустить ядро. Подробности — в логе на странице «Состояние».")
+        }
         "core_missing" => {
-            "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+            tr!(
+                "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+            )
         }
         "core_exited" => {
-            "Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние»."
+            tr!("Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние».")
         }
-        "core_timed_out" => "Ядро не успело запуститься вовремя. Повторите попытку.",
+        "core_timed_out" => tr!("Ядро не успело запуститься вовремя. Повторите попытку."),
         "tun_failed" => {
-            "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+            tr!(
+                "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+            )
         }
         "tun_timed_out" => {
-            "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+            tr!(
+                "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+            )
         }
-        "system_proxy_failed" => "Не удалось включить системный прокси. Повторите попытку.",
-        "connect_failed" => "Не удалось запустить подключение. Повторите попытку.",
-        "service_update_failed" => "Служба не смогла загрузить или проверить обновление.",
-        "service_unavailable" => "Служба MULTICORE недоступна.",
-        "disconnect_first" => "Сначала отключитесь: проверка меняет сетевые настройки.",
-        "troubleshoot_unavailable" => "Устранение неполадок недоступно в этой сборке.",
+        "system_proxy_failed" => tr!("Не удалось включить системный прокси. Повторите попытку."),
+        "connect_failed" => tr!("Не удалось запустить подключение. Повторите попытку."),
+        "service_update_failed" => tr!("Служба не смогла загрузить или проверить обновление."),
+        "service_unavailable" => tr!("Служба MULTICORE недоступна."),
+        "disconnect_first" => tr!("Сначала отключитесь: проверка меняет сетевые настройки."),
+        "troubleshoot_unavailable" => tr!("Устранение неполадок недоступно в этой сборке."),
         _ => return None,
     })
 }
@@ -1357,9 +1386,9 @@ impl DaemonClient for HttpDaemonClient {
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(DaemonError::definitive_http(
-                "Не удалось остановить ядра службы.",
-            ))
+            Err(DaemonError::definitive_http(tr!(
+                "Не удалось остановить ядра службы."
+            )))
         }
     }
 
@@ -1373,7 +1402,7 @@ impl DaemonClient for HttpDaemonClient {
         if !response.status().is_success() {
             let code = error_code(response);
             return Err(
-                DaemonError::definitive_http("Панель Mihomo сейчас недоступна.")
+                DaemonError::definitive_http(tr!("Панель Mihomo сейчас недоступна."))
                     .with_known_code(&code),
             );
         }
@@ -1392,7 +1421,8 @@ impl DaemonClient for HttpDaemonClient {
         if !response.status().is_success() {
             let code = error_code(response);
             return Err(
-                DaemonError::definitive_http("Данные сессии недоступны.").with_known_code(&code)
+                DaemonError::definitive_http(tr!("Данные сессии недоступны."))
+                    .with_known_code(&code),
             );
         }
         decode_bounded_json(response, SESSION_RESPONSE_LIMIT_BYTES)
@@ -1481,7 +1511,9 @@ impl DaemonClient for HttpDaemonClient {
             .send()
             .map_err(map_error)?;
         if !response.status().is_success() {
-            return Err(DaemonError::definitive_http("Значок группы недоступен."));
+            return Err(DaemonError::definitive_http(tr!(
+                "Значок группы недоступен."
+            )));
         }
         if response
             .content_length()
@@ -1493,7 +1525,9 @@ impl DaemonClient for HttpDaemonClient {
         response
             .take(GROUP_ICON_RESPONSE_LIMIT_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| DaemonError::transport("Не удалось прочитать ответ фонового сервиса."))?;
+            .map_err(|_| {
+                DaemonError::transport(tr!("Не удалось прочитать ответ фонового сервиса."))
+            })?;
         if bytes.len() > GROUP_ICON_RESPONSE_LIMIT_BYTES {
             return Err(response_too_large());
         }
@@ -1509,7 +1543,7 @@ impl DaemonClient for HttpDaemonClient {
         let mut endpoint = self.endpoint("/v1/selections/");
         endpoint
             .path_segments_mut()
-            .map_err(|()| DaemonError::new("Некорректный адрес фонового сервиса."))?
+            .map_err(|()| DaemonError::new(tr!("Некорректный адрес фонового сервиса.")))?
             .pop_if_empty()
             .push(group_id);
         let response = self
@@ -1531,10 +1565,10 @@ impl DaemonClient for HttpDaemonClient {
                 if code == "stale_revision" {
                     DaemonError::stale_revision()
                 } else {
-                    DaemonError::definitive_http("Не удалось изменить маршрут.")
+                    DaemonError::definitive_http(tr!("Не удалось изменить маршрут."))
                 }
             } else {
-                DaemonError::definitive_http("Фоновый сервис отклонил изменение маршрута.")
+                DaemonError::definitive_http(tr!("Фоновый сервис отклонил изменение маршрута."))
             });
         }
         decode_bounded_json(response, CATALOG_RESPONSE_LIMIT_BYTES)
@@ -1544,11 +1578,11 @@ impl DaemonClient for HttpDaemonClient {
 fn map_error(error: reqwest::Error) -> DaemonError {
     record_low_level("daemon_request_failed", &error);
     if error.is_timeout() {
-        DaemonError::transport("Фоновый сервис не ответил вовремя.")
+        DaemonError::transport(tr!("Фоновый сервис не ответил вовремя."))
     } else if error.is_connect() {
-        DaemonError::transport("Фоновый сервис не запущен.")
+        DaemonError::transport(tr!("Фоновый сервис не запущен."))
     } else {
-        DaemonError::transport("Не удалось выполнить запрос к фоновому сервису.")
+        DaemonError::transport(tr!("Не удалось выполнить запрос к фоновому сервису."))
     }
 }
 
@@ -1712,7 +1746,7 @@ pub(crate) mod test_support {
             self.record("GET /v1/dashboard-url");
             self.dashboard_url
                 .clone()
-                .ok_or_else(|| DaemonError::new("Подключитесь, чтобы открыть панель Mihomo."))
+                .ok_or_else(|| DaemonError::new(tr!("Подключитесь, чтобы открыть панель Mihomo.")))
         }
     }
 }
@@ -2432,6 +2466,7 @@ mod http_tests {
                     level: "info".into(),
                     component: String::new(),
                     message: "Подключение установлено.".into(),
+                    message_key: None,
                     details: None,
                 }],
             }
@@ -3214,6 +3249,78 @@ mod http_tests {
             read_low_level_entries(&path)
                 .expect("entry recorded")
                 .contains("after rotation")
+        );
+    }
+}
+
+#[cfg(test)]
+mod english_tests {
+    use super::*;
+    use multicore_i18n::{Lang, ThreadLanguage};
+
+    fn cyrillic(text: &str) -> bool {
+        text.chars().any(|c| ('\u{400}'..='\u{4ff}').contains(&c))
+    }
+
+    #[test]
+    fn known_error_codes_read_in_english() {
+        let _en = ThreadLanguage::set(Lang::En);
+        let codes = [
+            "profile_busy",
+            "profile_limit",
+            "subscription_unreachable",
+            "subscription_timeout",
+            "subscription_tls",
+            "subscription_redirect",
+            "subscription_forbidden",
+            "subscription_not_found",
+            "subscription_rate_limited",
+            "subscription_server_error",
+            "subscription_http_status",
+            "subscription_not_multicore",
+            "subscription_invalid",
+            "subscription_too_large",
+            "subscription_storage",
+            "subscription_prepare_failed",
+            "not_connected",
+            "dashboard_unavailable",
+            "service_busy",
+            "elevation_cancelled",
+            "elevation_failed",
+            "broker_failed",
+            "core_failed",
+            "core_missing",
+            "core_exited",
+            "core_timed_out",
+            "tun_failed",
+            "tun_timed_out",
+            "system_proxy_failed",
+            "connect_failed",
+            "service_update_failed",
+            "service_unavailable",
+            "disconnect_first",
+            "troubleshoot_unavailable",
+        ];
+        for code in codes {
+            let message = known_error_message(code).expect(code);
+            assert!(!cyrillic(message), "{code}: {message}");
+        }
+        assert_eq!(
+            known_error_message("elevation_cancelled"),
+            Some("Connection cancelled: administrator permission was not granted.")
+        );
+        assert_eq!(
+            DaemonError::stale_revision().to_string(),
+            "The route list has changed."
+        );
+    }
+
+    #[test]
+    fn russian_error_texts_are_unchanged() {
+        let _ru = ThreadLanguage::set(Lang::Ru);
+        assert_eq!(
+            known_error_message("profile_busy"),
+            Some("Отключитесь перед изменением подписки.")
         );
     }
 }

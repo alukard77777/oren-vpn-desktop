@@ -16,6 +16,7 @@
 //! The uncompressed total is capped at [`MAX_BUNDLE_BYTES`]; files are taken newest first and
 //! a file that does not fit keeps its newest lines.
 
+use multicore_i18n::tr;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -33,7 +34,10 @@ use crate::view_model::redact_event_text;
 pub(crate) const MAX_BUNDLE_BYTES: usize = 20 * 1024 * 1024;
 /// A single preferences file is never larger than this (see `preferences.rs`).
 const MAX_PREFERENCES_BYTES: u64 = 1024 * 1024;
-const TRUNCATED_MARKER: &str = "[… начало файла не поместилось в архив …]\n";
+/// Starts a file whose beginning did not fit in the archive.
+fn truncated_marker() -> String {
+    format!("{}\n", tr!("[… начало файла не поместилось в архив …]"))
+}
 
 static APP_STARTED: OnceLock<Instant> = OnceLock::new();
 
@@ -95,17 +99,22 @@ impl BundleInputs {
 pub(crate) fn service_log_entries(
     result: Result<DaemonServiceLog, DaemonError>,
 ) -> (String, Vec<(String, String)>) {
-    let line = |value: &str| format!("{:<22}{value}\n", "Журнал службы");
+    let line = |value: &str| format!("{:<22}{value}\n", tr!("Журнал службы"));
     let log = match result {
         Ok(log) => log,
-        Err(_) => return (line("недоступен: фоновый сервис не ответил"), Vec::new()),
+        Err(_) => {
+            return (
+                line(tr!("недоступен: фоновый сервис не ответил")),
+                Vec::new(),
+            );
+        }
     };
     let reason = match log.status.as_str() {
         "included" => None,
-        "no_service" => Some("нет: служба не используется (режим без службы)"),
-        "too_old" => Some("недоступен: служба слишком старая (service too old)"),
-        "busy" => Some("недоступен: службой пользуется другой пользователь"),
-        _ => Some("недоступен: служба не ответила"),
+        "no_service" => Some(tr!("нет: служба не используется (режим без службы)")),
+        "too_old" => Some(tr!("недоступен: служба слишком старая (service too old)")),
+        "busy" => Some(tr!("недоступен: службой пользуется другой пользователь")),
+        _ => Some(tr!("недоступен: служба не ответила")),
     };
     if let Some(reason) = reason {
         return (line(reason), Vec::new());
@@ -116,7 +125,7 @@ pub(crate) fn service_log_entries(
         .filter(|file| matches!(file.name.as_str(), "service.log" | "service.log.1"))
         .map(|file| {
             let text = if file.truncated {
-                format!("{TRUNCATED_MARKER}{}", file.text)
+                format!("{}{}", truncated_marker(), file.text)
             } else {
                 file.text
             };
@@ -124,7 +133,7 @@ pub(crate) fn service_log_entries(
         })
         .collect::<Vec<_>>();
     let note = if files.is_empty() {
-        "пуст".to_owned()
+        tr!("пуст").to_owned()
     } else {
         files
             .iter()
@@ -258,7 +267,7 @@ fn read_tail(path: &Path, limit: usize) -> io::Result<String> {
     if start > 0 {
         // Start at a whole line.
         let cut = text.find('\n').map_or(text.len(), |newline| newline + 1);
-        text.replace_range(..cut, TRUNCATED_MARKER);
+        text.replace_range(..cut, &truncated_marker());
     }
     Ok(text)
 }
@@ -268,16 +277,17 @@ fn keep_newest(text: &str, budget: usize) -> String {
     if text.len() <= budget {
         return text.to_owned();
     }
-    if budget <= TRUNCATED_MARKER.len() {
+    let marker = truncated_marker();
+    if budget <= marker.len() {
         return String::new();
     }
-    let mut start = text.len() - (budget - TRUNCATED_MARKER.len());
+    let mut start = text.len() - (budget - marker.len());
     while !text.is_char_boundary(start) {
         start += 1;
     }
     let tail = &text[start..];
     let tail = tail.find('\n').map_or("", |newline| &tail[newline + 1..]);
-    format!("{TRUNCATED_MARKER}{tail}")
+    format!("{marker}{tail}")
 }
 
 /// The preferences without anything that identifies the user or a subscription: profile ids
@@ -436,24 +446,28 @@ pub(crate) fn system_report(ui: &UiFacts) -> String {
             usize::BITS
         ),
     );
-    line(&mut out, "ОС", &os_description());
-    line(&mut out, "Процессор", &cpu_architecture());
-    line(&mut out, "Язык", &locale().unwrap_or_else(|| "—".into()));
+    line(&mut out, tr!("ОС"), &os_description());
+    line(&mut out, tr!("Процессор"), &cpu_architecture());
     line(
         &mut out,
-        "Масштаб экрана",
+        tr!("Язык"),
+        &locale().unwrap_or_else(|| "—".into()),
+    );
+    line(
+        &mut out,
+        tr!("Масштаб экрана"),
         &format!("{:.0}%", f64::from(ui.scale_factor) * 100.0),
     );
-    line(&mut out, "Отрисовка", &renderer_description());
+    line(&mut out, tr!("Отрисовка"), &renderer_description());
     let executable = std::env::current_exe().ok();
     line(
         &mut out,
-        "Установка",
+        tr!("Установка"),
         &install_description(executable.as_deref()),
     );
     line(
         &mut out,
-        "Путь установки",
+        tr!("Путь установки"),
         &executable
             .as_deref()
             .and_then(Path::parent)
@@ -461,34 +475,39 @@ pub(crate) fn system_report(ui: &UiFacts) -> String {
     );
     line(
         &mut out,
-        "Служба",
+        tr!("Служба"),
         if ui.service_mode {
             if ui.cores_ready {
-                "используется, ядра запущены"
+                tr!("используется, ядра запущены")
             } else {
-                "используется, ядра не запущены"
+                tr!("используется, ядра не запущены")
             }
         } else {
-            "не используется"
+            tr!("не используется")
         },
     );
     line(
         &mut out,
-        "Режим",
+        tr!("Режим"),
         if ui.tun_enabled {
-            "TUN (весь трафик)"
+            tr!("TUN (весь трафик)")
         } else {
-            "системный прокси"
+            tr!("системный прокси")
         },
     );
-    line(&mut out, "Подключение", &ui.connection);
+    // «Подключение» is also the connecting state ("Connecting") in the catalog.
+    let connection = match multicore_i18n::current() {
+        multicore_i18n::Lang::Ru => "Подключение", // i18n-ru-only
+        multicore_i18n::Lang::En => "Connection",
+    };
+    line(&mut out, connection, &ui.connection);
     if !ui.session_uptime.is_empty() {
-        line(&mut out, "Время подключения", &ui.session_uptime);
+        line(&mut out, tr!("Время подключения"), &ui.session_uptime);
     }
     let uptime = APP_STARTED.get().map(Instant::elapsed).unwrap_or_default();
     line(
         &mut out,
-        "Приложение работает",
+        tr!("Приложение работает"),
         &format!(
             "{:02}:{:02}:{:02}",
             uptime.as_secs() / 3600,
@@ -498,7 +517,7 @@ pub(crate) fn system_report(ui: &UiFacts) -> String {
     );
     line(
         &mut out,
-        "Архив создан",
+        tr!("Архив создан"),
         &chrono::Local::now()
             .format("%Y-%m-%d %H:%M:%S %:z")
             .to_string(),
@@ -514,12 +533,12 @@ fn renderer_description() -> String {
         "Skia (OpenGL)"
     };
     let mut description = if software {
-        "программная (резервная: GPU-отрисовка не запустилась)".to_owned()
+        tr!("программная (резервная: GPU-отрисовка не запустилась)").to_owned()
     } else {
         gpu.to_owned()
     };
     if std::env::var_os("SLINT_BACKEND").is_some() {
-        description.push_str(" · задан SLINT_BACKEND");
+        description.push_str(tr!(" · задан SLINT_BACKEND"));
     }
     description
 }
@@ -534,16 +553,16 @@ fn install_description(executable: Option<&Path>) -> String {
             _ => false,
         };
         let service = if crate::service_install::service_installed() {
-            "служба установлена"
+            tr!("служба установлена")
         } else {
-            "без службы"
+            tr!("без службы")
         };
         format!(
             "{} · {service}",
             if per_user {
-                "для текущего пользователя"
+                tr!("для текущего пользователя")
             } else {
-                "для всех пользователей"
+                tr!("для всех пользователей")
             }
         )
     }
@@ -554,9 +573,9 @@ fn install_description(executable: Option<&Path>) -> String {
         } else if executable
             .is_some_and(|path| path.starts_with("/usr") || path.starts_with("/opt"))
         {
-            "системный пакет".to_owned()
+            tr!("системный пакет").to_owned()
         } else {
-            "другое".to_owned()
+            tr!("другое").to_owned()
         }
     }
 }
@@ -581,7 +600,7 @@ fn os_description() -> String {
         let _ = write!(description, " {display}");
     }
     if !build.is_empty() {
-        let _ = write!(description, " (сборка {build}");
+        let _ = write!(description, " ({}", tr!("сборка {}", build));
         if let Some(revision) = revision {
             let _ = write!(description, ".{revision}");
         }
@@ -601,8 +620,9 @@ fn os_description() -> String {
     let kernel = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    format!(
-        "{pretty} · ядро {} · {} {}",
+    tr!(
+        "{} · ядро {} · {} {}",
+        pretty,
         kernel.trim(),
         session.trim(),
         desktop.trim()
@@ -845,7 +865,7 @@ mod tests {
             .find(|(name, _)| name == "logs/latest-core.log")
             .unwrap();
         let core = String::from_utf8_lossy(core);
-        assert!(core.starts_with(TRUNCATED_MARKER));
+        assert!(core.starts_with(&truncated_marker()));
         assert!(
             core.contains(&format!("line {:08}", index - 1)),
             "newest line kept"
@@ -909,7 +929,7 @@ mod tests {
         write_bundle(&path, &inputs).unwrap();
         let entries = read_zip(&path);
         let service = &entries["logs/service.log"];
-        assert!(service.starts_with(TRUNCATED_MARKER), "{service}");
+        assert!(service.starts_with(&truncated_marker()), "{service}");
         assert!(service.contains("1700000000 prepare generation 2 refused (NotReady) at resolve"));
         assert!(
             !service.contains("user copy"),
@@ -1012,5 +1032,21 @@ mod tests {
         assert!(report.contains("125%"));
         assert!(report.contains("системный прокси"));
         assert!(report.contains("ядра запущены"));
+    }
+}
+
+#[cfg(test)]
+mod english_tests {
+    use super::*;
+    use multicore_i18n::{Lang, ThreadLanguage};
+
+    #[test]
+    fn the_service_log_line_reads_in_english() {
+        let _en = ThreadLanguage::set(Lang::En);
+        let (note, files) = service_log_entries(Err(DaemonError::new("404")));
+        assert!(note.starts_with("Service log"), "{note}");
+        assert!(note.contains("no background service reply"), "{note}");
+        assert!(files.is_empty());
+        assert!(truncated_marker().starts_with("[… file start"));
     }
 }

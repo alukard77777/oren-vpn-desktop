@@ -21,6 +21,8 @@ mod preferences;
 #[cfg(all(test, feature = "preview-render"))]
 mod preview_render;
 mod renderer_fallback;
+#[cfg(test)]
+mod rust_catalog_tests;
 mod save_dialog;
 mod service_install;
 mod service_logo;
@@ -32,6 +34,7 @@ mod view_model;
 mod windows_settings;
 mod windows_shell;
 
+use multicore_i18n::tr;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -555,7 +558,10 @@ fn client_area_animation_enabled() -> Option<bool> {
     None
 }
 
-const PREFERENCE_SAVE_ERROR_RU: &str = "Не удалось сохранить настройки.";
+/// Shown in Settings when the preferences file cannot be written.
+fn preference_save_error() -> &'static str {
+    tr!("Не удалось сохранить настройки.")
+}
 const PREFERENCE_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 
 fn retry_delay_after_failure(attempt: usize) -> Option<Duration> {
@@ -911,7 +917,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         .store
         .is_none()
     {
-        ui.set_preference_error(PREFERENCE_SAVE_ERROR_RU.into());
+        ui.set_preference_error(preference_save_error().into());
     }
     apply_snapshot(&ui, &snapshot(&model.lock().expect("view model lock")));
     ui.set_local_page(visible_page_name(&loaded_preferences.visible_page).into());
@@ -1190,7 +1196,7 @@ fn queue_subscription_import(
         ui.set_local_page("subscriptions".into());
         ui.set_replace_editor_open(true);
         ui.set_import_error(
-            "Не удалось открыть ссылку подписки. Проверьте её и повторите попытку.".into(),
+            tr!("Не удалось открыть ссылку подписки. Проверьте её и повторите попытку.").into(),
         );
     }
 }
@@ -1908,7 +1914,7 @@ fn process_writer_results(
 fn preference_error_for_result(result: &WriterResult) -> &'static str {
     match result {
         WriterResult::Saved(_) => "",
-        WriterResult::Failed(_) => PREFERENCE_SAVE_ERROR_RU,
+        WriterResult::Failed(_) => preference_save_error(),
     }
 }
 
@@ -1948,7 +1954,7 @@ fn flush_preferences(
             ui.set_preference_error("".into());
         }
         Err(failure) => {
-            ui.set_preference_error(PREFERENCE_SAVE_ERROR_RU.into());
+            ui.set_preference_error(preference_save_error().into());
             let line = failure.log_line();
             eprintln!("preferences flush {line}");
             daemon::record_low_level("preferences_flush_failed", line);
@@ -2362,7 +2368,7 @@ fn continue_ready_update(
                 &weak,
                 &state,
                 ready.release,
-                "Подключение не остановилось, обновление не установлено. Повторите установку."
+                tr!("Подключение не остановилось, обновление не установлено. Повторите установку.")
                     .into(),
             );
             let has_profile = model
@@ -3141,7 +3147,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
     let catalog = model.catalog_presentation();
     let tray_groups = model.tray_catalog_groups(12, 64);
     let status = if presentation.is_connected {
-        format!("В сети · {}", presentation.node)
+        tr!("В сети · {}", presentation.node)
     } else {
         presentation.headline.clone()
     };
@@ -3267,7 +3273,7 @@ fn apply_launch_at_sign_in(ui: &AppWindow, state: std::io::Result<LaunchAtSignIn
             ui.set_launch_at_sign_in_enabled(false);
             ui.set_launch_at_sign_in_stale(false);
             ui.set_launch_at_sign_in_error(
-                "Не удалось изменить автозапуск. Проверьте права пользователя.".into(),
+                tr!("Не удалось изменить автозапуск. Проверьте права пользователя.").into(),
             );
         }
     }
@@ -3808,8 +3814,8 @@ fn wire_service_install(ui: &AppWindow) {
 fn present_troubleshoot_run(ui: &AppWindow, run: &troubleshoot::TroubleshootRun) {
     let card = |finding: &multicore_core::troubleshoot::Finding, badge: &str| UiTroubleshootCard {
         tone: troubleshoot::tone_name(finding.tone).into(),
-        title: finding.title.as_str().into(),
-        detail: finding.detail.as_str().into(),
+        title: finding.localized_title().into(),
+        detail: finding.localized_detail().into(),
         badge: badge.into(),
     };
     let summary = troubleshoot::summary(run.findings());
@@ -3836,8 +3842,8 @@ fn present_troubleshoot_run(ui: &AppWindow, run: &troubleshoot::TroubleshootRun)
             .iter()
             .map(|(offer, checked)| UiTroubleshootFix {
                 id: offer.id.as_str().into(),
-                title: offer.title.as_str().into(),
-                detail: offer.detail.as_str().into(),
+                title: offer.localized_title().into(),
+                detail: offer.localized_detail().into(),
                 needs_admin: offer.needs_admin,
                 needs_reboot: offer.needs_reboot,
                 checked: *checked,
@@ -3860,10 +3866,13 @@ fn present_troubleshoot_steps(
             .enumerate()
             .map(|(index, step)| UiTroubleshootStep {
                 // A finished step drops its ellipsis.
+                // The step names come from `multicore_core` in Russian, as catalog msgids.
                 label: if index < active {
-                    step.label().trim_end_matches('…').into()
+                    multicore_i18n::translate(step.label())
+                        .trim_end_matches('…')
+                        .into()
                 } else {
-                    step.label().into()
+                    multicore_i18n::translate(step.label()).into()
                 },
                 state: match index.cmp(&active) {
                     std::cmp::Ordering::Less => "done",
@@ -3899,6 +3908,27 @@ fn wire_troubleshoot(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Tim
         });
     }
 
+    // A language switch redraws the steps, the finished run and «N мин назад».
+    {
+        let (weak, run, checked_at) = (ui.as_weak(), run.clone(), checked_at.clone());
+        on_language_refresh(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let phase = ui.get_troubleshoot_phase();
+            if phase != "start" {
+                let steps = CheckStep::for_platform(cfg!(windows));
+                let active = usize::try_from(ui.get_troubleshoot_step_index()).unwrap_or(0);
+                present_troubleshoot_steps(&ui, &steps, active.min(steps.len()));
+            }
+            if matches!(phase.as_str(), "results" | "fixing") {
+                present_troubleshoot_run(&ui, &run.lock().expect("troubleshoot run lock"));
+            }
+            if let Some(at) = *checked_at.lock().expect("troubleshoot clock lock") {
+                ui.set_troubleshoot_checked_ago(troubleshoot::checked_ago(at.elapsed()).into());
+            }
+        });
+    }
     let (weak, start_run, start_model, start_checked_at) =
         (ui.as_weak(), run.clone(), model.clone(), checked_at.clone());
     ui.on_troubleshoot_start(move || {
@@ -4089,7 +4119,8 @@ fn wire_panels(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         };
         if let Some(ui) = weak.upgrade() {
             if panel == Panel::Events {
-                ui.set_event_filter("Все".into());
+                // The filter chips' ids (Slint compares them); never shown as text.
+                ui.set_event_filter("Все".into()); // i18n-ignore: filter id
             } else if panel == Panel::Routes {
                 ui.set_local_page("home".into());
             }
@@ -4525,9 +4556,10 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
             ui.set_event_filter(filter.clone().into());
         }
         let level = match filter.as_str() {
-            "Ошибки" => Some("error".to_owned()),
-            "Система" => Some("system".to_owned()),
-            "Ядра" => Some("cores".to_owned()),
+            // Chip ids from the Slint filter row, not shown as text.
+            "Ошибки" => Some("error".to_owned()), // i18n-ignore: filter id
+            "Система" => Some("system".to_owned()), // i18n-ignore: filter id
+            "Ядра" => Some("cores".to_owned()),   // i18n-ignore: filter id
             _ => None,
         };
         let events = model
@@ -5633,16 +5665,16 @@ fn toggle_presentation(presentation: &StatePresentation) -> TogglePresentation {
     let (title, on, busy, detail_is_exit) = if presentation.is_busy {
         // Disconnecting still reports is_connected, so busy is decided first.
         if presentation.is_connected {
-            ("Отключение…".to_owned(), false, true, true)
+            (tr!("Отключение…").to_owned(), false, true, true)
         } else {
-            ("Подключение…".to_owned(), true, true, true)
+            (tr!("Подключение…").to_owned(), true, true, true)
         }
     } else if presentation.is_connected {
-        ("Защита включена".to_owned(), true, false, true)
+        (tr!("Защита включена").to_owned(), true, false, true)
     } else if presentation.is_error || presentation.is_degraded {
         (presentation.eyebrow.to_owned(), false, false, false)
     } else {
-        ("Защита выключена".to_owned(), false, false, true)
+        (tr!("Защита выключена").to_owned(), false, false, true)
     };
     TogglePresentation {
         title,
@@ -5657,7 +5689,7 @@ fn subscription_initial(name: &str) -> String {
     name.chars()
         .find(|c| c.is_alphanumeric())
         .map(|c| c.to_uppercase().collect())
-        .unwrap_or_else(|| "П".into())
+        .unwrap_or_else(|| tr!("П").into())
 }
 
 /// Share of the traffic limit used, for the ring gauges (0 without a limit).
@@ -5799,6 +5831,22 @@ fn refresh_localized_texts(
     apply_launch_at_sign_in(ui, windows_settings::query_launch_at_sign_in());
     refresh_tray_popup(tray_popup, model);
     load_events(ui.as_weak(), model.clone());
+    LANGUAGE_REFRESHERS.with(|refreshers| {
+        for refresh in refreshers.borrow().iter() {
+            refresh();
+        }
+    });
+}
+
+thread_local! {
+    /// Re-renders of Rust-built texts kept outside the view model (the troubleshooting run,
+    /// …), run by `refresh_localized_texts` after a language switch. UI thread only.
+    static LANGUAGE_REFRESHERS: RefCell<Vec<Box<dyn Fn()>>> = RefCell::new(Vec::new());
+}
+
+/// Registers a re-render for `refresh_localized_texts`.
+fn on_language_refresh(refresh: impl Fn() + 'static) {
+    LANGUAGE_REFRESHERS.with(|refreshers| refreshers.borrow_mut().push(Box::new(refresh)));
 }
 
 fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
@@ -6204,13 +6252,13 @@ mod window_tests {
     use super::{
         DeleteFocusState, DeleteFocusTarget, LaunchArguments, LaunchMode,
         MAX_PENDING_SUBSCRIPTION_IMPORTS, MAX_READY_UPDATE_WAITS, PREFERENCE_RETRY_DELAYS,
-        PREFERENCE_SAVE_ERROR_RU, PendingImportOutcome, PendingSubscriptionConsents,
-        PendingSubscriptionImports, PersistenceTracker, PreferenceWriteFailure, PreferenceWriter,
-        ProfilePreferenceReconciler, ReadyUpdateStep, UpdateConfirmPlan, UpdateInstallIntent,
-        WindowObservation, WriterCommand, WriterResult, activation_for_launch_arguments,
-        ambient_motion_allowed, begin_update_download, delete_focus_plan, drain_latest_write,
-        initial_window_visible, next_maximized, parse_launch_arguments,
-        preference_error_for_result, preference_failure_is_terminal, ready_update_step,
+        PendingImportOutcome, PendingSubscriptionConsents, PendingSubscriptionImports,
+        PersistenceTracker, PreferenceWriteFailure, PreferenceWriter, ProfilePreferenceReconciler,
+        ReadyUpdateStep, UpdateConfirmPlan, UpdateInstallIntent, WindowObservation, WriterCommand,
+        WriterResult, activation_for_launch_arguments, ambient_motion_allowed,
+        begin_update_download, delete_focus_plan, drain_latest_write, initial_window_visible,
+        next_maximized, parse_launch_arguments, preference_error_for_result,
+        preference_failure_is_terminal, preference_save_error, ready_update_step,
         reduced_motion_from_client_area_animation, retry_delay_after_failure, route_hints_apply_to,
         runtime_allows_update, scale_factor_milli, shell_active_after_native_minimize_change,
         startup_should_connect, update_check_due, update_confirm_plan, update_install_intent,
@@ -7662,16 +7710,16 @@ mod window_tests {
         );
         assert_eq!(
             preference_error_for_result(&WriterResult::Failed(failure)),
-            PREFERENCE_SAVE_ERROR_RU
+            preference_save_error()
         );
         assert_eq!(
             preference_error_for_result(&WriterResult::Saved(AppPreferences::default())),
             ""
         );
-        assert!(!PREFERENCE_SAVE_ERROR_RU.is_ascii());
-        assert!(PREFERENCE_SAVE_ERROR_RU.chars().count() < 64);
-        assert!(!PREFERENCE_SAVE_ERROR_RU.contains("http"));
-        assert!(!PREFERENCE_SAVE_ERROR_RU.contains(":\\"));
+        assert!(!preference_save_error().is_ascii());
+        assert!(preference_save_error().chars().count() < 64);
+        assert!(!preference_save_error().contains("http"));
+        assert!(!preference_save_error().contains(":\\"));
     }
 
     /// A core host that briefly holds the data directory sharing reads only (the service
@@ -8864,5 +8912,34 @@ mod window_tests {
                 "missing clipboard wiring: {required}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod english_tests {
+    use crate::view_model::UiState;
+    use multicore_i18n::{Lang, ThreadLanguage};
+
+    #[test]
+    fn the_connection_toggle_reads_in_english() {
+        let _en = ThreadLanguage::set(Lang::En);
+        let ready = UiState::Ready {
+            profile: "p".into(),
+            node: "n".into(),
+        };
+        assert_eq!(
+            super::toggle_presentation(&ready.presentation()).title,
+            "Not protected"
+        );
+        let connected = UiState::Connected {
+            profile: "p".into(),
+            node: "n".into(),
+        };
+        assert_eq!(
+            super::toggle_presentation(&connected.presentation()).title,
+            "Protected"
+        );
+        assert_eq!(super::preference_save_error(), "Couldn't save settings.");
+        assert_eq!(super::subscription_initial("  "), "S");
     }
 }
