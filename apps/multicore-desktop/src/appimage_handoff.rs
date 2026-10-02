@@ -255,7 +255,7 @@ mod tests {
         let ui: String = include_str!("../ui/app.slint").split_whitespace().collect();
         assert!(ui.contains("\"Открытаустановленнаяверсия\""));
         assert!(ui.contains("\"AppImageможноудалить—используетсяMULTICOREизсистемы\""));
-        assert!(ui.contains("label:\"Понятно\";"));
+        assert!(ui.contains("label:@tr(\"Понятно\");"));
         assert!(ui.contains("root.handoff-notice-seen=root.handoff-notice-for;"));
         assert!(ui.contains(
             "handoff-toast-visible:root.handoff-notice-for!=\"\"&&root.handoff-notice-for!=root.handoff-notice-seen;"

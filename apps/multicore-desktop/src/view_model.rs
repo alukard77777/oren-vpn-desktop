@@ -5802,7 +5802,7 @@ mod tests {
         assert!(app.contains("routes-heading := HorizontalLayout"));
         assert!(app.contains("route-updated-meta := Text"));
         assert!(app.contains(
-            "text: root.latency-check-loading ? \"Замеряем задержку…\" : root.subscription-updated == \"Не обновлялась\" ? root.subscription-updated : \"Обновлено \" + root.subscription-updated;"
+            "text: root.latency-check-loading ? @tr(\"Замеряем задержку…\") : root.subscription-updated == @tr(\"Не обновлялась\") ? root.subscription-updated : @tr(\"Обновлено {}\", root.subscription-updated);"
         ));
         assert!(app.contains(
             "color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;"
@@ -5909,7 +5909,9 @@ mod tests {
         assert!(chip.contains("logo: root.service-logo;"));
         assert!(chip.contains("text: root.chip-meta-text;"));
         assert!(
-            app.contains("root.subscription-refresh-error != \"\" ? \"· Не удалось обновить\"")
+            app.contains(
+                "root.subscription-refresh-error != \"\" ? @tr(\"· Не удалось обновить\")"
+            )
         );
         assert!(!chip.contains("if root.subscription-refresh-error != \"\": Text"));
         assert!(app.contains("toggle-module := Rectangle"));
@@ -8974,12 +8976,16 @@ mod tests {
         // Settings is one iOS page: captioned grouped cards, no sub-navigation.
         assert!(!source.contains("SettingsNavItem"));
         let connection = settings
-            .find("text: \"ПОДКЛЮЧЕНИЕ\";")
+            .find("text: @tr(\"ПОДКЛЮЧЕНИЕ\");")
             .expect("connection section");
-        let app = settings.find("text: \"ПРИЛОЖЕНИЕ\";").expect("app section");
-        let help = settings.find("text: \"ПОМОЩЬ\";").expect("help section");
+        let app = settings
+            .find("text: @tr(\"ПРИЛОЖЕНИЕ\");")
+            .expect("app section");
+        let help = settings
+            .find("text: @tr(\"ПОМОЩЬ\");")
+            .expect("help section");
         let updates = settings
-            .find("text: \"ОБНОВЛЕНИЯ\";")
+            .find("text: @tr(\"ОБНОВЛЕНИЯ\");")
             .expect("updates section");
         // Updates close the page, below help.
         assert!(connection < app && app < help && help < updates);
@@ -8988,7 +8994,7 @@ mod tests {
         for caption in ["ПОДКЛЮЧЕНИЕ", "ПРИЛОЖЕНИЕ", "ПОМОЩЬ", "ОБНОВЛЕНИЯ"]
         {
             assert!(settings_lf.contains(&format!(
-                "HorizontalLayout {{ height: 16px; padding-left: 4px; SectionCaption {{ text: \"{caption}\"; }} }}\n                        Rectangle {{ height: 8px; background: transparent; }}"
+                "HorizontalLayout {{ height: 16px; padding-left: 4px; SectionCaption {{ text: @tr(\"{caption}\"); }} }}\n                        Rectangle {{ height: 8px; background: transparent; }}"
             )), "{caption}");
         }
         assert!(!settings.contains("height: 22px; padding-left: 4px; SectionCaption"));
@@ -9005,7 +9011,10 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("subscriptions-scroll := OverlayScroll").next())
             .expect("subscription header");
-        assert!(header.contains("label: root.import-pending ? \"Добавляем…\" : \"Добавить\";"));
+        assert!(
+            header
+                .contains("label: root.import-pending ? @tr(\"Добавляем…\") : @tr(\"Добавить\");")
+        );
         assert!(header.contains(
             "focus-epoch: root.profile-management-focus-id == \"\" ? root.profile-management-focus-serial : 0;"
         ));
@@ -9029,7 +9038,7 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("toggled(value)").next())
             .expect("TUN mode row");
-        assert!(row.contains("label: \"Режим TUN — весь трафик\";"));
+        assert!(row.contains("label: @tr(\"Режим TUN — весь трафик\");"));
         assert!(row.contains("enabled: !root.toggle-on && !root.toggle-busy"));
         assert!(row.contains("\"Применится при следующем подключении\""));
         // First row of the general settings card.
@@ -9037,7 +9046,7 @@ mod tests {
             app.find("if root.tun-toggle-available: ToggleRow {")
                 .unwrap()
                 < app
-                    .find("label: \"Запускать при входе в \" + root.system-name;")
+                    .find("label: @tr(\"Запускать при входе в {}\", root.system-name);")
                     .unwrap()
         );
         assert!(main.contains("ui.set_tun_toggle_available(cfg!(windows));"));
@@ -9070,7 +9079,7 @@ mod tests {
             "private property <float> skeleton-pulse: (root.catalog-skeleton || root.profile-menu-loading) && !root.reduced-motion"
         ));
         assert!(app.contains("if root.catalog-skeleton: route-skeleton := VerticalLayout {"));
-        assert!(app.contains("accessible-label: \"Загружаем маршруты\";"));
+        assert!(app.contains("accessible-label: @tr(\"Загружаем маршруты\");"));
         assert!(!app.contains("\"Загружаем маршруты…\""));
         assert!(app.contains(
             "if root.catalog-loading && root.catalog-groups.length == 0: HorizontalLayout {"
@@ -9086,7 +9095,7 @@ mod tests {
         let main = include_str!("main.rs").replace("\r\n", "\n");
         // Entry points: a quiet icon in the routes header and Ctrl+F on either layout.
         assert!(app.contains("route-search-toggle := FocusScope"));
-        assert!(app.contains("accessible-label: \"Поиск маршрутов\";"));
+        assert!(app.contains("accessible-label: @tr(\"Поиск маршрутов\");"));
         assert!(app.contains("event.modifiers.control && !event.modifiers.alt"));
         assert!(app.contains("event.text == \"f\" || event.text == \"F\" || event.text == \"а\" || event.text == \"А\""));
         // Esc closes search before it falls through to the panel/announcement handling.
@@ -9099,7 +9108,7 @@ mod tests {
                 < escape.find("root.announcement-open = false;").unwrap()
         );
         // Field: placeholder while empty, clear button once typed, blue Отмена.
-        assert!(app.contains("text: \"Поиск по маршрутам\";"));
+        assert!(app.contains("text: @tr(\"Поиск по маршрутам\");"));
         assert!(
             app.contains("if root.route-search-query != \"\": route-search-clear := TouchArea")
         );
@@ -9132,9 +9141,9 @@ mod tests {
         assert!(app.contains("pulsing: !root.reduced-motion;"));
         assert!(app.contains("property <float> phase: self.pulsing ? (1 + Math.sin(animation-tick() / 1200ms * 360deg)) / 2 : 0.5;"));
         assert!(app.contains("if root.route-search-loading: route-search-skeleton := Rectangle {"));
-        assert!(app.contains("text: \"Ничего не найдено\";"));
-        assert!(app.contains("text: \"Попробуйте другое название страны или сервера\";"));
-        assert!(app.contains("\" · поиск по всем группам\""));
+        assert!(app.contains("text: @tr(\"Ничего не найдено\");"));
+        assert!(app.contains("text: @tr(\"Попробуйте другое название страны или сервера\");"));
+        assert!(app.contains("@tr(\"Найдено {n} · поиск по всем группам\" | \"Найдено {n} · поиск по всем группам\" % root.route-search-hits.length)"));
         // Picking a result selects it in its own group and closes search.
         assert!(app.contains("root.choose-route-search-hit(hit.group-id, hit.node-id);\n                                                    root.close-route-search();"));
         assert!(main.contains("ui.on_route_search_changed(move |query| {"));
@@ -9147,8 +9156,8 @@ mod tests {
         let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // A press records the intent before the daemon answers…
         assert!(app.contains("root.toggle-intent = root.toggle-on ? \"off\" : \"on\";"));
-        assert!(app.contains(": root.toggle-intent == \"on\" ? \"Подключение…\""));
-        assert!(app.contains(": root.toggle-intent == \"off\" ? \"Отключение…\""));
+        assert!(app.contains(": root.toggle-intent == \"on\" ? @tr(\"Подключение…\")"));
+        assert!(app.contains(": root.toggle-intent == \"off\" ? @tr(\"Отключение…\")"));
         // …and any real state change (or an 8 s silence) hands control back.
         for handler in [
             "changed toggle-busy => { root.toggle-intent = \"none\"; }",
@@ -9213,15 +9222,20 @@ mod tests {
     fn tabs_use_inset_grouped_cards_with_attached_editors() {
         let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // Status: captioned cards; the log is one card of rows, not boxed cards.
-        for caption in ["text: \"ЯДРА\";", "text: \"МАППИНГ\";", "text: \"ЖУРНАЛ\";"]
-        {
+        for caption in [
+            "text: @tr(\"ЯДРА\");",
+            "text: @tr(\"МАППИНГ\");",
+            "text: @tr(\"ЖУРНАЛ\");",
+        ] {
             assert!(app.contains(caption), "missing status section {caption}");
         }
         assert!(app.contains("cores-card := Rectangle"));
         assert!(app.contains("mapping-card := Rectangle"));
         assert!(app.contains("event-log-card := Rectangle"));
         assert!(!app.contains("background: event.level == \"error\" ? #f06a6a0d"));
-        assert!(app.contains("disabled-hint: \"Подключитесь, чтобы открыть панель Mihomo.\";"));
+        assert!(
+            app.contains("disabled-hint: @tr(\"Подключитесь, чтобы открыть панель Mihomo.\");")
+        );
         // Subscriptions: one card; the editor and delete confirmation attach under their row.
         let row = app
             .split("settings-profile-row := Rectangle {")
@@ -9238,10 +9252,10 @@ mod tests {
             "opacity: Math.max(0, Math.min(1, (settings-profile-row.height - 56px) / 52px));"
         ));
         assert!(row.contains("background: profile.active ? Theme.elevated : transparent;"));
-        assert!(row.contains("text: \"АКТИВНА\";"));
+        assert!(row.contains("text: @tr(\"АКТИВНА\");"));
         assert!(row.contains("if settings-profile-row.editing: HorizontalLayout {"));
         assert!(row.contains("if settings-profile-row.confirming: HorizontalLayout {"));
-        assert!(row.contains("label: \"Удалить\"; tone: \"danger\";"));
+        assert!(row.contains("label: @tr(\"Удалить\"); tone: \"danger\";"));
         // Clicking an inactive row activates it; keyboard and a11y stay on the same scope.
         assert!(row.contains("if !profile.active: activate-profile-focus := FocusScope {"));
         assert!(row.contains("activate-profile-touch := TouchArea { enabled: parent.enabled; clicked => { root.activate-profile(profile.id); } }"));
@@ -9263,7 +9277,7 @@ mod tests {
         assert!(app.contains("animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
         assert!(app.contains("animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
         // "Скопировано ✓" crossfades over the label instead of swapping text.
-        assert!(app.contains("swap-label: \"Скопировано ✓\";"));
+        assert!(app.contains("swap-label: @tr(\"Скопировано ✓\");"));
         assert!(app.contains("swapped: root.diagnostics-copied;"));
         // URL fields forward focus to their input so `self.focus()` keeps working.
         assert!(app.contains("forward-focus: url-input;"));
@@ -9293,22 +9307,22 @@ mod tests {
         }
 
         for required in [
-            "text: \"Добавьте подписку\";",
-            "text: \"Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена\";",
-            "text: \"Ссылка хранится только на этом устройстве\";",
+            "text: @tr(\"Добавьте подписку\");",
+            "text: @tr(\"Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена\");",
+            "text: @tr(\"Ссылка хранится только на этом устройстве\");",
             "onboarding-copy := VerticalLayout",
             "first-run-actions := VerticalLayout",
-            "label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";",
+            "label: root.import-pending ? @tr(\"Добавляем…\") : @tr(\"Вставить из буфера\");",
             "root.paste-subscription();",
-            "label: \"Ввести ссылку вручную\";",
+            "label: @tr(\"Ввести ссылку вручную\");",
             "focus-epoch: root.first-run-trigger-focus-serial;",
             "first-run-url-input := UrlField",
-            "accessible-name: \"URL подписки\";",
+            "accessible-name: @tr(\"URL подписки\");",
             "changed focus-serial => { self.focus(); }",
             "init => { self.focus(); }",
-            "label: root.import-pending ? \"Добавляем…\" : \"Добавить\";",
+            "label: root.import-pending ? @tr(\"Добавляем…\") : @tr(\"Добавить\");",
             "root.import-url(root.subscription-draft);",
-            "label: \"Отмена\";",
+            "label: @tr(\"Отмена\");",
             "root.first-run-trigger-focus-serial += 1;",
             "root.dismiss-first-run-import();",
             "text: root.import-error;",
@@ -9322,19 +9336,21 @@ mod tests {
 
         assert!(onboarding.contains("if root.first-run-manual-open"));
         let paste_action = onboarding
-            .split("label: root.import-pending ? \"Добавляем…\" : \"Вставить из буфера\";")
+            .split(
+                "label: root.import-pending ? @tr(\"Добавляем…\") : @tr(\"Вставить из буфера\");",
+            )
             .nth(1)
             .and_then(|action| action.split("activated =>").next())
             .expect("paste action");
         assert!(paste_action.contains("enabled: !root.import-pending;"));
         let manual_trigger = onboarding
-            .split("label: \"Ввести ссылку вручную\";")
+            .split("label: @tr(\"Ввести ссылку вручную\");")
             .nth(1)
             .and_then(|action| action.split("activated =>").next())
             .expect("manual trigger");
         assert!(manual_trigger.contains("enabled: !root.import-pending;"));
         let add_action = onboarding
-            .split("label: root.import-pending ? \"Добавляем…\" : \"Добавить\";")
+            .split("label: root.import-pending ? @tr(\"Добавляем…\") : @tr(\"Добавить\");")
             .nth(1)
             .and_then(|action| action.split("activated =>").next())
             .expect("manual add action");
@@ -9343,7 +9359,7 @@ mod tests {
                 .contains("enabled: !root.import-pending && root.subscription-draft != \"\";")
         );
         let cancel_action = onboarding
-            .split("label: \"Отмена\";")
+            .split("label: @tr(\"Отмена\");")
             .nth(1)
             .and_then(|action| action.split("activated =>").next())
             .expect("manual cancel action");
@@ -9400,10 +9416,12 @@ mod tests {
             .expect("subscription management page");
         assert!(management.contains("root.add-subscription();"));
         assert!(management.contains("text <=> root.subscription-draft;"));
-        assert!(management.contains("accessible-name: \"URL подписки\";"));
+        assert!(management.contains("accessible-name: @tr(\"URL подписки\");"));
         assert!(management.contains("accepted => {"));
-        assert!(management.contains("label: \"Отмена\";"));
-        assert!(management.contains("root.import-pending ? \"Добавляем…\" : \"Добавить\""));
+        assert!(management.contains("label: @tr(\"Отмена\");"));
+        assert!(
+            management.contains("root.import-pending ? @tr(\"Добавляем…\") : @tr(\"Добавить\")")
+        );
         assert!(management.contains("root.import-url(root.subscription-draft);"));
         // A failed deep-link import renders on the page even without the editor.
         assert!(
@@ -9535,7 +9553,7 @@ mod tests {
         assert!(title_subscription.contains("chip-chevron := Path"));
         assert!(
             title_subscription
-                .contains("root.subscription-refresh-pending ? \"Подписка обновляется\"")
+                .contains("root.subscription-refresh-pending ? @tr(\"Подписка обновляется\")")
         );
         assert!(title_subscription.contains("root.refresh-subscription();"));
         assert!(title_subscription.contains("announcement-bell := FocusScope"));
@@ -9596,9 +9614,9 @@ mod tests {
             "animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"
         ));
         assert!(announcement.contains("transform-scale: self.shown ? 1 : 0.97;"));
-        assert!(announcement.contains("text: \"НОВОЕ ОТ ПРОВАЙДЕРА\";"));
+        assert!(announcement.contains("text: @tr(\"НОВОЕ ОТ ПРОВАЙДЕРА\");"));
         assert!(announcement.contains("announcement-close := FocusScope"));
-        assert!(announcement.contains("accessible-label: \"Закрыть сообщение провайдера\";"));
+        assert!(announcement.contains("accessible-label: @tr(\"Закрыть сообщение провайдера\");"));
         assert!(announcement.contains("accessible-role: none;"));
         assert!(source.contains("clicked => { root.announcement-open = false; }"));
         assert!(source.contains("in property <string> subscription-title:"));
@@ -9688,13 +9706,13 @@ mod tests {
             "@image-url(\"../assets/home.svg\")",
             "@image-url(\"../assets/status.svg\")",
             "@image-url(\"../assets/settings.svg\")",
-            "label: \"Главная\";",
-            "label: \"Состояние\";",
-            "label: \"Настройки\";",
-            "text: \"Маршруты\";",
+            "label: @tr(\"Главная\");",
+            "label: @tr(\"Состояние\");",
+            "label: @tr(\"Настройки\");",
+            "text: @tr(\"Маршруты\");",
             "routes-heading := HorizontalLayout",
             "route-updated-meta := Text",
-            "root.subscription-updated;",
+            "@tr(\"Обновлено {}\", root.subscription-updated)",
             "root.open-panel(\"events\")",
             "root.refresh-subscription();",
             "root.primary-action();",

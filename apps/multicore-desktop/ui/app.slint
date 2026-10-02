@@ -189,7 +189,7 @@ component NavToggle inherits Rectangle {
     border-width: toggle-focus.has-focus ? 2px : 0px;
     border-color: Theme.focus;
     accessible-role: button;
-    accessible-label: root.collapsed ? "Развернуть меню" : "Свернуть меню";
+    accessible-label: root.collapsed ? @tr("Развернуть меню") : @tr("Свернуть меню");
     accessible-action-default => { root.activated(); }
 
     Path {
@@ -210,7 +210,7 @@ component NavToggle inherits Rectangle {
         x: 44px;
         width: Math.max(0px, parent.width - 56px);
         height: parent.height;
-        text: "Свернуть";
+        text: @tr("Свернуть");
         color: toggle-touch.has-hover ? Theme.text-secondary : Theme.text-muted;
         font-family: Theme.font-family;
         font-size: Theme.type-metadata-size;
@@ -265,7 +265,7 @@ component SmallAction inherits Rectangle {
     opacity: root.enabled ? 1 : 0.45;
     accessible-role: button;
     accessible-label: root.label;
-    accessible-description: root.selected ? "Выбранный фильтр" : "";
+    accessible-description: root.selected ? @tr("Выбранный фильтр") : "";
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
 
@@ -1033,7 +1033,7 @@ component RouteSearchRow inherits Rectangle {
     accessible-role: button;
     accessible-label: root.prefix + root.matched + root.suffix + ", " + root.group-label
         + (root.latency-text == "" ? "" : ", " + root.latency-text)
-        + (root.selected ? ", выбрано" : "");
+        + (root.selected ? @tr(", выбрано") : "");
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
     animate background { duration: 140ms; easing: ease-out; }
@@ -1252,21 +1252,21 @@ export component AppWindow inherits Window {
     background: Theme.canvas;
     default-font-family: Theme.font-family;
 
-    in property <string> status-eyebrow: "Профиль не добавлен";
-    in property <string> headline: "Добавьте подписку";
-    in property <string> supporting: "Вставьте URL — остальное настроим автоматически.";
-    in property <string> node-name: "Маршрут не выбран";
+    in property <string> status-eyebrow: @tr("Профиль не добавлен");
+    in property <string> headline: @tr("Добавьте подписку");
+    in property <string> supporting: @tr("Вставьте URL — остальное настроим автоматически.");
+    in property <string> node-name: @tr("Маршрут не выбран");
     in property <string> node-icon: "";
     in property <image> node-icon-image;
     in property <bool> has-profile: false;
-    in property <string> primary-label: "Подключить";
+    in property <string> primary-label: @tr("Подключить");
     in property <bool> primary-enabled: false;
     // The Mihomo dashboard is only meaningful while a live, authenticated controller
     // session exists, i.e. while Connected.
     in property <bool> dashboard-available: false;
     in property <string> status-tone: "neutral";
     // Connection toggle (home): see toggle_presentation in main.rs.
-    in property <string> toggle-title: "Защита выключена";
+    in property <string> toggle-title: @tr("Защита выключена");
     in property <bool> toggle-on: false;
     in property <bool> toggle-busy: false;
     in property <bool> toggle-detail-is-exit: true;
@@ -1294,18 +1294,18 @@ export component AppWindow inherits Window {
     in property <string> import-error;
     // Not an error: an import kept in the list while connected.
     in property <string> import-notice;
-    in property <string> subscription-title: "Подписка";
+    in property <string> subscription-title: @tr("Подписка");
     // First letter of the subscription name, for the chip avatar without a logo.
-    in property <string> subscription-initial: "П";
-    in property <string> subscription-usage: "Нет данных";
-    in property <string> subscription-expiry: "Добавьте ссылку";
-    in property <string> subscription-updated: "Не обновлялась";
+    in property <string> subscription-initial: @tr("П");
+    in property <string> subscription-usage: @tr("Нет данных");
+    in property <string> subscription-expiry: @tr("Добавьте ссылку");
+    in property <string> subscription-updated: @tr("Не обновлялась");
     in property <bool> subscription-updated-stale: false;
     in property <image> service-logo;
     in property <bool> has-service-logo: false;
     // Compact quota of the active subscription (title chip, tray header).
     in property <string> subscription-remaining: "∞ GiB";
-    in property <string> subscription-days: "Бессрочно";
+    in property <string> subscription-days: @tr("Бессрочно");
     in property <float> subscription-used-fraction: 0;
     in property <bool> subscription-unlimited: true;
     in property <string> subscription-quota-tone: "accent";
@@ -1314,7 +1314,7 @@ export component AppWindow inherits Window {
     // check ("hold"), then gives way to the ring sweeping to the new value ("idle").
     in-out property <string> chip-phase: "idle";
     private property <bool> chip-logo-entering: false;
-    private property <string> chip-meta-text: root.subscription-refresh-error != "" ? "· Не удалось обновить"
+    private property <string> chip-meta-text: root.subscription-refresh-error != "" ? @tr("· Не удалось обновить")
         : "· " + root.subscription-remaining + " · " + root.subscription-days;
     // The quota line from before the refresh, cross-faded out as the new one arrives.
     private property <string> chip-meta-previous;
@@ -1392,11 +1392,11 @@ export component AppWindow inherits Window {
     // False until the cores can measure (per-user mode not connected, no catalog yet).
     in property <bool> latency-check-available: false;
     in property <string> latency-check-error;
-    in property <string> diagnostics-xray-value: "Остановлен";
+    in property <string> diagnostics-xray-value: @tr("Остановлен");
     in property <string> diagnostics-xray-tone: "neutral";
-    in property <string> diagnostics-mihomo-value: "Остановлен";
+    in property <string> diagnostics-mihomo-value: @tr("Остановлен");
     in property <string> diagnostics-mihomo-tone: "neutral";
-    in property <string> diagnostics-tun-value: "Остановлен";
+    in property <string> diagnostics-tun-value: @tr("Остановлен");
     in property <string> diagnostics-tun-tone: "neutral";
     in property <bool> diagnostics-loading: false;
     in property <[UiProxyMapping]> diagnostic-mappings;
@@ -1439,7 +1439,7 @@ export component AppWindow inherits Window {
     private property <int> power-action-focus-serial: 0;
     in property <bool> update-available: false;
     in property <string> update-status: "MULTICORE 0.3.0";
-    in property <string> update-detail: "Канал обновлений не настроен";
+    in property <string> update-detail: @tr("Канал обновлений не настроен");
     in property <string> update-action-label;
     in property <bool> update-action-enabled: false;
     in property <bool> update-busy: false;
@@ -1584,8 +1584,8 @@ export component AppWindow inherits Window {
         : root.toggle-intent == "off" ? false
         : root.toggle-on;
     private property <bool> shown-busy: root.toggle-busy || root.toggle-intent != "none";
-    private property <string> shown-title: root.toggle-intent == "on" ? "Подключение…"
-        : root.toggle-intent == "off" ? "Отключение…"
+    private property <string> shown-title: root.toggle-intent == "on" ? @tr("Подключение…")
+        : root.toggle-intent == "off" ? @tr("Отключение…")
         : root.toggle-title;
     private property <string> shown-tone: root.toggle-intent != "none" ? "neutral" : root.status-tone;
     function press-toggle() {
@@ -2172,8 +2172,8 @@ export component AppWindow inherits Window {
                             focus-on-click: true;
                             focus-on-tab-navigation: true;
                             accessible-role: button;
-                            accessible-label: "Выбрать профиль подписки";
-                            accessible-description: root.subscription-title + ", осталось " + root.subscription-remaining + ", " + root.subscription-days + ". Обновлено " + root.subscription-updated + ". " + (root.profile-menu-open ? "Список профилей открыт" : "Открыть список профилей");
+                            accessible-label: @tr("Выбрать профиль подписки");
+                            accessible-description: @tr("{}, осталось {}, {}. Обновлено {}. {}", root.subscription-title, root.subscription-remaining, root.subscription-days, root.subscription-updated, root.profile-menu-open ? @tr("Список профилей открыт") : @tr("Открыть список профилей"));
                             accessible-enabled: self.enabled;
                             accessible-action-default => { self.toggle-menu(true); }
                             changed focus-serial => { self.focus(); }
@@ -2226,7 +2226,7 @@ export component AppWindow inherits Window {
                         focus-on-click: true;
                         focus-on-tab-navigation: true;
                         accessible-role: button;
-                        accessible-label: self.source-mode ? "Указать ссылку подписки" : root.subscription-refresh-pending ? "Подписка обновляется" : "Обновить подписку";
+                        accessible-label: self.source-mode ? @tr("Указать ссылку подписки") : root.subscription-refresh-pending ? @tr("Подписка обновляется") : @tr("Обновить подписку");
                         accessible-enabled: self.enabled;
                         accessible-action-default => { if (self.enabled) { self.run(); } }
                         function run() {
@@ -2284,7 +2284,7 @@ export component AppWindow inherits Window {
                         focus-on-click: true;
                         focus-on-tab-navigation: true;
                         accessible-role: button;
-                        accessible-label: root.announcement-open ? "Скрыть сообщение провайдера" : "Сообщение провайдера";
+                        accessible-label: root.announcement-open ? @tr("Скрыть сообщение провайдера") : @tr("Сообщение провайдера");
                         accessible-action-default => { self.toggle(); }
                         function toggle() {
                             if (root.profile-menu-open) { root.close-profile-menu(); }
@@ -2333,9 +2333,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                TitleBarButton { x: parent.width - 132px; y: -root.resize-border; height: 44px + root.resize-border; kind: "minimize"; state-label: "Свернуть окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
-                TitleBarButton { x: parent.width - 88px; y: -root.resize-border; height: 44px + root.resize-border; kind: root.maximized ? "restore" : "maximize"; state-label: "Развернуть или восстановить окно"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
-                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: "Закрыть MULTICORE"; activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
+                TitleBarButton { x: parent.width - 132px; y: -root.resize-border; height: 44px + root.resize-border; kind: "minimize"; state-label: @tr("Свернуть окно"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
+                TitleBarButton { x: parent.width - 88px; y: -root.resize-border; height: 44px + root.resize-border; kind: root.maximized ? "restore" : "maximize"; state-label: @tr("Развернуть или восстановить окно"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
+                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: @tr("Закрыть MULTICORE"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
             }
 
             HorizontalLayout {
@@ -2355,10 +2355,10 @@ export component AppWindow inherits Window {
                 padding: 10px;
                 spacing: root.navigation-collapsed ? 8px : 4px;
 
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/home.svg"); label: "Главная"; active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/status.svg"); label: "Состояние"; active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/subscriptions.svg"); label: "Подписки"; badge: root.subscription-profiles.length > 1 ? "" + root.subscription-profiles.length : ""; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
-                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: "Настройки"; active: root.visible-page == "settings" || root.visible-page == "troubleshoot"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/home.svg"); label: @tr("Главная"); active: root.visible-page == "home"; enabled: !root.profile-menu-open; activated => { root.local-page = "home"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/status.svg"); label: @tr("Состояние"); active: root.visible-page == "status"; enabled: !root.profile-menu-open; activated => { root.local-page = "status"; root.open-panel("events"); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/subscriptions.svg"); label: @tr("Подписки"); badge: root.subscription-profiles.length > 1 ? "" + root.subscription-profiles.length : ""; active: root.visible-page == "subscriptions"; enabled: !root.profile-menu-open; activated => { root.local-page = "subscriptions"; root.close-panel(); } }
+                NavItem { compact: root.navigation-collapsed; icon-source: @image-url("../assets/settings.svg"); label: @tr("Настройки"); active: root.visible-page == "settings" || root.visible-page == "troubleshoot"; enabled: !root.profile-menu-open; activated => { root.local-page = "settings"; root.close-panel(); } }
 
                 Rectangle { vertical-stretch: 1; background: transparent; }
 
@@ -2628,7 +2628,7 @@ export component AppWindow inherits Window {
                                             font-size: 13px;
                                             font-weight: Theme.weight-regular;
                                             vertical-alignment: top;
-                                            accessible-label: "Время сессии " + root.session-uptime;
+                                            accessible-label: @tr("Время сессии {}", root.session-uptime);
                                         }
                                     }
                                 }
@@ -2646,16 +2646,16 @@ export component AppWindow inherits Window {
                                     if root.exit-now-name != "": Text { text: "→"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.exit-now-name != "" && root.exit-now-icon-image.width > 0: Image { width: 14px; height: 14px; y: 1px; source: root.exit-now-icon-image; image-fit: contain; accessible-role: none; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } }
                                     if root.exit-now-name != "" && root.exit-now-icon != "" && root.exit-now-icon-image.width == 0: Text { text: root.exit-now-icon; color: Theme.text-secondary; font-family: Theme.emoji-font-family; font-size: Theme.type-metadata-size; accessible-role: none; }
-                                    if root.exit-now-name != "": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } accessible-label: "Текущий узел " + root.exit-now-name; }
+                                    if root.exit-now-name != "": Text { horizontal-stretch: 0; max-width: 160px; text: root.exit-now-name; color: Theme.text-secondary; font-size: Theme.type-metadata-size; overflow: elide; vertical-alignment: center; opacity: root.exit-now-entering ? 0 : 1; animate opacity { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } accessible-label: @tr("Текущий узел {}", root.exit-now-name); }
                                     // Separator dots are their own elements so the 6px spacing sits evenly on both sides.
                                     if root.node-latency != "": Text { text: "·"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.node-latency != "": Text { text: root.node-latency; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; }
                                     // Live speed follows the exit inline; each arrow only shows with a value.
                                     if root.traffic-down != "": Text { text: "·"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
                                     if root.traffic-down != "": Text { text: "↓"; color: Theme.accent-blue; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
-                                    if root.traffic-down != "": Text { min-width: 56px; text: root.traffic-down; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Загрузка " + root.traffic-down; }
+                                    if root.traffic-down != "": Text { min-width: 56px; text: root.traffic-down; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: @tr("Загрузка {}", root.traffic-down); }
                                     if root.traffic-up != "": Text { text: "↑"; color: Theme.accent-green; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: none; }
-                                    if root.traffic-up != "": Text { text: root.traffic-up; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: "Отдача " + root.traffic-up; }
+                                    if root.traffic-up != "": Text { text: root.traffic-up; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-label: @tr("Отдача {}", root.traffic-up); }
                                     Rectangle { horizontal-stretch: 1; background: transparent; }
                                 }
                                 if !root.toggle-detail-is-exit: Text {
@@ -2877,7 +2877,7 @@ export component AppWindow inherits Window {
                                     preferred-width: 0px;
                                     alignment: center;
                                     spacing: 2px;
-                                    conflict-title := Text { text: "Конфликт с другим VPN-приложением"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                                    conflict-title := Text { text: @tr("Конфликт с другим VPN-приложением"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
                                     conflict-copy := Text { text: root.conflicting-apps-message; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                                 }
                                 // Centred vertically like the icon and text.
@@ -2887,12 +2887,12 @@ export component AppWindow inherits Window {
                                         spacing: 4px;
                                         BannerAction {
                                             primary: true;
-                                            label: root.conflicting-apps-closing ? "Закрываем…" : "Закрыть";
+                                            label: root.conflicting-apps-closing ? @tr("Закрываем…") : @tr("Закрыть");
                                             enabled: !root.profile-menu-open && !root.conflicting-apps-closing;
                                             activated => { root.close-conflicting-apps(); }
                                         }
                                         BannerAction {
-                                            label: "Понятно";
+                                            label: @tr("Понятно");
                                             enabled: !root.profile-menu-open;
                                             activated => { root.dismiss-conflicting-apps-banner(); }
                                         }
@@ -2935,8 +2935,8 @@ export component AppWindow inherits Window {
                                     preferred-width: 0px;
                                     alignment: center;
                                     spacing: 2px;
-                                    troubleshoot-title := Text { text: "Не получается подключиться?"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
-                                    troubleshoot-copy := Text { text: "Проверим антивирусы, прокси, программы обхода блокировок и другое, что мешает VPN."; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                    troubleshoot-title := Text { text: @tr("Не получается подключиться?"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; overflow: elide; }
+                                    troubleshoot-copy := Text { text: @tr("Проверим антивирусы, прокси, программы обхода блокировок и другое, что мешает VPN."); color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                                 }
                                 VerticalLayout {
                                     alignment: center;
@@ -2944,12 +2944,12 @@ export component AppWindow inherits Window {
                                         spacing: 4px;
                                         BannerAction {
                                             primary: true;
-                                            label: "Устранить неполадки";
+                                            label: @tr("Устранить неполадки");
                                             enabled: !root.profile-menu-open;
                                             activated => { root.open-troubleshoot("home"); }
                                         }
                                         BannerAction {
-                                            label: "Скрыть";
+                                            label: @tr("Скрыть");
                                             enabled: !root.profile-menu-open;
                                             activated => { root.troubleshoot-offer-dismissed = true; }
                                         }
@@ -2988,7 +2988,7 @@ export component AppWindow inherits Window {
                                 onboarding-copy := VerticalLayout {
                                     spacing: 8px;
                                     Text {
-                                        text: "Добавьте подписку";
+                                        text: @tr("Добавьте подписку");
                                         color: Theme.text-primary;
                                         font-size: 20px;
                                         font-weight: Theme.weight-semibold;
@@ -2997,7 +2997,7 @@ export component AppWindow inherits Window {
                                         accessible-role: text;
                                     }
                                     Text {
-                                        text: "Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена";
+                                        text: @tr("Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена");
                                         color: Theme.text-secondary;
                                         font-size: Theme.type-label-size;
                                         horizontal-alignment: center;
@@ -3020,8 +3020,8 @@ export component AppWindow inherits Window {
                                         alignment: start;
                                         spacing: 0px;
                                         ActionRow {
-                                            label: root.import-pending ? "Добавляем…" : "Вставить из буфера";
-                                            state-label: "Вставить подписку из буфера обмена";
+                                            label: root.import-pending ? @tr("Добавляем…") : @tr("Вставить из буфера");
+                                            state-label: @tr("Вставить подписку из буфера обмена");
                                             icon: @image-url("../assets/clipboard.svg");
                                             accent: true;
                                             show-separator: true;
@@ -3029,7 +3029,7 @@ export component AppWindow inherits Window {
                                             activated => { root.paste-subscription(); }
                                         }
                                         ActionRow {
-                                            label: "Ввести ссылку вручную";
+                                            label: @tr("Ввести ссылку вручную");
                                             icon: @image-url("../assets/plus.svg");
                                             chevron: true;
                                             expanded: root.first-run-manual-open;
@@ -3055,7 +3055,7 @@ export component AppWindow inherits Window {
                                                 text <=> root.subscription-draft;
                                                 placeholder: "https://…";
                                                 enabled: !root.import-pending;
-                                                accessible-name: "URL подписки";
+                                                accessible-name: @tr("URL подписки");
                                                 init => { self.focus(); }
                                                 changed focus-serial => { self.focus(); }
                                                 accepted => {
@@ -3068,7 +3068,7 @@ export component AppWindow inherits Window {
                                             VerticalLayout {
                                                 alignment: center;
                                                 TextAction {
-                                                    label: "Отмена";
+                                                    label: @tr("Отмена");
                                                     tone: "neutral";
                                                     enabled: !root.import-pending;
                                                     activated => {
@@ -3082,7 +3082,7 @@ export component AppWindow inherits Window {
                                             VerticalLayout {
                                                 alignment: center;
                                                 TextAction {
-                                                    label: root.import-pending ? "Добавляем…" : "Добавить";
+                                                    label: root.import-pending ? @tr("Добавляем…") : @tr("Добавить");
                                                     enabled: !root.import-pending && root.subscription-draft != "";
                                                     activated => { root.import-url(root.subscription-draft); }
                                                 }
@@ -3102,7 +3102,7 @@ export component AppWindow inherits Window {
                                     accessible-live-region: polite;
                                 }
                                 if root.import-error == "": Text {
-                                    text: "Ссылка хранится только на этом устройстве";
+                                    text: @tr("Ссылка хранится только на этом устройстве");
                                     color: Theme.text-muted;
                                     font-size: Theme.type-metadata-size;
                                     horizontal-alignment: center;
@@ -3113,7 +3113,7 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     alignment: center;
                                     spacing: 12px;
-                                    for step[i] in ["1 СКОПИРУЙТЕ ССЫЛКУ", "2 ВСТАВЬТЕ", "3 ВКЛЮЧИТЕ ЗАЩИТУ"]: HorizontalLayout {
+                                    for step[i] in [@tr("1 СКОПИРУЙТЕ ССЫЛКУ"), @tr("2 ВСТАВЬТЕ"), @tr("3 ВКЛЮЧИТЕ ЗАЩИТУ")]: HorizontalLayout {
                                         spacing: 12px;
                                         if i > 0: Text { text: "·"; color: Theme.text-muted; opacity: 0.5; font-size: 11px; }
                                         SectionCaption { text: step; font-weight: Theme.weight-medium; }
@@ -3152,7 +3152,7 @@ export component AppWindow inherits Window {
                                         padding-top: 9px;
                                         alignment: start;
                                     routes-title := Text {
-                                        text: "Маршруты";
+                                        text: @tr("Маршруты");
                                         color: Theme.text-primary;
                                         font-size: Theme.type-label-size;
                                         font-weight: Theme.weight-semibold;
@@ -3176,7 +3176,7 @@ export component AppWindow inherits Window {
                                         padding-top: 9px + (Theme.type-label-size - Theme.type-metadata-size) * 1.05;
                                         alignment: start;
                                     route-updated-meta := Text {
-                                        text: root.latency-check-loading ? "Замеряем задержку…" : root.subscription-updated == "Не обновлялась" ? root.subscription-updated : "Обновлено " + root.subscription-updated;
+                                        text: root.latency-check-loading ? @tr("Замеряем задержку…") : root.subscription-updated == @tr("Не обновлялась") ? root.subscription-updated : @tr("Обновлено {}", root.subscription-updated);
                                         color: !root.latency-check-loading && root.subscription-updated-stale ? Theme.warning : Theme.text-muted;
                                         font-size: Theme.type-metadata-size;
                                         horizontal-alignment: left;
@@ -3194,7 +3194,7 @@ export component AppWindow inherits Window {
                                     focus-on-click: true;
                                     focus-on-tab-navigation: true;
                                     accessible-role: button;
-                                    accessible-label: "Поиск маршрутов";
+                                    accessible-label: @tr("Поиск маршрутов");
                                     accessible-action-default => { root.open-route-search(); }
                                     key-pressed(event) => {
                                         if (event.text == " " || event.text == "\n") {
@@ -3231,7 +3231,7 @@ export component AppWindow inherits Window {
                                     focus-on-click: true;
                                     focus-on-tab-navigation: true;
                                     accessible-role: button;
-                                    accessible-label: "Проверить пинг";
+                                    accessible-label: @tr("Проверить пинг");
                                     accessible-action-default => { root.check-latency(); }
                                     key-pressed(event) => {
                                         if (event.text == " " || event.text == "\n") {
@@ -3322,7 +3322,7 @@ export component AppWindow inherits Window {
                                         color: Theme.text-primary;
                                         font-size: Theme.type-label-size;
                                         vertical-alignment: center;
-                                        accessible-label: "Поиск по маршрутам";
+                                        accessible-label: @tr("Поиск по маршрутам");
                                         changed focus-serial => { self.focus(); }
                                         edited => { root.route-search-changed(self.text); }
                                         accepted => {
@@ -3336,7 +3336,7 @@ export component AppWindow inherits Window {
                                         x: 36px;
                                         width: parent.width - 48px;
                                         height: parent.height;
-                                        text: "Поиск по маршрутам";
+                                        text: @tr("Поиск по маршрутам");
                                         color: Theme.text-muted;
                                         font-size: Theme.type-label-size;
                                         vertical-alignment: center;
@@ -3372,7 +3372,7 @@ export component AppWindow inherits Window {
                                     focus-on-click: true;
                                     focus-on-tab-navigation: true;
                                     accessible-role: button;
-                                    accessible-label: "Закрыть поиск";
+                                    accessible-label: @tr("Закрыть поиск");
                                     accessible-action-default => { root.close-route-search(); }
                                     key-pressed(event) => {
                                         if (event.text == " " || event.text == "\n") {
@@ -3384,7 +3384,7 @@ export component AppWindow inherits Window {
                                     Text {
                                         width: parent.width;
                                         height: parent.height;
-                                        text: "Отмена";
+                                        text: @tr("Отмена");
                                         color: search-cancel-touch.has-hover ? Theme.accent-blue-hover : Theme.accent-blue;
                                         font-size: Theme.type-metadata-size;
                                         font-weight: Theme.weight-semibold;
@@ -3617,7 +3617,7 @@ export component AppWindow inherits Window {
                                         alignment: center;
                                         BannerAction {
                                             primary: true;
-                                            label: root.catalog-loading ? "Загружаем…" : "Повторить";
+                                            label: root.catalog-loading ? @tr("Загружаем…") : @tr("Повторить");
                                             enabled: !root.catalog-loading && !root.profile-menu-open;
                                             activated => { root.retry-catalog(); }
                                         }
@@ -3669,7 +3669,7 @@ export component AppWindow inherits Window {
                                     if root.catalog-skeleton: route-skeleton := VerticalLayout {
                                         spacing: 0px;
                                         accessible-role: text;
-                                        accessible-label: "Загружаем маршруты";
+                                        accessible-label: @tr("Загружаем маршруты");
                                         for i in 5: Rectangle {
                                             height: 48px;
                                             // Flag block, name bar and latency bar, like a real row.
@@ -3679,7 +3679,7 @@ export component AppWindow inherits Window {
                                             if i < 4: Rectangle { x: 56px; y: parent.height - 1px; width: parent.width - 56px; height: 1px; background: #ffffff0f; }
                                         }
                                     }
-                                    if root.catalog-nodes.length == 0 && !root.catalog-loading: Text { height: 52px; text: "В этой группе нет доступных серверов"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
+                                    if root.catalog-nodes.length == 0 && !root.catalog-loading: Text { height: 52px; text: @tr("В этой группе нет доступных серверов"); color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                                     }
                                     }
                                 }
@@ -3712,8 +3712,8 @@ export component AppWindow inherits Window {
                                             alignment: center;
                                             Image { width: 28px; height: 28px; source: @image-url("../assets/search.svg"); colorize: Theme.text-muted; image-fit: contain; accessible-role: none; }
                                         }
-                                        Text { text: "Ничего не найдено"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; accessible-role: text; accessible-live-region: polite; }
-                                        Text { text: "Попробуйте другое название страны или сервера"; color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: center; }
+                                        Text { text: @tr("Ничего не найдено"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                                        Text { text: @tr("Попробуйте другое название страны или сервера"); color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: center; }
                                     }
                                     if !root.route-search-loading && root.route-search-hits.length > 0: route-search-card := Rectangle {
                                         height: route-search-list.preferred-height;
@@ -3749,7 +3749,7 @@ export component AppWindow inherits Window {
                                     if !root.route-search-loading && root.route-search-hits.length > 0: HorizontalLayout {
                                         padding-left: 4px;
                                         route-search-count := Text {
-                                            text: "Найдено " + root.route-search-hits.length + " · поиск по всем группам";
+                                            text: @tr("Найдено {n} · поиск по всем группам" | "Найдено {n} · поиск по всем группам" % root.route-search-hits.length);
                                             color: Theme.text-muted;
                                             font-size: Theme.type-metadata-size;
                                             accessible-role: text;
@@ -3773,23 +3773,23 @@ export component AppWindow inherits Window {
                 spacing: 0px;
                 // Title and log actions stay put; the cards scroll under them when the window is short.
                 PageHeader {
-                    title: "Состояние";
+                    title: @tr("Состояние");
                     scrolled: status-scroll.scrolled;
                     reduced-motion: root.reduced-motion;
                     VerticalLayout {
                         alignment: center;
                         TextAction {
-                            label: "Открыть дашборд";
+                            label: @tr("Открыть дашборд");
                             enabled: root.dashboard-available && !root.profile-menu-open;
-                            disabled-hint: "Подключитесь, чтобы открыть панель Mihomo.";
+                            disabled-hint: @tr("Подключитесь, чтобы открыть панель Mihomo.");
                             activated => { root.open-dashboard(); }
                         }
                     }
                     VerticalLayout {
                         alignment: center;
                         TextAction {
-                            label: "Копировать лог";
-                            swap-label: "Скопировано ✓";
+                            label: @tr("Копировать лог");
+                            swap-label: @tr("Скопировано ✓");
                             swapped: root.diagnostics-copied;
                             enabled: !root.profile-menu-open;
                             activated => { root.copy-diagnostics(); }
@@ -3798,11 +3798,11 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         alignment: center;
                         TextAction {
-                            label: "Сохранить лог…";
-                            swap-label: root.diagnostics-save-state == "saving" ? "Сохраняем…"
-                                : root.diagnostics-save-state == "failed" ? "Не сохранено"
-                                : root.diagnostics-save-state == "saved-downloads" ? "В Загрузках ✓"
-                                : "Сохранено ✓";
+                            label: @tr("Сохранить лог…");
+                            swap-label: root.diagnostics-save-state == "saving" ? @tr("Сохраняем…")
+                                : root.diagnostics-save-state == "failed" ? @tr("Не сохранено")
+                                : root.diagnostics-save-state == "saved-downloads" ? @tr("В Загрузках ✓")
+                                : @tr("Сохранено ✓");
                             swap-tone: root.diagnostics-save-state == "failed" ? "danger"
                                 : root.diagnostics-save-state == "saving" ? "neutral"
                                 : "success";
@@ -3828,8 +3828,8 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 16px;
                             padding-left: 4px;
-                            SectionCaption { text: "ЯДРА"; }
-                            if root.diagnostics-loading: Text { text: "Обновляем…"; color: Theme.text-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                            SectionCaption { text: @tr("ЯДРА"); }
+                            if root.diagnostics-loading: Text { text: @tr("Обновляем…"); color: Theme.text-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
                         }
                         Rectangle { height: 8px; background: transparent; }
                         cores-card := Rectangle {
@@ -3843,15 +3843,15 @@ export component AppWindow inherits Window {
                             clip: true;
                             VerticalLayout {
                                 spacing: 0px;
-                                HealthRow { label: "Транспорт Xray"; value: root.diagnostics-xray-value; tone: root.diagnostics-xray-tone; show-separator: true; }
-                                HealthRow { label: "Политики Mihomo"; value: root.diagnostics-mihomo-value; tone: root.diagnostics-mihomo-tone; show-separator: true; }
-                                HealthRow { label: "Туннель TUN"; value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
+                                HealthRow { label: @tr("Транспорт Xray"); value: root.diagnostics-xray-value; tone: root.diagnostics-xray-tone; show-separator: true; }
+                                HealthRow { label: @tr("Политики Mihomo"); value: root.diagnostics-mihomo-value; tone: root.diagnostics-mihomo-tone; show-separator: true; }
+                                HealthRow { label: @tr("Туннель TUN"); value: root.diagnostics-tun-value; tone: root.diagnostics-tun-tone; }
                             }
                         }
                         Rectangle { height: 20px; background: transparent; }
 
-                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "МАППИНГ"; } }
-                        HorizontalLayout { padding-left: 4px; padding-top: 2px; Footnote { text: "Локальные прокси-адреса для сторонних приложений"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: @tr("МАППИНГ"); } }
+                        HorizontalLayout { padding-left: 4px; padding-top: 2px; Footnote { text: @tr("Локальные прокси-адреса для сторонних приложений"); } }
                         Rectangle { height: 8px; background: transparent; }
                         mapping-card := Rectangle {
                             opacity: root.page-entering ? 0 : 1;
@@ -3885,13 +3885,13 @@ export component AppWindow inherits Window {
                                         }
                                         if index < root.diagnostic-mappings.length - 1: Rectangle { x: 46px; y: parent.height - 1px; width: parent.width - 46px; height: 1px; background: #ffffff0f; }
                                     }
-                                    if root.diagnostic-mappings.length == 0: Text { height: 44px; text: "Маппинги появятся после загрузки подписки"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
+                                    if root.diagnostic-mappings.length == 0: Text { height: 44px; text: @tr("Маппинги появятся после загрузки подписки"); color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                                 }
                             }
                         }
                         Rectangle { height: 20px; background: transparent; }
 
-                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ЖУРНАЛ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: @tr("ЖУРНАЛ"); } }
                         Rectangle { height: 8px; background: transparent; }
                         event-filter-track := Rectangle {
                             height: 38px;
@@ -3902,10 +3902,10 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 padding: 2px;
                                 spacing: 2px;
-                                QuietChip { min-width: 0px; label: "Все"; selected: root.event-filter == "Все"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
-                                QuietChip { min-width: 0px; label: "Система"; selected: root.event-filter == "Система"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
-                                QuietChip { min-width: 0px; label: "Ошибки"; selected: root.event-filter == "Ошибки"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
-                                QuietChip { min-width: 0px; label: "Ядра"; selected: root.event-filter == "Ядра"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
+                                QuietChip { min-width: 0px; label: @tr("Все"); selected: root.event-filter == "Все"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Все"); } }
+                                QuietChip { min-width: 0px; label: @tr("Система"); selected: root.event-filter == "Система"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Система"); } }
+                                QuietChip { min-width: 0px; label: @tr("Ошибки"); selected: root.event-filter == "Ошибки"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ошибки"); } }
+                                QuietChip { min-width: 0px; label: @tr("Ядра"); selected: root.event-filter == "Ядра"; modal-enabled: !root.profile-menu-open; activated => { root.filter-events("Ядра"); } }
                             }
                         }
                         Rectangle { height: 10px; background: transparent; }
@@ -3954,12 +3954,12 @@ export component AppWindow inherits Window {
                                                 color: event.level == "error" ? #f3c5c5 : Theme.text-secondary;
                                                 font-size: Theme.type-metadata-size;
                                                 wrap: word-wrap;
-                                                accessible-label: (event.level == "error" ? "Ошибка" : "Событие") + (event.component == "" ? "" : ", " + event.component) + (event.timestamp == "" ? "" : ", " + event.timestamp) + ": " + event.message;
+                                                accessible-label: (event.level == "error" ? @tr("Ошибка") : @tr("Событие")) + (event.component == "" ? "" : ", " + event.component) + (event.timestamp == "" ? "" : ", " + event.timestamp) + ": " + event.message;
                                             }
                                         }
                                         if index < root.events.length - 1: Rectangle { x: 86px; y: parent.height - 1px; width: parent.width - 86px; height: 1px; background: #ffffff0f; }
                                     }
-                                    if root.events.length == 0: Text { height: 64px; text: "Событий пока нет"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
+                                    if root.events.length == 0: Text { height: 64px; text: @tr("Событий пока нет"); color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                                 }
                             }
                         }
@@ -3978,7 +3978,7 @@ export component AppWindow inherits Window {
                 spacing: 0px;
                 // The title stays put; the sections scroll under it.
                 PageHeader {
-                    title: "Настройки";
+                    title: @tr("Настройки");
                     scrolled: settings-scroll.scrolled;
                     reduced-motion: root.reduced-motion;
                 }
@@ -3996,7 +3996,7 @@ export component AppWindow inherits Window {
                         padding-right: 28px;
                         padding-bottom: 24px;
                         spacing: 0px;
-                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ПОДКЛЮЧЕНИЕ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: @tr("ПОДКЛЮЧЕНИЕ"); } }
                         Rectangle { height: 8px; background: transparent; }
                         connection-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
@@ -4012,12 +4012,12 @@ export component AppWindow inherits Window {
                                 padding-right: 16px;
                                 spacing: 0px;
                                 if root.tun-toggle-available: ToggleRow {
-                                    label: "Режим TUN — весь трафик";
+                                    label: @tr("Режим TUN — весь трафик");
                                     description: root.toggle-on || root.toggle-busy
-                                        ? "Применится при следующем подключении"
+                                        ? @tr("Применится при следующем подключении")
                                         : root.tun-enabled
-                                            ? "Все приложения идут через VPN"
-                                            : "Только программы с системным прокси · без прав администратора";
+                                            ? @tr("Все приложения идут через VPN")
+                                            : @tr("Только программы с системным прокси · без прав администратора");
                                     checked: root.tun-enabled;
                                     show-separator: true;
                                     // The mode is chosen at connect time, so it is locked while connected.
@@ -4025,8 +4025,8 @@ export component AppWindow inherits Window {
                                     toggled(value) => { root.tun-enabled = value; }
                                 }
                                 ToggleRow {
-                                    label: "Подключаться после входа в систему";
-                                    description: root.launch-at-sign-in-enabled ? "Когда появится сеть и профиль будет готов" : "Сначала включите автозапуск";
+                                    label: @tr("Подключаться после входа в систему");
+                                    description: root.launch-at-sign-in-enabled ? @tr("Когда появится сеть и профиль будет готов") : @tr("Сначала включите автозапуск");
                                     checked: root.auto-connect-on-startup;
                                     enabled: root.launch-at-sign-in-enabled && !root.profile-menu-open;
                                     toggled(value) => { root.auto-connect-on-startup = value; }
@@ -4036,7 +4036,7 @@ export component AppWindow inherits Window {
                         if root.tun-toggle-available: HorizontalLayout {
                             padding-left: 4px;
                             padding-top: 6px;
-                            Footnote { text: "Без TUN трафик идёт через системный прокси — без запроса прав администратора"; }
+                            Footnote { text: @tr("Без TUN трафик идёт через системный прокси — без запроса прав администратора"); }
                         }
                         if root.service-card-visible: Rectangle { height: 12px; background: transparent; }
                         if root.service-card-visible: Rectangle {
@@ -4057,11 +4057,11 @@ export component AppWindow inherits Window {
                                     horizontal-stretch: 1;
                                     alignment: center;
                                     spacing: 2px;
-                                    Text { text: "Мгновенное подключение — установить службу"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; wrap: word-wrap; }
+                                    Text { text: @tr("Мгновенное подключение — установить службу"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; wrap: word-wrap; }
                                     Text {
                                         text: root.service-install-error != ""
                                             ? root.service-install-error
-                                            : "Один запрос прав сейчас — дальше без запросов. Подписки сохранятся.";
+                                            : @tr("Один запрос прав сейчас — дальше без запросов. Подписки сохранятся.");
                                         color: root.service-install-error != "" ? Theme.error : Theme.text-muted;
                                         font-size: Theme.type-metadata-size;
                                         wrap: word-wrap;
@@ -4070,7 +4070,7 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center;
                                     TextAction {
-                                        label: root.service-install-busy ? "Загружаем…" : "Установить";
+                                        label: root.service-install-busy ? @tr("Загружаем…") : @tr("Установить");
                                         enabled: !root.service-install-busy && !root.profile-menu-open;
                                         activated => { root.install-service(); }
                                     }
@@ -4079,7 +4079,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: 20px; background: transparent; }
 
-                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ПРИЛОЖЕНИЕ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: @tr("ПРИЛОЖЕНИЕ"); } }
                         Rectangle { height: 8px; background: transparent; }
                         app-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
@@ -4095,16 +4095,16 @@ export component AppWindow inherits Window {
                                 padding-right: 16px;
                                 spacing: 0px;
                                 ToggleRow {
-                                    label: "Запускать при входе в " + root.system-name;
-                                    description: root.launch-at-sign-in-stale ? "Путь приложения изменился — включите заново" : "";
+                                    label: @tr("Запускать при входе в {}", root.system-name);
+                                    description: root.launch-at-sign-in-stale ? @tr("Путь приложения изменился — включите заново") : "";
                                     checked: root.launch-at-sign-in-enabled;
                                     show-separator: true;
                                     enabled: !root.profile-menu-open;
                                     toggled(value) => { root.set-launch-at-sign-in(value); }
                                 }
                                 ToggleRow {
-                                    label: "Живой фон";
-                                    description: root.reduced-motion ? "Анимация отключена настройками " + root.system-name : "Спокойные волны на главной";
+                                    label: @tr("Живой фон");
+                                    description: root.reduced-motion ? @tr("Анимация отключена настройками {}", root.system-name) : @tr("Спокойные волны на главной");
                                     // Under system reduced-motion the animation never runs, so the
                                     // switch must not look on/enabled while the text says it's off.
                                     checked: root.ambient-background-enabled && !root.reduced-motion;
@@ -4124,7 +4124,7 @@ export component AppWindow inherits Window {
                                     height: 48px;
                                     spacing: 12px;
                                     Text {
-                                        text: root.reset-data-armed ? "Все подписки и настройки будут удалены" : "Удалить все данные";
+                                        text: root.reset-data-armed ? @tr("Все подписки и настройки будут удалены") : @tr("Удалить все данные");
                                         color: root.reset-data-armed ? Theme.error : Theme.text-primary;
                                         font-size: Theme.type-label-size;
                                         vertical-alignment: center;
@@ -4134,7 +4134,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         TextAction {
-                                            label: root.reset-data-armed ? "Удалить" : "Удалить…";
+                                            label: root.reset-data-armed ? @tr("Удалить") : @tr("Удалить…");
                                             tone: "danger";
                                             enabled: !root.profile-menu-open;
                                             activated => {
@@ -4152,7 +4152,7 @@ export component AppWindow inherits Window {
                         if root.launch-at-sign-in-error != "": HorizontalLayout { padding-left: 4px; padding-top: 6px; Text { min-height: 20px; text: root.launch-at-sign-in-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; } }
                         Rectangle { height: 20px; background: transparent; }
 
-                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ПОМОЩЬ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: @tr("ПОМОЩЬ"); } }
                         Rectangle { height: 8px; background: transparent; }
                         troubleshoot-card := Rectangle {
                             opacity: root.page-entering ? 0 : 1;
@@ -4172,13 +4172,13 @@ export component AppWindow inherits Window {
                                     horizontal-stretch: 1;
                                     alignment: center;
                                     spacing: 2px;
-                                    Text { text: "Устранить неполадки"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; overflow: elide; }
-                                    Text { text: "Если VPN не подключается: проверим антивирусы, прокси, порты и другое"; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                    Text { text: @tr("Устранить неполадки"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; overflow: elide; }
+                                    Text { text: @tr("Если VPN не подключается: проверим антивирусы, прокси, порты и другое"); color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                                 }
                                 VerticalLayout {
                                     alignment: center;
                                     TextAction {
-                                        label: "Открыть";
+                                        label: @tr("Открыть");
                                         enabled: !root.profile-menu-open;
                                         activated => { root.open-troubleshoot("settings"); }
                                     }
@@ -4186,7 +4186,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { height: 20px; background: transparent; }
-                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: "ОБНОВЛЕНИЯ"; } }
+                        HorizontalLayout { height: 16px; padding-left: 4px; SectionCaption { text: @tr("ОБНОВЛЕНИЯ"); } }
                         Rectangle { height: 8px; background: transparent; }
                         updates-card := Rectangle {
                         opacity: root.page-entering ? 0 : 1;
@@ -4285,15 +4285,15 @@ export component AppWindow inherits Window {
                 spacing: 0px;
                 // Title, "Добавить" and the note stay put; the list scrolls under them.
                 PageHeader {
-                    title: "Подписки";
-                    subtitle: "До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве";
+                    title: @tr("Подписки");
+                    subtitle: @tr("До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве");
                     gap: 16px;
                     scrolled: subscriptions-scroll.scrolled;
                     reduced-motion: root.reduced-motion;
                     VerticalLayout {
                         alignment: center;
                         TextAction {
-                            label: root.import-pending ? "Добавляем…" : "Добавить";
+                            label: root.import-pending ? @tr("Добавляем…") : @tr("Добавить");
                             icon: @image-url("../assets/plus.svg");
                             has-icon: true;
                             enabled: !root.import-pending;
@@ -4312,7 +4312,7 @@ export component AppWindow inherits Window {
                         spacing: 0px;
                         if root.deep-link-import-host != "": Text {
                             min-height: 24px;
-                            text: root.import-pending ? "Добавляем подписку с " + root.deep-link-import-host + "…" : "Подписка с " + root.deep-link-import-host + " ожидает добавления…";
+                            text: root.import-pending ? @tr("Добавляем подписку с {}…", root.deep-link-import-host) : @tr("Подписка с {} ожидает добавления…", root.deep-link-import-host);
                             color: Theme.text-secondary;
                             font-size: Theme.type-metadata-size;
                             overflow: elide;
@@ -4359,9 +4359,9 @@ export component AppWindow inherits Window {
                                     alignment: center;
                                     UrlField {
                                         text <=> root.subscription-draft;
-                                        placeholder: "Ссылка на новую подписку";
+                                        placeholder: @tr("Ссылка на новую подписку");
                                         enabled: !root.import-pending;
-                                        accessible-name: "URL подписки";
+                                        accessible-name: @tr("URL подписки");
                                         init => { self.focus(); }
                                         accepted => {
                                             if (!root.import-pending && root.subscription-draft != "") {
@@ -4373,7 +4373,7 @@ export component AppWindow inherits Window {
                                     VerticalLayout {
                                         alignment: center;
                                         TextAction {
-                                            label: "Отмена";
+                                            label: @tr("Отмена");
                                             tone: "neutral";
                                             enabled: !root.import-pending;
                                             activated => {
@@ -4385,7 +4385,7 @@ export component AppWindow inherits Window {
                                     }
                                     VerticalLayout {
                                         alignment: center;
-                                        TextAction { label: root.import-pending ? "Добавляем…" : "Добавить"; enabled: !root.import-pending && root.subscription-draft != ""; activated => { root.import-url(root.subscription-draft); } }
+                                        TextAction { label: root.import-pending ? @tr("Добавляем…") : @tr("Добавить"); enabled: !root.import-pending && root.subscription-draft != ""; activated => { root.import-url(root.subscription-draft); } }
                                     }
                                 }
                             }
@@ -4399,13 +4399,13 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: "МОИ ПОДПИСКИ"; } }
-                        if root.profile-menu-loading: Text { height: 44px; text: "Загружаем подписки…"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                        HorizontalLayout { height: 22px; padding-left: 4px; SectionCaption { text: @tr("МОИ ПОДПИСКИ"); } }
+                        if root.profile-menu-loading: Text { height: 44px; text: @tr("Загружаем подписки…"); color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
                         if root.profile-menu-error != "": HorizontalLayout {
                             min-height: 52px;
                             spacing: 12px;
                             Text { horizontal-stretch: 1; text: root.profile-menu-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
-                            VerticalLayout { alignment: center; TextAction { label: "Повторить"; activated => { root.retry-profile-menu(); } } }
+                            VerticalLayout { alignment: center; TextAction { label: @tr("Повторить"); activated => { root.retry-profile-menu(); } } }
                         }
                         if root.profile-mutation-error != "": Text {
                             min-height: 24px;
@@ -4422,7 +4422,7 @@ export component AppWindow inherits Window {
                             border-color: #ffffff0a;
                             border-width: 1px;
                             border-radius: 14px;
-                            Text { text: "Подписок пока нет"; color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
+                            Text { text: @tr("Подписок пока нет"); color: Theme.text-muted; font-size: Theme.type-metadata-size; vertical-alignment: center; horizontal-alignment: center; }
                         }
                         // One inset grouped card; the active subscription is tinted with a blue bar.
                         if root.subscription-profiles.length > 0: subscriptions-card := Rectangle {
@@ -4452,7 +4452,7 @@ export component AppWindow inherits Window {
                                         x: 0; y: 0; width: parent.width - 132px; height: 56px;
                                         enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                         focus-on-click: true; focus-on-tab-navigation: true;
-                                        accessible-role: button; accessible-label: "Сделать активной " + profile.title; accessible-description: root.profile-switch-locked ? "Отключитесь, чтобы сменить подписку" : ""; accessible-enabled: self.enabled;
+                                        accessible-role: button; accessible-label: @tr("Сделать активной {}", profile.title); accessible-description: root.profile-switch-locked ? @tr("Отключитесь, чтобы сменить подписку") : ""; accessible-enabled: self.enabled;
                                         accessible-action-default => { if (self.enabled) { root.activate-profile(profile.id); } }
                                         Rectangle { background: activate-profile-touch.has-hover && parent.enabled ? #ffffff06 : transparent; border-color: Theme.focus; border-width: parent.has-focus ? Theme.focus-width : 0px; animate background { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } }
                                         key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.activate-profile(profile.id); return accept; } return reject; }
@@ -4483,22 +4483,22 @@ export component AppWindow inherits Window {
                                         width: active-tag.preferred-width + 12px;
                                         border-radius: 4px;
                                         background: #3ccb7f1f;
-                                        active-tag := Text { text: "АКТИВНА"; color: Theme.accent-green; font-size: 10px; font-weight: Theme.weight-bold; letter-spacing: 0.5px; horizontal-alignment: center; vertical-alignment: center; }
+                                        active-tag := Text { text: @tr("АКТИВНА"); color: Theme.accent-green; font-size: 10px; font-weight: Theme.weight-bold; letter-spacing: 0.5px; horizontal-alignment: center; vertical-alignment: center; }
                                     }
                                     Text {
                                         x: 52px; y: 29px; width: parent.width - 52px - 132px; height: 18px;
                                         text: settings-profile-row.pending
-                                            ? root.profile-pending-operation == "refresh" ? "Обновляем…"
-                                            : root.profile-pending-operation == "edit" ? "Меняем ссылку…"
-                                            : root.profile-pending-operation == "delete" ? "Удаляем…"
-                                            : "Применяем…"
-                                            : !profile.available ? profile.expiry + " · " + profile.usage + " · Временно недоступна"
+                                            ? root.profile-pending-operation == "refresh" ? @tr("Обновляем…")
+                                            : root.profile-pending-operation == "edit" ? @tr("Меняем ссылку…")
+                                            : root.profile-pending-operation == "delete" ? @tr("Удаляем…")
+                                            : @tr("Применяем…")
+                                            : !profile.available ? @tr("{} · {} · Временно недоступна", profile.expiry, profile.usage)
                                             : profile.expiry + " · " + profile.usage;
                                         color: settings-profile-row.pending ? Theme.accent-blue : !profile.available ? Theme.warning : Theme.text-muted;
                                         font-size: Theme.type-metadata-size;
                                         vertical-alignment: center;
                                         overflow: elide;
-                                        accessible-description: settings-profile-row.pending ? "" : !profile.available ? "Временно недоступна" : profile.active ? "Активна" : "Доступна";
+                                        accessible-description: settings-profile-row.pending ? "" : !profile.available ? @tr("Временно недоступна") : profile.active ? @tr("Активна") : @tr("Доступна");
                                     }
 
                                     refresh-profile-focus := FocusScope {
@@ -4506,7 +4506,7 @@ export component AppWindow inherits Window {
                                         x: parent.width - 128px; y: 12px; width: 32px; height: 32px;
                                         enabled: root.subscription-refresh-enabled && profile.available && root.profile-pending-operation == "none";
                                         focus-on-click: true; focus-on-tab-navigation: true;
-                                        accessible-role: button; accessible-label: "Обновить " + profile.title; accessible-enabled: self.enabled;
+                                        accessible-role: button; accessible-label: @tr("Обновить {}", profile.title); accessible-enabled: self.enabled;
                                         accessible-action-default => { if (self.enabled) { root.refresh-profile(profile.id); } }
                                         init => { if (root.profile-management-focus-id == profile.id && root.profile-management-focus-serial > 0) { self.focus(); } }
                                         changed focus-serial => { if (root.profile-management-focus-id == profile.id && self.enabled) { self.focus(); } }
@@ -4518,7 +4518,7 @@ export component AppWindow inherits Window {
                                         x: parent.width - 92px; y: 12px; width: 32px; height: 32px;
                                         enabled: root.subscription-management-enabled && root.profile-pending-operation == "none";
                                         focus-on-click: true; focus-on-tab-navigation: true;
-                                        accessible-role: button; accessible-label: "Изменить URL " + profile.title; accessible-enabled: self.enabled;
+                                        accessible-role: button; accessible-label: @tr("Изменить URL {}", profile.title); accessible-enabled: self.enabled;
                                         accessible-action-default => { if (self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; } }
                                         Rectangle { border-radius: 8px; opacity: parent.enabled ? 1 : 0.45; background: settings-profile-row.editing ? #4c9dff26 : edit-profile-touch.has-hover && parent.enabled ? #ffffff0d : transparent; border-color: Theme.focus; border-width: parent.has-focus ? Theme.focus-width : 0px; animate background { duration: 160ms; easing: cubic-bezier(0.22, 1, 0.36, 1); } Image { x: 8px; y: 8px; width: 16px; height: 16px; source: @image-url("../assets/edit.svg"); colorize: settings-profile-row.editing ? Theme.accent-blue : edit-profile-touch.has-hover ? Theme.text-primary : Theme.text-muted; image-fit: contain; accessible-role: none; } }
                                         key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.profile-delete-confirm-id = ""; root.profile-edit-draft = ""; root.profile-edit-id = root.profile-edit-id == profile.id ? "" : profile.id; return accept; } return reject; }
@@ -4529,7 +4529,7 @@ export component AppWindow inherits Window {
                                         x: parent.width - 56px; y: 12px; width: 32px; height: 32px;
                                         enabled: root.subscription-refresh-enabled && root.profile-pending-operation == "none";
                                         focus-on-click: true; focus-on-tab-navigation: true;
-                                        accessible-role: button; accessible-label: "Удалить " + profile.title; accessible-enabled: self.enabled;
+                                        accessible-role: button; accessible-label: @tr("Удалить {}", profile.title); accessible-enabled: self.enabled;
                                         accessible-action-default => { if (self.enabled) { root.profile-edit-id = ""; root.profile-delete-confirm-id = profile.id; } }
                                         init => { if (root.profile-delete-control-focus-id == profile.id && root.profile-delete-control-focus-serial > 0) { self.focus(); } }
                                         changed focus-serial => { if (root.profile-delete-control-focus-id == profile.id && self.enabled) { self.focus(); } }
@@ -4548,9 +4548,9 @@ export component AppWindow inherits Window {
                                         alignment: center;
                                         UrlField {
                                             text <=> root.profile-edit-draft;
-                                            placeholder: "Новый URL подписки";
+                                            placeholder: @tr("Новый URL подписки");
                                             enabled: root.profile-pending-operation == "none";
-                                            accessible-name: "Новый URL для " + profile.title;
+                                            accessible-name: @tr("Новый URL для {}", profile.title);
                                             init => { self.focus(); }
                                             accepted => {
                                                 if (root.profile-edit-draft != "" && root.profile-pending-operation == "none") {
@@ -4559,16 +4559,16 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                         }
-                                        VerticalLayout { alignment: center; TextAction { label: "Отмена"; tone: "neutral"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-edit-id = ""; root.profile-edit-draft = ""; } } }
-                                        VerticalLayout { alignment: center; TextAction { label: root.profile-pending-operation == "edit" ? "Сохраняем…" : "Сохранить"; enabled: root.profile-edit-draft != "" && root.profile-pending-operation == "none"; activated => { root.replace-profile-source(profile.id, root.profile-edit-draft); } } }
+                                        VerticalLayout { alignment: center; TextAction { label: @tr("Отмена"); tone: "neutral"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-edit-id = ""; root.profile-edit-draft = ""; } } }
+                                        VerticalLayout { alignment: center; TextAction { label: root.profile-pending-operation == "edit" ? @tr("Сохраняем…") : @tr("Сохранить"); enabled: root.profile-edit-draft != "" && root.profile-pending-operation == "none"; activated => { root.replace-profile-source(profile.id, root.profile-edit-draft); } } }
                                     }
                                     if settings-profile-row.confirming: HorizontalLayout {
                                         x: 52px; y: 56px; width: parent.width - 52px - 10px; height: 52px; spacing: 8px;
                                         // Fades in with the row's own height animation — no extra timer.
                                         opacity: Math.max(0, Math.min(1, (settings-profile-row.height - 56px) / 52px));
-                                        Text { horizontal-stretch: 1; text: "Удалить подписку?"; color: Theme.text-secondary; font-size: Theme.type-label-size; vertical-alignment: center; }
-                                        VerticalLayout { alignment: center; TextAction { label: "Отмена"; tone: "neutral"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; } } }
-                                        VerticalLayout { alignment: center; TextAction { label: "Удалить"; tone: "danger"; enabled: root.profile-pending-operation == "none"; activated => { root.delete-profile(profile.id); } } }
+                                        Text { horizontal-stretch: 1; text: @tr("Удалить подписку?"); color: Theme.text-secondary; font-size: Theme.type-label-size; vertical-alignment: center; }
+                                        VerticalLayout { alignment: center; TextAction { label: @tr("Отмена"); tone: "neutral"; enabled: root.profile-pending-operation == "none"; activated => { root.profile-delete-control-focus-id = profile.id; root.profile-delete-confirm-id = ""; root.profile-delete-control-focus-serial += 1; } } }
+                                        VerticalLayout { alignment: center; TextAction { label: @tr("Удалить"); tone: "danger"; enabled: root.profile-pending-operation == "none"; activated => { root.delete-profile(profile.id); } } }
                                     }
                                     if index < root.subscription-profiles.length - 1: Rectangle { x: 52px; y: parent.height - 1px; width: parent.width - 52px; height: 1px; background: #ffffff0f; }
                                 }
@@ -4579,8 +4579,8 @@ export component AppWindow inherits Window {
                             padding-top: 8px;
                             Footnote {
                                 text: root.profile-switch-locked && root.subscription-profiles.length > 1
-                                    ? "Отключитесь, чтобы сменить подписку"
-                                    : "Нажмите на подписку, чтобы сделать её активной. Обновление происходит автоматически при запуске приложения или вручную.";
+                                    ? @tr("Отключитесь, чтобы сменить подписку")
+                                    : @tr("Нажмите на подписку, чтобы сделать её активной. Обновление происходит автоматически при запуске приложения или вручную.");
                             }
                         }
                         Rectangle { vertical-stretch: 1; background: transparent; }
@@ -4632,7 +4632,7 @@ export component AppWindow inherits Window {
                         preferred-width: 0px;
                         alignment: center;
                         spacing: 2px;
-                        update-toast-title := Text { text: "Доступно обновление"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
+                        update-toast-title := Text { text: @tr("Доступно обновление"); color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
                         update-toast-copy := Text { text: root.update-status; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                     }
                     VerticalLayout {
@@ -4641,7 +4641,7 @@ export component AppWindow inherits Window {
                             spacing: 4px;
                             BannerAction {
                                 filled: true;
-                                label: root.update-action-label != "" ? root.update-action-label : "Подробнее";
+                                label: root.update-action-label != "" ? root.update-action-label : @tr("Подробнее");
                                 enabled: update-toast.shown && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
                                     && (root.update-action-label == "" || !root.update-runtime-busy);
                                 activated => {
@@ -4650,7 +4650,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             BannerAction {
-                                label: "Позже";
+                                label: @tr("Позже");
                                 enabled: update-toast.shown && !root.profile-menu-open;
                                 activated => { root.update-banner-dismissed-for = root.update-status; }
                             }
@@ -4702,9 +4702,9 @@ export component AppWindow inherits Window {
                         preferred-width: 0px;
                         alignment: center;
                         spacing: 2px;
-                        service-toast-title := Text { text: "Мгновенное подключение"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
+                        service-toast-title := Text { text: @tr("Мгновенное подключение"); color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
                         service-toast-copy := Text {
-                            text: root.service-install-error != "" ? root.service-install-error : "Установите службу — VPN будет включаться без запроса прав";
+                            text: root.service-install-error != "" ? root.service-install-error : @tr("Установите службу — VPN будет включаться без запроса прав");
                             color: root.service-install-error != "" ? Theme.error : Theme.text-secondary;
                             font-size: Theme.type-metadata-size;
                             wrap: word-wrap;
@@ -4717,12 +4717,12 @@ export component AppWindow inherits Window {
                             spacing: 4px;
                             BannerAction {
                                 filled: true;
-                                label: root.service-install-busy ? "Загружаем…" : "Установить";
+                                label: root.service-install-busy ? @tr("Загружаем…") : @tr("Установить");
                                 enabled: service-toast.shown && !root.service-install-busy && !root.profile-menu-open;
                                 activated => { root.install-service(); }
                             }
                             BannerAction {
-                                label: "Не сейчас";
+                                label: @tr("Не сейчас");
                                 enabled: service-toast.shown && !root.service-install-busy && !root.profile-menu-open;
                                 activated => { root.service-offer-dismissed = true; }
                             }
@@ -4775,14 +4775,14 @@ export component AppWindow inherits Window {
                         preferred-width: 0px;
                         alignment: center;
                         spacing: 2px;
-                        handoff-toast-title := Text { text: "Открыта установленная версия"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
-                        handoff-toast-copy := Text { text: "AppImage можно удалить — используется MULTICORE из системы"; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                        handoff-toast-title := Text { text: @tr("Открыта установленная версия"); color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
+                        handoff-toast-copy := Text { text: @tr("AppImage можно удалить — используется MULTICORE из системы"); color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                     }
                     VerticalLayout {
                         alignment: center;
                         BannerAction {
                             filled: true;
-                            label: "Понятно";
+                            label: @tr("Понятно");
                             enabled: handoff-toast.shown && !root.profile-menu-open;
                             activated => { root.handoff-notice-seen = root.handoff-notice-for; }
                         }
@@ -4837,7 +4837,7 @@ export component AppWindow inherits Window {
                         Text {
                             x: 12px;
                             height: parent.height;
-                            text: "МОИ ПОДПИСКИ";
+                            text: @tr("МОИ ПОДПИСКИ");
                             color: Theme.text-muted;
                             font-size: 11px;
                             font-weight: Theme.weight-semibold;
@@ -4853,7 +4853,7 @@ export component AppWindow inherits Window {
                         padding-left: 12px;
                         padding-right: 12px;
                         Text {
-                            text: "Отключитесь, чтобы сменить подписку";
+                            text: @tr("Отключитесь, чтобы сменить подписку");
                             color: Theme.text-muted;
                             font-size: 12px;
                             vertical-alignment: center;
@@ -4897,7 +4897,7 @@ export component AppWindow inherits Window {
                             focus-on-click: true;
                             focus-on-tab-navigation: root.profile-menu-keyboard-open;
                             accessible-role: button;
-                            accessible-label: "Повторить загрузку профилей";
+                            accessible-label: @tr("Повторить загрузку профилей");
                             accessible-action-default => { root.retry-profile-menu(); }
                             init => { if (root.profile-menu-keyboard-open) { self.focus(); } }
                             Rectangle {
@@ -4905,7 +4905,7 @@ export component AppWindow inherits Window {
                                 background: retry-profile-touch.has-hover ? #ffffff0d : Theme.surface;
                                 border-color: parent.has-focus && root.profile-menu-keyboard-open ? Theme.focus : Theme.line;
                                 border-width: 1px;
-                                Text { text: "Повторить"; color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: @tr("Повторить"); color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-semibold; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             key-pressed(event) => { if (event.text == " " || event.text == "\n") { root.retry-profile-menu(); return accept; } return reject; }
                             retry-profile-touch := TouchArea { clicked => { root.retry-profile-menu(); } }
@@ -4916,12 +4916,12 @@ export component AppWindow inherits Window {
                         height: 128px;
                         enabled: true;
                         accessible-role: text;
-                        accessible-label: "Загружаем профили";
+                        accessible-label: @tr("Загружаем профили");
                         init => { if (root.profile-menu-keyboard-open) { self.focus(); } }
                         VerticalLayout {
                             padding-top: 4px;
                             spacing: 0px;
-                            Text { x: 12px; height: 24px; text: "Загружаем профили…"; color: Theme.text-muted; font-size: 12px; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
+                            Text { x: 12px; height: 24px; text: @tr("Загружаем профили…"); color: Theme.text-muted; font-size: 12px; vertical-alignment: center; accessible-role: text; accessible-live-region: polite; }
                             for _[index] in 2: Rectangle {
                                 height: 40px;
                                 opacity: 0.55 + 0.45 * root.skeleton-pulse;
@@ -4975,7 +4975,7 @@ export component AppWindow inherits Window {
                                     x: 38px;
                                     width: Math.min(self.preferred-width, parent.width - self.x - (profile.active ? 12px : 0px) - row-quota.width - 24px);
                                     height: parent.height;
-                                    text: root.profile-pending-id == profile.id && root.profile-pending-operation == "activate" ? profile.title + " · Переключаем…" : profile.title;
+                                    text: root.profile-pending-id == profile.id && root.profile-pending-operation == "activate" ? @tr("{} · Переключаем…", profile.title) : profile.title;
                                     color: profile.active || profile-row.hovered ? Theme.text-primary : Theme.text-muted;
                                     font-size: 13px;
                                     font-weight: profile.active ? Theme.weight-semibold : Theme.weight-medium;
@@ -4998,7 +4998,7 @@ export component AppWindow inherits Window {
                                     if profile.expired: Text {
                                         x: parent.width - self.width;
                                         height: parent.height;
-                                        text: "ИСТЕКЛА";
+                                        text: @tr("ИСТЕКЛА");
                                         color: Theme.error;
                                         font-size: 10px;
                                         font-weight: Theme.weight-semibold;
@@ -5035,8 +5035,8 @@ export component AppWindow inherits Window {
                                     focus-on-click: true;
                                     focus-on-tab-navigation: root.profile-menu-keyboard-open;
                                     accessible-role: button;
-                                    accessible-label: (profile.active ? profile.title + ", активная подписка" : "Активировать " + profile.title)
-                                        + (profile.expired ? ", срок истёк" : ", осталось " + profile.remaining + ", " + profile.days);
+                                    accessible-label: (profile.active ? @tr("{}, активная подписка", profile.title) : @tr("Активировать {}", profile.title))
+                                        + (profile.expired ? @tr(", срок истёк") : @tr(", осталось {}, {}", profile.remaining, profile.days));
                                     accessible-enabled: self.enabled;
                                     accessible-action-default => { if (self.enabled) { if (profile.active) { root.close-profile-menu(); } else { root.activate-profile(profile.id); } } }
                                     init => { if (index == 0 && self.enabled && root.profile-menu-keyboard-open) { self.focus(); } }
@@ -5096,7 +5096,7 @@ export component AppWindow inherits Window {
                             focus-on-click: true;
                             focus-on-tab-navigation: root.profile-menu-keyboard-open;
                             accessible-role: button;
-                            accessible-label: "Добавить подписку";
+                            accessible-label: @tr("Добавить подписку");
                             accessible-enabled: self.enabled;
                             accessible-action-default => { if (self.enabled) { root.add-subscription(); } }
                             key-pressed(event) => { if ((event.text == " " || event.text == "\n") && self.enabled) { root.add-subscription(); return accept; } return reject; }
@@ -5113,7 +5113,7 @@ export component AppWindow inherits Window {
                                         alignment: center;
                                         Image { width: 14px; height: 14px; source: @image-url("../assets/plus.svg"); colorize: Theme.accent-blue; image-fit: contain; accessible-role: none; }
                                     }
-                                    Text { text: "Добавить"; color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-medium; vertical-alignment: center; accessible-role: none; }
+                                    Text { text: @tr("Добавить"); color: Theme.text-primary; font-size: 12px; font-weight: Theme.weight-medium; vertical-alignment: center; accessible-role: none; }
                                 }
                             }
                             menu-add-touch := TouchArea { enabled: parent.enabled; clicked => { root.add-subscription(); } }
@@ -5128,7 +5128,7 @@ export component AppWindow inherits Window {
                             focus-on-click: true;
                             focus-on-tab-navigation: root.profile-menu-keyboard-open;
                             accessible-role: button;
-                            accessible-label: "Все подписки";
+                            accessible-label: @tr("Все подписки");
                             accessible-action-default => { self.open-all(); }
                             function open-all() {
                                 root.local-page = "subscriptions";
@@ -5143,7 +5143,7 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     alignment: center;
                                     spacing: 6px;
-                                    Text { text: "Все подписки"; color: menu-all-touch.has-hover ? Theme.text-primary : Theme.text-muted; font-size: 12px; font-weight: Theme.weight-medium; vertical-alignment: center; accessible-role: none; }
+                                    Text { text: @tr("Все подписки"); color: menu-all-touch.has-hover ? Theme.text-primary : Theme.text-muted; font-size: 12px; font-weight: Theme.weight-medium; vertical-alignment: center; accessible-role: none; }
                                     VerticalLayout {
                                         alignment: center;
                                         Image { width: 12px; height: 12px; source: @image-url("../assets/arrow-right.svg"); colorize: menu-all-touch.has-hover ? Theme.text-primary : Theme.text-muted; image-fit: contain; accessible-role: none; }
@@ -5226,7 +5226,7 @@ export component AppWindow inherits Window {
                     y: 14px;
                     width: parent.width - 84px;
                     height: 18px;
-                    text: "НОВОЕ ОТ ПРОВАЙДЕРА";
+                    text: @tr("НОВОЕ ОТ ПРОВАЙДЕРА");
                     color: announcement-popover.tone-color;
                     font-size: 11px;
                     font-weight: Theme.weight-semibold;
@@ -5243,7 +5243,7 @@ export component AppWindow inherits Window {
                     focus-on-click: true;
                     focus-on-tab-navigation: announcement-popover.shown;
                     accessible-role: button;
-                    accessible-label: "Закрыть сообщение провайдера";
+                    accessible-label: @tr("Закрыть сообщение провайдера");
                     accessible-action-default => { root.announcement-open = false; }
                     key-pressed(event) => {
                         if (event.text == " " || event.text == "\n") {
@@ -5328,7 +5328,7 @@ export component AppWindow inherits Window {
                 spacing: 12px;
                 Text {
                     height: 26px;
-                    text: "Обновить MULTICORE?";
+                    text: @tr("Обновить MULTICORE?");
                     color: Theme.text-primary;
                     font-family: Theme.font-family;
                     font-size: Theme.type-label-size;
@@ -5337,7 +5337,7 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     height: 54px;
-                    text: "Скачаем обновление, не отключая VPN.\nТуннель остановится только после загрузки.";
+                    text: @tr("Скачаем обновление, не отключая VPN.\nТуннель остановится только после загрузки.");
                     color: Theme.text-secondary;
                     font-family: Theme.font-family;
                     font-size: Theme.type-metadata-size;
@@ -5352,7 +5352,7 @@ export component AppWindow inherits Window {
                     // Conditional creation does not fire changed focus-epoch.
                     update-cancel-action := SmallAction {
                         width: 88px;
-                        label: "Отмена";
+                        label: @tr("Отмена");
                         focus-epoch: root.update-confirm-focus-serial;
                         init => { self.focus-action(); }
                         activated => {
@@ -5362,7 +5362,7 @@ export component AppWindow inherits Window {
                     }
                     update-confirm-action := SmallAction {
                         width: 200px;
-                        label: "Обновить и перезапустить";
+                        label: @tr("Обновить и перезапустить");
                         selected: true;
                         enabled: !root.update-runtime-busy;
                         activated => { root.confirm-update-restart(); }
@@ -5415,14 +5415,14 @@ export component AppWindow inherits Window {
                     spacing: 12px;
                     Text {
                         height: 26px;
-                        text: "Добавить подписку?";
+                        text: @tr("Добавить подписку?");
                         color: Theme.text-primary;
                         font-size: Theme.type-label-size;
                         font-weight: Theme.weight-semibold;
                     }
                     Text {
                         height: 36px;
-                        text: "Получена ссылка. Загрузить подписку с домена:";
+                        text: @tr("Получена ссылка. Загрузить подписку с домена:");
                         color: Theme.text-secondary;
                         font-size: Theme.type-metadata-size;
                         wrap: word-wrap;
@@ -5442,8 +5442,8 @@ export component AppWindow inherits Window {
                         alignment: end;
                         spacing: 8px;
                         // Conditional creation does not fire changed focus-epoch.
-                        no-action := SmallAction { width: 88px; label: "Отмена"; focus-epoch: root.deep-link-focus-serial; init => { self.focus-action(); } activated => { root.cancel-deep-link(); } }
-                        yes-action := SmallAction { width: 104px; label: "Добавить"; selected: true; activated => { root.confirm-deep-link(); } }
+                        no-action := SmallAction { width: 88px; label: @tr("Отмена"); focus-epoch: root.deep-link-focus-serial; init => { self.focus-action(); } activated => { root.cancel-deep-link(); } }
+                        yes-action := SmallAction { width: 104px; label: @tr("Добавить"); selected: true; activated => { root.confirm-deep-link(); } }
                     }
                 }
             }

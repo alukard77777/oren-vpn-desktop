@@ -236,9 +236,11 @@ mod tests {
         assert!(ui.contains("\"Мгновенноеподключение\""));
         assert!(ui.contains("\"Установитеслужбу—VPNбудетвключатьсябеззапросаправ\""));
         // «Установить» is the Settings card's own flow; «Не сейчас» is remembered.
-        assert!(ui.contains("label:root.service-install-busy?\"Загружаем…\":\"Установить\";"));
+        assert!(
+            ui.contains("label:root.service-install-busy?@tr(\"Загружаем…\"):@tr(\"Установить\");")
+        );
         assert!(ui.contains("activated=>{root.install-service();}"));
-        assert!(ui.contains("label:\"Несейчас\";"));
+        assert!(ui.contains("label:@tr(\"Несейчас\");"));
         assert!(ui.contains("activated=>{root.service-offer-dismissed=true;}"));
         let main: String = include_str!("main.rs").split_whitespace().collect();
         assert!(main.contains(

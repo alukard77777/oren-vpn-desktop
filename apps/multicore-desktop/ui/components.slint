@@ -124,7 +124,7 @@ export component QuietChip inherits Rectangle {
     // left-pinned icon left a gap that varied with the label's length.
     property <length> content-x: !root.has-icon-slot ? Theme.space-4 : max(Theme.space-3, (root.width - 22px - chip-label.preferred-width) / 2);
     in property <string> label;
-    in property <string> selected-state-label: "выбрано";
+    in property <string> selected-state-label: @tr("выбрано");
     in property <string> state-label:
         root.label + (root.selected ? ", " + root.selected-state-label : "");
     in property <bool> enabled: true;
@@ -293,8 +293,8 @@ export component RouteNodeRow inherits Rectangle {
     // No latency yet: a placeholder holds the value's place (pulsing while
     // a measurement runs) instead of the number appearing from nowhere.
     in property <bool> trailing-measuring: false;
-    in property <string> selected-state-label: "выбрано";
-    in property <string> pending-state-label: "выбор применяется";
+    in property <string> selected-state-label: @tr("выбрано");
+    in property <string> pending-state-label: @tr("выбор применяется");
     in property <string> state-label:
         root.label
         + (root.supporting-text == "" ? "" : ", " + root.supporting-text)

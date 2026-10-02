@@ -149,7 +149,7 @@ component FindingRow inherits Rectangle {
     height: Math.max(56px, body.preferred-height + 24px);
     background: transparent;
     accessible-role: text;
-    accessible-label: (root.card.tone == "error" ? "Ошибка: " : root.card.tone == "warning" ? "Предупреждение: " : "") + root.card.title + ". " + root.card.detail;
+    accessible-label: (root.card.tone == "error" ? @tr("Ошибка: ") : root.card.tone == "warning" ? @tr("Предупреждение: ") : "") + root.card.title + ". " + root.card.detail;
     ToneIcon { x: 12px; y: (parent.height - self.height) / 2; tone: root.card.tone; }
     body := VerticalLayout {
         x: 42px;
@@ -234,14 +234,14 @@ component FixRow inherits Rectangle {
                 width: admin-label.preferred-width + 14px;
                 border-radius: 6px;
                 background: Theme.elevated;
-                admin-label := Text { x: 7px; height: parent.height; text: "Права администратора"; color: Theme.text-secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                admin-label := Text { x: 7px; height: parent.height; text: @tr("Права администратора"); color: Theme.text-secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
             }
             if root.fix.needs-reboot: Rectangle {
                 height: 20px;
                 width: reboot-label.preferred-width + 14px;
                 border-radius: 6px;
                 background: #e7aa451f;
-                reboot-label := Text { x: 7px; height: parent.height; text: "Нужна перезагрузка"; color: Theme.warning; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                reboot-label := Text { x: 7px; height: parent.height; text: @tr("Нужна перезагрузка"); color: Theme.warning; font-size: 11px; vertical-alignment: center; accessible-role: none; }
             }
         }
     }
@@ -398,8 +398,8 @@ export component TroubleshootPage inherits Rectangle {
     private property <bool> busy: root.phase == "running" || root.phase == "fixing" || root.repair-busy != "";
     private property <bool> finished: root.phase == "results" || root.phase == "fixing";
     private property <float> progress: root.steps.length == 0 ? 0 : Math.min(1, (root.step-index + (root.phase == "running" ? 0.5 : 1)) / root.steps.length);
-    private property <string> pill-text: root.phase == "running" ? "Проверяем…"
-        : root.phase == "fixing" ? "Исправляем…"
+    private property <string> pill-text: root.phase == "running" ? @tr("Проверяем…")
+        : root.phase == "fixing" ? @tr("Исправляем…")
         : root.phase == "results" ? root.status-text
         : "";
     private property <string> pill-tone: root.phase == "running" || root.phase == "fixing" ? "info" : root.status-tone;
@@ -437,11 +437,11 @@ export component TroubleshootPage inherits Rectangle {
                                 border-width: crumb-focus.has-focus ? Theme.focus-width : 0px;
                                 border-radius: 4px;
                                 accessible-role: button;
-                                accessible-label: "Настройки";
+                                accessible-label: @tr("Настройки");
                                 accessible-action-default => { root.open-settings(); }
                                 crumb-text := Text {
                                     height: parent.height;
-                                    text: "Настройки";
+                                    text: @tr("Настройки");
                                     color: crumb-touch.has-hover ? Theme.text-primary : Theme.text-muted;
                                     font-size: 13px;
                                     font-weight: Theme.weight-medium;
@@ -466,9 +466,9 @@ export component TroubleshootPage inherits Rectangle {
                                 alignment: center;
                                 Image { width: 12px; height: 12px; source: @image-url("../assets/chevron-right.svg"); colorize: Theme.text-muted; image-fit: contain; accessible-role: none; }
                             }
-                            Text { text: "Устранение неполадок"; color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-medium; vertical-alignment: center; overflow: elide; accessible-role: none; }
+                            Text { text: @tr("Устранение неполадок"); color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-medium; vertical-alignment: center; overflow: elide; accessible-role: none; }
                         }
-                        Text { height: 30px; text: "Устранение неполадок"; color: Theme.text-primary; font-size: Theme.type-title-size; font-weight: Theme.weight-title; vertical-alignment: center; overflow: elide; accessible-role: text; }
+                        Text { height: 30px; text: @tr("Устранение неполадок"); color: Theme.text-primary; font-size: Theme.type-title-size; font-weight: Theme.weight-title; vertical-alignment: center; overflow: elide; accessible-role: text; }
                     }
                     VerticalLayout {
                         horizontal-stretch: 0;
@@ -509,7 +509,7 @@ export component TroubleshootPage inherits Rectangle {
                             if root.finished: PageButton {
                                 kind: "quiet";
                                 padding-x: 10px;
-                                label: "Проверить заново";
+                                label: @tr("Проверить заново");
                                 icon: @image-url("../assets/refresh.svg");
                                 has-icon: true;
                                 icon-size: 13px;
@@ -524,7 +524,7 @@ export component TroubleshootPage inherits Rectangle {
                                 icon: @image-url("../assets/close.svg");
                                 has-icon: true;
                                 icon-size: 12px;
-                                accessible-label: "Закрыть";
+                                accessible-label: @tr("Закрыть");
                                 activated => { root.close(); }
                             }
                         }
@@ -536,14 +536,14 @@ export component TroubleshootPage inherits Rectangle {
                     alignment: start;
                     Text {
                         text: root.checked-ago == ""
-                            ? "Проверим, что на этом компьютере может мешать VPN, и поможем это исправить."
-                            : "Проверили, что на этом компьютере может мешать VPN";
+                            ? @tr("Проверим, что на этом компьютере может мешать VPN, и поможем это исправить.")
+                            : @tr("Проверили, что на этом компьютере может мешать VPN");
                         color: Theme.text-muted;
                         font-size: Theme.type-metadata-size;
                         overflow: elide;
                     }
                     if root.checked-ago != "": Text {
-                        text: " · последняя проверка " + root.checked-ago;
+                        text: @tr(" · последняя проверка {}", root.checked-ago);
                         color: Theme.text-muted.with-alpha(0.7);
                         font-size: Theme.type-metadata-size;
                         overflow: elide;
@@ -583,11 +583,11 @@ export component TroubleshootPage inherits Rectangle {
                                 horizontal-stretch: 1;
                                 spacing: 3px;
                                 alignment: center;
-                                Text { text: "Что проверим"; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
+                                Text { text: @tr("Что проверим"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; }
                                 Text {
                                     text: root.windows
-                                        ? "Антивирусы, программы обхода блокировок, занятые порты, системный прокси, другие VPN, Drover для Discord, файл hosts, групповые политики, время и DNS."
-                                        : "Прокси в переменных окружения, файл hosts и системное время.";
+                                        ? @tr("Антивирусы, программы обхода блокировок, занятые порты, системный прокси, другие VPN, Drover для Discord, файл hosts, групповые политики, время и DNS.")
+                                        : @tr("Прокси в переменных окружения, файл hosts и системное время.");
                                     color: Theme.text-secondary;
                                     font-size: Theme.type-metadata-size;
                                     wrap: word-wrap;
@@ -596,19 +596,19 @@ export component TroubleshootPage inherits Rectangle {
                         }
                         Text {
                             text: root.windows
-                                ? "Сами по ходу проверки мы только отключим сторонний системный прокси и очистим DNS-кэш. Всё остальное — лишь то, что вы отметите."
-                                : "Проверка ничего не меняет в системе.";
+                                ? @tr("Сами по ходу проверки мы только отключим сторонний системный прокси и очистим DNS-кэш. Всё остальное — лишь то, что вы отметите.")
+                                : @tr("Проверка ничего не меняет в системе.");
                             color: Theme.text-muted;
                             font-size: Theme.type-metadata-size;
                             wrap: word-wrap;
                         }
-                        if root.connected: Text { text: "Сначала отключитесь: проверка меняет сетевые настройки."; color: Theme.warning; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                        if root.connected: Text { text: @tr("Сначала отключитесь: проверка меняет сетевые настройки."); color: Theme.warning; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                         if root.error-text != "": Text { text: root.error-text; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                         HorizontalLayout {
                             alignment: start;
                             PrimaryAction {
                                 width: 184px;
-                                label: "Начать проверку";
+                                label: @tr("Начать проверку");
                                 enabled: !root.connected && !root.busy;
                                 activated => { root.begin-run(); }
                             }
@@ -627,14 +627,14 @@ export component TroubleshootPage inherits Rectangle {
                             spacing: 10px;
                             Text {
                                 horizontal-stretch: 1;
-                                text: root.step-index < root.steps.length ? root.steps[root.step-index].label : "Готово";
+                                text: root.step-index < root.steps.length ? root.steps[root.step-index].label : @tr("Готово");
                                 color: Theme.text-primary;
                                 font-size: Theme.type-label-size;
                                 font-weight: Theme.weight-semibold;
                                 overflow: elide;
                             }
                             Text {
-                                text: Math.min(root.step-index + 1, root.steps.length) + " из " + root.steps.length;
+                                text: @tr("{} из {}", Math.min(root.step-index + 1, root.steps.length), root.steps.length);
                                 color: Theme.text-muted;
                                 font-size: Theme.type-metadata-size;
                                 vertical-alignment: center;
@@ -712,7 +712,7 @@ export component TroubleshootPage inherits Rectangle {
                     if root.fix-results.length > 0: VerticalLayout {
                         padding-top: 20px;
                         spacing: 0px;
-                        SectionHead { text: "РЕЗУЛЬТАТ ИСПРАВЛЕНИЙ"; }
+                        SectionHead { text: @tr("РЕЗУЛЬТАТ ИСПРАВЛЕНИЙ"); }
                         GroupCard {
                             height: fix-results-list.preferred-height;
                             fix-results-list := VerticalLayout {
@@ -722,14 +722,14 @@ export component TroubleshootPage inherits Rectangle {
                         if root.reboot-recommended: HorizontalLayout {
                             padding-left: 4px;
                             padding-top: 6px;
-                            Text { text: "Перезагрузите ПК, чтобы изменения вступили в силу."; color: Theme.warning; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                            Text { text: @tr("Перезагрузите ПК, чтобы изменения вступили в силу."); color: Theme.warning; font-size: Theme.type-metadata-size; wrap: word-wrap; }
                         }
                     }
 
                     if root.cards.length > 0: VerticalLayout {
                         padding-top: 20px;
                         spacing: 0px;
-                        SectionHead { text: "ЧТО НАШЛИ"; }
+                        SectionHead { text: @tr("ЧТО НАШЛИ"); }
                         GroupCard {
                             height: cards-list.preferred-height;
                             cards-list := VerticalLayout {
@@ -741,7 +741,7 @@ export component TroubleshootPage inherits Rectangle {
                     if root.fixes.length > 0: VerticalLayout {
                         padding-top: 20px;
                         spacing: 0px;
-                        SectionHead { text: root.summary-tone == "success" ? "ЕСЛИ ВСЁ РАВНО НЕ РАБОТАЕТ" : "ИСПРАВЛЕНИЯ — ОТМЕТЬТЕ НУЖНЫЕ"; }
+                        SectionHead { text: root.summary-tone == "success" ? @tr("ЕСЛИ ВСЁ РАВНО НЕ РАБОТАЕТ") : @tr("ИСПРАВЛЕНИЯ — ОТМЕТЬТЕ НУЖНЫЕ"); }
                         GroupCard {
                             height: fixes-list.preferred-height;
                             fixes-list := VerticalLayout {
@@ -761,7 +761,7 @@ export component TroubleshootPage inherits Rectangle {
                 if root.windows && root.phase != "running": VerticalLayout {
                     padding-top: 20px;
                     spacing: 0px;
-                    SectionHead { text: "ИНСТРУМЕНТЫ"; }
+                    SectionHead { text: @tr("ИНСТРУМЕНТЫ"); }
                     HorizontalLayout {
                         spacing: 12px;
                         PageButton {
@@ -771,7 +771,7 @@ export component TroubleshootPage inherits Rectangle {
                             preferred-width: 0px;
                             horizontal-stretch: 1;
                             kind: "outline";
-                            label: root.repair-busy == "wintun" ? "Выполняем…" : "Переустановить Wintun";
+                            label: root.repair-busy == "wintun" ? @tr("Выполняем…") : @tr("Переустановить Wintun");
                             icon: @image-url("../assets/layers.svg");
                             has-icon: true;
                             icon-size: 16px;
@@ -785,7 +785,7 @@ export component TroubleshootPage inherits Rectangle {
                             preferred-width: 0px;
                             horizontal-stretch: 1;
                             kind: "outline";
-                            label: root.repair-busy == "service" ? "Выполняем…" : "Переустановить службу";
+                            label: root.repair-busy == "service" ? @tr("Выполняем…") : @tr("Переустановить службу");
                             icon: @image-url("../assets/server.svg");
                             has-icon: true;
                             icon-size: 16px;
@@ -810,8 +810,8 @@ export component TroubleshootPage inherits Rectangle {
                                 Text {
                                     horizontal-stretch: 1;
                                     text: root.repair-confirm == "wintun"
-                                        ? "Удалим сетевой адаптер MULTICORE — при следующем подключении он создастся заново. Понадобятся права администратора; другие VPN и драйвер Wintun не затронутся."
-                                        : "Заново зарегистрируем и запустим службу MULTICORE из установленных файлов. Служба перезапустится; понадобятся права администратора.";
+                                        ? @tr("Удалим сетевой адаптер MULTICORE — при следующем подключении он создастся заново. Понадобятся права администратора; другие VPN и драйвер Wintun не затронутся.")
+                                        : @tr("Заново зарегистрируем и запустим службу MULTICORE из установленных файлов. Служба перезапустится; понадобятся права администратора.");
                                     color: Theme.warning;
                                     font-size: 12px;
                                     vertical-alignment: center;
@@ -819,12 +819,12 @@ export component TroubleshootPage inherits Rectangle {
                                 }
                                 VerticalLayout {
                                     alignment: center;
-                                    LinkAction { label: "Отмена"; tone: "neutral"; activated => { root.repair-confirm = ""; } }
+                                    LinkAction { label: @tr("Отмена"); tone: "neutral"; activated => { root.repair-confirm = ""; } }
                                 }
                                 VerticalLayout {
                                     alignment: center;
                                     LinkAction {
-                                        label: "Да, переустановить";
+                                        label: @tr("Да, переустановить");
                                         tone: "danger";
                                         enabled: !root.busy && !root.connected;
                                         activated => {
@@ -843,7 +843,7 @@ export component TroubleshootPage inherits Rectangle {
                     padding-left: 4px;
                     padding-top: 20px;
                     Text {
-                        text: "Если не помогло — перезагрузите ПК. Расширения браузера вроде «Обход блокировок Рунета» тоже могут мешать VPN.";
+                        text: @tr("Если не помогло — перезагрузите ПК. Расширения браузера вроде «Обход блокировок Рунета» тоже могут мешать VPN.");
                         color: Theme.text-muted;
                         font-size: 12px;
                         wrap: word-wrap;
@@ -867,13 +867,13 @@ export component TroubleshootPage inherits Rectangle {
                 if root.fixes.length > 0: PageButton {
                     kind: "primary";
                     padding-x: 18px;
-                    label: root.phase == "fixing" ? "Исправляем…" : "Исправить выбранное (" + root.checked-count + ")";
+                    label: root.phase == "fixing" ? @tr("Исправляем…") : @tr("Исправить выбранное ({})", root.checked-count);
                     enabled: root.checked-count > 0 && !root.busy;
                     activated => { root.apply-fixes(); }
                 }
                 Text {
                     horizontal-stretch: 1;
-                    text: root.fixes.length > 0 ? "Без вашей отметки ничего не меняется" : "";
+                    text: root.fixes.length > 0 ? @tr("Без вашей отметки ничего не меняется") : "";
                     color: Theme.text-muted;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -882,7 +882,7 @@ export component TroubleshootPage inherits Rectangle {
                 }
                 PageButton {
                     kind: "secondary";
-                    label: "Повторить подключение";
+                    label: @tr("Повторить подключение");
                     enabled: !root.busy && !root.connected;
                     activated => { root.retry-connect(); }
                 }
