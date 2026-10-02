@@ -129,7 +129,7 @@ component TraySegment inherits Rectangle {
     border-width: segment-focus.has-focus ? Theme.focus-width : 0px;
     opacity: root.enabled ? 1 : 0.5;
     accessible-role: button;
-    accessible-label: root.label + (root.selected ? ", выбрано" : "");
+    accessible-label: root.label + (root.selected ? @tr(", выбрано") : "");
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
     animate background { duration: 140ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
@@ -202,7 +202,7 @@ component TrayNodeRow inherits Rectangle {
     border-color: Theme.focus;
     border-width: node-focus.has-focus ? Theme.focus-width : 0px;
     accessible-role: button;
-    accessible-label: root.label + (root.latency == "" ? "" : ", " + root.latency) + (root.selected ? ", выбрано" : "");
+    accessible-label: root.label + (root.latency == "" ? "" : ", " + root.latency) + (root.selected ? @tr(", выбрано") : "");
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.activated(); } }
     animate background { duration: 140ms; easing: ease-out; }
@@ -333,8 +333,8 @@ export component TrayPopup inherits Window {
     default-font-family: Theme.font-family;
 
     // Tooltip-style status line, kept for assistive technology.
-    in property <string> status-text: "Готово";
-    in property <string> connection-label: "Подключиться";
+    in property <string> status-text: @tr("Готово");
+    in property <string> connection-label: @tr("Подключиться");
     in property <bool> connection-enabled: true;
     in property <bool> connected: false;
     in property <bool> has-profile: true;
@@ -349,7 +349,7 @@ export component TrayPopup inherits Window {
     in property <bool> subscription-unlimited: true;
     in property <string> subscription-quota-tone: "accent";
     in property <bool> subscription-failed: false;
-    in property <string> toggle-title: "Защита выключена";
+    in property <string> toggle-title: @tr("Защита выключена");
     in property <bool> toggle-on: false;
     in property <bool> toggle-busy: false;
     in property <bool> toggle-detail-is-exit: true;
@@ -391,8 +391,8 @@ export component TrayPopup inherits Window {
         : root.toggle-intent == "off" ? false
         : root.toggle-on;
     private property <bool> shown-busy: root.toggle-busy || root.toggle-intent != "none";
-    private property <string> shown-title: root.toggle-intent == "on" ? "Подключение…"
-        : root.toggle-intent == "off" ? "Отключение…"
+    private property <string> shown-title: root.toggle-intent == "on" ? @tr("Подключение…")
+        : root.toggle-intent == "off" ? @tr("Отключение…")
         : root.toggle-title;
     private property <string> shown-tone: root.toggle-intent != "none" ? "neutral" : root.status-tone;
     function press-toggle() {
@@ -480,14 +480,14 @@ export component TrayPopup inherits Window {
                         overflow: elide;
                     }
                     if root.has-profile: Text {
-                        text: root.subscription-failed ? " · Не удалось обновить"
+                        text: root.subscription-failed ? @tr(" · Не удалось обновить")
                             : " · " + root.subscription-remaining + " · " + root.subscription-days;
                         color: root.subscription-failed || root.subscription-quota-tone == "danger" ? Theme.error : Theme.text-muted;
                         font-size: 11.5px;
                         vertical-alignment: center;
                     }
                     if !root.has-profile: Text {
-                        text: "Нет подписки";
+                        text: @tr("Нет подписки");
                         color: Theme.text-muted;
                         font-size: 11.5px;
                         vertical-alignment: center;
@@ -645,7 +645,7 @@ export component TrayPopup inherits Window {
                         // A wider popup gives a long exit name more room.
                         if root.exit-name != "": Text { max-width: Math.max(110px, root.width - 194px); text: root.exit-name; color: Theme.text-secondary; font-size: 11.5px; vertical-alignment: center; overflow: elide; }
                         if root.exit-latency != "": Text { text: "· " + root.exit-latency; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; }
-                        if root.session-uptime != "": Text { text: "· " + root.session-uptime; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; accessible-label: "Время сессии " + root.session-uptime; }
+                        if root.session-uptime != "": Text { text: "· " + root.session-uptime; color: Theme.text-muted; font-size: 11.5px; vertical-alignment: center; accessible-label: @tr("Время сессии {}", root.session-uptime); }
                     }
                     if !root.toggle-detail-is-exit: Text {
                         text: root.supporting;
@@ -829,13 +829,13 @@ export component TrayPopup inherits Window {
                     width: parent.width - self.x - 12px;
                     alignment: center;
                     spacing: 2px;
-                    Text { text: "Добавить подписку"; color: add-touch.has-hover ? Theme.accent-blue-hover : Theme.accent-blue; font-size: 13px; font-weight: Theme.weight-semibold; }
-                    Text { text: "Откроется главное окно"; color: Theme.text-muted; font-size: 11.5px; }
+                    Text { text: @tr("Добавить подписку"); color: add-touch.has-hover ? Theme.accent-blue-hover : Theme.accent-blue; font-size: 13px; font-weight: Theme.weight-semibold; }
+                    Text { text: @tr("Откроется главное окно"); color: Theme.text-muted; font-size: 11.5px; }
                 }
                 FocusScope {
                     focus-on-tab-navigation: true;
                     accessible-role: button;
-                    accessible-label: "Добавить подписку";
+                    accessible-label: @tr("Добавить подписку");
                     accessible-action-default => { root.add-subscription(); }
                     key-pressed(event) => {
                         if (event.text == " " || event.text == "\n") {
@@ -1035,7 +1035,7 @@ export component TrayPopup inherits Window {
                         }
                         if root.node-rows.length == 0: Text {
                             height: 48px;
-                            text: "Маршруты пока недоступны";
+                            text: @tr("Маршруты пока недоступны");
                             color: Theme.text-muted;
                             font-size: 12px;
                             horizontal-alignment: center;
@@ -1056,7 +1056,7 @@ export component TrayPopup inherits Window {
                     x: 6px;
                     y: 4px;
                     width: parent.width / 2 - 10px;
-                    label: "Открыть";
+                    label: @tr("Открыть");
                     icon: @image-url("../assets/tray-open.svg");
                     activated => { root.open-main(); }
                 }
@@ -1071,7 +1071,7 @@ export component TrayPopup inherits Window {
                     x: parent.width / 2 + 4px;
                     y: 4px;
                     width: parent.width / 2 - 10px;
-                    label: "Выйти";
+                    label: @tr("Выйти");
                     icon: @image-url("../assets/tray-quit.svg");
                     activated => { root.exit-app(); }
                 }

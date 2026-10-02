@@ -14,3 +14,673 @@ msgstr ""
 
 msgid "Выбран провайдером подписки"
 msgstr "Set by your subscription provider"
+
+# Slint interface (ui/*.slint)
+
+msgid "Развернуть меню"
+msgstr "Expand menu"
+
+msgid "Свернуть меню"
+msgstr "Collapse menu"
+
+msgid "Свернуть"
+msgstr "Collapse"
+
+msgid "Выбранный фильтр"
+msgstr "Selected filter"
+
+msgid ", выбрано"
+msgstr ", selected"
+
+msgid "Профиль не добавлен"
+msgstr "No profile yet"
+
+msgid "Добавьте подписку"
+msgstr "Add a subscription"
+
+msgid "Вставьте URL — остальное настроим автоматически."
+msgstr "Paste a URL — we'll set up the rest."
+
+msgid "Маршрут не выбран"
+msgstr "No route selected"
+
+msgid "Подключить"
+msgstr "Connect"
+
+msgid "Защита выключена"
+msgstr "Protection off"
+
+msgid "Подписка"
+msgstr "Subscription"
+
+msgid "П"
+msgstr "S"
+
+msgid "Нет данных"
+msgstr "No data"
+
+msgid "Добавьте ссылку"
+msgstr "Add a link"
+
+msgid "Не обновлялась"
+msgstr "Never updated"
+
+msgid "Бессрочно"
+msgstr "No expiry"
+
+msgid "· Не удалось обновить"
+msgstr "· Update failed"
+
+msgid "Остановлен"
+msgstr "Stopped"
+
+msgid "Канал обновлений не настроен"
+msgstr "Update channel not set up"
+
+msgid "Подключение…"
+msgstr "Connecting…"
+
+msgid "Отключение…"
+msgstr "Disconnecting…"
+
+msgid "Выбрать профиль подписки"
+msgstr "Choose a subscription"
+
+msgid "{}, осталось {}, {}. Обновлено {}. {}"
+msgstr "{}, {} left, {}. Updated {}. {}"
+
+msgid "Список профилей открыт"
+msgstr "Profile list open"
+
+msgid "Открыть список профилей"
+msgstr "Open profile list"
+
+msgid "Указать ссылку подписки"
+msgstr "Set subscription link"
+
+msgid "Подписка обновляется"
+msgstr "Updating subscription"
+
+msgid "Обновить подписку"
+msgstr "Update subscription"
+
+msgid "Скрыть сообщение провайдера"
+msgstr "Hide provider message"
+
+msgid "Сообщение провайдера"
+msgstr "Provider message"
+
+msgid "Свернуть окно"
+msgstr "Minimize"
+
+msgid "Развернуть или восстановить окно"
+msgstr "Maximize or restore window"
+
+msgid "Закрыть MULTICORE"
+msgstr "Close MULTICORE"
+
+msgid "Главная"
+msgstr "Home"
+
+msgid "Состояние"
+msgstr "Status"
+
+msgid "Подписки"
+msgstr "Subscriptions"
+
+msgid "Настройки"
+msgstr "Settings"
+
+msgid "Время сессии {}"
+msgstr "Session time {}"
+
+msgid "Текущий узел {}"
+msgstr "Exit server {}"
+
+msgid "Загрузка {}"
+msgstr "Download {}"
+
+msgid "Отдача {}"
+msgstr "Upload {}"
+
+msgid "Конфликт с другим VPN-приложением"
+msgstr "Conflict with another VPN app"
+
+msgid "Закрываем…"
+msgstr "Closing…"
+
+msgid "Закрыть"
+msgstr "Close"
+
+msgid "Понятно"
+msgstr "Got it"
+
+msgid "Не получается подключиться?"
+msgstr "Can't connect?"
+
+msgid "Проверим антивирусы, прокси, программы обхода блокировок и другое, что мешает VPN."
+msgstr "We'll check antivirus, proxies, DPI bypass tools and more that can block the VPN."
+
+msgid "Устранить неполадки"
+msgstr "Troubleshoot"
+
+msgid "Скрыть"
+msgstr "Hide"
+
+msgid "Скопируйте ссылку у провайдера — мы подхватим её из буфера обмена"
+msgstr "Copy the link from your provider — we'll pick it up from the clipboard"
+
+msgid "Добавляем…"
+msgstr "Adding…"
+
+msgid "Вставить из буфера"
+msgstr "Paste link"
+
+msgid "Вставить подписку из буфера обмена"
+msgstr "Paste subscription from clipboard"
+
+msgid "Ввести ссылку вручную"
+msgstr "Enter link manually"
+
+msgid "URL подписки"
+msgstr "Subscription URL"
+
+msgid "Отмена"
+msgstr "Cancel"
+
+msgid "Добавить"
+msgstr "Add"
+
+msgid "Ссылка хранится только на этом устройстве"
+msgstr "The link stays on this device"
+
+msgid "1 СКОПИРУЙТЕ ССЫЛКУ"
+msgstr "1 COPY THE LINK"
+
+msgid "2 ВСТАВЬТЕ"
+msgstr "2 PASTE"
+
+msgid "3 ВКЛЮЧИТЕ ЗАЩИТУ"
+msgstr "3 CONNECT"
+
+msgid "Маршруты"
+msgstr "Routes"
+
+msgid "Замеряем задержку…"
+msgstr "Measuring latency…"
+
+msgid "Обновлено {}"
+msgstr "Updated {}"
+
+msgid "Поиск маршрутов"
+msgstr "Search routes"
+
+msgid "Проверить пинг"
+msgstr "Check ping"
+
+msgid "Поиск по маршрутам"
+msgstr "Search routes"
+
+msgid "Закрыть поиск"
+msgstr "Close search"
+
+msgid "Загружаем…"
+msgstr "Loading…"
+
+msgid "Повторить"
+msgstr "Retry"
+
+msgid "Загружаем маршруты"
+msgstr "Loading routes"
+
+msgid "В этой группе нет доступных серверов"
+msgstr "No servers available in this group"
+
+msgid "Ничего не найдено"
+msgstr "Nothing found"
+
+msgid "Попробуйте другое название страны или сервера"
+msgstr "Try another country or server name"
+
+msgid "Открыть дашборд"
+msgstr "Open dashboard"
+
+msgid "Подключитесь, чтобы открыть панель Mihomo."
+msgstr "Connect to open the Mihomo dashboard."
+
+msgid "Копировать лог"
+msgstr "Copy log"
+
+msgid "Скопировано ✓"
+msgstr "Copied ✓"
+
+msgid "Сохранить лог…"
+msgstr "Save log…"
+
+msgid "Сохраняем…"
+msgstr "Saving…"
+
+msgid "Не сохранено"
+msgstr "Not saved"
+
+msgid "В Загрузках ✓"
+msgstr "In Downloads ✓"
+
+msgid "Сохранено ✓"
+msgstr "Saved ✓"
+
+msgid "ЯДРА"
+msgstr "CORES"
+
+msgid "Обновляем…"
+msgstr "Updating…"
+
+msgid "Транспорт Xray"
+msgstr "Xray transport"
+
+msgid "Политики Mihomo"
+msgstr "Mihomo policies"
+
+msgid "Туннель TUN"
+msgstr "TUN tunnel"
+
+msgid "МАППИНГ"
+msgstr "MAPPING"
+
+msgid "Локальные прокси-адреса для сторонних приложений"
+msgstr "Local proxy addresses for other apps"
+
+msgid "Маппинги появятся после загрузки подписки"
+msgstr "Mappings appear once a subscription loads"
+
+msgid "ЖУРНАЛ"
+msgstr "LOG"
+
+msgid "Все"
+msgstr "All"
+
+msgid "Система"
+msgstr "System"
+
+msgid "Ошибки"
+msgstr "Errors"
+
+msgid "Ядра"
+msgstr "Cores"
+
+msgid "Ошибка"
+msgstr "Error"
+
+msgid "Событие"
+msgstr "Event"
+
+msgid "Событий пока нет"
+msgstr "No events yet"
+
+msgid "ПОДКЛЮЧЕНИЕ"
+msgstr "CONNECTION"
+
+msgid "Режим TUN — весь трафик"
+msgstr "TUN mode — all traffic"
+
+msgid "Применится при следующем подключении"
+msgstr "Applies on next connect"
+
+msgid "Все приложения идут через VPN"
+msgstr "All apps go through the VPN"
+
+msgid "Только программы с системным прокси · без прав администратора"
+msgstr "Only apps that use the system proxy · no admin rights"
+
+msgid "Подключаться после входа в систему"
+msgstr "Connect after sign-in"
+
+msgid "Когда появится сеть и профиль будет готов"
+msgstr "Once the network and profile are ready"
+
+msgid "Сначала включите автозапуск"
+msgstr "Turn on autostart first"
+
+msgid "Без TUN трафик идёт через системный прокси — без запроса прав администратора"
+msgstr "Without TUN, traffic goes through the system proxy — no admin prompt"
+
+msgid "Мгновенное подключение — установить службу"
+msgstr "Instant connect — install the service"
+
+msgid "Один запрос прав сейчас — дальше без запросов. Подписки сохранятся."
+msgstr "One admin prompt now, none after. Subscriptions are kept."
+
+msgid "Установить"
+msgstr "Install"
+
+msgid "ПРИЛОЖЕНИЕ"
+msgstr "APP"
+
+msgid "Запускать при входе в {}"
+msgstr "Launch at {} sign-in"
+
+msgid "Путь приложения изменился — включите заново"
+msgstr "The app moved — turn this on again"
+
+msgid "Живой фон"
+msgstr "Live background"
+
+msgid "Анимация отключена настройками {}"
+msgstr "Animation is off in {} settings"
+
+msgid "Спокойные волны на главной"
+msgstr "Calm waves on Home"
+
+msgid "Все подписки и настройки будут удалены"
+msgstr "Erases all subscriptions and settings"
+
+msgid "Удалить все данные"
+msgstr "Delete all data"
+
+msgid "Удалить"
+msgstr "Delete"
+
+msgid "Удалить…"
+msgstr "Delete…"
+
+msgid "ПОМОЩЬ"
+msgstr "HELP"
+
+msgid "Если VPN не подключается: проверим антивирусы, прокси, порты и другое"
+msgstr "If the VPN won't connect: we check antivirus, proxies, ports and more"
+
+msgid "Открыть"
+msgstr "Open"
+
+msgid "ОБНОВЛЕНИЯ"
+msgstr "UPDATES"
+
+msgid "До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве"
+msgstr "Up to 16 subscriptions · one active at a time · links stay on this device"
+
+msgid "Добавляем подписку с {}…"
+msgstr "Adding from {}…"
+
+msgid "Подписка с {} ожидает добавления…"
+msgstr "Waiting to add subscription from {}…"
+
+msgid "Ссылка на новую подписку"
+msgstr "New subscription link"
+
+msgid "МОИ ПОДПИСКИ"
+msgstr "SUBSCRIPTIONS"
+
+msgid "Загружаем подписки…"
+msgstr "Loading list…"
+
+msgid "Подписок пока нет"
+msgstr "No subscriptions"
+
+msgid "Сделать активной {}"
+msgstr "Make {} active"
+
+msgid "Отключитесь, чтобы сменить подписку"
+msgstr "Disconnect to switch subscriptions"
+
+msgid "АКТИВНА"
+msgstr "ACTIVE"
+
+msgid "Меняем ссылку…"
+msgstr "Changing link…"
+
+msgid "Удаляем…"
+msgstr "Deleting…"
+
+msgid "Применяем…"
+msgstr "Applying…"
+
+msgid "{} · {} · Временно недоступна"
+msgstr "{} · {} · Unavailable for now"
+
+msgid "Временно недоступна"
+msgstr "Unavailable for now"
+
+msgid "Активна"
+msgstr "Active"
+
+msgid "Доступна"
+msgstr "Available"
+
+msgid "Обновить {}"
+msgstr "Update {}"
+
+msgid "Изменить URL {}"
+msgstr "Change URL of {}"
+
+msgid "Удалить {}"
+msgstr "Delete {}"
+
+msgid "Новый URL подписки"
+msgstr "New URL"
+
+msgid "Новый URL для {}"
+msgstr "New URL for {}"
+
+msgid "Сохранить"
+msgstr "Save"
+
+msgid "Удалить подписку?"
+msgstr "Delete this one?"
+
+msgid "Нажмите на подписку, чтобы сделать её активной. Обновление происходит автоматически при запуске приложения или вручную."
+msgstr "Click a subscription to make it active. It updates automatically when the app starts, or manually."
+
+msgid "Доступно обновление"
+msgstr "Update available"
+
+msgid "Подробнее"
+msgstr "Details"
+
+msgid "Позже"
+msgstr "Later"
+
+msgid "Мгновенное подключение"
+msgstr "Instant connect"
+
+msgid "Установите службу — VPN будет включаться без запроса прав"
+msgstr "Install the service — the VPN turns on without a prompt"
+
+msgid "Не сейчас"
+msgstr "Not now"
+
+msgid "Открыта установленная версия"
+msgstr "Opened the installed version"
+
+msgid "AppImage можно удалить — используется MULTICORE из системы"
+msgstr "You can delete the AppImage — the installed MULTICORE is used"
+
+msgid "Повторить загрузку профилей"
+msgstr "Retry loading profiles"
+
+msgid "Загружаем профили"
+msgstr "Loading profiles"
+
+msgid "Загружаем профили…"
+msgstr "Loading profiles…"
+
+msgid "{} · Переключаем…"
+msgstr "{} · Switching…"
+
+msgid "ИСТЕКЛА"
+msgstr "EXPIRED"
+
+msgid "{}, активная подписка"
+msgstr "{}, active subscription"
+
+msgid "Активировать {}"
+msgstr "Activate {}"
+
+msgid ", срок истёк"
+msgstr ", expired"
+
+msgid ", осталось {}, {}"
+msgstr ", {} left, {}"
+
+msgid "Добавить подписку"
+msgstr "Add subscription"
+
+msgid "Все подписки"
+msgstr "Show all"
+
+msgid "НОВОЕ ОТ ПРОВАЙДЕРА"
+msgstr "FROM YOUR PROVIDER"
+
+msgid "Закрыть сообщение провайдера"
+msgstr "Close provider message"
+
+msgid "Обновить MULTICORE?"
+msgstr "Update MULTICORE?"
+
+msgid "Скачаем обновление, не отключая VPN.\nТуннель остановится только после загрузки."
+msgstr "The update downloads with the VPN on.\nThe tunnel stops only after the download."
+
+msgid "Обновить и перезапустить"
+msgstr "Update and restart"
+
+msgid "Добавить подписку?"
+msgstr "Add subscription?"
+
+msgid "Получена ссылка. Загрузить подписку с домена:"
+msgstr "Got a link. Load the subscription from:"
+
+msgid "выбрано"
+msgstr "selected"
+
+msgid "выбор применяется"
+msgstr "applying selection"
+
+msgid "Готово"
+msgstr "Ready"
+
+msgid "Подключиться"
+msgstr "Connect"
+
+msgid " · Не удалось обновить"
+msgstr " · Update failed"
+
+msgid "Нет подписки"
+msgstr "No subscription"
+
+msgid "Откроется главное окно"
+msgstr "Opens the main window"
+
+msgid "Маршруты пока недоступны"
+msgstr "Routes not available yet"
+
+msgid "Выйти"
+msgstr "Quit"
+
+msgid "Ошибка: "
+msgstr "Error: "
+
+msgid "Предупреждение: "
+msgstr "Warning: "
+
+msgid "Права администратора"
+msgstr "Admin rights"
+
+msgid "Нужна перезагрузка"
+msgstr "Restart needed"
+
+msgid "Проверяем…"
+msgstr "Checking…"
+
+msgid "Исправляем…"
+msgstr "Fixing…"
+
+msgid "Устранение неполадок"
+msgstr "Troubleshooting"
+
+msgid "Проверить заново"
+msgstr "Check again"
+
+msgid "Проверим, что на этом компьютере может мешать VPN, и поможем это исправить."
+msgstr "We'll find what on this PC may block the VPN and help fix it."
+
+msgid "Проверили, что на этом компьютере может мешать VPN"
+msgstr "Checked what on this PC may block the VPN"
+
+msgid " · последняя проверка {}"
+msgstr " · last check {}"
+
+msgid "Что проверим"
+msgstr "What we check"
+
+msgid "Антивирусы, программы обхода блокировок, занятые порты, системный прокси, другие VPN, Drover для Discord, файл hosts, групповые политики, время и DNS."
+msgstr "Antivirus, DPI bypass tools, busy ports, system proxy, other VPNs, Drover for Discord, hosts file, group policies, time and DNS."
+
+msgid "Прокси в переменных окружения, файл hosts и системное время."
+msgstr "Proxy environment variables, the hosts file and system time."
+
+msgid "Сами по ходу проверки мы только отключим сторонний системный прокси и очистим DNS-кэш. Всё остальное — лишь то, что вы отметите."
+msgstr "On our own we only turn off a third-party system proxy and flush the DNS cache. Everything else only if you select it."
+
+msgid "Проверка ничего не меняет в системе."
+msgstr "The check changes nothing."
+
+msgid "Сначала отключитесь: проверка меняет сетевые настройки."
+msgstr "Disconnect first: the check changes network settings."
+
+msgid "Начать проверку"
+msgstr "Start check"
+
+msgid "{} из {}"
+msgstr "{} of {}"
+
+msgid "РЕЗУЛЬТАТ ИСПРАВЛЕНИЙ"
+msgstr "FIX RESULTS"
+
+msgid "Перезагрузите ПК, чтобы изменения вступили в силу."
+msgstr "Restart your PC for the changes to take effect."
+
+msgid "ЧТО НАШЛИ"
+msgstr "FINDINGS"
+
+msgid "ЕСЛИ ВСЁ РАВНО НЕ РАБОТАЕТ"
+msgstr "IF IT STILL DOESN'T WORK"
+
+msgid "ИСПРАВЛЕНИЯ — ОТМЕТЬТЕ НУЖНЫЕ"
+msgstr "FIXES — PICK WHAT YOU NEED"
+
+msgid "ИНСТРУМЕНТЫ"
+msgstr "TOOLS"
+
+msgid "Выполняем…"
+msgstr "Working…"
+
+msgid "Переустановить Wintun"
+msgstr "Reinstall Wintun"
+
+msgid "Переустановить службу"
+msgstr "Reinstall service"
+
+msgid "Удалим сетевой адаптер MULTICORE — при следующем подключении он создастся заново. Понадобятся права администратора; другие VPN и драйвер Wintun не затронутся."
+msgstr "We'll remove the MULTICORE network adapter — it's recreated on the next connect. Needs admin rights; other VPNs and the Wintun driver stay untouched."
+
+msgid "Заново зарегистрируем и запустим службу MULTICORE из установленных файлов. Служба перезапустится; понадобятся права администратора."
+msgstr "We'll re-register and start the MULTICORE service from the installed files. The service restarts; admin rights are needed."
+
+msgid "Да, переустановить"
+msgstr "Yes, reinstall"
+
+msgid "Если не помогло — перезагрузите ПК. Расширения браузера вроде «Обход блокировок Рунета» тоже могут мешать VPN."
+msgstr "Still not working? Restart your PC. Browser extensions that bypass blocking can also interfere with the VPN."
+
+msgid "Исправить выбранное ({})"
+msgstr "Fix selected ({})"
+
+msgid "Без вашей отметки ничего не меняется"
+msgstr "Nothing changes unless you select it"
+
+msgid "Повторить подключение"
+msgstr "Retry connection"
+
+msgid "Найдено {n} · поиск по всем группам"
+msgid_plural "Найдено {n} · поиск по всем группам"
+msgstr[0] "{n} result · all groups"
+msgstr[1] "{n} results · all groups"

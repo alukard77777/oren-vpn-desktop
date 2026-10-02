@@ -351,17 +351,17 @@ mod tests {
         let app = include_str!("../ui/app.slint").replace("\r\n", "\n");
         // No «‹ Назад»: a breadcrumb to Settings, a status pill, «Проверить заново» and ✕.
         assert!(!page.contains("‹ Назад"));
-        assert!(page.contains("text: \"Настройки\";"));
+        assert!(page.contains("text: @tr(\"Настройки\");"));
         assert!(page.contains("crumb-touch := TouchArea { mouse-cursor: pointer; clicked => { root.open-settings(); } }"));
-        assert!(page.contains("label: \"Проверить заново\";"));
-        assert!(page.contains("accessible-label: \"Закрыть\";"));
+        assert!(page.contains("label: @tr(\"Проверить заново\");"));
+        assert!(page.contains("accessible-label: @tr(\"Закрыть\");"));
         // Header, then the scrolling body, then the action bar.
         let header = page.find("// ---- Header").expect("header");
         let body = page.find("scroll := OverlayScroll").expect("body");
         let bar = page.find("// ---- Action bar").expect("action bar");
         assert!(header < body && body < bar);
-        assert!(page.contains("\"Исправить выбранное (\" + root.checked-count + \")\""));
-        assert!(page.contains("label: \"Повторить подключение\";"));
+        assert!(page.contains("@tr(\"Исправить выбранное ({})\", root.checked-count)"));
+        assert!(page.contains("label: @tr(\"Повторить подключение\");"));
         // ✕ and «Повторить подключение» go back where the page was opened from; the
         // breadcrumb always goes to Settings, which stays lit in the rail.
         let usage = app

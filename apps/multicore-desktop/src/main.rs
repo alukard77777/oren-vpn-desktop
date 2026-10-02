@@ -6555,9 +6555,9 @@ mod window_tests {
             "in property <bool> subscription-updated-stale",
             "title-subscription := Rectangle",
             "subscription-refresh-action := FocusScope",
-            "root.subscription-refresh-pending ? \"Подписка обновляется\" : \"Обновить подписку\"",
+            "root.subscription-refresh-pending ? @tr(\"Подписка обновляется\") : @tr(\"Обновить подписку\")",
             "root.refresh-subscription();",
-            "accessible-description: root.subscription-title + \", осталось \" + root.subscription-remaining + \", \" + root.subscription-days + \". Обновлено \" + root.subscription-updated",
+            "accessible-description: @tr(\"{}, осталось {}, {}. Обновлено {}. {}\", root.subscription-title, root.subscription-remaining, root.subscription-days, root.subscription-updated",
             "announcement-popover := Rectangle",
             "announcement-copy := Text",
             "routes-heading := HorizontalLayout",
@@ -6613,7 +6613,7 @@ mod window_tests {
             .and_then(|source| source.split("route-search-toggle := FocusScope").next())
             .expect("routes header source");
         // The bare date ("29.09.2026") next to "Маршруты" read as unexplained.
-        assert!(routes_header.contains(": \"Обновлено \" + root.subscription-updated;"));
+        assert!(routes_header.contains(": @tr(\"Обновлено {}\", root.subscription-updated);"));
         // The separator dot is its own element so both of its gaps are equal.
         assert!(routes_header.contains("text: \"·\";"));
         assert!(routes_header.contains("root.subscription-updated-stale ? Theme.warning"));
@@ -6622,7 +6622,7 @@ mod window_tests {
         assert!(!routes_header.contains("route-updated-divider := Rectangle"));
         assert!(!routes_header.contains("commands: \"M 7 1.5"));
         // Latency progress is shown in place of the timestamp, not as extra chrome.
-        assert!(routes_header.contains("root.latency-check-loading ? \"Замеряем задержку…\""));
+        assert!(routes_header.contains("root.latency-check-loading ? @tr(\"Замеряем задержку…\")"));
         assert!(!routes_header.contains("catalog-selection-queued"));
         // Connection card lifts on hover and the mesh/rail decoration fades, not pops.
         assert!(ui.contains("drop-shadow-blur: strip-glow-touch.has-hover ? 20px : 0px;"));
@@ -6636,7 +6636,7 @@ mod window_tests {
             .and_then(|source| source.split("route-search-bar := Rectangle").next())
             .expect("speedtest button source");
         assert!(speedtest.contains("width: 32px;") && speedtest.contains("height: 36px;"));
-        assert!(speedtest.contains("accessible-label: \"Проверить пинг\";"));
+        assert!(speedtest.contains("accessible-label: @tr(\"Проверить пинг\");"));
         assert!(speedtest.contains("../assets/gauge.svg"));
         assert!(speedtest.contains("if root.latency-check-loading: latency-check-ring := Path"));
         assert!(speedtest.contains("stroke: #4c9dff;"));
@@ -6998,7 +6998,7 @@ mod window_tests {
             "root.settings-section == \"updates\"",
             "profile-menu-keyboard-open",
             "parent.has-focus && root.profile-menu-keyboard-open",
-            "accessible-label: \"Выбрать профиль подписки\"",
+            "accessible-label: @tr(\"Выбрать профиль подписки\")",
             "Загружаем профили…",
             "Повторить загрузку профилей",
             "@image-url(\"../assets/refresh.svg\")",
@@ -7052,8 +7052,8 @@ mod window_tests {
             "height: Math.min(parent.height - 8px, root.profile-menu-content-height);",
             "opacity: root.profile-menu-open ? 1 : 0;",
             "y: root.profile-menu-open ? -2px : -8px;",
-            "text: \"МОИ ПОДПИСКИ\";",
-            "text: \"ИСТЕКЛА\";",
+            "text: @tr(\"МОИ ПОДПИСКИ\");",
+            "text: @tr(\"ИСТЕКЛА\");",
             "menu-add := FocusScope",
             "menu-all := FocusScope",
             "root.add-subscription();",
@@ -7325,8 +7325,8 @@ mod window_tests {
             "callback cancel-update-restart()",
             "Скачаем обновление, не отключая VPN.",
             "Туннель остановится только после загрузки.",
-            "label: \"Обновить и перезапустить\"",
-            "label: \"Отмена\"",
+            "label: @tr(\"Обновить и перезапустить\")",
+            "label: @tr(\"Отмена\")",
             "update-modal-focus := FocusScope",
             "focus-epoch: root.update-confirm-focus-serial;",
         ] {
@@ -7420,7 +7420,7 @@ mod window_tests {
         let preferences = include_str!("preferences.rs");
 
         for required in [
-            "label: \"Подписки\"; badge: root.subscription-profiles.length > 1 ? \"\" + root.subscription-profiles.length : \"\"; active: root.visible-page == \"subscriptions\"",
+            "label: @tr(\"Подписки\"); badge: root.subscription-profiles.length > 1 ? \"\" + root.subscription-profiles.length : \"\"; active: root.visible-page == \"subscriptions\"",
             "if root.visible-page == \"subscriptions\"",
             "VisiblePage::Subscriptions => \"subscriptions\"",
             "\"subscriptions\" => Some(VisiblePage::Subscriptions)",
@@ -7446,7 +7446,7 @@ mod window_tests {
         assert!(ui.contains("root.replace-profile-source(profile.id, root.profile-edit-draft);"));
         // Expiry first: at the minimum width the elide must eat the usage, not the expiry.
         assert!(ui.contains("profile.expiry + \" · \" + profile.usage"));
-        assert!(ui.contains("accessible-label: \"Изменить URL \" + profile.title"));
+        assert!(ui.contains("accessible-label: @tr(\"Изменить URL {}\", profile.title)"));
         assert!(ui.contains("@image-url(\"../assets/edit.svg\")"));
         let edit_control = ui
             .split("edit-profile-focus := FocusScope")
@@ -8388,7 +8388,7 @@ mod window_tests {
             "visible: self.opacity > 0;",
             "border-color: update-toast-hover.has-hover ? #3a414b : Theme.line;",
             "filled: true;",
-            "label: root.update-action-label != \"\" ? root.update-action-label : \"Подробнее\";",
+            "label: root.update-action-label != \"\" ? root.update-action-label : @tr(\"Подробнее\");",
             "root.update-banner-dismissed-for = root.update-status;",
         ] {
             assert!(toast.contains(required), "update toast missing: {required}");
@@ -8689,8 +8689,8 @@ mod window_tests {
             .expect("deep-link confirmation overlay");
         assert!(modal.contains("background: #05070bc7;"));
         assert!(modal.contains("text: root.deep-link-confirm-host;"));
-        assert!(modal.contains("label: \"Отмена\";"));
-        assert!(modal.contains("label: \"Добавить\";"));
+        assert!(modal.contains("label: @tr(\"Отмена\");"));
+        assert!(modal.contains("label: @tr(\"Добавить\");"));
         assert!(!modal.contains("root.subscription-draft"));
         assert!(modal.contains("key-pressed(event)"));
         assert!(modal.contains("root.cancel-deep-link();"));
