@@ -4,6 +4,8 @@
 //! Ctrl+C arrives as Ctrl+«с» and copy, paste, cut, select-all, undo and redo silently do
 //! nothing. Native Windows and GTK controls match the physical key instead; this filter does
 //! the same by re-dispatching such a key press with its Latin letter.
+//!
+//! The same filter (a window has only one) reports keyboard focus changes of the window.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -47,11 +49,13 @@ fn remapped_shortcut(
     })
 }
 
-/// Installs the filter on `window`. It uses the window's only winit event-filter slot.
-pub(crate) fn install(window: &slint::Window) {
+/// Installs the filter on `window`. It uses the window's only winit event-filter slot, so it
+/// also calls `focus_changed` whenever the window gains or loses keyboard focus.
+pub(crate) fn install(window: &slint::Window, focus_changed: impl Fn(bool) + 'static) {
     let modifiers = Rc::new(Cell::new(ModifiersState::empty()));
     window.on_winit_window_event(move |window, event| {
         match event {
+            WindowEvent::Focused(focused) => focus_changed(*focused),
             WindowEvent::ModifiersChanged(state) => modifiers.set(state.state()),
             WindowEvent::KeyboardInput {
                 event,

@@ -3415,6 +3415,7 @@ dependencies = [
  "embed-resource",
  "getrandom 0.4.3",
  "gtk",
+ "i-slint-core",
  "ico",
  "image",
  "multicore-core",

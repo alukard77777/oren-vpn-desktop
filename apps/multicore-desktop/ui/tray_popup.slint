@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { IconLoadingSlot } from "components.slint";
 import "../assets/fonts/Twemoji.Mozilla.ttf";
@@ -196,6 +196,12 @@ component TrayNodeRow inherits Rectangle {
     callback activated();
     // Right click: re-measure this route's latency only.
     callback secondary-activated();
+    // Tab/Shift+Tab and the arrow keys move focus one row (+1 or -1) through the list, rows
+    // out of view included; false past either end, where Tab leaves the list as usual.
+    callback step-focus(int) -> bool;
+    // The list wants this row focused (it may have just been created for that).
+    in property <bool> focus-request: false;
+    callback focus-request-taken();
 
     height: 44px;
     background: root.selected ? Theme.elevated : node-touch.has-hover && root.enabled ? #ffffff06 : transparent;
@@ -294,6 +300,17 @@ component TrayNodeRow inherits Rectangle {
         background: #ffffff0f;
     }
 
+    // Focus is taken once the row exists and the event loop runs again, never while the
+    // list is still being laid out.
+    Timer {
+        interval: 1ms;
+        running: root.focus-request;
+        triggered => {
+            node-focus.focus();
+            root.focus-request-taken();
+        }
+    }
+
     node-focus := FocusScope {
         enabled: root.enabled;
         focus-on-click: true;
@@ -302,6 +319,15 @@ component TrayNodeRow inherits Rectangle {
             if (event.text == " " || event.text == "\n") {
                 root.activated();
                 return accept;
+            }
+            if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                return reject;
+            }
+            if ((event.text == Key.Tab && !event.modifiers.shift) || event.text == Key.DownArrow) {
+                return root.step-focus(1) ? accept : reject;
+            }
+            if (event.text == Key.Backtab || event.text == Key.Tab || event.text == Key.UpArrow) {
+                return root.step-focus(-1) ? accept : reject;
             }
             return reject;
         }
@@ -1004,44 +1030,63 @@ export component TrayPopup inherits Window {
                 }
             }
 
-            // The shown group's nodes in one inset grouped card.
+            // The shown group's nodes in one inset grouped card; only the rows in view exist.
             if root.has-profile: node-card := Rectangle {
                 x: 10px;
                 y: root.group-rows.length > 0 && !root.dumb-mode ? 176px : 134px;
                 width: parent.width - 20px;
-                height: Math.min(node-list.preferred-height, parent.height - self.y - 54px);
+                height: Math.min(root.node-rows.length > 0 ? root.node-rows.length * 44px : 48px, parent.height - self.y - 54px);
                 background: Theme.surface;
                 border-color: #ffffff0a;
                 border-width: 1px;
                 border-radius: 12px;
                 clip: true;
-                ScrollView {
-                    node-list := VerticalLayout {
-                        spacing: 0px;
-                        for node[index] in root.node-rows: TrayNodeRow {
-                            icon: node.icon;
-                            icon-image: node.icon-image;
-                            icon-loading: node.icon-loading;
-                            label: node.label;
-                            latency: node.detail;
-                            tone: node.tone;
-                            selected: node.selected;
-                            enabled: node.enabled;
-                            measuring: node.measuring;
-                            reduced-motion: root.reduced-motion;
-                            show-separator: index < root.node-rows.length - 1;
-                            activated => { root.select-node(node.group-id, node.id); }
-                            secondary-activated => { root.measure-node(node.group-id, node.id); }
+                if root.node-rows.length > 0: node-list := ListView {
+                    // The row keyboard focus is moving to (see `focus-row`).
+                    property <int> focus-index: -1;
+                    property <bool> focus-pending: false;
+                    // Scrolls row `index` into view, so that it exists, and has it take keyboard
+                    // focus. False past either end of the list.
+                    function focus-row(index: int) -> bool {
+                        if (index < 0 || index >= root.node-rows.length) {
+                            return false;
                         }
-                        if root.node-rows.length == 0: Text {
-                            height: 48px;
-                            text: @tr("Маршруты пока недоступны");
-                            color: Theme.text-muted;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        if (index * 44px < -self.viewport-y) {
+                            self.viewport-y = -index * 44px;
+                        } else if ((index + 1) * 44px > -self.viewport-y + self.visible-height) {
+                            self.viewport-y = -((index + 1) * 44px - self.visible-height);
                         }
+                        self.focus-index = index;
+                        self.focus-pending = true;
+                        return true;
                     }
+                    for node[index] in root.node-rows: TrayNodeRow {
+                        icon: node.icon;
+                        icon-image: node.icon-image;
+                        icon-loading: node.icon-loading;
+                        label: node.label;
+                        latency: node.detail;
+                        tone: node.tone;
+                        selected: node.selected;
+                        enabled: node.enabled;
+                        measuring: node.measuring;
+                        reduced-motion: root.reduced-motion;
+                        show-separator: index < root.node-rows.length - 1;
+                        focus-request: node-list.focus-pending && node-list.focus-index == index;
+                        focus-request-taken => { node-list.focus-pending = false; }
+                        step-focus(step) => { return node-list.focus-row(index + step); }
+                        activated => { root.select-node(node.group-id, node.id); }
+                        secondary-activated => { root.measure-node(node.group-id, node.id); }
+                    }
+                }
+                if root.node-rows.length == 0: Text {
+                    width: parent.width;
+                    height: 48px;
+                    text: @tr("Маршруты пока недоступны");
+                    color: Theme.text-muted;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
 

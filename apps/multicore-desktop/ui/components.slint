@@ -311,6 +311,13 @@ export component RouteNodeRow inherits Rectangle {
     callback activated();
     // Right click: re-measure this route's latency only (no context menu).
     callback secondary-activated();
+    // In a virtualized ListView: Tab/Shift+Tab and the arrow keys move focus one row
+    // (+1 or -1) through the list, rows out of view included; false past either end, where
+    // Tab leaves the list as usual.
+    callback step-focus(int) -> bool;
+    // The list wants this row focused (it may have just been created for that).
+    in property <bool> focus-request: false;
+    callback focus-request-taken();
 
     // Row of an inset grouped list: bare flag, label, latency; the selected row
     // is tinted with a blue leading bar (no check mark), others tint on hover.
@@ -480,6 +487,17 @@ export component RouteNodeRow inherits Rectangle {
         background: #ffffff0f;
     }
 
+    // Focus is taken once the row exists and the event loop runs again, never while the
+    // list is still being laid out.
+    Timer {
+        interval: 1ms;
+        running: root.focus-request;
+        triggered => {
+            row-focus.focus();
+            root.focus-request-taken();
+        }
+    }
+
     row-focus := FocusScope {
         enabled: root.enabled;
         focus-on-click: true;
@@ -488,6 +506,15 @@ export component RouteNodeRow inherits Rectangle {
             if (event.text == " " || event.text == "\n") {
                 root.activated();
                 return accept;
+            }
+            if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                return reject;
+            }
+            if ((event.text == Key.Tab && !event.modifiers.shift) || event.text == Key.DownArrow) {
+                return root.step-focus(1) ? accept : reject;
+            }
+            if (event.text == Key.Backtab || event.text == Key.Tab || event.text == Key.UpArrow) {
+                return root.step-focus(-1) ? accept : reject;
             }
             return reject;
         }
@@ -569,6 +596,185 @@ export component OverlayScroll inherits Rectangle {
             height: parent.height;
             interactive: false;
             @children
+        }
+    }
+
+    thumb := Rectangle {
+        width: bar-touch.has-hover || bar-touch.pressed ? 6px : 4px;
+        height: root.thumb-height;
+        x: parent.width - 3px - self.width;
+        y: root.bar-inset + (root.track - self.height) * (-flick.viewport-y / Math.max(1px, root.max-scroll));
+        border-radius: self.width / 2;
+        background: #ffffff;
+        opacity: !root.bar-shown ? 0 : bar-touch.pressed ? 0.40 : bar-touch.has-hover ? 0.30 : 0.18;
+        animate opacity { duration: root.reduced-motion ? 0ms : root.bar-shown ? 120ms : 360ms; easing: ease-out; }
+        animate width { duration: root.reduced-motion ? 0ms : 120ms; easing: ease-out; }
+    }
+
+    bar-touch := TouchArea {
+        x: parent.width - self.width;
+        width: 10px;
+        height: parent.height;
+        enabled: root.scrollable;
+        pointer-event(event) => {
+            if (event.button != PointerEventButton.left || event.kind != PointerEventKind.down) {
+                return;
+            }
+            if (self.mouse-y >= thumb.y && self.mouse-y <= thumb.y + thumb.height) {
+                root.drag-start-offset = -flick.viewport-y;
+            } else {
+                // Track click: one page towards the pointer, then drag from there.
+                flick.viewport-y = -Math.max(0px, Math.min(root.max-scroll,
+                    -flick.viewport-y + (self.mouse-y < thumb.y ? -1 : 1) * flick.height * 0.9));
+                root.drag-start-offset = -flick.viewport-y;
+            }
+        }
+        moved => {
+            if (self.pressed && root.track > root.thumb-height) {
+                flick.viewport-y = -Math.max(0px, Math.min(root.max-scroll,
+                    root.drag-start-offset + (self.mouse-y - self.pressed-y) * root.max-scroll / (root.track - root.thumb-height)));
+            }
+        }
+    }
+}
+
+// A long list that instantiates only the rows in view: the Slint compiler virtualizes a `for`
+// placed directly in an element whose type is named `ListView` and which has the viewport and
+// visible size properties below (std-widgets' own ListView works the same way). Rows must all
+// be `row-height` tall. Looks and scrolls like OverlayScroll. The inset grouped card behind the
+// rows is drawn only over the part in view (plus room for its corners): a shape as tall as a
+// list of thousands of rows overflows the software renderer's 16-bit coordinates. An optional
+// footer line follows the card, scrolling with it.
+export component ListView inherits Rectangle {
+    in property <bool> reduced-motion: false;
+    in property <length> bar-inset: 4px;
+    in property <int> row-count;
+    in property <length> row-height;
+    in property <brush> card-background: transparent;
+    in property <brush> card-border-color: transparent;
+    in property <length> card-border-width: 0px;
+    in property <length> card-radius: 0px;
+    in property <string> footer-text;
+    out property <length> visible-width: flick.width;
+    // Where rows are laid out: the whole area, less the part of the footer scrolled into view
+    // (so Slint's list layout neither leaves a gap above it nor scrolls it back out).
+    out property <length> visible-height: flick.height - root.footer-shown-height;
+    in-out property <length> viewport-width <=> flick.viewport-width;
+    // Set by Slint's list layout to the rows' height; the footer scrolls in below them.
+    in-out property <length> viewport-height;
+    in-out property <length> viewport-y <=> flick.viewport-y;
+    out property <length> content-height: root.row-count * root.row-height;
+    out property <length> max-scroll: Math.max(0px, root.content-height + root.footer-height - flick.height);
+    out property <bool> scrolled: flick.viewport-y < -0.5px;
+    out property <bool> hovered: hover.has-hover;
+    // The row keyboard focus is moving to (see `request-focus`).
+    in-out property <int> focus-index: -1;
+    in-out property <bool> focus-pending: false;
+
+    private property <length> footer-height: root.footer-text == "" ? 0px : 8px + footer.preferred-height;
+    private property <length> footer-shown-height: Math.max(0px, Math.min(root.footer-height,
+        -flick.viewport-y + flick.height - root.content-height));
+    private property <bool> scrollable: root.max-scroll > 0.5px;
+    private property <bool> moving: false;
+    private property <int> idle-ticks: 0;
+    private property <bool> bar-shown: root.scrollable
+        && (root.moving || bar-touch.pressed || bar-touch.has-hover || hover.has-hover);
+    private property <length> track: root.height - 2 * root.bar-inset;
+    private property <length> thumb-height: Math.min(root.track, Math.max(32px, root.track * flick.height / Math.max(1px, root.content-height + root.footer-height)));
+    private property <length> drag-start-offset;
+    // Where the view was when last seen.
+    private property <length> seen-viewport-y: 0px;
+
+    vertical-stretch: 1;
+    horizontal-stretch: 1;
+    min-height: 0px;
+    background: transparent;
+    // The card runs past the edges by its corner radius when scrolled.
+    clip: true;
+    accessible-role: list;
+
+    // Scrolls row `index` into view, so that it exists, and has it take keyboard focus.
+    // False past either end of the list.
+    public function request-focus(index: int) -> bool {
+        if (index < 0 || index >= root.row-count) {
+            return false;
+        }
+        if (index * root.row-height < -flick.viewport-y) {
+            flick.viewport-y = -index * root.row-height;
+        } else if ((index + 1) * root.row-height > -flick.viewport-y + flick.height) {
+            flick.viewport-y = -Math.min(root.max-scroll, (index + 1) * root.row-height - flick.height);
+        }
+        root.focus-index = index;
+        root.focus-pending = true;
+        return true;
+    }
+
+    // Content that shrank (another group, a removed row) must not leave the view past its end.
+    changed max-scroll => {
+        if (-flick.viewport-y > root.max-scroll) {
+            flick.viewport-y = -root.max-scroll;
+        }
+    }
+    changed viewport-y => {
+        root.moving = true;
+        root.idle-ticks = 0;
+        // Slint's list layout lands a long jump (a fast wheel spin, a thumb drag: more than a
+        // screen and a half) on a row boundary. One that ends within a row of the end was
+        // headed for the end: finish it, or the footer stays hidden.
+        if (root.footer-height > 0px
+            && Math.abs(flick.viewport-y - root.seen-viewport-y) > flick.height * 1.5
+            && -flick.viewport-y > root.max-scroll - root.row-height
+            && -flick.viewport-y < root.max-scroll - 0.5px
+            && Math.mod(-flick.viewport-y / 1px, root.row-height / 1px) < 0.01) {
+            flick.viewport-y = -root.max-scroll;
+        }
+        root.seen-viewport-y = flick.viewport-y;
+    }
+
+    Timer {
+        interval: 300ms;
+        running: root.moving;
+        triggered => {
+            root.idle-ticks += 1;
+            if (root.idle-ticks >= 3) {
+                root.moving = false;
+            }
+        }
+    }
+
+    // Wraps the content, so it stays hovered over child controls while they still get every click.
+    hover := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        card := Rectangle {
+            property <length> slack: root.card-radius + root.card-border-width + 2px;
+            y: Math.max(flick.viewport-y, -self.slack);
+            width: parent.width;
+            height: Math.max(0px, Math.min(flick.viewport-y + root.content-height, root.height + self.slack) - self.y);
+            background: root.card-background;
+            border-color: root.card-border-color;
+            border-width: root.card-border-width;
+            border-radius: root.card-radius;
+            clip: true;
+            flick := Flickable {
+                y: -card.y;
+                width: parent.width;
+                height: root.height;
+                viewport-height: root.viewport-height + root.footer-height;
+                interactive: false;
+                @children
+            }
+        }
+        footer := Text {
+            x: 4px;
+            y: flick.viewport-y + root.content-height + 8px;
+            width: parent.width - self.x;
+            visible: root.footer-text != "";
+            text: root.footer-text;
+            color: Theme.text-muted;
+            font-size: Theme.type-metadata-size;
+            accessible-role: text;
+            accessible-live-region: polite;
         }
     }
 

@@ -65,6 +65,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Slint's own core at its exact version: tests walk the item tree to see which rows of a
+# virtualized list exist.
+i-slint-core = { version = "=1.17.0", default-features = false }
 multicore-platform = { path = "../../crates/multicore-platform", features = ["test-support"] }
 tempfile = "3"
 

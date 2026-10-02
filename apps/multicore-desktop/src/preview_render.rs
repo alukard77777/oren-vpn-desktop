@@ -26,6 +26,9 @@ thread_local! {
     static LAST_WINDOW: RefCell<Option<Rc<MinimalSoftwareWindow>>> = const { RefCell::new(None) };
     /// Time skipped ahead by `advance_clock`, on top of the real clock.
     static CLOCK_SKIP: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// While set, Slint's clock is only what `CLOCK_SKIP` adds: frame counts do not depend on
+    /// how long rendering takes.
+    static CLOCK_FROZEN: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
 static CLOCK_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -40,7 +43,10 @@ impl slint::platform::Platform for PreviewPlatform {
     }
 
     fn duration_since_start(&self) -> Duration {
-        CLOCK_START.get_or_init(std::time::Instant::now).elapsed() + CLOCK_SKIP.get()
+        CLOCK_FROZEN
+            .get()
+            .unwrap_or_else(|| CLOCK_START.get_or_init(std::time::Instant::now).elapsed())
+            + CLOCK_SKIP.get()
     }
 }
 
@@ -1892,6 +1898,82 @@ fn render_ui_previews() {
     v112_previews();
     icon_loading_previews();
     scroll_previews();
+    list_previews();
+}
+
+/// Saves the shown component's next frame at `width`×`height` (logical px), without showing
+/// it again: the state built up so far (scroll position, …) is kept.
+fn save_frame(name: &str, width: u32, height: u32) {
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let scale = preview_scale();
+    let (width, height) = (
+        (width as f32 * scale) as u32,
+        (height as f32 * scale) as u32,
+    );
+    window.set_size(PhysicalSize::new(width, height));
+    settle(1);
+    window.request_redraw();
+    let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (width * height) as usize];
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, width as usize);
+    });
+    let bytes = buffer
+        .iter()
+        .flat_map(|pixel| [pixel.r, pixel.g, pixel.b])
+        .collect::<Vec<_>>();
+    let image = image::RgbImage::from_raw(width, height, bytes).expect("preview buffer size");
+    let directory = output_dir();
+    std::fs::create_dir_all(&directory).expect("create preview directory");
+    let path = directory.join(format!("{name}-{width}x{height}.png"));
+    image.save(&path).expect("save preview png");
+    println!("{}", path.display());
+}
+
+/// Long, virtualized lists: 2,000 routes scrolled to the middle while the window grows to
+/// 1600×900 and back, 2,000 search results at their end, and the tray popup at its largest.
+fn list_previews() {
+    if wanted("lv-home") {
+        let ui = new_app();
+        connected(&ui);
+        ui.set_catalog_nodes(many_nodes(2_000, 1_000));
+        let window = LAST_WINDOW
+            .with(|last| last.borrow().clone())
+            .expect("preview window adapter");
+        window.set_size(PhysicalSize::new(840, 720));
+        ui.show().expect("show app window");
+        draw_frame();
+        wheel((420.0, 500.0), -48.0 * 1_000.0);
+        save_frame("lv-home-2000-middle", 840, 720);
+        save_frame("lv-home-2000-middle", 1600, 900);
+        save_frame("lv-home-2000-middle-back", 840, 720);
+        ui.hide().expect("hide app window");
+    }
+    if wanted("lv-search") {
+        let ui = new_app();
+        connected(&ui);
+        ui.set_route_search_open(true);
+        ui.set_route_search_query("node".into());
+        ui.set_route_search_hits(many_hits(2_000));
+        let window = LAST_WINDOW
+            .with(|last| last.borrow().clone())
+            .expect("preview window adapter");
+        window.set_size(PhysicalSize::new(840, 720));
+        ui.show().expect("show app window");
+        settle(4);
+        draw_frame();
+        wheel((420.0, 500.0), -1_000_000.0);
+        draw_frame();
+        save_frame("lv-search-2000-end", 840, 720);
+        ui.hide().expect("hide app window");
+    }
+    if wanted("lv-tray") {
+        let popup = new_popup();
+        tray_connected(&popup);
+        popup.set_node_rows(many_tray_rows(64));
+        capture(&popup, "lv-tray-largest", 520, 900);
+    }
 }
 
 /// Sixteen subscriptions (the maximum): the five sample rows over and over with unique ids.
@@ -2645,4 +2727,395 @@ fn an_auto_opened_notice_closes_and_hover_only_pauses_it() {
         "a notice opened by hand stays open"
     );
     ui.hide().expect("hide");
+}
+
+/// Advances Slint's clock in 20 ms frames, driving timers and drawing like the event loop
+/// does, with the clock frozen to the skipped time (rendering speed does not matter). Returns
+/// how many frames were drawn or still animating.
+fn frames_over(component: &impl ComponentHandle, ms: u64) -> u32 {
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let size = window.size();
+    let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (size.width * size.height) as usize];
+    let mut frames = 0;
+    CLOCK_FROZEN.set(Some(
+        CLOCK_START.get_or_init(std::time::Instant::now).elapsed(),
+    ));
+    for _ in 0..ms / 20 {
+        CLOCK_SKIP.set(CLOCK_SKIP.get() + Duration::from_millis(20));
+        slint::platform::update_timers_and_animations();
+        let drawn = window.draw_if_needed(|renderer| {
+            renderer.render(&mut buffer, size.width as usize);
+        });
+        if drawn || component.window().has_active_animations() {
+            frames += 1;
+        }
+    }
+    CLOCK_FROZEN.set(None);
+    frames
+}
+
+/// A main window at rest draws nothing: no timer or animation keeps asking for frames. The
+/// ambient waves («Живой фон») step four times a second, only on the home page, and only
+/// while the window has focus and motion is allowed.
+#[test]
+fn an_idle_window_draws_nothing_and_the_ambient_waves_stay_cheap() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let at_rest = |ambient: bool, window_active: bool, reduced_motion: bool, panel: &str| {
+        let ui = new_app();
+        connected(&ui);
+        ui.set_reduced_motion(reduced_motion);
+        ui.set_ambient_background_enabled(ambient);
+        ui.set_window_active(window_active);
+        ui.set_active_panel(s(panel));
+        let window = LAST_WINDOW
+            .with(|last| last.borrow().clone())
+            .expect("preview window adapter");
+        window.set_size(PhysicalSize::new(840, 720));
+        ui.show().expect("show app window");
+        // Entry animations and the first latency/route fades settle first.
+        frames_over(&ui, 3_000);
+        let frames = frames_over(&ui, 5_000);
+        ui.hide().expect("hide app window");
+        frames
+    };
+    assert_eq!(at_rest(false, true, false, "routes"), 0, "home, waves off");
+    assert_eq!(
+        at_rest(true, false, false, "routes"),
+        0,
+        "home, window not focused"
+    );
+    assert_eq!(
+        at_rest(true, true, true, "routes"),
+        0,
+        "home, reduced motion"
+    );
+    assert_eq!(at_rest(true, true, false, "events"), 0, "status page");
+    let waves = at_rest(true, true, false, "routes");
+    assert!(
+        (15..=21).contains(&waves),
+        "the waves step 4 times a second: {waves} frames in 5 s"
+    );
+
+    let popup = new_popup();
+    tray_connected(&popup);
+    popup.set_reduced_motion(false);
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(304, 460));
+    popup.show().expect("show tray popup");
+    frames_over(&popup, 3_000);
+    assert_eq!(frames_over(&popup, 5_000), 0, "tray popup at rest");
+    popup.hide().expect("hide tray popup");
+}
+
+/// `count` routes named "Node 0000"…, every one with a flag, a latency and a hairline.
+fn many_nodes(count: usize, selected: usize) -> ModelRc<UiCatalogNode> {
+    let flags = ["🇩🇪", "🇸🇪", "🇳🇱", "🇫🇮", "🇵🇱", "🇺🇸"];
+    let rows = (0..count)
+        .map(|index| {
+            let icon = flags[index % flags.len()];
+            UiCatalogNode {
+                id: format!("n{index}").into(),
+                icon: icon.into(),
+                icon_image: crate::emoji_images::image_for(icon),
+                icon_loading: false,
+                label: format!("Node {index:04}").into(),
+                selected: index == selected,
+                latency_text: format!("{} мс", 20 + index % 300).into(),
+                latency_tone: "success".into(),
+                measuring: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// `count` search hits for "node", across two groups.
+fn many_hits(count: usize) -> ModelRc<UiRouteSearchHit> {
+    let rows = (0..count)
+        .map(|index| UiRouteSearchHit {
+            icon: "🇩🇪".into(),
+            icon_image: crate::emoji_images::image_for("🇩🇪"),
+            icon_loading: false,
+            group_id: if index % 2 == 0 { "g1" } else { "g2" }.into(),
+            group_label: s(if index % 2 == 0 {
+                "Сервер"
+            } else {
+                "Игры"
+            }),
+            node_id: format!("n{index}").into(),
+            prefix: "".into(),
+            matched: "Node".into(),
+            suffix: format!(" {index:04}").into(),
+            selected: index == 0,
+            latency_text: format!("{} мс", 20 + index % 300).into(),
+            latency_tone: "success".into(),
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// `count` tray routes named "Node 0000"….
+fn many_tray_rows(count: usize) -> ModelRc<TrayMenuRow> {
+    let rows = (0..count)
+        .map(|index| TrayMenuRow {
+            id: format!("n{index}").into(),
+            group_id: "g1".into(),
+            icon: "🇸🇪".into(),
+            icon_image: crate::emoji_images::image_for("🇸🇪"),
+            icon_loading: false,
+            label: format!("Node {index:04}").into(),
+            detail: format!("{} мс", 20 + index % 300).into(),
+            tone: "success".into(),
+            selected: index == 0,
+            enabled: true,
+            measuring: false,
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// Draws one frame of the shown component at its window's current size with the software
+/// renderer (which panicked on a route list taller than its 16-bit coordinates).
+fn draw_frame() {
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let size = window.size();
+    let mut buffer = vec![Rgb8Pixel::new(0, 0, 0); (size.width * size.height) as usize];
+    slint::platform::update_timers_and_animations();
+    window.request_redraw();
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, size.width as usize);
+    });
+}
+
+/// A row's label, top and bottom in window coordinates.
+type RowSpan = (String, f32, f32);
+
+/// The virtualized list's rows that exist right now ("Node …" buttons), as (label, top,
+/// bottom) in window coordinates, and the list's own top and bottom.
+fn list_rows(component: &impl ComponentHandle) -> (Vec<RowSpan>, (f32, f32)) {
+    use i_slint_core::accessibility::AccessibleStringProperty;
+    use i_slint_core::item_tree::ItemRc;
+    use i_slint_core::items::AccessibleRole;
+    use i_slint_core::window::WindowInner;
+    let root = ItemRc::new_root(WindowInner::from_pub(component.window()).component());
+    let span = |item: &ItemRc| {
+        let geometry = item.geometry();
+        let top = item.map_to_window(geometry.origin).y;
+        (top, top + geometry.size.height)
+    };
+    let mut lists = Vec::new();
+    let mut rows = Vec::new();
+    root.visit_descendants(|item| {
+        match item.accessible_role() {
+            AccessibleRole::List => lists.push(span(item)),
+            AccessibleRole::Button => {
+                if let Some(label) = item
+                    .accessible_string_property(AccessibleStringProperty::Label)
+                    .filter(|label| label.starts_with("Node "))
+                {
+                    let (top, bottom) = span(item);
+                    rows.push((label.to_string(), top, bottom));
+                }
+            }
+            _ => {}
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(lists.len(), 1, "one list on screen");
+    rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+    (rows, lists[0])
+}
+
+/// Top and bottom, in window coordinates, of the text whose label contains `needle`.
+fn text_span(component: &impl ComponentHandle, needle: &str) -> Option<(f32, f32)> {
+    use i_slint_core::accessibility::AccessibleStringProperty;
+    use i_slint_core::item_tree::ItemRc;
+    use i_slint_core::items::AccessibleRole;
+    use i_slint_core::window::WindowInner;
+    let root = ItemRc::new_root(WindowInner::from_pub(component.window()).component());
+    root.visit_descendants(|item| {
+        let found = item.accessible_role() == AccessibleRole::Text
+            && item
+                .accessible_string_property(AccessibleStringProperty::Label)
+                .is_some_and(|label| label.contains(needle));
+        if found {
+            let geometry = item.geometry();
+            let top = item.map_to_window(geometry.origin).y;
+            return std::ops::ControlFlow::Break((top, top + geometry.size.height));
+        }
+        std::ops::ControlFlow::Continue(())
+    })
+}
+
+/// The rows that exist cover the whole visible list (no blank band, also right after a
+/// resize) and are few: about a screenful, never the whole model.
+fn assert_rows_fill_the_list(component: &impl ComponentHandle, context: &str) -> Vec<String> {
+    let (rows, (top, bottom)) = list_rows(component);
+    assert!(!rows.is_empty(), "{context}: no rows");
+    let screenful = ((bottom - top) / 44.0).ceil() as usize + 2;
+    assert!(
+        rows.len() <= screenful,
+        "{context}: {} rows exist for a {}px list",
+        rows.len(),
+        bottom - top
+    );
+    let first = rows.first().expect("rows");
+    let last = rows.last().expect("rows");
+    assert!(first.1 <= top + 0.5, "{context}: gap above the first row");
+    for pair in rows.windows(2) {
+        assert!(
+            (pair[1].1 - pair[0].2).abs() < 0.5,
+            "{context}: rows are not contiguous at {}",
+            pair[0].0
+        );
+    }
+    assert!(
+        last.2 >= bottom - 0.5,
+        "{context}: blank band under {} ({} < {bottom})",
+        last.0,
+        last.2
+    );
+    rows.into_iter().map(|row| row.0).collect()
+}
+
+/// The number in a "Node 0123, …" row label.
+fn row_index(label: &str) -> usize {
+    label
+        .trim_start_matches("Node ")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("row number")
+}
+
+fn wheel(at: (f32, f32), delta_y: f32) {
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let position = slint::LogicalPosition::new(at.0, at.1);
+    window.dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y,
+    });
+    // The wheel scrolls smoothly: let the motion finish.
+    advance_clock(Duration::from_millis(600));
+}
+
+/// A group of 2,000 routes: drawn with the software renderer at the top, the middle and the
+/// end, and while the window grows to 1600×900 and back. Only about a screenful of rows
+/// exists at any time, and they always fill the list.
+#[test]
+fn a_huge_route_group_draws_with_a_screenful_of_rows() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    connected(&ui);
+    ui.set_catalog_nodes(many_nodes(2_000, 1_000));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    draw_frame();
+    let top = assert_rows_fill_the_list(&ui, "top");
+    assert!(top[0].starts_with("Node 0000"), "{top:?}");
+
+    // Halfway, then the window grows and shrinks again: rows follow at once.
+    wheel((420.0, 500.0), -48.0 * 1_000.0);
+    draw_frame();
+    let middle = assert_rows_fill_the_list(&ui, "middle");
+    assert!((900..1_100).contains(&row_index(&middle[0])), "{middle:?}");
+    window.set_size(PhysicalSize::new(1600, 900));
+    draw_frame();
+    let wide = assert_rows_fill_the_list(&ui, "1600x900");
+    assert!(wide.len() > middle.len(), "more rows for a taller list");
+    window.set_size(PhysicalSize::new(840, 720));
+    draw_frame();
+    assert_rows_fill_the_list(&ui, "back to 840x720");
+
+    wheel((420.0, 500.0), -1_000_000.0);
+    draw_frame();
+    let end = assert_rows_fill_the_list(&ui, "end");
+    assert!(
+        end.last().expect("rows").starts_with("Node 1999"),
+        "{end:?}"
+    );
+    ui.hide().expect("hide app window");
+}
+
+/// 2,000 search results scrolled to the end: the last result and the count under the card
+/// are on screen, with only a screenful of rows behind them.
+#[test]
+fn a_huge_search_result_list_scrolls_to_its_count() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    connected(&ui);
+    ui.set_route_search_open(true);
+    ui.set_route_search_query("node".into());
+    ui.set_route_search_hits(many_hits(2_000));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    settle(4);
+    draw_frame();
+    assert_rows_fill_the_list(&ui, "results");
+    wheel((420.0, 500.0), -1_000_000.0);
+    draw_frame();
+    draw_frame();
+    let (rows, (_, bottom)) = list_rows(&ui);
+    assert!(rows.len() <= 16, "{} result rows exist", rows.len());
+    let last = rows.last().expect("rows");
+    assert!(last.0.starts_with("Node 1999"), "{rows:?}");
+    let (count_top, count_bottom) = text_span(&ui, "2000 · ").expect("result count");
+    assert!(count_top >= last.2 + 7.5, "the count follows the card");
+    assert!(
+        count_bottom <= bottom + 0.5,
+        "the count is in view at the end: last {last:?} count {count_top}..{count_bottom} list bottom {bottom}"
+    );
+
+    // Another query starts at the top of its results.
+    ui.set_route_search_query("node 1".into());
+    ui.set_route_search_hits(many_hits(1_000));
+    draw_frame();
+    draw_frame();
+    let fresh = assert_rows_fill_the_list(&ui, "new query");
+    assert!(fresh[0].starts_with("Node 0000"), "{fresh:?}");
+    ui.hide().expect("hide app window");
+}
+
+/// The tray popup dragged to its largest size fills its taller list right away.
+#[test]
+fn a_large_tray_popup_fills_its_route_list() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let popup = new_popup();
+    tray_connected(&popup);
+    popup.set_node_rows(many_tray_rows(500));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(304, 460));
+    popup.show().expect("show tray popup");
+    draw_frame();
+    assert_rows_fill_the_list(&popup, "tray 304x460");
+    window.set_size(PhysicalSize::new(520, 900));
+    draw_frame();
+    assert_rows_fill_the_list(&popup, "tray 520x900");
+    wheel((260.0, 600.0), -1_000_000.0);
+    draw_frame();
+    let end = assert_rows_fill_the_list(&popup, "tray end");
+    assert!(
+        end.last().expect("rows").starts_with("Node 0499"),
+        "{end:?}"
+    );
+    popup.hide().expect("hide tray popup");
 }

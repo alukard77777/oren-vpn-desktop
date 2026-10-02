@@ -1,6 +1,6 @@
 import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { IconLoadingSlot, OverlayScroll, PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
+import { IconLoadingSlot, ListView, OverlayScroll, PrimaryAction, QuietChip, RouteNodeRow } from "components.slint";
 import { TroubleshootPage, UiTroubleshootCard, UiTroubleshootFix, UiTroubleshootStep } from "troubleshoot.slint";
 import "../assets/fonts/Twemoji.Mozilla.ttf";
 export { TrayPopup, TrayMenuRow } from "tray_popup.slint";
@@ -1023,6 +1023,12 @@ component RouteSearchRow inherits Rectangle {
     in property <bool> entering;
     in property <int> stagger-index;
     callback activated();
+    // Tab/Shift+Tab and the arrow keys move focus one row (+1 or -1) through the results, rows
+    // out of view included; false past either end, where Tab leaves the list as usual.
+    callback step-focus(int) -> bool;
+    // The list wants this row focused (it may have just been created for that).
+    in property <bool> focus-request: false;
+    callback focus-request-taken();
 
     height: 48px;
     background: root.selected ? Theme.elevated : result-touch.has-hover && root.enabled ? #ffffff06 : transparent;
@@ -1115,6 +1121,17 @@ component RouteSearchRow inherits Rectangle {
     }
     }
 
+    // Focus is taken once the row exists and the event loop runs again, never while the
+    // list is still being laid out.
+    Timer {
+        interval: 1ms;
+        running: root.focus-request;
+        triggered => {
+            result-focus.focus();
+            root.focus-request-taken();
+        }
+    }
+
     result-focus := FocusScope {
         enabled: root.enabled;
         focus-on-click: true;
@@ -1123,6 +1140,15 @@ component RouteSearchRow inherits Rectangle {
             if (event.text == " " || event.text == "\n") {
                 root.activated();
                 return accept;
+            }
+            if (event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                return reject;
+            }
+            if ((event.text == Key.Tab && !event.modifiers.shift) || event.text == Key.DownArrow) {
+                return root.step-focus(1) ? accept : reject;
+            }
+            if (event.text == Key.Backtab || event.text == Key.Tab || event.text == Key.UpArrow) {
+                return root.step-focus(-1) ? accept : reject;
             }
             return reject;
         }
@@ -1287,6 +1313,8 @@ export component AppWindow inherits Window {
     in property <bool> route-search-loading: false;
     private property <int> route-search-focus-serial: 0;
     private property <bool> route-search-results-shown: root.route-search-open && (root.route-search-query != "" || root.route-search-loading);
+    // Result rows in the virtualized list; otherwise the loading or nothing-found placeholder.
+    private property <bool> route-search-rows-shown: !root.route-search-loading && root.route-search-hits.length > 0;
     // One frame of "entering" so results fade in when they replace the list.
     private property <bool> route-search-entering: false;
     in property <string> traffic-up;
@@ -1425,12 +1453,14 @@ export component AppWindow inherits Window {
     in property <bool> reduced-motion: false;
     in property <string> system-name: "Windows";
     in property <string> runtime-versions: "MULTICORE";
-    // Ambient waves drift ~3px/s, so ten steps a second look continuous and cost a
-    // sixth of the redraws a per-frame property animation would.
+    // The window has keyboard focus (set by the host); the ambient waves rest while it does not.
+    in property <bool> window-active: true;
+    // Ambient waves drift at most ~5px/s at a few percent opacity, so four steps a second
+    // (about a pixel each) look continuous: every step redraws the whole window.
     private property <int> ambient-wave-step: 0;
     // 0 → 1 → 0 over 24 s (12 s each way), cosine-eased like ease-in-out.
-    private property <float> ambient-wave-t: (1 - Math.cos(root.ambient-wave-step / 240 * 360deg)) / 2;
-    private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
+    private property <float> ambient-wave-t: (1 - Math.cos(root.ambient-wave-step / 96 * 360deg)) / 2;
+    private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && root.window-active && !root.reduced-motion && !root.minimized && root.visible-page == "home";
     in-out property <bool> replace-editor-open: false;
     in-out property <int> import-success-serial: 0;
     in-out property <bool> first-run-manual-open: false;
@@ -1529,6 +1559,9 @@ export component AppWindow inherits Window {
     private property <bool> page-entering: false;
     // Route list placeholders while the first catalog loads.
     private property <bool> catalog-skeleton: root.catalog-loading && root.catalog-nodes.length == 0;
+    // Real route rows in the virtualized list; otherwise the placeholder card (skeleton,
+    // empty group) or nothing behind the failed-catalog card.
+    private property <bool> route-rows-shown: root.catalog-nodes.length > 0 && root.catalog-error == "";
     // Shared shimmer for skeletons. animation-tick() is only read while a skeleton
     // is on screen, so an idle window schedules no animation frames.
     private property <float> skeleton-pulse: (root.catalog-skeleton || root.profile-menu-loading) && !root.reduced-motion
@@ -1834,9 +1867,9 @@ export component AppWindow inherits Window {
     }
 
     wave-step-timer := Timer {
-        interval: 100ms;
+        interval: 250ms;
         running: root.ambient-motion-active;
-        triggered => { root.ambient-wave-step = Math.mod(root.ambient-wave-step + 1, 240); }
+        triggered => { root.ambient-wave-step = Math.mod(root.ambient-wave-step + 1, 96); }
     }
 
     // Any reported change of the real state ends the optimistic phase.
@@ -3625,47 +3658,62 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if root.catalog-error == "" && root.latency-check-error != "": Text { min-height: 28px; text: root.latency-check-error; color: Theme.error; font-size: Theme.type-metadata-size; wrap: word-wrap; }
-                            if !root.route-search-results-shown: route-list-scroll := OverlayScroll {
+                            // The routes: only the rows in view exist, so a group of thousands of
+                            // nodes costs what a screenful does. Full width: the card lines up with
+                            // the connect module and its latency column with the switch's right edge.
+                            if !root.route-search-results-shown && root.route-rows-shown: route-list := ListView {
+                                vertical-stretch: 1;
+                                reduced-motion: root.reduced-motion;
+                                row-count: root.catalog-nodes.length;
+                                row-height: 48px;
+                                // iOS-style inset grouped list: one card, hairlines between rows.
+                                card-background: Theme.surface;
+                                card-border-color: #ffffff0a;
+                                card-border-width: 1px;
+                                card-radius: 14px;
+                                for node[index] in root.catalog-nodes: RouteNodeRow {
+                                    opacity: root.routes-entering ? 0 : 1;
+                                    animate opacity { duration: 160ms; easing: ease-out; }
+                                    height: 48px;
+                                    show-separator: index < root.catalog-nodes.length - 1;
+                                    icon: node.icon;
+                                    icon-image: node.icon-image;
+                                    icon-loading: node.icon-loading;
+                                    reduced-motion: root.reduced-motion;
+                                    label: node.label;
+                                    supporting-text: "";
+                                    trailing-text: node.latency-text;
+                                    // Per row: a sweep marks the rows still waiting; a row measured
+                                    // on its own shows its value as soon as it is in.
+                                    trailing-measuring: node.measuring;
+                                    trailing-tone: node.latency-tone;
+                                    selected: node.selected;
+                                    pending: root.catalog-selection-pending && node.selected;
+                                    enabled: root.catalog-selection-enabled && !root.profile-menu-open;
+                                    focus-request: route-list.focus-pending && route-list.focus-index == index;
+                                    focus-request-taken => { route-list.focus-pending = false; }
+                                    step-focus(step) => { return route-list.request-focus(index + step); }
+                                    activated => { root.select-catalog-node(node.id); }
+                                    secondary-activated => { root.measure-catalog-node(node.id); }
+                                }
+                            }
+                            // No routes yet, none in the group, or a failed catalog.
+                            if !root.route-search-results-shown && !root.route-rows-shown: route-list-scroll := OverlayScroll {
                                 vertical-stretch: 1;
                                 reduced-motion: root.reduced-motion;
                                 VerticalLayout {
-                                    // Full width: the card lines up with the connect module and
-                                    // its latency column with the switch's right edge.
                                     alignment: start;
-                                    // iOS-style inset grouped list: one card, hairlines between rows.
                                     route-list-card := Rectangle {
                                     // The failed-catalog card stands in for the list.
                                     visible: root.catalog-error == "";
-                                    height: root.catalog-error == "" ? route-list.preferred-height : 0px;
+                                    height: root.catalog-error == "" ? route-placeholder.preferred-height : 0px;
                                     background: Theme.surface;
                                     border-color: #ffffff0a;
                                     border-width: 1px;
                                     border-radius: 14px;
                                     clip: true;
-                                    route-list := VerticalLayout {
+                                    route-placeholder := VerticalLayout {
                                     spacing: 0px;
-                                    for node[index] in root.catalog-nodes: RouteNodeRow {
-                                        opacity: root.routes-entering ? 0 : 1;
-                                        animate opacity { duration: 160ms; easing: ease-out; }
-                                        height: 48px;
-                                        show-separator: index < root.catalog-nodes.length - 1;
-                                        icon: node.icon;
-                                        icon-image: node.icon-image;
-                                        icon-loading: node.icon-loading;
-                                        reduced-motion: root.reduced-motion;
-                                        label: node.label;
-                                        supporting-text: "";
-                                        trailing-text: node.latency-text;
-                                        // Per row: a sweep marks the rows still waiting; a row measured
-                                        // on its own shows its value as soon as it is in.
-                                        trailing-measuring: node.measuring;
-                                        trailing-tone: node.latency-tone;
-                                        selected: node.selected;
-                                        pending: root.catalog-selection-pending && node.selected;
-                                        enabled: root.catalog-selection-enabled && !root.profile-menu-open;
-                                        activated => { root.select-catalog-node(node.id); }
-                                        secondary-activated => { root.measure-catalog-node(node.id); }
-                                    }
                                     if root.catalog-skeleton: route-skeleton := VerticalLayout {
                                         spacing: 0px;
                                         accessible-role: text;
@@ -3684,7 +3732,48 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.route-search-results-shown: route-search-results := OverlayScroll {
+                            // Results: virtualized like the route list; the count follows the card.
+                            if root.route-search-results-shown && root.route-search-rows-shown: route-search-results := ListView {
+                                vertical-stretch: 1;
+                                reduced-motion: root.reduced-motion;
+                                opacity: root.route-search-entering ? 0 : 1;
+                                animate opacity { duration: 200ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                                row-count: root.route-search-hits.length;
+                                row-height: 48px;
+                                card-background: Theme.surface;
+                                card-border-color: #ffffff0a;
+                                card-border-width: 1px;
+                                card-radius: 14px;
+                                footer-text: @tr("Найдено {n} · поиск по всем группам" | "Найдено {n} · поиск по всем группам" % root.route-search-hits.length);
+                                // Another query starts at the top of its results.
+                                property <string> query: root.route-search-query;
+                                changed query => { self.viewport-y = 0px; }
+                                for hit[index] in root.route-search-hits: RouteSearchRow {
+                                    icon: hit.icon;
+                                    icon-image: hit.icon-image;
+                                    icon-loading: hit.icon-loading;
+                                    prefix: hit.prefix;
+                                    matched: hit.matched;
+                                    suffix: hit.suffix;
+                                    group-label: hit.group-label;
+                                    latency-text: hit.latency-text;
+                                    latency-tone: hit.latency-tone;
+                                    selected: hit.selected;
+                                    show-separator: index < root.route-search-hits.length - 1;
+                                    entering: root.route-search-entering;
+                                    stagger-index: index;
+                                    enabled: root.catalog-selection-enabled && !root.profile-menu-open;
+                                    focus-request: route-search-results.focus-pending && route-search-results.focus-index == index;
+                                    focus-request-taken => { route-search-results.focus-pending = false; }
+                                    step-focus(step) => { return route-search-results.request-focus(index + step); }
+                                    activated => {
+                                        root.choose-route-search-hit(hit.group-id, hit.node-id);
+                                        root.close-route-search();
+                                    }
+                                }
+                            }
+                            // Loading or nothing found.
+                            if root.route-search-results-shown && !root.route-search-rows-shown: route-search-placeholder := OverlayScroll {
                                 vertical-stretch: 1;
                                 reduced-motion: root.reduced-motion;
                                 opacity: root.route-search-entering ? 0 : 1;
@@ -3714,47 +3803,6 @@ export component AppWindow inherits Window {
                                         }
                                         Text { text: @tr("Ничего не найдено"); color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-semibold; horizontal-alignment: center; accessible-role: text; accessible-live-region: polite; }
                                         Text { text: @tr("Попробуйте другое название страны или сервера"); color: Theme.text-muted; font-size: Theme.type-metadata-size; horizontal-alignment: center; }
-                                    }
-                                    if !root.route-search-loading && root.route-search-hits.length > 0: route-search-card := Rectangle {
-                                        height: route-search-list.preferred-height;
-                                        background: Theme.surface;
-                                        border-color: #ffffff0a;
-                                        border-width: 1px;
-                                        border-radius: 14px;
-                                        clip: true;
-                                        route-search-list := VerticalLayout {
-                                            spacing: 0px;
-                                            for hit[index] in root.route-search-hits: RouteSearchRow {
-                                                icon: hit.icon;
-                                                icon-image: hit.icon-image;
-                                                icon-loading: hit.icon-loading;
-                                                prefix: hit.prefix;
-                                                matched: hit.matched;
-                                                suffix: hit.suffix;
-                                                group-label: hit.group-label;
-                                                latency-text: hit.latency-text;
-                                                latency-tone: hit.latency-tone;
-                                                selected: hit.selected;
-                                                show-separator: index < root.route-search-hits.length - 1;
-                                                entering: root.route-search-entering;
-                                                stagger-index: index;
-                                                enabled: root.catalog-selection-enabled && !root.profile-menu-open;
-                                                activated => {
-                                                    root.choose-route-search-hit(hit.group-id, hit.node-id);
-                                                    root.close-route-search();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !root.route-search-loading && root.route-search-hits.length > 0: HorizontalLayout {
-                                        padding-left: 4px;
-                                        route-search-count := Text {
-                                            text: @tr("Найдено {n} · поиск по всем группам" | "Найдено {n} · поиск по всем группам" % root.route-search-hits.length);
-                                            color: Theme.text-muted;
-                                            font-size: Theme.type-metadata-size;
-                                            accessible-role: text;
-                                            accessible-live-region: polite;
-                                        }
                                     }
                                 }
                             }

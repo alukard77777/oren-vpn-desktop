@@ -8783,10 +8783,10 @@ mod tests {
             "in-out property <bool> shell-active",
             "in property <bool> reduced-motion",
             "wave-step-timer := Timer",
-            "interval: 100ms;\n        running: root.ambient-motion-active;",
-            "root.ambient-wave-step = Math.mod(root.ambient-wave-step + 1, 240);",
-            "private property <float> ambient-wave-t: (1 - Math.cos(root.ambient-wave-step / 240 * 360deg)) / 2;",
-            "private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && !root.reduced-motion && !root.minimized && root.visible-page == \"home\"",
+            "interval: 250ms;\n        running: root.ambient-motion-active;",
+            "root.ambient-wave-step = Math.mod(root.ambient-wave-step + 1, 96);",
+            "private property <float> ambient-wave-t: (1 - Math.cos(root.ambient-wave-step / 96 * 360deg)) / 2;",
+            "private property <bool> ambient-motion-active: root.ambient-background-enabled && root.shell-active && root.window-active && !root.reduced-motion && !root.minimized && root.visible-page == \"home\"",
         ] {
             assert!(
                 source.contains(required),
@@ -9156,14 +9156,20 @@ mod tests {
         ));
         assert!(app.contains("entering: root.route-search-entering;"));
         // Results replace the list; skeletons pulse only while loading and motion is allowed.
-        assert!(
-            app.contains(
-                "if !root.route-search-results-shown: route-list-scroll := OverlayScroll {"
-            )
-        );
+        // Rows and results are virtualized lists; placeholders scroll as before.
         assert!(app.contains(
-            "if root.route-search-results-shown: route-search-results := OverlayScroll {"
+            "if !root.route-search-results-shown && root.route-rows-shown: route-list := ListView {"
         ));
+        assert!(app.contains(
+            "if !root.route-search-results-shown && !root.route-rows-shown: route-list-scroll := OverlayScroll {"
+        ));
+        assert!(app.contains(
+            "if root.route-search-results-shown && root.route-search-rows-shown: route-search-results := ListView {"
+        ));
+        assert!(app.contains(
+            "if root.route-search-results-shown && !root.route-search-rows-shown: route-search-placeholder := OverlayScroll {"
+        ));
+        assert!(app.contains("changed query => { self.viewport-y = 0px; }"));
         assert!(app.contains("pulsing: !root.reduced-motion;"));
         assert!(app.contains("property <float> phase: self.pulsing ? (1 + Math.sin(animation-tick() / 1200ms * 360deg)) / 2 : 0.5;"));
         assert!(app.contains("if root.route-search-loading: route-search-skeleton := Rectangle {"));
@@ -9171,7 +9177,7 @@ mod tests {
         assert!(app.contains("text: @tr(\"Попробуйте другое название страны или сервера\");"));
         assert!(app.contains("@tr(\"Найдено {n} · поиск по всем группам\" | \"Найдено {n} · поиск по всем группам\" % root.route-search-hits.length)"));
         // Picking a result selects it in its own group and closes search.
-        assert!(app.contains("root.choose-route-search-hit(hit.group-id, hit.node-id);\n                                                    root.close-route-search();"));
+        assert!(app.contains("root.choose-route-search-hit(hit.group-id, hit.node-id);\n                                        root.close-route-search();"));
         assert!(main.contains("ui.on_route_search_changed(move |query| {"));
         assert!(main.contains("ui.invoke_select_catalog_group(group_id);"));
         assert!(main.contains("if ui.get_route_search_open() {\n        apply_route_search(ui, catalog, ui.get_route_search_query().as_str());"));
@@ -9694,12 +9700,18 @@ mod tests {
         x: 56px;"
         ));
         let route_card = source
-            .split("route-list-card := Rectangle {")
+            .split("route-list := ListView {")
             .nth(1)
-            .and_then(|card| card.split("route-list := VerticalLayout").next())
+            .and_then(|card| card.split("for node[index] in root.catalog-nodes").next())
             .expect("route list card");
-        assert!(route_card.contains("border-radius: 14px;"));
-        assert!(route_card.contains("clip: true;"));
+        assert!(route_card.contains("card-radius: 14px;"));
+        assert!(route_card.contains("row-height: 48px;"));
+        let list_view = components
+            .split("export component ListView")
+            .nth(1)
+            .expect("ListView source");
+        assert!(list_view.contains("border-radius: root.card-radius;"));
+        assert!(list_view.contains("clip: true;"));
         assert!(!source.contains("min-width: 132px;"));
         assert!(source.contains("padding: 20px;"));
         assert!(source.contains("for node[index] in root.catalog-nodes: RouteNodeRow"));

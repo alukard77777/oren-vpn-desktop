@@ -18,7 +18,7 @@ mod linux_shell_tests;
 mod log_bundle;
 mod logo_cache;
 mod preferences;
-#[cfg(all(test, feature = "preview-render"))]
+#[cfg(test)]
 mod preview_render;
 mod renderer_fallback;
 #[cfg(windows)]
@@ -927,7 +927,14 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     // created; the app's own language (Russian unless chosen or set by the provider) wins.
     select_slint_language(language::current());
     sync_language(&ui);
-    layout_shortcuts::install(ui.window());
+    // Ambient motion only while the window has focus; winit reports it once shown.
+    ui.set_window_active(false);
+    let focus_ui = ui.as_weak();
+    layout_shortcuts::install(ui.window(), move |focused| {
+        if let Some(ui) = focus_ui.upgrade() {
+            ui.set_window_active(focused);
+        }
+    });
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
     let _logo_cache_session = logo_cache::LogoCacheSession::install();
