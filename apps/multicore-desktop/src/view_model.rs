@@ -974,6 +974,10 @@ impl DesktopViewModel {
         self.service_mode
     }
 
+    pub(crate) fn active_profile_id(&self) -> Option<&str> {
+        self.active_profile_id.as_deref()
+    }
+
     /// A background status poll while waiting for the service's cores. Touches only the
     /// readiness flags; returns true when the cores just became ready and a latency check
     /// is waiting for them.

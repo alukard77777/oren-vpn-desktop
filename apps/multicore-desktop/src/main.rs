@@ -4034,28 +4034,51 @@ fn wire_session_stats(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Ti
 }
 
 /// While the service warms the cores after start-up (or after a subscription change), polls
-/// `/v1/status` every two seconds so a waiting latency check starts as soon as they are up.
+/// `/v1/status` so a waiting latency check starts as soon as they are up: every half second
+/// for the first seconds of a warm-up (a switch warms the new subscription's cores in a second
+/// or two, and the routes wait for them), every two seconds after that.
 fn wire_cores_ready_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    /// Fast polls per warm-up: 20 x 500 ms.
+    const FAST_POLLS: u32 = 20;
     let timer = Timer::default();
     let weak = ui.as_weak();
     let in_flight = Arc::new(AtomicBool::new(false));
     let ticks = Cell::new(0_u32);
-    timer.start(TimerMode::Repeated, Duration::from_secs(2), move || {
-        let (watching, ready) = {
+    let fast_polls = Cell::new(FAST_POLLS);
+    let warming = RefCell::new(None::<Option<String>>);
+    timer.start(TimerMode::Repeated, CORES_READY_POLL, move || {
+        let (watching, ready, profile) = {
             let model = model.lock().expect("view model lock");
             (
                 model.service_mode()
                     && !model.presentation().is_connected
                     && model.presentation().has_profile,
                 model.cores_ready(),
+                model.active_profile_id().map(str::to_owned),
             )
         };
+        ticks.set(ticks.get().wrapping_add(1));
+        // A new warm-up (the cores went down, or another subscription is now active) gets
+        // its own window of fast polls.
+        let warm_up = (watching && !ready).then_some(profile);
+        if warm_up.is_some() && *warming.borrow() != warm_up {
+            fast_polls.set(FAST_POLLS);
+        }
+        *warming.borrow_mut() = warm_up;
         // Once ready, keep checking every 10 s so a later loss of the cores shows up
         // before latency checks start failing.
-        ticks.set(ticks.get().wrapping_add(1));
-        let due = !ready || ticks.get().is_multiple_of(5);
+        let due = if ready {
+            ticks.get().is_multiple_of(20)
+        } else if fast_polls.get() > 0 {
+            true
+        } else {
+            ticks.get().is_multiple_of(4)
+        };
         if !watching || !due || in_flight.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if !ready {
+            fast_polls.set(fast_polls.get().saturating_sub(1));
         }
         let client = model.lock().expect("view model lock").daemon_client();
         let (weak, model, in_flight) = (weak.clone(), model.clone(), in_flight.clone());
@@ -4078,6 +4101,9 @@ fn wire_cores_ready_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -
     });
     timer
 }
+
+/// Tick of [`wire_cores_ready_watch`].
+const CORES_READY_POLL: Duration = Duration::from_millis(500);
 
 fn apply_session_line(ui: &AppWindow, line: &SessionLine) {
     if ui.get_session_uptime() != line.uptime.as_str() {
