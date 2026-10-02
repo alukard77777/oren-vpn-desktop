@@ -25,6 +25,8 @@ mod save_dialog;
 mod service_install;
 mod service_logo;
 mod single_instance;
+#[cfg(test)]
+mod slint_catalog_tests;
 mod tray;
 mod troubleshoot;
 mod updater;
