@@ -18,7 +18,7 @@ use multicore_daemon::service_client::{
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, CoreBackend, PreparedController, bind_loopback,
-    options_controller_factory, publish_readiness_if_enabled, try_router_shared,
+    options_controller_factory, publish_readiness_if_enabled, try_router_with_troubleshooting,
 };
 #[cfg(not(windows))]
 use multicore_daemon::{
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|executable| dashboard_directory_for(&executable)),
         dashboard_directory: None,
         log_path: data_directory.join("logs").join("latest-core.log"),
-        marker_path: system_proxy_marker,
+        marker_path: system_proxy_marker.clone(),
     };
     let elevated_factory = Mutex::new(None);
     let warm_stages = WarmStages::default();
@@ -255,7 +255,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is used too; without one it answers `service_unavailable`.
     let service_updates =
         cfg!(windows).then(|| service.clone() as Arc<dyn multicore_daemon::ServiceUpdates>);
-    let app = try_router_shared(shared, token, dashboard_url, service_updates)?;
+    // «Устранить неполадки»: detection and user-level fixes here, privileged fixes through
+    // the service or the UAC-elevated core host.
+    #[cfg(windows)]
+    let troubleshooting: Arc<dyn multicore_daemon::troubleshoot::Troubleshooting> = Arc::new(
+        multicore_daemon::troubleshoot::windows::SystemTroubleshooting {
+            service: Some(service.clone() as Arc<dyn multicore_daemon::troubleshoot::ServiceFixes>),
+            proxy_marker: system_proxy_marker,
+            package_root: env::current_exe()
+                .ok()
+                .and_then(|executable| dashboard_directory_for(&executable)),
+            // The on-demand Mihomo's controller (per-user TUN and proxy mode).
+            extra_ports: vec![multicore_core::troubleshoot::ListenPort {
+                port: mihomo_controller_address.port(),
+                udp: false,
+                mihomo: true,
+            }],
+        },
+    );
+    #[cfg(not(windows))]
+    let troubleshooting: Arc<dyn multicore_daemon::troubleshoot::Troubleshooting> =
+        Arc::new(multicore_daemon::troubleshoot::SystemTroubleshooting);
+    let app = try_router_with_troubleshooting(
+        shared,
+        token,
+        dashboard_url,
+        service_updates,
+        Some(troubleshooting),
+    )?;
     let listener = bind_loopback(address).await?;
     let resolved_address = listener.local_addr()?;
     {

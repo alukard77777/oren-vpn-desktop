@@ -197,6 +197,8 @@ pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
             Duration::from_secs(15 * 60)
         }
         ServiceCommand::Status | ServiceCommand::Diagnostics => Duration::from_secs(15),
+        // Each fix waits at most a minute (a tool, a service stop); a batch has at most eight.
+        ServiceCommand::Troubleshoot { .. } => Duration::from_secs(10 * 60),
         _ => Duration::from_secs(5),
     }
 }
@@ -581,6 +583,26 @@ impl<C: ServiceConnector> ServiceSession<C> {
             version: version.to_owned(),
         })? {
             ServiceResponse::UpdateStarted => Ok(()),
+            ServiceResponse::Busy => Err(ServiceError::Busy),
+            ServiceResponse::Error { code } => Err(ServiceError::Rejected(code)),
+            _ => Err(ServiceError::Protocol),
+        }
+    }
+
+    /// «Устранить неполадки»: the service runs these fixed fixes and reports one outcome
+    /// each. On a channel of its own, like `update`: an older service rejects the unknown
+    /// command (`Rejected(InvalidRequest)`) and closes only this channel.
+    pub fn troubleshoot(
+        &self,
+        fixes: &[multicore_core::troubleshoot::PrivilegedFix],
+    ) -> Result<Vec<multicore_core::troubleshoot::FixOutcome>, ServiceError> {
+        let transport = self.connector.connect()?;
+        match transport.request(&ServiceCommand::Troubleshoot {
+            fixes: fixes.to_vec(),
+        })? {
+            ServiceResponse::Troubleshot { outcomes } if outcomes.len() == fixes.len() => {
+                Ok(outcomes)
+            }
             ServiceResponse::Busy => Err(ServiceError::Busy),
             ServiceResponse::Error { code } => Err(ServiceError::Rejected(code)),
             _ => Err(ServiceError::Protocol),

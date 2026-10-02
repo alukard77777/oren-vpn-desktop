@@ -41,6 +41,8 @@ struct FakeService {
     gate_entered: bool,
     /// The generation the fake runs (the last one prepared).
     generation: Option<u64>,
+    /// `Troubleshoot` is answered like a service older than troubleshooting.
+    troubleshoot_unknown: bool,
 }
 
 #[derive(Clone, Default)]
@@ -120,6 +122,14 @@ impl ServiceTransport for FakeTransport {
             },
             ServiceCommand::Shutdown => ServiceResponse::ShuttingDown,
             ServiceCommand::Update { .. } => ServiceResponse::UpdateStarted,
+            ServiceCommand::Troubleshoot { .. } if service.troubleshoot_unknown => {
+                ServiceResponse::Error {
+                    code: BrokerErrorCode::InvalidRequest,
+                }
+            }
+            ServiceCommand::Troubleshoot { fixes } => ServiceResponse::Troubleshot {
+                outcomes: vec![multicore_core::troubleshoot::FixOutcome::Done; fixes.len()],
+            },
             ServiceCommand::StageUpdate { version } => ServiceResponse::UpdateStaged {
                 version: if service.stage_wrong_version {
                     "9.9.9".into()
@@ -789,4 +799,40 @@ async fn a_generation_replaced_under_a_proxy_connection_is_a_lost_connection() {
     supervisor.disconnect().await.unwrap();
     assert_eq!(proxy.restored.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(!session.connection_lost());
+}
+
+#[test]
+fn troubleshooting_runs_on_its_own_channel_and_an_old_service_is_told_apart() {
+    use multicore_core::troubleshoot::{FixOutcome, PrivilegedFix};
+    let (session, connector, _slot) = session();
+    session.prepare(3).unwrap();
+    let fixes = [PrivilegedFix::ResyncTime, PrivilegedFix::ReinstallWintun];
+    assert_eq!(
+        session.troubleshoot(&fixes),
+        Ok(vec![FixOutcome::Done, FixOutcome::Done])
+    );
+    {
+        let service = connector.0.lock().unwrap();
+        assert_eq!(
+            service.connects, 2,
+            "troubleshooting opened its own channel"
+        );
+        assert!(service.commands.contains(&ServiceCommand::Troubleshoot {
+            fixes: fixes.to_vec()
+        }));
+    }
+    assert!(
+        session.cores_ready(),
+        "the connection channel was left alone"
+    );
+    connector.0.lock().unwrap().troubleshoot_unknown = true;
+    assert_eq!(
+        session.troubleshoot(&fixes),
+        Err(ServiceError::Rejected(BrokerErrorCode::InvalidRequest))
+    );
+    assert!(
+        service_response_timeout(&ServiceCommand::Troubleshoot {
+            fixes: fixes.to_vec()
+        }) >= std::time::Duration::from_secs(5 * 60)
+    );
 }
