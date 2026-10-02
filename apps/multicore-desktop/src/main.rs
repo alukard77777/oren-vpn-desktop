@@ -5462,6 +5462,33 @@ fn catalog_icon_image(
         .unwrap_or_else(|| emoji_images::image_for(emoji))
 }
 
+/// Updates `current` row by row when it already shows the same rows (same ids, same order):
+/// the row components are kept, so their own transitions (an icon cross-fading in when its
+/// download finishes) can run. Otherwise (another group, rows added or removed) returns a new
+/// model to set; replacing the model rebuilds every row.
+fn sync_rows<T: Clone + PartialEq + 'static>(
+    current: ModelRc<T>,
+    rows: Vec<T>,
+    id: impl Fn(&T) -> SharedString,
+) -> Option<ModelRc<T>> {
+    use slint::Model as _;
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<T>>()
+        && model.row_count() == rows.len()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(index, row)| model.row_data(index).is_some_and(|old| id(&old) == id(row)))
+    {
+        for (index, row) in rows.into_iter().enumerate() {
+            if model.row_data(index).as_ref() != Some(&row) {
+                model.set_row_data(index, row);
+            }
+        }
+        return None;
+    }
+    Some(ModelRc::new(VecModel::from(rows)))
+}
+
 /// Latency of the exit shown on the home toggle, when the visible catalog holds
 /// it as the selected node; empty otherwise (never a placeholder like "—").
 fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
@@ -5515,12 +5542,55 @@ fn apply_catalog(ui: &AppWindow, catalog: &CatalogPresentation) {
         .collect::<Vec<_>>();
     ui.set_catalog_dumb_mode(catalog.dumb_mode);
     ui.set_node_latency(catalog.exit_latency_text.clone().into());
-    ui.set_catalog_groups(ModelRc::new(VecModel::from(groups)));
-    ui.set_catalog_nodes(ModelRc::new(VecModel::from(nodes)));
+    if let Some(groups) = sync_rows(ui.get_catalog_groups(), groups, |group| group.id.clone()) {
+        ui.set_catalog_groups(groups);
+    }
+    if let Some(nodes) = sync_rows(ui.get_catalog_nodes(), nodes, |node| node.id.clone()) {
+        ui.set_catalog_nodes(nodes);
+    }
     ui.set_catalog_loading(catalog.loading);
     ui.set_catalog_selection_enabled(catalog.selection_enabled);
     ui.set_catalog_selection_pending(catalog.selection_pending);
     ui.set_catalog_error(catalog.error.clone().unwrap_or_default().into());
+}
+
+#[cfg(test)]
+mod row_sync_tests {
+    use slint::{Model, ModelRc, VecModel};
+
+    use super::{UiCatalogNode, sync_rows};
+
+    fn node(id: &str, loading: bool) -> UiCatalogNode {
+        UiCatalogNode {
+            id: id.into(),
+            icon_loading: loading,
+            ..UiCatalogNode::default()
+        }
+    }
+
+    #[test]
+    fn the_same_rows_are_updated_in_place_and_other_rows_replace_the_model() {
+        let current = ModelRc::new(VecModel::from(vec![node("a", true), node("b", false)]));
+        // An icon arrived: same rows, so the row components stay (their cross-fade runs).
+        assert!(
+            sync_rows(
+                current.clone(),
+                vec![node("a", false), node("b", false)],
+                |row| row.id.clone()
+            )
+            .is_none()
+        );
+        assert!(!current.row_data(0).unwrap().icon_loading);
+        // Another group's rows: a new model.
+        let replaced = sync_rows(
+            current.clone(),
+            vec![node("c", false), node("d", false)],
+            |row| row.id.clone(),
+        )
+        .expect("other rows");
+        assert_eq!(replaced.row_data(0).unwrap().id, "c");
+        assert!(sync_rows(current, vec![node("a", false)], |row| row.id.clone()).is_some());
+    }
 }
 
 #[cfg(test)]
