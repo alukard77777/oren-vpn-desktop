@@ -3223,7 +3223,8 @@ fn wire_tray_popup_focus_loss(
 ) -> Timer {
     let timer = Timer::default();
     let weak = popup.as_weak();
-    let grace_ticks = Rc::new(Cell::new(0_u8));
+    // A popup created on demand opens right away: give its first ticks the same grace.
+    let grace_ticks = Rc::new(Cell::new(2_u8));
     let timer_grace = grace_ticks.clone();
     let mut initial_model_cache = TrayPopupModelCache::default();
     initial_model_cache.observe(&tray_menu_model(&model.lock().expect("view model lock")));
