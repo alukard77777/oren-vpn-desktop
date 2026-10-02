@@ -35,6 +35,11 @@ PrivilegesRequiredOverridesAllowed=commandline dialog
 ; "Без службы" over a service install removes the service install first (PrepareToInstall).
 UsePreviousPrivileges=no
 UsedUserAreasWarning=no
+; The language follows the Windows UI language, never a dialog or an earlier install: Russian UI
+; gets Russian, any other English (the first entry in [Languages] is the fallback).
+ShowLanguageDialog=no
+LanguageDetectionMethod=uilanguage
+UsePreviousLanguage=no
 #if Arch == "x64"
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -64,8 +69,8 @@ VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppVersion}
 
 [Languages]
-Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Messages]
 russian.PrivilegesRequiredOverrideTitle=Как установить MULTICORE
@@ -80,15 +85,60 @@ english.PrivilegesRequiredOverrideTitle=How to install MULTICORE
 english.PrivilegesRequiredOverrideInstruction=Choose how to install
 english.PrivilegesRequiredOverrideText1=With the service MULTICORE connects instantly: one administrator prompt now and none later. Without the service no administrator rights are needed: the system proxy works as before, and TUN mode asks for rights on every connect.
 english.PrivilegesRequiredOverrideText2=With the service MULTICORE connects instantly: one administrator prompt now and none later. Without the service no administrator rights are needed: the system proxy works as before, and TUN mode asks for rights on every connect.
-english.PrivilegesRequiredOverrideAllUsers=With the service (recommended)
-english.PrivilegesRequiredOverrideAllUsersRecommended=With the service (recommended)
-english.PrivilegesRequiredOverrideCurrentUser=Without the service
-english.PrivilegesRequiredOverrideCurrentUserRecommended=Without the service
+english.PrivilegesRequiredOverrideAllUsers=With service (recommended)
+english.PrivilegesRequiredOverrideAllUsersRecommended=With service (recommended)
+english.PrivilegesRequiredOverrideCurrentUser=No service
+english.PrivilegesRequiredOverrideCurrentUserRecommended=No service
+
+; Every text of this script, in both languages; [Code] reads them with CustomMessage.
+[CustomMessages]
+russian.ShortcutsGroup=Ярлыки:
+english.ShortcutsGroup=Icons:
+russian.DesktopIconTask=Создать ярлык на рабочем столе
+english.DesktopIconTask=Create a desktop shortcut
+russian.AutostartGroup=Автозапуск:
+english.AutostartGroup=Startup:
+russian.AutostartTask=Запускать MULTICORE вместе с Windows
+english.AutostartTask=Start MULTICORE with Windows
+russian.DataGroup=Данные:
+english.DataGroup=Data:
+russian.CleanDataTask=Удалить старые подписки и настройки
+english.CleanDataTask=Delete old subscriptions and settings
+russian.LaunchApp=Запустить MULTICORE
+english.LaunchApp=Launch MULTICORE
+russian.ServiceDescription=MULTICORE: ядра Mihomo и Xray для мгновенного подключения
+english.ServiceDescription=MULTICORE: Mihomo and Xray cores for instant connection
+russian.ServiceRegisterFailed=Не удалось зарегистрировать службу MULTICORE (код %1). Приложение будет работать без службы и запрашивать права для TUN. Перезагрузите компьютер и запустите установку снова.
+english.ServiceRegisterFailed=Could not register the MULTICORE service (code %1). The app will run without it and ask for rights for TUN. Restart the computer and run Setup again.
+russian.ServiceInstallPresent=MULTICORE уже установлен со службой. Чтобы установить его без службы, версию со службой нужно удалить (потребуются права администратора). Подписки и настройки сохранятся.%n%nУдалить MULTICORE со службой и продолжить?
+english.ServiceInstallPresent=MULTICORE is installed with the service. To install it without the service, that version must be removed first (administrator rights needed). Subscriptions and settings are kept.%n%nRemove MULTICORE with the service and continue?
+russian.ServiceInstallKept=MULTICORE уже установлен со службой. Запустите установку снова и выберите «Со службой» или сначала удалите MULTICORE в «Параметры → Приложения».
+english.ServiceInstallKept=MULTICORE is installed with the service. Run Setup again and choose "With service", or first remove MULTICORE in Settings → Apps.
+russian.StillRunning=MULTICORE ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.
+english.StillRunning=MULTICORE is still running. Close it (tray icon → Quit) and run Setup again.
+russian.ServiceInstallRemoveFailed=Не удалось удалить MULTICORE со службой. Удалите его в «Параметры → Приложения» и запустите установку снова.
+english.ServiceInstallRemoveFailed=Could not remove MULTICORE with the service. Remove it in Settings → Apps and run Setup again.
+russian.X86RemoveFailedCode=Не удалось удалить 32-битный MULTICORE (код %1). Удалите его в «Параметры → Приложения» и запустите установку снова.
+english.X86RemoveFailedCode=Could not remove the 32-bit MULTICORE (code %1). Remove it in Settings → Apps and run Setup again.
+russian.X86RemoveFailed=Не удалось удалить 32-битный MULTICORE. Удалите его в «Параметры → Приложения» и запустите установку снова.
+english.X86RemoveFailed=Could not remove the 32-bit MULTICORE. Remove it in Settings → Apps and run Setup again.
+russian.X86SetupOn64BitWindows=Это 32-битная версия MULTICORE. На 64-битной Windows лучше установить %1: 32-битная версия работает, но медленнее и может дольше поднимать TUN.%n%nВсё равно установить 32-битную версию?
+english.X86SetupOn64BitWindows=This is the 32-bit MULTICORE. On 64-bit Windows, %1 fits better: the 32-bit version works, but slower, and TUN may take longer to start.%n%nInstall the 32-bit version anyway?
+russian.X64SetupOnArm64=Это версия MULTICORE для x64. На Windows для ARM лучше установить MultiCore-Setup-arm64.exe: версия x64 работает здесь только через эмуляцию, медленнее и расходует больше заряда.%n%nВсё равно установить версию x64?
+english.X64SetupOnArm64=This is MULTICORE for x64. On Windows on ARM, MultiCore-Setup-arm64.exe fits better: x64 runs here only emulated, slower and with more battery drain.%n%nInstall the x64 version anyway?
+russian.X64InstallPresent=На этом компьютере уже установлен 64-битный MULTICORE. Установите %1 или сначала удалите MULTICORE в «Параметры → Приложения».
+english.X64InstallPresent=The 64-bit MULTICORE is already installed on this PC. Install %1, or first remove MULTICORE in Settings → Apps.
+russian.Arm64InstallPresent=На этом компьютере уже установлен MULTICORE для ARM64. Установите MultiCore-Setup-arm64.exe или сначала удалите MULTICORE в «Параметры → Приложения».
+english.Arm64InstallPresent=MULTICORE for ARM64 is already installed on this PC. Install MultiCore-Setup-arm64.exe, or first remove MULTICORE in Settings → Apps.
+russian.ServiceDirOnly=Со службой MULTICORE устанавливается только в %1.
+english.ServiceDirOnly=With the service, MULTICORE installs only to %1.
+russian.DeleteDataPrompt=Удалить подписки и настройки?
+english.DeleteDataPrompt=Erase subscriptions and settings?
 
 [Tasks]
-Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Ярлыки:"; Flags: unchecked
-Name: "autostart"; Description: "Запускать MULTICORE вместе с Windows"; GroupDescription: "Автозапуск:"; Flags: unchecked
-Name: "cleandata"; Description: "Удалить старые подписки и настройки"; GroupDescription: "Данные:"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:DesktopIconTask}"; GroupDescription: "{cm:ShortcutsGroup}"; Flags: unchecked
+Name: "autostart"; Description: "{cm:AutostartTask}"; GroupDescription: "{cm:AutostartGroup}"; Flags: unchecked
+Name: "cleandata"; Description: "{cm:CleanDataTask}"; GroupDescription: "{cm:DataGroup}"; Flags: unchecked
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -115,7 +165,7 @@ Root: HKA; Subkey: "Software\Classes\multicore\DefaultIcon"; ValueType: string; 
 Root: HKA; Subkey: "Software\Classes\multicore\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\current\MultiCore.exe"" ""%1"""
 
 [Run]
-Filename: "{app}\current\MultiCore.exe"; Description: "Запустить MULTICORE"; WorkingDir: "{app}\current"; Flags: postinstall shellexec skipifsilent
+Filename: "{app}\current\MultiCore.exe"; Description: "{cm:LaunchApp}"; WorkingDir: "{app}\current"; Flags: postinstall shellexec skipifsilent
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\.multicore-previous-*"
@@ -398,12 +448,10 @@ begin
   if Registered <> 0 then
   begin
     { 1072: the old service is still marked for deletion until a reboot. }
-    SuppressibleMsgBox('Не удалось зарегистрировать службу MULTICORE (код ' + IntToStr(Registered) + '). '
-      + 'Приложение будет работать без службы и запрашивать права для TUN. '
-      + 'Перезагрузите компьютер и запустите установку снова.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox(FmtMessage(CustomMessage('ServiceRegisterFailed'), [IntToStr(Registered)]), mbError, MB_OK, IDOK);
     exit;
   end;
-  RunSc('description ' + ServiceName + ' "MULTICORE: ядра Mihomo и Xray для мгновенного подключения"');
+  RunSc('description ' + ServiceName + ' "' + CustomMessage('ServiceDescription') + '"');
   RunSc('failure ' + ServiceName + ' reset= 86400 actions= restart/5000/restart/5000');
   RunSc('start ' + ServiceName);
 end;
@@ -537,19 +585,16 @@ begin
   ServiceUninstaller := ServiceInstallUninstaller;
   if ServiceUninstaller = '' then
     exit;
-  if SuppressibleMsgBox('MULTICORE уже установлен со службой. Чтобы установить его без службы, '
-       + 'версию со службой нужно удалить (потребуются права администратора). Подписки и настройки сохранятся.'
-       + #13#10#13#10 + 'Удалить MULTICORE со службой и продолжить?',
+  if SuppressibleMsgBox(CustomMessage('ServiceInstallPresent'),
        mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) <> IDYES then
   begin
-    Result := 'MULTICORE уже установлен со службой. Запустите установку снова и выберите «Со службой» '
-      + 'или сначала удалите MULTICORE в «Параметры → Приложения».';
+    Result := CustomMessage('ServiceInstallKept');
     exit;
   end;
   ServiceDir := RemoveBackslash(ExtractFilePath(ServiceUninstaller));
   if not WaitForExit(ServiceDir, True) then
   begin
-    Result := 'MULTICORE ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    Result := CustomMessage('StillRunning');
     exit;
   end;
   { Keep launch at sign-in: the service install's value is removed with it. }
@@ -570,7 +615,7 @@ begin
   if ServiceInstallUninstaller <> '' then
   begin
     MoveAutostartFromServiceInstall := False;
-    Result := 'Не удалось удалить MULTICORE со службой. Удалите его в «Параметры → Приложения» и запустите установку снова.';
+    Result := CustomMessage('ServiceInstallRemoveFailed');
   end;
 end;
 
@@ -596,7 +641,7 @@ begin
   if not WaitForExit(X86Dir, False) then
   begin
     MoveAutostartFromServiceInstall := False;
-    Result := 'MULTICORE ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    Result := CustomMessage('StillRunning');
     exit;
   end;
   if not Exec(X86Uninstaller, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
@@ -610,8 +655,7 @@ begin
   if X86ServiceUninstaller <> '' then
   begin
     MoveAutostartFromServiceInstall := False;
-    Result := 'Не удалось удалить 32-битный MULTICORE (код ' + IntToStr(ResultCode) + '). '
-      + 'Удалите его в «Параметры → Приложения» и запустите установку снова.';
+    Result := FmtMessage(CustomMessage('X86RemoveFailedCode'), [IntToStr(ResultCode)]);
   end;
 end;
 
@@ -640,7 +684,7 @@ begin
     exit;
   if not WaitForPerUserCopyToExit then
   begin
-    Result := 'MULTICORE ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    Result := CustomMessage('StillRunning');
     exit;
   end;
   MoveAutostartFromServiceInstall :=
@@ -659,7 +703,7 @@ begin
   if X86PerUserCopyPresent then
   begin
     MoveAutostartFromServiceInstall := False;
-    Result := 'Не удалось удалить 32-битный MULTICORE. Удалите его в «Параметры → Приложения» и запустите установку снова.';
+    Result := CustomMessage('X86RemoveFailed');
   end;
 end;
 
@@ -706,9 +750,7 @@ begin
   if not IsX86SetupOn64BitWindows then
     exit;
   { Silent installs (the app's own service migration) keep the 32-bit flavour. }
-  Result := SuppressibleMsgBox('Это 32-битная версия MULTICORE. На 64-битной Windows лучше установить '
-      + Native64BitSetupName + ': 32-битная версия работает, но медленнее и может дольше поднимать TUN.'
-      + #13#10#13#10 + 'Всё равно установить 32-битную версию?',
+  Result := SuppressibleMsgBox(FmtMessage(CustomMessage('X86SetupOn64BitWindows'), [Native64BitSetupName]),
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES;
 end;
 
@@ -747,9 +789,7 @@ begin
   if not IsX64SetupOnArm64 then
     exit;
   { Silent installs (the app's own service migration) keep the x64 flavour. }
-  Result := SuppressibleMsgBox('Это версия MULTICORE для x64. На Windows для ARM лучше установить '
-      + 'MultiCore-Setup-arm64.exe: версия x64 работает здесь только через эмуляцию, медленнее и расходует больше заряда.'
-      + #13#10#13#10 + 'Всё равно установить версию x64?',
+  Result := SuppressibleMsgBox(CustomMessage('X64SetupOnArm64'),
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES;
 end;
 
@@ -776,15 +816,13 @@ begin
   { Never replace a 64-bit install with the 32-bit flavour. }
   if X64InstallPresent then
   begin
-    Result := 'На этом компьютере уже установлен 64-битный MULTICORE. Установите ' + Native64BitSetupName + ' '
-      + 'или сначала удалите MULTICORE в «Параметры → Приложения».';
+    Result := FmtMessage(CustomMessage('X64InstallPresent'), [Native64BitSetupName]);
     exit;
   end;
   { Never replace an ARM64 install with the emulated x64 flavour. }
   if Arm64InstallPresent then
   begin
-    Result := 'На этом компьютере уже установлен MULTICORE для ARM64. Установите MultiCore-Setup-arm64.exe '
-      + 'или сначала удалите MULTICORE в «Параметры → Приложения».';
+    Result := CustomMessage('Arm64InstallPresent');
     exit;
   end;
   if not IsAdminInstallMode then
@@ -796,7 +834,7 @@ begin
   end;
   if CompareText(RemoveBackslashUnlessRoot(ExpandConstant('{app}')), ServiceInstallDir) <> 0 then
   begin
-    Result := 'Со службой MULTICORE устанавливается только в ' + ServiceInstallDir + '.';
+    Result := FmtMessage(CustomMessage('ServiceDirOnly'), [ServiceInstallDir]);
     exit;
   end;
   Result := RemoveX86ServiceInstall;
@@ -804,7 +842,7 @@ begin
     exit;
   if DirExists(PerUserInstallDir) and not WaitForPerUserCopyToExit then
   begin
-    Result := 'MULTICORE ещё запущен. Закройте его (значок в трее → Выход) и запустите установку снова.';
+    Result := CustomMessage('StillRunning');
     exit;
   end;
   { The running service holds files in the current folder; stop it before Setup checks for files in use. }
@@ -859,7 +897,7 @@ begin
       RunSc('delete ' + ServiceName);
     end;
     if (not UninstallSilent) and
-       (SuppressibleMsgBox('Удалить подписки и настройки?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES) and
+       (SuppressibleMsgBox(CustomMessage('DeleteDataPrompt'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES) and
        (UserLocalAppData <> '') then
       SafeDelTree(UserLocalAppData + '\MultiCore');
   end;
