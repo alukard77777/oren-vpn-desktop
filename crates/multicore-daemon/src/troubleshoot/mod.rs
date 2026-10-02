@@ -639,7 +639,10 @@ pub fn run_privileged(
         }
         Err(ServiceError::Rejected(BrokerErrorCode::NotReady)) => Err(BatchError::TunnelUp),
         Err(ServiceError::Busy) => Err(BatchError::Busy),
-        Err(ServiceError::TimedOut | ServiceError::Rejected(_)) => Err(BatchError::Failed),
+        // TunRejected only comes from SetTun; a fix batch never sends one.
+        Err(ServiceError::TimedOut | ServiceError::Rejected(_) | ServiceError::TunRejected(_)) => {
+            Err(BatchError::Failed)
+        }
         Err(
             ServiceError::NotInstalled
             | ServiceError::Unavailable
