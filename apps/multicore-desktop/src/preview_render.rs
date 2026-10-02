@@ -273,9 +273,36 @@ fn capture_scrolled(
     println!("{}", path.display());
 }
 
+/// A fixture text as the app would show it: in English previews a catalog `msgid` becomes
+/// its English text. Texts the catalog has no entry for (provider content, composed text)
+/// stay as written, or come from [`en`]; English previews list any Cyrillic left over.
 fn s(value: &str) -> SharedString {
-    value.into()
+    if preview_language() == multicore_i18n::Lang::Ru {
+        return value.into();
+    }
+    let fixture = || {
+        FIXTURE_ENGLISH
+            .iter()
+            .find(|(russian, _)| *russian == value)
+            .map(|(_, english)| *english)
+    };
+    match multicore_i18n::english(value).or_else(fixture) {
+        Some(english) => english.into(),
+        None => {
+            if value
+                .chars()
+                .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+            {
+                eprintln!("preview text left in Russian: {value:?}");
+            }
+            value.into()
+        }
+    }
 }
+
+/// English for fixture texts the catalog cannot translate: provider content (an English
+/// provider in English previews) and texts the app composes from several catalog entries.
+const FIXTURE_ENGLISH: &[(&str, &str)] = &[];
 
 fn groups() -> ModelRc<UiCatalogGroup> {
     let rows = [
