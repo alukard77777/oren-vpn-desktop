@@ -93,6 +93,12 @@ const MIXED_RELEASE: &[u8] = br#"{
             "digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         },
         {
+            "name":"multicore-windows-arm64.zip",
+            "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v0.3.0/multicore-windows-arm64.zip",
+            "size":5555,
+            "digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
             "name":"MultiCore-0.3.0-x86_64.AppImage",
             "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v0.3.0/MultiCore-0.3.0-x86_64.AppImage",
             "size":5678,
@@ -128,6 +134,15 @@ fn appimage_release_selects_the_versioned_linux_asset() {
     );
 }
 
+/// Size and digest character of each flavour's bundle in `MIXED_RELEASE`.
+fn mixed_release_bundle(arch: WindowsArch) -> (u64, char) {
+    match arch {
+        WindowsArch::X64 => (1234, 'a'),
+        WindowsArch::X86 => (4321, 'c'),
+        WindowsArch::Arm64 => (5555, 'e'),
+    }
+}
+
 #[test]
 fn each_windows_flavour_takes_only_its_own_bundle() {
     assert_eq!(
@@ -138,39 +153,55 @@ fn each_windows_flavour_takes_only_its_own_bundle() {
         WindowsArch::X86.bundle_asset_name(),
         "multicore-windows-x86.zip"
     );
-    let x64 = GitHubRelease::parse_for_arch(MIXED_RELEASE, WindowsArch::X64).unwrap();
-    assert_eq!(x64.asset().size(), 1234);
-    assert!(
-        x64.asset()
-            .download_url()
-            .ends_with("/multicore-windows-x64.zip")
+    assert_eq!(
+        WindowsArch::Arm64.bundle_asset_name(),
+        "multicore-windows-arm64.zip"
     );
-    let x86 = GitHubRelease::parse_for_arch(MIXED_RELEASE, WindowsArch::X86).unwrap();
-    assert_eq!(x86.asset().size(), 4321);
-    assert_eq!(x86.asset().sha256_hex(), "c".repeat(64));
-    assert!(
-        x86.asset()
-            .download_url()
-            .ends_with("/multicore-windows-x86.zip")
-    );
+    for arch in WindowsArch::ALL {
+        let (size, digest) = mixed_release_bundle(arch);
+        let release = GitHubRelease::parse_for_arch(MIXED_RELEASE, arch).unwrap();
+        assert_eq!(release.asset().size(), size, "{arch:?}");
+        assert_eq!(
+            release.asset().sha256_hex(),
+            digest.to_string().repeat(64),
+            "{arch:?}"
+        );
+        assert!(
+            release
+                .asset()
+                .download_url()
+                .ends_with(&format!("/{}", arch.bundle_asset_name())),
+            "{arch:?}"
+        );
+    }
 
-    // A release without this flavour's bundle offers no update rather than the other one.
-    let x64_only = String::from_utf8(MIXED_RELEASE.to_vec())
-        .unwrap()
-        .replace("multicore-windows-x86.zip", "multicore-windows-arm64.zip");
-    assert!(GitHubRelease::parse_for_arch(x64_only.as_bytes(), WindowsArch::X86).is_err());
-    assert!(GitHubRelease::parse_for_arch(x64_only.as_bytes(), WindowsArch::X64).is_ok());
-    let x86_only = String::from_utf8(MIXED_RELEASE.to_vec())
-        .unwrap()
-        .replace("multicore-windows-x64.zip", "multicore-windows-arm64.zip");
-    assert!(GitHubRelease::parse_for_arch(x86_only.as_bytes(), WindowsArch::X64).is_err());
-    assert!(GitHubRelease::parse_for_arch(x86_only.as_bytes(), WindowsArch::X86).is_ok());
+    // A release without one flavour's bundle offers that flavour no update rather than
+    // another flavour's bundle, and still updates the others.
+    for missing in WindowsArch::ALL {
+        let without = String::from_utf8(MIXED_RELEASE.to_vec())
+            .unwrap()
+            .replace(missing.bundle_asset_name(), "multicore-windows-other.zip");
+        for arch in WindowsArch::ALL {
+            let parsed = GitHubRelease::parse_for_arch(without.as_bytes(), arch);
+            if arch == missing {
+                assert!(parsed.is_err(), "{arch:?} must not take another bundle");
+            } else {
+                assert_eq!(
+                    parsed.unwrap().asset().size(),
+                    mixed_release_bundle(arch).0,
+                    "{arch:?} without {missing:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
 fn this_build_uses_the_assets_of_its_own_architecture() {
     let expected = if cfg!(target_arch = "x86") {
         WindowsArch::X86
+    } else if cfg!(target_arch = "aarch64") {
+        WindowsArch::Arm64
     } else {
         WindowsArch::X64
     };
@@ -181,11 +212,44 @@ fn this_build_uses_the_assets_of_its_own_architecture() {
         expected.installer_asset_name()
     );
     let release = GitHubRelease::parse(MIXED_RELEASE).unwrap();
-    let foreign = match expected {
-        WindowsArch::X64 => "multicore-windows-x86.zip",
-        WindowsArch::X86 => "multicore-windows-x64.zip",
-    };
-    assert!(!release.asset().download_url().ends_with(foreign));
+    assert!(
+        release
+            .asset()
+            .download_url()
+            .ends_with(&format!("/{}", expected.bundle_asset_name()))
+    );
+    for foreign in WindowsArch::ALL
+        .into_iter()
+        .filter(|arch| *arch != expected)
+    {
+        assert!(
+            !release
+                .asset()
+                .download_url()
+                .ends_with(foreign.bundle_asset_name())
+        );
+    }
+}
+
+#[test]
+fn pe_identity_of_each_windows_flavour() {
+    assert_eq!(WindowsArch::X64.pe_machine(), 0x8664);
+    assert_eq!(WindowsArch::X86.pe_machine(), 0x014c);
+    assert_eq!(WindowsArch::Arm64.pe_machine(), 0xaa64);
+    assert_eq!(WindowsArch::X64.pe_optional_magic(), 0x20b);
+    assert_eq!(WindowsArch::X86.pe_optional_magic(), 0x10b);
+    assert_eq!(WindowsArch::Arm64.pe_optional_magic(), 0x20b);
+    assert_eq!(WindowsArch::Arm64.pe_optional_header_fixed_size(), 112);
+    assert_eq!(WindowsArch::Arm64.pe_description(), "PE32+ ARM64");
+    // Machine and description tell every pair of flavours apart.
+    for a in WindowsArch::ALL {
+        for b in WindowsArch::ALL.into_iter().filter(|b| *b != a) {
+            assert_ne!(a.pe_machine(), b.pe_machine());
+            assert!(!a.pe_description().contains(b.pe_description()));
+            assert_ne!(a.bundle_asset_name(), b.bundle_asset_name());
+            assert_ne!(a.installer_asset_name(), b.installer_asset_name());
+        }
+    }
 }
 
 #[test]
@@ -212,9 +276,14 @@ fn the_installer_asset_is_parsed_from_the_pinned_repository() {
         WindowsArch::X86.installer_asset_name(),
         "MultiCore-Setup-x86.exe"
     );
+    assert_eq!(
+        WindowsArch::Arm64.installer_asset_name(),
+        "MultiCore-Setup-arm64.exe"
+    );
     let repository = Repository::parse("fatyzzz/multicore-releases").unwrap();
     let digest = "a".repeat(64);
     let x86_digest = "d".repeat(64);
+    let arm64_digest = "f".repeat(64);
     let body = format!(
         r#"{{"tag_name":"v1.1.0","html_url":"https://github.com/fatyzzz/multicore-releases/releases/tag/v1.1.0",
             "assets":[{{"name":"MultiCore-Setup-x64.exe","size":1000,
@@ -222,7 +291,10 @@ fn the_installer_asset_is_parsed_from_the_pinned_repository() {
             "digest":"sha256:{digest}"}},
             {{"name":"MultiCore-Setup-x86.exe","size":900,
             "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v1.1.0/MultiCore-Setup-x86.exe",
-            "digest":"sha256:{x86_digest}"}}]}}"#
+            "digest":"sha256:{x86_digest}"}},
+            {{"name":"MultiCore-Setup-arm64.exe","size":950,
+            "browser_download_url":"https://github.com/fatyzzz/multicore-releases/releases/download/v1.1.0/MultiCore-Setup-arm64.exe",
+            "digest":"sha256:{arm64_digest}"}}]}}"#
     );
     let x64 = GitHubRelease::parse_installer_for_arch(body.as_bytes(), WindowsArch::X64).unwrap();
     assert!(
@@ -238,6 +310,24 @@ fn the_installer_asset_is_parsed_from_the_pinned_repository() {
             .ends_with("/MultiCore-Setup-x86.exe")
     );
     assert_eq!(x86.asset().sha256_hex(), x86_digest);
+    let arm64 =
+        GitHubRelease::parse_installer_for_arch(body.as_bytes(), WindowsArch::Arm64).unwrap();
+    assert!(
+        arm64
+            .asset()
+            .download_url()
+            .ends_with("/MultiCore-Setup-arm64.exe")
+    );
+    assert_eq!(arm64.asset().sha256_hex(), arm64_digest);
+    // Each flavour's installer only: without the ARM64 installer an ARM64 client gets none.
+    let without_arm64 = body.replace("MultiCore-Setup-arm64.exe", "MultiCore-Setup-other.exe");
+    assert!(
+        GitHubRelease::parse_installer_for_arch(without_arm64.as_bytes(), WindowsArch::Arm64)
+            .is_err()
+    );
+    assert!(
+        GitHubRelease::parse_installer_for_arch(without_arm64.as_bytes(), WindowsArch::X64).is_ok()
+    );
     let release =
         GitHubRelease::parse_installer_for_repository(&repository, body.as_bytes()).unwrap();
     assert!(

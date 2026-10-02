@@ -15,28 +15,37 @@ use thiserror::Error;
 
 /// Windows release flavour. Every release carries one portable bundle and one installer per
 /// flavour; a client only ever takes the assets of the architecture it was compiled for, so a
-/// 32-bit build never installs the x64 bundle and the reverse.
+/// 32-bit build never installs the x64 bundle, an ARM64 build never installs the x64 bundle that
+/// Windows on ARM could only run emulated, and so on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsArch {
     /// `x86_64-pc-windows-msvc`: PE32+ AMD64 images.
     X64,
     /// `i686-pc-windows-msvc`: PE32 i386 images.
     X86,
+    /// `aarch64-pc-windows-msvc`: PE32+ ARM64 images.
+    Arm64,
 }
 
 impl WindowsArch {
     /// The flavour of this build. Non-Windows builds report x64; they never use these assets.
     pub const CURRENT: Self = if cfg!(target_arch = "x86") {
         Self::X86
+    } else if cfg!(target_arch = "aarch64") {
+        Self::Arm64
     } else {
         Self::X64
     };
+
+    /// Every Windows flavour a release carries.
+    pub const ALL: [Self; 3] = [Self::X64, Self::X86, Self::Arm64];
 
     /// Portable bundle and updater asset.
     pub const fn bundle_asset_name(self) -> &'static str {
         match self {
             Self::X64 => "multicore-windows-x64.zip",
             Self::X86 => "multicore-windows-x86.zip",
+            Self::Arm64 => "multicore-windows-arm64.zip",
         }
     }
 
@@ -45,6 +54,7 @@ impl WindowsArch {
         match self {
             Self::X64 => "MultiCore-Setup-x64.exe",
             Self::X86 => "MultiCore-Setup-x86.exe",
+            Self::Arm64 => "MultiCore-Setup-arm64.exe",
         }
     }
 
@@ -53,13 +63,14 @@ impl WindowsArch {
         match self {
             Self::X64 => 0x8664,
             Self::X86 => 0x014c,
+            Self::Arm64 => 0xaa64,
         }
     }
 
     /// Optional-header magic: PE32+ (`0x20b`) or PE32 (`0x10b`).
     pub const fn pe_optional_magic(self) -> u16 {
         match self {
-            Self::X64 => 0x020b,
+            Self::X64 | Self::Arm64 => 0x020b,
             Self::X86 => 0x010b,
         }
     }
@@ -69,13 +80,14 @@ impl WindowsArch {
         match self {
             Self::X64 => "PE32+ AMD64",
             Self::X86 => "PE32 i386",
+            Self::Arm64 => "PE32+ ARM64",
         }
     }
 
     /// Size of the optional header up to the data directories.
     pub const fn pe_optional_header_fixed_size(self) -> u16 {
         match self {
-            Self::X64 => 112,
+            Self::X64 | Self::Arm64 => 112,
             Self::X86 => 96,
         }
     }

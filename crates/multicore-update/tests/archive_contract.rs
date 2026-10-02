@@ -11,18 +11,18 @@ use multicore_release::{
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 
-/// The other Windows flavour than this build's.
+/// Another Windows flavour than this build's.
 fn foreign_arch() -> WindowsArch {
     match WindowsArch::CURRENT {
         WindowsArch::X64 => WindowsArch::X86,
-        WindowsArch::X86 => WindowsArch::X64,
+        WindowsArch::X86 | WindowsArch::Arm64 => WindowsArch::X64,
     }
 }
 
 fn fake_pe_for(arch: WindowsArch) -> Vec<u8> {
     // PE32+ carries a 0xf0-byte optional header, PE32 a 0xe0-byte one.
     let optional_size: u16 = match arch {
-        WindowsArch::X64 => 0x00f0,
+        WindowsArch::X64 | WindowsArch::Arm64 => 0x00f0,
         WindowsArch::X86 => 0x00e0,
     };
     let mut bytes = vec![0_u8; 512];
@@ -125,12 +125,13 @@ fn valid_bundle_extracts_and_verifies_every_file() {
 
 #[test]
 fn each_flavour_accepts_only_its_own_executables() {
-    for (bundle_arch, client_arch) in [
-        (WindowsArch::X64, WindowsArch::X64),
-        (WindowsArch::X86, WindowsArch::X86),
-        (WindowsArch::X64, WindowsArch::X86),
-        (WindowsArch::X86, WindowsArch::X64),
-    ] {
+    // Every bundle flavour against every client flavour.
+    let pairs = WindowsArch::ALL.into_iter().flat_map(|bundle| {
+        WindowsArch::ALL
+            .into_iter()
+            .map(move |client| (bundle, client))
+    });
+    for (bundle_arch, client_arch) in pairs {
         let temp = TempDir::new().unwrap();
         let archive = temp.path().join("bundle.zip");
         let files = required_files_for(bundle_arch);
@@ -151,18 +152,23 @@ fn each_flavour_accepts_only_its_own_executables() {
 }
 
 #[test]
-fn this_build_rejects_the_other_flavours_bundle() {
-    let temp = TempDir::new().unwrap();
-    let archive = temp.path().join("bundle.zip");
-    let files = required_files_for(foreign_arch());
-    write_bundle(&archive, &files, &files);
-    let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains(WindowsArch::CURRENT.pe_description()),
-        "{error}"
-    );
+fn this_build_rejects_the_other_flavours_bundles() {
+    for foreign in WindowsArch::ALL
+        .into_iter()
+        .filter(|arch| *arch != WindowsArch::CURRENT)
+    {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("bundle.zip");
+        let files = required_files_for(foreign);
+        write_bundle(&archive, &files, &files);
+        let error = extract_verified_bundle(&archive, &temp.path().join("out")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(WindowsArch::CURRENT.pe_description()),
+            "{foreign:?}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -341,11 +347,16 @@ fn missing_or_foreign_core_host_is_rejected() {
         "{error}"
     );
 
-    // The right machine with the other flavour's optional-header magic (PE32 vs PE32+).
+    // The right machine with the other optional-header magic (PE32 vs PE32+).
     let archive = temp.path().join("foreign-magic-core-host.zip");
     let mut files = required_files();
     let mut foreign_magic = fake_pe();
-    foreign_magic[0x98..0x9a].copy_from_slice(&foreign_arch().pe_optional_magic().to_le_bytes());
+    let other_magic: u16 = if WindowsArch::CURRENT.pe_optional_magic() == 0x020b {
+        0x010b
+    } else {
+        0x020b
+    };
+    foreign_magic[0x98..0x9a].copy_from_slice(&other_magic.to_le_bytes());
     files.insert("runtime/multicore-core-host.exe".into(), foreign_magic);
     write_bundle(&archive, &files, &files);
 
@@ -422,10 +433,12 @@ fn built_release_bundle_matches_updater_contract() {
     let archive = std::env::var_os("MULTICORE_RELEASE_BUNDLE")
         .map(std::path::PathBuf::from)
         .expect("MULTICORE_RELEASE_BUNDLE must name the built release ZIP");
-    // The x64 test binary also checks the x86 bundle: MULTICORE_RELEASE_BUNDLE_ARCH=x86.
+    // The x64 test binary also checks the x86 and ARM64 bundles:
+    // MULTICORE_RELEASE_BUNDLE_ARCH=x86 or arm64.
     let arch = match std::env::var("MULTICORE_RELEASE_BUNDLE_ARCH").as_deref() {
         Ok("x86") => WindowsArch::X86,
         Ok("x64") => WindowsArch::X64,
+        Ok("arm64") => WindowsArch::Arm64,
         Ok(other) => panic!("unknown MULTICORE_RELEASE_BUNDLE_ARCH {other:?}"),
         Err(_) => WindowsArch::CURRENT,
     };

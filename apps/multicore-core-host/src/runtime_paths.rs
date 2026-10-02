@@ -531,7 +531,7 @@ fn open_guard(path: &Path, directory: bool) -> Result<GuardedPath, ResolveError>
     })
 }
 
-/// The cores must be images of this build's architecture (PE32+ AMD64 or PE32 i386).
+/// The cores must be images of this build's architecture (PE32+ AMD64, PE32 i386 or PE32+ ARM64).
 fn validate_native_pe(file: &mut File) -> Result<(), ResolveError> {
     let arch = multicore_release::WindowsArch::CURRENT;
     let mut dos = [0u8; 64];
@@ -597,6 +597,8 @@ mod tests {
     const FOREIGN_MACHINE: u16 = match multicore_release::WindowsArch::CURRENT {
         multicore_release::WindowsArch::X64 => 0x014c,
         multicore_release::WindowsArch::X86 => 0x8664,
+        // x64 cores would run emulated on Windows on ARM, but an ARM64 build takes ARM64 only.
+        multicore_release::WindowsArch::Arm64 => 0x8664,
     };
     fn pe(path: &Path, machine: u16, dll: bool) {
         let mut bytes = vec![0u8; 0x100];
