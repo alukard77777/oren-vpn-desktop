@@ -21,6 +21,8 @@ mod preferences;
 #[cfg(all(test, feature = "preview-render"))]
 mod preview_render;
 mod renderer_fallback;
+#[cfg(windows)]
+mod renderer_release;
 #[cfg(test)]
 mod rust_catalog_tests;
 mod save_dialog;
@@ -749,9 +751,25 @@ fn drain_latest_write(commands: &Receiver<WriterCommand>, latest: &mut AppPrefer
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 thread_local! {
     static CREATING_TRAY_POPUP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Windows: the tray popup gets its rounded corners when its window is created, so a popup
+/// created on demand (see `TrayPopupSlot`) never shows a square-cornered first frame.
+#[cfg(windows)]
+pub(crate) fn tray_popup_window_attributes(
+    attributes: slint::winit_030::winit::window::WindowAttributes,
+) -> slint::winit_030::winit::window::WindowAttributes {
+    use slint::winit_030::winit::platform::windows::{
+        CornerPreference, WindowAttributesExtWindows,
+    };
+    if CREATING_TRAY_POPUP.with(Cell::get) {
+        attributes.with_corner_preference(CornerPreference::Round)
+    } else {
+        attributes
+    }
 }
 
 /// Winit with Skia on OpenGL (Slint's default renderer for this build; Skia
@@ -778,12 +796,12 @@ fn select_linux_backend(software_renderer: bool) -> Result<(), slint::PlatformEr
 }
 
 fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     CREATING_TRAY_POPUP.with(|creating| creating.set(true));
     let popup = TrayPopup::new().inspect(|popup| {
         let _ = popup.window();
     });
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     CREATING_TRAY_POPUP.with(|creating| creating.set(false));
     popup
 }
@@ -1018,42 +1036,57 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         pending_subscription_consents.clone(),
         pending_subscription_imports.clone(),
     );
-    let tray_popup = create_tray_popup()?;
     let tray_popup_open = Rc::new(Cell::new(false));
     let tray_popup_geometry = Rc::new(TrayPopupGeometry::new(loaded_preferences.tray_popup_size));
-    wire_tray_popup_resize(
-        &tray_popup,
-        tray_popup_geometry.clone(),
-        preference_tracker.clone(),
-    );
-    wire_tray_popup_actions(
-        &tray_popup,
-        ui.as_weak(),
-        model.clone(),
-        preference_writer.clone(),
-        preference_tracker.clone(),
-        tray_popup_open.clone(),
-    );
-    let _tray_popup_focus_timer = wire_tray_popup_focus_loss(
-        &tray_popup,
-        tray_popup_open.clone(),
-        model.clone(),
-        ui.as_weak(),
-    );
+    let tray_popup_slot = {
+        let geometry = tray_popup_geometry.clone();
+        let tracker = preference_tracker.clone();
+        let writer = preference_writer.clone();
+        let tray_popup_open = tray_popup_open.clone();
+        let model = model.clone();
+        let ui = ui.as_weak();
+        Rc::new(TrayPopupSlot::new(
+            tray_popup_open.clone(),
+            Box::new(move || {
+                let tray_popup = create_tray_popup()?;
+                wire_tray_popup_resize(&tray_popup, geometry.clone(), tracker.clone());
+                wire_tray_popup_actions(
+                    &tray_popup,
+                    ui.clone(),
+                    model.clone(),
+                    writer.clone(),
+                    tracker.clone(),
+                    tray_popup_open.clone(),
+                );
+                let focus_timer = wire_tray_popup_focus_loss(
+                    &tray_popup,
+                    tray_popup_open.clone(),
+                    model.clone(),
+                    ui.clone(),
+                );
+                Ok((tray_popup, focus_timer))
+            }),
+        ))
+    };
+    // Linux keeps one popup for the whole run; Windows creates it on the first open.
+    #[cfg(not(windows))]
+    tray_popup_slot.get_or_create()?;
+    #[cfg(windows)]
+    let _tray_popup_release_timer = wire_tray_popup_release(tray_popup_slot.clone());
     let tray_model = tray_menu_model(&model.lock().expect("view model lock"));
     let tray_model_source = model.clone();
     let tray_action_ui = ui.as_weak();
     let tray_action_model = model.clone();
     let tray_preference_writer = preference_writer.clone();
     let tray_preference_tracker = preference_tracker.clone();
-    let tray_interaction_popup = tray_popup.as_weak();
+    let tray_interaction_popup = tray_popup_slot.clone();
     let tray_interaction_popup_open = tray_popup_open.clone();
     let tray_runtime = tray::start(
         tray_model,
         move || tray_menu_model(&tray_model_source.lock().expect("view model lock")),
         move |interaction| match interaction {
             TrayInteraction::Command(command) => {
-                hide_tray_popup(&tray_interaction_popup, &tray_interaction_popup_open);
+                hide_tray_popup(&tray_interaction_popup.weak(), &tray_interaction_popup_open);
                 handle_tray_command(
                     &tray_action_ui,
                     &tray_action_model,
@@ -1067,7 +1100,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
                     &tray_interaction_popup,
                     &tray_action_ui,
                     &tray_action_model,
-                    &tray_interaction_popup_open,
                     &tray_popup_geometry,
                     PhysicalPosition { x, y },
                 );
@@ -1139,7 +1171,9 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     }
     let result = slint::run_event_loop_until_quit();
     flush_preferences(&ui, &model, &preference_writer, &preference_tracker);
-    let _ = tray_popup.hide();
+    if let Some(tray_popup) = tray_popup_slot.weak().upgrade() {
+        let _ = tray_popup.hide();
+    }
     let _ = ui.hide();
     drop(tray_runtime);
     result
@@ -1984,13 +2018,18 @@ fn wire_preference_persistence(
         if scale_factor != last_scale_factor.replace(scale_factor) {
             apply_latest_snapshot(&ui, &model);
         }
-        if let Some(current) = ui.window().with_winit_window(current_monitor_signature) {
-            let previous = last_monitor_signature.get();
-            if monitor_cap_changed(previous, current)
-                && let Some(applied) = ui.window().with_winit_window(set_current_monitor_max_size)
-            {
-                last_monitor_signature.set(applied);
+        match ui.window().with_winit_window(current_monitor_signature) {
+            Some(current) => {
+                let previous = last_monitor_signature.get();
+                if monitor_cap_changed(previous, current)
+                    && let Some(applied) =
+                        ui.window().with_winit_window(set_current_monitor_max_size)
+                {
+                    last_monitor_signature.set(applied);
+                }
             }
+            // Released while hidden in the tray: cap the recreated window again.
+            None => last_monitor_signature.set(None),
         }
         process_writer_results(
             &ui,
@@ -2571,7 +2610,8 @@ fn close_window(weak: &slint::Weak<AppWindow>, tray_available: bool) {
 /// Wayland cannot hide a native Winit window: Slint must destroy its surface
 /// and recreate it on show(). The explicit run_event_loop_until_quit() keeps
 /// tray events and timers alive while there are no visible windows.
-/// Preserve the native-only hide path on Windows.
+/// Windows hides only the native window, so reopening is instant, and releases its
+/// renderer once it stays hidden (`renderer_release`).
 fn hide_window_to_tray(ui: &AppWindow) {
     #[cfg(target_os = "linux")]
     {
@@ -2601,6 +2641,8 @@ fn hide_window_to_tray(ui: &AppWindow) {
         let _ = ui.window().with_winit_window(|window| {
             window.set_visible(false);
         });
+        #[cfg(windows)]
+        renderer_release::release_when_left_hidden(ui);
     }
 }
 
@@ -2779,6 +2821,71 @@ fn hide_tray_popup(weak: &slint::Weak<TrayPopup>, open: &Rc<Cell<bool>>) {
     open.set(false);
 }
 
+/// The tray popup and its focus-loss timer. Linux creates it once at startup. On Windows
+/// it exists only while it is used: each window draws with its own Direct3D device, which
+/// alone keeps tens of megabytes of driver memory, so the popup is created on the first
+/// open and dropped (window, device and all) once it has stayed closed for about
+/// `renderer_release::RELEASE_AFTER` (`wire_tray_popup_release`).
+struct TrayPopupSlot {
+    popup: RefCell<Option<(TrayPopup, Timer)>>,
+    create: Box<dyn Fn() -> Result<(TrayPopup, Timer), slint::PlatformError>>,
+    open: Rc<Cell<bool>>,
+    /// When the popup was last seen open.
+    #[cfg(windows)]
+    last_open: Cell<std::time::Instant>,
+}
+
+impl TrayPopupSlot {
+    fn new(
+        open: Rc<Cell<bool>>,
+        create: Box<dyn Fn() -> Result<(TrayPopup, Timer), slint::PlatformError>>,
+    ) -> Self {
+        Self {
+            popup: RefCell::new(None),
+            create,
+            open,
+            #[cfg(windows)]
+            last_open: Cell::new(std::time::Instant::now()),
+        }
+    }
+
+    /// The current popup, or a dangling handle when there is none.
+    fn weak(&self) -> slint::Weak<TrayPopup> {
+        self.popup
+            .borrow()
+            .as_ref()
+            .map(|(popup, _)| popup.as_weak())
+            .unwrap_or_default()
+    }
+
+    /// The popup, created first when there is none (then `true`).
+    fn get_or_create(&self) -> Result<(TrayPopup, bool), slint::PlatformError> {
+        if let Some((popup, _)) = self.popup.borrow().as_ref() {
+            return Ok((popup.clone_strong(), false));
+        }
+        let (popup, focus_timer) = (self.create)()?;
+        let handle = popup.clone_strong();
+        *self.popup.borrow_mut() = Some((popup, focus_timer));
+        Ok((handle, true))
+    }
+}
+
+/// Drops the closed tray popup about `RELEASE_AFTER` after it was last open.
+#[cfg(windows)]
+fn wire_tray_popup_release(slot: Rc<TrayPopupSlot>) -> Timer {
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_secs(15), move || {
+        if slot.open.get() {
+            slot.last_open.set(std::time::Instant::now());
+        } else if slot.last_open.get().elapsed() >= renderer_release::RELEASE_AFTER {
+            // Out of the slot first: dropping the component runs its destructors.
+            let released = slot.popup.borrow_mut().take();
+            drop(released);
+        }
+    });
+    timer
+}
+
 /// Size and resize state of the tray popup, shared by opening and the edge drags.
 struct TrayPopupGeometry {
     /// Logical size the user chose (or the default), restored on every open.
@@ -2921,29 +3028,40 @@ fn wire_tray_popup_resize(
 }
 
 fn toggle_tray_popup(
-    popup_weak: &slint::Weak<TrayPopup>,
+    slot: &TrayPopupSlot,
     main_weak: &slint::Weak<AppWindow>,
     model: &Arc<Mutex<DesktopViewModel>>,
-    open: &Rc<Cell<bool>>,
-    geometry: &TrayPopupGeometry,
+    geometry: &Rc<TrayPopupGeometry>,
     anchor: PhysicalPosition,
 ) {
+    let open = &slot.open;
     if open.get() {
-        hide_tray_popup(popup_weak, open);
+        hide_tray_popup(&slot.weak(), open);
         return;
     }
-    let (Some(popup), Some(main)) = (popup_weak.upgrade(), main_weak.upgrade()) else {
+    let Some(main) = main_weak.upgrade() else {
         return;
     };
+    let (popup, created) = match slot.get_or_create() {
+        Ok(popup) => popup,
+        Err(error) => {
+            eprintln!("tray popup unavailable: {error}");
+            return;
+        }
+    };
+    #[cfg(windows)]
+    slot.last_open.set(std::time::Instant::now());
     apply_tray_popup_model(
         &popup,
         tray_menu_model(&model.lock().expect("view model lock")),
     );
     sync_tray_live_state(&popup, &main);
-    let _ = popup.show();
+    // The main window has no native window while it is released in the tray, and a new
+    // popup gets its own only on the next event-loop turn.
     let monitors = main
         .window()
         .with_winit_window(monitor_rects)
+        .or_else(|| popup.window().with_winit_window(monitor_rects))
         .unwrap_or_default();
     // The remembered size, fitted to this monitor, anchored at the tray corner;
     // the edges away from that corner resize it.
@@ -2951,36 +3069,92 @@ fn toggle_tray_popup(
     geometry.grip.set(grip);
     popup.set_grow_up(grip.up);
     popup.set_grow_left(grip.left);
-    let monitor = tray_popup_monitor(anchor, &monitors);
-    let _ = popup.window().with_winit_window(|window| {
-        use slint::winit_030::winit::dpi::PhysicalSize as WinitPhysicalSize;
-        use slint::winit_030::winit::window::WindowLevel;
-        let scale_milli = monitor.map_or_else(
-            || (window.scale_factor() * 1000.0).round() as u32,
-            |monitor| monitor.scale_milli,
-        );
-        let popup_size = tray_popup_size(geometry.size.get(), scale_milli, monitor);
-        apply_tray_popup_native_rounding(window);
-        window.set_window_level(WindowLevel::AlwaysOnTop);
-        match place_tray_popup(anchor, popup_size, &monitors, None) {
-            Some(position) => set_tray_popup_rect(
-                window,
-                PhysicalRect {
-                    x: position.x,
-                    y: position.y,
-                    width: popup_size.0,
-                    height: popup_size.1,
-                },
-            ),
-            None => {
-                let _ =
-                    window.request_inner_size(WinitPhysicalSize::new(popup_size.0, popup_size.1));
-            }
-        }
-        window.focus_window();
-        window.request_redraw();
-    });
+    if created {
+        preplace_new_tray_popup(&popup, anchor, geometry, &monitors);
+    }
+    let _ = popup.show();
+    let placed = popup
+        .window()
+        .with_winit_window(|window| place_tray_popup_window(window, anchor, geometry, &monitors))
+        .is_some();
+    if !placed {
+        let weak = popup.as_weak();
+        let geometry = geometry.clone();
+        let _ = slint::spawn_local(async move {
+            let Some(popup) = weak.upgrade() else {
+                return;
+            };
+            let Ok(window) = popup.window().winit_window().await else {
+                return;
+            };
+            let monitors = monitor_rects(&window);
+            let grip = tray_popup_grip(anchor, &monitors);
+            geometry.grip.set(grip);
+            popup.set_grow_up(grip.up);
+            popup.set_grow_left(grip.left);
+            place_tray_popup_window(&window, anchor, &geometry, &monitors);
+        });
+    }
     open.set(true);
+}
+
+/// A new popup's window is created on the next event-loop turn and shown at once: put it
+/// where it will open (off-screen when no monitor is known yet) so no frame shows elsewhere.
+fn preplace_new_tray_popup(
+    popup: &TrayPopup,
+    anchor: PhysicalPosition,
+    geometry: &TrayPopupGeometry,
+    monitors: &[MonitorRect],
+) {
+    let window = popup.window();
+    let monitor = tray_popup_monitor(anchor, monitors);
+    let scale_milli = monitor.map_or_else(
+        || (window.scale_factor() * 1000.0).round() as u32,
+        |monitor| monitor.scale_milli,
+    );
+    let size = tray_popup_size(geometry.size.get(), scale_milli, monitor);
+    let position = place_tray_popup(anchor, size, monitors, None).unwrap_or(PhysicalPosition {
+        x: -32_000,
+        y: -32_000,
+    });
+    window.set_position(slint::PhysicalPosition::new(position.x, position.y));
+    window.set_size(slint::PhysicalSize::new(size.0, size.1));
+}
+
+/// Native placement of the open popup: its size on this monitor, anchored at the tray
+/// corner, rounded corners, above other windows, focused.
+fn place_tray_popup_window(
+    window: &slint::winit_030::winit::window::Window,
+    anchor: PhysicalPosition,
+    geometry: &TrayPopupGeometry,
+    monitors: &[MonitorRect],
+) {
+    use slint::winit_030::winit::dpi::PhysicalSize as WinitPhysicalSize;
+    use slint::winit_030::winit::window::WindowLevel;
+    let monitor = tray_popup_monitor(anchor, monitors);
+    let scale_milli = monitor.map_or_else(
+        || (window.scale_factor() * 1000.0).round() as u32,
+        |monitor| monitor.scale_milli,
+    );
+    let popup_size = tray_popup_size(geometry.size.get(), scale_milli, monitor);
+    apply_tray_popup_native_rounding(window);
+    window.set_window_level(WindowLevel::AlwaysOnTop);
+    match place_tray_popup(anchor, popup_size, monitors, None) {
+        Some(position) => set_tray_popup_rect(
+            window,
+            PhysicalRect {
+                x: position.x,
+                y: position.y,
+                width: popup_size.0,
+                height: popup_size.1,
+            },
+        ),
+        None => {
+            let _ = window.request_inner_size(WinitPhysicalSize::new(popup_size.0, popup_size.1));
+        }
+    }
+    window.focus_window();
+    window.request_redraw();
 }
 
 fn dispatch_tray_popup_command(
@@ -3108,7 +3282,8 @@ fn wire_tray_popup_focus_loss(
 ) -> Timer {
     let timer = Timer::default();
     let weak = popup.as_weak();
-    let grace_ticks = Rc::new(Cell::new(0_u8));
+    // A popup created on demand opens right away: give its first ticks the same grace.
+    let grace_ticks = Rc::new(Cell::new(2_u8));
     let timer_grace = grace_ticks.clone();
     let mut initial_model_cache = TrayPopupModelCache::default();
     initial_model_cache.observe(&tray_menu_model(&model.lock().expect("view model lock")));
@@ -6501,8 +6676,9 @@ mod window_tests {
             .and_then(|source| source.split("fn activation_for_launch_arguments(").next())
             .expect("desktop main entrypoint");
         let compact_main = main_entry.split_whitespace().collect::<String>();
+        // Every popup the slot creates gets the focus-loss timer, kept with it.
         assert!(compact_main.contains(
-            "wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone(),ui.as_weak(),)"
+            "letfocus_timer=wire_tray_popup_focus_loss(&tray_popup,tray_popup_open.clone(),model.clone(),ui.clone(),);Ok((tray_popup,focus_timer))"
         ));
         // The switch keeps the popup open (it goes through the in-place dispatcher),
         // while opening the window and quitting close it.
@@ -7433,6 +7609,48 @@ mod window_tests {
             .and_then(|source| source.split("fn tray_menu_model").next())
             .expect("close handler");
         assert!(!close_handler.contains("MinimizeToTaskbar"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_creates_the_tray_popup_on_demand_and_drops_it_when_left_closed() {
+        let source = include_str!("main.rs");
+        let main_entry = source
+            .split("fn main()")
+            .nth(1)
+            .and_then(|source| source.split("fn activation_for_launch_arguments(").next())
+            .expect("desktop main entrypoint");
+        let compact_main = main_entry.split_whitespace().collect::<String>();
+        assert!(compact_main.contains("#[cfg(not(windows))]tray_popup_slot.get_or_create()?;"));
+        assert!(compact_main.contains(
+            "#[cfg(windows)]let_tray_popup_release_timer=wire_tray_popup_release(tray_popup_slot.clone());"
+        ));
+        let release = source
+            .split("fn wire_tray_popup_release(")
+            .nth(1)
+            .and_then(|source| source.split("/// Size and resize state").next())
+            .expect("popup release timer");
+        assert!(release.contains("renderer_release::RELEASE_AFTER"));
+        assert!(release.contains("slot.popup.borrow_mut().take()"));
+        let toggle = source
+            .split("fn toggle_tray_popup(")
+            .nth(1)
+            .and_then(|source| source.split("fn dispatch_tray_popup_command(").next())
+            .expect("popup toggle");
+        // A new popup is put in place before its window exists, then placed natively.
+        let preplace = toggle
+            .find("preplace_new_tray_popup(")
+            .expect("pre-placement");
+        let show = toggle.find("popup.show()").expect("show");
+        assert!(preplace < show);
+        assert!(toggle.contains("winit_window().await"));
+        let renderer = include_str!("renderer_fallback.rs");
+        assert_eq!(
+            renderer
+                .matches("with_winit_window_attributes_hook(crate::tray_popup_window_attributes)")
+                .count(),
+            2
+        );
     }
 
     #[test]

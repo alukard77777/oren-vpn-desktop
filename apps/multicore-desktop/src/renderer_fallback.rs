@@ -34,10 +34,12 @@ pub fn software_renderer_requested() -> bool {
 /// Linux selects its backend in `select_linux_backend`, passing the renderer.
 #[cfg(not(target_os = "linux"))]
 pub fn select_software_renderer() -> Result<(), slint::PlatformError> {
-    slint::BackendSelector::new()
+    let selector = slint::BackendSelector::new()
         .backend_name("winit".into())
-        .renderer_name("software".into())
-        .select()
+        .renderer_name("software".into());
+    #[cfg(windows)]
+    let selector = selector.with_winit_window_attributes_hook(crate::tray_popup_window_attributes);
+    selector.select()
 }
 
 /// Skia on Direct3D 12. Without the explicit Direct3D request Slint's Skia
@@ -52,6 +54,7 @@ pub fn select_gpu_renderer() -> Result<(), slint::PlatformError> {
         .backend_name("winit".into())
         .renderer_name("skia".into())
         .require_d3d()
+        .with_winit_window_attributes_hook(crate::tray_popup_window_attributes)
         .select()
 }
 
