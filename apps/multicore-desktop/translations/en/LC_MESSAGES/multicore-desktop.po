@@ -704,7 +704,7 @@ msgid "Подключение…"
 msgstr "Connecting…"
 
 msgid "Отключение…"
-msgstr "Disconnecting…"
+msgstr "Stopping…"
 
 msgid "Выбрать профиль подписки"
 msgstr "Choose a subscription"
@@ -725,7 +725,7 @@ msgid "Подписка обновляется"
 msgstr "Updating subscription"
 
 msgid "Обновить подписку"
-msgstr "Update subscription"
+msgstr "Refresh"
 
 msgid "Скрыть сообщение провайдера"
 msgstr "Hide provider message"
@@ -803,7 +803,7 @@ msgid "Ввести ссылку вручную"
 msgstr "Enter link manually"
 
 msgid "URL подписки"
-msgstr "Subscription URL"
+msgstr "Link address"
 
 msgid "Отмена"
 msgstr "Cancel"
@@ -983,7 +983,7 @@ msgid "Путь приложения изменился — включите з�
 msgstr "The app moved — turn this on again"
 
 msgid "Живой фон"
-msgstr "Live background"
+msgstr "Live waves"
 
 msgid "Анимация отключена настройками {}"
 msgstr "Animation is off in {} settings"
@@ -1178,7 +1178,7 @@ msgid " · Не удалось обновить"
 msgstr " · Update failed"
 
 msgid "Нет подписки"
-msgstr "No subscription"
+msgstr "No profile"
 
 msgid "Откроется главное окно"
 msgstr "Opens the main window"

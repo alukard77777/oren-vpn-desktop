@@ -432,6 +432,8 @@ mod tests {
     const LONGER_ENGLISH: &[&str] = &[
         // «Подписка» / "Subscription": no shorter natural word.
         "Подписка",
+        // The Subscriptions page in the navigation rail (checked expanded in the previews).
+        "Подписки",
         // Runtime-check states: one short word each.
         "Запуск",
         "Сбой",
