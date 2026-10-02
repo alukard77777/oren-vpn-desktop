@@ -441,6 +441,8 @@ mod tests {
         "до {}",
         // Plural "{n} days" is one character over "{n} дн.".
         "{n} дн.",
+        // The inline delete confirmation: "Delete it?" reads vague next to the row.
+        "Удалить подписку?",
         // A label of the saved log's system.txt, not shown in the window.
         "Язык",
     ];

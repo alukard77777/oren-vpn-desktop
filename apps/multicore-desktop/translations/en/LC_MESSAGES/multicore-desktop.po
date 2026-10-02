@@ -709,13 +709,13 @@ msgid "Драйвер перехвата пакетов (его использу
 msgstr "A packet capture driver (used by zapret and GoodbyeDPI) intercepts traffic and breaks the VPN."
 
 msgid "Программа обхода блокировок перехватывает трафик и мешает VPN."
-msgstr "A censorship bypass tool intercepts traffic and breaks the VPN."
+msgstr "A DPI bypass tool intercepts traffic and breaks the VPN."
 
 msgid "Драйвер перехвата пакетов (его используют zapret и GoodbyeDPI): служба остановлена, но может запуститься снова."
 msgstr "A packet capture driver (used by zapret and GoodbyeDPI): stopped, but it may start again."
 
 msgid "Программа обхода блокировок: служба остановлена, но может запуститься снова."
-msgstr "A censorship bypass tool: its service is stopped, but may start again."
+msgstr "A DPI bypass tool: its service is stopped, but may start again."
 
 msgid "Остановить и удалить службу {0}"
 msgstr "Stop and remove the {0} service"
@@ -724,7 +724,7 @@ msgid "Служба будет остановлена и удалена из Win
 msgstr "The service will be stopped and removed from Windows. Its files stay, so you can reinstall it if needed."
 
 msgid "Найдены программы обхода блокировок"
-msgstr "Censorship bypass tools found"
+msgstr "DPI bypass tools found"
 
 msgid "{0}. Если они запущены — закройте их. MULTICORE эти папки не трогает."
 msgstr "{0}. If they're running, close them. MULTICORE leaves these folders alone."
@@ -1010,7 +1010,7 @@ msgid "Антивирусы…"
 msgstr "Antivirus…"
 
 msgid "Программы обхода блокировок…"
-msgstr "Bypass tools…"
+msgstr "DPI bypass tools…"
 
 msgid "Порты…"
 msgstr "Ports…"
@@ -1621,7 +1621,7 @@ msgid "Сохранить"
 msgstr "Save"
 
 msgid "Удалить подписку?"
-msgstr "Delete this one?"
+msgstr "Delete subscription?"
 
 msgid "Нажмите на подписку, чтобы сделать её активной. Обновление происходит автоматически при запуске приложения или вручную."
 msgstr "Click a subscription to make it active. It updates automatically when the app starts, or manually."

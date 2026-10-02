@@ -302,7 +302,180 @@ fn s(value: &str) -> SharedString {
 
 /// English for fixture texts the catalog cannot translate: provider content (an English
 /// provider in English previews) and texts the app composes from several catalog entries.
-const FIXTURE_ENGLISH: &[(&str, &str)] = &[];
+const FIXTURE_ENGLISH: &[(&str, &str)] = &[
+    // Provider content: groups, nodes and subscription names an English provider would send.
+    ("Автовыбор", "Auto"),
+    ("Без VPN", "Direct"),
+    ("Сервер", "Server"),
+    ("Серверы", "Servers"),
+    ("Игры", "Games"),
+    ("Стриминг", "Streaming"),
+    ("Медиа", "Media"),
+    ("Прочее", "Other"),
+    ("Россия", "Russia"),
+    ("Зарубежье", "Abroad"),
+    (
+        "Очень длинное название группы от провайдера подписки",
+        "A very long group name from the subscription provider",
+    ),
+    ("Локальный профиль", "Local profile"),
+    ("Локальный профиль 2", "Local profile 2"),
+    ("Локальный профиль 3", "Local profile 3"),
+    ("Локальный профиль 4", "Local profile 4"),
+    ("Рабочий", "Work"),
+    ("Рабочий 2", "Work 2"),
+    ("Рабочий 3", "Work 3"),
+    ("Поездки", "Travel"),
+    ("Поездки 2", "Travel 2"),
+    ("Поездки 3", "Travel 3"),
+    ("Пятая", "Fifth"),
+    ("Пятая 2", "Fifth 2"),
+    ("Пятая 3", "Fifth 3"),
+    (
+        "Резерв с очень длинным названием провайдера подписки",
+        "Backup with a very long subscription provider name",
+    ),
+    (
+        "Резерв с очень длинным названием провайдера подписки 2",
+        "Backup with a very long subscription provider name 2",
+    ),
+    (
+        "Резерв с очень длинным названием провайдера подписки 3",
+        "Backup with a very long subscription provider name 3",
+    ),
+    ("Л", "L"),
+    ("Р", "W"),
+    (
+        "Плановые работы сегодня в 23:00 по московскому времени. В это время возможны кратковременные отключения серверов в Германии и Нидерландах.",
+        "Scheduled maintenance today at 23:00 Moscow time. Servers in Germany and the Netherlands may briefly go offline.",
+    ),
+    (
+        "Плановые работы сегодня в 23:00 по московскому времени. Возможны кратковременные отключения серверов в Германии и Нидерландах.",
+        "Scheduled maintenance today at 23:00 Moscow time. Servers in Germany and the Netherlands may briefly go offline.",
+    ),
+    (
+        "Новые серверы в Финляндии и Польше уже доступны в группе «Сервер».",
+        "New servers in Finland and Poland are now in the “Server” group.",
+    ),
+    // Texts the app formats (units, counts, dates) or composes from several catalog entries.
+    ("42 мс", "42 ms"),
+    ("48 мс", "48 ms"),
+    ("52 мс", "52 ms"),
+    ("61 мс", "61 ms"),
+    ("64 мс", "64 ms"),
+    ("96 мс", "96 ms"),
+    ("144 мс", "144 ms"),
+    ("181 мс", "181 ms"),
+    ("220 мс", "220 ms"),
+    ("Тайм-аут", "timeout"),
+    ("27.09.2026", "Sep 27, 2026"),
+    ("38 мс", "38 ms"),
+    ("🌍 Серверы", "🌍 Servers"),
+    ("🎮 Игры", "🎮 Games"),
+    ("🌍 Автовыбор", "🌍 Auto"),
+    ("12 дн.", "12 days"),
+    ("2 дн.", "2 days"),
+    ("1 дн.", "1 day"),
+    ("Осталось 12 дней", "12 days left"),
+    ("Осталось 1 день", "1 day left"),
+    ("2 мин назад", "2 min ago"),
+    ("2.4 МБ/с", "2.4 MB/s"),
+    ("320 КБ/с", "320 KB/s"),
+    ("1016 Б/с", "1016 B/s"),
+    ("0 Б/с", "0 B/s"),
+    ("В сети · Автовыбор", "Online · Auto"),
+    (
+        "Трафик: 12.4 / 100 GiB · осталось 87.6 GiB · до 14 окт.",
+        "Data: 12.4 / 100 GiB · 87.6 GiB left · until Oct 14",
+    ),
+    (
+        "Трафик без лимита · бессрочно",
+        "Unlimited data · no expiry",
+    ),
+    (
+        "Подписка истекла 30 сент. · трафик 100 / 100 GiB",
+        "Expired Sep 30 · data 100 / 100 GiB",
+    ),
+    (
+        "Подписка истекла 30 сент. · трафик 60 / 100 GiB",
+        "Expired Sep 30 · data 60 / 100 GiB",
+    ),
+    ("Работает", "Ready"),
+    ("Активен", "Ready"),
+    ("Обновить", "Update"),
+    ("Не удалось обновить подписку", "Update failed"),
+    ("MULTICORE 0.4.0 доступна", "MULTICORE 0.4.0 available"),
+    (
+        "MULTICORE 0.3.4 · установится после отключения",
+        "MULTICORE 0.3.4 · installs after you disconnect",
+    ),
+    (
+        "Загрузим подписанный пакет и перезапустим клиент. Активный туннель будет корректно остановлен.",
+        "We'll download the signed package and restart the app. The tunnel stops cleanly.",
+    ),
+    (
+        "Доступна версия 0.4.0 с исправлениями безопасности и стабильности",
+        "Version 0.4.0 is available with security and stability fixes",
+    ),
+    (
+        "Не удалось сохранить настройки. Изменения применятся только до перезапуска.",
+        "Couldn't save settings. Changes last until a restart.",
+    ),
+    (
+        "Не удалось изменить автозапуск. Проверьте права доступа к реестру и повторите попытку.",
+        "Couldn't change autostart. Check registry permissions and try again.",
+    ),
+    (
+        "Фоновый сервис не ответил вовремя",
+        "Background service timed out",
+    ),
+    (
+        "Служба MULTICORE не отвечает — перезапускаем…",
+        "MULTICORE service not responding — restarting…",
+    ),
+    ("Сервер не ответил за 15 с", "Server didn't answer in 15 s"),
+    (
+        "Сервер не ответил за 15 с — повторите или выберите другой маршрут",
+        "Server didn't answer in 15 s — retry or pick another route",
+    ),
+    (
+        "Не удалось запустить Mihomo. Проверьте исполняемые файлы.",
+        "Couldn't start Mihomo. Check its executable files.",
+    ),
+    (
+        "Не удалось загрузить маршруты. Каталог устарел: обновите подписку, чтобы получить актуальный список серверов.",
+        "Couldn't load routes. The list is outdated: refresh the subscription to get current servers.",
+    ),
+    (
+        "Не удалось загрузить маршруты. Каталог устарел — обновите подписку, чтобы получить актуальный список серверов.",
+        "Couldn't load routes. The list is outdated — refresh the subscription to get current servers.",
+    ),
+    (
+        "Запущен Happ — он перехватывает туннель. Закройте его, чтобы MULTICORE мог подключиться.",
+        "Happ is running and takes over the tunnel. Close it so MULTICORE can connect.",
+    ),
+    (
+        "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
+        "Another VPN app found (FlClash): it may conflict with MULTICORE. Close it before connecting.",
+    ),
+    (
+        "Обнаружены другие VPN-приложения (FlClash, Happ): они могут конфликтовать с MULTICORE. Закройте их перед подключением. Закрыть удалось не всё: FlClash запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows».",
+        "Other VPN apps found (FlClash, Happ): they may conflict with MULTICORE. Close them before connecting. Not everything closed: FlClash runs its engine as a Windows service, which this button can't stop without admin rights. Disconnect in that app before closing it, or stop its service in Windows Services.",
+    ),
+    // Log lines (the daemon's own lines arrive with codes; these stand for core output).
+    (
+        "Локальные SOCKS-мосты готовы.",
+        "Local SOCKS bridges ready.",
+    ),
+    (
+        "Контроллер и TUN MULTICORE готовы.",
+        "MULTICORE controller and TUN ready.",
+    ),
+    (
+        "Не удалось применить локальную настройку маршрута для группы «Игры». Сервис вернул ошибку проверки конфигурации, повторите попытку позже или обновите подписку.",
+        "Couldn't apply the local route setting for the “Games” group. The service rejected the configuration; try again later or refresh the subscription.",
+    ),
+];
 
 fn groups() -> ModelRc<UiCatalogGroup> {
     let rows = [
@@ -432,7 +605,7 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
                 has_logo: false,
                 logo: Default::default(),
                 logo_small: Default::default(),
-                fallback: s(&title.chars().next().unwrap().to_string()),
+                fallback: s(title).chars().next().unwrap().to_string().into(),
                 remaining: s(remaining),
                 days: s(days),
                 used_fraction: used.max(0.0),
@@ -465,6 +638,10 @@ fn ready(ui: &AppWindow) {
     ui.set_primary_enabled(true);
     ui.set_status_tone(s("accent"));
     ui.set_subscription_title(s("Локальный профиль"));
+    if preview_language() == multicore_i18n::Lang::En {
+        // The host derives the avatar letter from the (English) name.
+        ui.set_subscription_initial(s("L"));
+    }
     ui.set_subscription_usage(s("874.9 GiB"));
     ui.set_subscription_expiry(s("Срок неизвестен"));
     ui.set_subscription_updated(s("27.09.2026"));
@@ -552,10 +729,10 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
     let node = |id: &str, label: &str, selected: bool, latency: &str, tone: &str| {
         CatalogNodePresentation {
             id: id.into(),
-            label: label.into(),
+            label: s(label).to_string(),
             selected,
             delay_ms: None,
-            latency_text: latency.into(),
+            latency_text: s(latency).to_string(),
             latency_tone: tone.into(),
             icon_id: None,
             icon_pending: false,
@@ -567,7 +744,7 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
         exit_latency_text: if loading {
             String::new()
         } else {
-            "42 мс".into()
+            s("42 мс").to_string()
         },
         search_groups: if loading {
             Vec::new()
@@ -575,7 +752,7 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
             vec![
                 CatalogSearchGroup {
                     id: "g1".into(),
-                    label: "🌍 Серверы".into(),
+                    label: s("🌍 Серверы").to_string(),
                     nodes: vec![
                         node("n1", "🌍 Автовыбор", true, "42 мс", "success"),
                         node("n2", "🇩🇪 Germany", false, "96 мс", "warning"),
@@ -584,7 +761,7 @@ fn open_route_search(ui: &AppWindow, query: &str, loading: bool) {
                 },
                 CatalogSearchGroup {
                     id: "g2".into(),
-                    label: "🎮 Игры".into(),
+                    label: s("🎮 Игры").to_string(),
                     nodes: vec![node("n4", "🇩🇪 Germany · Games", true, "38 мс", "success")],
                 },
             ]
@@ -617,7 +794,13 @@ fn mappings() -> ModelRc<UiProxyMapping> {
 
 type Scenario = (&'static str, u32, u32, fn(&AppWindow));
 
-fn finding(tone: &str, title: &str, detail: &str) -> multicore_core::troubleshoot::Finding {
+/// A troubleshooting card as the daemon sends it: codes (`multicore_i18n::daemon_messages`)
+/// with their Russian text.
+fn finding(
+    tone: &str,
+    title: (&str, &[&str]),
+    detail: (&str, &[&str]),
+) -> multicore_core::troubleshoot::Finding {
     use multicore_core::troubleshoot::Tone;
     let tone = match tone {
         "error" => Tone::Error,
@@ -625,75 +808,119 @@ fn finding(tone: &str, title: &str, detail: &str) -> multicore_core::troubleshoo
         "success" => Tone::Success,
         _ => Tone::Info,
     };
-    multicore_core::troubleshoot::Finding::new(tone, title, detail)
+    multicore_core::troubleshoot::Finding::keyed(tone, key(title), key(detail))
+}
+
+fn key((code, args): (&str, &[&str])) -> multicore_i18n::MessageKey {
+    multicore_i18n::MessageKey::with_args(code, args.iter().copied())
+}
+
+fn offer(
+    id: &str,
+    title: (&str, &[&str]),
+    detail: (&str, &[&str]),
+    needs_admin: bool,
+    needs_reboot: bool,
+) -> multicore_core::troubleshoot::FixOffer {
+    multicore_core::troubleshoot::FixOffer::keyed(
+        id.into(),
+        key(title),
+        key(detail),
+        needs_admin,
+        needs_reboot,
+    )
 }
 
 fn winsock_offer() -> multicore_core::troubleshoot::FixOffer {
-    multicore_core::troubleshoot::FixOffer {
-        id: "winsock-reset".into(),
-        title: "Сбросить сетевые настройки (Winsock)".into(),
-        detail: "Восстанавливает сетевой стек Windows, если его испортила другая программа. Нужна перезагрузка ПК; некоторые VPN и антивирусы после сброса придётся переустановить.".into(),
-        needs_admin: true,
-        needs_reboot: true,
-        title_key: None,
-        detail_key: None,
-    }
+    offer(
+        "winsock-reset",
+        ("ts.network.winsock_reset", &[]),
+        ("ts.network.winsock_reset_detail", &[]),
+        true,
+        true,
+    )
 }
 
-/// The copy the daemon writes for a machine with Kaspersky, zapret, a busy port, a foreign proxy
-/// and Drover (see crates/multicore-daemon/src/troubleshoot).
+/// The cards the daemon sends for a machine with Kaspersky, zapret, a busy port, a foreign
+/// proxy and Drover (see crates/multicore-daemon/src/troubleshoot).
 fn troubleshoot_mixed_run() -> crate::troubleshoot::TroubleshootRun {
-    use multicore_core::troubleshoot::{FixOffer, StepReport};
+    use multicore_core::troubleshoot::StepReport;
     let mut run = crate::troubleshoot::TroubleshootRun::default();
     run.add_step(StepReport {
-        findings: vec![finding("error", "Обнаружен Kaspersky", "Kaspersky часто блокирует VPN. Если подключение не работает — выключите его или добавьте MULTICORE в исключения.")],
+        findings: vec![finding(
+            "error",
+            ("ts.antivirus.found", &["Kaspersky"]),
+            ("ts.antivirus.severe", &["Kaspersky"]),
+        )],
         fixes: Vec::new(),
     });
     run.add_step(StepReport {
         findings: vec![
-            finding("error", "Работает zapret", "Программа обхода блокировок перехватывает трафик и мешает VPN."),
-            finding("warning", "Найдены программы обхода блокировок", "C:\\Users\\user\\Downloads\\zapret. Если они запущены — закройте их. MULTICORE эти папки не трогает."),
+            finding(
+                "error",
+                ("ts.dpi.running", &["zapret"]),
+                ("ts.dpi.program_running", &[]),
+            ),
+            finding(
+                "warning",
+                ("ts.dpi.folders", &[]),
+                ("ts.dpi.folders_detail", &[ZAPRET_FOLDER]),
+            ),
         ],
-        fixes: vec![FixOffer {
-            id: "remove-dpi-service:zapret".into(),
-            title: "Остановить и удалить службу zapret".into(),
-            detail: "Служба будет остановлена и удалена из Windows. Файлы программы останутся — при необходимости её можно установить снова.".into(),
-            needs_admin: true,
-            needs_reboot: false,
-            title_key: None,
-            detail_key: None,
-        }],
+        fixes: vec![offer(
+            "remove-dpi-service:zapret",
+            ("ts.dpi.remove", &["zapret"]),
+            ("ts.dpi.remove_detail", &[]),
+            true,
+            false,
+        )],
     });
     run.add_step(StepReport {
-        findings: vec![finding("warning", "Порт 10808 занят", "Его занимает «v2rayN.exe», а он нужен подписке. Закройте эту программу и повторите подключение.")],
+        findings: vec![finding(
+            "warning",
+            ("ts.port.busy", &["10808"]),
+            ("ts.port.named_owner", &["v2rayN.exe"]),
+        )],
         fixes: Vec::new(),
-    });
-    run.add_step(StepReport {
-        findings: vec![finding("info", "Системный прокси отключён", "Был включён прокси 127.0.0.1:8080 — он мешает подключению. Включить снова: Параметры → Сеть и Интернет → Прокси.")],
-        fixes: Vec::new(),
-    });
-    run.add_step(StepReport {
-        findings: vec![finding("warning", "Найден Drover для Discord", "Подменная version.dll в папке Discord пускает его трафик мимо VPN и может мешать подключению.")],
-        fixes: vec![FixOffer {
-            id: "delete-drover".into(),
-            title: "Удалить Drover из папки Discord".into(),
-            detail: "Будут удалены version.dll и drover.ini (файлов: 2). Сам Discord продолжит работать.".into(),
-            needs_admin: false,
-            needs_reboot: false,
-            title_key: None,
-            detail_key: None,
-        }],
     });
     run.add_step(StepReport {
         findings: vec![finding(
             "info",
-            "DNS-кэш очищен",
-            "Устаревшие записи DNS больше не помешают подключению.",
+            ("ts.proxy.disabled", &[]),
+            ("ts.proxy.disabled_detail", &["127.0.0.1:8080"]),
         )],
+        fixes: Vec::new(),
+    });
+    run.add_step(StepReport {
+        findings: vec![finding(
+            "warning",
+            ("ts.drover.found", &[]),
+            ("ts.drover.found_detail", &[]),
+        )],
+        fixes: vec![offer(
+            "delete-drover",
+            ("ts.drover.remove", &[]),
+            ("ts.drover.remove_detail", &["2"]),
+            false,
+            false,
+        )],
+    });
+    run.add_step(StepReport {
+        findings: vec![dns_flushed()],
         fixes: vec![winsock_offer()],
     });
     run
 }
+
+fn dns_flushed() -> multicore_core::troubleshoot::Finding {
+    finding(
+        "info",
+        ("ts.network.dns_flushed", &[]),
+        ("ts.network.dns_flushed_detail", &[]),
+    )
+}
+
+const ZAPRET_FOLDER: &str = "C:\\Users\\user\\Downloads\\zapret";
 
 fn troubleshoot_page(ui: &AppWindow) {
     ready(ui);
@@ -772,13 +999,13 @@ fn scenarios() -> Vec<Scenario> {
                     findings: vec![
                         finding(
                             "success",
-                            "Служба zapret удалена",
-                            "Если она не успела остановиться, то исчезнет после перезагрузки.",
+                            ("ts.fix.dpi_removed", &["zapret"]),
+                            ("ts.fix.dpi_removed_detail", &[]),
                         ),
                         finding(
                             "success",
-                            "Настройки Winsock сброшены",
-                            "Перезагрузите ПК, чтобы изменения вступили в силу.",
+                            ("ts.fix.winsock_done", &[]),
+                            ("ts.fix.winsock_done_detail", &[]),
                         ),
                     ],
                     reboot_recommended: true,
@@ -792,11 +1019,7 @@ fn scenarios() -> Vec<Scenario> {
             troubleshoot_page(ui);
             let mut run = crate::troubleshoot::TroubleshootRun::default();
             run.add_step(multicore_core::troubleshoot::StepReport {
-                findings: vec![finding(
-                    "info",
-                    "DNS-кэш очищен",
-                    "Устаревшие записи DNS больше не помешают подключению.",
-                )],
+                findings: vec![dns_flushed()],
                 fixes: vec![winsock_offer()],
             });
             crate::present_troubleshoot_run(ui, &run);
