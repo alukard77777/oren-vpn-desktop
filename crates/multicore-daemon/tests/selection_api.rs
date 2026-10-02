@@ -698,7 +698,8 @@ async fn selection_endpoint_returns_the_updated_safe_catalog() {
         selector.calls.lock().unwrap().as_slice(),
         &[("group / ? # %".into(), "second".into())]
     );
-    assert!(!catalog.to_string().contains("group / ? # %"));
+    // Ordinary punctuation is shown as written; the raw name only travels to Mihomo, escaped.
+    assert_eq!(catalog["groups"][0]["label"], "group / ? # %");
 }
 
 #[tokio::test]

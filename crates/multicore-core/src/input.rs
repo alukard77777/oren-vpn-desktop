@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value as JsonValue;
 use serde_yaml_ng::Value as YamlValue;
@@ -17,10 +17,26 @@ pub const IDLE_XRAY_CONFIG: &[u8] = br#"{"log":{"loglevel":"warning"},"inbounds"
 pub struct ProxyGroup {
     pub name: String,
     pub group_type: String,
+    /// The group's explicit `proxies` list, as written.
     pub proxies: Vec<String>,
     /// The group's `icon` value, as written by the provider (usually an image URL).
     /// Untrusted: only `Snapshot` decides whether it is a fetchable HTTPS URL.
     pub icon: Option<String>,
+    /// `hidden: true`: the provider keeps the group out of client UIs (Mihomo's API reports it
+    /// as hidden; dashboards, Clash Verge and FlClash do not list it).
+    pub hidden: bool,
+    /// What Mihomo puts in the group, in its order, without duplicates: the explicit `proxies`,
+    /// then (`include-all` / `include-all-proxies`) every config proxy matching `filter`.
+    /// Members dropped by `exclude-filter` / `exclude-type` stay listed but not `offered`, so
+    /// a member keeps its position whatever the filters say.
+    pub members: Vec<GroupMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    pub name: String,
+    /// Mihomo keeps the member after `exclude-filter` and `exclude-type`: it can be selected.
+    pub offered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -147,7 +163,7 @@ pub fn parse_mihomo(bytes: &[u8]) -> Result<MihomoConfig, ConfigError> {
         }
     }
 
-    let proxy_names = mapping
+    let proxy_names: Vec<String> = mapping
         .get(YamlValue::String("proxies".into()))
         .and_then(YamlValue::as_sequence)
         .into_iter()
@@ -155,6 +171,37 @@ pub fn parse_mihomo(bytes: &[u8]) -> Result<MihomoConfig, ConfigError> {
         .filter_map(|proxy| string_field(proxy, "name"))
         .map(ToOwned::to_owned)
         .collect();
+    let mut member_types: HashMap<&str, &str> = HashMap::new();
+    for proxy in mapping
+        .get(YamlValue::String("proxies".into()))
+        .and_then(YamlValue::as_sequence)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(name), Some(kind)) = (string_field(proxy, "name"), string_field(proxy, "type"))
+        {
+            member_types
+                .entry(name)
+                .or_insert_with(|| mihomo_type_name(kind));
+        }
+    }
+    for group in mapping
+        .get(YamlValue::String("proxy-groups".into()))
+        .and_then(YamlValue::as_sequence)
+        .into_iter()
+        .flatten()
+    {
+        if let (Some(name), Some(kind)) = (string_field(group, "name"), string_field(group, "type"))
+        {
+            member_types
+                .entry(name)
+                .or_insert_with(|| mihomo_type_name(kind));
+        }
+    }
+    // Mihomo's `AllProxies`: every `proxies` entry, sorted (Go's byte-wise `slices.Sort`).
+    let mut all_proxies: Vec<&str> = proxy_names.iter().map(String::as_str).collect();
+    all_proxies.sort_unstable();
+    all_proxies.dedup();
 
     let groups = mapping
         .get(YamlValue::String("proxy-groups".into()))
@@ -164,7 +211,7 @@ pub fn parse_mihomo(bytes: &[u8]) -> Result<MihomoConfig, ConfigError> {
         .filter_map(|group| {
             let name = string_field(group, "name")?.to_owned();
             let group_type = string_field(group, "type")?.to_owned();
-            let proxies = group
+            let proxies: Vec<String> = group
                 .as_mapping()?
                 .get(YamlValue::String("proxies".into()))
                 .and_then(YamlValue::as_sequence)
@@ -177,11 +224,14 @@ pub fn parse_mihomo(bytes: &[u8]) -> Result<MihomoConfig, ConfigError> {
                 .map(str::trim)
                 .filter(|icon| !icon.is_empty() && icon.len() <= MAX_GROUP_ICON_FIELD_BYTES)
                 .map(ToOwned::to_owned);
+            let members = group_members(group, &proxies, &all_proxies, &member_types);
             Some(ProxyGroup {
                 name,
                 group_type,
                 proxies,
                 icon,
+                hidden: bool_field(group, "hidden"),
+                members,
             })
         })
         .collect();
@@ -240,6 +290,135 @@ fn check_size(bytes: &[u8]) -> Result<(), ConfigError> {
         Err(ConfigError::TooLarge)
     } else {
         Ok(())
+    }
+}
+
+/// Longest `filter` / `exclude-filter` pattern evaluated; a longer one is ignored.
+const MAX_GROUP_PATTERN_BYTES: usize = 4096;
+/// Compiled-size cap per pattern: provider patterns are untrusted.
+const MAX_GROUP_PATTERN_COMPILED_BYTES: usize = 1 << 20;
+
+/// See `ProxyGroup::members`. Mirrors Mihomo v1.19.32 `outboundgroup.ParseProxyGroup` and
+/// `GroupBase.GetProxies` for config proxies; `use:` providers are fetched by Mihomo at run
+/// time and cannot be listed here.
+fn group_members(
+    group: &YamlValue,
+    explicit: &[String],
+    all_proxies: &[&str],
+    member_types: &HashMap<&str, &str>,
+) -> Vec<GroupMember> {
+    let mut seen = HashSet::new();
+    let mut names: Vec<&str> = explicit
+        .iter()
+        .map(String::as_str)
+        .filter(|name| seen.insert(*name))
+        .collect();
+    if bool_field(group, "include-all") || bool_field(group, "include-all-proxies") {
+        match string_field(group, "filter").filter(|filter| !filter.is_empty()) {
+            None => names.extend(all_proxies.iter().filter(|name| seen.insert(**name))),
+            Some(filter) => {
+                // A pattern Rust cannot evaluate adds nothing (as before this was modelled).
+                if let Some(filters) = compile_group_patterns(filter) {
+                    for name in all_proxies {
+                        if filters.iter().any(|filter| filter.is_match(name)) && seen.insert(name) {
+                            names.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A pattern Rust cannot evaluate excludes nothing: the member stays selectable as before.
+    let exclude_filters = string_field(group, "exclude-filter")
+        .filter(|filter| !filter.is_empty())
+        .and_then(compile_group_patterns)
+        .unwrap_or_default();
+    let exclude_types: Vec<&str> = string_field(group, "exclude-type")
+        .map(|types| {
+            types
+                .split('|')
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    names
+        .into_iter()
+        .map(|name| {
+            let filtered = exclude_filters.iter().any(|filter| filter.is_match(name));
+            let kind = member_types
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| builtin_type_name(name));
+            let excluded_type = exclude_types
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(kind));
+            GroupMember {
+                name: name.to_owned(),
+                offered: !filtered && !excluded_type,
+            }
+        })
+        .collect()
+}
+
+/// Mihomo splits `filter` / `exclude-filter` on backticks into several regular expressions.
+/// `None` when any of them cannot be compiled by Rust's `regex` (no look-around or
+/// back-references, unlike Mihomo's regexp2) or is unreasonably large.
+fn compile_group_patterns(patterns: &str) -> Option<Vec<regex::Regex>> {
+    if patterns.len() > MAX_GROUP_PATTERN_BYTES {
+        return None;
+    }
+    patterns
+        .split('`')
+        .map(|pattern| {
+            regex::RegexBuilder::new(pattern)
+                .size_limit(MAX_GROUP_PATTERN_COMPILED_BYTES)
+                .dfa_size_limit(MAX_GROUP_PATTERN_COMPILED_BYTES)
+                .build()
+                .ok()
+        })
+        .collect()
+}
+
+/// Mihomo's adapter type name (`C.AdapterType.String()`) for a config `type`, which is what
+/// `exclude-type` is compared with (case-insensitively).
+fn mihomo_type_name(kind: &str) -> &str {
+    match kind.to_ascii_lowercase().as_str() {
+        "ss" => "Shadowsocks",
+        "ssr" => "ShadowsocksR",
+        "socks5" => "Socks5",
+        "http" => "Http",
+        "hysteria2" | "hy2" => "Hysteria2",
+        "select" => "Selector",
+        "url-test" => "URLTest",
+        "fallback" => "Fallback",
+        "load-balance" => "LoadBalance",
+        "relay" => "Relay",
+        _ => kind,
+    }
+}
+
+fn builtin_type_name(name: &str) -> &'static str {
+    match name {
+        "DIRECT" => "Direct",
+        "REJECT" => "Reject",
+        "REJECT-DROP" => "RejectDrop",
+        "PASS" => "Pass",
+        "COMPATIBLE" => "Compatible",
+        "GLOBAL" => "Selector",
+        _ => "",
+    }
+}
+
+/// A YAML boolean, also accepting Mihomo's weakly typed "true"/"false" strings.
+fn bool_field(value: &YamlValue, key: &str) -> bool {
+    match value
+        .as_mapping()
+        .and_then(|map| map.get(YamlValue::String(key.into())))
+    {
+        Some(YamlValue::Bool(value)) => *value,
+        Some(YamlValue::String(value)) => value.trim().eq_ignore_ascii_case("true"),
+        _ => false,
     }
 }
 

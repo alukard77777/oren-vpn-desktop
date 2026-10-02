@@ -31,8 +31,8 @@ pub use fetch::{
     SubscriptionFetcher, UA_GROUP_ICON, UA_MIHOMO, UA_NATIVE, UA_SERVICE_LOGO, UA_XRAY,
 };
 pub use input::{
-    ConfigError, IDLE_XRAY_CONFIG, IDLE_XRAY_OUTBOUND_TAG, MAX_CONFIG_BYTES, MihomoConfig,
-    MihomoSocksMapping, ProxyGroup, XrayConfig, parse_mihomo, parse_xray,
+    ConfigError, GroupMember, IDLE_XRAY_CONFIG, IDLE_XRAY_OUTBOUND_TAG, MAX_CONFIG_BYTES,
+    MihomoConfig, MihomoSocksMapping, ProxyGroup, XrayConfig, parse_mihomo, parse_xray,
 };
 pub use network::default_ipv4_interface;
 pub use profile::{

@@ -2480,10 +2480,13 @@ impl<P: ProcessController> CoreRuntime<P> {
             let _ = self.state.transition(CoreConnectionState::Ready);
         }
         let selectable = selectable_groups(&snapshot);
-        self.profile = selectable.first().map(|group| group.name.to_owned());
+        let primary = primary_group_index(&selectable);
+        self.profile = primary.map(|index| selectable[index].name.to_owned());
         self.selected_nodes = selected_nodes;
         self.explicit_selected_nodes = explicit_selected_nodes;
-        self.current_node = self.selected_nodes.first().cloned().flatten();
+        self.current_node = primary
+            .and_then(|index| self.selected_nodes.get(index).cloned())
+            .flatten();
         self.catalog = build_catalog(
             &snapshot,
             revision,
@@ -4398,7 +4401,12 @@ mod error_chain_tests {
 fn default_selections(snapshot: &Snapshot) -> Vec<Option<String>> {
     selectable_groups(snapshot)
         .iter()
-        .map(|group| group.nodes.first().map(|node| (*node).to_owned()))
+        .map(|group| {
+            group
+                .offered_nodes()
+                .next()
+                .map(|(_, node)| node.to_owned())
+        })
         .collect()
 }
 
@@ -4446,14 +4454,10 @@ fn restored_selections(
         .map(|(group_index, group)| {
             let group_id = catalog_group_id(revision, group_index);
             saved.get(&group_id).and_then(|node_id| {
-                group
-                    .nodes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(node_index, node)| {
-                        (catalog_node_id(revision, group_index, node_index) == *node_id)
-                            .then(|| (*node).to_owned())
-                    })
+                group.offered_nodes().find_map(|(node_index, node)| {
+                    (catalog_node_id(revision, group_index, node_index) == *node_id)
+                        .then(|| node.to_owned())
+                })
             })
         })
         .collect()
@@ -4520,7 +4524,7 @@ fn selection_ids_for_names(
         .enumerate()
         .filter(|(_, node)| **node == node_name);
     let (node_index, _) = matching_nodes.next()?;
-    if matching_nodes.next().is_some() {
+    if matching_nodes.next().is_some() || !group.offers(node_index) {
         return None;
     }
     Some((
@@ -4740,6 +4744,7 @@ where
             active_profile_id,
             live,
             group_index,
+            is_primary,
             raw_group,
             raw_node,
             previous_raw_node,
@@ -4774,15 +4779,17 @@ where
                 })
                 .ok_or(SelectionError::UnknownGroup)?;
             let group = &groups[group_index];
+            if group.hidden {
+                return Err(SelectionError::UnknownGroup);
+            }
             let node_index = group
-                .nodes
-                .iter()
-                .enumerate()
+                .offered_nodes()
                 .find_map(|(index, _)| {
                     (catalog_node_id(request.revision, group_index, index) == request.node_id)
                         .then_some(index)
                 })
                 .ok_or(SelectionError::UnknownNode)?;
+            let is_primary = primary_group_index(&groups) == Some(group_index);
             let raw_group = group.name.to_owned();
             let raw_node = group.nodes[node_index].to_owned();
             let previous_raw_node = state.selected_nodes[group_index].clone();
@@ -4791,6 +4798,7 @@ where
                 active_profile_id,
                 live,
                 group_index,
+                is_primary,
                 raw_group,
                 raw_node,
                 previous_raw_node,
@@ -4866,11 +4874,13 @@ where
             });
             state.selected_nodes = selected_nodes;
             state.explicit_selected_nodes = explicit_selected_nodes;
-            state.current_node = state.selected_nodes.first().cloned().flatten();
+            state.current_node = primary_group_index(&selectable_groups(&snapshot))
+                .and_then(|index| state.selected_nodes.get(index).cloned())
+                .flatten();
         } else {
             state.selected_nodes[group_index] = Some(raw_node.clone());
             state.explicit_selected_nodes[group_index] = Some(raw_node.clone());
-            if group_index == 0 {
+            if is_primary {
                 state.current_node = Some(raw_node);
             }
         }
@@ -4903,14 +4913,8 @@ where
             if !state.cores_live() {
                 return Err(SessionError::NotConnected);
             }
-            // The raw name behind the exit the status reports: the selected group's node.
-            let exit_start = state
-                .catalog
-                .groups
-                .iter()
-                .position(|group| group.selected)
-                .and_then(|index| state.selected_nodes.get(index).cloned().flatten())
-                .or_else(|| state.current_node.clone());
+            // The raw name behind the exit the status reports: the primary group's node.
+            let exit_start = state.current_node.clone();
             (
                 state.state.current() == CoreConnectionState::Connected,
                 state.connected_since_unix_ms,
@@ -4993,6 +4997,7 @@ where
                 request.node_ids.iter().map(String::as_str).collect();
 
             let known_groups: HashSet<String> = (0..groups.len())
+                .filter(|group_index| !groups[*group_index].hidden)
                 .map(|group_index| catalog_group_id(revision, group_index))
                 .collect();
             if !requested_groups
@@ -5005,8 +5010,9 @@ where
                 .iter()
                 .enumerate()
                 .flat_map(|(group_index, group)| {
-                    (0..group.nodes.len())
-                        .map(move |node_index| catalog_node_id(revision, group_index, node_index))
+                    group.offered_nodes().map(move |(node_index, _)| {
+                        catalog_node_id(revision, group_index, node_index)
+                    })
                 })
                 .collect();
             if !requested_nodes
@@ -5025,15 +5031,13 @@ where
                     let group_requested = requested_groups.contains(group_id.as_str());
                     let requested_nodes = &requested_nodes;
                     group
-                        .nodes
-                        .iter()
-                        .enumerate()
+                        .offered_nodes()
                         .filter_map(move |(node_index, raw_node)| {
                             let node_id = catalog_node_id(revision, group_index, node_index);
                             (probe_all
                                 || group_requested
                                 || requested_nodes.contains(node_id.as_str()))
-                            .then(|| (group_id.clone(), node_id, (*raw_node).to_owned()))
+                            .then(|| (group_id.clone(), node_id, raw_node.to_owned()))
                         })
                 })
                 .collect();
@@ -5338,9 +5342,12 @@ fn build_catalog(
     let source_groups = selectable_groups(snapshot);
     let selected_group_index =
         profile.and_then(|profile| source_groups.iter().position(|group| group.name == profile));
+    // Hidden groups and members Mihomo drops are left out; ids keep their positions in the
+    // full lists, so every id maps to the same raw name whatever is shown.
     let groups = source_groups
         .iter()
         .enumerate()
+        .filter(|(_, group)| !group.hidden)
         .map(|(group_index, group)| {
             let selected = selected_group_index == Some(group_index);
             let selected_node_index = selected_nodes
@@ -5348,9 +5355,7 @@ fn build_catalog(
                 .and_then(Option::as_deref)
                 .and_then(|current_node| group.nodes.iter().position(|node| *node == current_node));
             let nodes = group
-                .nodes
-                .iter()
-                .enumerate()
+                .offered_nodes()
                 .map(|(node_index, node)| NodeDto {
                     id: catalog_node_id(revision, group_index, node_index),
                     label: safe_catalog_label(node, "Узел", node_index),
@@ -5374,6 +5379,25 @@ fn build_catalog(
 struct SelectableGroup<'a> {
     name: &'a str,
     nodes: Vec<&'a str>,
+    /// `offered[i]`: Mihomo keeps `nodes[i]` in the group, so it can be listed and selected.
+    offered: Vec<bool>,
+    /// `hidden: true`: the provider keeps this group out of the UI.
+    hidden: bool,
+}
+
+impl SelectableGroup<'_> {
+    fn offers(&self, node_index: usize) -> bool {
+        !self.hidden && self.offered.get(node_index).copied().unwrap_or(false)
+    }
+
+    /// The selectable nodes with their positions in `nodes`.
+    fn offered_nodes(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.offers(*index))
+            .map(|(index, node)| (index, *node))
+    }
 }
 
 /// The exact name-addressable namespace exposed by Mihomo's controller. Only interactive
@@ -5388,20 +5412,22 @@ fn selectable_groups(snapshot: &Snapshot) -> Vec<SelectableGroup<'_>> {
         .filter(|group| group.group_type.eq_ignore_ascii_case("select"))
         .take(MAX_CATALOG_GROUPS)
         .map(|group| {
-            let mut node_names = HashSet::new();
-            let nodes = group
-                .proxies
-                .iter()
-                .map(String::as_str)
-                .filter(|node| node_names.insert(*node))
-                .take(MAX_CATALOG_NODES_PER_GROUP)
-                .collect();
+            // Mihomo's members, in its order; ids index into this list, so members excluded
+            // by `exclude-filter` / `exclude-type` keep their place but are never offered.
+            let members = group.members.iter().take(MAX_CATALOG_NODES_PER_GROUP);
             SelectableGroup {
                 name: &group.name,
-                nodes,
+                nodes: members.clone().map(|member| member.name.as_str()).collect(),
+                offered: members.map(|member| member.offered).collect(),
+                hidden: group.hidden,
             }
         })
         .collect()
+}
+
+/// The group the connection card names: the first select group the provider did not hide.
+fn primary_group_index(groups: &[SelectableGroup<'_>]) -> Option<usize> {
+    groups.iter().position(|group| !group.hidden)
 }
 
 fn catalog_group_id(revision: u64, group_index: usize) -> String {
@@ -5412,8 +5438,9 @@ fn catalog_node_id(revision: u64, group_index: usize, node_index: usize) -> Stri
     format!("n-{revision:016x}-{group_index:04x}-{node_index:04x}")
 }
 
-/// Accepts only Unicode letters/numbers, ASCII space and this harmless punctuation:
-/// `- _ . , ( ) [ ] + # !`. Everything else receives a positional generic label.
+/// Accepts Unicode letters/numbers, ASCII space, the punctuation and symbols server names use
+/// (see `is_safe_catalog_label_char`) and emoji. Anything else, an address or `user:secret`
+/// form, a UUID or a recognizable credential gets a positional generic label instead.
 fn safe_catalog_label(source: &str, kind: &str, index: usize) -> String {
     // Nothing after this boundary can be published, so no presentation safety scan may spend
     // time or memory proportional to the rest of an untrusted (up to 32 MiB) YAML scalar.
@@ -5424,6 +5451,7 @@ fn safe_catalog_label(source: &str, kind: &str, index: usize) -> String {
     let published = &source[..published_end];
     if published.is_empty()
         || contains_uuid_like(published)
+        || contains_address_or_userinfo(published)
         || contains_structured_credential(published)
         || !published.chars().all(is_safe_catalog_label_char)
     {
@@ -5639,6 +5667,9 @@ fn decoded_contains_credential(decoded: &[u8], allow_short_pair: bool) -> bool {
     })
 }
 
+/// Everything a provider writes in an ordinary server name. Deliberately absent: control and
+/// format characters (bidi overrides, line/paragraph separators), `=`, `\` and backquotes;
+/// `:`, `@` and `/` are allowed here and checked structurally (`contains_address_or_userinfo`).
 fn is_safe_catalog_label_char(character: char) -> bool {
     if character.is_control() {
         return false;
@@ -5657,12 +5688,69 @@ fn is_safe_catalog_label_char(character: char) -> bool {
                 | '+'
                 | '#'
                 | '!'
+                | '|'
+                | '*'
+                | '/'
+                | ':'
+                | '@'
+                | '&'
+                | '%'
+                | '~'
+                | '?'
+                | ';'
+                | '\''
+                | '"'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                // Typographic dashes, quotes, bullets and signs.
+                | '\u{2010}'..='\u{2015}'
+                | '\u{2018}'..='\u{201f}'
+                | '\u{2022}'
+                | '\u{2026}'
+                | '\u{00b7}'
+                | '\u{00ab}'
+                | '\u{00bb}'
+                | '\u{00b0}'
+                | '\u{00a9}'
+                | '\u{00ae}'
+                | '\u{2116}'
+                | '\u{2122}'
+                | '\u{203c}'
+                | '\u{2049}'
+                | '\u{2139}'
+                // Arrows, technical symbols, enclosed numbers, shapes, symbols, dingbats.
                 | '\u{2190}'..='\u{21ff}'
-                | '\u{2600}'..='\u{27bf}'
-                | '\u{1f1e6}'..='\u{1f1ff}'
-                | '\u{1f300}'..='\u{1faff}'
+                | '\u{2300}'..='\u{23ff}'
+                | '\u{2460}'..='\u{24ff}'
+                | '\u{25a0}'..='\u{27bf}'
+                | '\u{2b00}'..='\u{2bff}'
+                | '\u{3030}'
+                | '\u{303d}'
+                | '\u{3297}'
+                | '\u{3299}'
+                // Emoji: pictographs, flags, skin tones, keycaps, ZWJ and tag sequences.
+                | '\u{1f000}'..='\u{1faff}'
                 | '\u{fe0f}'
+                | '\u{200d}'
+                | '\u{20e3}'
+                | '\u{e0020}'..='\u{e007f}'
         )
+}
+
+/// A URL (`scheme://`) or a `user:secret` / `user@host` form: `:` or `@` directly between two
+/// non-space characters. "Германия: Франкфурт" and "Nodes @ 10 Gbps" stay readable.
+fn contains_address_or_userinfo(source: &str) -> bool {
+    if source.contains("://") {
+        return true;
+    }
+    let characters: Vec<char> = source.chars().collect();
+    characters.windows(3).any(|window| {
+        matches!(window[1], ':' | '@') && !window[0].is_whitespace() && !window[2].is_whitespace()
+    })
 }
 
 fn contains_uuid_like(source: &str) -> bool {
