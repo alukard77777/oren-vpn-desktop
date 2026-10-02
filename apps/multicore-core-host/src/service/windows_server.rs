@@ -269,6 +269,7 @@ pub(crate) fn production_verifier(host_executable: PathBuf) -> Arc<Verifier> {
             user_key: format!("{}:{}", facts.session_id, facts.user_sid),
             data_root,
             uid: 0,
+            administrator: facts.administrator,
         })
     })
 }

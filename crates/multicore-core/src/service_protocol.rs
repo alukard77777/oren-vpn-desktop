@@ -10,6 +10,7 @@ use crate::elevation_protocol::{
     BrokerErrorCode, ElevatedEngine, ElevatedLogRecord, ElevatedRuntimeState, ProtocolError,
     decode_frame_versioned, encode_frame_versioned,
 };
+use crate::troubleshoot::{FixOutcome, PrivilegedFix, validate_fix_batch};
 
 pub const SERVICE_PROTOCOL_VERSION: u16 = 2;
 /// Longest accepted `Update.version` (`major.minor.patch`).
@@ -41,6 +42,11 @@ pub enum ServiceCommand {
     Update {
         version: String,
     },
+    /// «Устранить неполадки»: runs these fixed fixes in order and reports one outcome each.
+    /// Additive like `StageUpdate`: an older service answers `Error{InvalidRequest}`.
+    Troubleshoot {
+        fixes: Vec<PrivilegedFix>,
+    },
 }
 
 impl ServiceCommand {
@@ -50,6 +56,9 @@ impl ServiceCommand {
             Self::Update { version } | Self::StageUpdate { version }
                 if !is_release_version(version) =>
             {
+                Err(ProtocolError::InvalidSchema)
+            }
+            Self::Troubleshoot { fixes } if validate_fix_batch(fixes, true).is_err() => {
                 Err(ProtocolError::InvalidSchema)
             }
             _ => Ok(()),
@@ -124,6 +133,10 @@ pub enum ServiceResponse {
         version: String,
     },
     UpdateStarted,
+    /// `Troubleshoot` ran: one outcome per requested fix, in order.
+    Troubleshot {
+        outcomes: Vec<FixOutcome>,
+    },
     /// Another interactive user's session holds the cores.
     Busy,
     Error {
@@ -181,6 +194,9 @@ pub fn service_response_matches(command: &ServiceCommand, response: &ServiceResp
             ServiceCommand::StageUpdate { version },
             ServiceResponse::UpdateStaged { version: actual },
         ) => version == actual,
+        (ServiceCommand::Troubleshoot { fixes }, ServiceResponse::Troubleshot { outcomes }) => {
+            fixes.len() == outcomes.len()
+        }
         (ServiceCommand::Status, ServiceResponse::Status { .. })
         | (ServiceCommand::Diagnostics, ServiceResponse::ProcessDiagnostics { .. })
         | (ServiceCommand::Shutdown, ServiceResponse::ShuttingDown)

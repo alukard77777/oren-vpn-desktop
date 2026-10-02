@@ -11,6 +11,10 @@ mod runtime_paths;
 #[path = "../src/service/mod.rs"]
 #[allow(dead_code)]
 mod service;
+#[cfg(windows)]
+#[path = "../src/troubleshoot.rs"]
+#[allow(dead_code)]
+mod troubleshoot;
 #[cfg(unix)]
 #[path = "../src/unix_runtime_paths.rs"]
 #[allow(dead_code)]
@@ -110,6 +114,7 @@ fn user(key: &str) -> ClientIdentity {
         user_key: key.to_owned(),
         data_root: PathBuf::from("/home/user/.local/share/multicore"),
         uid: 1000,
+        administrator: true,
     }
 }
 
@@ -356,11 +361,13 @@ fn each_account_gets_its_own_mihomo_home() {
             user_key: "1:S-1-5-21-1-2-3-1001".into(),
             data_root: PathBuf::from("/a"),
             uid: 1001,
+            administrator: false,
         },
         ClientIdentity {
             user_key: "2:S-1-5-21-1-2-3-1002".into(),
             data_root: PathBuf::from("/b"),
             uid: 1002,
+            administrator: false,
         },
     );
     let alice_home = client_home(root, &alice);
@@ -428,6 +435,7 @@ fn reading_a_client_generation_leaves_its_runtime_free_for_the_next_one() {
         user_key: format!("1:{owner}"),
         data_root: data.clone(),
         uid: 0,
+        administrator: false,
     };
 
     let generation = read_client_generation(&client, &host, 7, || Ok(())).unwrap();
@@ -1108,6 +1116,7 @@ mod windows_identity_checks {
             session_id: session,
             user_sid: "S-1-5-21-1-2-3-1001".into(),
             interactive,
+            administrator: false,
         }
     }
 
@@ -1304,6 +1313,7 @@ mod windows_pipe_server {
             user_key: "1:alice".into(),
             data_root: PathBuf::from(r"C:\Users\alice\AppData\Local\MultiCore"),
             uid: 0,
+            administrator: false,
         })
     }
 
@@ -1492,6 +1502,7 @@ mod windows_pipe_server {
                 },
                 data_root: PathBuf::from(r"C:\Users\alice\AppData\Local\MultiCore"),
                 uid: 0,
+                administrator: false,
             })
         });
         let stop = manual_event();
@@ -2546,4 +2557,220 @@ fn a_switch_off_that_took_effect_is_recorded_as_off_even_if_reported_failed() {
         service.execute(A, &alice, ServiceCommand::Status),
         ServiceResponse::Status { tun_on: false, .. }
     ));
+}
+
+mod troubleshoot_in_the_service {
+    use super::{A, A2, B, FakeCores, user};
+    use crate::service::core_loop::{
+        ClientIdentity, ConnectionId, ServiceLoop, Troubleshooter, execute_shared,
+    };
+    use multicore_core::elevation_protocol::BrokerErrorCode;
+    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse};
+    use multicore_core::troubleshoot::{DpiService, FixOutcome, PrivilegedFix};
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
+    };
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Recording {
+        ran: Mutex<Vec<Vec<PrivilegedFix>>>,
+    }
+
+    impl Troubleshooter for Recording {
+        fn run(&self, fixes: &[PrivilegedFix]) -> Vec<FixOutcome> {
+            self.ran.lock().unwrap().push(fixes.to_vec());
+            fixes
+                .iter()
+                .map(|fix| match fix {
+                    PrivilegedFix::ReinstallWintun => FixOutcome::NothingToDo,
+                    _ => FixOutcome::Done,
+                })
+                .collect()
+        }
+    }
+
+    fn troubleshoot(fixes: &[PrivilegedFix]) -> ServiceCommand {
+        ServiceCommand::Troubleshoot {
+            fixes: fixes.to_vec(),
+        }
+    }
+
+    fn standard_user(key: &str) -> ClientIdentity {
+        ClientIdentity {
+            administrator: false,
+            ..user(key)
+        }
+    }
+
+    #[test]
+    fn an_administrator_gets_one_outcome_per_fix_in_request_order() {
+        let recording = Arc::new(Recording::default());
+        let mut service =
+            ServiceLoop::new(FakeCores::default()).with_troubleshooter(recording.clone());
+        let fixes = [
+            PrivilegedFix::ReinstallWintun,
+            PrivilegedFix::RemoveDpiService {
+                service: DpiService::Zapret,
+            },
+        ];
+        assert_eq!(
+            service.execute(A, &user("1:alice"), troubleshoot(&fixes)),
+            ServiceResponse::Troubleshot {
+                outcomes: vec![FixOutcome::NothingToDo, FixOutcome::Done]
+            }
+        );
+        assert_eq!(*recording.ran.lock().unwrap(), [fixes.to_vec()]);
+        // Troubleshooting claims nothing: the cores were never touched.
+        assert!(service.cores_mut().calls.is_empty());
+        assert_eq!(service.owner_key(), None);
+    }
+
+    #[test]
+    fn standard_users_other_sessions_and_a_live_tunnel_are_refused() {
+        let recording = Arc::new(Recording::default());
+        let mut service =
+            ServiceLoop::new(FakeCores::default()).with_troubleshooter(recording.clone());
+        let winsock = [PrivilegedFix::WinsockReset];
+        assert_eq!(
+            service.execute(A, &standard_user("1:alice"), troubleshoot(&winsock)),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::AuthenticationFailed
+            },
+            "a standard user is sent to the UAC prompt instead"
+        );
+        let alice = user("1:alice");
+        service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+        service.execute(A, &alice, ServiceCommand::SetTun { on: true });
+        assert_eq!(
+            service.execute(B, &user("2:bob"), troubleshoot(&winsock)),
+            ServiceResponse::Busy
+        );
+        assert_eq!(
+            service.execute(A2, &alice, troubleshoot(&[PrivilegedFix::ReinstallWintun])),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::NotReady
+            },
+            "never remove the adapter under a running tunnel"
+        );
+        assert!(recording.ran.lock().unwrap().is_empty());
+        assert!(service.cores_mut().tun, "the tunnel stayed up");
+        // Without a troubleshooter (Linux) the command is unsupported.
+        let mut bare = ServiceLoop::new(FakeCores::default());
+        assert_eq!(
+            bare.execute(A, &alice, troubleshoot(&winsock)),
+            ServiceResponse::Error {
+                code: BrokerErrorCode::Unsupported
+            }
+        );
+    }
+
+    /// Blocks inside `run` until released.
+    struct Blocking {
+        started: Mutex<Sender<()>>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl Troubleshooter for Blocking {
+        fn run(&self, fixes: &[PrivilegedFix]) -> Vec<FixOutcome> {
+            self.started.lock().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            vec![FixOutcome::Done; fixes.len()]
+        }
+    }
+
+    #[test]
+    fn fixes_run_outside_the_lock_and_one_batch_at_a_time() {
+        let (started_tx, started) = channel();
+        let (release, release_rx) = channel();
+        let service = Arc::new(Mutex::new(
+            ServiceLoop::new(FakeCores::default()).with_troubleshooter(Arc::new(Blocking {
+                started: Mutex::new(started_tx),
+                release: Mutex::new(release_rx),
+            })),
+        ));
+        let running = {
+            let service = service.clone();
+            std::thread::spawn(move || {
+                execute_shared(
+                    &service,
+                    ConnectionId(9),
+                    &user("1:alice"),
+                    troubleshoot(&[PrivilegedFix::ResyncTime]),
+                )
+            })
+        };
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            service.try_lock().is_ok(),
+            "the batch must not hold the lock"
+        );
+        assert!(matches!(
+            execute_shared(
+                &service,
+                ConnectionId(1),
+                &user("1:alice"),
+                ServiceCommand::Status
+            ),
+            ServiceResponse::Status { .. }
+        ));
+        assert_eq!(
+            execute_shared(
+                &service,
+                ConnectionId(2),
+                &user("1:alice"),
+                troubleshoot(&[PrivilegedFix::WinsockReset])
+            ),
+            ServiceResponse::Busy
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            running.join().unwrap(),
+            ServiceResponse::Troubleshot {
+                outcomes: vec![FixOutcome::Done]
+            }
+        );
+    }
+}
+
+#[cfg(windows)]
+mod troubleshoot_helper_checks {
+    use super::troubleshoot::{is_machine_install_host, service_command_line};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn the_service_is_only_registered_from_the_machine_wide_install() {
+        let roots = [
+            PathBuf::from(r"C:\Program Files"),
+            PathBuf::from(r"C:\Program Files (x86)"),
+        ];
+        for host in [
+            r"C:\Program Files\MultiCore\current\runtime\multicore-core-host.exe",
+            r"\\?\C:\Program Files\MultiCore\current\runtime\multicore-core-host.exe",
+            r"c:\program files (x86)\multicore\CURRENT\runtime\MULTICORE-CORE-HOST.EXE",
+        ] {
+            assert!(is_machine_install_host(Path::new(host), &roots), "{host}");
+        }
+        for host in [
+            r"C:\Users\me\AppData\Local\Programs\MultiCore\current\runtime\multicore-core-host.exe",
+            r"C:\Program Files\MultiCore\.multicore-previous-1.1.2-1\runtime\multicore-core-host.exe",
+            r"C:\Program Files\MultiCore\current\runtime\..\runtime\multicore-core-host.exe",
+            r"C:\Program Files\Other\current\runtime\multicore-core-host.exe",
+            r"C:\Program Files\MultiCore\current\runtime\multicore-daemon.exe",
+            r"D:\Program Files\MultiCore\current\runtime\multicore-core-host.exe",
+        ] {
+            assert!(!is_machine_install_host(Path::new(host), &roots), "{host}");
+        }
+    }
+
+    #[test]
+    fn the_command_line_matches_the_installer() {
+        assert_eq!(
+            service_command_line(Path::new(
+                r"\\?\C:\Program Files\MultiCore\current\runtime\multicore-core-host.exe"
+            )),
+            r#""C:\Program Files\MultiCore\current\runtime\multicore-core-host.exe" --service"#
+        );
+    }
 }
