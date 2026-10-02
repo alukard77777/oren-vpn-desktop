@@ -862,6 +862,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     language::initialize(
         loaded_preferences.language,
         loaded_preferences.language_set_by_user,
+        language::detect_system_language(),
     );
     let (client, _bootstrap_guard): (Arc<dyn DaemonClient>, Option<bootstrap::Bootstrap>) =
         match bootstrap::start() {
@@ -2000,9 +2001,8 @@ fn wire_preference_persistence(
             tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());
             tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
             tracker.set_tun_enabled(ui.get_tun_enabled());
-            if let Some(language) = language::Lang::from_tag(&ui.get_language()) {
-                tracker.set_language(language, ui.get_language_set_by_user());
-            }
+            let (language, set_by_user) = language::persisted();
+            tracker.set_language(language, set_by_user);
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
             }
@@ -5745,6 +5745,7 @@ fn split_leading_emoji_image(name: &str) -> (slint::Image, &str) {
 fn sync_language(ui: &AppWindow) {
     let current = language::current();
     ui.set_language_set_by_user(language::user_chosen());
+    ui.set_language_from_provider(language::source() == language::Source::Provider);
     if ui.get_language() != current.code() {
         select_slint_language(current);
         ui.set_language(current.code().into());
