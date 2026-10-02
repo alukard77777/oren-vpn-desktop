@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    # x64 (x86_64-pc-windows-msvc) or x86 (i686-pc-windows-msvc).
-    [ValidateSet('x64', 'x86')]
+    # x64 (x86_64-pc-windows-msvc), x86 (i686-pc-windows-msvc) or arm64 (aarch64-pc-windows-msvc,
+    # cross-compiled on an x64 host).
+    [ValidateSet('x64', 'x86', 'arm64')]
     [string]$Architecture = 'x64',
     # Where skia-binaries-<key>.tar.gz is written (the directory package-windows-release.ps1
     # reads through -SkiaBinariesDirectory / MULTICORE_SKIA_BINARIES_DIR).
@@ -19,7 +20,7 @@ param(
 #
 # rust-skia publishes prebuilt Skia binaries only for the dynamic C runtime (/MD), while the
 # release links the C runtime statically (+crt-static, see package-windows-release.ps1), and it
-# publishes no 32-bit Windows build at all. So the Windows release links Skia built here: the
+# publishes no 32-bit or ARM64 Windows build at all. So the Windows release links Skia built here: the
 # pinned rust-skia Skia fork, built by skia-bindings itself (offline build) with clang-cl and
 # packed exactly like a skia-binaries download. The archive's SHA-256 is pinned in
 # packaging/windows-<arch>/versions.json (build.skiaBinaries); rebuilding produces a different
@@ -36,10 +37,14 @@ $SkiaRepository = "https://github.com/$($Pin.source.repository).git"
 $SkiaTag = [string]$Pin.source.tag
 $SkiaCommit = [string]$Pin.source.commit
 if ($SkiaCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'build.skiaBinaries.source.commit must be a full lowercase commit' }
-$CargoTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+$CargoTarget = switch -CaseSensitive ($Architecture) {
+    'x86' { 'i686-pc-windows-msvc' }
+    'arm64' { 'aarch64-pc-windows-msvc' }
+    default { 'x86_64-pc-windows-msvc' }
+}
 
 $LlvmHome = [IO.Path]::GetFullPath($LlvmHome)
-foreach ($tool in @('bin\clang-cl.exe', 'bin\libclang.dll')) {
+foreach ($tool in @('bin\clang-cl.exe', 'bin\libclang.dll', 'bin\llvm-lib.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $LlvmHome $tool) -PathType Leaf)) { throw "LLVM installation lacks $tool`: $LlvmHome" }
 }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -77,7 +82,8 @@ if (-not (Test-Path -LiteralPath $Ninja -PathType Leaf)) { throw "ninja was not 
 # 2. skia-bindings' own offline build, configured exactly like the release build.
 $TargetDirectory = Join-Path $WorkDirectory "target-$Architecture"
 $saved = @{}
-foreach ($name in @('LLVM_HOME', 'LIBCLANG_PATH', 'SKIA_SOURCE_DIR', 'SKIA_NINJA_COMMAND', 'CARGO_TARGET_DIR', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTFLAGS', 'SKIA_BINARIES_URL')) {
+$CcTarget = $CargoTarget.Replace('-', '_')
+foreach ($name in @('LLVM_HOME', 'LIBCLANG_PATH', 'SKIA_SOURCE_DIR', 'SKIA_NINJA_COMMAND', 'CARGO_TARGET_DIR', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTFLAGS', 'SKIA_BINARIES_URL', "CC_$CcTarget", "CXX_$CcTarget", "AR_$CcTarget")) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 try {
@@ -89,6 +95,15 @@ try {
     Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
     Remove-Item Env:SKIA_BINARIES_URL -ErrorAction SilentlyContinue
     $env:CARGO_ENCODED_RUSTFLAGS = '-Ctarget-feature=+crt-static'
+    if ($Architecture -ceq 'arm64') {
+        # Skia itself is always compiled by clang-cl (gn's clang_win). For ARM64 the cc crate
+        # compiles skia-bindings' bindings.cpp with clang-cl and archives it with llvm-lib as
+        # well, so the cross build needs no MSVC ARM64 compiler (only its headers, which are
+        # architecture-neutral). Linking MultiCore for ARM64 still needs the MSVC ARM64 libraries.
+        [Environment]::SetEnvironmentVariable("CC_$CcTarget", (Join-Path $LlvmHome 'bin\clang-cl.exe'), 'Process')
+        [Environment]::SetEnvironmentVariable("CXX_$CcTarget", (Join-Path $LlvmHome 'bin\clang-cl.exe'), 'Process')
+        [Environment]::SetEnvironmentVariable("AR_$CcTarget", (Join-Path $LlvmHome 'bin\llvm-lib.exe'), 'Process')
+    }
     Push-Location $RepositoryRoot
     try {
         Invoke-Checked 'skia-bindings build' { cargo build --locked --release --target $CargoTarget -p skia-bindings }
@@ -119,7 +134,9 @@ Copy-Item -LiteralPath (Join-Path $SkiaSource 'LICENSE') -Destination (Join-Path
 [IO.File]::WriteAllText((Join-Path $binaries 'tag.txt'), [string]$Pin.skiaBindings)
 $archive = Join-Path $OutputDirectory "skia-binaries-$key.tar.gz"
 if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
-Invoke-Checked 'tar' { tar.exe -czf $archive -C $stage skia-binaries }
+# Windows' own bsdtar: a GNU tar earlier on PATH (Git's usr\bin) takes C:\... for a remote host.
+$Tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+Invoke-Checked 'tar' { & $Tar -czf $archive -C $stage skia-binaries }
 $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
 Write-Output "Built $archive"
 Write-Output "sha256 $sha (pinned: $($Pin.sha256))"

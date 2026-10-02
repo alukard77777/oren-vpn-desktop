@@ -7,12 +7,13 @@
 #ifndef AppVersion
   #error AppVersion must be provided by build-windows-installer.ps1
 #endif
-; x64 (default) or x86: the 32-bit flavour for 32-bit Windows, installed in 32-bit mode.
+; x64 (default), x86 (the 32-bit flavour for 32-bit Windows, installed in 32-bit mode) or arm64
+; (Windows on ARM, installed in 64-bit mode like x64).
 #ifndef Arch
   #define Arch "x64"
 #endif
-#if Arch != "x64" && Arch != "x86"
-  #error Arch must be x64 or x86
+#if Arch != "x64" && Arch != "x86" && Arch != "arm64"
+  #error Arch must be x64, x86 or arm64
 #endif
 
 #define AppName "MULTICORE"
@@ -38,6 +39,12 @@ UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputBaseFilename=MultiCore-Setup-x64
+#elif Arch == "arm64"
+; Same AppId, folders and 64-bit uninstall entry as x64, so on Windows on ARM it replaces an
+; (emulated) x64 install in place. ARM64 Windows only: an x64 or x86 PC refuses this installer.
+ArchitecturesAllowed=arm64
+ArchitecturesInstallIn64BitMode=arm64
+OutputBaseFilename=MultiCore-Setup-arm64
 #else
 ; Same AppId as x64. Always 32-bit install mode: {commonpf} is Program Files (x86) on 64-bit
 ; Windows, Program Files on 32-bit Windows; the uninstall entry lives in the 32-bit view.
@@ -132,8 +139,8 @@ var
   UserSid: String;
   { That user's %LOCALAPPDATA%; '' when it could not be found. }
   UserLocalAppDataPath: String;
-  { "Без службы" replaced a service install, or x64 replaced an x86 install, whose launch at
-    sign-in was on: turn it on again for this install. }
+  { "Без службы" replaced a service install, or x64/arm64 replaced an x86 install, whose launch
+    at sign-in was on: turn it on again for this install. }
   MoveAutostartFromServiceInstall: Boolean;
 
 function GetCurrentProcessId: Cardinal;
@@ -164,7 +171,7 @@ end;
 
 { Service mode installs only here: the SYSTEM service must never run from a user-writable folder.
   The x86 installer always runs in 32-bit install mode (Program Files (x86) on 64-bit Windows),
-  the x64 one always in 64-bit mode. }
+  the x64 and arm64 ones always in 64-bit mode (Program Files, also on Windows on ARM). }
 function ServiceInstallDir: String;
 begin
   if not Is64BitInstallMode then
@@ -476,8 +483,8 @@ begin
     Log('Per-user MULTICORE uninstaller exited with ' + IntToStr(ResultCode));
 end;
 
-{ x64 on 64-bit Windows: the uninstaller of an x86 service install (32-bit uninstall view,
-  Program Files (x86)), or ''. The x86 installer reads that entry as its own, so never here. }
+{ x64 or arm64 on 64-bit Windows: the uninstaller of an x86 service install (32-bit uninstall
+  view, Program Files (x86)), or ''. The x86 installer reads that entry as its own, so never here. }
 function X86ServiceUninstaller: String;
 var
   X86Uninstaller: String;
@@ -513,7 +520,7 @@ begin
     if FileExists(Uninstaller) then
       Result := Uninstaller;
   end;
-  { x64 "Без службы" over an x86 service install removes it the same way. }
+  { x64/arm64 "Без службы" over an x86 service install removes it the same way. }
   if Result = '' then
     Result := X86ServiceUninstaller;
 end;
@@ -567,9 +574,9 @@ begin
   end;
 end;
 
-{ x64 service mode over an x86 service install (installed by mistake on 64-bit Windows): stop
-  the service, wait for its processes, run its own uninstaller (elevated: Program Files (x86) is
-  administrators-only; /VERYSILENT keeps subscriptions and settings), then install x64. }
+{ x64/arm64 service mode over an x86 service install (installed by mistake on 64-bit Windows):
+  stop the service, wait for its processes, run its own uninstaller (elevated: Program Files (x86)
+  is administrators-only; /VERYSILENT keeps subscriptions and settings), then install. }
 function RemoveX86ServiceInstall: String;
 var
   X86Uninstaller, X86Dir, AutostartValue: String;
@@ -608,7 +615,7 @@ begin
   end;
 end;
 
-{ x64 on 64-bit Windows: the signed-in user's per-user copy is the x86 package. }
+{ x64/arm64 on 64-bit Windows: the signed-in user's per-user copy is the x86 package. }
 function X86PerUserCopyPresent: Boolean;
 var
   Manifest: AnsiString;
@@ -621,8 +628,8 @@ begin
     (Pos('"platform": "windows-x86"', Manifest) > 0);
 end;
 
-{ x64 "Без службы" over an x86 per-user copy: same folder and entry, but a 32-bit-mode install.
-  Remove it with its own uninstaller (silent: the data stays), then install x64. }
+{ x64/arm64 "Без службы" over an x86 per-user copy: same folder and entry, but a 32-bit-mode
+  install. Remove it with its own uninstaller (silent: the data stays), then install. }
 function RemoveX86PerUserCopy: String;
 var
   AutostartValue: String;
@@ -656,14 +663,23 @@ begin
   end;
 end;
 
-{ The 32-bit installer (32-bit install mode) on 64-bit Windows: the x64 installer fits better. }
+{ The 64-bit installer made for this Windows: ARM64 on Windows on ARM, x64 elsewhere. }
+function Native64BitSetupName: String;
+begin
+  if IsArm64 then
+    Result := 'MultiCore-Setup-arm64.exe'
+  else
+    Result := 'MultiCore-Setup-x64.exe';
+end;
+
+{ The 32-bit installer (32-bit install mode) on 64-bit Windows: a 64-bit installer fits better. }
 function IsX86SetupOn64BitWindows: Boolean;
 begin
   Result := (not Is64BitInstallMode) and IsWin64;
 end;
 
-{ An x64 install found by the x86 installer: its service install (64-bit uninstall entry) or a
-  per-user copy whose package manifest is the x64 one. }
+{ A 64-bit (x64 or ARM64) install found by the x86 installer: its service install (64-bit
+  uninstall entry) or a per-user copy whose package manifest is a 64-bit one. }
 function X64InstallPresent: Boolean;
 var
   Manifest: AnsiString;
@@ -678,7 +694,8 @@ begin
   end;
   if (PerUserInstallDir <> '') and
      LoadStringFromFile(PerUserInstallDir + '\current\versions.json', Manifest) and
-     (Pos('"platform": "windows-x64"', Manifest) > 0) then
+     ((Pos('"platform": "windows-x64"', Manifest) > 0) or
+      (Pos('"platform": "windows-arm64"', Manifest) > 0)) then
     Result := True;
 end;
 
@@ -690,8 +707,49 @@ begin
     exit;
   { Silent installs (the app's own service migration) keep the 32-bit flavour. }
   Result := SuppressibleMsgBox('Это 32-битная версия MULTICORE. На 64-битной Windows лучше установить '
-      + 'MultiCore-Setup-x64.exe: 32-битная версия работает, но медленнее и может дольше поднимать TUN.'
+      + Native64BitSetupName + ': 32-битная версия работает, но медленнее и может дольше поднимать TUN.'
       + #13#10#13#10 + 'Всё равно установить 32-битную версию?',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES;
+end;
+
+{ The x64 installer on Windows on ARM: x64 runs there only emulated, the arm64 installer fits
+  better. (The x86 and arm64 installers never ask this.) }
+function IsX64SetupOnArm64: Boolean;
+begin
+  Result := ('{#Arch}' = 'x64') and IsArm64;
+end;
+
+{ An ARM64 install found by the x64 installer on Windows on ARM. Both flavours share the folders
+  and the 64-bit uninstall entry, so only the package manifest of the service install or of the
+  per-user copy tells them apart. }
+function Arm64InstallPresent: Boolean;
+var
+  Manifest: AnsiString;
+begin
+  Result := False;
+  if not IsX64SetupOnArm64 then
+    exit;
+  if LoadStringFromFile(ExpandConstant('{commonpf64}\MultiCore\current\versions.json'), Manifest) and
+     (Pos('"platform": "windows-arm64"', Manifest) > 0) then
+  begin
+    Result := True;
+    exit;
+  end;
+  Result := (PerUserInstallDir <> '') and
+    LoadStringFromFile(PerUserInstallDir + '\current\versions.json', Manifest) and
+    (Pos('"platform": "windows-arm64"', Manifest) > 0);
+end;
+
+<event('InitializeSetup')>
+function WarnX64SetupOnArm64: Boolean;
+begin
+  Result := True;
+  if not IsX64SetupOnArm64 then
+    exit;
+  { Silent installs (the app's own service migration) keep the x64 flavour. }
+  Result := SuppressibleMsgBox('Это версия MULTICORE для x64. На Windows для ARM лучше установить '
+      + 'MultiCore-Setup-arm64.exe: версия x64 работает здесь только через эмуляцию, медленнее и расходует больше заряда.'
+      + #13#10#13#10 + 'Всё равно установить версию x64?',
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES;
 end;
 
@@ -715,10 +773,17 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  { Never replace an x64 install with the 32-bit flavour. }
+  { Never replace a 64-bit install with the 32-bit flavour. }
   if X64InstallPresent then
   begin
-    Result := 'На этом компьютере уже установлен 64-битный MULTICORE. Установите MultiCore-Setup-x64.exe '
+    Result := 'На этом компьютере уже установлен 64-битный MULTICORE. Установите ' + Native64BitSetupName + ' '
+      + 'или сначала удалите MULTICORE в «Параметры → Приложения».';
+    exit;
+  end;
+  { Never replace an ARM64 install with the emulated x64 flavour. }
+  if Arm64InstallPresent then
+  begin
+    Result := 'На этом компьютере уже установлен MULTICORE для ARM64. Установите MultiCore-Setup-arm64.exe '
       + 'или сначала удалите MULTICORE в «Параметры → Приложения».';
     exit;
   end;

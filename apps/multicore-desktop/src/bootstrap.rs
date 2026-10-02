@@ -330,7 +330,7 @@ fn open_locked_executable(path: &Path) -> Result<File, BootstrapError> {
 }
 
 /// The package's executables must be images of this build's architecture: PE32+ AMD64 for the
-/// x64 build, PE32 i386 for the x86 build.
+/// x64 build, PE32 i386 for the x86 build, PE32+ ARM64 for the ARM64 build.
 #[cfg(windows)]
 fn validate_native_pe(file: &mut File) -> Result<(), BootstrapError> {
     const MAX_PE_HEADER_BYTES: u64 = 1024 * 1024;
@@ -1575,6 +1575,8 @@ mod tests {
     const FOREIGN: (u16, u16) = match multicore_release::WindowsArch::CURRENT {
         multicore_release::WindowsArch::X64 => (0x014c, 0x10b),
         multicore_release::WindowsArch::X86 => (0x8664, 0x20b),
+        // x64 images would run emulated on Windows on ARM, but an ARM64 build takes ARM64 only.
+        multicore_release::WindowsArch::Arm64 => (0x8664, 0x20b),
     };
 
     #[cfg(windows)]

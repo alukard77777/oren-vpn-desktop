@@ -71,6 +71,19 @@ foreach ($token in @(
     'if RegKeyExists(HKLM64, UninstallKey) then',
     '(Pos(''"platform": "windows-x64"'', Manifest) > 0)',
     'уже установлен 64-битный MULTICORE',
+    # On Windows on ARM the 64-bit installer to recommend is the ARM64 one.
+    'function Native64BitSetupName: String;',
+    'if IsArm64 then',
+    "Result := 'MultiCore-Setup-arm64.exe'",
+    '(Pos(''"platform": "windows-arm64"'', Manifest) > 0)',
+    # x64 on Windows on ARM: recommend arm64 and never replace an ARM64 install (both share
+    # Program Files and the 64-bit uninstall entry, so only the package manifest tells them apart).
+    'function IsX64SetupOnArm64: Boolean;',
+    "Result := ('{#Arch}' = 'x64') and IsArm64;",
+    'function Arm64InstallPresent: Boolean;',
+    "LoadStringFromFile(ExpandConstant('{commonpf64}\MultiCore\current\versions.json'), Manifest)",
+    'function WarnX64SetupOnArm64: Boolean;',
+    'уже установлен MULTICORE для ARM64',
     # x64 over an x86 install on 64-bit Windows: migrate it, keeping the user's data.
     'function X86ServiceUninstaller: String;',
     "RegQueryStringValue(HKLM32, UninstallKey, 'UninstallString', X86Uninstaller)",
@@ -179,6 +192,21 @@ foreach ($guard in @(@('function X86ServiceUninstaller:', 'HKLM32'), @('function
 $x86Removal = Get-Body 'function RemoveX86ServiceInstall:'
 if (-not ($x86Removal.IndexOf('StopService;') -ge 0 -and $x86Removal.IndexOf('StopService;') -lt $x86Removal.IndexOf('WaitForExit(') -and $x86Removal.IndexOf('WaitForExit(') -lt $x86Removal.IndexOf('Exec(X86Uninstaller'))) {
     throw 'FAIL: the x86 service install is stopped and its processes gone before its uninstaller runs'
+}
+if (-not ($prepare.IndexOf('if Arm64InstallPresent then') -ge 0 -and $prepare.IndexOf('if Arm64InstallPresent then') -lt $prepare.IndexOf('Result := RemoveServiceInstall;'))) {
+    throw 'FAIL: the x64 installer must refuse an ARM64 install before touching any install'
+}
+$arm64Check = Get-Body 'function Arm64InstallPresent:'
+if (-not ($arm64Check.IndexOf('if not IsX64SetupOnArm64 then') -ge 0 -and $arm64Check.IndexOf('if not IsX64SetupOnArm64 then') -lt $arm64Check.IndexOf('LoadStringFromFile'))) {
+    throw 'FAIL: only the x64 installer on Windows on ARM may evaluate the ARM64-install refusal'
+}
+$arm64Warning = Get-Body 'function WarnX64SetupOnArm64:'
+if (-not ($arm64Warning.IndexOf('if not IsX64SetupOnArm64 then') -ge 0 -and $arm64Warning.IndexOf('if not IsX64SetupOnArm64 then') -lt $arm64Warning.IndexOf('SuppressibleMsgBox('))) {
+    throw 'FAIL: only the x64 installer on Windows on ARM may recommend the ARM64 installer'
+}
+# Silent installs (the app's own service migration) keep their flavour: default answer Yes.
+if (-not $arm64Warning.Contains('MB_YESNO or MB_DEFBUTTON2, IDYES) = IDYES')) {
+    throw 'FAIL: a silent x64 install on Windows on ARM must keep going'
 }
 $x64Check = Get-Body 'function X64InstallPresent:'
 if (-not ($x64Check.IndexOf('if not IsX86SetupOn64BitWindows then') -ge 0 -and $x64Check.IndexOf('if not IsX86SetupOn64BitWindows then') -lt $x64Check.IndexOf('RegKeyExists(HKLM64'))) {

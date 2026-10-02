@@ -10,8 +10,9 @@ param(
     [string]$UpdateRepository,
     [string]$ReleaseAssetPath,
     [switch]$AssertReleaseReady,
-    # x64 (default, PE32+ AMD64) or x86 (PE32 i386, Rust target i686-pc-windows-msvc).
-    [ValidateSet('x64', 'x86')]
+    # x64 (default, PE32+ AMD64), x86 (PE32 i386, Rust target i686-pc-windows-msvc) or arm64
+    # (PE32+ ARM64, Rust target aarch64-pc-windows-msvc).
+    [ValidateSet('x64', 'x86', 'arm64')]
     [string]$Architecture = 'x64',
     # Holds skia-binaries-<key>.tar.gz for this architecture, built by scripts/build-skia-binaries.ps1
     # and pinned in versions.json (build.skiaBinaries). Defaults to MULTICORE_SKIA_BINARIES_DIR.
@@ -28,14 +29,19 @@ $PrivilegedBrokerReleaseReady = $true
 $ReleaseGateMessage = 'Production packaging is disabled until the least-privilege core broker and package inventory are complete (Tasks 2-4).'
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $MetadataRoot = Join-Path $RepositoryRoot "packaging\windows-$Architecture"
-# Both flavours ship the same notices (identical core versions and licenses).
+# All flavours ship the same notices (identical core versions and licenses).
 $NoticesPath = Join-Path $RepositoryRoot 'packaging\windows-x64\THIRD_PARTY_NOTICES.md'
 $DefaultManifestPath = Join-Path $MetadataRoot 'versions.json'
 $Platform = "windows-$Architecture"
 $ReleaseAssetName = "multicore-$Platform.zip"
-# x64 keeps the host target (no --target) exactly as before; x86 cross-compiles. (Not named
-# $RustTarget: PowerShell variables are case-insensitive and $rustTarget is the target directory.)
-$CargoBuildTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { $null }
+# x64 keeps the host target (no --target) exactly as before; x86 and arm64 cross-compile. (Not
+# named $RustTarget: PowerShell variables are case-insensitive and $rustTarget is the target
+# directory.)
+$CargoBuildTarget = switch -CaseSensitive ($Architecture) {
+    'x86' { 'i686-pc-windows-msvc' }
+    'arm64' { 'aarch64-pc-windows-msvc' }
+    default { $null }
+}
 if (-not $ManifestPath) { $ManifestPath = $DefaultManifestPath }
 $manifestCandidate = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ManifestPath))
 $isFixtureInvocation = $false
@@ -114,14 +120,14 @@ function Assert-NoPrivateBuildPaths {
     }
 }
 
-# rust-skia publishes no prebuilt Skia for the static C runtime (+crt-static) or for 32-bit
-# Windows, so skia-bindings links the pinned, locally built archive instead of downloading one
+# rust-skia publishes no prebuilt Skia for the static C runtime (+crt-static) or for 32-bit or
+# ARM64 Windows, so skia-bindings links the pinned, locally built archive instead of downloading one
 # (it would otherwise try to build Skia from source, or link a different build).
 function Resolve-PinnedSkiaBinaries {
     param([object]$Build)
     if (-not ($Build.PSObject.Properties.Name -contains 'skiaBinaries')) { throw 'versions.json lacks the build.skiaBinaries pin' }
     $pin = $Build.skiaBinaries
-    $expectedTarget = if ($Architecture -ceq 'x86') { 'i686-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+    $expectedTarget = if ($CargoBuildTarget) { $CargoBuildTarget } else { 'x86_64-pc-windows-msvc' }
     if ([string]$pin.key -cnotmatch "^[0-9a-f]{20}-$expectedTarget-[a-z0-9-]+-static$") { throw 'build.skiaBinaries.key is not a static-CRT key for this architecture' }
     if ([string]$pin.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'build.skiaBinaries.sha256 is not a SHA-256 pin' }
     if ([string]::IsNullOrWhiteSpace($SkiaBinariesDirectory)) {
@@ -162,6 +168,11 @@ function Invoke-PinnedRustBuild {
     foreach ($name in @('SKIA_BINARIES_URL', 'FORCE_SKIA_BUILD', 'FORCE_SKIA_BINARIES_DOWNLOAD', 'SKIA_SOURCE_DIR', 'SKIA_LIBRARY_SEARCH_PATH', 'SKIA_DEBUG')) {
         $savedSkiaEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
+    # The ARM64 build picks its C compiler and flags through cc's target-specific variables.
+    $savedArm64CompilerEnvironment = @{}
+    foreach ($name in @('CC_aarch64_pc_windows_msvc', 'CFLAGS_aarch64_pc_windows_msvc', 'CXXFLAGS_aarch64_pc_windows_msvc', 'CFLAGS_x86_64_pc_windows_msvc', 'CXXFLAGS_x86_64_pc_windows_msvc')) {
+        $savedArm64CompilerEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
     Push-Location $RepositoryRoot
     try {
         $cargoVersion = (& cargo -V 2>&1 | Out-String).Trim()
@@ -195,6 +206,21 @@ function Invoke-PinnedRustBuild {
         $nativePathFlags = "/experimental:deterministic /pathmap:$userProfile=builder-home /d1trimfile:$userProfile\"
         $env:CFLAGS = $nativePathFlags
         $env:CXXFLAGS = $nativePathFlags
+        foreach ($name in $savedArm64CompilerEnvironment.Keys) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        if ($Target -ceq 'aarch64-pc-windows-msvc') {
+            # ring builds its ARM64 C and assembly only with clang (it swaps MSVC's cl.exe for
+            # clang itself), so every C build for ARM64 goes through LLVM clang with clang's
+            # spelling of the path remapping. cc adds CFLAGS to every target's own flags and
+            # clang would read the cl.exe flags as file names, so those stay with the x64 host.
+            $clang = Get-Command 'clang.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $clang) { throw 'The ARM64 build needs LLVM clang.exe on PATH (ring compiles its ARM64 code only with clang)' }
+            Remove-Item Env:CFLAGS, Env:CXXFLAGS -ErrorAction SilentlyContinue
+            $env:CFLAGS_x86_64_pc_windows_msvc = $nativePathFlags
+            $env:CXXFLAGS_x86_64_pc_windows_msvc = $nativePathFlags
+            $env:CC_aarch64_pc_windows_msvc = $clang.Source
+            $env:CFLAGS_aarch64_pc_windows_msvc = "-ffile-prefix-map=$userProfile=builder-home"
+            $env:CXXFLAGS_aarch64_pc_windows_msvc = "-ffile-prefix-map=$userProfile=builder-home"
+        }
         $env:CARGO_TARGET_DIR = $TargetDirectory
         if ($UpdateRepository) {
             if ($UpdateRepository -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$') {
@@ -220,6 +246,7 @@ function Invoke-PinnedRustBuild {
         if ($hadTargetDirectory) { $env:CARGO_TARGET_DIR = $savedTargetDirectory } else { Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
         if ($hadUpdateRepository) { $env:MULTICORE_UPDATE_REPOSITORY = $savedUpdateRepository } else { Remove-Item Env:MULTICORE_UPDATE_REPOSITORY -ErrorAction SilentlyContinue }
         foreach ($name in $savedSkiaEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedSkiaEnvironment[$name], 'Process') }
+        foreach ($name in $savedArm64CompilerEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedArm64CompilerEnvironment[$name], 'Process') }
     }
 }
 
@@ -356,6 +383,27 @@ function Assert-ExactProductionPin {
             'mihomo-windows-386-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-386-v1.19.32.zip',
             '2fb4cfe1552e74eb1b2a0b98ec334041286a0de2ca01ca1ae16b4bf179c09b3f', 'mihomo-windows-386.exe',
             '113d2a9118c26288df743cd753da519f2b2b8de17f1db7a3a892c1dd795eec2e', '268435456',
+            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
+            '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
+            'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
+            '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
+        )
+        # arm64: the same upstream releases and commits, ARM64 Windows assets.
+        'arm64/xray' = @(
+            'XTLS/Xray-core', 'v26.9.30', 'b26a91de4f3294e26a0ad0a970b81a386a41f789', 'MPL-2.0',
+            'Xray-windows-arm64-v8a.zip', 'https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-windows-arm64-v8a.zip',
+            '5cf7ad4fd9aac5aa248ae7e598f3f0a0d0f79a6195089d611ddef9653830f1b0', 'xray.exe',
+            '9b38318d22f0abb2a64aa8030e59e606f6048ffc45c193d68998ac5d08d55416', '268435456',
+            'Xray-core-MPL-2.0.txt', 'https://raw.githubusercontent.com/XTLS/Xray-core/b26a91de4f3294e26a0ad0a970b81a386a41f789/LICENSE',
+            '1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5',
+            'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
+            'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
+        )
+        'arm64/mihomo' = @(
+            'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
+            'mihomo-windows-arm64-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-arm64-v1.19.32.zip',
+            '7a4f6e58af9a120920935f2150cf642d945085fdb3e753314505b334234e1d1e', 'mihomo-windows-arm64.exe',
+            '7211487d8e4092cf6cf6fbbdbc10a10fbde462847e36fb8a43479b0e4cad4b33', '268435456',
             'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
             '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
             'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
@@ -559,13 +607,13 @@ function Read-UInt16 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUIn
 function Read-UInt32 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUInt32($Bytes, $Offset) }
 function Read-UInt64 { param([byte[]]$Bytes, [int]$Offset) [BitConverter]::ToUInt64($Bytes, $Offset) }
 
-# PE32+ AMD64 for x64, PE32 i386 for x86. PE32 has BaseOfData and 32-bit ImageBase/stack/heap
+# PE32+ AMD64 for x64, PE32 i386 for x86, PE32+ ARM64 for arm64. PE32 has BaseOfData and 32-bit ImageBase/stack/heap
 # fields, so everything after offset 24 of the optional header sits 16 bytes earlier.
 function Assert-NativePeExecutable {
     param([string]$Path, [string]$Description)
     $isPe32 = $Architecture -ceq 'x86'
-    $expectedMachine = if ($isPe32) { 0x014c } else { 0x8664 }
-    $machineName = if ($isPe32) { 'i386' } else { 'AMD64' }
+    $expectedMachine = switch -CaseSensitive ($Architecture) { 'x86' { 0x014c } 'arm64' { 0xaa64 } default { 0x8664 } }
+    $machineName = switch -CaseSensitive ($Architecture) { 'x86' { 'i386' } 'arm64' { 'ARM64' } default { 'AMD64' } }
     $expectedMagic = if ($isPe32) { 0x010b } else { 0x020b }
     $formatName = if ($isPe32) { 'PE32' } else { 'PE32+' }
     $minimumOptional = if ($isPe32) { 0xe0 } else { 0xf0 }

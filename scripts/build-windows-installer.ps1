@@ -5,8 +5,8 @@ param(
     [string]$OutputDirectory = 'dist\release',
     [string]$AppVersion = '1.1.2',
     [string]$CompilerPath,
-    # x64 (default) or x86; the payload must be the package built for the same flavour.
-    [ValidateSet('x64', 'x86')]
+    # x64 (default), x86 or arm64; the payload must be the package built for the same flavour.
+    [ValidateSet('x64', 'x86', 'arm64')]
     [string]$Architecture = 'x64',
     [switch]$ValidateOnly
 )
@@ -139,8 +139,8 @@ if ($ValidateOnly) {
     return
 }
 
-# The package's own hash-verified manifest names its flavour: an x86 installer must never carry
-# the x64 payload (or the reverse).
+# The package's own hash-verified manifest names its flavour: an x86 or arm64 installer must never
+# carry the x64 payload (or the reverse).
 $payloadManifest = Get-Content -Raw -LiteralPath (Join-Path $payload 'versions.json') | ConvertFrom-Json
 if ([string]$payloadManifest.platform -cne "windows-$Architecture") {
     throw "Payload platform '$($payloadManifest.platform)' does not match installer architecture windows-$Architecture"
