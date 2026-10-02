@@ -1200,7 +1200,7 @@ msgstr "Couldn't update the subscription. Try again."
 msgid "Введите корректный HTTP(S) URL."
 msgstr "Enter a valid HTTP(S) URL."
 
-msgid "Не удалось изменить ссылку подписку. Повторите попытку."
+msgid "Не удалось изменить ссылку подписки. Повторите попытку."
 msgstr "Couldn't change the subscription link. Try again."
 
 msgid "Не удалось удалить подписку. Повторите попытку."

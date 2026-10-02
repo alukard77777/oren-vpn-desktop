@@ -1309,7 +1309,7 @@ impl DesktopViewModel {
             Err(error) => {
                 self.profile_error = Some(profile_mutation_error(
                     &error,
-                    tr!("Не удалось изменить ссылку подписку. Повторите попытку."),
+                    tr!("Не удалось изменить ссылку подписки. Повторите попытку."),
                 ));
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
