@@ -1119,6 +1119,30 @@ fn known_error_message(code: &str) -> Option<&'static str> {
         "not_connected" => "Подключитесь, чтобы открыть панель Mihomo.",
         "dashboard_unavailable" => "Панель Mihomo недоступна в этой сборке.",
         "service_busy" => "MULTICORE уже запущен у другого пользователя.",
+        // Why a Connect's cores did not start (the daemon's start-failure codes).
+        "elevation_cancelled" => "Подключение отменено: не выдано разрешение администратора.",
+        "elevation_failed" => {
+            "Не удалось запустить службу подключения с правами администратора."
+        }
+        "broker_failed" => "Служба подключения не ответила. Повторите попытку.",
+        "core_failed" => {
+            "Не удалось запустить ядро. Подробности — в логе на странице «Состояние»."
+        }
+        "core_missing" => {
+            "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+        }
+        "core_exited" => {
+            "Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние»."
+        }
+        "core_timed_out" => "Ядро не успело запуститься вовремя. Повторите попытку.",
+        "tun_failed" => {
+            "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+        }
+        "tun_timed_out" => {
+            "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN."
+        }
+        "system_proxy_failed" => "Не удалось включить системный прокси. Повторите попытку.",
+        "connect_failed" => "Не удалось запустить подключение. Повторите попытку.",
         "service_update_failed" => "Служба не смогла загрузить или проверить обновление.",
         "service_unavailable" => "Служба MULTICORE недоступна.",
         _ => return None,
@@ -1612,6 +1636,51 @@ mod http_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_failed_connect_shows_why_the_cores_did_not_start() {
+        for (code, expected) in [
+            (
+                "tun_failed",
+                "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.",
+            ),
+            (
+                "core_missing",
+                "Не удалось запустить ядро: файл не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE.",
+            ),
+            (
+                "core_exited",
+                "Ядро завершилось сразу после запуска. Причина — в логе на странице «Состояние».",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind connect server");
+            let address = listener.local_addr().expect("connect server address");
+            let body = format!(r#"{{"code":"{code}","message":"x"}}"#);
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept connect request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                    let read = stream.read(&mut buffer).expect("read connect request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write connect response");
+            });
+            let client = HttpDaemonClient::new(format!("http://{address}"), "token")
+                .expect("loopback client");
+            let error = client.connect_with_tun(true).expect_err("cores did not start");
+            server.join().expect("connect server");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     #[test]
     fn service_updates_are_posted_and_busy_is_explained() {

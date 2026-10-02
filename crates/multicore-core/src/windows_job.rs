@@ -148,6 +148,14 @@ impl WindowsJobLauncher {
             )
         };
         if created == 0 {
+            // Why the core could not be launched (missing file, antivirus block, access
+            // denied) belongs in its diagnostics: the error alone says only "launch failed".
+            let error = std::io::Error::last_os_error();
+            self.logs.push(
+                command.engine,
+                DiagnosticStream::Stderr,
+                &crate::sidecar::launch_failure_line(&command.program, &error),
+            );
             return Err(ProcessError::LaunchFailed(command.engine));
         }
         let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };

@@ -2112,12 +2112,42 @@ async fn connect_failure_message_explains_the_classified_cause() {
         (
             Engine::Mihomo,
             StartFailureCause::CoreFailed,
-            "Не удалось запустить Mihomo. Проверьте исполняемые файлы.",
+            "Не удалось запустить Mihomo. Подробности — в логе на странице «Состояние».",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::CoreMissing,
+            "Не удалось запустить Mihomo: файл ядра не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE.",
+        ),
+        (
+            Engine::Xray,
+            StartFailureCause::CoreExited,
+            "Xray завершился сразу после запуска. Причина — в логе на странице «Состояние».",
         ),
         (
             Engine::Mihomo,
             StartFailureCause::ReadinessTimedOut,
             "Mihomo не успел запуститься вовремя. Повторите попытку.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::TunFailed,
+            "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::TunTimedOut,
+            "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::SystemProxyFailed,
+            "Не удалось включить системный прокси. Повторите попытку.",
+        ),
+        (
+            Engine::Mihomo,
+            StartFailureCause::Unknown,
+            "Не удалось запустить подключение. Повторите попытку.",
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -2137,11 +2167,127 @@ async fn connect_failure_message_explains_the_classified_cause() {
             .await
             .unwrap();
 
-        assert!(backend.connect().await.is_err());
+        let error = backend.connect().await.unwrap_err();
+        // The HTTP layer answers with the cause, not a bare "backend_error".
+        assert_eq!(error.start_failure(), Some((engine, cause)));
         let status = backend.status().await.unwrap();
         assert_eq!(status.state, ConnectionState::Ready);
         assert_eq!(status.message.as_deref(), Some(expected));
     }
+}
+
+/// Fails `engine`'s start; its diagnostics log alternates lines of `engine` and Xray.
+struct LoggingFailureController {
+    engine: Engine,
+    lines: Vec<String>,
+}
+
+impl ProcessController for LoggingFailureController {
+    type Error = StartFailureCause;
+
+    fn start<'a>(
+        &'a self,
+        engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if engine == self.engine {
+                Err(StartFailureCause::CoreExited)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn stop<'a>(
+        &'a self,
+        _engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn diagnostics<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = multicore_core::ProcessDiagnostics> + Send + 'a>> {
+        Box::pin(async move {
+            let logs = self
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| multicore_core::CoreLogRecord {
+                    id: index as u64,
+                    timestamp_ms: 0,
+                    engine: if index % 2 == 0 {
+                        self.engine
+                    } else {
+                        Engine::Xray
+                    },
+                    stream: multicore_core::DiagnosticStream::Stderr,
+                    message: line.clone(),
+                })
+                .collect();
+            multicore_core::ProcessDiagnostics {
+                logs,
+                ..Default::default()
+            }
+        })
+    }
+
+    fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
+        *error
+    }
+}
+
+#[tokio::test]
+async fn a_failed_start_logs_the_last_lines_of_the_failed_core() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ProfileStore::open(directory.path().join("profiles"), None).unwrap();
+    let mut lines: Vec<String> = (0..20).map(|index| format!("line {index}")).collect();
+    lines.push("level=fatal msg=\"Start TUN listening error: configure tun interface\"".into());
+    let backend = test_backend(
+        store,
+        SubscriptionFetcher::new(FixtureHttp::default()),
+        move |_snapshot: &Snapshot| -> Result<Arc<LoggingFailureController>, BackendError> {
+            Ok(Arc::new(LoggingFailureController {
+                engine: Engine::Mihomo,
+                lines: lines.clone(),
+            }))
+        },
+    )
+    .unwrap();
+    backend
+        .import_subscription(ImportSubscriptionRequest {
+            url: "https://example.invalid/sub".into(),
+        })
+        .await
+        .unwrap();
+    assert!(backend.connect().await.is_err());
+
+    let events = backend.events_after(0).await.unwrap();
+    let failure = events
+        .iter()
+        .rev()
+        .find(|event| event.message == "Запуск подключения завершился ошибкой.")
+        .expect("failure event");
+    let tail: Vec<String> = failure.details.as_ref().unwrap()["core_log_tail"]
+        .as_array()
+        .expect("core log tail")
+        .iter()
+        .map(|line| line.as_str().unwrap().to_owned())
+        .collect();
+    // Only the failed core's lines, oldest first, the newest eight of them.
+    assert_eq!(
+        tail,
+        [
+            "line 6",
+            "line 8",
+            "line 10",
+            "line 12",
+            "line 14",
+            "line 16",
+            "line 18",
+            "level=fatal msg=\"Start TUN listening error: configure tun interface\"",
+        ]
+    );
 }
 
 #[tokio::test]

@@ -87,6 +87,75 @@ async fn post_connect(backend: &RecordingBackend, body: &'static str) -> StatusC
         .status()
 }
 
+#[derive(Clone)]
+struct FailingBackend;
+
+#[async_trait]
+impl Backend for FailingBackend {
+    async fn status(&self) -> Result<StatusDto, BackendError> {
+        Ok(status())
+    }
+
+    async fn catalog(&self) -> Result<CatalogDto, BackendError> {
+        Ok(CatalogDto {
+            revision: 0,
+            groups: Vec::new(),
+        })
+    }
+
+    async fn import_subscription(
+        &self,
+        _request: ImportSubscriptionRequest,
+    ) -> Result<StatusDto, BackendError> {
+        Err(BackendError::new())
+    }
+
+    async fn connect(&self) -> Result<StatusDto, BackendError> {
+        Err(BackendError::from_start_failure(
+            multicore_core::Engine::Mihomo,
+            multicore_core::StartFailureCause::TunFailed,
+        ))
+    }
+
+    async fn disconnect(&self) -> Result<StatusDto, BackendError> {
+        Ok(status())
+    }
+
+    async fn events_after(&self, _after: u64) -> Result<Vec<EventDto>, BackendError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn a_connect_whose_cores_did_not_start_says_why() {
+    let response = router(FailingBackend, TOKEN)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/connect")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Not a bare 500 "backend_error": the cause has its own code.
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "tun_failed");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Не удалось включить TUN-адаптер."),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn an_empty_connect_body_keeps_tun_mode() {
     let backend = RecordingBackend::default();

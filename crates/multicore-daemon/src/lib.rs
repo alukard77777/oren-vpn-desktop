@@ -369,6 +369,7 @@ pub struct ApiErrorBody {
 #[derive(Clone, Debug)]
 pub struct BackendError {
     profile_mutation: Option<ProfileMutationError>,
+    start_failure: Option<(Engine, multicore_core::StartFailureCause)>,
 }
 
 impl BackendError {
@@ -376,6 +377,7 @@ impl BackendError {
     pub const fn new() -> Self {
         Self {
             profile_mutation: None,
+            start_failure: None,
         }
     }
 
@@ -383,12 +385,30 @@ impl BackendError {
     pub const fn from_profile_mutation(error: ProfileMutationError) -> Self {
         Self {
             profile_mutation: Some(error),
+            start_failure: None,
+        }
+    }
+
+    /// A Connect whose cores did not start: which core, and why.
+    #[must_use]
+    pub const fn from_start_failure(
+        engine: Engine,
+        cause: multicore_core::StartFailureCause,
+    ) -> Self {
+        Self {
+            profile_mutation: None,
+            start_failure: Some((engine, cause)),
         }
     }
 
     #[must_use]
     pub const fn profile_mutation(&self) -> Option<ProfileMutationError> {
         self.profile_mutation
+    }
+
+    #[must_use]
+    pub const fn start_failure(&self) -> Option<(Engine, multicore_core::StartFailureCause)> {
+        self.start_failure
     }
 }
 
@@ -1601,7 +1621,16 @@ async fn connect(State(state): State<AppState>, body: Bytes) -> Result<Json<Stat
         .connect_with(options)
         .await
         .map(Json)
-        .map_err(|_| ApiError::backend("Не удалось подключиться. Повторите попытку."))
+        .map_err(|error| match error.start_failure() {
+            // The cores did not start: say which and why (the desktop shows a message per
+            // code), instead of a bare 500 "backend_error".
+            Some((engine, cause)) => ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                start_failure_code(cause),
+                &start_failure_message(engine, cause),
+            ),
+            None => ApiError::backend("Не удалось подключиться. Повторите попытку."),
+        })
 }
 
 async fn shutdown(State(state): State<AppState>, body: Bytes) -> Result<StatusCode, ApiError> {
@@ -3083,6 +3112,12 @@ where
                 }
             }
         }
+        let core_log_tail = match &result {
+            Err(multicore_core::SupervisorError::StartFailed { engine, .. }) => {
+                failed_core_log_tail(controller.as_ref(), *engine).await
+            }
+            _ => Vec::new(),
+        };
         let mut state = self.inner.write().await;
         abandoned.disarm();
         match result {
@@ -3147,9 +3182,11 @@ where
                         "rollback_failed": rollback_failed,
                         "shown": shown,
                         "os": std::env::consts::OS,
+                        // What the failed core itself printed last: usually the actual reason.
+                        "core_log_tail": core_log_tail,
                     }),
                 );
-                Err(BackendError::new())
+                Err(BackendError::from_start_failure(engine, cause))
             }
             Err(multicore_core::SupervisorError::StopFailed) => {
                 state.mark_error(
@@ -5192,6 +5229,53 @@ impl<P: ProcessController> Drop for AbandonedConnectGuard<'_, P> {
     }
 }
 
+/// At most this many of the failed core's last log lines go into the failure event.
+const FAILED_CORE_LOG_TAIL_LINES: usize = 8;
+const FAILED_CORE_LOG_LINE_CHARS: usize = 300;
+/// The service answers `Diagnostics` within seconds; a failure report must not wait longer.
+const FAILED_CORE_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The last lines the failed core wrote (its own explanation of the failure), oldest first.
+async fn failed_core_log_tail<P: ProcessController + ?Sized>(
+    controller: &P,
+    engine: Engine,
+) -> Vec<String> {
+    let Ok(diagnostics) =
+        tokio::time::timeout(FAILED_CORE_DIAGNOSTICS_TIMEOUT, controller.diagnostics()).await
+    else {
+        return Vec::new();
+    };
+    let mut tail: Vec<String> = diagnostics
+        .logs
+        .iter()
+        .rev()
+        .filter(|record| record.engine == engine)
+        .take(FAILED_CORE_LOG_TAIL_LINES)
+        .map(|record| record.message.chars().take(FAILED_CORE_LOG_LINE_CHARS).collect())
+        .collect();
+    tail.reverse();
+    tail
+}
+
+/// The API error code of a failed Connect: the desktop maps each to its own message.
+fn start_failure_code(cause: multicore_core::StartFailureCause) -> &'static str {
+    use multicore_core::StartFailureCause as Cause;
+    match cause {
+        Cause::ElevationCancelled => "elevation_cancelled",
+        Cause::ElevationFailed => "elevation_failed",
+        Cause::BrokerFailed => "broker_failed",
+        Cause::CoreFailed => "core_failed",
+        Cause::CoreMissing => "core_missing",
+        Cause::CoreExited => "core_exited",
+        Cause::ReadinessTimedOut => "core_timed_out",
+        Cause::TunFailed => "tun_failed",
+        Cause::TunTimedOut => "tun_timed_out",
+        Cause::SystemProxyFailed => "system_proxy_failed",
+        Cause::ServiceBusy => "service_busy",
+        Cause::Unknown => "connect_failed",
+    }
+}
+
 fn start_failure_message(
     engine: multicore_core::Engine,
     cause: multicore_core::StartFailureCause,
@@ -5209,14 +5293,23 @@ fn start_failure_message(
             "Не удалось запустить службу подключения с правами администратора.".to_owned()
         }
         Cause::BrokerFailed => "Служба подключения не ответила. Повторите попытку.".to_owned(),
-        Cause::CoreFailed => format!("Не удалось запустить {core}. Проверьте исполняемые файлы."),
+        Cause::CoreFailed => format!("Не удалось запустить {core}. Подробности — в логе на странице «Состояние»."),
+        Cause::CoreMissing => format!(
+            "Не удалось запустить {core}: файл ядра не найден или заблокирован. Проверьте карантин антивируса и переустановите MULTICORE."
+        ),
+        Cause::CoreExited => {
+            format!("{core} завершился сразу после запуска. Причина — в логе на странице «Состояние».")
+        }
         Cause::ReadinessTimedOut => {
             format!("{core} не успел запуститься вовремя. Повторите попытку.")
         }
-        Cause::ServiceBusy => "MULTICORE уже запущен у другого пользователя.".to_owned(),
-        Cause::Unknown => {
-            "Не удалось запустить подключение. Проверьте исполняемые файлы.".to_owned()
+        Cause::TunFailed => "Не удалось включить TUN-адаптер. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.".to_owned(),
+        Cause::TunTimedOut => "TUN-адаптер не включился вовремя. Повторите попытку; если не поможет — перезагрузите компьютер или подключитесь без TUN.".to_owned(),
+        Cause::SystemProxyFailed => {
+            "Не удалось включить системный прокси. Повторите попытку.".to_owned()
         }
+        Cause::ServiceBusy => "MULTICORE уже запущен у другого пользователя.".to_owned(),
+        Cause::Unknown => "Не удалось запустить подключение. Повторите попытку.".to_owned(),
     }
 }
 

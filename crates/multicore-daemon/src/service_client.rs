@@ -154,6 +154,8 @@ pub enum ServiceError {
     TimedOut,
     Protocol,
     Rejected(BrokerErrorCode),
+    /// The service refused to switch the TUN adapter on (`SetTun{on:true}` during Connect).
+    TunRejected(BrokerErrorCode),
 }
 
 impl fmt::Display for ServiceError {
@@ -171,6 +173,8 @@ impl ServiceError {
             Self::Busy => StartFailureCause::ServiceBusy,
             Self::Rejected(BrokerErrorCode::TimedOut) => StartFailureCause::ReadinessTimedOut,
             Self::Rejected(_) => StartFailureCause::CoreFailed,
+            Self::TunRejected(BrokerErrorCode::TimedOut) => StartFailureCause::TunTimedOut,
+            Self::TunRejected(_) => StartFailureCause::TunFailed,
             _ => StartFailureCause::BrokerFailed,
         }
     }
@@ -740,7 +744,12 @@ impl<C: ServiceConnector> ProcessController for ServiceTunController<C> {
                 Engine::Xray if warm_up => session.prepare_idle(generation),
                 Engine::Xray => claim_and_prepare(session, generation),
                 Engine::Mihomo => {
-                    session.set_tun(true)?;
+                    // In this mode starting Mihomo means switching its TUN adapter on: a refusal
+                    // here is an adapter problem, not a missing or crashed core.
+                    session.set_tun(true).map_err(|error| match error {
+                        ServiceError::Rejected(code) => ServiceError::TunRejected(code),
+                        other => other,
+                    })?;
                     session.set_in_use(IN_USE_TUN);
                     Ok(())
                 }

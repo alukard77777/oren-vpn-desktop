@@ -237,6 +237,38 @@ async fn the_proxy_mode_controller_keeps_tun_off_and_never_stops_cores() {
 }
 
 #[tokio::test]
+async fn a_tun_switch_the_service_refused_is_a_tun_failure_not_a_missing_core() {
+    // A live report: the service could not switch TUN on and the user was told to "check the
+    // executables" of Mihomo, which were fine.
+    let (session, connector, _) = session();
+    connector.0.lock().unwrap().tun_rollback = true;
+    let supervisor = Supervisor::new(Arc::new(ServiceTunController::new(session, 3)));
+    let error = supervisor.connect().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            multicore_core::SupervisorError::StartFailed {
+                engine: Engine::Mihomo,
+                cause: StartFailureCause::TunTimedOut,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    for (code, cause) in [
+        (BrokerErrorCode::NotReady, StartFailureCause::TunFailed),
+        (BrokerErrorCode::TimedOut, StartFailureCause::TunTimedOut),
+    ] {
+        assert_eq!(ServiceError::TunRejected(code).start_failure_cause(), cause);
+    }
+    // A refusal outside the switch (Prepare) is still a core start failure.
+    assert_eq!(
+        ServiceError::Rejected(BrokerErrorCode::NotReady).start_failure_cause(),
+        StartFailureCause::CoreFailed
+    );
+}
+
+#[tokio::test]
 async fn busy_is_reported_as_another_user() {
     let (session, connector, _) = session();
     connector.0.lock().unwrap().busy = true;

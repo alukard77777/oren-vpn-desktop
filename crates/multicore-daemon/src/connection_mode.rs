@@ -137,7 +137,7 @@ impl<P: ProcessController> ProcessController for SystemProxyController<P> {
     fn start_failure_cause(&self, error: &Self::Error) -> StartFailureCause {
         match error {
             ProxyModeError::Core(error) => self.inner.start_failure_cause(error),
-            ProxyModeError::SystemProxy => StartFailureCause::CoreFailed,
+            ProxyModeError::SystemProxy => StartFailureCause::SystemProxyFailed,
         }
     }
 }
@@ -330,7 +330,7 @@ mod tests {
         assert!(matches!(error, ProxyModeError::SystemProxy));
         assert_eq!(
             controller.start_failure_cause(&error),
-            StartFailureCause::CoreFailed
+            StartFailureCause::SystemProxyFailed
         );
         assert_eq!(recorder.calls(), ["start Mihomo", "apply", "stop Mihomo"]);
     }
