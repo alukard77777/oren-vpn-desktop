@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 pub(crate) const CRASH_LOG_FILE_NAME: &str = "crash.log";
 /// Past this size the file keeps only its newest half (a few reports).
 const MAX_CRASH_LOG_BYTES: u64 = 256 * 1024;
-/// Raw frames written per report.
+/// Raw frames written per report (Windows module+offset frames).
+#[cfg(windows)]
 const MAX_RAW_FRAMES: usize = 96;
 
 /// Installs the hook; the previous hook (the default one: stderr) still runs after it.
