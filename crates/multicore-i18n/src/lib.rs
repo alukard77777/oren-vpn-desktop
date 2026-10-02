@@ -441,8 +441,8 @@ mod tests {
         "до {}",
         // Plural "{n} days" is one character over "{n} дн.".
         "{n} дн.",
-        // Troubleshooting step label.
-        "Сеть и DNS…",
+        // A label of the saved log's system.txt, not shown in the window.
+        "Язык",
     ];
 
     fn chars(text: &str) -> usize {

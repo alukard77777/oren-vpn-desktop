@@ -14,11 +14,8 @@ const TEST_ONLY_FILES: &[&str] = &[
     "linux_shell_tests.rs",
     "preview_render.rs",
     "rust_catalog_tests.rs",
+    "slint_catalog_tests.rs",
 ];
-
-/// TODO(i18n): translated on their own branches; the coordinator drops them from this list
-/// once those are merged.
-const CYRILLIC_SCAN_PENDING: &[&str] = &["view_model.rs"];
 
 #[derive(Debug)]
 struct Literal {
@@ -285,9 +282,7 @@ fn no_russian_literal_ships_outside_the_catalog() {
     let mut untranslated = Vec::new();
     for path in sources() {
         let file = path.file_name().unwrap().to_string_lossy().into_owned();
-        if TEST_ONLY_FILES.contains(&file.as_str())
-            || CYRILLIC_SCAN_PENDING.contains(&file.as_str())
-        {
+        if TEST_ONLY_FILES.contains(&file.as_str()) {
             continue;
         }
         for literal in literals(&path) {

@@ -740,7 +740,15 @@ fn apply_status_language(status: &DaemonStatus) {
     crate::language::apply_provider_language(Some(provider));
 }
 
-pub fn state_from_status(status: DaemonStatus) -> UiState {
+pub fn state_from_status(mut status: DaemonStatus) -> UiState {
+    // A message the daemon sent with a code is shown in the interface language.
+    if let Some(message) = status
+        .message_key
+        .as_ref()
+        .and_then(multicore_i18n::MessageKey::localize)
+    {
+        status.message = Some(message);
+    }
     if status.degraded {
         return UiState::DaemonDegraded {
             message: status
@@ -808,6 +816,9 @@ pub struct DesktopViewModel {
     event_epoch: Option<String>,
     event_cursor: u64,
     event_cache: Vec<PresentedEvent>,
+    /// The daemon's message code of a cached event (by id) and the event's details suffix:
+    /// the feed re-renders those messages in the current language.
+    event_keys: std::collections::HashMap<u64, (multicore_i18n::MessageKey, String)>,
     event_load_error: Option<PresentedEvent>,
     event_filter: EventFilter,
     next_event_generation: u64,
@@ -896,6 +907,7 @@ impl DesktopViewModel {
             event_epoch: None,
             event_cursor: 0,
             event_cache: Vec::new(),
+            event_keys: std::collections::HashMap::new(),
             event_load_error: None,
             event_filter: EventFilter::All,
             next_event_generation: 0,
@@ -2194,6 +2206,7 @@ impl DesktopViewModel {
                     self.event_epoch = Some(batch.epoch);
                     self.event_cursor = 0;
                     self.event_cache.clear();
+                    self.event_keys.clear();
                 }
                 let next_cursor = batch
                     .events
@@ -2202,17 +2215,25 @@ impl DesktopViewModel {
                     .max()
                     .unwrap_or(self.event_cursor)
                     .max(self.event_cursor);
-                self.event_cache.extend(
-                    batch
-                        .events
-                        .into_iter()
-                        .filter(|event| event.id > self.event_cursor)
-                        .map(PresentedEvent::from),
-                );
+                for event in batch
+                    .events
+                    .into_iter()
+                    .filter(|event| event.id > self.event_cursor)
+                {
+                    if let Some(key) = event.message_key.clone() {
+                        let suffix = format_event_details(event.details.as_ref())
+                            .map(|details| format!(" {}", redact_event_text(&details)))
+                            .unwrap_or_default();
+                        self.event_keys.insert(event.id, (key, suffix));
+                    }
+                    self.event_cache.push(PresentedEvent::from(event));
+                }
                 self.event_cursor = next_cursor;
                 if self.event_cache.len() > 500 {
                     let remove = self.event_cache.len() - 500;
-                    self.event_cache.drain(..remove);
+                    for event in self.event_cache.drain(..remove) {
+                        self.event_keys.remove(&event.id);
+                    }
                 }
             }
             Err(_) => {
@@ -3411,7 +3432,15 @@ impl DesktopViewModel {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        events.extend(self.event_cache.clone());
+        events.extend(self.event_cache.iter().map(|event| {
+            let mut event = event.clone();
+            if let Some((key, suffix)) = self.event_keys.get(&event.id)
+                && let Some(message) = key.localize()
+            {
+                event.message = redact_event_text(&message) + suffix;
+            }
+            event
+        }));
         if let Some(error) = &self.diagnostics_error {
             events.insert(0, error.clone());
         }
@@ -3444,6 +3473,11 @@ impl DesktopViewModel {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The event feed as shown, in the current language.
+    pub(crate) fn event_feed(&self) -> Vec<PresentedEvent> {
+        self.filtered_events()
     }
 
     fn filtered_events(&self) -> Vec<PresentedEvent> {
@@ -4124,27 +4158,19 @@ pub(crate) fn derive_catalog_display(label: &str, kind: CatalogDisplayKind) -> C
     }
 
     let lowercase = value.to_lowercase();
-    let icon = if lowercase.contains("minecraft")
-        || lowercase.contains("game")
-        || lowercase.contains("игр")
-    // i18n-ignore: matches provider labels
-    {
+    // Words in provider labels (matched, never shown).
+    const GAMES: &[&str] = &["minecraft", "game", "игр"]; // i18n-ignore: provider labels
+    const MEDIA: &[&str] = &["youtube", "video", "media", "стрим"]; // i18n-ignore: provider labels
+    const DIRECT: &[&str] = &["без vpn", "direct", "прям"]; // i18n-ignore: provider labels
+    const AUTO: &[&str] = &["auto", "авто"]; // i18n-ignore: provider labels
+    let has = |words: &[&str]| words.iter().any(|word| lowercase.contains(word));
+    let icon = if has(GAMES) {
         "🎮"
-    } else if lowercase.contains("youtube")
-        || lowercase.contains("video")
-        || lowercase.contains("media")
-        || lowercase.contains("стрим")
-    // i18n-ignore: matches provider labels
-    {
+    } else if has(MEDIA) {
         "▶"
-    } else if lowercase.contains("без vpn") // i18n-ignore: matches provider labels
-        || lowercase.contains("direct")
-        || lowercase.contains("прям")
-    // i18n-ignore: matches provider labels
-    {
+    } else if has(DIRECT) {
         "↗"
-    } else if lowercase.contains("auto") || lowercase.contains("авто") {
-        // i18n-ignore: matches provider labels
+    } else if has(AUTO) {
         "↻"
     } else {
         match kind {
@@ -11638,5 +11664,88 @@ mod tests {
         let refresh = model.begin_refresh();
         model.finish_refresh(refresh, Ok(status(Some("en"))));
         assert_eq!(multicore_i18n::current(), Lang::Ru);
+    }
+
+    #[test]
+    fn coded_daemon_messages_follow_the_interface_language() {
+        let key = multicore_i18n::MessageKey::with_args("start.core_exited", ["Mihomo"]);
+        let russian = key.russian().expect("registered code");
+        let status = || DaemonStatus {
+            state: "error".into(),
+            message: Some(russian.clone()),
+            message_key: Some(key.clone()),
+            ..DaemonStatus::default()
+        };
+        let UiState::Error { message } = state_from_status(status()) else {
+            panic!("an error state");
+        };
+        assert_eq!(message, russian);
+        {
+            let _en = multicore_i18n::ThreadLanguage::set(Lang::En);
+            let UiState::Error { message } = state_from_status(status()) else {
+                panic!("an error state");
+            };
+            assert_eq!(
+                message,
+                "Mihomo exited right after starting. See the log on the Status page."
+            );
+        }
+        // An unknown code (a newer daemon) falls back to the text it sent.
+        let unknown = DaemonStatus {
+            message_key: Some(multicore_i18n::MessageKey::new("future.code")),
+            ..status()
+        };
+        let _en = multicore_i18n::ThreadLanguage::set(Lang::En);
+        let UiState::Error { message } = state_from_status(unknown) else {
+            panic!("an error state");
+        };
+        assert_eq!(message, russian);
+    }
+
+    #[test]
+    fn coded_log_events_are_rendered_again_after_a_language_switch() {
+        let mut view_model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let request = view_model.begin_events_request().expect("event request");
+        let feed = view_model
+            .finish_events(
+                request.token,
+                Ok(DaemonEventBatch {
+                    epoch: "epoch".into(),
+                    events: vec![
+                        DaemonEvent {
+                            id: 1,
+                            timestamp: "1".into(),
+                            level: "info".into(),
+                            component: "core".into(),
+                            message: "Подключение установлено.".into(),
+                            message_key: Some(multicore_i18n::MessageKey::new(
+                                "connect.established",
+                            )),
+                            details: Some(serde_json::json!({ "total_ms": 812 })),
+                        },
+                        DaemonEvent {
+                            id: 2,
+                            timestamp: "2".into(),
+                            level: "info".into(),
+                            component: "mihomo".into(),
+                            message: "provider line".into(),
+                            message_key: None,
+                            details: None,
+                        },
+                    ],
+                }),
+            )
+            .expect("completion");
+        let message = |feed: &[PresentedEvent], id| {
+            feed.iter()
+                .find(|event| event.id == id)
+                .map(|event| event.message.clone())
+                .expect("event")
+        };
+        assert_eq!(message(&feed, 1), "Подключение установлено. [total_ms=812]");
+        let _en = multicore_i18n::ThreadLanguage::set(Lang::En);
+        let feed = view_model.event_feed();
+        assert_eq!(message(&feed, 1), "Connected. [total_ms=812]");
+        assert_eq!(message(&feed, 2), "provider line");
     }
 }

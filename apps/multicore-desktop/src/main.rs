@@ -5832,6 +5832,8 @@ fn refresh_localized_texts(
     );
     apply_launch_at_sign_in(ui, windows_settings::query_launch_at_sign_in());
     refresh_tray_popup(tray_popup, model);
+    let feed = model.lock().expect("view model lock").event_feed();
+    apply_events(ui, feed);
     load_events(ui.as_weak(), model.clone());
     LANGUAGE_REFRESHERS.with(|refreshers| {
         for refresh in refreshers.borrow().iter() {

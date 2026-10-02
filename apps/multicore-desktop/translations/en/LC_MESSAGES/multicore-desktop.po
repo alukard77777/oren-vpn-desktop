@@ -459,17 +459,11 @@ msgstr "Online · {}"
 msgid "Не удалось изменить автозапуск. Проверьте права пользователя."
 msgstr "Couldn't change autostart. Check your user permissions."
 
-msgid "Отключение…"
-msgstr "Disconnecting…"
-
 msgid "Подключение…"
 msgstr "Connecting…"
 
 msgid "Защита включена"
 msgstr "Protected"
-
-msgid "Защита выключена"
-msgstr "Not protected"
 
 msgid "П"
 msgstr "S"
@@ -479,9 +473,6 @@ msgstr "ZIP file (*.zip)"
 
 msgid "Сохранить лог MULTICORE"
 msgstr "Save MULTICORE log"
-
-msgid "Канал обновлений не настроен"
-msgstr "No update channel configured"
 
 msgid "В релизе нет установщика со службой"
 msgstr "The release has no service installer"
@@ -584,9 +575,6 @@ msgstr "Downloading {}…"
 
 msgid "Проверяем размер и SHA-256 перед установкой"
 msgstr "Checking size and SHA-256 before installing"
-
-msgid "Загружаем…"
-msgstr "Downloading…"
 
 msgid "Не удалось установить версию {}"
 msgstr "Couldn't install version {}"
@@ -1082,7 +1070,7 @@ msgid "Подключить"
 msgstr "Connect"
 
 msgid "Защита выключена"
-msgstr "Protection off"
+msgstr "Not protected"
 msgid "Нет профиля"
 msgstr "No profile"
 
@@ -1239,9 +1227,6 @@ msgstr "Couldn't confirm the change. Refreshing subscriptions."
 msgid "Подписка"
 msgstr "Subscription"
 
-msgid "П"
-msgstr "S"
-
 msgid "Нет данных"
 msgstr "No data"
 
@@ -1262,9 +1247,6 @@ msgstr "Stopped"
 
 msgid "Канал обновлений не настроен"
 msgstr "Update channel not set up"
-
-msgid "Подключение…"
-msgstr "Connecting…"
 
 msgid "Отключение…"
 msgstr "Stopping…"
@@ -1410,9 +1392,6 @@ msgstr "Close search"
 msgid "Загружаем…"
 msgstr "Loading…"
 
-msgid "Повторить"
-msgstr "Retry"
-
 msgid "Загружаем маршруты"
 msgstr "Loading routes"
 
@@ -1427,9 +1406,6 @@ msgstr "Try another country or server name"
 
 msgid "Открыть дашборд"
 msgstr "Open dashboard"
-
-msgid "Подключитесь, чтобы открыть панель Mihomo."
-msgstr "Connect to open the Mihomo dashboard."
 
 msgid "Копировать лог"
 msgstr "Copy log"
@@ -1532,9 +1508,6 @@ msgstr "Instant connect — install the service"
 
 msgid "Один запрос прав сейчас — дальше без запросов. Подписки сохранятся."
 msgstr "One admin prompt now, none after. Subscriptions are kept."
-
-msgid "Установить"
-msgstr "Install"
 
 msgid "ПРИЛОЖЕНИЕ"
 msgstr "APP"
@@ -1749,9 +1722,6 @@ msgstr "Opens the main window"
 msgid "Маршруты пока недоступны"
 msgstr "Routes not available yet"
 
-msgid "Выйти"
-msgstr "Quit"
-
 msgid "Ошибка: "
 msgstr "Error: "
 
@@ -1796,9 +1766,6 @@ msgstr "On our own we only turn off a third-party system proxy and flush the DNS
 
 msgid "Проверка ничего не меняет в системе."
 msgstr "The check changes nothing."
-
-msgid "Сначала отключитесь: проверка меняет сетевые настройки."
-msgstr "Disconnect first: the check changes network settings."
 
 msgid "Начать проверку"
 msgstr "Start check"
