@@ -1176,7 +1176,7 @@ fn scenarios() -> Vec<Scenario> {
             connected(ui);
             ui.set_local_page(s("subscriptions"));
             ui.set_subscription_profiles(profiles(3));
-            ui.set_import_notice(s(crate::view_model::IMPORT_KEPT_NOTICE_RU));
+            ui.set_import_notice(s(crate::view_model::import_kept_notice()));
         }),
         ("subscriptions-editor-error", 840, 720, |ui| {
             ready(ui);

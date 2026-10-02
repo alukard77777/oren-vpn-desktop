@@ -5,6 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use multicore_i18n::{Lang, tr, trn};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
@@ -17,9 +18,11 @@ use crate::daemon::{
 #[allow(dead_code)] // Wired into the Slint shell in Task 6.
 const MAX_SUBSCRIPTION_PROFILES: usize = 16;
 pub(crate) const MAX_SUBSCRIPTION_URL_BYTES: usize = 8_192;
+
 /// A subscription added while connected in a mode where switching needs a disconnect.
-pub(crate) const IMPORT_KEPT_NOTICE_RU: &str =
-    "Подписка добавлена. Переключиться на неё можно после отключения VPN.";
+pub(crate) fn import_kept_notice() -> &'static str {
+    tr!("Подписка добавлена. Переключиться на неё можно после отключения VPN.")
+}
 const MAX_SERVICE_LOGO_PATH_BYTES: usize = 1024;
 const STABLE_ROUTE_KEY_PREFIX: &str = "label-sha256:";
 
@@ -430,12 +433,12 @@ impl UiState {
     pub fn presentation(&self) -> StatePresentation {
         match self {
             Self::Empty => StatePresentation {
-                eyebrow: "Профиль не добавлен",
-                headline: "Добавьте подписку".into(),
-                supporting: "Вставьте URL — остальное настроим автоматически.".into(),
-                profile: "Нет профиля".into(),
-                node: "Маршрут не выбран".into(),
-                primary_label: "Подключиться",
+                eyebrow: tr!("Профиль не добавлен"),
+                headline: tr!("Добавьте подписку").into(),
+                supporting: tr!("Вставьте URL — остальное настроим автоматически.").into(),
+                profile: tr!("Нет профиля").into(),
+                node: tr!("Маршрут не выбран").into(),
+                primary_label: tr!("Подключиться"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
                 semantic_tone: SemanticTone::Neutral,
@@ -446,12 +449,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::Importing => StatePresentation {
-                eyebrow: "Импорт",
-                headline: "Добавляем профиль…".into(),
-                supporting: "Проверяем подписку и доступные маршруты.".into(),
-                profile: "Новый профиль".into(),
-                node: "Маршрут не выбран".into(),
-                primary_label: "Добавляем…",
+                eyebrow: tr!("Импорт"),
+                headline: tr!("Добавляем профиль…").into(),
+                supporting: tr!("Проверяем подписку и доступные маршруты.").into(),
+                profile: tr!("Новый профиль").into(),
+                node: tr!("Маршрут не выбран").into(),
+                primary_label: tr!("Добавляем…"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
                 semantic_tone: SemanticTone::Warning,
@@ -462,12 +465,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::Ready { profile, node } => StatePresentation {
-                eyebrow: "Готово",
-                headline: "Можно подключаться".into(),
+                eyebrow: tr!("Готово"),
+                headline: tr!("Можно подключаться").into(),
                 supporting: String::new(),
                 profile: profile.clone(),
                 node: node.clone(),
-                primary_label: "Подключиться",
+                primary_label: tr!("Подключиться"),
                 primary_action: PrimaryAction::Connect,
                 primary_enabled: true,
                 semantic_tone: SemanticTone::Accent,
@@ -482,12 +485,12 @@ impl UiState {
                 node,
                 step,
             } => StatePresentation {
-                eyebrow: "Подключение",
-                headline: "Устанавливаем соединение…".into(),
+                eyebrow: tr!("Подключение"),
+                headline: tr!("Устанавливаем соединение…").into(),
                 supporting: step.clone(),
                 profile: profile.clone(),
                 node: node.clone(),
-                primary_label: "Подключаем…",
+                primary_label: tr!("Подключаем…"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
                 semantic_tone: SemanticTone::Warning,
@@ -498,12 +501,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::Connected { profile, node } => StatePresentation {
-                eyebrow: "Подключено",
-                headline: "Соединение защищено".into(),
-                supporting: "Текущий маршрут".into(),
+                eyebrow: tr!("Подключено"),
+                headline: tr!("Соединение защищено").into(),
+                supporting: tr!("Текущий маршрут").into(),
                 profile: profile.clone(),
                 node: node.clone(),
-                primary_label: "Отключиться",
+                primary_label: tr!("Отключиться"),
                 primary_action: PrimaryAction::Disconnect,
                 primary_enabled: true,
                 semantic_tone: SemanticTone::Success,
@@ -514,12 +517,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::Disconnecting { profile, node } => StatePresentation {
-                eyebrow: "Отключение",
-                headline: "Завершаем соединение…".into(),
-                supporting: "Отключаем локальный маршрут.".into(),
+                eyebrow: tr!("Отключение"),
+                headline: tr!("Завершаем соединение…").into(),
+                supporting: tr!("Отключаем локальный маршрут.").into(),
                 profile: profile.clone(),
                 node: node.clone(),
-                primary_label: "Отключаем…",
+                primary_label: tr!("Отключаем…"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
                 semantic_tone: SemanticTone::Warning,
@@ -530,12 +533,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::Error { message } => StatePresentation {
-                eyebrow: "Не удалось подключиться",
-                headline: "Что-то пошло не так".into(),
+                eyebrow: tr!("Не удалось подключиться"),
+                headline: tr!("Что-то пошло не так").into(),
                 supporting: message.clone(),
                 profile: "—".into(),
-                node: "Авто".into(),
-                primary_label: "Проверить снова",
+                node: tr!("Авто").into(),
+                primary_label: tr!("Проверить снова"),
                 primary_action: PrimaryAction::Retry,
                 primary_enabled: true,
                 semantic_tone: SemanticTone::Danger,
@@ -546,12 +549,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::ServiceUnreachable { message } => StatePresentation {
-                eyebrow: "Нет связи с сервисом",
-                headline: "Сервис не отвечает".into(),
+                eyebrow: tr!("Нет связи с сервисом"),
+                headline: tr!("Сервис не отвечает").into(),
                 supporting: message.clone(),
-                profile: "Состояние неизвестно".into(),
+                profile: tr!("Состояние неизвестно").into(),
                 node: "—".into(),
-                primary_label: "Проверить снова",
+                primary_label: tr!("Проверить снова"),
                 primary_action: PrimaryAction::Retry,
                 primary_enabled: true,
                 semantic_tone: SemanticTone::Danger,
@@ -562,12 +565,12 @@ impl UiState {
                 is_degraded: false,
             },
             Self::DaemonDegraded { message } => StatePresentation {
-                eyebrow: "Сервис недоступен",
-                headline: "Ограниченный режим".into(),
+                eyebrow: tr!("Сервис недоступен"),
+                headline: tr!("Ограниченный режим").into(),
                 supporting: message.clone(),
-                profile: "Состояние неизвестно".into(),
+                profile: tr!("Состояние неизвестно").into(),
                 node: "—".into(),
-                primary_label: "Остановить туннель",
+                primary_label: tr!("Остановить туннель"),
                 primary_action: PrimaryAction::Cleanup,
                 primary_enabled: true,
                 semantic_tone: SemanticTone::Warning,
@@ -668,25 +671,27 @@ pub struct ConflictingAppsPresentation {
     pub message: String,
 }
 
-/// Builds the Russian banner copy for one or more detected conflicting apps,
+/// Builds the banner copy for one or more detected conflicting apps,
 /// appending a note about any app a close attempt could not fully remove.
 fn conflicting_apps_message(apps: &[&'static str], close_note: &[&'static str]) -> String {
     let names = apps.join(", ");
     let mut message = if apps.len() > 1 {
-        format!(
-            "Обнаружены другие VPN-приложения ({names}): они могут конфликтовать с MULTICORE. Закройте их перед подключением."
+        tr!(
+            "Обнаружены другие VPN-приложения ({}): они могут конфликтовать с MULTICORE. Закройте их перед подключением.",
+            names
         )
     } else {
-        format!(
-            "Обнаружено другое VPN-приложение ({names}): оно может конфликтовать с MULTICORE. Закройте его перед подключением."
+        tr!(
+            "Обнаружено другое VPN-приложение ({}): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
+            names
         )
     };
     if !close_note.is_empty() {
         let stuck = close_note.join(", ");
-        message.push_str(&format!(
-            " Закрыть удалось не всё: {stuck} запускает свой движок как службу Windows, \
-            которую наша кнопка не трогает без повышения прав. Отключитесь в самом \
-            приложении перед закрытием или остановите его службу в «Службах Windows»."
+        message.push(' ');
+        message.push_str(&tr!(
+            "Закрыть удалось не всё: {} запускает свой движок как службу Windows, которую наша кнопка не трогает без повышения прав. Отключитесь в самом приложении перед закрытием или остановите его службу в «Службах Windows».",
+            stuck
         ));
     }
     message
@@ -740,12 +745,12 @@ pub fn state_from_status(status: DaemonStatus) -> UiState {
         return UiState::DaemonDegraded {
             message: status
                 .message
-                .unwrap_or_else(|| "Фоновый сервис отвечает не полностью.".into()),
+                .unwrap_or_else(|| tr!("Фоновый сервис отвечает не полностью.").into()),
         };
     }
 
-    let profile = status.profile.unwrap_or_else(|| "Основной".into());
-    let node = status.current_node.unwrap_or_else(|| "Авто".into());
+    let profile = status.profile.unwrap_or_else(|| tr!("Основной").into());
+    let node = status.current_node.unwrap_or_else(|| tr!("Авто").into());
     match status.state.as_str() {
         "empty" => UiState::Empty,
         "importing" => UiState::Importing,
@@ -754,17 +759,17 @@ pub fn state_from_status(status: DaemonStatus) -> UiState {
             node,
             step: status
                 .message
-                .unwrap_or_else(|| "Проверяем доступность маршрута…".into()),
+                .unwrap_or_else(|| tr!("Проверяем доступность маршрута…").into()),
         },
         "connected" => UiState::Connected { profile, node },
         "ready" | "disconnected" => UiState::Ready { profile, node },
         "error" => UiState::Error {
             message: status
                 .message
-                .unwrap_or_else(|| "Повторите попытку через несколько секунд.".into()),
+                .unwrap_or_else(|| tr!("Повторите попытку через несколько секунд.").into()),
         },
         _ => UiState::Error {
-            message: "Фоновый сервис вернул неизвестное состояние.".into(),
+            message: tr!("Фоновый сервис вернул неизвестное состояние.").into(),
         },
     }
 }
@@ -860,7 +865,7 @@ impl DesktopViewModel {
         Self {
             client,
             state: UiState::DaemonDegraded {
-                message: "Проверяем фоновый сервис…".into(),
+                message: tr!("Проверяем фоновый сервис…").into(),
             },
             panel: Panel::None,
             import_pending: false,
@@ -941,9 +946,9 @@ impl DesktopViewModel {
             .active_mutation
             .is_some_and(|active| active.kind == MutationKind::DisconnectReconciliation)
         {
-            presentation.eyebrow = "Проверка";
-            presentation.headline = "Проверяем состояние…".into();
-            presentation.primary_label = "Проверяем…";
+            presentation.eyebrow = tr!("Проверка");
+            presentation.headline = tr!("Проверяем состояние…").into();
+            presentation.primary_label = tr!("Проверяем…");
             presentation.semantic_tone = SemanticTone::Warning;
             presentation.is_connected = false;
             presentation.is_busy = true;
@@ -1091,7 +1096,7 @@ impl DesktopViewModel {
             }
             Err(_) => {
                 self.profile_list_error =
-                    Some("Не удалось загрузить подписки. Повторите попытку.".into());
+                    Some(tr!("Не удалось загрузить подписки. Повторите попытку.").into());
                 if self.profile_list_reconciliation_pending {
                     self.profile_reload_needed = true;
                 }
@@ -1141,7 +1146,10 @@ impl DesktopViewModel {
                 true
             }
             Err(error) => {
-                self.profile_error = Some(profile_mutation_error(&error, "активировать"));
+                self.profile_error = Some(profile_mutation_error(
+                    &error,
+                    tr!("Не удалось активировать подписку. Повторите попытку."),
+                ));
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }
@@ -1211,7 +1219,10 @@ impl DesktopViewModel {
                 true
             }
             Err(error) => {
-                self.profile_error = Some(profile_mutation_error(&error, "обновить"));
+                self.profile_error = Some(profile_mutation_error(
+                    &error,
+                    tr!("Не удалось обновить подписку. Повторите попытку."),
+                ));
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }
@@ -1226,7 +1237,7 @@ impl DesktopViewModel {
         url: &str,
     ) -> Option<ProfileRequestToken> {
         if !valid_subscription_url(url) {
-            self.profile_error = Some("Введите корректный HTTP(S) URL.".into());
+            self.profile_error = Some(tr!("Введите корректный HTTP(S) URL.").into());
             return None;
         }
         if !self.profile_mutation_preflight(profile_id, false, false) {
@@ -1284,7 +1295,10 @@ impl DesktopViewModel {
                 true
             }
             Err(error) => {
-                self.profile_error = Some(profile_mutation_error(&error, "изменить ссылку"));
+                self.profile_error = Some(profile_mutation_error(
+                    &error,
+                    tr!("Не удалось изменить ссылку подписку. Повторите попытку."),
+                ));
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }
@@ -1338,7 +1352,10 @@ impl DesktopViewModel {
                 true
             }
             Err(error) => {
-                self.profile_error = Some(profile_mutation_error(&error, "удалить"));
+                self.profile_error = Some(profile_mutation_error(
+                    &error,
+                    tr!("Не удалось удалить подписку. Повторите попытку."),
+                ));
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }
@@ -1417,11 +1434,11 @@ impl DesktopViewModel {
         if matches!(self.state, UiState::Connecting { .. })
             || (!allow_connected && matches!(self.state, UiState::Connected { .. }))
         {
-            self.profile_error = Some("Отключитесь перед изменением подписки.".into());
+            self.profile_error = Some(tr!("Отключитесь перед изменением подписки.").into());
             return false;
         }
         if matches!(self.state, UiState::DaemonDegraded { .. }) {
-            self.profile_error = Some("Дождитесь восстановления фонового сервиса.".into());
+            self.profile_error = Some(tr!("Дождитесь восстановления фонового сервиса.").into());
             return false;
         }
         if self.active_profile_mutation.is_some()
@@ -1434,7 +1451,7 @@ impl DesktopViewModel {
             || self.profile_reconciliation_required()
             || self.state.presentation().is_busy
         {
-            self.profile_error = Some("Дождитесь завершения текущей операции.".into());
+            self.profile_error = Some(tr!("Дождитесь завершения текущей операции.").into());
             return false;
         }
         let Some(profile) = self
@@ -1442,11 +1459,11 @@ impl DesktopViewModel {
             .iter()
             .find(|profile| profile.id == profile_id)
         else {
-            self.profile_error = Some("Подписка больше недоступна. Обновите список.".into());
+            self.profile_error = Some(tr!("Подписка больше недоступна. Обновите список.").into());
             return false;
         };
         if requires_available && !profile.available {
-            self.profile_error = Some("Эту подписку сейчас нельзя обновить.".into());
+            self.profile_error = Some(tr!("Эту подписку сейчас нельзя обновить.").into());
             return false;
         }
         self.profile_error = None;
@@ -1505,11 +1522,11 @@ impl DesktopViewModel {
         self.active_profile_id = None;
         self.sync_profile_active_flags();
         self.state = UiState::DaemonDegraded {
-            message: "Проверяем состояние подписок…".into(),
+            message: tr!("Проверяем состояние подписок…").into(),
         };
         if self.profile_error.is_none() {
             self.profile_error =
-                Some("Не удалось подтвердить изменение. Обновляем состояние подписок.".into());
+                Some(tr!("Не удалось подтвердить изменение. Обновляем состояние подписок.").into());
         }
         self.require_profile_reconciliation(true, true, true);
     }
@@ -1603,10 +1620,10 @@ impl DesktopViewModel {
     pub(crate) fn subscription_presentation_at(&self, now_unix: u64) -> SubscriptionPresentation {
         let Some(info) = &self.subscription else {
             return SubscriptionPresentation {
-                display_name: "Подписка".into(),
-                usage: "Нет данных".into(),
-                expiry: "Добавьте ссылку".into(),
-                updated: "Не обновлялась".into(),
+                display_name: tr!("Подписка").into(),
+                usage: tr!("Нет данных").into(),
+                expiry: tr!("Добавьте ссылку").into(),
+                updated: tr!("Не обновлялась").into(),
                 updated_stale: false,
                 announcement_text: String::new(),
                 announcement_tone: "info".into(),
@@ -1632,7 +1649,7 @@ impl DesktopViewModel {
             (Some(used), Some(total)) => format!("{} / {}", format_gib(used), format_gib(total)),
             (Some(used), None) => format_gib(used),
             (None, Some(total)) => format!("— / {}", format_gib(total)),
-            _ => "Нет данных".into(),
+            _ => tr!("Нет данных").into(),
         };
         let expiry = format_expiry(info.expires_at_unix, now_unix);
         let quota =
@@ -1647,7 +1664,7 @@ impl DesktopViewModel {
             .filter(|name| !name.is_empty())
             .or_else(|| bounded_plain_text(&info.source_name, 128))
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Подписка".into());
+            .unwrap_or_else(|| tr!("Подписка").into());
         let announcement_text = info
             .announcement_text
             .as_deref()
@@ -1744,7 +1761,7 @@ impl DesktopViewModel {
             }
             Err(error) => {
                 self.subscription_refresh_error =
-                    Some("Не удалось обновить. Рабочий профиль сохранён.".into());
+                    Some(tr!("Не удалось обновить. Рабочий профиль сохранён.").into());
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
                 }
@@ -1805,8 +1822,8 @@ impl DesktopViewModel {
     pub(crate) fn prepare_retry_connect(&mut self) {
         if matches!(self.state, UiState::Error { .. }) && self.active_mutation.is_none() {
             self.state = UiState::Ready {
-                profile: "Основной".into(),
-                node: "Авто".into(),
+                profile: tr!("Основной").into(),
+                node: tr!("Авто").into(),
             };
             self.connection_notice = None;
         }
@@ -1840,7 +1857,7 @@ impl DesktopViewModel {
             self.state = UiState::Connecting {
                 profile: current.profile,
                 node: current.node,
-                step: "Запускаем локальный маршрут…".into(),
+                step: tr!("Запускаем локальный маршрут…").into(),
             };
         } else if action == PrimaryAction::Disconnect {
             let current = self.state.presentation();
@@ -1879,11 +1896,11 @@ impl DesktopViewModel {
             .active_mutation
             .is_some_and(|active| active.kind != MutationKind::Refresh)
         {
-            self.import_error = Some("Дождитесь завершения операции подключения.".into());
+            self.import_error = Some(tr!("Дождитесь завершения операции подключения.").into());
             return None;
         }
         if !valid_subscription_url(url) {
-            self.import_error = Some("Введите корректный HTTP(S) URL.".into());
+            self.import_error = Some(tr!("Введите корректный HTTP(S) URL.").into());
             return None;
         }
         self.import_error = None;
@@ -1948,7 +1965,7 @@ impl DesktopViewModel {
                 self.profile_error = None;
                 self.profile_reload_needed = true;
                 self.import_error = None;
-                self.import_notice = Some(IMPORT_KEPT_NOTICE_RU.to_owned());
+                self.import_notice = Some(import_kept_notice().to_owned());
             }
             Ok(status) => {
                 self.invalidate_profile_list_request();
@@ -1965,7 +1982,7 @@ impl DesktopViewModel {
                 self.import_error = Some(if error.is_specific() {
                     error.to_string()
                 } else {
-                    "Не удалось добавить подписку. Проверьте URL и повторите попытку.".into()
+                    tr!("Не удалось добавить подписку. Проверьте URL и повторите попытку.").into()
                 });
                 if error.requires_reconciliation() {
                     self.require_full_profile_reconciliation();
@@ -2016,18 +2033,20 @@ impl DesktopViewModel {
             Ok(status) => (self.apply_daemon_status(status), false, true),
             Err(error) if error.requires_reconciliation() => (
                 UiState::DaemonDegraded {
-                    message: "Не удалось подтвердить завершение соединения. Проверяем состояние…"
-                        .into(),
+                    message: tr!(
+                        "Не удалось подтвердить завершение соединения. Проверяем состояние…"
+                    )
+                    .into(),
                 },
                 true,
                 false,
             ),
             Err(_) => {
                 self.connection_notice =
-                    Some("Не удалось отключиться. Соединение остаётся активным.".into());
+                    Some(tr!("Не удалось отключиться. Соединение остаётся активным.").into());
                 (
                     rollback.unwrap_or_else(|| UiState::Error {
-                        message: "Не удалось отключиться. Повторите попытку.".into(),
+                        message: tr!("Не удалось отключиться. Повторите попытку.").into(),
                     }),
                     false,
                     false,
@@ -2059,7 +2078,8 @@ impl DesktopViewModel {
         self.state = match result {
             Ok(status) => self.apply_daemon_status(status),
             Err(_) => UiState::DaemonDegraded {
-                message: "Не удалось подтвердить состояние соединения. Повторите проверку.".into(),
+                message: tr!("Не удалось подтвердить состояние соединения. Повторите проверку.")
+                    .into(),
             },
         };
         self.active_mutation = None;
@@ -2126,7 +2146,8 @@ impl DesktopViewModel {
                     timestamp: String::new(),
                     component: "system".into(),
                     level: "error".into(),
-                    message: "Не удалось обновить диагностику. Повторно откройте экран.".into(),
+                    message: tr!("Не удалось обновить диагностику. Повторно откройте экран.")
+                        .into(),
                 });
             }
         }
@@ -2200,7 +2221,7 @@ impl DesktopViewModel {
                     timestamp: String::new(),
                     component: "system".into(),
                     level: "error".into(),
-                    message: "Не удалось загрузить события. Повторите попытку.".into(),
+                    message: tr!("Не удалось загрузить события. Повторите попытку.").into(),
                 });
             }
         }
@@ -2461,12 +2482,12 @@ impl DesktopViewModel {
                 self.catalog_revision = None;
                 self.latency_queued = true;
                 self.latency_error =
-                    Some("Каталог маршрутов изменился. Обновляем задержку…".into());
+                    Some(tr!("Каталог маршрутов изменился. Обновляем задержку…").into());
                 refresh_catalog = true;
             }
             Err(_) => {
                 self.latency_error =
-                    Some("Не удалось проверить задержку. Повторите попытку.".into());
+                    Some(tr!("Не удалось проверить задержку. Повторите попытку.").into());
             }
         }
         Some(LatencyOutcome {
@@ -2583,12 +2604,12 @@ impl DesktopViewModel {
                 self.catalog_revision = None;
                 self.latency_queued = true;
                 self.latency_error =
-                    Some("Каталог маршрутов изменился. Обновляем задержку…".into());
+                    Some(tr!("Каталог маршрутов изменился. Обновляем задержку…").into());
                 refresh_catalog = true;
             }
             Err(_) => {
                 self.latency_error =
-                    Some("Не удалось проверить задержку. Повторите попытку.".into());
+                    Some(tr!("Не удалось проверить задержку. Повторите попытку.").into());
             }
         }
         Some(LatencyOutcome {
@@ -2623,10 +2644,9 @@ impl DesktopViewModel {
                 if self.profile_catalog_reconciliation_pending {
                     self.profile_catalog_reload_needed = true;
                 }
-                self.catalog_error = self
-                    .catalog_notice_after_refresh
-                    .take()
-                    .or_else(|| Some("Не удалось загрузить маршруты. Повторите попытку.".into()));
+                self.catalog_error = self.catalog_notice_after_refresh.take().or_else(|| {
+                    Some(tr!("Не удалось загрузить маршруты. Повторите попытку.").into())
+                });
             }
         }
         Some(self.catalog_presentation())
@@ -2844,7 +2864,8 @@ impl DesktopViewModel {
         if failed {
             self.catalog_revision = None;
             self.catalog_error = Some(
-                "Подключено, но часть маршрутов не применилась. Проверьте выбор ещё раз.".into(),
+                tr!("Подключено, но часть маршрутов не применилась. Проверьте выбор ещё раз.")
+                    .into(),
             );
         } else {
             self.catalog_error = None;
@@ -2895,17 +2916,18 @@ impl DesktopViewModel {
                 let refresh_catalog = stale_revision || ambiguous || self.catalog_request_deferred;
                 if stale_revision {
                     self.catalog_revision = None;
-                    self.catalog_error =
-                        Some("Каталог маршрутов изменился. Обновляем его; повторите выбор.".into());
+                    self.catalog_error = Some(
+                        tr!("Каталог маршрутов изменился. Обновляем его; повторите выбор.").into(),
+                    );
                     self.catalog_notice_after_refresh =
-                        Some("Каталог маршрутов обновлён. Повторите выбор.".into());
+                        Some(tr!("Каталог маршрутов обновлён. Повторите выбор.").into());
                 } else if ambiguous {
                     self.catalog_revision = None;
-                    let message = "Не удалось подтвердить изменение маршрута. Каталог обновляется; повторите попытку.".to_owned();
+                    let message = tr!("Не удалось подтвердить изменение маршрута. Каталог обновляется; повторите попытку.").to_owned();
                     self.catalog_error = Some(message.clone());
                     self.catalog_notice_after_refresh = Some(message);
                 } else {
-                    let message = "Не удалось изменить маршрут. Повторите попытку.".to_owned();
+                    let message = tr!("Не удалось изменить маршрут. Повторите попытку.").to_owned();
                     self.catalog_error = Some(message.clone());
                     if refresh_catalog {
                         self.catalog_revision = None;
@@ -3074,7 +3096,7 @@ impl DesktopViewModel {
                     .iter()
                     .find(|node| node.selected)
                     .map(|node| node.label.clone())
-                    .unwrap_or_else(|| "Не выбран".into()),
+                    .unwrap_or_else(|| tr!("Не выбран").into()),
                 icon_id: group.icon_id.clone(),
                 icon_pending: group.icon_pending,
             })
@@ -3146,7 +3168,7 @@ impl DesktopViewModel {
                         .iter()
                         .find(|node| node.selected)
                         .map(|node| node.label.clone())
-                        .unwrap_or_else(|| "Не выбран".into()),
+                        .unwrap_or_else(|| tr!("Не выбран").into()),
                     nodes,
                     icon_id: group.icon_id.clone(),
                     icon_pending: group.icon_pending,
@@ -3198,7 +3220,7 @@ impl DesktopViewModel {
         self.catalog_groups = previous_catalog;
         if self.queued_selections.len() != before && self.catalog_notice_after_refresh.is_none() {
             self.catalog_notice_after_refresh =
-                Some("Каталог маршрутов обновлён. Повторите выбор.".into());
+                Some(tr!("Каталог маршрутов обновлён. Повторите выбор.").into());
         }
         for queued in &mut self.queued_selections {
             queued.revision = catalog.revision;
@@ -3410,7 +3432,7 @@ impl DesktopViewModel {
         let mut events = self.all_events();
         events.sort_by_key(|event| std::cmp::Reverse(event.id));
         if events.is_empty() {
-            return "Событий пока нет.".to_owned();
+            return tr!("Событий пока нет.").to_owned();
         }
         events
             .into_iter()
@@ -3446,19 +3468,19 @@ impl DesktopViewModel {
 fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPresentation {
     if loading && value.is_none() {
         return RuntimeCheckPresentation {
-            value: "Проверка".into(),
+            value: tr!("Проверка").into(),
             tone: "accent".into(),
         };
     }
     let (value, tone) = match value {
-        Some("ready") => ("Готов", "success"),
-        Some("starting") => ("Запуск", "warning"),
-        Some("failed") => ("Сбой", "danger"),
-        Some("unsupported") => ("Без проверки", "neutral"),
-        Some("disabled") => ("Выключен", "neutral"),
-        Some("stopped") => ("Выкл", "neutral"),
-        Some(_) => ("Неизвестно", "danger"),
-        None => ("Нет данных", "neutral"),
+        Some("ready") => (tr!("Готов"), "success"),
+        Some("starting") => (tr!("Запуск"), "warning"),
+        Some("failed") => (tr!("Сбой"), "danger"),
+        Some("unsupported") => (tr!("Без проверки"), "neutral"),
+        Some("disabled") => (tr!("Выключен"), "neutral"),
+        Some("stopped") => (tr!("Выкл"), "neutral"),
+        Some(_) => (tr!("Неизвестно"), "danger"),
+        None => (tr!("Нет данных"), "neutral"),
     };
     RuntimeCheckPresentation {
         value: value.into(),
@@ -3479,9 +3501,9 @@ fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
             }
             .into(),
         ),
-        ("timeout", _) => ("таймаут".into(), "danger".into()),
-        ("error" | "unavailable", _) => ("нет связи".into(), "danger".into()),
-        _ => ("нет данных".into(), "neutral".into()),
+        ("timeout", _) => (tr!("таймаут").into(), "danger".into()),
+        ("error" | "unavailable", _) => (tr!("нет связи").into(), "danger".into()),
+        _ => (tr!("нет данных").into(), "neutral".into()),
     }
 }
 
@@ -3499,7 +3521,7 @@ fn safe_catalog_label(label: &str) -> String {
         .trim()
         .to_owned();
     if label.is_empty() {
-        "Без названия".into()
+        tr!("Без названия").into()
     } else {
         label
     }
@@ -3524,7 +3546,7 @@ fn subscription_refresh_interval(info: &DaemonSubscriptionInfo) -> u64 {
 
 fn format_update_date(updated_at_unix: u64) -> String {
     if updated_at_unix == 0 {
-        return "Не обновлялась".into();
+        return tr!("Не обновлялась").into();
     }
 
     // Convert whole UTC days since the Unix epoch to a Gregorian date without
@@ -3543,8 +3565,18 @@ fn format_update_date(updated_at_unix: u64) -> String {
     if month <= 2 {
         year += 1;
     }
+    if multicore_i18n::current() == Lang::En {
+        // "Sep 14, 2026": a numeric date reads differently across English locales.
+        let name = MONTHS_EN[usize::try_from(month - 1).unwrap_or(0).min(11)];
+        return format!("{name} {day}, {year:04}");
+    }
     format!("{day:02}.{month:02}.{year:04}")
 }
+
+/// English month abbreviations for short dates ("Oct 13", "Sep 14, 2026").
+const MONTHS_EN: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 fn format_gib(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1024_f64.powi(3))
@@ -3556,12 +3588,12 @@ fn present_subscription_profile(
 ) -> Option<SubscriptionProfilePresentation> {
     let id = safe_profile_id(&profile.id)?;
     let redacted_title = redact_event_text(&profile.display_name);
-    let title = bounded_plain_text(&redacted_title, 128).unwrap_or_else(|| "Подписка".into());
+    let title = bounded_plain_text(&redacted_title, 128).unwrap_or_else(|| tr!("Подписка").into());
     let usage = match (profile.used_bytes, profile.total_bytes) {
         (Some(used), Some(total)) => format!("{} / {}", format_gib(used), format_gib(total)),
         (Some(used), None) => format_gib(used),
         (None, Some(total)) => format!("— / {}", format_gib(total)),
-        (None, None) => "Нет данных".into(),
+        (None, None) => tr!("Нет данных").into(),
     };
     let now_unix = current_unix_time();
     let expiry = format_expiry(profile.expires_at_unix, now_unix);
@@ -3605,15 +3637,15 @@ fn valid_subscription_url(value: &str) -> bool {
 }
 
 #[allow(dead_code)] // Used by profile presentation methods wired in Task 6.
-fn profile_mutation_error(error: &crate::daemon::DaemonError, action: &str) -> String {
+/// `failure` is the text for any other error ("Не удалось удалить подписку…").
+fn profile_mutation_error(error: &crate::daemon::DaemonError, failure: &str) -> String {
     if error.is_profile_conflict() {
-        return "Отключитесь перед изменением подписки.".into();
+        return tr!("Отключитесь перед изменением подписки.").into();
     }
     if error.is_profile_not_found() {
-        return "Подписка больше недоступна. Обновите список.".into();
+        return tr!("Подписка больше недоступна. Обновите список.").into();
     }
-    let action = bounded_plain_text(action, 32).unwrap_or_else(|| "изменить".into());
-    format!("Не удалось {action} подписку. Повторите попытку.")
+    failure.to_owned()
 }
 
 fn profile_result_may_have_committed<T>(result: &Result<T, crate::daemon::DaemonError>) -> bool {
@@ -3686,16 +3718,16 @@ const UNLIMITED_EXPIRY_DAYS: u64 = 10 * 365;
 
 fn format_expiry(expires_at_unix: Option<u64>, now_unix: u64) -> String {
     let Some(expires) = expires_at_unix else {
-        return "Срок неизвестен".into();
+        return tr!("Срок неизвестен").into();
     };
     if expires <= now_unix {
-        return "Срок истёк".into();
+        return tr!("Срок истёк").into();
     }
     let days = (expires - now_unix).div_ceil(86_400);
     if days > UNLIMITED_EXPIRY_DAYS {
-        "Бессрочно".into()
+        tr!("Бессрочно").into()
     } else {
-        format!("Осталось {days} {}", russian_days(days))
+        tr!("Осталось {0} {1}", days, days_word(days))
     }
 }
 
@@ -3737,9 +3769,12 @@ fn quota_presentation(
         .map(|expires| (expires - now_unix).div_ceil(86_400))
         .filter(|days| *days <= UNLIMITED_EXPIRY_DAYS);
     let days = if expired {
-        "Срок истёк".to_owned()
+        tr!("Срок истёк").to_owned()
     } else {
-        days_left.map_or_else(|| "Бессрочно".to_owned(), |days| format!("{days} дн."))
+        days_left.map_or_else(
+            || tr!("Бессрочно").to_owned(),
+            |days| trn!("{n} дн.", "{n} дн.", days),
+        )
     };
     let tone = if expired || exhausted {
         "danger"
@@ -3784,25 +3819,28 @@ fn quota_tooltip(
         && expires <= now_unix
     {
         let mut text = match &date {
-            Some(date) => format!("Подписка истекла {date}"),
-            None => "Подписка истекла".to_owned(),
+            Some(date) => tr!("Подписка истекла {}", date),
+            None => tr!("Подписка истекла").to_owned(),
         };
         if let Some(total) = total {
-            text.push_str(&format!(" · трафик {}", traffic_pair(used, total)));
+            text.push_str(" · ");
+            text.push_str(&tr!("трафик {}", traffic_pair(used, total)));
         }
         return text;
     }
     let mut text = match total {
-        Some(total) if used >= total => format!("Трафик исчерпан: {}", traffic_pair(used, total)),
-        Some(total) => format!(
-            "Трафик: {} · осталось {remaining}",
-            traffic_pair(used, total)
+        Some(total) if used >= total => tr!("Трафик исчерпан: {}", traffic_pair(used, total)),
+        Some(total) => tr!(
+            "Трафик: {} · осталось {}",
+            traffic_pair(used, total),
+            remaining
         ),
-        None => "Трафик без лимита".to_owned(),
+        None => tr!("Трафик без лимита").to_owned(),
     };
+    text.push_str(" · ");
     match date.filter(|_| dated) {
-        Some(date) => text.push_str(&format!(" · до {date}")),
-        None => text.push_str(" · бессрочно"),
+        Some(date) => text.push_str(&tr!("до {}", date)),
+        None => text.push_str(tr!("бессрочно")),
     }
     text
 }
@@ -3828,22 +3866,23 @@ fn traffic_pair(used: u64, total: u64) -> String {
     format!("{} / {} {unit}", number(used.min(total)), number(total))
 }
 
-/// "13 окт." in the local time zone; "13 окт. 2027" outside the current year.
+/// "13 окт." in the local time zone; "13 окт. 2027" outside the current year. English:
+/// "Oct 13", "Oct 13, 2027".
 fn short_local_date(unix: u64, now_unix: u64) -> String {
     use chrono::{Datelike, TimeZone};
     const MONTHS: [&str; 12] = [
-        "янв.",
-        "февр.",
-        "мар.",
-        "апр.",
-        "мая",
-        "июн.",
-        "июл.",
-        "авг.",
-        "сент.",
-        "окт.",
-        "нояб.",
-        "дек.",
+        "янв.",  // i18n-ru-only
+        "февр.", // i18n-ru-only
+        "мар.",  // i18n-ru-only
+        "апр.",  // i18n-ru-only
+        "мая",   // i18n-ru-only
+        "июн.",  // i18n-ru-only
+        "июл.",  // i18n-ru-only
+        "авг.",  // i18n-ru-only
+        "сент.", // i18n-ru-only
+        "окт.",  // i18n-ru-only
+        "нояб.", // i18n-ru-only
+        "дек.",  // i18n-ru-only
     ];
     let local = |seconds: u64| {
         chrono::Local
@@ -3853,8 +3892,16 @@ fn short_local_date(unix: u64, now_unix: u64) -> String {
     let (Some(date), Some(now)) = (local(unix), local(now_unix)) else {
         return String::new();
     };
-    let month = MONTHS[date.month0() as usize];
     // No-break spaces keep a date on one line when the tooltip wraps.
+    if multicore_i18n::current() == Lang::En {
+        let month = MONTHS_EN[date.month0() as usize];
+        return if date.year() == now.year() {
+            format!("{month}\u{a0}{}", date.day())
+        } else {
+            format!("{month}\u{a0}{}, {}", date.day(), date.year())
+        };
+    }
+    let month = MONTHS[date.month0() as usize];
     if date.year() == now.year() {
         format!("{}\u{a0}{month}", date.day())
     } else {
@@ -3862,17 +3909,21 @@ fn short_local_date(unix: u64, now_unix: u64) -> String {
     }
 }
 
-fn russian_days(days: u64) -> &'static str {
+/// The word after a day count: Russian has three forms, English two.
+fn days_word(days: u64) -> &'static str {
+    if multicore_i18n::current() == Lang::En {
+        return if days == 1 { "day" } else { "days" };
+    }
     let last_two = days % 100;
     let last = days % 10;
     if (11..=14).contains(&last_two) {
-        "дней"
+        "дней" // i18n-ru-only
     } else if last == 1 {
-        "день"
+        "день" // i18n-ru-only
     } else if (2..=4).contains(&last) {
-        "дня"
+        "дня" // i18n-ru-only
     } else {
-        "дней"
+        "дней" // i18n-ru-only
     }
 }
 
@@ -4076,20 +4127,24 @@ pub(crate) fn derive_catalog_display(label: &str, kind: CatalogDisplayKind) -> C
     let icon = if lowercase.contains("minecraft")
         || lowercase.contains("game")
         || lowercase.contains("игр")
+    // i18n-ignore: matches provider labels
     {
         "🎮"
     } else if lowercase.contains("youtube")
         || lowercase.contains("video")
         || lowercase.contains("media")
         || lowercase.contains("стрим")
+    // i18n-ignore: matches provider labels
     {
         "▶"
-    } else if lowercase.contains("без vpn")
+    } else if lowercase.contains("без vpn") // i18n-ignore: matches provider labels
         || lowercase.contains("direct")
         || lowercase.contains("прям")
+    // i18n-ignore: matches provider labels
     {
         "↗"
     } else if lowercase.contains("auto") || lowercase.contains("авто") {
+        // i18n-ignore: matches provider labels
         "↻"
     } else {
         match kind {
@@ -4272,25 +4327,25 @@ pub(crate) fn format_uptime(elapsed_ms: u64) -> String {
 
 /// "0 Б/с", "320 КБ/с", "2.4 МБ/с": binary units, one decimal below 10, whole numbers above.
 pub(crate) fn format_speed(bytes_per_second: f64) -> String {
-    const UNITS: [&str; 4] = ["Б/с", "КБ/с", "МБ/с", "ГБ/с"];
+    let units = [tr!("Б/с"), tr!("КБ/с"), tr!("МБ/с"), tr!("ГБ/с")];
     let mut value = bytes_per_second.max(0.0);
     let mut unit = 0;
-    while unit + 1 < UNITS.len() && value >= 1024.0 {
+    while unit + 1 < units.len() && value >= 1024.0 {
         value /= 1024.0;
         unit += 1;
     }
     if unit == 0 && value.round() < 1024.0 {
-        return format!("{} {}", value.round(), UNITS[0]);
+        return format!("{} {}", value.round(), units[0]);
     }
     if unit == 0 {
-        return format!("1.0 {}", UNITS[1]);
+        return format!("1.0 {}", units[1]);
     }
     if value < 10.0 && format!("{value:.1}") != "10.0" {
-        format!("{value:.1} {}", UNITS[unit])
-    } else if value.round() >= 1024.0 && unit + 1 < UNITS.len() {
-        format!("1.0 {}", UNITS[unit + 1])
+        format!("{value:.1} {}", units[unit])
+    } else if value.round() >= 1024.0 && unit + 1 < units.len() {
+        format!("1.0 {}", units[unit + 1])
     } else {
-        format!("{} {}", value.round(), UNITS[unit])
+        format!("{} {}", value.round(), units[unit])
     }
 }
 
@@ -6654,7 +6709,7 @@ mod tests {
             }),
         );
         assert_eq!(model.import_error(), None);
-        assert_eq!(model.import_notice(), Some(IMPORT_KEPT_NOTICE_RU));
+        assert_eq!(model.import_notice(), Some(import_kept_notice()));
         assert!(model.presentation().is_connected);
         assert_eq!(
             model.profile_presentation().active_id.as_deref(),
@@ -11264,5 +11319,294 @@ mod tests {
         let presentation = model.conflicting_apps_presentation();
         assert!(!presentation.visible);
         assert!(presentation.apps.is_empty());
+    }
+
+    // ---- English interface -------------------------------------------------------------
+
+    fn english() -> multicore_i18n::ThreadLanguage {
+        multicore_i18n::ThreadLanguage::set(Lang::En)
+    }
+
+    fn has_cyrillic(text: &str) -> bool {
+        text.chars().any(|c| ('\u{400}'..='\u{4ff}').contains(&c))
+    }
+
+    fn assert_english(text: &str, what: &str) {
+        assert!(!has_cyrillic(text), "{what} is not English: {text:?}");
+    }
+
+    #[test]
+    fn english_state_presentations_carry_no_russian() {
+        let _en = english();
+        // Provider content (profile and server names) stays as the provider wrote it.
+        let profile = "Мой провайдер".to_owned();
+        let node = "🇸🇪 Швеция".to_owned();
+        let states = [
+            UiState::Empty,
+            UiState::Importing,
+            UiState::Ready {
+                profile: profile.clone(),
+                node: node.clone(),
+            },
+            UiState::Connecting {
+                profile: profile.clone(),
+                node: node.clone(),
+                step: "step".into(),
+            },
+            UiState::Disconnecting {
+                profile: profile.clone(),
+                node: node.clone(),
+            },
+            UiState::Connected {
+                profile: profile.clone(),
+                node: node.clone(),
+            },
+            UiState::Error {
+                message: "error".into(),
+            },
+            UiState::ServiceUnreachable {
+                message: "unreachable".into(),
+            },
+            UiState::DaemonDegraded {
+                message: "degraded".into(),
+            },
+        ];
+        for state in states {
+            let presentation = state.presentation();
+            for (what, text) in [
+                ("eyebrow", presentation.eyebrow.to_owned()),
+                ("headline", presentation.headline.clone()),
+                ("supporting", presentation.supporting.clone()),
+                ("primary label", presentation.primary_label.to_owned()),
+            ] {
+                assert_english(&text, &format!("{state:?} {what}"));
+            }
+            if presentation.profile != profile {
+                assert_english(&presentation.profile, &format!("{state:?} profile"));
+            }
+            if presentation.node != node {
+                assert_english(&presentation.node, &format!("{state:?} node"));
+            }
+        }
+        let connected = UiState::Connected { profile, node }.presentation();
+        assert_eq!(connected.eyebrow, "Connected");
+        assert_eq!(connected.headline, "Connection secured");
+        assert_eq!(connected.primary_label, "Disconnect");
+        assert_eq!(UiState::Empty.presentation().headline, "Add a subscription");
+    }
+
+    #[test]
+    fn english_status_fallbacks_carry_no_russian() {
+        let _en = english();
+        for state in ["connecting", "connected", "ready", "error", "bogus"] {
+            let presentation = state_from_status(DaemonStatus {
+                state: state.into(),
+                ..DaemonStatus::default()
+            })
+            .presentation();
+            for text in [
+                presentation.headline,
+                presentation.supporting,
+                presentation.profile,
+                presentation.node,
+            ] {
+                assert_english(&text, state);
+            }
+        }
+        let degraded = state_from_status(DaemonStatus {
+            degraded: true,
+            ..DaemonStatus::default()
+        });
+        assert_eq!(
+            degraded,
+            UiState::DaemonDegraded {
+                message: "Background service is degraded.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn english_quota_and_expiry_read_naturally() {
+        use chrono::TimeZone;
+        let _en = english();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let day = 86_400;
+        let noon = |year, month, day| {
+            chrono::Utc
+                .with_ymd_and_hms(year, month, day, 12, 0, 0)
+                .unwrap()
+                .timestamp() as u64
+        };
+        let now = noon(2026, 10, 2);
+
+        let normal = quota_presentation(
+            Some(75 * GIB),
+            Some(100 * GIB),
+            Some(noon(2026, 10, 13)),
+            now,
+        );
+        assert_eq!(normal.days, "11 days");
+        assert_eq!(
+            normal.tooltip,
+            "Data: 75 / 100 GiB · 25.0 GiB left · until Oct\u{a0}13"
+        );
+        assert_eq!(
+            quota_presentation(None, None, Some(now + day), now).days,
+            "1 day"
+        );
+        let next_year = quota_presentation(None, None, Some(noon(2027, 1, 5)), now);
+        assert_eq!(next_year.tooltip, "Unlimited data · until Jan\u{a0}5, 2027");
+        let forever = quota_presentation(Some(GIB), Some(0), Some(now + 12_073 * day), now);
+        assert_eq!(forever.days, "No expiry");
+        assert_eq!(forever.tooltip, "Unlimited data · no expiry");
+        let expired = quota_presentation(
+            Some(3 * GIB),
+            Some(500 * 1024 * 1024),
+            Some(noon(2026, 9, 30)),
+            now,
+        );
+        assert_eq!(expired.days, "Expired");
+        assert_eq!(expired.tooltip, "Expired Sep\u{a0}30 · data 500 / 500 MiB");
+        let exhausted = quota_presentation(Some(120 * GIB), Some(100 * GIB), None, now);
+        assert_eq!(exhausted.tooltip, "Data used up: 100 / 100 GiB · no expiry");
+
+        assert_eq!(format_expiry(None, now), "Expiry unknown");
+        assert_eq!(format_expiry(Some(now), now), "Expired");
+        assert_eq!(format_expiry(Some(now + day), now), "1 day left");
+        assert_eq!(format_expiry(Some(now + 21 * day), now), "21 days left");
+        assert_eq!(format_expiry(Some(now + 12_073 * day), now), "No expiry");
+
+        assert_eq!(format_update_date(0), "Never updated");
+        assert_eq!(format_update_date(1_789_405_200), "Sep 14, 2026");
+        assert_eq!(format_update_date(1), "Jan 1, 1970");
+    }
+
+    #[test]
+    fn english_speeds_runtime_checks_and_latency() {
+        let _en = english();
+        assert_eq!(format_speed(512.0), "512 B/s");
+        assert_eq!(format_speed(320.0 * 1024.0), "320 KB/s");
+        assert_eq!(format_speed(2.4 * 1024.0 * 1024.0), "2.4 MB/s");
+        assert_eq!(format_speed(3.0 * 1024.0 * 1024.0 * 1024.0), "3.0 GB/s");
+        for value in [
+            None,
+            Some("ready"),
+            Some("starting"),
+            Some("failed"),
+            Some("unsupported"),
+            Some("disabled"),
+            Some("stopped"),
+            Some("other"),
+        ] {
+            assert_english(&present_runtime_check(value, false).value, "runtime check");
+        }
+        assert_eq!(present_runtime_check(None, true).value, "Checking");
+        assert_eq!(present_runtime_check(Some("ready"), false).value, "Ready");
+        for status in ["ok", "timeout", "error", "unavailable", "unknown"] {
+            assert_english(&latency_display(status, Some(42)).0, status);
+        }
+        assert_eq!(latency_display("timeout", None).0, "timeout");
+        assert_eq!(safe_catalog_label("  "), "Untitled");
+    }
+
+    #[test]
+    fn english_conflicting_apps_banner() {
+        let _en = english();
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        model.set_conflicting_apps(vec!["FlClash"]);
+        assert_eq!(
+            model.conflicting_apps_presentation().message,
+            "Another VPN app found (FlClash): it may conflict with MULTICORE. Close it before connecting."
+        );
+        model.set_conflicting_apps(vec!["Incy", "FlClash"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.starts_with("Other VPN apps found (FlClash, Incy)"));
+        model.record_close_attempt(&["FlClash"]);
+        let message = model.conflicting_apps_presentation().message;
+        assert!(message.contains(" Not everything closed: FlClash runs its engine"));
+        assert_english(&message, "conflicting apps banner");
+    }
+
+    #[test]
+    fn english_view_model_presentations_carry_no_russian_but_provider_content() {
+        // Picked in Settings: a status without `app-language` keeps it.
+        crate::language::choose(Lang::En);
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        assert_english(
+            &model.subscription_presentation().expiry,
+            "empty subscription",
+        );
+        let refresh = model.begin_refresh();
+        model.finish_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                profile: Some("Провайдер".into()),
+                current_node: Some("Швеция".into()),
+                subscription: Some(DaemonSubscriptionInfo {
+                    source_name: "provider.example".into(),
+                    display_name: "Провайдер".into(),
+                    used_bytes: Some(1024),
+                    total_bytes: Some(1024 * 1024 * 1024),
+                    expires_at_unix: Some(current_unix_time() + 5 * 86_400),
+                    updated_at_unix: 1_789_405_200,
+                    ..DaemonSubscriptionInfo::default()
+                }),
+                ..DaemonStatus::default()
+            }),
+        );
+        let presentation = model.presentation();
+        assert_english(presentation.eyebrow, "eyebrow");
+        assert_english(&presentation.headline, "headline");
+        assert_english(&presentation.supporting, "supporting");
+        assert_english(presentation.primary_label, "primary label");
+        let subscription = model.subscription_presentation();
+        assert_eq!(subscription.display_name, "Провайдер");
+        for (what, text) in [
+            ("usage", subscription.usage.as_str()),
+            ("expiry", subscription.expiry.as_str()),
+            ("updated", subscription.updated.as_str()),
+            ("days", subscription.quota.days.as_str()),
+            ("tooltip", subscription.quota.tooltip.as_str()),
+        ] {
+            assert_english(text, what);
+        }
+        assert_eq!(subscription.updated, "Sep 14, 2026");
+        let diagnostics = model.diagnostics_presentation();
+        for check in [diagnostics.xray, diagnostics.mihomo, diagnostics.tun] {
+            assert_english(&check.value, "runtime check");
+        }
+        assert_english(&model.diagnostics_export_text(), "empty event export");
+    }
+
+    #[test]
+    fn a_status_with_app_language_switches_this_threads_language() {
+        crate::language::initialize(Lang::Ru, false);
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let status = |language: Option<&str>| DaemonStatus {
+            state: "ready".into(),
+            subscription: Some(DaemonSubscriptionInfo {
+                display_name: "Provider".into(),
+                app_language: language.map(str::to_owned),
+                ..DaemonSubscriptionInfo::default()
+            }),
+            ..DaemonStatus::default()
+        };
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Ok(status(Some("EN-us"))));
+        assert_eq!(multicore_i18n::current(), Lang::En);
+        assert_eq!(model.presentation().headline, "Ready to connect");
+
+        // Without the header the provider's language no longer applies: Russian again.
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Ok(status(None)));
+        assert_eq!(multicore_i18n::current(), Lang::Ru);
+        assert_eq!(model.presentation().headline, "Можно подключаться");
+
+        // A language picked in Settings wins over the header.
+        crate::language::choose(Lang::Ru);
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, Ok(status(Some("en"))));
+        assert_eq!(multicore_i18n::current(), Lang::Ru);
     }
 }
