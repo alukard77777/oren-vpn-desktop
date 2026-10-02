@@ -1,0 +1,18 @@
+[package]
+name = "multicore-i18n"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[build-dependencies]
+# The same gettext parser (and version) Slint's compiler bundles the `.po` with, so the
+# Rust-side catalog and the `@tr()` strings read the file identically.
+rspolib = "=0.1.2"

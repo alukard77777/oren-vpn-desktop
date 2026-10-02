@@ -134,6 +134,10 @@ pub struct SubscriptionInfo {
     /// `dumb-mode: on`: the provider asks clients to show only the first proxy group.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dumb_mode: bool,
+    /// `app-language: ru|en`: the interface language the provider asks for. The desktop
+    /// applies it until the user picks a language in Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_language: Option<multicore_i18n::Lang>,
 }
 
 impl SubscriptionInfo {
@@ -287,6 +291,7 @@ impl Snapshot {
                 announcement_action_label: metadata.announcement_action_label,
                 announcement_tone: metadata.announcement_tone,
                 dumb_mode: metadata.dumb_mode.unwrap_or(false),
+                app_language: metadata.app_language,
             },
             targets: metadata.targets,
         });
@@ -490,6 +495,7 @@ struct ParsedSubscriptionMetadata {
     announcement_action_label: Option<String>,
     announcement_tone: Option<AnnouncementTone>,
     dumb_mode: Option<bool>,
+    app_language: Option<multicore_i18n::Lang>,
     targets: SubscriptionTargets,
 }
 
@@ -556,6 +562,11 @@ impl ParsedSubscriptionMetadata {
         );
         metadata.targets.logo_url = first_vendor_url(headers, "servicelogo", false, true);
         metadata.dumb_mode = headers.suffix_values("dumb-mode").find_map(parse_switch);
+        // `app-language` or `<vendor>-app-language`: `ru`/`en` in any case, or a regional tag
+        // (`en-US`) for its base language. Other values are ignored.
+        metadata.app_language = headers
+            .suffix_values("app-language")
+            .find_map(multicore_i18n::Lang::from_tag);
         metadata
     }
 
@@ -575,6 +586,7 @@ impl ParsedSubscriptionMetadata {
                 .or(fallback.announcement_action_label),
             announcement_tone: self.announcement_tone.or(fallback.announcement_tone),
             dumb_mode: self.dumb_mode.or(fallback.dumb_mode),
+            app_language: self.app_language.or(fallback.app_language),
             targets: SubscriptionTargets {
                 home_url: self.targets.home_url.or(fallback.targets.home_url),
                 support_url: self.targets.support_url.or(fallback.targets.support_url),

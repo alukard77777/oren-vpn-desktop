@@ -4,6 +4,7 @@ members = [
     "crates/multicore-daemon",
     "crates/multicore-update",
     "crates/multicore-platform",
+    "crates/multicore-i18n",
     "apps/multicore-desktop",
     "apps/multicore-core-host",
     "apps/multicore-updater",

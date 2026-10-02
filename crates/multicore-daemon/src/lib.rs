@@ -178,6 +178,10 @@ pub struct SubscriptionInfoDto {
     /// The provider's `dumb-mode` header: clients show only the first route group.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dumb_mode: bool,
+    /// The provider's `app-language` header (`ru`/`en`): the interface language the desktop
+    /// applies until the user picks one in Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_language: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2922,6 +2926,9 @@ impl<P: ProcessController> CoreRuntime<P> {
                                 .pending(snapshot.subscription_source_url()),
                             refresh_available: snapshot.subscription_source_url().is_some(),
                             dumb_mode: info.dumb_mode,
+                            app_language: info
+                                .app_language
+                                .map(|language| language.code().to_owned()),
                         })
                 }),
             cores_ready: self.cores_live(),

@@ -165,6 +165,8 @@ fn is_metadata_header(name: &str) -> bool {
         || name.ends_with("-subscription-userinfo")
         || name == "dumb-mode"
         || name.ends_with("-dumb-mode")
+        || name == "app-language"
+        || name.ends_with("-app-language")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

@@ -714,6 +714,129 @@ component HealthRow inherits Rectangle {
 
 // Settings row with an iOS switch (green when on). Rows sit inside a card that
 // supplies the 16px side padding; the hairline runs to the card's right edge.
+// One option of the language switch. The names are endonyms: never translated.
+component LanguageOption inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    callback activated();
+
+    min-width: option-label.preferred-width + 24px;
+    preferred-width: self.min-width;
+    height: 28px;
+    border-radius: 7px;
+    background: root.selected ? Theme.elevated : option-touch.has-hover && root.enabled ? #ffffff0a : transparent;
+    border-color: option-focus.has-focus ? Theme.focus : #ffffff14;
+    border-width: option-focus.has-focus ? Theme.focus-width : root.selected ? 1px : 0px;
+    animate background { duration: Motion.reduced ? 0ms : 160ms; easing: ease-out; }
+    accessible-role: radio-button;
+    accessible-label: root.label;
+    accessible-checked: root.selected;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    option-label := Text {
+        text: root.label;
+        color: root.selected ? Theme.text-primary : option-touch.has-hover && root.enabled ? Theme.text-secondary : Theme.text-muted;
+        font-family: Theme.font-family;
+        font-size: Theme.type-metadata-size;
+        font-weight: root.selected ? Theme.weight-semibold : Theme.weight-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    option-focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        option-touch := TouchArea {
+            enabled: root.enabled;
+            mouse-cursor: root.selected ? default : pointer;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+// «Язык / Language»: a two-way switch between Russian and English. The label is bilingual on
+// purpose, so a user who does not read the current language still finds it.
+component LanguageRow inherits Rectangle {
+    in property <string> label;
+    in property <string> description;
+    // "ru" or "en".
+    in property <string> language;
+    in property <bool> enabled: true;
+    in property <bool> show-separator: false;
+    callback selected(string);
+
+    height: root.description == "" ? 48px : 60px;
+    background: transparent;
+
+    Text {
+        x: 0;
+        y: root.description == "" ? 0px : 10px;
+        width: switch.x - 12px;
+        height: root.description == "" ? parent.height : 20px;
+        text: root.label;
+        color: root.enabled ? Theme.text-primary : Theme.text-secondary;
+        font-family: Theme.font-family;
+        font-size: Theme.type-label-size;
+        font-weight: Theme.weight-medium;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if root.description != "": Text {
+        x: 0;
+        y: 31px;
+        width: switch.x - 12px;
+        text: root.description;
+        color: Theme.text-muted;
+        font-family: Theme.font-family;
+        font-size: Theme.type-metadata-size;
+        overflow: elide;
+    }
+    switch := Rectangle {
+        width: options.preferred-width;
+        height: 32px;
+        x: parent.width - self.width;
+        y: (parent.height - self.height) / 2;
+        border-radius: 9px;
+        background: #ffffff0a;
+        opacity: root.enabled ? 1 : 0.45;
+        accessible-role: groupbox;
+        accessible-label: root.label;
+        options := HorizontalLayout {
+            padding: 2px;
+            spacing: 2px;
+            LanguageOption {
+                label: "Русский";
+                selected: root.language != "en";
+                enabled: root.enabled;
+                activated => { root.selected("ru"); }
+            }
+            LanguageOption {
+                label: "English";
+                selected: root.language == "en";
+                enabled: root.enabled;
+                activated => { root.selected("en"); }
+            }
+        }
+    }
+    if root.show-separator: Rectangle {
+        x: 0;
+        y: parent.height - 1px;
+        width: parent.width + 16px;
+        height: 1px;
+        background: #ffffff0f;
+    }
+}
+
 component ToggleRow inherits Rectangle {
     in property <string> label;
     in property <string> description;
@@ -1290,6 +1413,10 @@ export component AppWindow inherits Window {
     in property <string> service-install-error;
     in property <string> preference-error;
     in-out property <bool> ambient-background-enabled: true;
+    // Interface language: "ru" (default) or "en". Set by the host, which also switches the
+    // bundled translation; `language-set-by-user` once the user picked it in Settings.
+    in property <string> language: "ru";
+    in property <bool> language-set-by-user: false;
     // Icon-only navigation rail; collapsed on first run, remembered after.
     in-out property <bool> navigation-collapsed: true;
     in-out property <bool> shell-active: true;
@@ -1508,6 +1635,11 @@ export component AppWindow inherits Window {
         root.route-search-changed("");
     }
     callback set-launch-at-sign-in(bool);
+    // The user picked a language in Settings ("ru" or "en").
+    callback select-language(string);
+    // The language changed (user or provider): the host re-renders the texts it builds.
+    callback language-changed();
+    changed language => { root.language-changed(); }
     callback window-drag();
     callback window-resize(string);
     callback window-minimize();
@@ -3977,6 +4109,14 @@ export component AppWindow inherits Window {
                                     enabled: !root.profile-menu-open && !root.reduced-motion;
                                     show-separator: true;
                                     toggled(value) => { root.ambient-background-enabled = value; }
+                                }
+                                LanguageRow {
+                                    label: "Язык / Language";
+                                    description: !root.language-set-by-user && root.language == "en" ? @tr("Выбран провайдером подписки") : "";
+                                    language: root.language;
+                                    enabled: !root.profile-menu-open;
+                                    show-separator: true;
+                                    selected(code) => { root.select-language(code); }
                                 }
                                 HorizontalLayout {
                                     height: 48px;

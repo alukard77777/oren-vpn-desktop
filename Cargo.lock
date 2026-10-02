@@ -3339,6 +3339,7 @@ dependencies = [
  "fs2",
  "getrandom 0.4.3",
  "image",
+ "multicore-i18n",
  "quick-xml",
  "regex",
  "reqwest 0.13.5",
@@ -3389,6 +3390,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "multicore-core",
+ "multicore-i18n",
  "multicore-platform",
  "reqwest 0.13.5",
  "rustix 1.1.4",
@@ -3416,6 +3418,7 @@ dependencies = [
  "ico",
  "image",
  "multicore-core",
+ "multicore-i18n",
  "multicore-platform",
  "multicore-release",
  "regex",
@@ -3433,6 +3436,15 @@ dependencies = [
  "windows-sys 0.61.2",
  "x11rb",
  "zip",
+]
+
+[[package]]
+name = "multicore-i18n"
+version = "0.1.0"
+dependencies = [
+ "rspolib",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

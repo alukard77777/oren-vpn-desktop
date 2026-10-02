@@ -723,6 +723,18 @@ pub fn redact_event_text(input: &str) -> String {
         .into_owned()
 }
 
+/// A status names the active subscription's `app-language` (or none): it decides the
+/// interface language until the user picks one (see `language`). Applied before the status's
+/// texts are presented, so they come out in the new language.
+fn apply_status_language(status: &DaemonStatus) {
+    let provider = status
+        .subscription
+        .as_ref()
+        .and_then(|subscription| subscription.app_language.as_deref())
+        .and_then(crate::language::Lang::from_tag);
+    crate::language::apply_provider_language(Some(provider));
+}
+
 pub fn state_from_status(status: DaemonStatus) -> UiState {
     if status.degraded {
         return UiState::DaemonDegraded {
@@ -982,6 +994,7 @@ impl DesktopViewModel {
 
     fn apply_daemon_status(&mut self, status: DaemonStatus) -> UiState {
         self.set_authoritative_active_profile(status.active_profile_id.clone());
+        apply_status_language(&status);
         self.subscription = status.subscription.clone();
         self.pin_dumb_mode_group();
         self.cores_ready = status.cores_ready;
@@ -1534,6 +1547,7 @@ impl DesktopViewModel {
             .as_deref()
             .and_then(safe_profile_id);
         self.sync_profile_active_flags();
+        apply_status_language(&status);
         self.subscription = status.subscription.clone();
         self.pin_dumb_mode_group();
         state_from_status(status)

@@ -652,3 +652,108 @@ async fn dumb_mode_survives_a_store_round_trip() {
             .dumb_mode
     );
 }
+
+#[tokio::test]
+async fn app_language_header_is_case_insensitive_with_optional_vendor_prefix_and_region() {
+    use multicore_i18n::Lang;
+    for (name, value, expected) in [
+        ("app-language", "en", Some(Lang::En)),
+        ("App-Language", "EN", Some(Lang::En)),
+        ("app-language", "ru", Some(Lang::Ru)),
+        ("app-language", "Ru-RU", Some(Lang::Ru)),
+        ("app-language", "en-US", Some(Lang::En)),
+        ("app-language", " en_GB ", Some(Lang::En)),
+        ("flclashx-app-language", "en", Some(Lang::En)),
+        ("vendor-App-Language", "ru", Some(Lang::Ru)),
+        ("app-language", "de", None),
+        ("app-language", "english", None),
+        ("app-language", "", None),
+        ("xapp-language", "en", None),
+        ("app-languages", "en", None),
+    ] {
+        let snapshot = native_info([(name, value)]).await;
+        assert_eq!(
+            snapshot.subscription_info().unwrap().app_language,
+            expected,
+            "{name}: {value}"
+        );
+    }
+    assert_eq!(
+        native_info([])
+            .await
+            .subscription_info()
+            .unwrap()
+            .app_language,
+        None
+    );
+    // The first valid value wins; an invalid one does not hide a later valid one.
+    let first_valid = native_info([("app-language", "fr"), ("x-app-language", "en")]).await;
+    assert_eq!(
+        first_valid.subscription_info().unwrap().app_language,
+        Some(Lang::En)
+    );
+}
+
+#[tokio::test]
+async fn app_language_falls_back_from_mihomo_to_xray_headers() {
+    let http = FakeHttp::new(vec![
+        response(503, Vec::new(), []),
+        response(200, MIHOMO, [("app-language", "klingon")]),
+        response(200, XRAY, [("app-language", "en")]),
+    ]);
+    let store = AtomicSnapshot::default();
+    SubscriptionFetcher::new(http)
+        .refresh("https://fallback.example/sub", &store)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .current()
+            .unwrap()
+            .subscription_info()
+            .unwrap()
+            .app_language,
+        Some(multicore_i18n::Lang::En)
+    );
+}
+
+#[tokio::test]
+async fn app_language_is_persisted_only_when_present_and_survives_a_round_trip() {
+    let root = TempDirectory::new();
+    let store = PersistentSnapshotStore::open(&root.0).unwrap();
+    let snapshot = Snapshot::parse(MIHOMO.as_bytes(), XRAY.as_bytes())
+        .unwrap()
+        .with_subscription_source("https://language.example/private", None, 1)
+        .unwrap();
+    store.commit(snapshot).unwrap();
+    let persisted = fs::read_to_string(
+        root.0
+            .join("snapshot-00000000000000000001")
+            .join("subscription.json"),
+    )
+    .unwrap();
+    assert!(!persisted.contains("app_language"));
+    drop(store);
+
+    let root = TempDirectory::new();
+    let store = PersistentSnapshotStore::open(&root.0).unwrap();
+    SubscriptionFetcher::new(FakeHttp::new(vec![response(
+        200,
+        bundle(),
+        [("app-language", "EN-us")],
+    )]))
+    .refresh("https://example.invalid/private-token", &store)
+    .await
+    .unwrap();
+    drop(store);
+    let reopened = PersistentSnapshotStore::open(&root.0).unwrap();
+    assert_eq!(
+        reopened
+            .current()
+            .unwrap()
+            .subscription_info()
+            .unwrap()
+            .app_language,
+        Some(multicore_i18n::Lang::En)
+    );
+}

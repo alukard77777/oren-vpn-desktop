@@ -68,6 +68,18 @@ pub struct AppPreferences {
     /// once set, so older versions (which reject unknown fields) can still read the file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tray_popup_size: Option<TrayPopupSizePreference>,
+    /// The interface language last applied: the user's pick, or the active subscription's
+    /// `app-language` header. Russian is the default and is not written, like the two flags
+    /// below, so older versions (which reject unknown fields) keep reading the file.
+    #[serde(skip_serializing_if = "is_default_language")]
+    pub language: multicore_i18n::Lang,
+    /// The user picked `language` in Settings: provider headers never change it again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub language_set_by_user: bool,
+}
+
+fn is_default_language(language: &multicore_i18n::Lang) -> bool {
+    *language == multicore_i18n::Lang::default()
 }
 
 /// Tray popup size in logical pixels.
@@ -106,6 +118,8 @@ impl Default for AppPreferences {
             appimage_handoff_seen: None,
             service_offer_dismissed: false,
             tray_popup_size: None,
+            language: multicore_i18n::Lang::Ru,
+            language_set_by_user: false,
         }
     }
 }
@@ -730,6 +744,8 @@ mod tests {
                 width: 400,
                 height: 640,
             }),
+            language: multicore_i18n::Lang::En,
+            language_set_by_user: true,
         };
 
         store.save(&expected).unwrap();
@@ -765,6 +781,8 @@ mod tests {
                 appimage_handoff_seen: None,
                 service_offer_dismissed: false,
                 tray_popup_size: None,
+                language: multicore_i18n::Lang::Ru,
+                language_set_by_user: false,
             }
         );
     }
@@ -774,6 +792,27 @@ mod tests {
         let raw = serde_json::to_string(&AppPreferences::default()).unwrap();
         assert!(!raw.contains("appimage_handoff_seen"));
         assert!(!raw.contains("service_offer_dismissed"));
+    }
+
+    #[test]
+    fn default_language_is_not_written_so_older_versions_still_read_the_file() {
+        let raw = serde_json::to_string(&AppPreferences::default()).unwrap();
+        assert!(!raw.contains("language"));
+        let provider_english = AppPreferences {
+            language: multicore_i18n::Lang::En,
+            ..AppPreferences::default()
+        };
+        let raw = serde_json::to_string(&provider_english).unwrap();
+        assert!(raw.contains(r#""language":"en""#));
+        assert!(!raw.contains("language_set_by_user"));
+        let old = br#"{"schema_version":1,"ambient_background":true}"#;
+        let loaded: AppPreferences = serde_json::from_slice(old).unwrap();
+        assert_eq!(loaded.language, multicore_i18n::Lang::Ru);
+        assert!(!loaded.language_set_by_user);
+        let chosen = br#"{"schema_version":1,"language":"ru","language_set_by_user":true}"#;
+        let loaded: AppPreferences = serde_json::from_slice(chosen).unwrap();
+        assert_eq!(loaded.language, multicore_i18n::Lang::Ru);
+        assert!(loaded.language_set_by_user);
     }
 
     #[test]

@@ -70,6 +70,9 @@ export component ComponentCheck inherits Window {{
         compile_windows_resources(&manifest_dir, &output_dir, &icon_tree);
     }
 
+    // English is bundled from the same catalog the Rust strings use (`multicore-i18n`). Russian
+    // is the source language: `@tr("…")` msgids are the exact Russian text, with no context.
+    println!("cargo:rerun-if-changed=translations/en/LC_MESSAGES/multicore-desktop.po");
     slint_build::compile_with_config(
         "ui/app.slint",
         slint_build::CompilerConfiguration::new()
@@ -77,7 +80,9 @@ export component ComponentCheck inherits Window {{
             // color scheme and drew white LineEdits/scrollbars on a light
             // Windows theme.
             .with_style("fluent-dark".into())
-            .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles),
+            .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles)
+            .with_bundled_translations(manifest_dir.join("translations"))
+            .with_default_translation_context(slint_build::DefaultTranslationContext::None),
     )
     .expect("failed to compile the Slint UI");
 }

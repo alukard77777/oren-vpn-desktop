@@ -1,0 +1,16 @@
+# English interface of MULTICORE.
+#
+# The source language is Russian: every msgid is the exact Russian text of the app (Slint
+# `@tr("…")` and Rust `tr!("…")`), every msgstr its English text. Placeholders follow Slint:
+# `{}` next argument, `{0}` positional, `{n}` plural count.
+msgid ""
+msgstr ""
+"Project-Id-Version: multicore-desktop\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid "Выбран провайдером подписки"
+msgstr "Set by your subscription provider"

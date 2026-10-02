@@ -9,6 +9,7 @@ mod crisp_image;
 mod daemon;
 mod data_reset;
 mod emoji_images;
+mod language;
 mod layout_shortcuts;
 #[cfg(target_os = "linux")]
 mod linux_display;
@@ -424,6 +425,11 @@ impl PersistenceTracker {
 
     fn set_service_offer_dismissed(&mut self, dismissed: bool) {
         self.desired.service_offer_dismissed = dismissed;
+    }
+
+    fn set_language(&mut self, language: language::Lang, set_by_user: bool) {
+        self.desired.language = language;
+        self.desired.language_set_by_user = set_by_user;
     }
 
     fn set_route_preferences(
@@ -851,6 +857,12 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         }
     }
     let launch_mode = launch_arguments.mode;
+    // Before anything builds user-facing text: the language comes from the preferences.
+    let (preference_store, loaded_preferences) = load_preferences();
+    language::initialize(
+        loaded_preferences.language,
+        loaded_preferences.language_set_by_user,
+    );
     let (client, _bootstrap_guard): (Arc<dyn DaemonClient>, Option<bootstrap::Bootstrap>) =
         match bootstrap::start() {
             Ok(bootstrap) => (bootstrap.client(), Some(bootstrap)),
@@ -861,7 +873,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
             }
         };
 
-    let (preference_store, loaded_preferences) = load_preferences();
     let preference_tracker = Arc::new(Mutex::new(PersistenceTracker::new(
         loaded_preferences.clone(),
     )));
@@ -885,6 +896,10 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         renderer_fallback::select_gpu_renderer()?;
     }
     let ui = AppWindow::new()?;
+    // Slint picks a bundled translation from the system locale when the first component is
+    // created; the app's own language (Russian unless chosen or set by the provider) wins.
+    select_slint_language(language::current());
+    sync_language(&ui);
     layout_shortcuts::install(ui.window());
     #[cfg(not(windows))]
     ui.set_system_name("Linux".into());
@@ -1053,6 +1068,12 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     .map_err(|error| eprintln!("tray unavailable: {error}"))
     .ok();
     wire_window_controls(&ui, tray_runtime.is_some());
+    wire_language(
+        &ui,
+        model.clone(),
+        update_state.clone(),
+        tray_popup.as_weak(),
+    );
     let _preference_timer = wire_preference_persistence(
         &ui,
         model.clone(),
@@ -1979,6 +2000,9 @@ fn wire_preference_persistence(
             tracker.set_service_offer_dismissed(ui.get_service_offer_dismissed());
             tracker.set_rail_growth(ui.get_rail_growth_delta(), ui.get_rail_grown_width());
             tracker.set_tun_enabled(ui.get_tun_enabled());
+            if let Some(language) = language::Lang::from_tag(&ui.get_language()) {
+                tracker.set_language(language, ui.get_language_set_by_user());
+            }
             if let Some((profile, selected_group, selections)) = route_preferences {
                 tracker.set_route_preferences(profile, selected_group, selections);
             }
@@ -5715,7 +5739,69 @@ fn split_leading_emoji_image(name: &str) -> (slint::Image, &str) {
     }
 }
 
+/// Brings the window to the current language (a provider header may have changed it while a
+/// daemon status was applied): switches the bundled Slint translation, and the `language`
+/// property's change handler (`wire_language`) re-renders the texts built in Rust.
+fn sync_language(ui: &AppWindow) {
+    let current = language::current();
+    ui.set_language_set_by_user(language::user_chosen());
+    if ui.get_language() != current.code() {
+        select_slint_language(current);
+        ui.set_language(current.code().into());
+    }
+}
+
+fn select_slint_language(language: language::Lang) {
+    if let Err(error) = slint::select_bundled_translation(language.slint_bundle()) {
+        eprintln!("interface language could not be selected: {error}");
+    }
+}
+
+/// «Язык / Language» in Settings, and the re-render after any language change.
+fn wire_language(
+    ui: &AppWindow,
+    model: Arc<Mutex<DesktopViewModel>>,
+    update_state: Arc<Mutex<UpdateState>>,
+    tray_popup: slint::Weak<TrayPopup>,
+) {
+    let weak = ui.as_weak();
+    ui.on_select_language(move |code| {
+        let (Some(ui), Some(language)) = (weak.upgrade(), language::Lang::from_tag(&code)) else {
+            return;
+        };
+        language::choose(language);
+        sync_language(&ui);
+    });
+    let weak = ui.as_weak();
+    ui.on_language_changed(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        refresh_localized_texts(&ui, &model, &update_state, &tray_popup);
+    });
+}
+
+/// Re-applies every text the host builds, in the current language. Texts already shown as a
+/// one-off result (an error of the last action, a toast) keep the language they were made in.
+fn refresh_localized_texts(
+    ui: &AppWindow,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    update_state: &Arc<Mutex<UpdateState>>,
+    tray_popup: &slint::Weak<TrayPopup>,
+) {
+    let current = apply_latest_snapshot(ui, model);
+    apply_update_state(
+        ui,
+        &update_state.lock().expect("update state lock"),
+        runtime_allows_update(&current.presentation),
+    );
+    apply_launch_at_sign_in(ui, windows_settings::query_launch_at_sign_in());
+    refresh_tray_popup(tray_popup, model);
+    load_events(ui.as_weak(), model.clone());
+}
+
 fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
+    sync_language(ui);
     let presentation = &snapshot.presentation;
     let toggle = toggle_presentation(presentation);
     ui.set_toggle_title(toggle.title.into());
@@ -6508,7 +6594,8 @@ mod window_tests {
             .split("announcement-popover := Rectangle")
             .nth(1)
             .expect("announcement source");
-        let announcement = announcement.chars().take(6000).collect::<String>();
+        // Checkouts with CRLF line endings (and `@tr()` wrappers) make the source longer.
+        let announcement = announcement.chars().take(8000).collect::<String>();
         assert!(announcement.contains("property <bool> shown: root.announcement-open"));
         assert!(announcement.contains("height: announcement-copy.preferred-height + 50px;"));
         assert!(announcement.contains("wrap: word-wrap;"));

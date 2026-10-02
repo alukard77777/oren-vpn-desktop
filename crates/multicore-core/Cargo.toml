@@ -10,6 +10,7 @@ base64.workspace = true
 fs2 = "0.4"
 getrandom = "0.4"
 image.workspace = true
+multicore-i18n = { path = "../multicore-i18n" }
 quick-xml.workspace = true
 reqwest.workspace = true
 regex.workspace = true

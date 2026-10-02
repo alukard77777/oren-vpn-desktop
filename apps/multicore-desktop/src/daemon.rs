@@ -281,6 +281,10 @@ pub struct DaemonSubscriptionInfo {
     /// The provider's `dumb-mode` header: only the first route group is shown.
     #[serde(default)]
     pub dumb_mode: bool,
+    /// The provider's `app-language` header (`ru`/`en`): applied until the user picks a
+    /// language in Settings.
+    #[serde(default)]
+    pub app_language: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
