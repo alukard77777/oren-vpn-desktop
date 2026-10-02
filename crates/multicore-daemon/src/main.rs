@@ -36,8 +36,8 @@ type Controller = ModeController<
 >;
 type Session = ServiceSession<ProductionServiceConnector>;
 
-const SERVICE_UNAVAILABLE_NOTICE: &str =
-    "Служба MULTICORE недоступна — права администратора будут запрошены при подключении.";
+/// `multicore_i18n::daemon_messages` code of the notice.
+const SERVICE_UNAVAILABLE_NOTICE: &str = "service.unavailable_notice";
 /// How often the watcher looks at the service: also the upper bound for noticing that a
 /// connection carried by the service is gone.
 const WATCH_INTERVAL: Duration = Duration::from_secs(3);
@@ -400,12 +400,13 @@ where
         self.watch_service().await
     }
 
-    async fn notice(&self, phase: &str, message: &str) {
-        self.record_notice(phase, message).await;
+    async fn notice(&self, phase: &str, code: &str) {
+        self.record_notice(phase, multicore_daemon::DaemonText::code(code))
+            .await;
     }
 
-    async fn clear_notice(&self, message: &str) {
-        CoreBackend::clear_notice(self, message).await;
+    async fn clear_notice(&self, code: &str) {
+        CoreBackend::clear_notice(self, &multicore_daemon::DaemonText::code(code)).await;
     }
 
     async fn connected(&self) -> bool {

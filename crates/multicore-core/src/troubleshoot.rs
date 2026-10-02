@@ -304,17 +304,18 @@ impl CheckStep {
 
     #[must_use]
     pub fn label(self) -> &'static str {
+        use multicore_i18n::tr;
         match self {
-            Self::Antivirus => "Антивирусы…",
-            Self::Dpi => "Программы обхода блокировок…",
-            Self::Ports => "Порты…",
-            Self::Proxy => "Системный прокси…",
-            Self::Vpn => "VPN-подключения…",
+            Self::Antivirus => tr!("Антивирусы…"),
+            Self::Dpi => tr!("Программы обхода блокировок…"),
+            Self::Ports => tr!("Порты…"),
+            Self::Proxy => tr!("Системный прокси…"),
+            Self::Vpn => tr!("VPN-подключения…"),
             Self::Discord => "Discord…",
-            Self::Hosts => "Файл hosts…",
-            Self::Policies => "Групповые политики…",
-            Self::Time => "Системное время…",
-            Self::Network => "Сеть и DNS…",
+            Self::Hosts => tr!("Файл hosts…"),
+            Self::Policies => tr!("Групповые политики…"),
+            Self::Time => tr!("Системное время…"),
+            Self::Network => tr!("Сеть и DNS…"),
         }
     }
 }
@@ -335,6 +336,12 @@ pub struct Finding {
     pub tone: Tone,
     pub title: String,
     pub detail: String,
+    /// Stable codes of `title`/`detail` (`multicore_i18n::daemon_messages`): the desktop shows
+    /// them in its language. `title`/`detail` stay the Russian text for older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_key: Option<multicore_i18n::MessageKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_key: Option<multicore_i18n::MessageKey>,
 }
 
 impl Finding {
@@ -343,8 +350,51 @@ impl Finding {
             tone,
             title: title.into(),
             detail: detail.into(),
+            title_key: None,
+            detail_key: None,
         }
     }
+
+    /// A card from two registered daemon messages.
+    ///
+    /// # Panics
+    /// When a code is not in `multicore_i18n::daemon_messages` (a programming error).
+    #[must_use]
+    pub fn keyed(
+        tone: Tone,
+        title: multicore_i18n::MessageKey,
+        detail: multicore_i18n::MessageKey,
+    ) -> Self {
+        Self {
+            tone,
+            title: russian(&title),
+            detail: russian(&detail),
+            title_key: Some(title),
+            detail_key: Some(detail),
+        }
+    }
+
+    /// The title in the interface language (the Russian text for an unknown code).
+    #[must_use]
+    pub fn localized_title(&self) -> String {
+        localized(self.title_key.as_ref(), &self.title)
+    }
+
+    /// The detail in the interface language (the Russian text for an unknown code).
+    #[must_use]
+    pub fn localized_detail(&self) -> String {
+        localized(self.detail_key.as_ref(), &self.detail)
+    }
+}
+
+fn russian(key: &multicore_i18n::MessageKey) -> String {
+    key.russian()
+        .unwrap_or_else(|| panic!("unregistered daemon message code {}", key.code))
+}
+
+fn localized(key: Option<&multicore_i18n::MessageKey>, fallback: &str) -> String {
+    key.and_then(multicore_i18n::MessageKey::localize)
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 /// A fix the user may tick. Nothing in an offer runs until the user confirms it.
@@ -359,6 +409,46 @@ pub struct FixOffer {
     pub needs_admin: bool,
     /// Takes effect only after a reboot.
     pub needs_reboot: bool,
+    /// Stable codes of `title`/`detail`, as in [`Finding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_key: Option<multicore_i18n::MessageKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_key: Option<multicore_i18n::MessageKey>,
+}
+
+impl FixOffer {
+    /// An offer whose texts are registered daemon messages.
+    ///
+    /// # Panics
+    /// When a code is not in `multicore_i18n::daemon_messages` (a programming error).
+    #[must_use]
+    pub fn keyed(
+        id: String,
+        title: multicore_i18n::MessageKey,
+        detail: multicore_i18n::MessageKey,
+        needs_admin: bool,
+        needs_reboot: bool,
+    ) -> Self {
+        Self {
+            id,
+            title: russian(&title),
+            detail: russian(&detail),
+            needs_admin,
+            needs_reboot,
+            title_key: Some(title),
+            detail_key: Some(detail),
+        }
+    }
+
+    #[must_use]
+    pub fn localized_title(&self) -> String {
+        localized(self.title_key.as_ref(), &self.title)
+    }
+
+    #[must_use]
+    pub fn localized_detail(&self) -> String {
+        localized(self.detail_key.as_ref(), &self.detail)
+    }
 }
 
 /// `POST /v1/troubleshoot/check`.

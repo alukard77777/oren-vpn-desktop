@@ -22,7 +22,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod daemon_messages;
 
+/// `((msgid, msgid_plural), (English one, English other))`.
+type PluralEntry = ((&'static str, &'static str), (&'static str, &'static str));
+
 mod catalog {
+    use super::PluralEntry;
     include!(concat!(env!("OUT_DIR"), "/catalog.rs"));
 }
 
@@ -197,8 +201,7 @@ pub fn catalog_entries() -> impl Iterator<Item = (&'static str, &'static str)> {
 }
 
 /// Every plural entry: `((msgid, msgid_plural), (English one, English other))`.
-pub fn catalog_plural_entries()
--> impl Iterator<Item = ((&'static str, &'static str), (&'static str, &'static str))> {
+pub fn catalog_plural_entries() -> impl Iterator<Item = PluralEntry> {
     catalog::PLURAL.iter().copied()
 }
 
@@ -218,19 +221,14 @@ pub fn format_with_count(template: &str, args: &[&dyn Display], n: Option<i64>) 
     while let Some(position) = rest.find(['{', '}']) {
         output.push_str(&rest[..position]);
         let tail = &rest[position..];
-        if tail.starts_with("{{") {
+        if let Some(after) = tail.strip_prefix("{{") {
             output.push('{');
-            rest = &tail[2..];
+            rest = after;
             continue;
         }
-        if tail.starts_with("}}") {
+        if let Some(after) = tail.strip_prefix("}}").or_else(|| tail.strip_prefix('}')) {
             output.push('}');
-            rest = &tail[2..];
-            continue;
-        }
-        if tail.starts_with('}') {
-            output.push('}');
-            rest = &tail[1..];
+            rest = after;
             continue;
         }
         let Some(end) = tail.find('}') else {

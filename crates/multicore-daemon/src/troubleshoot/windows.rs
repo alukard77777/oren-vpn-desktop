@@ -149,7 +149,11 @@ impl SystemTroubleshooting {
             }
             CheckStep::Proxy => {
                 let (outcome, pac_host) = clear_system_proxy(&self.proxy_marker);
-                findings(proxy_findings(&outcome, pac_host.as_deref()))
+                let pac_host = pac_host.as_ref().map(|host| {
+                    host.as_deref()
+                        .map_or(super::PacHost::Unrecognized, super::PacHost::Named)
+                });
+                findings(proxy_findings(&outcome, pac_host))
             }
             CheckStep::Vpn => findings(vpn_findings(&ras_connections())),
             CheckStep::Discord => drover_report(scan_drover().as_ref()),
@@ -449,7 +453,9 @@ fn listeners(wanted: &[ListenPort]) -> Vec<PortOwner> {
 /// Puts back MULTICORE's leftover proxy, then switches off whatever proxy is still on (the
 /// daemon is disconnected here, so no proxy is ours to keep). Returns what was done and the
 /// host of a proxy auto-config script, which is reported but left alone.
-fn clear_system_proxy(marker: &Path) -> (ProxyOutcome, Option<String>) {
+/// The outcome, and the host of a proxy auto-configuration script when one is set (`None`
+/// inside when its address has no recognizable host).
+fn clear_system_proxy(marker: &Path) -> (ProxyOutcome, Option<Option<String>>) {
     let settings = WinInetSettings;
     // MULTICORE's own proxy from a connection that never cleaned up: the marker still matches
     // what is applied, so `recover` puts the user's earlier settings back.
@@ -474,7 +480,6 @@ fn clear_system_proxy(marker: &Path) -> (ProxyOutcome, Option<String>) {
             reqwest::Url::parse(url)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_else(|| "(адрес не распознан)".to_owned())
         });
     if current.proxy_enable != Some(1) {
         let outcome = if recovered {

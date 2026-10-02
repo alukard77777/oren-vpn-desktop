@@ -21,11 +21,26 @@ use multicore_core::troubleshoot::{
     CheckStep, DpiService, Finding, FixId, FixOffer, FixOutcome, FixReport, ListenPort,
     PrivilegedFix, StepReport, Tone,
 };
+use multicore_i18n::MessageKey;
 
 use crate::service_client::ServiceError;
 
 /// The most fix ids one `POST /v1/troubleshoot/fix` may carry.
 pub const MAX_FIX_REQUEST: usize = 12;
+
+/// A registered daemon message (`multicore_i18n::daemon_messages`) without arguments.
+fn key(code: &str) -> MessageKey {
+    MessageKey::new(code)
+}
+
+/// A registered daemon message with arguments.
+fn key_with(code: &str, args: impl IntoIterator<Item = impl Into<String>>) -> MessageKey {
+    MessageKey::with_args(code, args)
+}
+
+fn finding(tone: Tone, title: MessageKey, detail: MessageKey) -> Finding {
+    Finding::keyed(tone, title, detail)
+}
 
 /// Router-facing troubleshooting (production: [`windows::SystemTroubleshooting`]).
 #[async_trait::async_trait]
@@ -112,21 +127,16 @@ pub fn antivirus_findings(antivirus: &[Antivirus]) -> Vec<Finding> {
         .iter()
         .map(|item| {
             if item.severe {
-                Finding::new(
+                finding(
                     Tone::Error,
-                    format!("Обнаружен {}", item.name),
-                    format!(
-                        "{} часто блокирует VPN. Если подключение не работает — выключите его \
-                         или добавьте MULTICORE в исключения.",
-                        item.name
-                    ),
+                    key_with("ts.antivirus.found", [item.name]),
+                    key_with("ts.antivirus.severe", [item.name]),
                 )
             } else {
-                Finding::new(
+                finding(
                     Tone::Warning,
-                    format!("Обнаружен {}", item.name),
-                    "Антивирус может мешать VPN. Если подключение не работает — добавьте \
-                     MULTICORE в исключения или временно отключите защиту.",
+                    key_with("ts.antivirus.found", [item.name]),
+                    key("ts.antivirus.mild"),
                 )
             }
         })
@@ -148,45 +158,43 @@ pub fn dpi_report(services: &[DpiServiceState], folders: &[String]) -> StepRepor
             state.service,
             DpiService::WinDivert | DpiService::WinDivert14
         );
-        let what = if driver {
-            "Драйвер перехвата пакетов (его используют zapret и GoodbyeDPI)"
-        } else {
-            "Программа обхода блокировок"
-        };
         report.findings.push(if state.running {
-            Finding::new(
+            finding(
                 Tone::Error,
-                format!("Работает {name}"),
-                format!("{what} перехватывает трафик и мешает VPN."),
+                key_with("ts.dpi.running", [name]),
+                key(if driver {
+                    "ts.dpi.driver_running"
+                } else {
+                    "ts.dpi.program_running"
+                }),
             )
         } else {
-            Finding::new(
+            finding(
                 Tone::Warning,
-                format!("Установлена служба {name}"),
-                format!("{what}: служба остановлена, но может запуститься снова."),
+                key_with("ts.dpi.installed", [name]),
+                key(if driver {
+                    "ts.dpi.driver_stopped"
+                } else {
+                    "ts.dpi.program_stopped"
+                }),
             )
         });
-        report.fixes.push(FixOffer {
-            id: FixId::Privileged(PrivilegedFix::RemoveDpiService {
+        report.fixes.push(FixOffer::keyed(
+            FixId::Privileged(PrivilegedFix::RemoveDpiService {
                 service: state.service,
             })
             .as_text(),
-            title: format!("Остановить и удалить службу {name}"),
-            detail: "Служба будет остановлена и удалена из Windows. Файлы программы \
-                     останутся — при необходимости её можно установить снова."
-                .into(),
-            needs_admin: true,
-            needs_reboot: false,
-        });
+            key_with("ts.dpi.remove", [name]),
+            key("ts.dpi.remove_detail"),
+            true,
+            false,
+        ));
     }
     if !folders.is_empty() {
-        report.findings.push(Finding::new(
+        report.findings.push(finding(
             Tone::Warning,
-            "Найдены программы обхода блокировок",
-            format!(
-                "{}. Если они запущены — закройте их. MULTICORE эти папки не трогает.",
-                folders.join(", ")
-            ),
+            key("ts.dpi.folders"),
+            key_with("ts.dpi.folders_detail", [folders.join(", ")]),
         ));
     }
     report
@@ -245,20 +253,20 @@ pub fn port_findings(
         {
             continue;
         }
-        let process = owner
-            .process_name
-            .as_deref()
-            .map_or_else(|| "другая программа".to_owned(), |name| format!("«{name}»"));
-        findings.push(Finding::new(
+        let port = owner.port.to_string();
+        findings.push(finding(
             Tone::Warning,
-            format!(
-                "Порт {}{} занят",
-                owner.port,
-                if owner.udp { " (UDP)" } else { "" }
+            key_with(
+                if owner.udp {
+                    "ts.port.busy_udp"
+                } else {
+                    "ts.port.busy"
+                },
+                [port],
             ),
-            format!(
-                "Его занимает {process}, а он нужен подписке. Закройте эту программу и \
-                 повторите подключение."
+            owner.process_name.as_deref().map_or_else(
+                || key("ts.port.unknown_owner"),
+                |name| key_with("ts.port.named_owner", [name]),
             ),
         ));
     }
@@ -289,39 +297,41 @@ pub fn looks_like_our_proxy(server: &str, proxy_override: Option<&str>) -> bool 
     ours_server && proxy_override == Some(crate::system_proxy::PROXY_OVERRIDE)
 }
 
-pub fn proxy_findings(outcome: &ProxyOutcome, pac_host: Option<&str>) -> Vec<Finding> {
+/// The host of a proxy auto-configuration script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacHost<'a> {
+    Named(&'a str),
+    /// The script address is not a URL with a host.
+    Unrecognized,
+}
+
+pub fn proxy_findings(outcome: &ProxyOutcome, pac_host: Option<PacHost<'_>>) -> Vec<Finding> {
     let mut findings = match outcome {
         ProxyOutcome::Direct => Vec::new(),
-        ProxyOutcome::StaleOursCleared => vec![Finding::new(
+        ProxyOutcome::StaleOursCleared => vec![finding(
             Tone::Info,
-            "Убран прокси от прошлого подключения",
-            "MULTICORE не успел выключить системный прокси. Прежние настройки восстановлены.",
+            key("ts.proxy.stale_cleared"),
+            key("ts.proxy.stale_cleared_detail"),
         )],
-        ProxyOutcome::ForeignDisabled { server } => vec![Finding::new(
+        ProxyOutcome::ForeignDisabled { server } => vec![finding(
             Tone::Info,
-            "Системный прокси отключён",
-            format!(
-                "Был включён прокси {server} — он мешает подключению. Включить снова: \
-                 Параметры → Сеть и Интернет → Прокси."
-            ),
+            key("ts.proxy.disabled"),
+            key_with("ts.proxy.disabled_detail", [server.as_str()]),
         )],
-        ProxyOutcome::DisableFailed { server } => vec![Finding::new(
+        ProxyOutcome::DisableFailed { server } => vec![finding(
             Tone::Error,
-            "Не удалось отключить системный прокси",
-            format!(
-                "Включён прокси {server}. Отключите его вручную: Параметры → Сеть и \
-                 Интернет → Прокси."
-            ),
+            key("ts.proxy.disable_failed"),
+            key_with("ts.proxy.disable_failed_detail", [server.as_str()]),
         )],
     };
     if let Some(host) = pac_host {
-        findings.push(Finding::new(
+        findings.push(finding(
             Tone::Warning,
-            "Включён сценарий настройки прокси",
-            format!(
-                "Адрес сценария: {host}. Если подключение не работает, выключите «Использовать \
-                 сценарий настройки» в Параметры → Сеть и Интернет → Прокси."
-            ),
+            key("ts.proxy.pac"),
+            match host {
+                PacHost::Named(host) => key_with("ts.proxy.pac_detail", [host]),
+                PacHost::Unrecognized => key("ts.proxy.pac_detail_unparsed"),
+            },
         ));
     }
     findings
@@ -333,14 +343,10 @@ pub fn proxy_environment_findings(variables: &[String]) -> Vec<Finding> {
     if variables.is_empty() {
         return Vec::new();
     }
-    vec![Finding::new(
+    vec![finding(
         Tone::Warning,
-        "Прокси задан в переменных окружения",
-        format!(
-            "{}. Программы могут отправлять трафик мимо VPN — уберите эти переменные, если \
-             подключение не работает.",
-            variables.join(", ")
-        ),
+        key("ts.proxy.env"),
+        key_with("ts.proxy.env_detail", [variables.join(", ")]),
     )]
 }
 
@@ -348,11 +354,10 @@ pub fn vpn_findings(connections: &[String]) -> Vec<Finding> {
     connections
         .iter()
         .map(|name| {
-            Finding::new(
+            finding(
                 Tone::Warning,
-                format!("Активно VPN-подключение «{name}»"),
-                "Два VPN одновременно конфликтуют. Отключите его: Параметры → Сеть и \
-                 Интернет → VPN.",
+                key_with("ts.vpn.active", [name.as_str()]),
+                key("ts.vpn.active_detail"),
             )
         })
         .collect()
@@ -371,33 +376,27 @@ pub fn drover_report(state: Option<&DroverState>) -> StepReport {
     };
     if state.discord_running {
         return StepReport {
-            findings: vec![Finding::new(
+            findings: vec![finding(
                 Tone::Error,
-                "Найден Drover для Discord",
-                "Подменная version.dll в папке Discord пускает его трафик мимо VPN. Закройте \
-                 Discord и повторите проверку — тогда её можно будет удалить.",
+                key("ts.drover.found"),
+                key("ts.drover.found_running"),
             )],
             fixes: Vec::new(),
         };
     }
     StepReport {
-        findings: vec![Finding::new(
+        findings: vec![finding(
             Tone::Warning,
-            "Найден Drover для Discord",
-            "Подменная version.dll в папке Discord пускает его трафик мимо VPN и может \
-             мешать подключению.",
+            key("ts.drover.found"),
+            key("ts.drover.found_detail"),
         )],
-        fixes: vec![FixOffer {
-            id: FixId::DeleteDrover.as_text(),
-            title: "Удалить Drover из папки Discord".into(),
-            detail: format!(
-                "Будут удалены version.dll и drover.ini (файлов: {}). Сам Discord \
-                 продолжит работать.",
-                state.files
-            ),
-            needs_admin: false,
-            needs_reboot: false,
-        }],
+        fixes: vec![FixOffer::keyed(
+            FixId::DeleteDrover.as_text(),
+            key("ts.drover.remove"),
+            key_with("ts.drover.remove_detail", [state.files.to_string()]),
+            false,
+            false,
+        )],
     }
 }
 
@@ -411,13 +410,10 @@ pub fn hosts_findings(path: &str, entries: &[String]) -> Vec<Finding> {
         .map(|entry| format!("«{entry}»"))
         .collect::<Vec<_>>()
         .join(", ");
-    vec![Finding::new(
+    vec![finding(
         Tone::Warning,
-        format!("В файле hosts есть записи: {}", entries.len()),
-        format!(
-            "{path}: {examples}. Они могут перенаправлять сайты. MULTICORE этот файл не \
-             меняет — проверьте его вручную."
-        ),
+        key_with("ts.hosts.entries", [entries.len().to_string()]),
+        key_with("ts.hosts.entries_detail", [path.to_owned(), examples]),
     )]
 }
 
@@ -432,14 +428,10 @@ pub fn policy_findings(restricted: &[&str]) -> Vec<Finding> {
     if restricted.is_empty() {
         return Vec::new();
     }
-    vec![Finding::new(
+    vec![finding(
         Tone::Error,
-        "Ограничения сети",
-        format!(
-            "Групповые политики запрещают менять сетевые настройки ({}). Возможно, это \
-             корпоративный или школьный ПК — обратитесь к его администратору.",
-            restricted.join(", ")
-        ),
+        key("ts.policy.restricted"),
+        key_with("ts.policy.restricted_detail", [restricted.join(", ")]),
     )]
 }
 
@@ -464,38 +456,35 @@ pub fn clock_state(skew_seconds: Option<i64>) -> ClockState {
 }
 
 fn resync_offer() -> FixOffer {
-    FixOffer {
-        id: FixId::Privileged(PrivilegedFix::ResyncTime).as_text(),
-        title: "Синхронизировать время".into(),
-        detail: "Запустит службу времени Windows и сверит часы с сервером времени.".into(),
-        needs_admin: true,
-        needs_reboot: false,
-    }
+    FixOffer::keyed(
+        FixId::Privileged(PrivilegedFix::ResyncTime).as_text(),
+        key("ts.clock.resync"),
+        key("ts.clock.resync_detail"),
+        true,
+        false,
+    )
 }
 
-fn skew_text(seconds: i64) -> String {
+/// «Часы спешат на 5 мин», «Часы отстают на 3 ч».
+fn skew_title(seconds: i64) -> MessageKey {
     let minutes = seconds.unsigned_abs().div_ceil(60);
-    let amount = if minutes >= 120 {
-        format!("{} ч", minutes / 60)
-    } else {
-        format!("{minutes} мин")
+    let (code, amount) = match (seconds > 0, minutes >= 120) {
+        (true, true) => ("ts.clock.ahead_hours", minutes / 60),
+        (true, false) => ("ts.clock.ahead_minutes", minutes),
+        (false, true) => ("ts.clock.behind_hours", minutes / 60),
+        (false, false) => ("ts.clock.behind_minutes", minutes),
     };
-    if seconds > 0 {
-        format!("спешат на {amount}")
-    } else {
-        format!("отстают на {amount}")
-    }
+    key_with(code, [amount.to_string()])
 }
 
 pub fn clock_report(state: ClockState, windows: bool) -> StepReport {
     match state {
         ClockState::InSync => StepReport::default(),
         ClockState::Skewed(seconds) => StepReport {
-            findings: vec![Finding::new(
+            findings: vec![finding(
                 Tone::Warning,
-                format!("Часы {}", skew_text(seconds)),
-                "Неверное время ломает защищённые подключения. Включите «Установить время \
-                 автоматически» или синхронизируйте часы.",
+                skew_title(seconds),
+                key("ts.clock.skewed_detail"),
             )],
             fixes: if windows {
                 vec![resync_offer()]
@@ -504,10 +493,10 @@ pub fn clock_report(state: ClockState, windows: bool) -> StepReport {
             },
         },
         ClockState::Unknown => StepReport {
-            findings: vec![Finding::new(
+            findings: vec![finding(
                 Tone::Info,
-                "Не удалось сверить время",
-                "Сервер проверки времени не ответил — возможно, нет доступа в интернет.",
+                key("ts.clock.unknown"),
+                key("ts.clock.unknown_detail"),
             )],
             fixes: if windows {
                 vec![resync_offer()]
@@ -523,44 +512,39 @@ pub fn clock_report(state: ClockState, windows: bool) -> StepReport {
 pub fn network_report(dns_flushed: Option<bool>, winhttp_proxy: Option<&str>) -> StepReport {
     let mut report = StepReport::default();
     match dns_flushed {
-        Some(true) => report.findings.push(Finding::new(
+        Some(true) => report.findings.push(finding(
             Tone::Info,
-            "DNS-кэш очищен",
-            "Устаревшие записи DNS больше не помешают подключению.",
+            key("ts.network.dns_flushed"),
+            key("ts.network.dns_flushed_detail"),
         )),
-        Some(false) => report.findings.push(Finding::new(
+        Some(false) => report.findings.push(finding(
             Tone::Warning,
-            "Не удалось очистить DNS-кэш",
-            "Это не критично: кэш обновится сам или после перезагрузки.",
+            key("ts.network.dns_flush_failed"),
+            key("ts.network.dns_flush_failed_detail"),
         )),
         None => {}
     }
     if let Some(proxy) = winhttp_proxy {
-        report.findings.push(Finding::new(
+        report.findings.push(finding(
             Tone::Warning,
-            "Задан прокси WinHTTP",
-            format!("Системные службы Windows ходят через {proxy}. Это может мешать VPN."),
+            key("ts.network.winhttp"),
+            key_with("ts.network.winhttp_detail", [proxy]),
         ));
-        report.fixes.push(FixOffer {
-            id: FixId::Privileged(PrivilegedFix::WinhttpResetProxy).as_text(),
-            title: "Сбросить прокси WinHTTP".into(),
-            detail: "То же, что «netsh winhttp reset proxy»: службы Windows снова будут \
-                     подключаться напрямую."
-                .into(),
-            needs_admin: true,
-            needs_reboot: false,
-        });
+        report.fixes.push(FixOffer::keyed(
+            FixId::Privileged(PrivilegedFix::WinhttpResetProxy).as_text(),
+            key("ts.network.winhttp_reset"),
+            key("ts.network.winhttp_reset_detail"),
+            true,
+            false,
+        ));
     }
-    report.fixes.push(FixOffer {
-        id: FixId::Privileged(PrivilegedFix::WinsockReset).as_text(),
-        title: "Сбросить сетевые настройки (Winsock)".into(),
-        detail: "Восстанавливает сетевой стек Windows, если его испортила другая программа. \
-                 Нужна перезагрузка ПК; некоторые VPN и антивирусы после сброса придётся \
-                 переустановить."
-            .into(),
-        needs_admin: true,
-        needs_reboot: true,
-    });
+    report.fixes.push(FixOffer::keyed(
+        FixId::Privileged(PrivilegedFix::WinsockReset).as_text(),
+        key("ts.network.winsock_reset"),
+        key("ts.network.winsock_reset_detail"),
+        true,
+        true,
+    ));
     report
 }
 
@@ -655,30 +639,30 @@ pub fn run_privileged(
 
 pub fn batch_error_finding(error: BatchError) -> Finding {
     match error {
-        BatchError::Cancelled => Finding::new(
+        BatchError::Cancelled => finding(
             Tone::Error,
-            "Исправления отменены",
-            "Без разрешения администратора их не выполнить.",
+            key("ts.batch.cancelled"),
+            key("ts.batch.cancelled_detail"),
         ),
-        BatchError::ServiceTooOld => Finding::new(
+        BatchError::ServiceTooOld => finding(
             Tone::Warning,
-            "Служба MULTICORE устарела",
-            "Обновите MULTICORE — тогда служба сможет выполнять эти исправления.",
+            key("ts.batch.service_too_old"),
+            key("ts.batch.service_too_old_detail"),
         ),
-        BatchError::Busy => Finding::new(
+        BatchError::Busy => finding(
             Tone::Error,
-            "MULTICORE запущен у другого пользователя",
-            "Исправления можно выполнить, когда он отключится.",
+            key("ts.batch.busy"),
+            key("ts.batch.busy_detail"),
         ),
-        BatchError::TunnelUp => Finding::new(
+        BatchError::TunnelUp => finding(
             Tone::Error,
-            "Сначала отключитесь",
-            "Пока работает подключение, адаптер Wintun удалять нельзя.",
+            key("ts.batch.tunnel_up"),
+            key("ts.batch.tunnel_up_detail"),
         ),
-        BatchError::Failed => Finding::new(
+        BatchError::Failed => finding(
             Tone::Error,
-            "Не удалось выполнить исправления",
-            "Запуск с правами администратора не удался. Повторите попытку.",
+            key("ts.batch.failed"),
+            key("ts.batch.failed_detail"),
         ),
     }
 }
@@ -690,77 +674,77 @@ pub fn privileged_finding(fix: PrivilegedFix, outcome: FixOutcome) -> Finding {
         (PrivilegedFix::RemoveDpiService { service }, outcome) => {
             let name = service.display_name();
             match outcome {
-                Done => Finding::new(
+                Done => finding(
                     Tone::Success,
-                    format!("Служба {name} удалена"),
-                    "Если она не успела остановиться, то исчезнет после перезагрузки.",
+                    key_with("ts.fix.dpi_removed", [name]),
+                    key("ts.fix.dpi_removed_detail"),
                 ),
-                NothingToDo => Finding::new(
+                NothingToDo => finding(
                     Tone::Info,
-                    format!("Службы {name} уже нет"),
-                    "Удалять нечего.",
+                    key_with("ts.fix.dpi_absent", [name]),
+                    key("ts.nothing_to_remove"),
                 ),
-                Failed => Finding::new(
+                Failed => finding(
                     Tone::Error,
-                    format!("Не удалось удалить службу {name}"),
-                    "Удалите программу через «Установка и удаление программ».",
+                    key_with("ts.fix.dpi_remove_failed", [name]),
+                    key("ts.fix.dpi_remove_failed_detail"),
                 ),
             }
         }
-        (PrivilegedFix::WinhttpResetProxy, Done | NothingToDo) => Finding::new(
+        (PrivilegedFix::WinhttpResetProxy, Done | NothingToDo) => finding(
             Tone::Success,
-            "Прокси WinHTTP сброшен",
-            "Службы Windows подключаются напрямую.",
+            key("ts.fix.winhttp_done"),
+            key("ts.fix.winhttp_done_detail"),
         ),
-        (PrivilegedFix::WinhttpResetProxy, Failed) => Finding::new(
+        (PrivilegedFix::WinhttpResetProxy, Failed) => finding(
             Tone::Error,
-            "Не удалось сбросить прокси WinHTTP",
-            "Выполните «netsh winhttp reset proxy» от имени администратора.",
+            key("ts.fix.winhttp_failed"),
+            key("ts.fix.winhttp_failed_detail"),
         ),
-        (PrivilegedFix::ResyncTime, Done | NothingToDo) => Finding::new(
+        (PrivilegedFix::ResyncTime, Done | NothingToDo) => finding(
             Tone::Success,
-            "Время синхронизировано",
-            "Часы сверены с сервером времени.",
+            key("ts.fix.time_done"),
+            key("ts.fix.time_done_detail"),
         ),
-        (PrivilegedFix::ResyncTime, Failed) => Finding::new(
+        (PrivilegedFix::ResyncTime, Failed) => finding(
             Tone::Error,
-            "Не удалось синхронизировать время",
-            "Включите «Установить время автоматически» в Параметры → Время и язык.",
+            key("ts.fix.time_failed"),
+            key("ts.fix.time_failed_detail"),
         ),
-        (PrivilegedFix::WinsockReset, Done | NothingToDo) => Finding::new(
+        (PrivilegedFix::WinsockReset, Done | NothingToDo) => finding(
             Tone::Success,
-            "Настройки Winsock сброшены",
-            "Перезагрузите ПК, чтобы изменения вступили в силу.",
+            key("ts.fix.winsock_done"),
+            key("ts.fix.winsock_done_detail"),
         ),
-        (PrivilegedFix::WinsockReset, Failed) => Finding::new(
+        (PrivilegedFix::WinsockReset, Failed) => finding(
             Tone::Error,
-            "Не удалось сбросить Winsock",
-            "Выполните «netsh winsock reset» от имени администратора.",
+            key("ts.fix.winsock_failed"),
+            key("ts.fix.winsock_failed_detail"),
         ),
-        (PrivilegedFix::ReinstallWintun, Done) => Finding::new(
+        (PrivilegedFix::ReinstallWintun, Done) => finding(
             Tone::Success,
-            "Адаптер Wintun удалён",
-            "MULTICORE создаст его заново при следующем подключении.",
+            key("ts.fix.wintun_done"),
+            key("ts.fix.wintun_done_detail"),
         ),
-        (PrivilegedFix::ReinstallWintun, NothingToDo) => Finding::new(
+        (PrivilegedFix::ReinstallWintun, NothingToDo) => finding(
             Tone::Info,
-            "Адаптера Wintun нет",
-            "Он будет создан заново при следующем подключении.",
+            key("ts.fix.wintun_absent"),
+            key("ts.fix.wintun_absent_detail"),
         ),
-        (PrivilegedFix::ReinstallWintun, Failed) => Finding::new(
+        (PrivilegedFix::ReinstallWintun, Failed) => finding(
             Tone::Error,
-            "Не удалось удалить адаптер Wintun",
-            "Перезагрузите ПК и повторите.",
+            key("ts.fix.wintun_failed"),
+            key("ts.fix.wintun_failed_detail"),
         ),
-        (PrivilegedFix::ReinstallService, Done | NothingToDo) => Finding::new(
+        (PrivilegedFix::ReinstallService, Done | NothingToDo) => finding(
             Tone::Success,
-            "Служба MULTICORE переустановлена",
-            "Служба зарегистрирована заново и запущена.",
+            key("ts.fix.service_done"),
+            key("ts.fix.service_done_detail"),
         ),
-        (PrivilegedFix::ReinstallService, Failed) => Finding::new(
+        (PrivilegedFix::ReinstallService, Failed) => finding(
             Tone::Error,
-            "Не удалось переустановить службу",
-            "Перезагрузите ПК и повторите или переустановите MULTICORE установщиком.",
+            key("ts.fix.service_failed"),
+            key("ts.fix.service_failed_detail"),
         ),
     }
 }
@@ -785,23 +769,25 @@ pub enum DroverRemoval {
 
 pub fn drover_removal_finding(result: DroverRemoval) -> Finding {
     match result {
-        DroverRemoval::Removed => Finding::new(
+        DroverRemoval::Removed => finding(
             Tone::Success,
-            "Drover удалён",
-            "Файлы удалены из папок Discord.",
+            key("ts.drover.removed"),
+            key("ts.drover.removed_detail"),
         ),
-        DroverRemoval::NothingFound => {
-            Finding::new(Tone::Info, "Drover не найден", "Удалять нечего.")
-        }
-        DroverRemoval::DiscordRunning => Finding::new(
-            Tone::Error,
-            "Закройте Discord и повторите",
-            "Пока Discord запущен, его файлы удалить нельзя.",
+        DroverRemoval::NothingFound => finding(
+            Tone::Info,
+            key("ts.drover.not_found"),
+            key("ts.nothing_to_remove"),
         ),
-        DroverRemoval::Failed => Finding::new(
+        DroverRemoval::DiscordRunning => finding(
             Tone::Error,
-            "Не удалось удалить Drover",
-            "Закройте Discord и повторите.",
+            key("ts.drover.close_discord"),
+            key("ts.drover.discord_running"),
+        ),
+        DroverRemoval::Failed => finding(
+            Tone::Error,
+            key("ts.drover.remove_failed"),
+            key("ts.drover.remove_failed_detail"),
         ),
     }
 }
@@ -890,10 +876,10 @@ impl Troubleshooting for SystemTroubleshooting {
 
     async fn fix(&self, _fixes: Vec<FixId>) -> FixReport {
         FixReport {
-            findings: vec![Finding::new(
+            findings: vec![finding(
                 Tone::Info,
-                "Доступно только в Windows",
-                "В Linux исправления выполняются вручную.",
+                key("ts.linux.fixes_unavailable"),
+                key("ts.linux.fixes_unavailable_detail"),
             )],
             reboot_recommended: false,
         }

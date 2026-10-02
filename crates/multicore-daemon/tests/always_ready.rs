@@ -15,8 +15,8 @@ use multicore_core::{
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, ConnectionState, CoreBackend, CoresReadiness,
-    ImportSubscriptionRequest, MihomoSelector, OptionsControllerFactory, PreparedController,
-    ProfileMutationError, SelectorError, options_controller_factory,
+    DaemonText, ImportSubscriptionRequest, MihomoSelector, OptionsControllerFactory,
+    PreparedController, ProfileMutationError, SelectorError, options_controller_factory,
 };
 
 pub const PROFILE_A: &str = "proxies:\n  - {name: node-a, type: socks5}\nproxy-groups:\n  - {name: g, type: select, proxies: [node-a]}\n";
@@ -404,11 +404,14 @@ async fn a_failing_warm_up_is_reported_once() {
 async fn a_notice_reaches_status_and_events() {
     let h = harness(&[PROFILE_A]);
     h.backend
-        .record_notice("service_unavailable", "Служба MULTICORE недоступна.")
+        .record_notice(
+            "service_unavailable",
+            DaemonText::code("service.unavailable_notice"),
+        )
         .await;
     assert_eq!(
         h.backend.status().await.unwrap().message.as_deref(),
-        Some("Служба MULTICORE недоступна.")
+        Some("Служба MULTICORE недоступна — права администратора будут запрошены при подключении.")
     );
     assert!(
         h.backend
@@ -416,7 +419,8 @@ async fn a_notice_reaches_status_and_events() {
             .await
             .unwrap()
             .iter()
-            .any(|event| event.message == "Служба MULTICORE недоступна.")
+            .any(|event| event.message == "Служба MULTICORE недоступна — права администратора будут запрошены при подключении."
+                && event.message_key.as_ref().is_some_and(|key| key.code == "service.unavailable_notice"))
     );
 }
 
@@ -898,14 +902,21 @@ async fn a_new_connection_is_checked_by_the_watcher_at_once() {
 async fn the_unavailable_notice_is_cleared_once_the_service_is_back() {
     let h = harness(&[PROFILE_A]);
     h.backend
-        .record_notice("service_unavailable", "Служба MULTICORE недоступна.")
+        .record_notice(
+            "service_unavailable",
+            DaemonText::code("service.unavailable_notice"),
+        )
         .await;
-    h.backend.clear_notice("другое сообщение").await;
+    h.backend
+        .clear_notice(&DaemonText::code("cores.lost"))
+        .await;
     assert_eq!(
         h.backend.status().await.unwrap().message.as_deref(),
-        Some("Служба MULTICORE недоступна.")
+        Some("Служба MULTICORE недоступна — права администратора будут запрошены при подключении.")
     );
-    h.backend.clear_notice("Служба MULTICORE недоступна.").await;
+    h.backend
+        .clear_notice(&DaemonText::code("service.unavailable_notice"))
+        .await;
     assert_eq!(h.backend.status().await.unwrap().message, None);
 }
 

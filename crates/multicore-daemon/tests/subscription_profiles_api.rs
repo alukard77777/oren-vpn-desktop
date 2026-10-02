@@ -26,6 +26,7 @@ impl Backend for MutationErrorBackend {
             profile: None,
             current_node: None,
             message: None,
+            message_key: None,
             degraded: false,
             subscription: None,
             cores_ready: false,

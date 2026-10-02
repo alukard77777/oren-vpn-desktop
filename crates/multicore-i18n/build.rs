@@ -85,10 +85,7 @@ fn main() {
         let _ = writeln!(out, "    ({msgid:?}, {msgstr:?}),");
     }
     out.push_str("];\n");
-    let _ = writeln!(
-        out,
-        "pub(crate) static PLURAL: &[((&str, &str), (&str, &str))] = &["
-    );
+    let _ = writeln!(out, "pub(crate) static PLURAL: &[PluralEntry] = &[");
     for ((msgid, msgid_plural), (one, other)) in &plural {
         let _ = writeln!(
             out,
