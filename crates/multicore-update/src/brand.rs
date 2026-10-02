@@ -43,6 +43,36 @@ fn normalize(path: &str) -> String {
         .to_lowercase()
 }
 
+/// The everyday spelling of a Windows path: `\\?\C:\x` becomes `C:\x` and `\\?\UNC\s\x`
+/// becomes `\\s\x`. `canonicalize` hands out the verbatim form; a process started from it
+/// sees its own path that way, and so would everything it writes for the user (the Run
+/// value, protocol handlers). Any other path, and one too long for the plain form, is kept.
+pub fn without_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    const MAX_PLAIN_PATH: usize = 259;
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let plain = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        let drive = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
+        if !drive {
+            return path.to_path_buf();
+        }
+        rest.to_owned()
+    } else {
+        return path.to_path_buf();
+    };
+    if plain.encode_utf16().count() > MAX_PLAIN_PATH || plain.contains('/') {
+        return path.to_path_buf();
+    }
+    plain.into()
+}
+
 /// `path` is `root` or lies beneath it (case-insensitive, `\\?\` and trailing `\` ignored).
 pub fn path_is_within(path: &str, root: &Path) -> bool {
     let Some(root) = root.to_str() else {
@@ -677,6 +707,42 @@ mod tests {
             None
         );
         assert_eq!(install_root_of_current(Path::new("current")), None);
+    }
+
+    #[test]
+    fn verbatim_prefix_is_dropped_only_where_the_plain_form_means_the_same() {
+        for (verbatim, plain) in [
+            (
+                r"\\?\C:\Program Files\MultiCore\current\MultiCore.exe",
+                r"C:\Program Files\MultiCore\current\MultiCore.exe",
+            ),
+            (
+                r"\\?\UNC\server\share\MultiCore.exe",
+                r"\\server\share\MultiCore.exe",
+            ),
+            (r"C:\Apps\MultiCore.exe", r"C:\Apps\MultiCore.exe"),
+            (
+                "/usr/lib/multicore/multicore",
+                "/usr/lib/multicore/multicore",
+            ),
+            // Not a drive path: `\\?\` is all that makes it valid.
+            (
+                r"\\?\Volume{0}\MultiCore.exe",
+                r"\\?\Volume{0}\MultiCore.exe",
+            ),
+        ] {
+            assert_eq!(
+                without_verbatim_prefix(Path::new(verbatim)),
+                PathBuf::from(plain),
+                "{verbatim}"
+            );
+        }
+        // Past MAX_PATH the plain form would not open; the verbatim one stays.
+        let long = format!(r"\\?\C:\{}\MultiCore.exe", "a".repeat(260));
+        assert_eq!(
+            without_verbatim_prefix(Path::new(&long)),
+            PathBuf::from(&long)
+        );
     }
 
     #[test]

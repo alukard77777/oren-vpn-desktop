@@ -77,7 +77,7 @@ fn is_installed_executable(executable: &Path) -> bool {
 /// Portable copies never claim the system-wide URL scheme for this user.
 #[cfg(windows)]
 pub fn ensure_url_protocol_registration() -> io::Result<()> {
-    let executable = std::env::current_exe()?;
+    let executable = launch_executable(&std::env::current_exe()?);
     if !is_installed_executable(&executable) {
         return Ok(());
     }
@@ -114,38 +114,118 @@ pub fn migrate_legacy_brand() {
         });
 }
 
+/// The executable autostart should start: the running one, spelled the plain way. After an
+/// in-app update the updater starts the new client from a canonicalized `\\?\` path, and
+/// `current_exe` then reports that spelling.
+pub fn launch_executable(current_executable: &Path) -> PathBuf {
+    multicore_release::brand::without_verbatim_prefix(current_executable)
+}
+
+/// `<install>` when `executable` is the installed `<install>\current\MultiCore.exe`.
+#[cfg(windows)]
+fn install_root_of(executable: &Path) -> Option<PathBuf> {
+    if !is_installed_executable(executable) {
+        return None;
+    }
+    executable
+        .parent()
+        .and_then(multicore_release::brand::install_root_of_current)
+        .map(launch_executable)
+}
+
+/// Autostart is on when the stored command starts this app: the running executable in any
+/// spelling (`\\?\`, case, `/`, missing `--background`), or, for an installed copy, the
+/// `MultiCore.exe` of an earlier layout or leftover inside the same install. Only a command
+/// that starts something else is stale; it is shown, never deleted or rewritten.
 pub fn classify_launch_command(
     stored_command: Option<&str>,
     current_executable: &Path,
+    install_root: Option<&Path>,
 ) -> io::Result<LaunchAtSignInState> {
-    let expected_command = build_launch_command(current_executable)?;
+    build_launch_command(&launch_executable(current_executable))?;
 
     let Some(stored_command) = stored_command else {
         return Ok(LaunchAtSignInState::Disabled);
     };
 
-    let Some(stored_executable) = parse_launch_command(stored_command) else {
-        return Ok(stale(stored_command));
-    };
-
-    if stored_command == expected_command
-        && paths_resolve_to_same_file(&stored_executable, current_executable)
-    {
-        Ok(LaunchAtSignInState::Enabled)
-    } else {
-        Ok(stale(stored_command))
+    match parse_launch_command(stored_command) {
+        Some(stored_executable)
+            if starts_this_app(&stored_executable, current_executable, install_root) =>
+        {
+            Ok(LaunchAtSignInState::Enabled)
+        }
+        _ => Ok(stale(stored_command)),
     }
 }
 
+/// The command to store instead of `stored_command` when autostart is on for this app but
+/// is not spelled the way it is written now. `None`: off, foreign, or already exact.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn repaired_launch_command(
+    stored_command: Option<&str>,
+    current_executable: &Path,
+    install_root: Option<&Path>,
+) -> io::Result<Option<String>> {
+    let expected = build_launch_command(&launch_executable(current_executable))?;
+    let state = classify_launch_command(stored_command, current_executable, install_root)?;
+    Ok(match (state, stored_command) {
+        (LaunchAtSignInState::Enabled, Some(stored)) if stored != expected => Some(expected),
+        _ => None,
+    })
+}
+
+/// The executable of `"<path>" --background`, `"<path>"`, or the same unquoted.
 fn parse_launch_command(command: &str) -> Option<PathBuf> {
-    let executable = command.strip_suffix(" --background")?;
-    let inner = executable.strip_prefix('"')?.strip_suffix('"')?;
+    let command = command.trim();
+    let executable = command
+        .strip_suffix(" --background")
+        .map(str::trim_end)
+        .unwrap_or(command);
+    let inner = match executable.strip_prefix('"') {
+        Some(quoted) => quoted.strip_suffix('"')?,
+        None => executable,
+    };
     if inner.is_empty() || inner.contains(['\0', '\r', '\n', '"']) {
         return None;
     }
 
     let path = PathBuf::from(inner);
     (path.is_absolute() && path.file_name().is_some()).then_some(path)
+}
+
+fn starts_this_app(stored: &Path, current: &Path, install_root: Option<&Path>) -> bool {
+    if path_key(stored) == path_key(current) || paths_resolve_to_same_file(stored, current) {
+        return true;
+    }
+    let (Some(root), Some(name), Some(current_name)) =
+        (install_root, stored.file_name(), current.file_name())
+    else {
+        return false;
+    };
+    same_name(name, current_name)
+        && stored
+            .to_str()
+            .is_some_and(|stored| multicore_release::brand::path_is_within(stored, root))
+}
+
+/// How a path compares: Windows paths ignore case, `\\?\` and `/` versus `\`.
+fn path_key(path: &Path) -> String {
+    let plain = launch_executable(path);
+    let text = plain.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('/', "\\").to_lowercase()
+    } else {
+        text.into_owned()
+    }
+}
+
+fn same_name(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
 }
 
 fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
@@ -168,7 +248,31 @@ fn stale(stored_command: &str) -> LaunchAtSignInState {
 #[cfg(windows)]
 pub fn query_launch_at_sign_in() -> io::Result<LaunchAtSignInState> {
     let current_executable = std::env::current_exe()?;
-    classify_launch_command(registry::read_run_value()?.as_deref(), &current_executable)
+    classify_launch_command(
+        registry::read_run_value()?.as_deref(),
+        &current_executable,
+        install_root_of(&current_executable).as_deref(),
+    )
+}
+
+/// Startup self-heal: an autostart value that starts this app in another spelling (`\\?\`
+/// written by a client the updater relaunched, an earlier layout of this install) is
+/// rewritten to the plain command for the running executable. The value keeps its name, so
+/// the user's Task Manager choice (`StartupApproved\Run\MultiCore`) stays as it was. Off and
+/// foreign values are left alone. True when the value was rewritten.
+#[cfg(windows)]
+pub fn repair_launch_at_sign_in() -> io::Result<bool> {
+    let current_executable = std::env::current_exe()?;
+    let Some(command) = repaired_launch_command(
+        registry::read_run_value()?.as_deref(),
+        &current_executable,
+        install_root_of(&current_executable).as_deref(),
+    )?
+    else {
+        return Ok(false);
+    };
+    registry::write_run_value(&command)?;
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -190,6 +294,7 @@ pub fn set_launch_at_sign_in(enabled: bool) -> io::Result<LaunchAtSignInState> {
     apply_launch_at_sign_in_change(
         enabled,
         &current_executable,
+        install_root_of(&current_executable).as_deref(),
         registry::write_run_value,
         registry::delete_run_value,
         registry::read_run_value,
@@ -340,7 +445,7 @@ mod autostart {
     }
 
     pub(super) fn query_in(entry: &Path, executable: &Path) -> io::Result<LaunchAtSignInState> {
-        classify_launch_command(read_exec(entry)?.as_deref(), executable)
+        classify_launch_command(read_exec(entry)?.as_deref(), executable, None)
     }
 
     pub(super) fn apply_in(
@@ -354,6 +459,7 @@ mod autostart {
         apply_launch_at_sign_in_change(
             enabled,
             executable,
+            None,
             |command| write_entry(entry, command),
             || delete_entry(entry),
             || read_exec(entry),
@@ -364,6 +470,7 @@ mod autostart {
 fn apply_launch_at_sign_in_change<Write, Delete, Read>(
     enabled: bool,
     current_executable: &Path,
+    install_root: Option<&Path>,
     mut write: Write,
     mut delete: Delete,
     mut read: Read,
@@ -374,12 +481,14 @@ where
     Read: FnMut() -> io::Result<Option<String>>,
 {
     if enabled {
-        write(&build_launch_command(current_executable)?)?;
+        write(&build_launch_command(&launch_executable(
+            current_executable,
+        ))?)?;
     } else {
         delete()?;
     }
 
-    let observed = classify_launch_command(read()?.as_deref(), current_executable)?;
+    let observed = classify_launch_command(read()?.as_deref(), current_executable, install_root)?;
     let verified = matches!(
         (enabled, &observed),
         (true, LaunchAtSignInState::Enabled) | (false, LaunchAtSignInState::Disabled)
@@ -561,6 +670,7 @@ mod tests {
     use super::{
         LaunchAtSignInState, apply_launch_at_sign_in_change, build_launch_command,
         build_protocol_command, classify_launch_command, is_installed_executable,
+        launch_executable, repaired_launch_command,
     };
     use std::cell::RefCell;
     use std::path::Path;
@@ -595,25 +705,181 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn only_the_exact_background_command_is_enabled() {
+    fn commands_that_start_this_executable_are_enabled_and_others_stale() {
         let executable = Path::new(r"C:\Apps\MultiCore.exe");
-        let exact = r#""C:\Apps\MultiCore.exe" --background"#;
-        assert_eq!(
-            classify_launch_command(Some(exact), executable).unwrap(),
-            LaunchAtSignInState::Enabled
-        );
-
-        for stale in [
+        for ours in [
+            r#""C:\Apps\MultiCore.exe" --background"#,
             r#""C:\Apps\MultiCore.exe""#,
-            r#""C:\Apps\MultiCore.exe" --background --extra"#,
             r#"C:\Apps\MultiCore.exe --background"#,
             r#" "C:\Apps\MultiCore.exe" --background "#,
         ] {
-            assert!(matches!(
-                classify_launch_command(Some(stale), executable).unwrap(),
-                LaunchAtSignInState::Stale { .. }
-            ));
+            assert_eq!(
+                classify_launch_command(Some(ours), executable, None).unwrap(),
+                LaunchAtSignInState::Enabled,
+                "{ours}"
+            );
         }
+
+        for stale in [
+            r#""C:\Apps\MultiCore.exe" --background --extra"#,
+            r#""C:\Apps\MultiCore.exe --background"#,
+            r#""C:\Other\MultiCore.exe" --background"#,
+        ] {
+            assert!(
+                matches!(
+                    classify_launch_command(Some(stale), executable, None).unwrap(),
+                    LaunchAtSignInState::Stale { .. }
+                ),
+                "{stale}"
+            );
+        }
+    }
+
+    const INSTALLED: &str = r"C:\Program Files\MultiCore\current\MultiCore.exe";
+    const VERBATIM: &str = r"\\?\C:\Program Files\MultiCore\current\MultiCore.exe";
+    const ROOT: &str = r"C:\Program Files\MultiCore";
+    const CANONICAL: &str = r#""C:\Program Files\MultiCore\current\MultiCore.exe" --background"#;
+
+    /// The updater relaunches the new client from a canonicalized (`\\?\`) path, while the
+    /// installer, the shortcuts and an earlier toggle use the plain one. Either spelling of
+    /// the same executable is the user's autostart and must read as on.
+    #[test]
+    fn every_spelling_of_the_running_executable_is_enabled() {
+        for (stored, running) in [
+            (CANONICAL, VERBATIM),
+            (
+                r#""\\?\C:\Program Files\MultiCore\current\MultiCore.exe" --background"#,
+                INSTALLED,
+            ),
+            (
+                r#""\\?\C:\Program Files\MultiCore\current\MultiCore.exe" --background"#,
+                VERBATIM,
+            ),
+            (
+                r#""c:\program files\multicore\CURRENT\multicore.exe" --background"#,
+                INSTALLED,
+            ),
+            (
+                r#""C:/Program Files/MultiCore/current/MultiCore.exe" --background"#,
+                INSTALLED,
+            ),
+            (
+                r#""C:\Program Files\MultiCore\current\MultiCore.exe""#,
+                INSTALLED,
+            ),
+            (
+                r#"  "C:\Program Files\MultiCore\current\MultiCore.exe" --background "#,
+                INSTALLED,
+            ),
+        ] {
+            for root in [None, Some(Path::new(ROOT))] {
+                assert_eq!(
+                    classify_launch_command(Some(stored), Path::new(running), root).unwrap(),
+                    LaunchAtSignInState::Enabled,
+                    "{stored} for {running}"
+                );
+            }
+        }
+    }
+
+    /// Whatever spelling is stored, startup rewrites it to the plain command for the running
+    /// executable; the value keeps its name, so Task Manager's StartupApproved state stays.
+    #[test]
+    fn startup_repairs_any_spelling_to_the_plain_command() {
+        let root = Some(Path::new(ROOT));
+        for running in [INSTALLED, VERBATIM] {
+            for stored in [
+                r#""\\?\C:\Program Files\MultiCore\current\MultiCore.exe" --background"#,
+                r#""c:\program files\multicore\current\multicore.exe" --background"#,
+                r#""C:\Program Files\MultiCore\current\MultiCore.exe""#,
+                // Earlier layouts and leftovers of this install.
+                r#""C:\Program Files\MultiCore\MultiCore.exe" --background"#,
+                r#""C:\Program Files\MultiCore\.multicore-previous-1.1.4-77\MultiCore.exe" --background"#,
+            ] {
+                assert_eq!(
+                    repaired_launch_command(Some(stored), Path::new(running), root)
+                        .unwrap()
+                        .as_deref(),
+                    Some(CANONICAL),
+                    "{stored} for {running}"
+                );
+            }
+            assert_eq!(
+                repaired_launch_command(Some(CANONICAL), Path::new(running), root).unwrap(),
+                None,
+                "the canonical command is left alone"
+            );
+            assert_eq!(
+                repaired_launch_command(None, Path::new(running), root).unwrap(),
+                None,
+                "autostart that is off stays off"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_commands_are_stale_and_never_rewritten() {
+        let root = Some(Path::new(ROOT));
+        for stored in [
+            r#""D:\Portable\MultiCore\MultiCore.exe" --background"#,
+            r#""C:\Program Files\MultiCore2\current\MultiCore.exe" --background"#,
+            r#""C:\Program Files\MultiCore\current\Other.exe" --background"#,
+            r#""C:\Program Files\MultiCore\current\MultiCore.exe" --background --extra"#,
+            "not a command",
+        ] {
+            assert!(
+                matches!(
+                    classify_launch_command(Some(stored), Path::new(INSTALLED), root).unwrap(),
+                    LaunchAtSignInState::Stale { .. }
+                ),
+                "{stored}"
+            );
+            assert_eq!(
+                repaired_launch_command(Some(stored), Path::new(INSTALLED), root).unwrap(),
+                None,
+                "{stored}"
+            );
+        }
+        // A portable copy only owns its own executable, not a folder around it.
+        assert!(matches!(
+            classify_launch_command(
+                Some(r#""C:\Program Files\MultiCore\MultiCore.exe" --background"#),
+                Path::new(INSTALLED),
+                None
+            )
+            .unwrap(),
+            LaunchAtSignInState::Stale { .. }
+        ));
+    }
+
+    #[test]
+    fn turning_on_from_a_verbatim_launch_writes_the_plain_command() {
+        let stored = Rc::new(RefCell::new(None::<String>));
+        let write_store = stored.clone();
+        let read_store = stored.clone();
+        let state = apply_launch_at_sign_in_change(
+            true,
+            &launch_executable(Path::new(VERBATIM)),
+            Some(Path::new(ROOT)),
+            move |command| {
+                *write_store.borrow_mut() = Some(command.to_owned());
+                Ok(())
+            },
+            || Ok(()),
+            move || Ok(read_store.borrow().clone()),
+        )
+        .unwrap();
+        assert_eq!(state, LaunchAtSignInState::Enabled);
+        assert_eq!(stored.borrow().as_deref(), Some(CANONICAL));
+    }
+
+    #[test]
+    fn launch_executable_drops_only_the_verbatim_prefix() {
+        assert_eq!(launch_executable(Path::new(VERBATIM)), Path::new(INSTALLED));
+        assert_eq!(
+            launch_executable(Path::new(INSTALLED)),
+            Path::new(INSTALLED)
+        );
     }
 
     #[cfg(windows)]
@@ -628,6 +894,7 @@ mod tests {
         let enabled = apply_launch_at_sign_in_change(
             true,
             executable,
+            None,
             move |command| {
                 *write_store.borrow_mut() = Some(command.to_owned());
                 Ok(())
@@ -641,8 +908,14 @@ mod tests {
         .unwrap();
         assert_eq!(enabled, LaunchAtSignInState::Enabled);
 
-        let ignored_write =
-            apply_launch_at_sign_in_change(true, executable, |_| Ok(()), || Ok(()), || Ok(None));
+        let ignored_write = apply_launch_at_sign_in_change(
+            true,
+            executable,
+            None,
+            |_| Ok(()),
+            || Ok(()),
+            || Ok(None),
+        );
         assert!(ignored_write.is_err());
     }
 }

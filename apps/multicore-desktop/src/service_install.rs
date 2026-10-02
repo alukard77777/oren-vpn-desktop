@@ -12,7 +12,11 @@ static PENDING_INSTALLER: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub(crate) fn is_per_user_install(executable: &Path, local_app_data: &Path) -> bool {
     let normalize = |path: &Path| path.to_string_lossy().replace('/', "\\").to_lowercase();
-    normalize(executable).starts_with(&(normalize(local_app_data) + "\\programs\\multicore\\"))
+    // A client the updater relaunched sees its own path as `\\?\C:\...`.
+    normalize(&multicore_release::brand::without_verbatim_prefix(
+        executable,
+    ))
+    .starts_with(&(normalize(local_app_data) + "\\programs\\multicore\\"))
 }
 
 fn card_visible_on(windows: bool, per_user_install: bool, service_mode: bool) -> bool {
@@ -167,6 +171,11 @@ mod tests {
         ));
         assert!(is_per_user_install(
             Path::new(r"c:\users\ME\appdata\local\programs\multicore\current\MultiCore.exe"),
+            local
+        ));
+        // Relaunched by the updater after an in-app update.
+        assert!(is_per_user_install(
+            Path::new(r"\\?\C:\Users\me\AppData\Local\Programs\MultiCore\current\MultiCore.exe"),
             local
         ));
         assert!(!is_per_user_install(

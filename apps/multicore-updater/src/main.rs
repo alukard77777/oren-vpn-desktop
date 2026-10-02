@@ -8,7 +8,8 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use multicore_release::{
-    Version, extract_verified_bundle, rename_with_retry, transactional_swap, verify_archive_file,
+    Version, brand, extract_verified_bundle, rename_with_retry, transactional_swap,
+    verify_archive_file,
 };
 use serde::Serialize;
 
@@ -362,11 +363,14 @@ fn relaunch_current_client(request: &ApplyRequest) -> io::Result<()> {
 }
 
 /// Starts the desktop: directly without the service, in the user's session in service mode.
+/// Always from the plain path: `target` is canonicalized (`\\?\C:\...`), and a client started
+/// from that spelling sees it as its own path and writes it into the user's autostart value.
 fn launch_client(
     request: &ApplyRequest,
     executable: &Path,
     directory: &Path,
 ) -> io::Result<Box<dyn LaunchedClient>> {
+    let (executable, directory) = &client_launch_paths(executable, directory);
     match &request.service {
         None => Command::new(executable)
             .current_dir(directory)
@@ -381,6 +385,13 @@ fn launch_client(
         #[cfg(not(windows))]
         Some(_) => Err(io::Error::other("service mode is Windows-only")),
     }
+}
+
+fn client_launch_paths(executable: &Path, directory: &Path) -> (PathBuf, PathBuf) {
+    (
+        brand::without_verbatim_prefix(executable),
+        brand::without_verbatim_prefix(directory),
+    )
 }
 
 /// In service mode, (re)starts the MultiCore service; a no-op otherwise.
@@ -958,6 +969,28 @@ mod tests {
         assert!(found.contains(&child.id()), "{found:?}");
         // The test binary itself is excluded because it is the calling process.
         assert!(!super::processes_under(exe.parent().unwrap()).contains(&std::process::id()));
+    }
+
+    /// `apply_update` canonicalizes the target; the relaunched client must not inherit the
+    /// `\\?\` spelling (it would write it into the user's autostart value).
+    #[test]
+    fn the_client_is_relaunched_from_the_plain_path() {
+        let (executable, directory) = super::client_launch_paths(
+            Path::new(r"\\?\C:\Program Files\MultiCore\current\MultiCore.exe"),
+            Path::new(r"\\?\C:\Program Files\MultiCore\current"),
+        );
+        assert_eq!(
+            executable,
+            Path::new(r"C:\Program Files\MultiCore\current\MultiCore.exe")
+        );
+        assert_eq!(directory, Path::new(r"C:\Program Files\MultiCore\current"));
+        let source = include_str!("main.rs");
+        let launch = source
+            .split("fn launch_client(")
+            .nth(1)
+            .and_then(|body| body.split("\nfn ").next())
+            .expect("launch_client body");
+        assert!(launch.contains("client_launch_paths(executable, directory)"));
     }
 
     #[test]

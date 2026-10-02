@@ -49,7 +49,7 @@ fn missing_registry_value_is_disabled() {
     let executable = absolute_executable("MultiCore.exe");
 
     assert_eq!(
-        classify_launch_command(None, &executable).unwrap(),
+        classify_launch_command(None, &executable, None).unwrap(),
         LaunchAtSignInState::Disabled
     );
 }
@@ -60,7 +60,7 @@ fn exact_quoted_current_executable_is_enabled() {
     let command = build_launch_command(&executable).unwrap();
 
     assert_eq!(
-        classify_launch_command(Some(&command), &executable).unwrap(),
+        classify_launch_command(Some(&command), &executable, None).unwrap(),
         LaunchAtSignInState::Enabled
     );
 }
@@ -72,16 +72,30 @@ fn another_or_malformed_command_is_stale() {
 
     for stored in [
         other.as_str(),
-        executable.to_string_lossy().as_ref(),
-        &format!("\"{}\"", executable.display()),
         &format!("\"{}\" --background --extra", executable.display()),
         "\"unterminated",
     ] {
         assert_eq!(
-            classify_launch_command(Some(stored), &executable).unwrap(),
+            classify_launch_command(Some(stored), &executable, None).unwrap(),
             LaunchAtSignInState::Stale {
                 stored_command: stored.to_owned(),
             }
+        );
+    }
+}
+
+#[test]
+fn the_current_executable_without_quotes_or_background_flag_is_still_enabled() {
+    let executable = absolute_executable("MultiCore.exe");
+
+    for stored in [
+        executable.to_string_lossy().into_owned(),
+        format!("\"{}\"", executable.display()),
+    ] {
+        assert_eq!(
+            classify_launch_command(Some(&stored), &executable, None).unwrap(),
+            LaunchAtSignInState::Enabled,
+            "{stored}"
         );
     }
 }

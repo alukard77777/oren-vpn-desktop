@@ -878,6 +878,14 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     // An in-app update from 1.1.1 kept the installer's "MultiCore" entry and shortcuts.
     #[cfg(windows)]
     windows_settings::migrate_legacy_brand();
+    // The updater relaunches the new version from a `\\?\` path; an autostart value written
+    // in that (or any older) spelling of this app is put back in the plain form, kept on.
+    #[cfg(windows)]
+    match windows_settings::repair_launch_at_sign_in() {
+        Ok(true) => eprintln!("autostart command repaired for this executable"),
+        Ok(false) => {}
+        Err(error) => eprintln!("autostart command could not be repaired: {error}"),
+    }
     #[cfg(target_os = "linux")]
     if let Some(appimage) = appimage_handoff::handed_off_from() {
         match windows_settings::adopt_launch_at_sign_in_from(&appimage) {
@@ -8598,6 +8606,24 @@ mod window_tests {
             .find("windows_settings::migrate_legacy_brand();")
             .expect("installed copies rename the 1.1.1 entry and shortcuts on startup");
         assert!(forwarding < migration);
+    }
+
+    /// After an in-app update the primary instance puts the user's autostart value back in
+    /// the plain spelling before the settings page first reads it.
+    #[cfg(windows)]
+    #[test]
+    fn the_primary_instance_repairs_autostart_before_showing_it() {
+        let source = include_str!("main.rs");
+        let forwarding = source
+            .find("single_instance::claim_or_forward(&activation)")
+            .expect("single-instance forwarding");
+        let repair = source
+            .find("windows_settings::repair_launch_at_sign_in()")
+            .expect("startup repairs the autostart value");
+        let first_query = source
+            .find("apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in())")
+            .expect("the settings page reads autostart on startup");
+        assert!(forwarding < repair && repair < first_query);
     }
 
     #[test]
