@@ -5,6 +5,7 @@
 //!
 //! Screenshots are written to `artifacts/screenshots/<MULTICORE_PREVIEW_SET or "current">`.
 //! `MULTICORE_PREVIEW_SCALE=1.25` renders at a display scale factor (pixel-alignment checks).
+//! `MULTICORE_PREVIEW_LANG=en` renders the English interface (Russian otherwise).
 //! No window, GPU, daemon, or user data directory is touched.
 
 use std::cell::RefCell;
@@ -77,6 +78,33 @@ fn settle(steps: u32) {
         std::thread::sleep(Duration::from_millis(120));
         slint::platform::update_timers_and_animations();
     }
+}
+
+/// `MULTICORE_PREVIEW_LANG=en`: the interface language of the previews (Russian otherwise).
+fn preview_language() -> multicore_i18n::Lang {
+    std::env::var("MULTICORE_PREVIEW_LANG")
+        .ok()
+        .and_then(|tag| multicore_i18n::Lang::from_tag(&tag))
+        .unwrap_or_default()
+}
+
+/// A main window in the preview language. Slint picks a bundled translation from the system
+/// locale when the first component is created, so the language is selected every time.
+fn new_app() -> AppWindow {
+    let ui = AppWindow::new().expect("create app window");
+    let language = preview_language();
+    slint::select_bundled_translation(language.slint_bundle())
+        .expect("select the preview language");
+    ui.set_language(language.code().into());
+    ui
+}
+
+/// A tray popup in the preview language (see [`new_app`]).
+fn new_popup() -> TrayPopup {
+    let popup = TrayPopup::new().expect("create tray popup");
+    slint::select_bundled_translation(preview_language().slint_bundle())
+        .expect("select the preview language");
+    popup
 }
 
 /// `MULTICORE_PREVIEW_ONLY=chip,tray` renders only scenarios starting with those prefixes.
@@ -1309,7 +1337,7 @@ fn chip_motion_strip(unlimited: bool) {
     const WIDTH: u32 = 840;
     const HEIGHT: u32 = 720;
     const STRIP: (u32, u32, u32, u32) = (40, 0, 300, 50);
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     if unlimited {
         chip(&ui, "∞ GiB", "12 дн.", -1.0, "accent");
     } else {
@@ -1457,18 +1485,20 @@ fn tray_connected(popup: &TrayPopup) {
 #[ignore = "writes preview screenshots; run explicitly with --features preview-render"]
 fn render_ui_previews() {
     slint::platform::set_platform(Box::new(PreviewPlatform)).expect("install preview platform");
+    // Texts built in Rust (`tr!`) follow the same language on this thread.
+    std::mem::forget(multicore_i18n::ThreadLanguage::set(preview_language()));
     for (name, width, height, setup) in scenarios() {
         if !wanted(name) {
             continue;
         }
-        let ui = AppWindow::new().expect("create app window");
+        let ui = new_app();
         setup(&ui);
         capture(&ui, name, width, height);
     }
 
     // Motion frame 2: the provider logo right after it popped in (before the
     // 350 ms phase timer hands over to the hold).
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     chip(&ui, "86.4 GiB", "12 дн.", 0.136, "accent");
     ui.set_chip_phase(s("logo"));
     capture_after(&ui, "chip-motion-2-logo", 840, 720, 1);
@@ -1480,7 +1510,7 @@ fn render_ui_previews() {
 
     // One window through expand → collapse, like a user toggling the rail while
     // the window grows and shrinks with it: the list must reflow both ways.
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     connected(&ui);
     ui.set_navigation_collapsed(false);
     capture(&ui, "rail-sequence-1-expanded", 1016, 720);
@@ -1489,7 +1519,7 @@ fn render_ui_previews() {
 
     // Real-world exit line (long node + group + speeds) at the minimum window size
     // must elide inside the card instead of widening the layout past the window.
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     connected(&ui);
     ui.set_node_name(s("Auto Sweden"));
     ui.set_exit_now_name(s("Sweden [se]"));
@@ -1502,22 +1532,22 @@ fn render_ui_previews() {
 
     // Quota tooltips: the pointer rests on the chip's ring, its quota line, a dropdown row's
     // quota column, and the chip at the narrowest window.
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     chip_normal(&ui);
     capture_hover(&ui, "chip-tooltip-ring", 840, 720, (71.0, 19.0));
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     chip(&ui, "∞ GiB", "Бессрочно", -1.0, "accent");
     capture_hover(&ui, "chip-tooltip-unlimited-meta", 840, 720, (190.0, 19.0));
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     chip(&ui, "40.0 GiB", "Срок истёк", 0.6, "danger");
     capture_hover(&ui, "chip-tooltip-expired-min", 700, 620, (71.0, 19.0));
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     chip_normal(&ui);
     ui.set_profile_switch_locked(false);
     ui.set_subscription_profiles(profiles(5));
     ui.set_active_panel(s("subscription"));
     capture_hover(&ui, "chip-tooltip-menu-row", 840, 720, (350.0, 145.0));
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     chip_normal(&ui);
     ui.set_profile_switch_locked(false);
     ui.set_subscription_profiles(profiles(5));
@@ -1530,7 +1560,7 @@ fn render_ui_previews() {
         ("home-announcement-switch-2-hidden", 140),
     ] {
         if wanted(name) {
-            let ui = AppWindow::new().expect("create app window");
+            let ui = new_app();
             ready(&ui);
             ui.set_reduced_motion(false);
             ui.set_subscription_announcement_text(s(
@@ -1542,31 +1572,31 @@ fn render_ui_previews() {
         }
     }
 
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     capture(&popup, "tray-connected", 304, 460);
 
     // Dragged larger by its top-left corner: only the accent edges light up (no size readout).
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_node_rows(tray_many_rows());
     popup.set_resize_active(s("c"));
     capture(&popup, "tray-resizing", 400, 640);
 
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_node_rows(tray_many_rows());
     capture(&popup, "tray-large", 400, 640);
 
     // No traffic limit: infinite traffic, no usage bar.
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_subscription_remaining(s("∞ GiB"));
     popup.set_subscription_days(s("Бессрочно"));
     popup.set_subscription_unlimited(true);
     capture(&popup, "tray-unlimited", 304, 460);
 
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_toggle_title(s("Подключение…"));
     popup.set_toggle_busy(true);
@@ -1575,7 +1605,7 @@ fn render_ui_previews() {
     popup.set_reduced_motion(true);
     capture(&popup, "tray-connecting", 304, 460);
 
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_toggle_title(s("Защита выключена"));
     popup.set_toggle_on(false);
@@ -1586,7 +1616,7 @@ fn render_ui_previews() {
     popup.set_connection_label(s("Подключиться"));
     capture(&popup, "tray-off", 304, 460);
 
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_toggle_title(s("Не удалось подключиться"));
     popup.set_toggle_on(false);
@@ -1596,7 +1626,7 @@ fn render_ui_previews() {
     popup.set_subscription_failed(true);
     capture(&popup, "tray-error", 304, 460);
 
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     popup.set_status_text(s("Профиль не добавлен"));
     popup.set_connection_label(s("Подключиться"));
     popup.set_connection_enabled(false);
@@ -1680,13 +1710,13 @@ fn scroll_previews() {
         for (suffix, width, height) in [("", 840, 720), ("-min", 700, 620)] {
             let top = format!("{name}{suffix}-top");
             if wanted(&top) {
-                let ui = AppWindow::new().expect("create app window");
+                let ui = new_app();
                 setup(&ui);
                 capture(&ui, &top, width, height);
             }
             let end = format!("{name}{suffix}-end");
             if wanted(&end) {
-                let ui = AppWindow::new().expect("create app window");
+                let ui = new_app();
                 setup(&ui);
                 capture_scrolled(
                     &ui,
@@ -1953,7 +1983,7 @@ fn v112_previews() {
         if !wanted(name) {
             continue;
         }
-        let ui = AppWindow::new().expect("create app window");
+        let ui = new_app();
         setup(&ui);
         capture(&ui, name, *width, *height);
     }
@@ -1968,7 +1998,7 @@ fn v112_previews() {
         if !wanted(name) {
             continue;
         }
-        let popup = TrayPopup::new().expect("create tray popup");
+        let popup = new_popup();
         tray_connected(&popup);
         popup.set_reduced_motion(true);
         popup.set_group_rows(v112_tray_groups(if *dumb { 1 } else { 9 }, selected));
@@ -2116,7 +2146,7 @@ fn icon_loading_previews() {
         if !wanted(name) {
             continue;
         }
-        let ui = AppWindow::new().expect("create app window");
+        let ui = new_app();
         setup(&ui);
         capture(&ui, name, *width, *height);
     }
@@ -2128,7 +2158,7 @@ fn icon_loading_previews() {
         if !wanted(name) {
             continue;
         }
-        let popup = TrayPopup::new().expect("create tray popup");
+        let popup = new_popup();
         loading_tray(&popup);
         popup.set_reduced_motion(reduced);
         capture(&popup, name, 304, 460);
@@ -2144,7 +2174,7 @@ fn icon_placeholder_animates_only_while_loading() {
     // Another test on this thread may have installed it already.
     let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
     install_v112_icons();
-    let popup = TrayPopup::new().expect("create tray popup");
+    let popup = new_popup();
     tray_connected(&popup);
     popup.set_reduced_motion(false);
     let nodes = Rc::new(VecModel::from(
@@ -2211,7 +2241,7 @@ fn a_route_click_survives_snapshots_that_keep_the_rows() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::cell::Cell;
     let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
-    let ui = AppWindow::new().expect("create app window");
+    let ui = new_app();
     connected(&ui);
     ui.set_catalog_groups(groups());
     ui.set_catalog_nodes(nodes(false));
@@ -2280,7 +2310,7 @@ fn a_route_click_survives_snapshots_that_keep_the_rows() {
 fn an_auto_opened_notice_closes_and_hover_only_pauses_it() {
     let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
     let open_notice = |pointer: Option<(f32, f32)>| {
-        let ui = AppWindow::new().expect("create app window");
+        let ui = new_app();
         ready(&ui);
         ui.set_reduced_motion(false);
         ui.set_subscription_announcement_text(s(
