@@ -3119,3 +3119,178 @@ fn a_large_tray_popup_fills_its_route_list() {
     );
     popup.hide().expect("hide tray popup");
 }
+
+/// The shape of the subscription whose route list closed 1.1.4 on the first wheel notch
+/// (redacted): eight groups, one of 2 routes and the others of 101-102 (99 servers plus the
+/// auto group, DIRECT and other groups as routes).
+fn subscription_shaped_groups() -> ModelRc<UiCatalogGroup> {
+    let rows = [
+        ("🌍", "Зарубежные сайты"),
+        ("🇷🇺", "Российские сайты"),
+        ("💬", "Discord"),
+        ("✈️", "Telegram"),
+        ("✨", "AI"),
+        ("⬇️", "Torrent"),
+        ("📺", "YouTube"),
+        ("🌐", "Прочее"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (icon, label))| UiCatalogGroup {
+        id: format!("g-0000000000000000-{index:04}").into(),
+        icon: s(icon),
+        icon_image: crate::emoji_images::image_for(icon),
+        icon_loading: false,
+        label: s(label),
+        selected: index == 0,
+    })
+    .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// One group of that subscription: the auto group, DIRECT, then servers ("Node …" labels so
+/// `list_rows` finds them), some still measuring.
+fn subscription_shaped_nodes(count: usize) -> ModelRc<UiCatalogNode> {
+    let flags = ["⚡", "↗️", "🇩🇪", "🇳🇱", "🇬🇧", "🇵🇱", "🇫🇮", "🇸🇪", "🇺🇸", "🇰🇿"];
+    let rows = (0..count)
+        .map(|index| {
+            let icon = flags[index % flags.len()];
+            UiCatalogNode {
+                id: format!("n-0000000000000000-0000-{index:04}").into(),
+                icon: icon.into(),
+                icon_image: crate::emoji_images::image_for(icon),
+                icon_loading: false,
+                label: format!("Node {index:04} ⚡ Server").into(),
+                selected: index == 0,
+                latency_text: if index % 3 == 0 {
+                    "".into()
+                } else {
+                    format!("{} мс", 40 + index * 7 % 500).into()
+                },
+                latency_tone: "success".into(),
+                measuring: index % 3 == 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(rows))
+}
+
+/// One notch of a real mouse wheel, as the winit backend delivers it: a wheel event in the
+/// `Moved` phase (`WindowEvent::PointerScrolled` jumps instead), so Slint scrolls smoothly with
+/// a physics animation bounded by the list's own geometry. The pointer keeps moving while it
+/// runs and frames are drawn, as on a desktop.
+fn wheel_notch(at: (f32, f32), delta_y: f32) {
+    use i_slint_core::input::{MouseEvent, TouchPhase};
+    use i_slint_core::lengths::LogicalPoint;
+    use i_slint_core::window::WindowInner;
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    let position = slint::LogicalPosition::new(at.0, at.1);
+    window.dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    WindowInner::from_pub(window.window()).process_mouse_input(MouseEvent::Wheel {
+        position: LogicalPoint::new(at.0, at.1),
+        delta_x: 0.0,
+        delta_y,
+        phase: TouchPhase::Moved,
+    });
+    for frame in 0..5 {
+        advance_clock(Duration::from_millis(16));
+        window.dispatch_event(slint::platform::WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(at.0 + (frame % 2) as f32, at.1),
+        });
+        draw_frame();
+    }
+    // The smooth scroll takes 180 ms.
+    advance_clock(Duration::from_millis(200));
+}
+
+/// 1.1.4 closed the moment the wheel turned over a route list (home, search results, tray):
+/// the list's card followed the scroll position and the scrolled area sat inside the card, so
+/// the area's position depended on its own scroll position, and Slint's smooth wheel scroll,
+/// which bounds itself by that area, panicked with "Recursion detected".
+#[test]
+fn the_mouse_wheel_scrolls_the_route_list_of_a_large_subscription() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    connected(&ui);
+    ui.set_catalog_groups(subscription_shaped_groups());
+    ui.set_catalog_nodes(subscription_shaped_nodes(102));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    draw_frame();
+    for _ in 0..4 {
+        wheel_notch((420.0, 560.0), -120.0);
+    }
+    let down = assert_rows_fill_the_list(&ui, "wheel down");
+    assert!(row_index(&down[0]) > 0, "the list scrolled: {down:?}");
+    // Fast spins to the end.
+    for _ in 0..3 {
+        wheel_notch((420.0, 560.0), -100_000.0);
+        draw_frame();
+    }
+    let end = assert_rows_fill_the_list(&ui, "wheel to the end");
+    assert!(
+        end.last().expect("rows").starts_with("Node 0101"),
+        "{end:?}"
+    );
+    // Another group, much shorter, under a list scrolled to its end.
+    ui.set_catalog_nodes(subscription_shaped_nodes(2));
+    draw_frame();
+    wheel_notch((420.0, 560.0), -120.0);
+    wheel_notch((420.0, 560.0), 120.0);
+    ui.set_catalog_nodes(subscription_shaped_nodes(101));
+    draw_frame();
+    for _ in 0..3 {
+        wheel_notch((420.0, 560.0), -120.0);
+        wheel_notch((420.0, 560.0), 120.0);
+    }
+    assert_rows_fill_the_list(&ui, "after switching groups");
+    ui.hide().expect("hide app window");
+}
+
+#[test]
+fn the_mouse_wheel_scrolls_route_search_results() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    connected(&ui);
+    ui.set_route_search_open(true);
+    ui.set_route_search_query("node".into());
+    ui.set_route_search_hits(many_hits(714));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    settle(4);
+    draw_frame();
+    for _ in 0..4 {
+        wheel_notch((420.0, 500.0), -120.0);
+    }
+    let rows = assert_rows_fill_the_list(&ui, "results wheel down");
+    assert!(row_index(&rows[0]) > 0, "the results scrolled: {rows:?}");
+    ui.hide().expect("hide app window");
+}
+
+#[test]
+fn the_mouse_wheel_scrolls_the_tray_route_list() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let popup = new_popup();
+    tray_connected(&popup);
+    popup.set_node_rows(many_tray_rows(102));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(304, 460));
+    popup.show().expect("show tray popup");
+    draw_frame();
+    for _ in 0..4 {
+        wheel_notch((150.0, 380.0), -120.0);
+    }
+    let rows = assert_rows_fill_the_list(&popup, "tray wheel down");
+    assert!(row_index(&rows[0]) > 0, "the tray list scrolled: {rows:?}");
+    popup.hide().expect("hide tray popup");
+}

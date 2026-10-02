@@ -684,6 +684,13 @@ export component ListView inherits Rectangle {
     private property <length> drag-start-offset;
     // Where the view was when last seen.
     private property <length> seen-viewport-y: 0px;
+    // The scroll position the card is placed for: a copy of the viewport's, kept by `changed
+    // viewport-y` (which runs before every frame), never a binding to it. The scrolled area sits
+    // in the card, so a binding would make the area's position depend on its own scroll
+    // position, and Slint's smooth wheel scroll, which bounds itself by that area's geometry
+    // while it computes the scroll position, panics with "Recursion detected" (1.1.4 closed on
+    // the first wheel notch over a route list).
+    private property <length> card-viewport-y: 0px;
 
     vertical-stretch: 1;
     horizontal-stretch: 1;
@@ -729,6 +736,7 @@ export component ListView inherits Rectangle {
             flick.viewport-y = -root.max-scroll;
         }
         root.seen-viewport-y = flick.viewport-y;
+        root.card-viewport-y = flick.viewport-y;
     }
 
     Timer {
@@ -748,9 +756,9 @@ export component ListView inherits Rectangle {
         height: parent.height;
         card := Rectangle {
             property <length> slack: root.card-radius + root.card-border-width + 2px;
-            y: Math.max(flick.viewport-y, -self.slack);
+            y: Math.max(root.card-viewport-y, -self.slack);
             width: parent.width;
-            height: Math.max(0px, Math.min(flick.viewport-y + root.content-height, root.height + self.slack) - self.y);
+            height: Math.max(0px, Math.min(root.card-viewport-y + root.content-height, root.height + self.slack) - self.y);
             background: root.card-background;
             border-color: root.card-border-color;
             border-width: root.card-border-width;

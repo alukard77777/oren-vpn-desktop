@@ -5,6 +5,7 @@ mod appimage_handoff;
 mod bootstrap;
 mod clipboard_text;
 mod conflicting_apps;
+mod crash_log;
 mod crisp_image;
 mod daemon;
 mod data_reset;
@@ -807,6 +808,9 @@ fn create_tray_popup() -> Result<TrayPopup, slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // First of all: a panic anywhere below is written to logs/crash.log instead of only
+    // closing the app.
+    crash_log::install();
     // Before the single-instance guard: the resetting process waits for the old instance to
     // exit, deletes the data directory and starts a clean app itself.
     if data_reset::run_pending_reset(&std::env::args_os().skip(1).collect::<Vec<_>>()) {

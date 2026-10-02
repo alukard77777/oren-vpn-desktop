@@ -4,7 +4,8 @@
 //! (exactly what «Копировать лог» copies), `daemon-diagnostics.json` (the daemon's
 //! `/v1/diagnostics`: core health, the bounded core log, proxy mappings), `preferences.json`
 //! (with profile ids pseudonymised and paths dropped) and `logs/*` from the data directory
-//! (`events.log`, `client-errors.log`, the per-user core log and rotated predecessors), plus
+//! (`events.log`, `client-errors.log`, `crash.log` with the app's own panics, the per-user core
+//! log and rotated predecessors), plus
 //! `logs/service.log` (and `service.log.1`) of the always-ready service.
 //!
 //! Every text entry goes through the same redaction as the event feed (`redact_event_text`:
@@ -761,6 +762,17 @@ mod tests {
             format!("1\tcontext\tGET {SUBSCRIPTION_URL} token={SUBSCRIPTION_TOKEN} failed\n"),
         )
         .unwrap();
+        // A panic message may quote whatever the app was handling.
+        fs::write(
+            logs.join(crate::crash_log::CRASH_LOG_FILE_NAME),
+            format!(
+                "=== panic 1 · MULTICORE 1.1.5 ===
+thread 'main' panicked at x.rs:1:1:
+                 bad url {SUBSCRIPTION_URL}
+"
+            ),
+        )
+        .unwrap();
         fs::write(
             logs.join("latest-core.log"),
             format!(
@@ -812,6 +824,7 @@ mod tests {
             "logs/events.log",
             "logs/client-errors.log",
             "logs/latest-core.log",
+            "logs/crash.log",
         ] {
             assert!(entries.contains_key(name), "missing {name}: {entries:?}");
         }
@@ -834,6 +847,8 @@ mod tests {
         assert!(entries["preferences.json"].contains("profile-1"));
         assert!(entries["preferences.json"].contains("Germany"));
         assert!(entries["logs/client-errors.log"].contains("[REDACTED"));
+        assert!(entries["logs/crash.log"].contains("thread 'main' panicked"));
+        assert!(entries["logs/crash.log"].contains("[REDACTED"));
     }
 
     #[test]
