@@ -2022,8 +2022,10 @@ export component AppWindow inherits Window {
                         text: "MULTICORE";
                         color: Theme.text-primary;
                         font-family: Theme.font-family;
-                        font-size: Theme.type-label-size;
-                        font-weight: Theme.weight-semibold;
+                        // The tray popup's wordmark: tighter, bolder, tracked caps.
+                        font-size: 13px;
+                        font-weight: Theme.weight-bold;
+                        letter-spacing: 0.6px;
                         vertical-alignment: center;
                     }
 
@@ -4334,7 +4336,7 @@ export component AppWindow inherits Window {
                 // Title, "Добавить" and the note stay put; the list scrolls under them.
                 PageHeader {
                     title: @tr("Подписки");
-                    subtitle: @tr("До 16 подписок · активна только одна · ссылки хранятся только на этом устройстве");
+                    subtitle: @tr("До 100 подписок · активна только одна · ссылки хранятся только на этом устройстве");
                     gap: 16px;
                     scrolled: subscriptions-scroll.scrolled;
                     reduced-motion: root.reduced-motion;

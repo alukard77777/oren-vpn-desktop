@@ -19,8 +19,8 @@ use crate::{
     store_root::{DirectoryCapability, StoreLock},
 };
 
-pub const MAX_PROFILES: usize = 16;
-pub const MAX_PROFILE_INDEX_BYTES: u64 = 16 * 1024;
+pub const MAX_PROFILES: usize = 100;
+pub const MAX_PROFILE_INDEX_BYTES: u64 = 128 * 1024;
 pub const MAX_SELECTIONS_BYTES: u64 = 128 * 1024;
 pub const MAX_SELECTIONS: usize = 64;
 const INDEX_SCHEMA_VERSION: u32 = 1;
