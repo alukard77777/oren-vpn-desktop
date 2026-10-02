@@ -15,6 +15,10 @@ pub const SERVICE_PROTOCOL_VERSION: u16 = 2;
 /// Longest accepted `Update.version` (`major.minor.patch`).
 pub const MAX_UPDATE_VERSION_CHARS: usize = 32;
 
+/// How long the daemon waits for the service's answer to `SetTun`. The service keeps a TUN
+/// switch-on (Mihomo creating the Wintun adapter) and its rollback inside this budget.
+pub const SET_TUN_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceCommand {

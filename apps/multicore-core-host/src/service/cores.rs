@@ -38,8 +38,13 @@ use multicore_core::UnixGroupLauncher as PlatformLauncher;
 #[cfg(windows)]
 use multicore_core::WindowsJobLauncher as PlatformLauncher;
 
-/// How long `SetTun{on:true}` waits for the `MultiCore` adapter and Mihomo to agree.
+/// How long `SetTun{on:true}` waits, from the start of the switch, for Mihomo to answer the
+/// PATCH and for the `MultiCore` adapter and Mihomo to agree.
 pub(crate) const TUN_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `SetTun{on:false}` waits for Mihomo's answer (it first finishes a switch-on still
+/// in progress). With `TUN_READY_TIMEOUT` this stays under the daemon's 25 s `SetTun` budget,
+/// so a failed switch-on is rolled back within the same exchange.
+pub(crate) const TUN_OFF_TIMEOUT: Duration = Duration::from_secs(7);
 const TUN_POLL: Duration = Duration::from_millis(25);
 /// How long `SetTun{on:false}` waits for the loopback mixed port to accept connections again.
 pub(crate) const MIXED_PORT_RECHECK: Duration = Duration::from_secs(3);
@@ -269,7 +274,36 @@ impl ProductionCores {
         }
         let cleaned = started.elapsed();
         let (port, secret) = (active.controller_port, active.controller_secret.as_str());
-        mihomo_rest::set_tun_enabled(port, secret, on).map_err(|_| BrokerErrorCode::NotReady)?;
+        let deadline = started + TUN_READY_TIMEOUT;
+        // Mihomo answers the PATCH only after sing-tun created the Wintun adapter and its
+        // routes: seconds on some machines. Waiting just 3 s here failed Connect with "could
+        // not start Mihomo" while the adapter came up right after.
+        let answer_within = if on {
+            deadline.saturating_duration_since(Instant::now())
+        } else {
+            TUN_OFF_TIMEOUT
+        };
+        if let Err(error) = mihomo_rest::set_tun_enabled(port, secret, on, answer_within) {
+            let timed_out = mihomo_rest::is_timeout(&error);
+            service_log::append(
+                &self.service_directory,
+                &format!(
+                    "set_tun {} patch failed after {} ms: {}",
+                    if on { "on" } else { "off" },
+                    started.elapsed().as_millis(),
+                    if timed_out {
+                        "Mihomo did not answer in time (TUN adapter still being created)".to_owned()
+                    } else {
+                        format!("{:?}", error.kind())
+                    }
+                ),
+            );
+            return Err(if timed_out && on {
+                BrokerErrorCode::TimedOut
+            } else {
+                BrokerErrorCode::NotReady
+            });
+        }
         let patched = started.elapsed();
         if !on {
             // Switching TUN off re-creates Mihomo's listeners; a proxy-mode generation must come
@@ -289,11 +323,9 @@ impl ProductionCores {
             );
             return Ok(());
         }
-        let deadline = Instant::now() + TUN_READY_TIMEOUT;
         loop {
-            if self.runtime.block_on(multicore_core::multicore_tun_is_up())
-                && mihomo_rest::tun_enabled(port, secret).unwrap_or(false)
-            {
+            let adapter_up = self.runtime.block_on(multicore_core::multicore_tun_is_up());
+            if adapter_up && mihomo_rest::tun_enabled(port, secret).unwrap_or(false) {
                 service_log::append(
                     &self.service_directory,
                     &format!(
@@ -306,6 +338,15 @@ impl ProductionCores {
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                service_log::append(
+                    &self.service_directory,
+                    &format!(
+                        "set_tun on timed out: patch {} ms, adapter up: {adapter_up}, Mihomo TUN on: {}",
+                        (patched - cleaned).as_millis(),
+                        mihomo_rest::tun_enabled(port, secret)
+                            .map_or_else(|error| format!("{:?}", error.kind()), |on| on.to_string())
+                    ),
+                );
                 return Err(BrokerErrorCode::TimedOut);
             }
             std::thread::sleep(TUN_POLL);

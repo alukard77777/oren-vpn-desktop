@@ -192,7 +192,7 @@ pub trait ServiceConnector: Send + Sync + 'static {
 pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
     match command {
         ServiceCommand::Prepare { .. } => CORE_READINESS_TIMEOUT * 2 + Duration::from_secs(10),
-        ServiceCommand::SetTun { .. } => Duration::from_secs(25),
+        ServiceCommand::SetTun { .. } => multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT,
         ServiceCommand::Update { .. } | ServiceCommand::StageUpdate { .. } => {
             Duration::from_secs(15 * 60)
         }

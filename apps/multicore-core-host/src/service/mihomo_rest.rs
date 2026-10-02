@@ -17,9 +17,21 @@ pub(crate) fn request(
     path: &str,
     body: Option<&str>,
 ) -> io::Result<(u16, Vec<u8>)> {
+    request_within(port, secret, method, path, body, TIMEOUT)
+}
+
+/// `request` with `answer_within` as the read timeout: how long Mihomo may take to answer.
+fn request_within(
+    port: u16,
+    secret: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    answer_within: Duration,
+) -> io::Result<(u16, Vec<u8>)> {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_read_timeout(Some(answer_within.max(Duration::from_millis(1))))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     let body = body.unwrap_or("");
     let head = format!(
@@ -95,13 +107,22 @@ fn dechunk(mut body: &[u8]) -> io::Result<Vec<u8>> {
 /// in v1.19.32): only `enable` changes (other TUN fields come from the loaded config) and the
 /// reply is 204 even if the adapter failed, so callers confirm with [`tun_enabled`] and the
 /// adapter probe.
-pub(crate) fn set_tun_enabled(port: u16, secret: &str, on: bool) -> io::Result<()> {
+///
+/// Mihomo answers only after `listener.ReCreateTun` returned, i.e. after sing-tun created (or
+/// closed) the Wintun adapter and its routes, which takes seconds on some machines: the
+/// caller passes the time it can wait (`answer_within`) instead of the 3 s used for reads.
+pub(crate) fn set_tun_enabled(
+    port: u16,
+    secret: &str,
+    on: bool,
+    answer_within: Duration,
+) -> io::Result<()> {
     let body = if on {
         r#"{"tun":{"enable":true}}"#
     } else {
         r#"{"tun":{"enable":false}}"#
     };
-    let (status, _) = request(port, secret, "PATCH", "/configs", Some(body))?;
+    let (status, _) = request_within(port, secret, "PATCH", "/configs", Some(body), answer_within)?;
     if status == 204 {
         Ok(())
     } else {
@@ -109,6 +130,15 @@ pub(crate) fn set_tun_enabled(port: u16, secret: &str, on: bool) -> io::Result<(
             "PATCH /configs returned {status}"
         )))
     }
+}
+
+/// The request got no answer in time (as opposed to Mihomo refusing the connection or
+/// answering with an error).
+pub(crate) fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 pub(crate) fn tun_enabled(port: u16, secret: &str) -> io::Result<bool> {
