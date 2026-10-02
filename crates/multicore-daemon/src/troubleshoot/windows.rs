@@ -451,8 +451,18 @@ fn listeners(wanted: &[ListenPort]) -> Vec<PortOwner> {
 /// host of a proxy auto-config script, which is reported but left alone.
 fn clear_system_proxy(marker: &Path) -> (ProxyOutcome, Option<String>) {
     let settings = WinInetSettings;
-    let had_marker = marker.exists();
-    let recovered = had_marker && crate::system_proxy::recover(&settings, marker).is_ok();
+    // MULTICORE's own proxy from a connection that never cleaned up: the marker still matches
+    // what is applied, so `recover` puts the user's earlier settings back.
+    let ours_left_over = std::fs::read(marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<crate::system_proxy::ProxyMarker>(&bytes).ok())
+        .zip(settings.read().ok())
+        .is_some_and(|(saved, current)| {
+            crate::system_proxy::restore_plan(&current, &saved).is_some()
+        });
+    let recovered = marker.exists()
+        && crate::system_proxy::recover(&settings, marker).is_ok()
+        && ours_left_over;
     let Ok(current) = settings.read() else {
         return (ProxyOutcome::Direct, None);
     };
