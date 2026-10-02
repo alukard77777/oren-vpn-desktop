@@ -528,6 +528,18 @@ function Invoke-ServiceMode {
     } | Out-Null
 
     Reset-Disconnected
+    Check 'service-log-through-daemon' {
+        # The service log is SYSTEM-only; the daemon pages it from the service, redacted.
+        $log = Api GET '/v1/service-log'
+        if ($log.status -ne 'included') { throw "status $($log.status)" }
+        $current = @($log.files | Where-Object { $_.name -eq 'service.log' })
+        if (-not $current) { throw 'no service.log in the answer' }
+        $text = ($log.files | ForEach-Object { $_.text }) -join "`n"
+        if ($text -notmatch 'set_tun on ') { throw 'service.log lacks the set_tun lines of this run' }
+        if ($text -match '://') { throw 'service.log answer contains a URL' }
+        if ($text -match [regex]::Escape($env:USERNAME)) { throw 'service.log answer contains the user name' }
+        "files=$((@($log.files) | ForEach-Object { $_.name }) -join ',') bytes=$($text.Length)"
+    } | Out-Null
     Check 'quit-stops-cores' {
         Save-DaemonEvidence 'service-first-daemon'
         $warm = Get-ServiceCorePids
@@ -588,6 +600,11 @@ function Invoke-PerUserMode {
         $status = Get-Status
         if ($status.service_mode) { throw 'per-user daemon selected the service' }
         "service_mode=false state=$($status.state)"
+    } | Out-Null
+    Check 'service-log-absent-without-service' {
+        $log = Api GET '/v1/service-log'
+        if ($log.status -ne 'no_service' -or @($log.files).Count) { throw "status $($log.status)" }
+        'no_service'
     } | Out-Null
     if (-not (Import-Subscription)) { return }
     Check 'no-warm-cores-without-service' {
