@@ -2,6 +2,7 @@
 //! fix offers the user ticks, fix results). The checks and fixes themselves run in the daemon.
 
 use multicore_core::troubleshoot::{Finding, FixOffer, FixReport, StepReport, Tone};
+use multicore_i18n::{Lang, tr, trn};
 
 use crate::view_model::StatePresentation;
 
@@ -11,9 +12,21 @@ use crate::view_model::StatePresentation;
 pub(crate) fn offered_after_failure(presentation: &StatePresentation) -> bool {
     presentation.has_profile
         && presentation.is_error
-        && presentation.eyebrow == "Не удалось подключиться"
-        && !presentation.supporting.contains("отменено")
-        && !presentation.supporting.contains("другого пользователя")
+        && presentation.eyebrow == tr!("Не удалось подключиться")
+        && !caused_by_user(&presentation.supporting)
+}
+
+/// A dismissed administrator prompt or another user's session, in either language (the text
+/// may come from the daemon in Russian, or be localized by the desktop).
+fn caused_by_user(supporting: &str) -> bool {
+    // Matched against, never shown.
+    const MARKERS: [&str; 4] = [
+        "отменено",             // i18n-ignore: matched, not shown
+        "другого пользователя", // i18n-ignore: matched, not shown
+        "cancelled",
+        "another user",
+    ];
+    MARKERS.iter().any(|marker| supporting.contains(marker))
 }
 
 /// «Переустановить службу» re-registers the machine-wide service, so it is offered on Windows
@@ -49,20 +62,20 @@ pub(crate) fn summary(findings: &[Finding]) -> Summary {
     if findings.iter().any(|finding| finding.tone == Tone::Error) {
         Summary {
             tone: Tone::Error,
-            title: "Найдены проблемы",
-            detail: "Они мешают VPN. Ниже — что именно нашли и что можно исправить.",
+            title: tr!("Найдены проблемы"),
+            detail: tr!("Они мешают VPN. Ниже — что именно нашли и что можно исправить."),
         }
     } else if findings.iter().any(|finding| finding.tone == Tone::Warning) {
         Summary {
             tone: Tone::Warning,
-            title: "Есть предупреждения",
-            detail: "Это может мешать подключению. Посмотрите подробности ниже.",
+            title: tr!("Есть предупреждения"),
+            detail: tr!("Это может мешать подключению. Посмотрите подробности ниже."),
         }
     } else {
         Summary {
             tone: Tone::Success,
-            title: "Проблем не обнаружено",
-            detail: "Система готова к подключению.",
+            title: tr!("Проблем не обнаружено"),
+            detail: tr!("Система готова к подключению."),
         }
     }
 }
@@ -70,7 +83,7 @@ pub(crate) fn summary(findings: &[Finding]) -> Summary {
 /// The right-aligned label of a finding row: only what blocks VPN gets one.
 pub(crate) fn finding_badge(tone: Tone) -> &'static str {
     match tone {
-        Tone::Error => "Критично",
+        Tone::Error => tr!("Критично"),
         Tone::Warning | Tone::Info | Tone::Success => "",
     }
 }
@@ -93,29 +106,27 @@ pub(crate) fn status_pill(findings: &[Finding]) -> (String, Tone) {
             .count()
     };
     let (errors, warnings) = (count(Tone::Error), count(Tone::Warning));
+    // Russian needs three noun forms; the catalog's plural entries carry English's two.
+    let russian = multicore_i18n::current() == Lang::Ru;
     if errors > 0 {
-        (
-            format!(
-                "{errors} {}",
-                plural(errors, "проблема", "проблемы", "проблем")
-            ),
-            Tone::Error,
-        )
+        let text = if russian {
+            let noun = plural(errors, "проблема", "проблемы", "проблем"); // i18n-ru-only
+            format!("{errors} {noun}")
+        } else {
+            trn!("{n} проблема", "{n} проблем", errors)
+        };
+        (text, Tone::Error)
     } else if warnings > 0 {
-        (
-            format!(
-                "{warnings} {}",
-                plural(
-                    warnings,
-                    "предупреждение",
-                    "предупреждения",
-                    "предупреждений"
-                )
-            ),
-            Tone::Warning,
-        )
+        let text = if russian {
+            #[rustfmt::skip]
+            let noun = plural(warnings, "предупреждение", "предупреждения", "предупреждений"); // i18n-ru-only
+            format!("{warnings} {noun}")
+        } else {
+            trn!("{n} предупреждение", "{n} предупреждений", warnings)
+        };
+        (text, Tone::Warning)
     } else {
-        ("Всё в порядке".to_owned(), Tone::Success)
+        (tr!("Всё в порядке").to_owned(), Tone::Success)
     }
 }
 
@@ -123,10 +134,10 @@ pub(crate) fn status_pill(findings: &[Finding]) -> (String, Tone) {
 pub(crate) fn checked_ago(elapsed: std::time::Duration) -> String {
     let minutes = elapsed.as_secs() / 60;
     match minutes {
-        0 => "только что".to_owned(),
-        1..=59 => format!("{minutes} мин назад"),
-        60..=1439 => format!("{} ч назад", minutes / 60),
-        _ => format!("{} дн. назад", minutes / 1440),
+        0 => tr!("только что").to_owned(),
+        1..=59 => tr!("{} мин назад", minutes),
+        60..=1439 => tr!("{} ч назад", minutes / 60),
+        _ => trn!("{n} дн. назад", "{n} дн. назад", minutes / 1440),
     }
 }
 
@@ -477,5 +488,70 @@ mod tests {
             run.reboot_recommended(),
             "a reboot once needed stays needed"
         );
+    }
+}
+
+#[cfg(test)]
+mod english_tests {
+    use super::*;
+    use crate::view_model::UiState;
+    use multicore_i18n::ThreadLanguage;
+    use std::time::Duration;
+
+    fn findings(tone: Tone, count: usize) -> Vec<Finding> {
+        (0..count)
+            .map(|index| Finding::new(tone, index.to_string(), ""))
+            .collect()
+    }
+
+    #[test]
+    fn summary_pill_and_age_read_in_english() {
+        let _en = ThreadLanguage::set(Lang::En);
+        assert_eq!(summary(&[]).title, "No problems found");
+        assert_eq!(summary(&findings(Tone::Error, 1)).title, "Problems found");
+        assert_eq!(summary(&findings(Tone::Warning, 1)).title, "Warnings found");
+        assert_eq!(finding_badge(Tone::Error), "Critical");
+        assert_eq!(status_pill(&findings(Tone::Error, 1)).0, "1 problem");
+        assert_eq!(status_pill(&findings(Tone::Error, 3)).0, "3 problems");
+        assert_eq!(status_pill(&findings(Tone::Warning, 1)).0, "1 warning");
+        assert_eq!(status_pill(&findings(Tone::Warning, 21)).0, "21 warnings");
+        assert_eq!(status_pill(&[]).0, "All good");
+        assert_eq!(checked_ago(Duration::from_secs(10)), "just now");
+        assert_eq!(checked_ago(Duration::from_secs(120)), "2 min ago");
+        assert_eq!(checked_ago(Duration::from_secs(3 * 3600)), "3 h ago");
+        assert_eq!(checked_ago(Duration::from_secs(86_400)), "1 day ago");
+        assert_eq!(checked_ago(Duration::from_secs(2 * 86_400)), "2 days ago");
+    }
+
+    #[test]
+    fn every_check_step_has_an_english_name() {
+        for step in multicore_core::troubleshoot::CheckStep::ALL {
+            assert!(
+                multicore_i18n::english(step.label()).is_some(),
+                "{}",
+                step.label()
+            );
+        }
+    }
+
+    #[test]
+    fn user_caused_failures_are_recognized_in_both_languages() {
+        for message in [
+            "Подключение отменено: не выдано разрешение администратора.",
+            "Connection cancelled: administrator permission was not granted.",
+            "MULTICORE уже запущен у другого пользователя.",
+            "MULTICORE is already running for another user.",
+        ] {
+            assert!(caused_by_user(message), "{message}");
+        }
+        assert!(!caused_by_user(
+            "Couldn't start a core. See the log on the Status page."
+        ));
+        let _en = ThreadLanguage::set(Lang::En);
+        let failed = UiState::Error {
+            message: "Connection cancelled: administrator permission was not granted.".into(),
+        }
+        .presentation();
+        assert!(!offered_after_failure(&failed));
     }
 }

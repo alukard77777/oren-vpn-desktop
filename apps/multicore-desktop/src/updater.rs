@@ -1,3 +1,4 @@
+use multicore_i18n::tr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,10 +17,14 @@ pub(crate) const API_FALLBACK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 
 /// When the releases API was last asked, for the fallback cadence.
 static LAST_API_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
 const UPDATE_USER_AGENT: &str = concat!("multicore-updater/", env!("CARGO_PKG_VERSION"));
-#[cfg(target_os = "linux")]
-const REPLACEMENT_DETAIL: &str = "Будет заменён файл AppImage";
-#[cfg(not(target_os = "linux"))]
-const REPLACEMENT_DETAIL: &str = "Будет заменена установленная версия";
+/// What an installed update replaces.
+fn replacement_detail() -> &'static str {
+    if cfg!(target_os = "linux") {
+        tr!("Будет заменён файл AppImage")
+    } else {
+        tr!("Будет заменена установленная версия")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UpdateAction {
@@ -79,7 +84,7 @@ impl UpdateState {
         match self {
             Self::Unconfigured => UpdatePresentation {
                 status: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
-                detail: "Канал обновлений задаётся при сборке".into(),
+                detail: tr!("Канал обновлений задаётся при сборке").into(),
                 action_label: String::new(),
                 action: UpdateAction::None,
                 action_enabled: false,
@@ -87,9 +92,9 @@ impl UpdateState {
                 busy: false,
             },
             Self::Checking => UpdatePresentation {
-                status: "Проверяем обновления…".into(),
-                detail: format!("Установлена версия {}", env!("CARGO_PKG_VERSION")),
-                action_label: "Проверяем…".into(),
+                status: tr!("Проверяем обновления…").into(),
+                detail: tr!("Установлена версия {}", env!("CARGO_PKG_VERSION")),
+                action_label: tr!("Проверяем…").into(),
                 action: UpdateAction::None,
                 action_enabled: false,
                 available: false,
@@ -97,38 +102,38 @@ impl UpdateState {
             },
             Self::Deferred => UpdatePresentation {
                 status: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
-                detail: "Проверим обновления чуть позже".into(),
-                action_label: "Проверить".into(),
+                detail: tr!("Проверим обновления чуть позже").into(),
+                action_label: tr!("Проверить").into(),
                 action: UpdateAction::Check,
                 action_enabled: true,
                 available: false,
                 busy: false,
             },
             Self::Current => UpdatePresentation {
-                status: "Установлена актуальная версия".into(),
+                status: tr!("Установлена актуальная версия").into(),
                 detail: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
-                action_label: "Проверить".into(),
+                action_label: tr!("Проверить").into(),
                 action: UpdateAction::Check,
                 action_enabled: true,
                 available: false,
                 busy: false,
             },
             Self::Available(release) => UpdatePresentation {
-                status: format!("Доступна версия {}", release.version()),
+                status: tr!("Доступна версия {}", release.version()),
                 detail: if runtime_idle {
-                    REPLACEMENT_DETAIL.into()
+                    replacement_detail().into()
                 } else {
-                    "После загрузки туннель будет остановлен, а клиент перезапущен".into()
+                    tr!("После загрузки туннель будет остановлен, а клиент перезапущен").into()
                 },
-                action_label: "Установить".into(),
+                action_label: tr!("Установить").into(),
                 action: UpdateAction::Install,
                 action_enabled: true,
                 available: true,
                 busy: false,
             },
             Self::Managed(release) => UpdatePresentation {
-                status: format!("Доступна версия {}", release.version()),
-                detail: "Обновите пакет через менеджер пакетов".into(),
+                status: tr!("Доступна версия {}", release.version()),
+                detail: tr!("Обновите пакет через менеджер пакетов").into(),
                 action_label: String::new(),
                 action: UpdateAction::None,
                 action_enabled: false,
@@ -136,28 +141,28 @@ impl UpdateState {
                 busy: false,
             },
             Self::Downloading(release) => UpdatePresentation {
-                status: format!("Загружаем версию {}…", release.version()),
-                detail: "Проверяем размер и SHA-256 перед установкой".into(),
-                action_label: "Загружаем…".into(),
+                status: tr!("Загружаем версию {}…", release.version()),
+                detail: tr!("Проверяем размер и SHA-256 перед установкой").into(),
+                action_label: tr!("Загружаем…").into(),
                 action: UpdateAction::None,
                 action_enabled: false,
                 available: true,
                 busy: true,
             },
             Self::InstallFailed(release, message) => UpdatePresentation {
-                status: format!("Не удалось установить версию {}", release.version()),
+                status: tr!("Не удалось установить версию {}", release.version()),
                 detail: message.clone(),
-                action_label: "Повторить".into(),
+                action_label: tr!("Повторить").into(),
                 action: UpdateAction::Install,
                 action_enabled: true,
                 available: true,
                 busy: false,
             },
             Self::Error(message) => UpdatePresentation {
-                status: "Не удалось проверить обновления".into(),
+                status: tr!("Не удалось проверить обновления").into(),
                 detail: message.clone(),
                 action_label: if configured {
-                    "Повторить".into()
+                    tr!("Повторить").into()
                 } else {
                     String::new()
                 },
@@ -187,7 +192,7 @@ pub(crate) fn configured_repository() -> Result<Option<Repository>, String> {
     };
     Repository::parse(value)
         .map(Some)
-        .map_err(|_| "В сборке указан неверный GitHub-репозиторий".into())
+        .map_err(|_| tr!("В сборке указан неверный GitHub-репозиторий").into())
 }
 
 /// Why `release.txt` gave no version: the check falls back to the releases API.
@@ -240,12 +245,16 @@ pub(crate) fn check_latest(manual: bool, known: Option<Version>) -> CheckOutcome
     let repository = match configured_repository() {
         Ok(Some(repository)) => repository,
         Ok(None) => {
-            return CheckOutcome::State(UpdateState::Error("Канал обновлений не настроен".into()));
+            return CheckOutcome::State(UpdateState::Error(
+                tr!("Канал обновлений не настроен").into(),
+            ));
         }
         Err(error) => return CheckOutcome::State(UpdateState::Error(error)),
     };
     let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
-        return CheckOutcome::State(UpdateState::Error("Версия клиента собрана неверно".into()));
+        return CheckOutcome::State(UpdateState::Error(
+            tr!("Версия клиента собрана неверно").into(),
+        ));
     };
     let hint = fetch_release_hint(&repository);
     plan_check(
@@ -298,7 +307,7 @@ fn update_client(timeout: Duration) -> Result<reqwest::blocking::Client, String>
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(2))
         .build()
-        .map_err(|_| "Не удалось создать защищённое соединение".to_owned())
+        .map_err(|_| tr!("Не удалось создать защищённое соединение").to_owned())
 }
 
 /// The pinned repository's `release.txt` (raw.githubusercontent.com caches it ~5 min).
@@ -326,7 +335,7 @@ fn fetch_latest_release(repository: &Repository) -> Result<GitHubRelease, ApiErr
     let release = GitHubRelease::parse_for_repository(repository, &body);
     #[cfg(target_os = "linux")]
     let release = GitHubRelease::parse_appimage_for_repository(repository, &body);
-    release.map_err(|_| ApiError::Failed("Релиз не соответствует контракту MULTICORE".into()))
+    release.map_err(|_| ApiError::Failed(tr!("Релиз не соответствует контракту MULTICORE").into()))
 }
 
 /// Whether an API answer is GitHub's rate limit rather than a real failure.
@@ -337,7 +346,9 @@ pub(crate) fn is_rate_limited(status: u16) -> bool {
 /// The latest-release JSON of the pinned repository, bounded in size.
 pub(crate) fn fetch_latest_release_body(repository: &Repository) -> Result<Vec<u8>, String> {
     fetch_latest_release_body_checked(repository).map_err(|error| match error {
-        ApiError::RateLimited => "GitHub временно ограничил запросы. Повторите позже".to_owned(),
+        ApiError::RateLimited => {
+            tr!("GitHub временно ограничил запросы. Повторите позже").to_owned()
+        }
         ApiError::Failed(message) => message,
     })
 }
@@ -350,12 +361,12 @@ fn fetch_latest_release_body_checked(repository: &Repository) -> Result<Vec<u8>,
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("User-Agent", UPDATE_USER_AGENT)
         .send()
-        .map_err(|_| ApiError::Failed("GitHub сейчас недоступен".to_owned()))?;
+        .map_err(|_| ApiError::Failed(tr!("GitHub сейчас недоступен").to_owned()))?;
     if is_rate_limited(response.status().as_u16()) {
         return Err(ApiError::RateLimited);
     }
     if !response.status().is_success() {
-        return Err(ApiError::Failed(format!(
+        return Err(ApiError::Failed(tr!(
             "GitHub ответил HTTP {}",
             response.status().as_u16()
         )));
@@ -364,16 +375,16 @@ fn fetch_latest_release_body_checked(repository: &Repository) -> Result<Vec<u8>,
         .content_length()
         .is_some_and(|length| length > RELEASE_BODY_LIMIT as u64)
     {
-        return Err(ApiError::Failed("Ответ GitHub слишком большой".into()));
+        return Err(ApiError::Failed(tr!("Ответ GitHub слишком большой").into()));
     }
     let mut body = Vec::new();
     response
         .by_ref()
         .take(RELEASE_BODY_LIMIT as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|_| ApiError::Failed("Не удалось прочитать ответ GitHub".to_owned()))?;
+        .map_err(|_| ApiError::Failed(tr!("Не удалось прочитать ответ GitHub").to_owned()))?;
     if body.len() > RELEASE_BODY_LIMIT {
-        return Err(ApiError::Failed("Ответ GitHub слишком большой".into()));
+        return Err(ApiError::Failed(tr!("Ответ GitHub слишком большой").into()));
     }
     Ok(body)
 }
@@ -447,7 +458,9 @@ impl StagedUpdate {
             release.asset().size(),
             release.asset().sha256_hex(),
         )
-        .map_err(|_| "Загруженное обновление изменилось до установки — повторите загрузку".into())
+        .map_err(|_| {
+            tr!("Загруженное обновление изменилось до установки — повторите загрузку").into()
+        })
     }
 }
 
@@ -462,15 +475,15 @@ pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), St
 #[cfg(target_os = "linux")]
 fn appimage_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let LinuxInstall::AppImage(image) = linux_install() else {
-        return Err("Обновите MULTICORE через менеджер пакетов".into());
+        return Err(tr!("Обновите MULTICORE через менеджер пакетов").into());
     };
     let directory = image
         .parent()
-        .ok_or_else(|| "Некорректный путь AppImage".to_owned())?;
+        .ok_or_else(|| tr!("Некорректный путь AppImage").to_owned())?;
     let name = image
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "Некорректное имя AppImage".to_owned())?;
+        .ok_or_else(|| tr!("Некорректное имя AppImage").to_owned())?;
     let staged = directory.join(format!(".{name}.update"));
     let backup = directory.join(format!("{name}.old"));
     Ok((image, staged, backup))
@@ -482,7 +495,8 @@ fn appimage_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
 pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdate, String> {
     let (_, staged, _) = appimage_paths()?;
     if staged.exists() {
-        fs::remove_file(&staged).map_err(|_| "Не удалось очистить прошлую загрузку".to_owned())?;
+        fs::remove_file(&staged)
+            .map_err(|_| tr!("Не удалось очистить прошлую загрузку").to_owned())?;
     }
     download_release_to(release, &staged)?;
     if verify_archive_file(
@@ -493,7 +507,7 @@ pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdat
     .is_err()
     {
         let _ = fs::remove_file(&staged);
-        return Err("Загруженный AppImage не прошёл SHA-256 проверку".into());
+        return Err(tr!("Загруженный AppImage не прошёл SHA-256 проверку").into());
     }
     Ok(StagedUpdate { path: staged })
 }
@@ -510,7 +524,7 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
     }
     let (image, _, backup) = appimage_paths()?;
     install_appimage(&image, &staged.path, &backup)
-        .map_err(|_| "Не удалось заменить файл AppImage".to_owned())?;
+        .map_err(|_| tr!("Не удалось заменить файл AppImage").to_owned())?;
     Command::new("/bin/sh")
         .arg("-c")
         .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"")
@@ -522,7 +536,7 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|_| "Не удалось перезапустить MULTICORE".to_owned())?;
+        .map_err(|_| tr!("Не удалось перезапустить MULTICORE").to_owned())?;
     Ok(())
 }
 
@@ -532,13 +546,13 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
 pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdate, String> {
     let update_dir = update_directory()?;
     fs::create_dir_all(&update_dir)
-        .map_err(|_| "Не удалось создать папку обновлений".to_owned())?;
+        .map_err(|_| tr!("Не удалось создать папку обновлений").to_owned())?;
     let partial = update_dir.join(format!("multicore-{}.zip.partial", release.version()));
     let archive = update_dir.join(format!("multicore-{}.zip", release.version()));
     for stale in [&partial, &archive] {
         if stale.exists() {
             fs::remove_file(stale)
-                .map_err(|_| "Не удалось очистить прошлую загрузку".to_owned())?;
+                .map_err(|_| tr!("Не удалось очистить прошлую загрузку").to_owned())?;
         }
     }
 
@@ -548,9 +562,9 @@ pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdat
         release.asset().size(),
         release.asset().sha256_hex(),
     )
-    .map_err(|_| "Загруженный архив не прошёл SHA-256 проверку".to_owned())?;
+    .map_err(|_| tr!("Загруженный архив не прошёл SHA-256 проверку").to_owned())?;
     fs::rename(&partial, &archive)
-        .map_err(|_| "Не удалось зафиксировать загруженный архив".to_owned())?;
+        .map_err(|_| tr!("Не удалось зафиксировать загруженный архив").to_owned())?;
     Ok(StagedUpdate { path: archive })
 }
 
@@ -560,15 +574,17 @@ pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdat
 pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Result<(), String> {
     staged.reverify(release)?;
     let update_dir = update_directory()?;
-    let current_exe =
-        std::env::current_exe().map_err(|_| "Не удалось определить путь MULTICORE".to_owned())?;
+    let current_exe = std::env::current_exe()
+        .map_err(|_| tr!("Не удалось определить путь MULTICORE").to_owned())?;
     let target = current_exe
         .parent()
-        .ok_or_else(|| "Некорректный путь MULTICORE".to_owned())?
+        .ok_or_else(|| tr!("Некорректный путь MULTICORE").to_owned())?
         .to_path_buf();
     let helper_source = target.join("runtime").join("multicore-updater.exe");
     if !helper_source.is_file() {
-        return Err("В установке нет программы обновления (runtime/multicore-updater.exe)".into());
+        return Err(
+            tr!("В установке нет программы обновления (runtime/multicore-updater.exe)").into(),
+        );
     }
     remove_stale_helpers(&update_dir);
     // The PID keeps a still-running helper from an earlier attempt at the
@@ -579,7 +595,7 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
         std::process::id()
     ));
     fs::copy(&helper_source, &helper)
-        .map_err(|_| "Не удалось подготовить программу обновления".to_owned())?;
+        .map_err(|_| tr!("Не удалось подготовить программу обновления").to_owned())?;
 
     let mut command = Command::new(helper);
     command
@@ -604,7 +620,7 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
     }
     command
         .spawn()
-        .map_err(|_| "Не удалось запустить программу обновления".to_owned())?;
+        .map_err(|_| tr!("Не удалось запустить программу обновления").to_owned())?;
     Ok(())
 }
 
@@ -725,14 +741,14 @@ pub(crate) fn download_release_to(
             }
         }))
         .build()
-        .map_err(|_| "Не удалось создать соединение для загрузки".to_owned())?;
+        .map_err(|_| tr!("Не удалось создать соединение для загрузки").to_owned())?;
     let mut response = client
         .get(release.asset().download_url())
         .header("User-Agent", UPDATE_USER_AGENT)
         .send()
-        .map_err(|_| "Не удалось загрузить обновление".to_owned())?;
+        .map_err(|_| tr!("Не удалось загрузить обновление").to_owned())?;
     if !response.status().is_success() {
-        return Err(format!(
+        return Err(tr!(
             "Загрузка обновления вернула HTTP {}",
             response.status().as_u16()
         ));
@@ -741,36 +757,36 @@ pub(crate) fn download_release_to(
         .content_length()
         .is_some_and(|length| length != release.asset().size())
     {
-        return Err("Размер обновления не совпал с релизом".into());
+        return Err(tr!("Размер обновления не совпал с релизом").into());
     }
-    let mut output =
-        File::create(destination).map_err(|_| "Не удалось создать временный архив".to_owned())?;
+    let mut output = File::create(destination)
+        .map_err(|_| tr!("Не удалось создать временный архив").to_owned())?;
     let mut remaining = release.asset().size();
     let mut buffer = [0_u8; 64 * 1024];
     while remaining > 0 {
         let limit = buffer.len().min(remaining as usize);
         let read = response
             .read(&mut buffer[..limit])
-            .map_err(|_| "Загрузка обновления прервалась".to_owned())?;
+            .map_err(|_| tr!("Загрузка обновления прервалась").to_owned())?;
         if read == 0 {
-            return Err("Обновление загрузилось не полностью".into());
+            return Err(tr!("Обновление загрузилось не полностью").into());
         }
         output
             .write_all(&buffer[..read])
-            .map_err(|_| "Не удалось записать обновление".to_owned())?;
+            .map_err(|_| tr!("Не удалось записать обновление").to_owned())?;
         remaining -= read as u64;
     }
     let mut extra = [0_u8; 1];
     if response
         .read(&mut extra)
-        .map_err(|_| "Ошибка завершения загрузки".to_owned())?
+        .map_err(|_| tr!("Ошибка завершения загрузки").to_owned())?
         != 0
     {
-        return Err("Обновление больше заявленного размера".into());
+        return Err(tr!("Обновление больше заявленного размера").into());
     }
     output
         .flush()
-        .map_err(|_| "Не удалось сохранить обновление".to_owned())?;
+        .map_err(|_| tr!("Не удалось сохранить обновление").to_owned())?;
     Ok(())
 }
 
@@ -778,7 +794,7 @@ pub(crate) fn download_release_to(
 pub(crate) fn update_directory() -> Result<PathBuf, String> {
     multicore_platform::dirs::user_data_root()
         .map(|root| root.join("updates"))
-        .map_err(|_| "Каталог данных MULTICORE недоступен".to_owned())
+        .map_err(|_| tr!("Каталог данных MULTICORE недоступен").to_owned())
 }
 
 /// Marker the Windows updater waits for before discarding the previous version.
@@ -1372,5 +1388,61 @@ mod linux_tests {
         assert!(!staged.exists());
         let mode = std::fs::metadata(&image).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
+    }
+}
+
+#[cfg(test)]
+mod english_tests {
+    use super::*;
+    use multicore_i18n::{Lang, ThreadLanguage};
+
+    fn cyrillic(text: &str) -> bool {
+        text.chars().any(|c| ('\u{400}'..='\u{4ff}').contains(&c))
+    }
+
+    fn release() -> GitHubRelease {
+        GitHubRelease::parse_for_arch(
+            br#"{
+            "tag_name":"v0.2.0",
+            "html_url":"https://github.com/Fatyzzz/multi-core/releases/tag/v0.2.0",
+            "assets":[{
+                "name":"multicore-windows-x64.zip",
+                "browser_download_url":"https://github.com/Fatyzzz/multi-core/releases/download/v0.2.0/multicore-windows-x64.zip",
+                "size":1234,
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#,
+            multicore_release::WindowsArch::X64,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_update_state_reads_in_english() {
+        let _en = ThreadLanguage::set(Lang::En);
+        let states = [
+            UpdateState::Unconfigured,
+            UpdateState::Checking,
+            UpdateState::Deferred,
+            UpdateState::Current,
+            UpdateState::Available(release()),
+            UpdateState::Managed(release()),
+            UpdateState::Downloading(release()),
+            UpdateState::InstallFailed(release(), "swap failed".into()),
+            UpdateState::Error("GitHub is unavailable".into()),
+        ];
+        for state in states {
+            for idle in [true, false] {
+                for configured in [true, false] {
+                    let shown = state.presentation_with_configuration(idle, configured);
+                    for text in [&shown.status, &shown.detail, &shown.action_label] {
+                        assert!(!cyrillic(text), "{state:?}: {text}");
+                    }
+                }
+            }
+        }
+        let available = UpdateState::Available(release()).presentation(true);
+        assert_eq!(available.status, "Update 0.2.0 available");
+        assert_eq!(available.action_label, "Install");
     }
 }
