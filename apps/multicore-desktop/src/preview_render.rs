@@ -2729,6 +2729,189 @@ fn an_auto_opened_notice_closes_and_hover_only_pauses_it() {
     ui.hide().expect("hide");
 }
 
+/// The home switch's pill in an 840x720 window: a shown app window and the y of a point on
+/// the pill (x = 560), found by clicking down the window until the switch answers.
+fn shown_switch(ui: &AppWindow) -> (Rc<MinimalSoftwareWindow>, Rc<std::cell::Cell<u32>>, f32) {
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: 1.0 });
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    advance_clock(Duration::from_millis(600));
+    let presses = Rc::new(std::cell::Cell::new(0_u32));
+    let sink = presses.clone();
+    ui.on_primary_action(move || sink.set(sink.get() + 1));
+    let y = (80..700)
+        .step_by(6)
+        .map(|y| y as f32)
+        .find(|&y| {
+            click_at(&window, 560.0, y);
+            presses.get() > 0
+        })
+        .expect("the home switch answers a click");
+    presses.set(0);
+    (window, presses, y)
+}
+
+fn click_at(window: &MinimalSoftwareWindow, x: f32, y: f32) {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    let position = slint::LogicalPosition::new(x, y);
+    window.dispatch_event(WindowEvent::PointerMoved { position });
+    window.dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: PointerEventButton::Left,
+    });
+    window.dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: PointerEventButton::Left,
+    });
+    advance_clock(Duration::from_millis(50));
+}
+
+/// A provider notice the app opened by itself (a new notice on launch) must not swallow the
+/// first press of the power switch: 1.1.6 laid a window-wide click catcher under it, so that
+/// press only closed the notice and the switch needed a second one. A notice opened by hand
+/// from the bell still closes on a click outside it.
+#[test]
+fn an_auto_opened_notice_lets_the_first_switch_press_through() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    ready(&ui);
+    ui.set_subscription_announcement_text(s("Плановые работы сегодня в 23:00."));
+    let (window, presses, y) = shown_switch(&ui);
+
+    ui.set_announcement_auto_hide(true);
+    ui.set_announcement_open(true);
+    advance_clock(Duration::from_millis(300));
+    click_at(&window, 560.0, y);
+    assert_eq!(presses.get(), 1, "the press reaches the switch");
+
+    ui.set_announcement_open(false);
+    advance_clock(Duration::from_millis(300));
+    presses.set(0);
+    ui.set_announcement_open(true);
+    advance_clock(Duration::from_millis(300));
+    click_at(&window, 560.0, y);
+    assert!(
+        !ui.get_announcement_open(),
+        "a hand-opened notice closes on a click outside"
+    );
+    ui.hide().expect("hide app window");
+}
+
+/// End to end through the real wiring (`wire_primary_action`): a press while the launch
+/// subscription refresh holds the switch shows at once, sends nothing meanwhile, and sends
+/// exactly one Connect as soon as the refresh ends.
+#[test]
+fn a_press_during_the_launch_refresh_connects_once_the_refresh_ends() {
+    use crate::daemon::{DaemonClient, DaemonSubscriptionInfo, test_support::MockDaemonClient};
+    use std::sync::{Arc, Mutex};
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    // In memory only: the snapshot the press applies draws through it.
+    let _logos = crate::logo_cache::LogoCacheSession::install();
+    let mut client = MockDaemonClient::ready();
+    client.status.subscription = Some(DaemonSubscriptionInfo {
+        refresh_available: true,
+        ..DaemonSubscriptionInfo::default()
+    });
+    let client = Arc::new(client);
+    let model = Arc::new(Mutex::new(crate::DesktopViewModel::new(client.clone())));
+    let refresh = {
+        let mut model = model.lock().expect("model");
+        let check = model.begin_refresh();
+        model.finish_refresh(check, client.status());
+        model
+            .begin_subscription_refresh()
+            .expect("launch subscription refresh")
+    };
+    let ui = new_app();
+    let preferences = crate::preferences::AppPreferences::default();
+    let tracker = Arc::new(Mutex::new(crate::PersistenceTracker::new(
+        preferences.clone(),
+    )));
+    let reconciler = Arc::new(Mutex::new(crate::ProfilePreferenceReconciler::new(
+        preferences,
+        tracker,
+    )));
+    crate::wire_primary_action(
+        &ui,
+        model.clone(),
+        reconciler,
+        Rc::new(std::cell::Cell::new(true)),
+    );
+    let connects = || {
+        client
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|call| *call == "POST /v1/connect")
+            .count()
+    };
+
+    ui.invoke_primary_action();
+    assert!(ui.get_toggle_busy(), "the press shows at once");
+    advance_clock(Duration::from_secs(2));
+    assert_eq!(
+        connects(),
+        0,
+        "nothing is sent while the refresh holds the switch"
+    );
+    assert!(model.lock().expect("model").has_queued_primary_action());
+
+    let status = client.status();
+    assert!(
+        model
+            .lock()
+            .expect("model")
+            .finish_subscription_refresh(refresh, status)
+    );
+    advance_clock(Duration::from_millis(250));
+    // `run_connect` sends from its worker thread.
+    for _ in 0..100 {
+        if connects() > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    advance_clock(Duration::from_secs(2));
+    assert_eq!(connects(), 1, "one press, one connect");
+    assert!(!model.lock().expect("model").has_queued_primary_action());
+}
+
+/// Right after launch background work (the status check, the launch subscription refresh,
+/// restored routes) holds the switch. 1.1.6 dimmed it and dropped the press, so the first
+/// press only brought the pings that work loaded; a held switch now still takes the press
+/// (the host runs it once the work ends) and looks pressable.
+#[test]
+fn a_switch_held_by_background_work_still_takes_the_press() {
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    ready(&ui);
+    let (window, presses, y) = shown_switch(&ui);
+
+    ui.set_primary_enabled(false);
+    ui.set_primary_queueable(false);
+    advance_clock(Duration::from_millis(300));
+    click_at(&window, 560.0, y);
+    assert_eq!(
+        presses.get(),
+        0,
+        "a switch with nothing to do ignores the press"
+    );
+
+    ui.set_primary_queueable(true);
+    advance_clock(Duration::from_millis(300));
+    click_at(&window, 560.0, y);
+    assert_eq!(
+        presses.get(),
+        1,
+        "a held switch hands the press to the host"
+    );
+    ui.hide().expect("hide app window");
+}
+
 /// Advances Slint's clock in 20 ms frames, driving timers and drawing like the event loop
 /// does, with the clock frozen to the skipped time (rendering speed does not matter). Returns
 /// how many frames were drawn or still animating.

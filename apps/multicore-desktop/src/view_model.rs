@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use multicore_i18n::{Lang, tr, trn};
@@ -65,6 +65,16 @@ pub enum UiState {
     DaemonDegraded {
         message: String,
     },
+}
+
+/// How long a press of the switch may wait for background work before it is dropped.
+pub(crate) const QUEUED_PRIMARY_TTL: Duration = Duration::from_secs(60);
+
+/// A press of the switch waiting for background work (see `queue_primary_action`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedPrimary {
+    action: PrimaryAction,
+    since: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +431,10 @@ pub struct StatePresentation {
     pub primary_label: &'static str,
     pub primary_action: PrimaryAction,
     pub primary_enabled: bool,
+    /// The switch is held by background work (a status check, the launch subscription
+    /// refresh, a route change, a catalog reload) but still takes a press: it waits for that
+    /// work and then connects or disconnects (`DesktopViewModel::queue_primary_action`).
+    pub primary_queueable: bool,
     pub semantic_tone: SemanticTone,
     pub has_profile: bool,
     pub is_connected: bool,
@@ -441,6 +455,7 @@ impl UiState {
                 primary_label: tr!("Подключиться"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Neutral,
                 has_profile: false,
                 is_connected: false,
@@ -457,6 +472,7 @@ impl UiState {
                 primary_label: tr!("Добавляем…"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Warning,
                 has_profile: false,
                 is_connected: false,
@@ -473,6 +489,7 @@ impl UiState {
                 primary_label: tr!("Подключиться"),
                 primary_action: PrimaryAction::Connect,
                 primary_enabled: true,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Accent,
                 has_profile: true,
                 is_connected: false,
@@ -493,6 +510,7 @@ impl UiState {
                 primary_label: tr!("Подключаем…"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: false,
@@ -509,6 +527,7 @@ impl UiState {
                 primary_label: tr!("Отключиться"),
                 primary_action: PrimaryAction::Disconnect,
                 primary_enabled: true,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Success,
                 has_profile: true,
                 is_connected: true,
@@ -525,6 +544,7 @@ impl UiState {
                 primary_label: tr!("Отключаем…"),
                 primary_action: PrimaryAction::None,
                 primary_enabled: false,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: true,
@@ -541,6 +561,7 @@ impl UiState {
                 primary_label: tr!("Проверить снова"),
                 primary_action: PrimaryAction::Retry,
                 primary_enabled: true,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Danger,
                 has_profile: true,
                 is_connected: false,
@@ -557,6 +578,7 @@ impl UiState {
                 primary_label: tr!("Проверить снова"),
                 primary_action: PrimaryAction::Retry,
                 primary_enabled: true,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Danger,
                 has_profile: true,
                 is_connected: false,
@@ -573,6 +595,7 @@ impl UiState {
                 primary_label: tr!("Остановить туннель"),
                 primary_action: PrimaryAction::Cleanup,
                 primary_enabled: true,
+                primary_queueable: false,
                 semantic_tone: SemanticTone::Warning,
                 has_profile: true,
                 is_connected: false,
@@ -813,6 +836,8 @@ pub struct DesktopViewModel {
     active_profile_mutation: Option<ActiveProfileRequest>,
     next_mutation_generation: u64,
     active_mutation: Option<ActiveMutation>,
+    /// A power-switch press that arrived while background work held the switch.
+    queued_primary: Option<QueuedPrimary>,
     event_epoch: Option<String>,
     event_cursor: u64,
     event_cache: Vec<PresentedEvent>,
@@ -904,6 +929,7 @@ impl DesktopViewModel {
             active_profile_mutation: None,
             next_mutation_generation: 0,
             active_mutation: None,
+            queued_primary: None,
             event_epoch: None,
             event_cursor: 0,
             event_cache: Vec::new(),
@@ -965,16 +991,95 @@ impl DesktopViewModel {
             presentation.is_connected = false;
             presentation.is_busy = true;
         }
-        if self.active_mutation.is_some()
+        if let Some(queued) = self.queued_primary
+            && presentation.primary_action == queued.action
+        {
+            // The press shows at once; the switch stays busy until it runs.
+            return match queued.action {
+                PrimaryAction::Disconnect => UiState::Disconnecting {
+                    profile: presentation.profile,
+                    node: presentation.node,
+                },
+                _ => UiState::Connecting {
+                    profile: presentation.profile,
+                    node: presentation.node,
+                    step: tr!("Запускаем локальный маршрут…").into(),
+                },
+            }
+            .presentation();
+        }
+        if self.primary_action_held() {
+            presentation.primary_queueable = presentation.primary_enabled
+                && matches!(
+                    presentation.primary_action,
+                    PrimaryAction::Connect | PrimaryAction::Disconnect
+                );
+            presentation.primary_enabled = false;
+        }
+        presentation
+    }
+
+    /// Background work that the power switch has to wait for.
+    fn primary_action_held(&self) -> bool {
+        self.active_mutation.is_some()
             || self.import_pending
             || self.profile_mutation_pending()
             || self.profile_reconciliation_required()
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
-        {
-            presentation.primary_enabled = false;
+    }
+
+    /// A press of the switch that `begin_primary_action` could not start because background
+    /// work holds it (right after launch: the first status check, the launch subscription
+    /// refresh, restored route choices, the catalog reload). The press is kept and runs once
+    /// that work ends (`begin_queued_primary_action`) instead of being dropped, which made the
+    /// first press after launch do nothing but bring fresh pings. False when there is nothing
+    /// to queue (the switch is free, a press is already waiting, or the state offers neither
+    /// a connect nor a disconnect).
+    pub(crate) fn queue_primary_action(&mut self, now: Instant) -> bool {
+        if self.queued_primary.is_some() || !self.primary_action_held() {
+            return false;
         }
-        presentation
+        let state = self.state.presentation();
+        if !state.primary_enabled
+            || !matches!(
+                state.primary_action,
+                PrimaryAction::Connect | PrimaryAction::Disconnect
+            )
+        {
+            return false;
+        }
+        self.queued_primary = Some(QueuedPrimary {
+            action: state.primary_action,
+            since: now,
+        });
+        true
+    }
+
+    pub(crate) fn has_queued_primary_action(&self) -> bool {
+        self.queued_primary.is_some()
+    }
+
+    /// Starts the waiting press once the switch is free. It runs only as the action it was
+    /// pressed for: when the work ended in another state (already connected, an error) or
+    /// the press waited longer than [`QUEUED_PRIMARY_TTL`], it is dropped.
+    pub(crate) fn begin_queued_primary_action(
+        &mut self,
+        now: Instant,
+    ) -> Option<(PrimaryAction, MutationToken)> {
+        let queued = self.queued_primary?;
+        if now.saturating_duration_since(queued.since) > QUEUED_PRIMARY_TTL {
+            self.queued_primary = None;
+            return None;
+        }
+        if self.primary_action_held() {
+            return None;
+        }
+        self.queued_primary = None;
+        if self.state.presentation().primary_action != queued.action {
+            return None;
+        }
+        self.begin_primary_action()
     }
 
     pub(crate) fn panel(&self) -> Panel {
@@ -1742,6 +1847,8 @@ impl DesktopViewModel {
             || self.active_selection.is_some()
             || self.catalog_reconciliation_required
             || matches!(self.state, UiState::Connecting { .. })
+            // A pressed switch goes first: the refresh would hold it for the download.
+            || self.queued_primary.is_some()
             || !self
                 .subscription
                 .as_ref()
@@ -1842,13 +1949,7 @@ impl DesktopViewModel {
     }
 
     pub fn begin_primary_action(&mut self) -> Option<(PrimaryAction, MutationToken)> {
-        if self.active_mutation.is_some()
-            || self.import_pending
-            || self.profile_mutation_pending()
-            || self.profile_reconciliation_required()
-            || self.active_selection.is_some()
-            || self.catalog_reconciliation_required
-        {
+        if self.primary_action_held() {
             return None;
         }
         let action = self.state.presentation().primary_action;
@@ -6105,6 +6206,159 @@ mod tests {
         assert!(!model.launch_subscription_refresh_ready());
     }
 
+    /// A model just after launch: the first status answered (ready, refreshable subscription)
+    /// and the launch subscription refresh has started, which holds the power switch.
+    fn launching_model_with_subscription_refresh() -> (DesktopViewModel, MutationToken) {
+        let mut client = MockDaemonClient::ready();
+        client.status.subscription = Some(DaemonSubscriptionInfo {
+            updated_at_unix: 10_000,
+            refresh_available: true,
+            ..DaemonSubscriptionInfo::default()
+        });
+        let mut model = DesktopViewModel::new(Arc::new(client));
+        let refresh = model.begin_refresh();
+        let status = model.daemon_client().status().expect("status");
+        model.finish_refresh(refresh, Ok(status));
+        assert!(model.launch_subscription_refresh_ready());
+        let refresh = model
+            .begin_subscription_refresh()
+            .expect("launch subscription refresh");
+        (model, refresh)
+    }
+
+    /// The reported 1.1.6 bug: the first press of the switch right after launch landed while
+    /// the launch subscription refresh ran, was dropped, and only the pings it brought
+    /// changed; a second press was needed. The press now waits for that work and connects.
+    #[test]
+    fn a_connect_pressed_during_launch_work_runs_once_that_work_ends() {
+        let (mut model, refresh) = launching_model_with_subscription_refresh();
+        let now = Instant::now();
+        let held = model.presentation();
+        assert!(!held.primary_enabled, "the switch is held by the refresh");
+        assert!(held.primary_queueable, "but a press is still accepted");
+        assert!(model.begin_primary_action().is_none());
+
+        assert!(model.queue_primary_action(now));
+        let waiting = model.presentation();
+        assert!(waiting.is_busy, "the press shows at once as connecting");
+        assert_eq!(waiting.primary_label, "Подключаем…");
+        assert!(!waiting.primary_enabled && !waiting.primary_queueable);
+        assert!(!model.queue_primary_action(now), "one press, one connect");
+        assert!(model.begin_queued_primary_action(now).is_none());
+        assert!(
+            model.has_queued_primary_action(),
+            "still waiting for the refresh"
+        );
+
+        let status = model.daemon_client().status().expect("status");
+        assert!(model.finish_subscription_refresh(refresh, Ok(status)));
+        let (action, _token) = model
+            .begin_queued_primary_action(now)
+            .expect("the press connects as soon as the refresh ends");
+        assert_eq!(action, PrimaryAction::Connect);
+        assert!(matches!(model.state, UiState::Connecting { .. }));
+        assert!(!model.has_queued_primary_action());
+        assert!(model.begin_queued_primary_action(now).is_none());
+    }
+
+    /// A press that waited is dropped instead of doing something else: the work ended
+    /// connected (nothing left to do) or failed, or it waited too long.
+    #[test]
+    fn a_waiting_press_never_turns_into_another_action() {
+        let now = Instant::now();
+        let (mut model, refresh) = launching_model_with_subscription_refresh();
+        assert!(model.queue_primary_action(now));
+        assert!(model.finish_subscription_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "connected".into(),
+                ..DaemonStatus::default()
+            }),
+        ));
+        assert!(model.begin_queued_primary_action(now).is_none());
+        assert!(!model.has_queued_primary_action());
+        assert!(model.presentation().is_connected);
+        assert!(!model.presentation().is_busy);
+
+        let (mut model, refresh) = launching_model_with_subscription_refresh();
+        assert!(model.queue_primary_action(now));
+        assert!(model.finish_subscription_refresh(
+            refresh,
+            Ok(DaemonStatus {
+                state: "error".into(),
+                ..DaemonStatus::default()
+            }),
+        ));
+        assert!(model.begin_queued_primary_action(now).is_none());
+        assert_eq!(model.presentation().primary_action, PrimaryAction::Retry);
+
+        let (mut model, _refresh) = launching_model_with_subscription_refresh();
+        assert!(model.queue_primary_action(now));
+        assert!(
+            model
+                .begin_queued_primary_action(now + QUEUED_PRIMARY_TTL + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(!model.has_queued_primary_action(), "expired");
+        assert!(!model.presentation().is_busy);
+        assert!(model.presentation().primary_queueable);
+    }
+
+    /// Nothing to wait for: a free switch starts at once, and a state without a connect or
+    /// disconnect (importing, a failed check) never queues a press.
+    #[test]
+    fn only_a_held_connect_or_disconnect_is_queued() {
+        let now = Instant::now();
+        let mut model = DesktopViewModel::new(Arc::new(MockDaemonClient::ready()));
+        let refresh = model.begin_refresh();
+        let status = model.daemon_client().status().expect("status");
+        model.finish_refresh(refresh, Ok(status));
+        let free = model.presentation();
+        assert!(free.primary_enabled && !free.primary_queueable);
+        assert!(
+            !model.queue_primary_action(now),
+            "a free switch is not queued"
+        );
+
+        model.state = UiState::Error {
+            message: "x".into(),
+        };
+        let _refresh = model.begin_refresh();
+        assert!(!model.presentation().primary_queueable);
+        assert!(!model.queue_primary_action(now));
+
+        model.state = UiState::Connected {
+            profile: "Основной".into(),
+            node: "Auto".into(),
+        };
+        assert!(model.presentation().primary_queueable);
+        assert!(model.queue_primary_action(now));
+        let waiting = model.presentation();
+        assert!(waiting.is_busy);
+        assert_eq!(waiting.primary_label, "Отключаем…");
+    }
+
+    /// A press that waits for one piece of work is not pushed back by the next automatic
+    /// one: no subscription refresh starts while it waits.
+    #[test]
+    fn no_subscription_refresh_starts_while_a_press_waits() {
+        let now = Instant::now();
+        let (mut model, refresh) = launching_model_with_subscription_refresh();
+        let status = model.daemon_client().status().expect("status");
+        assert!(model.finish_subscription_refresh(refresh, Ok(status)));
+        let check = model.begin_refresh();
+        assert!(model.queue_primary_action(now));
+        let status = model.daemon_client().status().expect("status");
+        model.finish_refresh(check, Ok(status));
+        assert!(model.begin_subscription_refresh().is_none());
+        assert_eq!(
+            model
+                .begin_queued_primary_action(now)
+                .map(|(action, _)| action),
+            Some(PrimaryAction::Connect)
+        );
+    }
+
     #[test]
     fn automatic_subscription_refresh_uses_provider_interval_or_safe_default() {
         let mut client = MockDaemonClient::ready();
@@ -9566,7 +9820,7 @@ mod tests {
         );
         assert!(connection_strip.contains("width: root.has-profile ? parent.width : 0px;"));
         assert!(connection_strip.contains("height: root.has-profile ? parent.height : 0px;"));
-        assert!(connection_strip.contains("if (root.primary-enabled)"));
+        assert!(connection_strip.contains("if (root.primary-pressable)"));
         assert!(connection_strip.contains("root.press-toggle();"));
         assert!(connection_strip.contains("strip-glow-touch.pressed"));
         assert!(source.contains("subscription-refresh-action := FocusScope"));

@@ -3350,7 +3350,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
     build_menu_model(TrayInput {
         status,
         connection_label: presentation.primary_label.into(),
-        connection_enabled: presentation.primary_enabled
+        connection_enabled: (presentation.primary_enabled || presentation.primary_queueable)
             && presentation.primary_action != PrimaryAction::None,
         connected: presentation.is_connected,
         has_profile: presentation.has_profile,
@@ -3933,43 +3933,105 @@ fn wire_primary_action(
     startup_connect_pending: Rc<Cell<bool>>,
 ) {
     let weak = ui.as_weak();
+    let queued_press = Rc::new(Timer::default());
     ui.on_primary_action(move || {
         startup_connect_pending.set(false);
-        let (action, client, queued, current) = {
+        let (action, client, queued, current, waiting) = {
             let mut model = model.lock().expect("view model lock");
             // Re-scan right at the start of the attempt: warn before a
             // conflicting app causes a failed Connect, or explain one that
             // just happened.
             model.set_conflicting_apps(conflicting_apps::scan_running());
             let action = model.begin_primary_action();
+            // Held by background work (right after launch: the status check, the launch
+            // subscription refresh, restored routes): the press waits for that work instead
+            // of being lost.
+            let waiting = action.is_none() && model.queue_primary_action(Instant::now());
             let client = model.daemon_client();
             let queued = model.queued_node_selections();
-            (action, client, queued, snapshot(&model))
+            (action, client, queued, snapshot(&model), waiting)
         };
         if let Some(ui) = weak.upgrade() {
             apply_snapshot(&ui, &current);
         }
-
-        match action {
-            Some((PrimaryAction::Connect, mutation)) => {
-                let tun = weak.upgrade().is_none_or(|ui| connect_uses_tun(&ui));
-                run_connect(weak.clone(), model.clone(), client, mutation, queued, tun);
-            }
-            Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)) => {
-                run_disconnect(weak.clone(), model.clone(), client, mutation);
-            }
-            Some((PrimaryAction::Retry, mutation)) => {
-                run_status(
-                    weak.clone(),
-                    model.clone(),
-                    client,
-                    mutation,
-                    profile_preferences.clone(),
-                );
-            }
-            Some((PrimaryAction::None, _)) | None => {}
+        if waiting {
+            run_queued_primary_action(&queued_press, &weak, &model, &profile_preferences);
         }
+        dispatch_primary_action(&weak, &model, &profile_preferences, action, client, queued);
     });
+}
+
+/// While a press of the switch waits for background work, checks every
+/// [`QUEUED_PRIMARY_POLL`] whether the work ended and then starts it like a free press.
+/// The timer runs only while a press waits.
+fn run_queued_primary_action(
+    timer: &Rc<Timer>,
+    weak: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: &Arc<Mutex<ProfilePreferenceReconciler>>,
+) {
+    if timer.running() {
+        return;
+    }
+    let this = Rc::downgrade(timer);
+    let (weak, model, profile_preferences) =
+        (weak.clone(), model.clone(), profile_preferences.clone());
+    timer.start(TimerMode::Repeated, QUEUED_PRIMARY_POLL, move || {
+        let (action, client, queued, current) = {
+            let mut model = model.lock().expect("view model lock");
+            let action = model.begin_queued_primary_action(Instant::now());
+            if action.is_none() && model.has_queued_primary_action() {
+                return;
+            }
+            if action.is_some() {
+                model.set_conflicting_apps(conflicting_apps::scan_running());
+            }
+            let client = model.daemon_client();
+            let queued = model.queued_node_selections();
+            (action, client, queued, snapshot(&model))
+        };
+        // Started, or dropped (it waited too long, or the work ended in another state).
+        if let Some(timer) = this.upgrade() {
+            timer.stop();
+        }
+        if let Some(ui) = weak.upgrade() {
+            apply_snapshot(&ui, &current);
+        }
+        dispatch_primary_action(&weak, &model, &profile_preferences, action, client, queued);
+    });
+}
+
+/// Tick of [`run_queued_primary_action`]: short enough that a waiting press starts right
+/// after the work it waited for.
+const QUEUED_PRIMARY_POLL: Duration = Duration::from_millis(100);
+
+fn dispatch_primary_action(
+    weak: &slint::Weak<AppWindow>,
+    model: &Arc<Mutex<DesktopViewModel>>,
+    profile_preferences: &Arc<Mutex<ProfilePreferenceReconciler>>,
+    action: Option<(PrimaryAction, MutationToken)>,
+    client: Arc<dyn DaemonClient>,
+    queued: Vec<QueuedNodeSelection>,
+) {
+    match action {
+        Some((PrimaryAction::Connect, mutation)) => {
+            let tun = weak.upgrade().is_none_or(|ui| connect_uses_tun(&ui));
+            run_connect(weak.clone(), model.clone(), client, mutation, queued, tun);
+        }
+        Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)) => {
+            run_disconnect(weak.clone(), model.clone(), client, mutation);
+        }
+        Some((PrimaryAction::Retry, mutation)) => {
+            run_status(
+                weak.clone(),
+                model.clone(),
+                client,
+                mutation,
+                profile_preferences.clone(),
+            );
+        }
+        Some((PrimaryAction::None, _)) | None => {}
+    }
 }
 
 /// "Установить службу": download and verify the installer in the background, then quit.
@@ -6071,6 +6133,7 @@ fn apply_snapshot(ui: &AppWindow, snapshot: &UiSnapshot) {
     ui.set_has_profile(presentation.has_profile);
     ui.set_primary_label(SharedString::from(presentation.primary_label));
     ui.set_primary_enabled(presentation.primary_enabled);
+    ui.set_primary_queueable(presentation.primary_queueable);
     ui.set_update_runtime_busy(presentation.is_busy);
     ui.set_dashboard_available(presentation.is_connected || snapshot.cores_ready);
     // Never offer the service while the daemon already runs on it (or it is registered).
@@ -8464,6 +8527,34 @@ mod window_tests {
         }
     }
 
+    /// A press of the switch that background work holds is queued, not dropped, and a timer
+    /// starts it through the same dispatch as a free press once the work ends.
+    #[test]
+    fn a_held_switch_press_is_queued_and_started_once_the_work_ends() {
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        let press = source
+            .split("fn wire_primary_action(")
+            .nth(1)
+            .and_then(|source| source.split("fn run_queued_primary_action(").next())
+            .expect("primary action wiring");
+        assert!(press.contains(
+            "let waiting = action.is_none() && model.queue_primary_action(Instant::now());"
+        ));
+        assert!(press.contains(
+            "run_queued_primary_action(&queued_press, &weak, &model, &profile_preferences);"
+        ));
+        assert!(press.contains("dispatch_primary_action(&weak, &model, &profile_preferences"));
+        let queued = source
+            .split("fn run_queued_primary_action(")
+            .nth(1)
+            .and_then(|source| source.split("fn dispatch_primary_action(").next())
+            .expect("queued primary action wiring");
+        assert!(queued.contains("model.begin_queued_primary_action(Instant::now())"));
+        assert!(queued.contains("timer.stop();"));
+        assert!(queued.contains("dispatch_primary_action(&weak, &model, &profile_preferences"));
+        assert!(source.contains("ui.set_primary_queueable(presentation.primary_queueable);"));
+    }
+
     #[test]
     fn startup_auto_connect_requires_background_opt_in_ready_profile_and_network() {
         assert!(!startup_should_connect(
@@ -8751,7 +8842,11 @@ mod window_tests {
         assert!(
             ui.contains("color: root.shown-tone == \"danger\" ? #f0a3a3 : Theme.text-secondary;")
         );
-        assert!(ui.contains("opacity: root.primary-enabled || root.shown-busy ? 1 : 0.4;"));
+        // A switch held by background work still takes a press (`primary-queueable`).
+        assert!(ui.contains("opacity: root.primary-pressable || root.shown-busy ? 1 : 0.4;"));
+        assert!(ui.contains(
+            "private property <bool> primary-pressable: root.primary-enabled || root.primary-queueable;"
+        ));
     }
 
     #[test]

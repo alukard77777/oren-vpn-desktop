@@ -1289,6 +1289,11 @@ export component AppWindow inherits Window {
     in property <bool> has-profile: false;
     in property <string> primary-label: @tr("Подключить");
     in property <bool> primary-enabled: false;
+    // Background work (the launch status check and subscription refresh, a route change)
+    // holds the switch, but a press is still taken: the host runs it once that work ends.
+    in property <bool> primary-queueable: false;
+    // The switch takes a press now (at once, or once background work ends).
+    private property <bool> primary-pressable: root.primary-enabled || root.primary-queueable;
     // The Mihomo dashboard is only meaningful while a live, authenticated controller
     // session exists, i.e. while Connected.
     in property <bool> dashboard-available: false;
@@ -1624,7 +1629,7 @@ export component AppWindow inherits Window {
         : root.toggle-title;
     private property <string> shown-tone: root.toggle-intent != "none" ? "neutral" : root.status-tone;
     function press-toggle() {
-        if (!root.primary-enabled) {
+        if (!root.primary-pressable) {
             return;
         }
         if (!root.toggle-busy) {
@@ -2710,7 +2715,7 @@ export component AppWindow inherits Window {
                                 y: (parent.height - self.height) / 2;
                                 width: 76px;
                                 height: 42px;
-                                enabled: root.primary-enabled && !root.profile-menu-open;
+                                enabled: root.primary-pressable && !root.profile-menu-open;
                                 focus-on-click: true;
                                 focus-on-tab-navigation: true;
                                 accessible-role: button;
@@ -2722,12 +2727,12 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 accessible-action-default => {
-                                    if (root.primary-enabled) {
+                                    if (root.primary-pressable) {
                                         root.press-toggle();
                                     }
                                 }
                                 key-pressed(event) => {
-                                    if ((event.text == " " || event.text == "\n") && root.primary-enabled) {
+                                    if ((event.text == " " || event.text == "\n") && root.primary-pressable) {
                                         root.press-toggle();
                                         return accept;
                                     }
@@ -2747,7 +2752,7 @@ export component AppWindow inherits Window {
                                     width: parent.width;
                                     height: parent.height;
                                     background: transparent;
-                                    opacity: root.primary-enabled || root.shown-busy ? 1 : 0.4;
+                                    opacity: root.primary-pressable || root.shown-busy ? 1 : 0.4;
                                     animate opacity { duration: 180ms; easing: ease-in-out; }
 
                                     toggle-rail := Rectangle {
@@ -2857,14 +2862,14 @@ export component AppWindow inherits Window {
                         // This is the pill's only pointer surface. It sits above every visual
                         // child, so crossing the power icon never hands hover to another area.
                         strip-glow-touch := TouchArea {
-                            mouse-cursor: root.primary-enabled ? pointer : default;
+                            mouse-cursor: root.primary-pressable ? pointer : default;
                             x: 0;
                             y: 0;
                             width: root.has-profile ? parent.width : 0px;
                             height: root.has-profile ? parent.height : 0px;
                             enabled: !root.profile-menu-open;
                             clicked => {
-                                if (root.primary-enabled) {
+                                if (root.primary-pressable) {
                                     root.press-toggle();
                                 }
                             }
@@ -5208,7 +5213,10 @@ export component AppWindow inherits Window {
                 }
             }
 
-            if root.announcement-open && root.subscription-announcement-text != "": TouchArea {
+            // Only a notice opened by hand closes on a click outside it. One the app opened by
+            // itself (a new notice on launch, a switch) closes on its own after 15 s and lets
+            // clicks through: its click catcher swallowed the first press of the power switch.
+            if root.announcement-open && !root.announcement-auto-hide && root.subscription-announcement-text != "": TouchArea {
                 x: 0;
                 y: 0;
                 width: parent.width;
