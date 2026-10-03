@@ -3477,3 +3477,279 @@ fn the_mouse_wheel_scrolls_the_tray_route_list() {
     assert!(row_index(&rows[0]) > 0, "the tray list scrolled: {rows:?}");
     popup.hide().expect("hide tray popup");
 }
+
+/// Closures worker threads hand to `slint::invoke_from_event_loop`, run by `pump_stress_queue`
+/// on the UI thread as the real event loop would.
+type QueuedEvent = Box<dyn FnOnce() + Send>;
+static STRESS_QUEUE: std::sync::Mutex<Vec<QueuedEvent>> = std::sync::Mutex::new(Vec::new());
+
+struct StressProxy;
+
+impl slint::platform::EventLoopProxy for StressProxy {
+    fn quit_event_loop(&self) -> Result<(), slint::EventLoopError> {
+        Ok(())
+    }
+
+    fn invoke_from_event_loop(&self, event: QueuedEvent) -> Result<(), slint::EventLoopError> {
+        STRESS_QUEUE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+        Ok(())
+    }
+}
+
+/// [`PreviewPlatform`] plus an event loop proxy, so the app's real worker threads (latency
+/// sweeps, single-route pings, catalog loads) deliver their results.
+struct StressPlatform;
+
+impl slint::platform::Platform for StressPlatform {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        PreviewPlatform.create_window_adapter()
+    }
+
+    fn duration_since_start(&self) -> Duration {
+        PreviewPlatform.duration_since_start()
+    }
+
+    fn new_event_loop_proxy(&self) -> Option<Box<dyn slint::platform::EventLoopProxy>> {
+        Some(Box::new(StressProxy))
+    }
+}
+
+/// Runs what the workers queued so far; returns how many closures ran.
+fn pump_stress_queue() -> usize {
+    let queued = std::mem::take(
+        &mut *STRESS_QUEUE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let count = queued.len();
+    for event in queued {
+        event();
+    }
+    count
+}
+
+/// The reporting user's provider shape, larger: a dozen groups (one of them «Российские
+/// сайты»), from two routes up to several hundred, most routes with a measured delay.
+fn stress_catalog() -> crate::daemon::DaemonCatalog {
+    use crate::daemon::{DaemonCatalog, DaemonCatalogGroup, DaemonCatalogNode};
+    let labels = [
+        ("🌍 Зарубежные сайты", 420),
+        ("🇷🇺 Российские сайты", 3),
+        ("💬 Discord", 180),
+        ("✈️ Telegram", 180),
+        ("✨ AI", 120),
+        ("⬇️ Torrent", 2),
+        ("📺 YouTube", 300),
+        ("🎮 Игры", 64),
+        ("🎵 Spotify", 40),
+        ("🛒 Маркетплейсы", 12),
+        ("🏦 Банки", 5),
+        ("🌐 Прочее", 250),
+    ];
+    let flags = ["🇩🇪", "🇳🇱", "🇬🇧", "🇵🇱", "🇫🇮", "🇸🇪", "🇺🇸", "🇰🇿", "🇹🇷", "🇯🇵"];
+    DaemonCatalog {
+        revision: 7,
+        groups: labels
+            .iter()
+            .enumerate()
+            .map(|(group, (label, count))| DaemonCatalogGroup {
+                id: format!("g-stress-{group:04}"),
+                label: (*label).into(),
+                selected: group == 0,
+                nodes: (0..*count)
+                    .map(|node| DaemonCatalogNode {
+                        id: format!("n-stress-{group:04}-{node:04}"),
+                        label: format!("{} Node {node:04} ⚡ Server", flags[node % flags.len()]),
+                        selected: node == 0,
+                        delay_ms: (node % 4 != 0).then_some(30 + (node as u64 * 37) % 900),
+                        icon_id: None,
+                        icon_pending: false,
+                    })
+                    .collect(),
+                icon_id: None,
+                icon_pending: false,
+            })
+            .collect(),
+    }
+}
+
+/// Stress harness for the 1.1.6/1.1.7 reports «the app closes when I switch the route groups
+/// quickly» and «… when I press the ping button several times»: the app's own wiring (group
+/// tabs, the latency button, right-click pings, route picks, catalog loads and their worker
+/// threads) over a large catalog, hammered with interleaved clicks, wheel scrolling and frames
+/// on a thread with the 1 MiB stack of the real main thread. Any panic, recursion or stack
+/// overflow fails it. `MULTICORE_STRESS_ITERATIONS` sets the number of steps (4000).
+///
+/// It sets the process-wide Slint event loop proxy, so it runs alone:
+/// `cargo test -p multicore-desktop -- --ignored --exact preview_render::stress_group_tabs_pings_and_scrolling_on_a_large_catalog`
+#[test]
+#[ignore = "stress harness: sets the process-wide Slint event loop proxy; run it alone"]
+fn stress_group_tabs_pings_and_scrolling_on_a_large_catalog() {
+    let iterations: usize = std::env::var("MULTICORE_STRESS_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4000);
+    std::thread::Builder::new()
+        .name("multicore-stress-ui".into())
+        .stack_size(1 << 20)
+        .spawn(move || run_stress(iterations))
+        .expect("spawn the stress UI thread")
+        .join()
+        .expect("the stress run survives");
+}
+
+fn run_stress(iterations: usize) {
+    use crate::daemon::test_support::MockDaemonClient;
+    use crate::daemon::{DaemonClient, DaemonLatencies, DaemonLatencyEntry};
+    use std::sync::{Arc, Mutex};
+
+    slint::platform::set_platform(Box::new(StressPlatform)).expect("install the stress platform");
+    let _logos = crate::logo_cache::LogoCacheSession::install();
+    let catalog = stress_catalog();
+    let mut client = MockDaemonClient::ready();
+    client.status.state = "connected".into();
+    client.latencies = DaemonLatencies {
+        entries: catalog
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| DaemonLatencyEntry {
+                        group_id: group.id.clone(),
+                        node_id: node.id.clone(),
+                        latency_ms: (index % 5 != 0).then_some(20 + (index as u64 * 53) % 1500),
+                        status: if index % 5 == 0 { "timeout" } else { "ok" }.into(),
+                    })
+            })
+            .collect(),
+    };
+    client.catalog = catalog.clone();
+    let client = Arc::new(client);
+    let model = Arc::new(Mutex::new(crate::DesktopViewModel::new(client.clone())));
+    {
+        let mut model = model.lock().expect("model");
+        let refresh = model.begin_refresh();
+        model.finish_refresh(refresh, client.status());
+    }
+
+    let ui = new_app();
+    ui.set_ambient_background_enabled(true);
+    ui.set_window_active(true);
+    ui.set_shell_active(true);
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("stress window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    crate::apply_snapshot(&ui, &crate::snapshot(&model.lock().expect("model")));
+    crate::wire_catalog_group(&ui, model.clone());
+    crate::wire_catalog_node(&ui, model.clone());
+    crate::wire_manual_latency(&ui, model.clone());
+    crate::load_catalog(ui.as_weak(), model.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ui.get_catalog_groups().row_count() < catalog.groups.len() {
+        assert!(std::time::Instant::now() < deadline, "the catalog loads");
+        pump_stress_queue();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    draw_frame();
+
+    // Deterministic pseudo-random interleaving (xorshift).
+    let mut seed: u64 = 0x5eed_1157_c0de_cafe;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let mut counts = [0_usize; 6];
+    let mut delivered = 0;
+    for step in 0..iterations {
+        match next(10) {
+            // Group tabs, the action of the first report.
+            0..=3 => {
+                let group = &catalog.groups[next(catalog.groups.len())];
+                ui.invoke_select_catalog_group(group.id.as_str().into());
+                counts[0] += 1;
+            }
+            // The latency button, pressed again and again (the second report).
+            4 | 5 => {
+                ui.invoke_check_latency();
+                counts[1] += 1;
+            }
+            // Right-click pings of single rows.
+            6 => {
+                let nodes = ui.get_catalog_nodes();
+                if nodes.row_count() > 0 {
+                    let row = nodes.row_data(next(nodes.row_count())).expect("row");
+                    ui.invoke_measure_catalog_node(row.id);
+                }
+                counts[2] += 1;
+            }
+            // A route picked.
+            7 => {
+                let nodes = ui.get_catalog_nodes();
+                if nodes.row_count() > 0 {
+                    let row = nodes.row_data(next(nodes.row_count())).expect("row");
+                    ui.invoke_select_catalog_node(row.id);
+                }
+                counts[3] += 1;
+            }
+            // The wheel over the route list.
+            8 => {
+                let delta = if next(2) == 0 { -120.0 } else { 120.0 };
+                wheel_notch((420.0, 560.0), delta);
+                counts[4] += 1;
+            }
+            _ => counts[5] += 1,
+        }
+        // Workers answer in between: sometimes at once, sometimes after several clicks.
+        if next(3) == 0 {
+            std::thread::sleep(Duration::from_micros(next(1500) as u64));
+        }
+        delivered += pump_stress_queue();
+        advance_clock(Duration::from_millis(next(30) as u64 + 1));
+        if step % 3 == 0 {
+            draw_frame();
+        }
+    }
+    // Let every worker finish and its result land.
+    let started = std::time::Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(20));
+        let ran = pump_stress_queue();
+        delivered += ran;
+        draw_frame();
+        if ran == 0 && started.elapsed() > Duration::from_secs(1) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the workers settle"
+        );
+    }
+    eprintln!(
+        "stress: {iterations} steps; group switches {}, latency presses {}, single pings {}, \
+         route picks {}, wheel notches {}, idle {}; {delivered} worker results applied; \
+         {} daemon calls",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        client.calls.lock().expect("calls").len(),
+    );
+    assert_eq!(ui.get_catalog_groups().row_count(), catalog.groups.len());
+    assert!(
+        ui.get_catalog_nodes().row_count() > 0,
+        "the selected group still shows its routes"
+    );
+    ui.hide().expect("hide app window");
+}
