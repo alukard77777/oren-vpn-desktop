@@ -19,6 +19,8 @@ mod linux_display;
 mod linux_shell_tests;
 mod log_bundle;
 mod logo_cache;
+#[cfg(windows)]
+mod native_crash;
 mod preferences;
 #[cfg(test)]
 mod preview_render;
@@ -5045,6 +5047,7 @@ fn save_diagnostics_archive(
         daemon_diagnostics,
     );
     inputs.service_logs = service_logs;
+    inputs.windows_errors = log_bundle::windows_error_events();
     Some(
         log_bundle::write_bundle(&path, &inputs)
             .map(|()| fallback)

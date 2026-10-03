@@ -4,9 +4,11 @@
 //! (exactly what «Копировать лог» copies), `daemon-diagnostics.json` (the daemon's
 //! `/v1/diagnostics`: core health, the bounded core log, proxy mappings), `preferences.json`
 //! (with profile ids pseudonymised and paths dropped) and `logs/*` from the data directory
-//! (`events.log`, `client-errors.log`, `crash.log` with the app's own panics, the per-user core
-//! log and rotated predecessors), plus
-//! `logs/service.log` (and `service.log.1`) of the always-ready service.
+//! (`events.log`, `client-errors.log`, `crash.log` with the app's own panics, native crashes
+//! and unrequested event loop exits, `stderr.log`, the per-user core log and rotated
+//! predecessors), plus `logs/service.log` (and `service.log.1`) of the always-ready service,
+//! and on Windows `windows-errors.txt`: the system's «Application Error» events of MULTICORE's
+//! executables (exception code, faulting module and offset).
 //!
 //! Every text entry goes through the same redaction as the event feed (`redact_event_text`:
 //! URLs, `token=`/`secret=`/`password=` values, authorization headers, UUID-shaped ids such as
@@ -78,6 +80,8 @@ pub(crate) struct BundleInputs {
     pub(crate) home: Option<PathBuf>,
     /// The service's own log files (`service.log`, `service.log.1`) as the daemon returned them.
     pub(crate) service_logs: Vec<(String, String)>,
+    /// `windows-errors.txt` ([`windows_error_events`]); empty: no such file.
+    pub(crate) windows_errors: String,
 }
 
 impl BundleInputs {
@@ -90,6 +94,7 @@ impl BundleInputs {
             data_root: multicore_platform::dirs::user_data_root().ok(),
             home: home_directory(),
             service_logs: Vec::new(),
+            windows_errors: String::new(),
         }
     }
 }
@@ -145,6 +150,143 @@ pub(crate) fn service_log_entries(
     (line(&note), files)
 }
 
+/// MULTICORE's executables as Windows Error Reporting names them.
+#[cfg(windows)]
+const OWN_EXECUTABLES: [&str; 4] = [
+    "multicore-desktop.exe",
+    "multicore-daemon.exe",
+    "multicore-core-host.exe",
+    "multicore-updater.exe",
+];
+/// Events asked for; the newest come first.
+#[cfg(windows)]
+const MAX_WINDOWS_ERROR_EVENTS: usize = 20;
+/// `wevtutil` normally answers in a fraction of a second.
+#[cfg(windows)]
+const WINDOWS_EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The newest «Application Error» events (Event ID 1000) of MULTICORE's executables from the
+/// Windows Application log, one line each: a native crash the app could not record itself
+/// (a fail-fast abort, heap corruption, a crash before the handler was installed) is still
+/// named there with its exception code, faulting module and offset. Empty when there are none
+/// or `wevtutil` fails or takes longer than [`WINDOWS_EVENTS_TIMEOUT`]. Paths are left out.
+#[cfg(windows)]
+pub(crate) fn windows_error_events() -> String {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let apps = OWN_EXECUTABLES
+        .iter()
+        .map(|name| format!("Data[@Name='AppName']='{name}'"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let query = format!(
+        "/q:*[System[Provider[@Name='Application Error'] and (EventID=1000)] and EventData[{apps}]]"
+    );
+    let Ok(mut child) = std::process::Command::new("wevtutil.exe")
+        .args([
+            "qe",
+            "Application",
+            query.as_str(),
+            &format!("/c:{MAX_WINDOWS_ERROR_EVENTS}"),
+            "/rd:true",
+            "/f:xml",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    else {
+        return String::new();
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return String::new();
+    };
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout
+            .by_ref()
+            .take(4 * 1024 * 1024)
+            .read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < WINDOWS_EVENTS_TIMEOUT => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return String::new();
+            }
+        }
+    }
+    let xml = reader.join().unwrap_or_default();
+    summarize_application_errors(&String::from_utf8_lossy(&xml))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn windows_error_events() -> String {
+    String::new()
+}
+
+/// One line per `<Event>` of `wevtutil /f:xml` output: when, which executable and version,
+/// the exception code, and the faulting module, its version and the offset in it.
+#[cfg(any(windows, test))]
+fn summarize_application_errors(xml: &str) -> String {
+    static DATA: OnceLock<Regex> = OnceLock::new();
+    static TIME: OnceLock<Regex> = OnceLock::new();
+    let data = DATA.get_or_init(|| {
+        Regex::new(r"<Data Name='([A-Za-z]+)'>([^<]*)</Data>").expect("event data pattern")
+    });
+    let time = TIME.get_or_init(|| {
+        Regex::new(r"<TimeCreated SystemTime='([^']*)'").expect("event time pattern")
+    });
+    let mut lines = Vec::new();
+    for event in xml.split("<Event ").skip(1) {
+        let field = |name: &str| {
+            data.captures_iter(event)
+                .find(|captures| &captures[1] == name)
+                .map(|captures| captures[2].trim().to_owned())
+                .unwrap_or_default()
+        };
+        let when = time
+            .captures(event)
+            .map(|captures| captures[1].to_owned())
+            .unwrap_or_default();
+        let named = |name: String, version: String| {
+            if version.is_empty() {
+                name
+            } else {
+                format!("{name} {version}")
+            }
+        };
+        lines.push(format!(
+            "{when}  {}  exception 0x{}  in {} +0x{}",
+            named(field("AppName"), field("AppVersion")),
+            field("ExceptionCode"),
+            named(field("ModuleName"), field("ModuleVersion")),
+            field("FaultingOffset").trim_start_matches('0'),
+        ));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Windows «Application Error» events (Event ID 1000) of MULTICORE, newest first:
+{}
+",
+        lines.join(
+            "
+"
+        )
+    )
+}
+
 fn home_directory() -> Option<PathBuf> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE");
@@ -198,6 +340,13 @@ pub(crate) fn collect_entries(inputs: &BundleInputs) -> Vec<(String, Vec<u8>)> {
         inputs.daemon_diagnostics.clone(),
         &mut budget,
     );
+    if !inputs.windows_errors.is_empty() {
+        push(
+            "windows-errors.txt".into(),
+            inputs.windows_errors.clone(),
+            &mut budget,
+        );
+    }
     // Bounded by the service (512 KiB), so it comes before the user's own logs.
     let mut names = std::collections::BTreeSet::new();
     for (name, text) in &inputs.service_logs {
@@ -811,6 +960,7 @@ thread 'main' panicked at x.rs:1:1:
             data_root: Some(root.clone()),
             home: Some(directory.path().to_path_buf()),
             service_logs: Vec::new(),
+            windows_errors: String::new(),
         };
         let path = directory.path().join("bundle.zip");
         write_bundle(&path, &inputs).unwrap();
@@ -871,6 +1021,7 @@ thread 'main' panicked at x.rs:1:1:
             data_root: Some(root),
             home: None,
             service_logs: Vec::new(),
+            windows_errors: String::new(),
         };
         let entries = collect_entries(&inputs);
         let total = entries.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
@@ -939,6 +1090,7 @@ thread 'main' panicked at x.rs:1:1:
             data_root: Some(root.clone()),
             home: Some(directory.path().to_path_buf()),
             service_logs,
+            windows_errors: String::new(),
         };
         let path = directory.path().join("bundle.zip");
         write_bundle(&path, &inputs).unwrap();
@@ -1015,6 +1167,7 @@ thread 'main' panicked at x.rs:1:1:
             data_root: None,
             home: None,
             service_logs: Vec::new(),
+            windows_errors: String::new(),
         };
         assert!(
             !collect_entries(&inputs)
@@ -1047,6 +1200,40 @@ thread 'main' panicked at x.rs:1:1:
         assert!(report.contains("125%"));
         assert!(report.contains("системный прокси"));
         assert!(report.contains("ядра запущены"));
+    }
+
+    #[test]
+    fn windows_application_errors_become_one_line_each_without_paths() {
+        let xml = "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>            <Provider Name='Application Error'/><EventID>1000</EventID>            <TimeCreated SystemTime='2026-10-03T18:39:28.1234567Z'/></System><EventData>            <Data Name='AppName'>multicore-desktop.exe</Data><Data Name='AppVersion'>1.1.7.0</Data>            <Data Name='ModuleName'>D3D12Core.dll</Data><Data Name='ModuleVersion'>10.0.26100.1</Data>            <Data Name='ExceptionCode'>c0000005</Data><Data Name='FaultingOffset'>00000000000a1b2c</Data>            <Data Name='AppPath'>C:/Users/someone/AppData/Local/MultiCore/multicore-desktop.exe</Data>            </EventData></Event><Event xmlns='x'><System><TimeCreated SystemTime='2026-10-02T10:00:00Z'/>            </System><EventData><Data Name='AppName'>multicore-daemon.exe</Data>            <Data Name='ExceptionCode'>c0000409</Data><Data Name='ModuleName'>multicore-daemon.exe</Data>            <Data Name='FaultingOffset'>0000000000001000</Data></EventData></Event>";
+        let text = summarize_application_errors(xml);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(
+            lines[1],
+            "2026-10-03T18:39:28.1234567Z  multicore-desktop.exe 1.1.7.0  exception 0xc0000005  in D3D12Core.dll 10.0.26100.1 +0xa1b2c"
+        );
+        assert!(
+            lines[2].contains("multicore-daemon.exe  exception 0xc0000409"),
+            "{text}"
+        );
+        assert!(!text.contains("someone"), "{text}");
+        assert_eq!(summarize_application_errors(""), "");
+    }
+
+    #[test]
+    fn windows_errors_go_into_the_archive_when_there_are_any() {
+        let mut inputs = BundleInputs::default();
+        let names = |inputs: &BundleInputs| {
+            collect_entries(inputs)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        assert!(!names(&inputs).contains(&"windows-errors.txt".to_owned()));
+        inputs.windows_errors = "events
+"
+        .into();
+        assert!(names(&inputs).contains(&"windows-errors.txt".to_owned()));
     }
 }
 

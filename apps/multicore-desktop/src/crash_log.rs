@@ -27,6 +27,10 @@ const MAX_RAW_FRAMES: usize = 96;
 /// Installs the hook; the previous hook (the default one: stderr) still runs after it. On
 /// Windows also the native crash handler and the stderr log.
 pub(crate) fn install() {
+    #[cfg(windows)]
+    if let Some(path) = crash_log_path() {
+        crate::native_crash::install(&path);
+    }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let report = panic_report(info, env!("CARGO_PKG_VERSION"));
