@@ -217,6 +217,10 @@ Assert-True ($PackagerSource.Contains("'-Ctarget-feature=+crt-static'")) 'releas
 Assert-True ($PackagerSource.Contains('$skia = Resolve-PinnedSkiaBinaries $Build')) 'release builds must link the SHA-256-pinned Skia binaries (no prebuilt exists for +crt-static, x86 or arm64)'
 Assert-True ($PackagerSource.Contains('$env:SKIA_BINARIES_URL = $skia.Url')) 'skia-bindings must read the pinned archive instead of downloading or building Skia'
 Assert-True ($PackagerSource.Contains('Assert-LinkedPinnedSkia $TargetDirectory $Target $skia.Key')) 'release builds must prove they linked the pinned Skia key'
+Assert-True ($PackagerSource.Contains('$rustTarget = Join-Path $stage ''.rust-target''')) 'release builds must default to an isolated, discarded Cargo target directory'
+Assert-True ($PackagerSource.Contains('if (-not $persistentRustTarget) {')) 'only the isolated Cargo target directory may be deleted after packaging'
+Assert-True ($PackagerSource.Contains('CargoTargetDirectory must lie outside the package and its stage')) 'a persistent Cargo target directory must never become package content'
+Assert-True ($PackagerSource.Contains("if (`$keys.Count -ne 1) { throw")) 'a persistent target directory must fail closed when more than one Skia build output exists'
 foreach ($skiaArchitecture in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'), @('arm64', 'aarch64-pc-windows-msvc'))) {
     $skiaManifest = Get-Content -Raw -LiteralPath (Join-Path $RepositoryRoot "packaging\windows-$($skiaArchitecture[0])\versions.json") | ConvertFrom-Json
     $skiaPin = $skiaManifest.build.skiaBinaries
@@ -318,6 +322,19 @@ try {
     Assert-True $failed 'online mode must reject every custom manifest before network access'
     Assert-True (-not (Test-Path -LiteralPath $customOnlineDestination)) 'custom online manifest rejection must not publish'
     Assert-NoStageResidue $TestRoot 'custom online manifest rejection'
+
+    $persistentTargetDestination = Join-Path $TestRoot 'fixture-persistent-target-output'
+    $persistentTargetParameters = @{
+        DestinationPath = $persistentTargetDestination; OfflineSourceDirectory = $BaseInput; ManifestPath = $manifest
+        DesktopExecutablePath = $Desktop; DaemonExecutablePath = $Daemon; CoreHostExecutablePath = $CoreHost; UpdaterExecutablePath = $Updater
+        FixtureContractMode = $true; CargoTargetDirectory = (Join-Path $TestRoot 'persistent-target')
+    }
+    $failed = $false
+    try { & $Packager @persistentTargetParameters | Out-Null } catch { $failed = $true }
+    Assert-True $failed 'a persistent Cargo target directory must be rejected outside production packaging'
+    Assert-True (-not (Test-Path -LiteralPath $persistentTargetDestination)) 'fixture persistent-target rejection must not publish'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $TestRoot 'persistent-target'))) 'fixture persistent-target rejection must not create the target directory'
+    Assert-NoStageResidue $TestRoot 'fixture persistent-target rejection'
 
     $malformedDesktop = Join-Path $TestRoot 'malformed-desktop.exe'; New-TestPe $malformedDesktop -Malformed
     $malformedDesktopDestination = Join-Path $TestRoot 'malformed-desktop-output'
