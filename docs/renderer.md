@@ -18,6 +18,16 @@ recorded in `<data root>/software-renderer` and the app restarts itself with
 `MULTICORE_SOFTWARE_RENDERER=1`; either one selects the software renderer.
 `SLINT_BACKEND` (for example `winit-software`) overrides the selection for diagnostics.
 
+A renderer can also fail later, while drawing: Skia's Direct3D surface returns an error
+for a failed `Present`, fence or swap-chain call (for example `Error presenting d3d swap
+chain: 887a0005` once the driver removed the device), and Slint's winit backend leaves the
+event loop on it. Up to 1.1.7 that closed the app without a trace. `event_loop_guard` runs
+the loop until the app itself quits (`event_loop_guard::request_quit`): any other exit is
+written to `logs/crash.log`, every window gets a new native window and renderer (a new
+Direct3D device), and the loop runs again. After three such recoveries within ten minutes
+the error is final, and one that names the GPU renderer (matched without regard to case)
+restarts the app with the software renderer as above.
+
 ## Skia binaries in release builds
 
 `skia-bindings` normally downloads prebuilt Skia from `rust-skia/skia-binaries`. The

@@ -7,6 +7,11 @@
 //!
 //! Release builds carry no symbols, so on Windows each frame is also written as
 //! `module+offset`, which the build's PDB resolves afterwards.
+//!
+//! The same file receives what is not a panic: an event loop that stopped without the app
+//! asking ([`record_event_loop_exit`], see `event_loop_guard`) and, on Windows, native
+//! crashes (access violations, stack overflows; see `native_crash`), while the app's stderr
+//! goes to `logs/stderr.log` for the runtime's own last words (aborts, allocation failures).
 
 use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,7 +24,8 @@ const MAX_CRASH_LOG_BYTES: u64 = 256 * 1024;
 #[cfg(windows)]
 const MAX_RAW_FRAMES: usize = 96;
 
-/// Installs the hook; the previous hook (the default one: stderr) still runs after it.
+/// Installs the hook; the previous hook (the default one: stderr) still runs after it. On
+/// Windows also the native crash handler and the stderr log.
 pub(crate) fn install() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -32,8 +38,34 @@ pub(crate) fn install() {
     }));
 }
 
+/// The event loop stopped without the app asking (`event_loop_guard`): what ended it and what
+/// happens next go to crash.log, and a line to client-errors.log.
+pub(crate) fn record_event_loop_exit(detail: &str, action: &str) {
+    let report = event_loop_exit_report(detail, action, env!("CARGO_PKG_VERSION"));
+    if let Some(path) = crash_log_path() {
+        append_report(&path, &report);
+    }
+    crate::daemon::record_low_level("event_loop_exit", format!("{detail} | {action}"));
+}
+
+pub(crate) fn event_loop_exit_report(detail: &str, action: &str, version: &str) -> String {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!(
+        "=== event loop stopped {unix_ms} · MULTICORE {version} ({}, {}) ===
+{detail}
+{action}
+
+",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
 #[cfg(not(test))]
-fn crash_log_path() -> Option<PathBuf> {
+pub(crate) fn crash_log_path() -> Option<PathBuf> {
     multicore_platform::dirs::user_data_root()
         .ok()
         .map(|root| root.join("logs").join(CRASH_LOG_FILE_NAME))
@@ -41,7 +73,7 @@ fn crash_log_path() -> Option<PathBuf> {
 
 /// Tests never write into the real user's data directory.
 #[cfg(test)]
-fn crash_log_path() -> Option<PathBuf> {
+pub(crate) fn crash_log_path() -> Option<PathBuf> {
     Some(
         std::env::temp_dir()
             .join(format!("multicore-desktop-test-{}", std::process::id()))
@@ -185,13 +217,18 @@ fn raw_frames() -> Vec<String> {
     Vec::new()
 }
 
+/// The panic hook and the test crash.log are process-wide: the tests that replace the hook or
+/// read the file take turns.
+#[cfg(test)]
+pub(crate) static TEST_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
     /// The panic hook is process-wide: the tests that replace it take turns.
-    static HOOK: Mutex<()> = Mutex::new(());
+    use super::TEST_LOG_LOCK as HOOK;
 
     /// Runs `f` under a hook that keeps the report it builds (the process-wide hook is shared
     /// by every test thread, so only this thread's panic is kept).
@@ -253,6 +290,44 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("crash log");
         assert!(text.ends_with("=== newest ===\n"));
         assert!(!text.contains("=== first ==="));
+    }
+
+    #[test]
+    fn an_unrequested_event_loop_exit_is_written_to_the_crash_log() {
+        let report = event_loop_exit_report(
+            "the event loop stopped with an error: Error presenting d3d swap chain: 887a0005",
+            "recreating the windows and their renderer, attempt 1 of 3 within 10 min",
+            "9.9.9",
+        );
+        assert!(report.starts_with("=== event loop stopped "), "{report}");
+        assert!(report.contains("MULTICORE 9.9.9"), "{report}");
+        assert!(
+            report.contains(
+                "887a0005
+recreating the windows"
+            ),
+            "{report}"
+        );
+
+        let _hook = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = crash_log_path().expect("test crash log path");
+        record_event_loop_exit("event loop test detail", "event loop test action");
+        let text = std::fs::read_to_string(&path).expect("crash log written");
+        assert!(
+            text.contains(
+                "event loop test detail
+event loop test action
+"
+            ),
+            "{text}"
+        );
+        let client_errors = path.with_file_name("client-errors.log");
+        let lines = std::fs::read_to_string(&client_errors).expect("client-errors.log written");
+        assert!(
+            lines.lines().any(|line| line.contains("	event_loop_exit	")
+                && line.contains("event loop test detail | event loop test action")),
+            "{lines}"
+        );
     }
 
     #[test]

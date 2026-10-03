@@ -58,26 +58,32 @@ pub fn select_gpu_renderer() -> Result<(), slint::PlatformError> {
         .select()
 }
 
-/// Whether a platform error from creating or showing a window means the GPU
-/// renderer itself could not start, as opposed to any other startup failure.
+/// Whether a platform error from creating, showing or drawing a window means the
+/// GPU renderer itself failed, as opposed to any other failure. Also the errors
+/// that end the event loop for good after `event_loop_guard` could not recover
+/// the renderer: Skia spells those in lower case («Error presenting d3d swap
+/// chain: 887a0005», «error setting up completion signal for d3d12 command
+/// queue»), so the match ignores case.
 pub fn is_gpu_renderer_failure(error: &slint::PlatformError) -> bool {
     is_gpu_renderer_failure_text(&error.to_string())
 }
 
 fn is_gpu_renderer_failure_text(text: &str) -> bool {
+    let text = text.to_lowercase();
     [
-        "OpenGL",
+        "opengl",
         "glutin",
-        "EGL",
-        "WGL",
-        "GL context",
+        "egl",
+        "wgl",
+        "gl context",
         "suitable renderer",
         // Skia on Direct3D 12 (Windows) and Vulkan.
-        "D3D",
-        "DXGI",
-        "Direct3D",
-        "Skia",
-        "Vulkan",
+        "d3d",
+        "dxgi",
+        "direct3d",
+        "swap chain",
+        "skia",
+        "vulkan",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -180,8 +186,24 @@ mod tests {
         assert!(is_gpu_renderer_failure_text(
             "Direct3D rendering requested but this is only supported on Windows"
         ));
+        // Runtime failures of Skia's Direct3D surface, which end the event loop.
+        assert!(is_gpu_renderer_failure_text(
+            "Error presenting d3d swap chain: 887a0005"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "error setting up completion signal for d3d12 command queue failed. 887a0005"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "Error resizing swap chain buffers failed. 887a0001"
+        ));
+        assert!(is_gpu_renderer_failure_text(
+            "unable to retrieve swap chain back buffer: 0x887A0005"
+        ));
         assert!(!is_gpu_renderer_failure_text(
             "No default Slint platform was selected"
+        ));
+        assert!(!is_gpu_renderer_failure_text(
+            "the event loop kept stopping without a quit request"
         ));
         assert!(!is_gpu_renderer_failure_text("event loop already running"));
     }

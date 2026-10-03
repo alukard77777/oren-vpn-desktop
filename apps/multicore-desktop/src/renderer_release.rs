@@ -22,9 +22,6 @@ use crate::AppWindow;
 /// the tray popup is dropped after staying closed about as long (`TrayPopupSlot`).
 pub(crate) const RELEASE_AFTER: Duration = Duration::from_secs(60);
 
-/// Slint 1.17 destroys a window on `hide()` when this variable is set.
-const DESTROY_ON_HIDE: &str = "SLINT_DESTROY_WINDOW_ON_HIDE";
-
 thread_local! {
     /// Bumped on every hide to the tray, so only the latest hide's release runs.
     static HIDE_SERIAL: Cell<u64> = const { Cell::new(0) };
@@ -52,39 +49,10 @@ pub(crate) fn release_when_left_hidden(ui: &AppWindow) {
         if ui.get_shell_active() || !hidden {
             return;
         }
-        if let Err(error) = destroy_hidden(ui.window()) {
+        if let Err(error) = crate::event_loop_guard::destroy_native_window(ui.window()) {
             eprintln!("hidden window renderer not released: {error}");
         }
     });
-}
-
-/// Destroys the hidden `window` (native window, renderer and its caches) through Slint, which
-/// recreates it with the same size and maximized state on the next `show()`.
-fn destroy_hidden(window: &slint::Window) -> Result<(), slint::PlatformError> {
-    let size = window.size().to_logical(window.scale_factor());
-    let maximized = window.is_maximized();
-    let preset = std::env::var_os(DESTROY_ON_HIDE).is_some();
-    if !preset {
-        // SAFETY: the standard library documents `set_var` and `remove_var` as always safe
-        // on Windows, also with other threads running.
-        unsafe { std::env::set_var(DESTROY_ON_HIDE, "1") };
-    }
-    let hidden = window.hide();
-    if !preset {
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(DESTROY_ON_HIDE) };
-    }
-    hidden?;
-    if !window.has_winit_window() {
-        // Slint keeps the last size and position for the new window but not a maximized
-        // state it already believes in; refresh it like the Wayland path does.
-        window.set_size(size);
-        if maximized {
-            window.set_maximized(false);
-            window.set_maximized(true);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -116,9 +84,9 @@ mod tests {
             .find("renderer_release::release_when_left_hidden(ui)")
             .expect("deferred release");
         assert!(hide < release);
-        let source = include_str!("renderer_release.rs");
+        let source = include_str!("event_loop_guard.rs");
         let release_body = source
-            .split("fn destroy_hidden(")
+            .split("fn destroy_native_window(")
             .nth(1)
             .expect("release body");
         assert!(release_body.contains("std::env::set_var(DESTROY_ON_HIDE"));

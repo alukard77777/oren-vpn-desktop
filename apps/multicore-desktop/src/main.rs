@@ -10,6 +10,7 @@ mod crisp_image;
 mod daemon;
 mod data_reset;
 mod emoji_images;
+mod event_loop_guard;
 mod language;
 mod layout_shortcuts;
 #[cfg(target_os = "linux")]
@@ -1188,7 +1189,9 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     if _bootstrap_guard.is_some() {
         slint::Timer::single_shot(Duration::from_secs(2), updater::confirm_started);
     }
-    let result = slint::run_event_loop_until_quit();
+    let result = event_loop_guard::run_until_quit(|| {
+        recreate_windows_after_renderer_failure(&ui, &tray_popup_slot)
+    });
     flush_preferences(&ui, &model, &preference_writer, &preference_tracker);
     if let Some(tray_popup) = tray_popup_slot.weak().upgrade() {
         let _ = tray_popup.hide();
@@ -1196,6 +1199,34 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     let _ = ui.hide();
     drop(tray_runtime);
     result
+}
+
+/// The event loop stopped on a renderer failure (`event_loop_guard`): every window gets a new
+/// native window and renderer (on Windows a new Direct3D device). The main window comes back
+/// if it was on screen and stays hidden otherwise, recreated on its next `show()`; the tray
+/// popup closes and is made anew when next opened.
+fn recreate_windows_after_renderer_failure(ui: &AppWindow, tray_popup_slot: &TrayPopupSlot) {
+    if let Some(popup) = tray_popup_slot.weak().upgrade() {
+        // Destroyed while still shown: Slint ignores a hide of a window it already hid.
+        popup.set_resize_active("".into());
+        if let Err(error) = event_loop_guard::destroy_native_window(popup.window()) {
+            eprintln!("tray popup renderer not recreated: {error}");
+        }
+        tray_popup_slot.open.set(false);
+    }
+    #[cfg(windows)]
+    {
+        // Out of the slot first: dropping the component runs its destructors.
+        let released = tray_popup_slot.popup.borrow_mut().take();
+        drop(released);
+    }
+    let shown = ui.get_shell_active();
+    if let Err(error) = event_loop_guard::destroy_native_window(ui.window()) {
+        eprintln!("main window renderer not recreated: {error}");
+    }
+    if shown && let Err(error) = ui.show() {
+        eprintln!("main window not shown again: {error}");
+    }
 }
 
 fn activation_for_launch_arguments(arguments: &LaunchArguments) -> single_instance::Activation {
@@ -2274,7 +2305,7 @@ fn finish_update_install(
         Ok(()) => {
             let _keep_state_alive = state;
             let _keep_window_alive = weak;
-            let _ = slint::quit_event_loop();
+            event_loop_guard::request_quit();
         }
         Err(error) => update_install_failed(&weak, &state, release, error),
     });
@@ -2621,7 +2652,7 @@ fn close_window(weak: &slint::Weak<AppWindow>, tray_available: bool) {
             }
         }
         CloseDisposition::Exit => {
-            let _ = slint::quit_event_loop();
+            event_loop_guard::request_quit();
         }
     }
 }
@@ -3434,7 +3465,7 @@ fn handle_tray_command(
         }
         TrayCommand::Exit => {
             flush_preferences(&ui, model, preference_writer, preference_tracker);
-            let _ = slint::quit_event_loop();
+            event_loop_guard::request_quit();
         }
     }
 }
@@ -4055,7 +4086,7 @@ fn wire_service_install(ui: &AppWindow) {
                 Ok(installer) => {
                     service_install::launch_after_exit(installer);
                     let _keep_window_alive = weak;
-                    let _ = slint::quit_event_loop();
+                    event_loop_guard::request_quit();
                 }
                 Err(error) => {
                     if let Some(ui) = weak.upgrade() {
@@ -4332,7 +4363,7 @@ fn wire_data_reset(ui: &AppWindow) {
     let weak = ui.as_weak();
     ui.on_reset_all_data(move || match data_reset::schedule_reset_and_relaunch() {
         Ok(()) => {
-            let _ = slint::quit_event_loop();
+            event_loop_guard::request_quit();
         }
         Err(error) => {
             eprintln!("data reset could not be started: {error}");
@@ -7420,7 +7451,7 @@ mod window_tests {
 
         let source = include_str!("main.rs");
         let shutdown = source
-            .split("let result = slint::run_event_loop_until_quit();")
+            .split("let result = event_loop_guard::run_until_quit(")
             .nth(1)
             .and_then(|source| source.split("fn activation_for_launch_arguments").next())
             .expect("common post-event-loop shutdown");
@@ -7437,7 +7468,7 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("fn run_update_check").next())
             .expect("updater wiring");
-        assert!(updater_exit.contains("slint::quit_event_loop()"));
+        assert!(updater_exit.contains("event_loop_guard::request_quit()"));
     }
 
     #[test]
@@ -8157,7 +8188,7 @@ mod window_tests {
             .expect("tray Exit branch");
         assert!(
             exit_branch.find("flush_preferences").unwrap()
-                < exit_branch.find("quit_event_loop").unwrap()
+                < exit_branch.find("request_quit").unwrap()
         );
         let timer = rust
             .split("fn wire_preference_persistence(")
@@ -8334,7 +8365,7 @@ mod window_tests {
             .expect("desktop startup body");
         assert!(source.contains("--background"));
         assert!(source.contains("LaunchMode::Background"));
-        assert!(launch.contains("slint::run_event_loop_until_quit()"));
+        assert!(launch.contains("event_loop_guard::run_until_quit("));
         assert!(source.contains("initial_window_visible(launch_mode, tray_runtime.is_some())"));
 
         let show_branch = source
@@ -9178,7 +9209,7 @@ mod window_tests {
                 .nth(1)
                 .and_then(|source| {
                     source
-                        .split("let result = slint::run_event_loop_until_quit();")
+                        .split("let result = event_loop_guard::run_until_quit(")
                         .next()
                 })
                 .expect("startup after import callback wiring");
