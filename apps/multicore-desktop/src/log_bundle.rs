@@ -8,16 +8,19 @@
 //! and unrequested event loop exits, `stderr.log`, the per-user core log and rotated
 //! predecessors), plus `logs/service.log` (and `service.log.1`) of the always-ready service,
 //! and on Windows `windows-errors.txt`: the system's «Application Error» events of MULTICORE's
-//! executables (exception code, faulting module and offset).
+//! executables (exception code, faulting module and offset), and `core-sessions/`: one folder
+//! per connection of the range chosen in the «Сохранить лог» popup with that connection's core
+//! output (`session_logs`).
 //!
 //! Every text entry goes through the same redaction as the event feed (`redact_event_text`:
 //! URLs, `token=`/`secret=`/`password=` values, authorization headers, UUID-shaped ids such as
 //! the HWID), plus quoted JSON keys of the same names, the device identity file's exact value
 //! and the user's home directory. Nothing here reads anything the app does not already own:
-//! the service's files are SYSTEM/root-only, so its core log arrives through the daemon's
-//! diagnostics and its own log through `/v1/service-log` (redacted by the service first).
-//! The uncompressed total is capped at [`MAX_BUNDLE_BYTES`]; files are taken newest first and
-//! a file that does not fit keeps its newest lines.
+//! the service's files are SYSTEM/root-only, so its core journal arrives through
+//! `/v1/core-journal` and its own log through `/v1/service-log` (both redacted by the service
+//! first). The uncompressed total is capped at [`MAX_BUNDLE_BYTES`]; files are taken newest
+//! first and a file that does not fit keeps its newest lines. `core-sessions/` has its own
+//! cap (`session_logs::MAX_CORE_SESSIONS_BYTES`).
 
 use multicore_i18n::tr;
 use std::collections::BTreeMap;
@@ -82,6 +85,8 @@ pub(crate) struct BundleInputs {
     pub(crate) service_logs: Vec<(String, String)>,
     /// `windows-errors.txt` ([`windows_error_events`]); empty: no such file.
     pub(crate) windows_errors: String,
+    /// `core-sessions/…` (see `session_logs`), within their own size cap.
+    pub(crate) core_sessions: Vec<(String, String)>,
 }
 
 impl BundleInputs {
@@ -95,6 +100,7 @@ impl BundleInputs {
             home: home_directory(),
             service_logs: Vec::new(),
             windows_errors: String::new(),
+            core_sessions: Vec::new(),
         }
     }
 }
@@ -370,6 +376,10 @@ pub(crate) fn collect_entries(inputs: &BundleInputs) -> Vec<(String, Vec<u8>)> {
                 push(format!("logs/{name}"), text, &mut budget);
             }
         }
+    }
+    // Bounded by `session_logs` (per connection and in all), outside the budget of the rest.
+    for (name, text) in &inputs.core_sessions {
+        entries.push((name.clone(), scrubber.scrub(text).into_bytes()));
     }
     entries
 }
@@ -961,6 +971,10 @@ thread 'main' panicked at x.rs:1:1:
             home: Some(directory.path().to_path_buf()),
             service_logs: Vec::new(),
             windows_errors: String::new(),
+            core_sessions: vec![(
+                "core-sessions/latest/core.log".into(),
+                format!("1791000000000\tmihomo\tstdout\tfetch {SUBSCRIPTION_URL}\n"),
+            )],
         };
         let path = directory.path().join("bundle.zip");
         write_bundle(&path, &inputs).unwrap();
@@ -975,6 +989,7 @@ thread 'main' panicked at x.rs:1:1:
             "logs/client-errors.log",
             "logs/latest-core.log",
             "logs/crash.log",
+            "core-sessions/latest/core.log",
         ] {
             assert!(entries.contains_key(name), "missing {name}: {entries:?}");
         }
@@ -1022,6 +1037,7 @@ thread 'main' panicked at x.rs:1:1:
             home: None,
             service_logs: Vec::new(),
             windows_errors: String::new(),
+            core_sessions: Vec::new(),
         };
         let entries = collect_entries(&inputs);
         let total = entries.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
@@ -1091,6 +1107,7 @@ thread 'main' panicked at x.rs:1:1:
             home: Some(directory.path().to_path_buf()),
             service_logs,
             windows_errors: String::new(),
+            core_sessions: Vec::new(),
         };
         let path = directory.path().join("bundle.zip");
         write_bundle(&path, &inputs).unwrap();
@@ -1168,6 +1185,7 @@ thread 'main' panicked at x.rs:1:1:
             home: None,
             service_logs: Vec::new(),
             windows_errors: String::new(),
+            core_sessions: Vec::new(),
         };
         assert!(
             !collect_entries(&inputs)

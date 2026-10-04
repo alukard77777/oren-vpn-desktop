@@ -632,6 +632,20 @@ fn profiles(count: usize) -> ModelRc<UiSubscriptionProfile> {
     ModelRc::new(VecModel::from(rows))
 }
 
+/// The «Сохранить лог» popup open over the status page with `range` chosen, with the hints
+/// `session_logs::range_hints` writes.
+fn log_range_open(ui: &AppWindow, range: &str) {
+    use multicore_i18n::tr;
+    connected(ui);
+    ui.set_local_page(s("status"));
+    ui.set_events(events());
+    ui.set_log_range_latest_hint(tr!("Идёт с {}", "14:32").into());
+    ui.set_log_range_week_hint(tr!("Подключений: {}", 12).into());
+    ui.set_log_range_all_hint(tr!("Подключений: {} · хранятся 30 дней", 48).into());
+    ui.set_log_range(s(range));
+    ui.set_log_range_open(true);
+}
+
 fn ready(ui: &AppWindow) {
     ui.set_has_profile(true);
     ui.set_status_eyebrow(s("Готово"));
@@ -1399,6 +1413,13 @@ fn scenarios() -> Vec<Scenario> {
             connected(ui);
             ui.set_local_page(s("status"));
             ui.set_diagnostics_save_state(s("failed"));
+        }),
+        // «Сохранить лог»: the range popup over the status page.
+        ("status-log-range", 840, 720, |ui| {
+            log_range_open(ui, "latest");
+        }),
+        ("status-log-range-week-min", 700, 620, |ui| {
+            log_range_open(ui, "week");
         }),
         ("home-menu-connected", 840, 720, |ui| {
             connected(ui);
@@ -2501,6 +2522,89 @@ fn icon_loading_previews() {
         popup.set_reduced_motion(reduced);
         capture(&popup, name, 304, 460);
     }
+}
+
+/// The «Сохранить лог» popup: the arrow keys move the choice, Enter, a double click or
+/// «Сохранить» save with it, and Esc or a click on the backdrop close it without saving;
+/// a click inside the card keeps it open.
+#[test]
+fn the_log_range_popup_saves_the_chosen_range_or_closes_without_saving() {
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    let _ = slint::platform::set_platform(Box::new(PreviewPlatform));
+    let ui = new_app();
+    connected(&ui);
+    ui.set_local_page(s("status"));
+    let window = LAST_WINDOW
+        .with(|last| last.borrow().clone())
+        .expect("preview window adapter");
+    window.set_size(PhysicalSize::new(840, 720));
+    ui.show().expect("show app window");
+    settle(2);
+    let saved = Rc::new(RefCell::new(Vec::<SharedString>::new()));
+    let sink = saved.clone();
+    ui.on_save_diagnostics(move |range| sink.borrow_mut().push(range));
+    let open = || {
+        ui.set_log_range(s("latest"));
+        ui.set_log_range_open(true);
+        settle(2);
+    };
+    let key = |key: Key| {
+        window.dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+        window.dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+        slint::platform::update_timers_and_animations();
+    };
+    let click = |x: f32, y: f32| {
+        let position = slint::LogicalPosition::new(x, y);
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+        window.dispatch_event(WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        });
+        slint::platform::update_timers_and_animations();
+    };
+
+    open();
+    key(Key::DownArrow);
+    assert_eq!(ui.get_log_range(), "week");
+    key(Key::DownArrow);
+    assert_eq!(ui.get_log_range(), "all");
+    key(Key::DownArrow);
+    assert_eq!(ui.get_log_range(), "all");
+    key(Key::UpArrow);
+    assert_eq!(ui.get_log_range(), "week");
+    key(Key::Return);
+    assert!(!ui.get_log_range_open());
+    assert_eq!(*saved.borrow(), [SharedString::from("week")]);
+
+    open();
+    key(Key::Escape);
+    assert!(!ui.get_log_range_open());
+    open();
+    click(30.0, 600.0);
+    assert!(
+        !ui.get_log_range_open(),
+        "a click on the backdrop closes it"
+    );
+    assert_eq!(saved.borrow().len(), 1, "closing never saves");
+
+    // The 340 px card is centred: its options start 82 px below its top, 62 px apart, and
+    // the buttons sit at its bottom right.
+    open();
+    let top = (720.0 - 340.0) / 2.0;
+    click(420.0, top + 82.0 + 62.0 * 2.0 + 28.0);
+    assert!(
+        ui.get_log_range_open(),
+        "a click inside the card keeps it open"
+    );
+    assert_eq!(ui.get_log_range(), "all");
+    click(420.0 + 220.0 - 24.0 - 60.0, top + 340.0 - 20.0 - 22.0);
+    assert!(!ui.get_log_range_open());
+    assert_eq!(saved.borrow().last().map(SharedString::as_str), Some("all"));
+    ui.hide().expect("hide app window");
 }
 
 /// The placeholder pulse reads `animation-tick()` only while an icon is loading: once the

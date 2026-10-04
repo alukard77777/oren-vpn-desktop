@@ -33,6 +33,7 @@ mod rust_catalog_tests;
 mod save_dialog;
 mod service_install;
 mod service_logo;
+mod session_logs;
 mod single_instance;
 #[cfg(test)]
 mod slint_catalog_tests;
@@ -1041,6 +1042,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
     wire_copy_diagnostics(&ui, model.clone());
+    wire_log_range(&ui);
     wire_save_diagnostics(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
     wire_catalog_node(&ui, model.clone());
@@ -4934,12 +4936,36 @@ fn diagnostics_export(model: &Arc<Mutex<DesktopViewModel>>) -> String {
     text
 }
 
-/// «Сохранить лог…»: asks where to save, then writes the diagnostics archive (see
-/// `log_bundle`). The label reports «Сохраняем…», then «Сохранено ✓» or «Не сохранено».
+/// «Сохранить лог…» opens the «Сохранить лог» popup: which connections go into the archive
+/// (see `session_logs`), «Последнее подключение» preselected; «Сохранить» continues with
+/// `save-diagnostics(range)`.
+fn wire_log_range(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_open_log_range(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let root = data_root::user_data_root().ok();
+        let hints = session_logs::range_hints(
+            root.as_deref(),
+            multicore_core::core_sessions::unix_ms_now(),
+        );
+        ui.set_log_range_latest_hint(hints.latest.into());
+        ui.set_log_range_week_hint(hints.week.into());
+        ui.set_log_range_all_hint(hints.all.into());
+        ui.set_log_range(session_logs::LogRange::Latest.key().into());
+        ui.set_log_range_open(true);
+    });
+}
+
+/// «Сохранить» in the «Сохранить лог» popup: asks where to save, then writes the diagnostics
+/// archive (see `log_bundle`) with the connections of the chosen range. The label reports
+/// «Сохраняем…», then «Сохранено ✓» or «Не сохранено».
 fn wire_save_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
     let weak = ui.as_weak();
-    ui.on_save_diagnostics(move || {
+    ui.on_save_diagnostics(move |range| {
+        let range = session_logs::LogRange::from_key(range.as_str());
         let Some(ui) = weak.upgrade() else {
             return;
         };
@@ -4961,7 +4987,7 @@ fn wire_save_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
         let owner = save_dialog::OwnerWindow::of(ui.window());
         let (weak, model) = (weak.clone(), model.clone());
         thread::spawn(move || {
-            let outcome = save_diagnostics_archive(&weak, &model, owner, &facts);
+            let outcome = save_diagnostics_archive(&weak, &model, owner, &facts, range);
             IN_PROGRESS.store(false, Ordering::Release);
             if let Some(Err(error)) = &outcome {
                 daemon::record_low_level("diagnostics_archive_failed", error);
@@ -4997,6 +5023,7 @@ fn save_diagnostics_archive(
     model: &Arc<Mutex<DesktopViewModel>>,
     owner: save_dialog::OwnerWindow,
     facts: &log_bundle::UiFacts,
+    range: session_logs::LogRange,
 ) -> Option<Result<bool, String>> {
     let name = log_bundle::default_file_name(chrono::Local::now());
     let (path, fallback) = match save_dialog::choose(owner, &name) {
@@ -5042,12 +5069,24 @@ fn save_diagnostics_archive(
     };
     // The service's own log is SYSTEM/root-only: the daemon asks the service for it.
     let (service_log_note, service_logs) = log_bundle::service_log_entries(client.service_log());
+    // The connections of the chosen range: the user's own journal and index, and the
+    // service's journal of this user through the daemon.
+    let data_root = data_root::user_data_root().ok();
+    let plan = session_logs::SessionPlan::read(
+        data_root.as_deref(),
+        range,
+        multicore_core::core_sessions::unix_ms_now(),
+    );
+    let service_journal = plan.since_ms().map(|since| client.core_journal(since));
+    let (sessions_note, core_sessions) =
+        session_logs::session_entries(&plan, data_root.as_deref(), service_journal, &service_logs);
     let mut inputs = log_bundle::BundleInputs::for_this_user(
-        log_bundle::system_report(facts) + &service_log_note,
+        log_bundle::system_report(facts) + &service_log_note + &sessions_note,
         diagnostics,
         daemon_diagnostics,
     );
     inputs.service_logs = service_logs;
+    inputs.core_sessions = core_sessions;
     inputs.windows_errors = log_bundle::windows_error_events();
     Some(
         log_bundle::write_bundle(&path, &inputs)
@@ -9149,7 +9188,9 @@ mod window_tests {
         assert!(!modal.contains("root.subscription-draft"));
         assert!(modal.contains("key-pressed(event)"));
         assert!(modal.contains("root.cancel-deep-link();"));
-        assert!(ui.contains("enabled: !root.deep-link-confirm-open && !root.update-confirm-open;"));
+        assert!(ui.contains(
+            "enabled: !root.deep-link-confirm-open && !root.update-confirm-open && !root.log-range-open;"
+        ));
 
         let rust = include_str!("main.rs");
         let queue = rust

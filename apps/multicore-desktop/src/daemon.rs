@@ -167,6 +167,10 @@ const TROUBLESHOOT_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
 const SERVICE_LOG_RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 /// The daemon pages the log from the service, possibly behind a `Prepare` holding its lock.
 const SERVICE_LOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The service keeps at most 64 MiB of journal per user; JSON escapes add a little.
+const CORE_JOURNAL_RESPONSE_LIMIT_BYTES: usize = 96 * 1024 * 1024;
+/// Paging up to 64 MiB through the service takes a while.
+const CORE_JOURNAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// One check: the clock check tries three servers at six seconds each.
 const TROUBLESHOOT_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
 /// Fixes wait for the administrator prompt and for services to stop.
@@ -354,6 +358,19 @@ pub struct DaemonServiceLog {
     pub status: String,
     #[serde(default)]
     pub files: Vec<DaemonServiceLogFile>,
+}
+
+/// GET /v1/core-journal: this user's core journal in the always-ready service.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DaemonCoreJournal {
+    /// `included`, `no_service`, `too_old`, `busy` or `unavailable`.
+    #[serde(default)]
+    pub status: String,
+    /// Whole `<unix ms>\t<engine>\t<stream>\t<message>` lines, oldest first.
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -675,6 +692,12 @@ pub trait DaemonClient: Send + Sync {
     /// GET /v1/service-log («Сохранить лог…»). Daemons without the route answer 404.
     fn service_log(&self) -> Result<DaemonServiceLog, DaemonError> {
         Err(DaemonError::new(tr!("Журнал службы недоступен.")))
+    }
+
+    /// GET /v1/core-journal?since_ms= («Сохранить лог…»): the service's core journal of this
+    /// user from `since_ms` on. Daemons without the route answer 404.
+    fn core_journal(&self, _since_ms: u64) -> Result<DaemonCoreJournal, DaemonError> {
+        Err(DaemonError::new(tr!("Журнал ядер службы недоступен.")))
     }
 
     /// GET /v1/dashboard-url. The returned URL embeds the ephemeral Mihomo controller secret for
@@ -1434,6 +1457,16 @@ impl DaemonClient for HttpDaemonClient {
                 .get(self.endpoint("/v1/service-log"))
                 .timeout(SERVICE_LOG_REQUEST_TIMEOUT),
             SERVICE_LOG_RESPONSE_LIMIT_BYTES,
+        )
+    }
+
+    fn core_journal(&self, since_ms: u64) -> Result<DaemonCoreJournal, DaemonError> {
+        self.send_json(
+            self.http
+                .get(self.endpoint("/v1/core-journal"))
+                .query(&[("since_ms", since_ms)])
+                .timeout(CORE_JOURNAL_REQUEST_TIMEOUT),
+            CORE_JOURNAL_RESPONSE_LIMIT_BYTES,
         )
     }
 
@@ -2635,6 +2668,24 @@ mod http_tests {
             assert!(error.requires_reconciliation());
             assert!(!error.to_string().contains("status-token"));
         }
+    }
+
+    #[test]
+    fn the_core_journal_is_asked_from_the_given_start() {
+        let (base_url, server) = start_selection_server(
+            "200 OK",
+            r#"{"status":"included","text":"1\tmihomo\tstdout\tready\n","truncated":false}"#,
+        );
+        let client =
+            HttpDaemonClient::new(base_url, "token").expect("construct authenticated client");
+        let journal = client.core_journal(1_791_000_000_000).expect("journal");
+        let request = server.join().expect("join test HTTP server");
+        assert!(
+            request.starts_with("GET /v1/core-journal?since_ms=1791000000000 "),
+            "{request}"
+        );
+        assert_eq!(journal.status, "included");
+        assert_eq!(journal.text, "1\tmihomo\tstdout\tready\n");
     }
 
     #[test]

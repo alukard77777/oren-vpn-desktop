@@ -1964,3 +1964,69 @@ msgstr "MB/s"
 
 msgid "ГБ/с"
 msgstr "GB/s"
+
+msgid "Сохранить лог"
+msgstr "Save log"
+
+msgid "Какие подключения положить в архив?"
+msgstr "Which connections go into the archive?"
+
+msgid "Последнее подключение"
+msgstr "Last connection"
+
+msgid "За неделю"
+msgstr "Past week"
+
+msgid "За всё время"
+msgstr "All time"
+
+msgid "Журнал ядер службы недоступен."
+msgstr "Service core log unavailable."
+
+msgid "последнее подключение"
+msgstr "last connection"
+
+msgid "за неделю"
+msgstr "past week"
+
+msgid "за всё время"
+msgstr "all time"
+
+msgid "Подключений ещё не было"
+msgstr "No connections yet"
+
+msgid "Идёт с {}"
+msgstr "Since {}"
+
+msgid "Начато {}"
+msgstr "Started {}"
+
+msgid "Подключений: {}"
+msgstr "Connections: {}"
+
+msgid "Подключений: {} · хранятся 30 дней"
+msgstr "Connections: {} · kept 30 days"
+
+msgid "Диапазон лога"
+msgstr "Log range"
+
+msgid "Подключения"
+msgstr "Connections"
+
+msgid "нет записанных подключений"
+msgstr "no recorded connections"
+
+msgid "журнал ядер службы недоступен: демон не ответил"
+msgstr "service core log unavailable: no daemon reply"
+
+msgid "журнал ядер службы обрезан по размеру"
+msgstr "service core log cut to size"
+
+msgid "журнал ядер службы недоступен: служба слишком старая"
+msgstr "service core log unavailable: service too old"
+
+msgid "журнал ядер службы недоступен: службой пользуется другой пользователь"
+msgstr "service core log unavailable: another user holds the service"
+
+msgid "журнал ядер службы недоступен: служба не ответила"
+msgstr "service core log unavailable: no service reply"
