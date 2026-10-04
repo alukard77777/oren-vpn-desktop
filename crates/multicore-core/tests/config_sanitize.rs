@@ -1751,3 +1751,115 @@ fn assert_pinned_xray_accepts(config_bytes: &[u8]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The patched Mihomo (packaging/mihomo-patches) reads its REALITY policy from two top-level keys.
+/// They survive the service sanitiser and the daemon's runtime staging with an accepted value,
+/// normalised to a plain string.
+#[test]
+fn reality_policy_keys_survive_with_accepted_values() {
+    for (mlkem, version, want_mlkem, want_version) in [
+        ("auto", "\"26.9.9\"", "auto", "26.9.9"),
+        ("on", "25.1.1", "on", "25.1.1"),
+        ("'OFF '", "v1.9.0", "off", "v1.9.0"),
+        ("Auto", "' 255.0.0 '", "auto", "255.0.0"),
+    ] {
+        let input = format!(
+            "mode: rule\nreality-mlkem: {mlkem}\nreality-client-version: {version}\nrules: ['MATCH,DIRECT']\n"
+        );
+        let out =
+            String::from_utf8(sanitize_mihomo(input.as_bytes(), &policy()).unwrap().yaml).unwrap();
+        let doc = yaml(out.as_bytes());
+        assert_eq!(doc["reality-mlkem"].as_str(), Some(want_mlkem), "{input}");
+        assert_eq!(
+            doc["reality-client-version"].as_str(),
+            Some(want_version),
+            "{input}"
+        );
+        // Never a YAML boolean. (A bare `on`/`off` is fine: Mihomo's YAML decoder reads it into
+        // the string field as written, which patch 0003's own Go test covers.)
+        assert!(!out.contains("reality-mlkem: true") && !out.contains("reality-mlkem: false"));
+    }
+}
+
+/// A value the patched core would refuse (it fails the whole config over it) is dropped, so the
+/// core falls back to its defaults; absent keys stay absent, which is the adaptive default.
+#[test]
+fn invalid_or_absent_reality_policy_keys_fall_back_to_the_core_defaults() {
+    for (mlkem, version) in [
+        ("always", "1.9"),
+        ("true", "256.0.0"),
+        ("{x: 1}", "1.9.0.1"),
+        ("[on]", "26.9.9-rc1"),
+        ("1", "a.b.c"),
+        ("''", "1..2"),
+        ("~", "26.9.9.9"),
+        ("on", "1000.0.0"),
+    ] {
+        let input = format!(
+            "mode: rule\nreality-mlkem: {mlkem}\nreality-client-version: {version}\nrules: ['MATCH,DIRECT']\n"
+        );
+        let doc = yaml(&sanitize_mihomo(input.as_bytes(), &policy()).unwrap().yaml);
+        assert!(
+            doc.get("reality-client-version").is_none(),
+            "{version} must be dropped"
+        );
+        if mlkem != "on" {
+            assert!(
+                doc.get("reality-mlkem").is_none(),
+                "{mlkem} must be dropped"
+            );
+        } else {
+            assert_eq!(doc["reality-mlkem"].as_str(), Some("on"));
+        }
+    }
+    let doc = yaml(
+        &sanitize_mihomo(b"mode: rule\nrules: ['MATCH,DIRECT']\n", &policy())
+            .unwrap()
+            .yaml,
+    );
+    assert!(doc.get("reality-mlkem").is_none());
+    assert!(doc.get("reality-client-version").is_none());
+}
+
+#[test]
+fn reality_policy_keys_pass_daemon_staging_and_the_service_sanitiser() {
+    let snapshot = Snapshot::parse(
+        b"reality-mlkem: on\nreality-client-version: '25.1.1'\nproxies:\n  - {name: a, type: vless, server: 192.0.2.1, port: 443, uuid: 00000000-0000-4000-8000-000000000001, tls: true, servername: example.com, client-fingerprint: firefox, reality-opts: {public-key: WB52-may9oKJkdKL4cbLSLg_t41INOVet9-1ey1RLnk, short-id: 0123456789abcdef}}\nproxy-groups:\n  - {name: g, type: select, proxies: [a]}\nrules: [MATCH,g]\n",
+        multicore_core::IDLE_XRAY_CONFIG,
+    )
+    .unwrap();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "daemon-secret")
+        .unwrap()
+        .with_proxy_mode(28765)
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staged = stage_runtime_with_mihomo_control(&snapshot, root.path(), &control).unwrap();
+    let mihomo = std::fs::read(&staged.paths().mihomo_config).unwrap();
+    let staged_doc = yaml(&mihomo);
+    assert_eq!(staged_doc["reality-mlkem"].as_str(), Some("on"));
+    assert_eq!(
+        staged_doc["reality-client-version"].as_str(),
+        Some("25.1.1")
+    );
+    let doc = yaml(&sanitize_mihomo(&mihomo, &policy()).unwrap().yaml);
+    assert_eq!(doc["reality-mlkem"].as_str(), Some("on"));
+    assert_eq!(doc["reality-client-version"].as_str(), Some("25.1.1"));
+    let proxy = &doc["proxies"][0];
+    assert_eq!(proxy["client-fingerprint"].as_str(), Some("firefox"));
+    assert_eq!(
+        proxy["reality-opts"]["short-id"].as_str(),
+        Some("0123456789abcdef")
+    );
+
+    // Without the keys nothing is added: the patched core's adaptive default applies.
+    let plain = Snapshot::parse(
+        b"proxies:\n  - {name: a, type: socks5, server: 127.0.0.1, port: 1}\nrules: [MATCH,a]\n",
+        multicore_core::IDLE_XRAY_CONFIG,
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let staged = stage_runtime_with_mihomo_control(&plain, root.path(), &control).unwrap();
+    let doc = yaml(&std::fs::read(&staged.paths().mihomo_config).unwrap());
+    assert!(doc.get("reality-mlkem").is_none());
+    assert!(doc.get("reality-client-version").is_none());
+}

@@ -23,8 +23,9 @@ mod windows_job;
 pub use config_sanitize::{
     ALLOWED_MIHOMO_KEYS, ALLOWED_XRAY_INBOUND_KEYS, ALLOWED_XRAY_INBOUND_PROTOCOLS,
     ALLOWED_XRAY_OUTBOUND_PROTOCOLS, ALLOWED_XRAY_RULE_KEYS, ALLOWED_XRAY_SECTIONS,
-    MihomoServicePolicy, SanitizeError, SanitizedMihomo, XRAY_ENDPOINT_KEYS, XRAY_FORBIDDEN_KEYS,
-    XRAY_XDRIVE_DIRECTORY, XRAY_XDRIVE_SERVICES, sanitize_mihomo, sanitize_xray,
+    MihomoServicePolicy, REALITY_CLIENT_VERSION_KEY, REALITY_MLKEM_KEY, SanitizeError,
+    SanitizedMihomo, XRAY_ENDPOINT_KEYS, XRAY_FORBIDDEN_KEYS, XRAY_XDRIVE_DIRECTORY,
+    XRAY_XDRIVE_SERVICES, sanitize_mihomo, sanitize_xray,
 };
 pub use device_identity::{DeviceIdentity, DeviceIdentityError, derive_incy_hwid, is_valid_hwid};
 pub use event::{Component, Event, Severity};
