@@ -1962,14 +1962,11 @@ msgstr "GB/s"
 msgid "Сохранить лог"
 msgstr "Save log"
 
-msgid "Какие подключения положить в архив?"
-msgstr "Which connections go into the archive?"
-
 msgid "Последнее подключение"
-msgstr "Last connection"
+msgstr "Latest connection"
 
 msgid "За неделю"
-msgstr "Past week"
+msgstr "Last week"
 
 msgid "За всё время"
 msgstr "All time"
@@ -1981,25 +1978,13 @@ msgid "последнее подключение"
 msgstr "last connection"
 
 msgid "за неделю"
-msgstr "past week"
+msgstr "last week"
 
 msgid "за всё время"
 msgstr "all time"
 
 msgid "Подключений ещё не было"
 msgstr "No connections yet"
-
-msgid "Идёт с {}"
-msgstr "Since {}"
-
-msgid "Начато {}"
-msgstr "Started {}"
-
-msgid "Подключений: {}"
-msgstr "Connections: {}"
-
-msgid "Подключений: {} · хранятся 30 дней"
-msgstr "Connections: {} · kept 30 days"
 
 msgid "Диапазон лога"
 msgstr "Log range"
@@ -2024,3 +2009,30 @@ msgstr "service core log unavailable: another user holds the service"
 
 msgid "журнал ядер службы недоступен: служба не ответила"
 msgstr "service core log unavailable: no service reply"
+
+msgid "Архив для поддержки: журналы ядер, события, система"
+msgstr "Support archive: core logs, events, system"
+
+msgid "Сохранить…"
+msgstr "Save…"
+
+msgid "{} подключение"
+msgstr "{} connection"
+
+msgid "{} подключения"
+msgstr "{} connections"
+
+msgid "{} подключений"
+msgstr "{} connections"
+
+msgid "<1 МБ"
+msgstr "<1 MB"
+
+msgid "~{} МБ"
+msgstr "~{} MB"
+
+msgid "{}–сейчас"
+msgstr "{}–now"
+
+msgid "Сегодня {}"
+msgstr "Today {}"

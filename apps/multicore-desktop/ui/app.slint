@@ -299,16 +299,18 @@ component SmallAction inherits Rectangle {
     }
 }
 
-// «Сохранить лог»: one range of the archive — a radio row with a title and a short hint.
+// «Сохранить лог»: one range of the archive — a selectable card with a line icon in a rounded
+// square, a title, a muted hint and a check mark when chosen.
 component LogRangeOption inherits Rectangle {
     in property <string> label;
     in property <string> hint;
+    in property <image> icon;
     in property <bool> selected: false;
     in property <int> focus-epoch: 0;
     out property <bool> option-has-focus: range-focus.has-focus;
     callback activated();
     callback focus-option();
-    // Enter: save with the chosen range.
+    // Enter or a double click: save with this range.
     callback confirmed();
     // Arrow keys: the previous (-1) or next (1) option.
     callback moved(int);
@@ -320,64 +322,73 @@ component LogRangeOption inherits Rectangle {
         }
     }
 
-    height: 56px;
+    height: 58px;
     border-radius: 10px;
-    background: root.selected ? #4c9dff14 : range-touch.has-hover ? #ffffff0a : transparent;
-    border-color: range-focus.has-focus ? Theme.focus : root.selected ? #4c9dff66 : #ffffff14;
+    background: root.selected ? #4c9dff1a : range-touch.has-hover ? #ffffff0f : #ffffff08;
+    border-color: range-focus.has-focus ? Theme.focus : root.selected ? #4c9dff66 : range-touch.has-hover ? #ffffff1a : #ffffff0d;
     border-width: range-focus.has-focus ? Theme.focus-width : 1px;
-    animate background { duration: Motion.reduced ? 0ms : 140ms; easing: ease-out; }
+    animate background, border-color { duration: Motion.reduced ? 0ms : 140ms; easing: ease-out; }
     accessible-role: radio-button;
     accessible-label: root.label;
     accessible-description: root.hint;
     accessible-checked: root.selected;
     accessible-action-default => { root.activated(); }
 
-    // The radio mark.
     Rectangle {
-        x: 14px;
+        x: 12px;
         y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
-        border-radius: 9px;
-        background: transparent;
-        border-color: root.selected ? Theme.accent-blue : Theme.text-muted;
-        border-width: 1.5px;
-        Rectangle {
-            x: 4px;
-            y: 4px;
-            width: 10px;
-            height: 10px;
-            border-radius: 5px;
-            background: Theme.accent-blue;
-            opacity: root.selected ? 1 : 0;
-            animate opacity { duration: Motion.reduced ? 0ms : 140ms; easing: ease-out; }
+        width: 32px;
+        height: 32px;
+        border-radius: 8px;
+        background: #ffffff0d;
+        Image {
+            x: 8px;
+            y: 8px;
+            width: 16px;
+            height: 16px;
+            source: root.icon;
+            colorize: root.selected ? Theme.accent-blue : #7f8996;
+            image-fit: contain;
+            accessible-role: none;
         }
     }
     Text {
-        x: 44px;
-        y: 9px;
-        width: parent.width - 58px;
-        height: 20px;
+        x: 56px;
+        y: 11px;
+        width: parent.width - 56px - (root.selected ? 40px : 12px);
+        height: 18px;
         text: root.label;
-        color: root.selected ? Theme.text-primary : Theme.text-secondary;
+        color: root.selected ? Theme.text-primary : #b8c0ca;
         font-family: Theme.font-family;
-        font-size: Theme.type-metadata-size + 1px;
-        font-weight: root.selected ? Theme.weight-semibold : Theme.weight-medium;
+        font-size: 13px;
+        font-weight: Theme.weight-semibold;
         vertical-alignment: center;
         overflow: elide;
         accessible-role: none;
     }
     Text {
-        x: 44px;
-        y: 29px;
-        width: parent.width - 58px;
-        height: 18px;
+        x: 56px;
+        y: 30px;
+        width: parent.width - 56px - (root.selected ? 40px : 12px);
+        height: 16px;
         text: root.hint;
-        color: Theme.text-muted;
+        color: #7f8996;
         font-family: Theme.font-family;
-        font-size: 12px;
+        font-size: 11px;
         vertical-alignment: center;
         overflow: elide;
+        accessible-role: none;
+    }
+    Image {
+        x: parent.width - 12px - self.width;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        source: @image-url("../assets/check.svg");
+        colorize: Theme.accent-blue;
+        image-fit: contain;
+        opacity: root.selected ? 1 : 0;
+        animate opacity { duration: Motion.reduced ? 0ms : 140ms; easing: ease-out; }
         accessible-role: none;
     }
     range-focus := FocusScope {
@@ -407,6 +418,58 @@ component LogRangeOption inherits Rectangle {
             mouse-cursor: pointer;
             clicked => { root.activated(); }
             double-clicked => { root.activated(); root.confirmed(); }
+        }
+    }
+}
+
+// «Сохранить лог» footer buttons: a ghost text button («Отмена») or the filled accent one
+// («Сохранить…»).
+component LogRangeButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    callback activated();
+
+    height: 36px;
+    min-width: button-label.preferred-width + (root.primary ? 40px : 32px);
+    preferred-width: self.min-width;
+    horizontal-stretch: 0;
+    border-radius: 8px;
+    background: !root.primary ? transparent
+        : button-touch.pressed ? Theme.accent-blue-pressed
+        : button-touch.has-hover ? Theme.accent-blue-hover
+        : Theme.accent-blue;
+    border-color: button-focus.has-focus ? Theme.focus : transparent;
+    border-width: button-focus.has-focus ? Theme.focus-width : 0px;
+    drop-shadow-blur: root.primary ? 12px : 0px;
+    drop-shadow-color: root.primary ? #4c9dff1a : transparent;
+    animate background { duration: Motion.reduced ? 0ms : 120ms; easing: ease-out; }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+
+    button-label := Text {
+        text: root.label;
+        color: root.primary ? #ffffff : button-touch.has-hover ? Theme.text-primary : #7f8996;
+        font-family: Theme.font-family;
+        font-size: 13px;
+        font-weight: root.primary ? Theme.weight-semibold : Theme.weight-medium;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    button-focus := FocusScope {
+        focus-on-click: true;
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+        button-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.activated(); }
         }
     }
 }
@@ -5629,32 +5692,43 @@ export component AppWindow inherits Window {
         }
     }
 
-    // «Сохранить лог»: which connections go into the archive, then the save dialog.
+    // «Сохранить лог»: which connections go into the archive, then the save dialog. The title
+    // bar and the rail stay visible; the content pane dims under a card centred in it.
     if root.log-range-open: Rectangle {
-        x: root.resize-border;
-        y: root.resize-border;
-        width: parent.width - 2 * root.resize-border;
-        height: parent.height - 2 * root.resize-border;
-        background: #05070bc7;
-        // A click on the backdrop closes it.
+        property <length> pane-x: root.resize-border
+            + (root.rail-width-live >= 0px ? root.rail-width-live : root.navigation-collapsed ? 64px : 176px);
+        property <length> pane-y: root.resize-border + 44px;
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        // A click anywhere outside the card closes it.
         TouchArea {
             width: parent.width;
             height: parent.height;
             clicked => { root.log-range-open = false; }
         }
+        Rectangle {
+            x: parent.pane-x;
+            y: parent.pane-y;
+            width: parent.width - parent.pane-x - root.resize-border;
+            height: parent.height - parent.pane-y - root.resize-border;
+            background: #0000008c;
+        }
 
         log-range-card := Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: Math.min(440px, parent.width - 48px);
-            height: 340px;
-            background: Theme.elevated;
-            border-color: Theme.line;
+            x: parent.pane-x + (parent.width - parent.pane-x - root.resize-border - self.width) / 2;
+            y: parent.pane-y + (parent.height - parent.pane-y - root.resize-border - self.height) / 2;
+            width: Math.min(380px, parent.width - parent.pane-x - root.resize-border - 32px);
+            height: log-range-content.preferred-height;
+            background: #1a1d23;
+            border-color: #ffffff1a;
             border-width: 1px;
-            border-radius: 16px;
-            drop-shadow-blur: 24px;
-            drop-shadow-offset-y: 8px;
-            drop-shadow-color: #00000080;
+            border-radius: 14px;
+            drop-shadow-blur: 40px;
+            drop-shadow-offset-y: 16px;
+            drop-shadow-color: #00000099;
             accessible-role: groupbox;
             accessible-label: @tr("Сохранить лог");
             // Clicks inside the card never reach the backdrop.
@@ -5677,73 +5751,73 @@ export component AppWindow inherits Window {
                     }
                     return reject;
                 }
-                VerticalLayout {
-                    padding: 24px;
-                    padding-bottom: 20px;
-                    spacing: 6px;
+                log-range-content := VerticalLayout {
+                    padding: 20px;
+                    spacing: 0px;
                     Text {
-                        height: 26px;
                         text: @tr("Сохранить лог");
                         color: Theme.text-primary;
                         font-family: Theme.font-family;
-                        font-size: Theme.type-label-size;
+                        font-size: 18px;
                         font-weight: Theme.weight-semibold;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        height: 22px;
-                        text: @tr("Какие подключения положить в архив?");
-                        color: Theme.text-secondary;
-                        font-family: Theme.font-family;
-                        font-size: Theme.type-metadata-size;
-                        vertical-alignment: top;
                         overflow: elide;
                     }
-                    LogRangeOption {
-                        label: @tr("Последнее подключение");
-                        hint: root.log-range-latest-hint;
-                        selected: root.log-range == "latest";
-                        focus-epoch: root.log-range == "latest" ? root.log-range-focus-serial : 0;
-                        // Conditional creation does not fire changed focus-epoch.
-                        init => { if (self.selected) { self.focus-option(); } }
-                        activated => { root.log-range = "latest"; }
-                        confirmed => { root.log-range-open = false; root.save-diagnostics(root.log-range); }
-                        moved(step) => { log-range-focus.select-step(step); }
+                    Text {
+                        text: @tr("Архив для поддержки: журналы ядер, события, система");
+                        color: #7f8996;
+                        font-family: Theme.font-family;
+                        font-size: 12px;
+                        wrap: word-wrap;
                     }
-                    LogRangeOption {
-                        label: @tr("За неделю");
-                        hint: root.log-range-week-hint;
-                        selected: root.log-range == "week";
-                        focus-epoch: root.log-range == "week" ? root.log-range-focus-serial : 0;
-                        init => { if (self.selected) { self.focus-option(); } }
-                        activated => { root.log-range = "week"; }
-                        confirmed => { root.log-range-open = false; root.save-diagnostics(root.log-range); }
-                        moved(step) => { log-range-focus.select-step(step); }
+                    Rectangle { height: 16px; background: transparent; }
+                    VerticalLayout {
+                        spacing: 8px;
+                        LogRangeOption {
+                            label: @tr("Последнее подключение");
+                            hint: root.log-range-latest-hint;
+                            icon: @image-url("../assets/log-latest.svg");
+                            selected: root.log-range == "latest";
+                            focus-epoch: root.log-range == "latest" ? root.log-range-focus-serial : 0;
+                            // Conditional creation does not fire changed focus-epoch.
+                            init => { if (self.selected) { self.focus-option(); } }
+                            activated => { root.log-range = "latest"; }
+                            confirmed => { root.log-range-open = false; root.save-diagnostics(root.log-range); }
+                            moved(step) => { log-range-focus.select-step(step); }
+                        }
+                        LogRangeOption {
+                            label: @tr("За неделю");
+                            hint: root.log-range-week-hint;
+                            icon: @image-url("../assets/log-week.svg");
+                            selected: root.log-range == "week";
+                            focus-epoch: root.log-range == "week" ? root.log-range-focus-serial : 0;
+                            init => { if (self.selected) { self.focus-option(); } }
+                            activated => { root.log-range = "week"; }
+                            confirmed => { root.log-range-open = false; root.save-diagnostics(root.log-range); }
+                            moved(step) => { log-range-focus.select-step(step); }
+                        }
+                        LogRangeOption {
+                            label: @tr("За всё время");
+                            hint: root.log-range-all-hint;
+                            icon: @image-url("../assets/log-all.svg");
+                            selected: root.log-range == "all";
+                            focus-epoch: root.log-range == "all" ? root.log-range-focus-serial : 0;
+                            init => { if (self.selected) { self.focus-option(); } }
+                            activated => { root.log-range = "all"; }
+                            confirmed => { root.log-range-open = false; root.save-diagnostics(root.log-range); }
+                            moved(step) => { log-range-focus.select-step(step); }
+                        }
                     }
-                    LogRangeOption {
-                        label: @tr("За всё время");
-                        hint: root.log-range-all-hint;
-                        selected: root.log-range == "all";
-                        focus-epoch: root.log-range == "all" ? root.log-range-focus-serial : 0;
-                        init => { if (self.selected) { self.focus-option(); } }
-                        activated => { root.log-range = "all"; }
-                        confirmed => { root.log-range-open = false; root.save-diagnostics(root.log-range); }
-                        moved(step) => { log-range-focus.select-step(step); }
-                    }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    Rectangle { height: 24px; background: transparent; }
                     HorizontalLayout {
-                        height: 44px;
                         alignment: end;
                         spacing: 8px;
-                        SmallAction {
-                            width: 88px;
+                        LogRangeButton {
                             label: @tr("Отмена");
                             activated => { root.log-range-open = false; }
                         }
-                        SmallAction {
-                            width: 120px;
-                            label: @tr("Сохранить");
-                            selected: true;
+                        LogRangeButton {
+                            label: @tr("Сохранить…");
+                            primary: true;
                             activated => {
                                 root.log-range-open = false;
                                 root.save-diagnostics(root.log-range);

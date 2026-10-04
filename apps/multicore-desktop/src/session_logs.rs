@@ -138,42 +138,125 @@ pub(crate) struct RangeHints {
     pub(crate) all: String,
 }
 
-/// The popup's hints: when the newest connection began, and how many connections the week
-/// and the whole index hold. Reads only the small index.
+/// The popup's hints: the newest connection's time span, and how many connections the week
+/// and the whole index hold; each with the approximate size of their core log when it is
+/// known (every connection ran without the service, whose journal size only the service
+/// knows). Reads the small index and the journal's file sizes only.
 pub(crate) fn range_hints(data_root: Option<&Path>, now_ms: u64) -> RangeHints {
     let all = SessionPlan::read(data_root, LogRange::All, now_ms);
     let week = SessionPlan::new(all.sessions.clone(), LogRange::Week, now_ms);
-    let latest = match all.sessions.last() {
+    let latest = SessionPlan::new(all.sessions.clone(), LogRange::Latest, now_ms);
+    let segments = data_root
+        .map(|root| journal_segments(&sessions_directory(root)))
+        .unwrap_or_default();
+    let with_size = |text: String, plan: &SessionPlan| match plan.approximate_bytes(&segments) {
+        Some(bytes) => format!("{text} · {}", approximate_size(bytes)),
+        None => text,
+    };
+    let latest_hint = match all.sessions.last() {
         None => tr!("Подключений ещё не было").to_owned(),
-        Some(session) if session.is_open() => {
-            tr!("Идёт с {}", local_time(session.connect_ms, now_ms))
-        }
-        Some(session) => tr!("Начато {}", local_time(session.connect_ms, now_ms)),
+        Some(session) => with_size(time_span(session, now_ms), &latest),
     };
     RangeHints {
-        latest,
-        week: tr!("Подключений: {}", week.count()),
-        all: tr!("Подключений: {} · хранятся 30 дней", all.count()),
+        latest: latest_hint,
+        week: with_size(connection_count(week.count()), &week),
+        all: with_size(connection_count(all.count()), &all),
     }
 }
 
-/// `15:04` today, `04.10 15:04` on another day of this year, `04.10.2025 15:04` otherwise.
-fn local_time(unix_ms: u64, now_ms: u64) -> String {
+impl SessionPlan {
+    /// The size of the user's journal segments written during the selected windows; `None`
+    /// when nothing is selected or a selected connection ran through the service.
+    fn approximate_bytes(
+        &self,
+        segments: &[multicore_core::core_sessions::JournalSegment],
+    ) -> Option<u64> {
+        if self.selected.is_empty()
+            || self
+                .selected
+                .iter()
+                .any(|&index| self.sessions[index].start.service)
+        {
+            return None;
+        }
+        Some(
+            segments
+                .iter()
+                .filter(|segment| {
+                    self.selected.iter().any(|&index| {
+                        let (from, to) = self.windows[index];
+                        segment.start_ms < to && segment.modified_ms >= from
+                    })
+                })
+                .map(|segment| segment.len)
+                .sum(),
+        )
+    }
+}
+
+/// `3 подключения`, `5 подключений`, `21 подключение` (English: `1 connection`, `5 connections`).
+fn connection_count(count: usize) -> String {
+    let russian = multicore_i18n::current() == multicore_i18n::Lang::Ru;
+    let (last, last_two) = (count % 10, count % 100);
+    if russian && last == 1 && last_two != 11 || !russian && count == 1 {
+        tr!("{} подключение", count)
+    } else if russian && (2..=4).contains(&last) && !(12..=14).contains(&last_two) {
+        tr!("{} подключения", count)
+    } else {
+        tr!("{} подключений", count)
+    }
+}
+
+/// `<1 МБ`, `~2 МБ`.
+fn approximate_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes < MIB {
+        tr!("<1 МБ").to_owned()
+    } else {
+        tr!("~{} МБ", (bytes + MIB / 2) / MIB)
+    }
+}
+
+/// `Сегодня 16:46–16:47`, `04.10 16:46–17:02`, `03.10 23:50–04.10 00:10`; a running
+/// connection ends in `сейчас`.
+fn time_span(session: &CoreSession, now_ms: u64) -> String {
     use chrono::{Datelike as _, Local, TimeZone as _};
     let at = |ms: u64| {
         Local
             .timestamp_millis_opt(i64::try_from(ms).unwrap_or(i64::MAX))
             .single()
     };
-    let (Some(when), Some(now)) = (at(unix_ms), at(now_ms)) else {
-        return (unix_ms / 1000).to_string();
+    let (Some(start), Some(now)) = (at(session.connect_ms), at(now_ms)) else {
+        return (session.connect_ms / 1000).to_string();
     };
-    if when.date_naive() == now.date_naive() {
-        when.format("%H:%M").to_string()
-    } else if when.year() == now.year() {
-        when.format("%d.%m %H:%M").to_string()
+    let day = |when: &chrono::DateTime<Local>| {
+        if when.year() == now.year() {
+            when.format("%d.%m").to_string()
+        } else {
+            when.format("%d.%m.%Y").to_string()
+        }
+    };
+    let end = match session.disconnect_ms {
+        None if session.is_open() => tr!("{}–сейчас", start.format("%H:%M")),
+        // Ended without a recorded time (the app stopped meanwhile).
+        None => start.format("%H:%M").to_string(),
+        Some(end_ms) => match at(end_ms) {
+            Some(end) if end.date_naive() == start.date_naive() => {
+                format!("{}–{}", start.format("%H:%M"), end.format("%H:%M"))
+            }
+            Some(end) => format!(
+                "{}–{} {}",
+                start.format("%H:%M"),
+                day(&end),
+                end.format("%H:%M")
+            ),
+            None => start.format("%H:%M").to_string(),
+        },
+    };
+    if start.date_naive() == now.date_naive() {
+        tr!("Сегодня {}", end)
     } else {
-        when.format("%d.%m.%Y %H:%M").to_string()
+        format!("{} {end}", day(&start))
     }
 }
 
@@ -679,14 +762,58 @@ mod tests {
         let now = multicore_core::core_sessions::unix_ms_now();
         let root = data_root(now);
         let hints = range_hints(Some(root.path()), now);
-        assert!(hints.latest.starts_with("Начато "), "{hints:?}");
-        assert_eq!(hints.week, "Подключений: 2");
-        assert_eq!(hints.all, "Подключений: 3 · хранятся 30 дней");
+        // The newest two ran through the service: their size is unknown.
+        assert!(
+            hints.latest.contains('–') && !hints.latest.contains("МБ"),
+            "{hints:?}"
+        );
+        assert_eq!(hints.week, "2 подключения");
+        assert_eq!(hints.all, "3 подключения");
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             range_hints(Some(empty.path()), now).latest,
             "Подключений ещё не было"
         );
+        assert_eq!(range_hints(Some(empty.path()), now).all, "0 подключений");
+    }
+
+    #[test]
+    fn hints_add_the_journal_size_when_no_connection_used_the_service() {
+        let now = multicore_core::core_sessions::unix_ms_now();
+        let directory = tempfile::tempdir().unwrap();
+        let sessions = sessions_directory(directory.path());
+        let index = SessionIndex::open(&sessions, now);
+        index.start(now - 120_000, &start(false));
+        index.end(now - 120_000, now - 60_000, "user");
+        fs::write(
+            sessions.join(segment_name(now - 119_000)),
+            vec![b'x'; 3 * 1024 * 1024],
+        )
+        .unwrap();
+        let hints = range_hints(Some(directory.path()), now);
+        assert!(hints.latest.ends_with(" · ~3 МБ"), "{hints:?}");
+        assert_eq!(hints.week, "1 подключение · ~3 МБ");
+        index.start(now - 30_000, &start(false));
+        let hints = range_hints(Some(directory.path()), now);
+        assert!(hints.latest.contains("–сейчас"), "{hints:?}");
+        assert_eq!(hints.all, "2 подключения · ~3 МБ");
+    }
+
+    #[test]
+    fn connection_counts_follow_russian_and_english_grammar() {
+        let forms = [1, 2, 5, 11, 12, 21, 22, 25, 111, 104]
+            .map(connection_count)
+            .join(", ");
+        assert_eq!(
+            forms,
+            "1 подключение, 2 подключения, 5 подключений, 11 подключений, 12 подключений, \
+             21 подключение, 22 подключения, 25 подключений, 111 подключений, 104 подключения"
+        );
+        let _english = multicore_i18n::ThreadLanguage::set(multicore_i18n::Lang::En);
+        assert_eq!(connection_count(1), "1 connection");
+        assert_eq!(connection_count(21), "21 connections");
+        assert_eq!(approximate_size(10), "<1 MB");
+        assert_eq!(approximate_size(5 * 1024 * 1024 + 100), "~5 MB");
     }
 
     #[test]

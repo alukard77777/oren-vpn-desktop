@@ -639,9 +639,20 @@ fn log_range_open(ui: &AppWindow, range: &str) {
     connected(ui);
     ui.set_local_page(s("status"));
     ui.set_events(events());
-    ui.set_log_range_latest_hint(tr!("Идёт с {}", "14:32").into());
-    ui.set_log_range_week_hint(tr!("Подключений: {}", 12).into());
-    ui.set_log_range_all_hint(tr!("Подключений: {} · хранятся 30 дней", 48).into());
+    ui.set_log_range_latest_hint(
+        format!(
+            "{} · {}",
+            tr!("Сегодня {}", "16:46–16:47"),
+            tr!("~{} МБ", 2)
+        )
+        .into(),
+    );
+    ui.set_log_range_week_hint(
+        format!("{} · {}", tr!("{} подключений", 12), tr!("~{} МБ", 18)).into(),
+    );
+    ui.set_log_range_all_hint(
+        format!("{} · {}", tr!("{} подключений", 37), tr!("~{} МБ", 41)).into(),
+    );
     ui.set_log_range(s(range));
     ui.set_log_range_open(true);
 }
@@ -2564,7 +2575,8 @@ fn the_log_range_popup_saves_the_chosen_range_or_closes_without_saving() {
             position,
             button: PointerEventButton::Left,
         });
-        slint::platform::update_timers_and_animations();
+        // Separate clicks, never a double click (which saves at once).
+        advance_clock(Duration::from_millis(800));
     };
 
     open();
@@ -2591,18 +2603,35 @@ fn the_log_range_popup_saves_the_chosen_range_or_closes_without_saving() {
     );
     assert_eq!(saved.borrow().len(), 1, "closing never saves");
 
-    // The 340 px card is centred: its options start 82 px below its top, 62 px apart, and
-    // the buttons sit at its bottom right.
+    // The card is centred in the content pane: walk down its middle to the last option,
+    // then on down its right side to «Сохранить…».
     open();
-    let top = (720.0 - 340.0) / 2.0;
-    click(420.0, top + 82.0 + 62.0 * 2.0 + 28.0);
-    assert!(
-        ui.get_log_range_open(),
-        "a click inside the card keeps it open"
-    );
-    assert_eq!(ui.get_log_range(), "all");
-    click(420.0 + 220.0 - 24.0 - 60.0, top + 340.0 - 20.0 - 22.0);
+    let middle = 70.0 + (840.0 - 76.0) / 2.0;
+    let mut option_y = None;
+    let mut inside = 0;
+    for y in (120..600).step_by(4) {
+        click(middle, y as f32);
+        if !ui.get_log_range_open() {
+            // Above the card: the backdrop closed it.
+            assert_eq!(inside, 0, "a click inside the card keeps it open");
+            open();
+            continue;
+        }
+        inside += 1;
+        if ui.get_log_range() == "all" {
+            option_y = Some(y as f32);
+            break;
+        }
+    }
+    let option_y = option_y.expect("the «За всё время» card is clickable");
+    assert_eq!(saved.borrow().len(), 1, "closing never saves");
+    let mut y = option_y + 40.0;
+    while ui.get_log_range_open() && y < 640.0 {
+        click(middle + 150.0, y);
+        y += 4.0;
+    }
     assert!(!ui.get_log_range_open());
+    assert_eq!(ui.get_log_range(), "all");
     assert_eq!(saved.borrow().last().map(SharedString::as_str), Some("all"));
     ui.hide().expect("hide app window");
 }
