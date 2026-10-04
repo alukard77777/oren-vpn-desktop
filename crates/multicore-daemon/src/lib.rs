@@ -2958,8 +2958,7 @@ impl<P: ProcessController> CoreRuntime<P> {
                 .as_ref()
                 .map(|id| multicore_core::core_sessions::profile_tag(id.as_str())),
         };
-        sessions.start(now, &start);
-        self.open_session_ms = Some(now);
+        self.open_session_ms = Some(sessions.start(now, &start));
     }
 
     /// The recorded connection ended (`user`, `switch`, `quit`, `cores_lost`, `failed`,

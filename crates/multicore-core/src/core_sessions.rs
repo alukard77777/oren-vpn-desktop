@@ -506,6 +506,9 @@ fn render_sessions(sessions: &[CoreSession]) -> String {
 #[derive(Debug)]
 pub struct SessionIndex {
     directory: PathBuf,
+    /// The newest connect time handed out: a session is identified by it, so each new one
+    /// starts strictly later even when two attempts fall in the same millisecond.
+    last_connect_ms: std::sync::atomic::AtomicU64,
 }
 
 impl SessionIndex {
@@ -517,6 +520,7 @@ impl SessionIndex {
     pub fn open(directory: impl Into<PathBuf>, now_ms: u64) -> Self {
         let index = Self {
             directory: directory.into(),
+            last_connect_ms: std::sync::atomic::AtomicU64::new(0),
         };
         let _ = fs::create_dir_all(&index.directory);
         let mut sessions = read_sessions(&index.directory);
@@ -538,6 +542,11 @@ impl SessionIndex {
             index.replace(&render_sessions(&sessions));
         }
         prune_journal(&index.directory, now_ms, None);
+        if let Some(newest) = sessions.iter().map(|session| session.connect_ms).max() {
+            index
+                .last_connect_ms
+                .store(newest, std::sync::atomic::Ordering::Relaxed);
+        }
         index
     }
 
@@ -574,8 +583,23 @@ impl SessionIndex {
         }
     }
 
-    /// A connection attempt began at `connect_ms`. Also prunes the journal.
-    pub fn start(&self, connect_ms: u64, start: &SessionStart) {
+    /// A connection attempt began at `connect_ms`. Also prunes the journal. Returns the time
+    /// that identifies the session (what [`Self::end`] takes): `connect_ms`, or one millisecond
+    /// after the previous session when that one began at the same time or later.
+    pub fn start(&self, connect_ms: u64, start: &SessionStart) -> u64 {
+        let mut previous = self.last_connect_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let connect_ms = loop {
+            let next = connect_ms.max(previous + 1);
+            match self.last_connect_ms.compare_exchange_weak(
+                previous,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(current) => previous = current,
+            }
+        };
         self.append(&IndexRecord::Start {
             connect_ms,
             mode: start.mode.clone(),
@@ -584,6 +608,7 @@ impl SessionIndex {
             profile: start.profile.clone(),
         });
         prune_journal(&self.directory, connect_ms, None);
+        connect_ms
     }
 
     /// The connection that began at `connect_ms` ended at `disconnect_ms` because of `reason`.
@@ -811,6 +836,36 @@ mod tests {
         let sessions = read_sessions(&root);
         assert_eq!(sessions[1].reason.as_deref(), Some("interrupted"));
         assert_eq!(sessions[1].disconnect_ms, None);
+    }
+
+    #[test]
+    fn sessions_started_in_the_same_millisecond_stay_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let now = unix_ms_now();
+        let index = SessionIndex::open(root, now);
+        let start = SessionStart {
+            mode: "tun".into(),
+            service: true,
+            engines: vec!["xray".into(), "mihomo".into()],
+            profile: None,
+        };
+        let first = index.start(now, &start);
+        index.end(first, now, "user");
+        let second = index.start(now, &start);
+        index.end(second, now, "failed");
+        let third = index.start(now - 10, &start);
+        assert_eq!(first, now);
+        assert!(first < second && second < third, "{first} {second} {third}");
+        let reasons = read_sessions(root)
+            .iter()
+            .map(|session| session.reason.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(reasons, ["user", "failed", ""]);
+
+        // A restarted daemon continues after the newest recorded session.
+        let reopened = SessionIndex::open(root, now);
+        assert!(reopened.start(now, &start) > third);
     }
 
     #[test]
