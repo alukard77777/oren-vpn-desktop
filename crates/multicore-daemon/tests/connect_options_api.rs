@@ -208,6 +208,9 @@ async fn a_malformed_connect_body_is_rejected_without_connecting() {
         "unexpected",
         r#"{"tun":"no"}"#,
         r#"{"tun":false,"extra":1}"#,
+        // Internal flags are never a client's to set.
+        r#"{"warm_up":true}"#,
+        r#"{"service_only":true}"#,
     ] {
         assert_eq!(
             post_connect(&backend, body).await,

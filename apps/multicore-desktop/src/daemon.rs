@@ -384,7 +384,14 @@ pub struct DaemonServiceLogFile {
 /// GET /v1/session: when the live connection started and Mihomo's cumulative byte counters.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DaemonSession {
+    /// Wall-clock start of the live connection; 0 when there is none (warm service cores
+    /// before connecting, or a connection the service just lost).
     pub connected_since_unix_ms: u64,
+    /// How long the live connection has been up, measured by the daemon on a monotonic clock
+    /// (wall-clock jumps after sleep or a time sync do not move it). Absent from older daemons
+    /// and while not connected.
+    #[serde(default)]
+    pub connected_for_ms: Option<u64>,
     #[serde(default)]
     pub download_total: Option<u64>,
     #[serde(default)]

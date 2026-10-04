@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -208,7 +208,15 @@ pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
         ServiceCommand::Update { .. } | ServiceCommand::StageUpdate { .. } => {
             Duration::from_secs(15 * 60)
         }
-        ServiceCommand::Status | ServiceCommand::Diagnostics => Duration::from_secs(15),
+        // The service answers both under its lock, where a crash restart of both cores (each
+        // core's readiness, then the tunnel back on) may be running: a shorter budget dropped
+        // the channel mid-restart, and the dropped channel made the service stop the very
+        // cores it had just brought back.
+        ServiceCommand::Status | ServiceCommand::Diagnostics => {
+            CORE_READINESS_TIMEOUT * 2
+                + multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT
+                + Duration::from_secs(10)
+        }
         // Each fix waits at most a minute (a tool, a service stop); a batch has at most eight.
         ServiceCommand::Troubleshoot { .. } => Duration::from_secs(10 * 60),
         // One small file read, but it may wait behind a `Prepare` holding the service's lock.
@@ -268,6 +276,25 @@ pub struct ServiceSession<C: ServiceConnector> {
     owner: Mutex<Option<u64>>,
     available: AtomicBool,
     controller: Arc<ControllerSlot>,
+    /// What the last failed exchange or unhealthy `Status` saw (see `loss_details`).
+    last_trouble: Mutex<Option<serde_json::Value>>,
+}
+
+/// A command's name for the loss details (never its arguments).
+fn command_label(command: &ServiceCommand) -> &'static str {
+    match command {
+        ServiceCommand::Prepare { .. } => "Prepare",
+        ServiceCommand::SetTun { .. } => "SetTun",
+        ServiceCommand::Status => "Status",
+        ServiceCommand::Stop { .. } => "Stop",
+        ServiceCommand::Diagnostics => "Diagnostics",
+        ServiceCommand::ServiceLog { .. } => "ServiceLog",
+        ServiceCommand::CoreJournal { .. } => "CoreJournal",
+        ServiceCommand::Shutdown => "Shutdown",
+        ServiceCommand::Update { .. } => "Update",
+        ServiceCommand::StageUpdate { .. } => "StageUpdate",
+        ServiceCommand::Troubleshoot { .. } => "Troubleshoot",
+    }
 }
 
 impl<C: ServiceConnector> ServiceSession<C> {
@@ -284,7 +311,35 @@ impl<C: ServiceConnector> ServiceSession<C> {
             owner: Mutex::new(None),
             available: AtomicBool::new(false),
             controller,
+            last_trouble: Mutex::new(None),
         }
+    }
+
+    fn note_trouble(&self, trouble: serde_json::Value) {
+        if let Ok(mut last) = self.last_trouble.lock() {
+            *last = Some(trouble);
+        }
+    }
+
+    /// Why `connection_lost` holds, for the loss event: the last failed exchange (which
+    /// command, the error, how long it took) or unhealthy `Status` (each core's state, the
+    /// failure code, the tunnel, the generation), and the session's flags now.
+    #[must_use]
+    pub fn loss_details(&self) -> serde_json::Value {
+        let replaced = self
+            .owner()
+            .is_some_and(|owner| self.prepared_generation() != Some(owner));
+        serde_json::json!({
+            "last": self.last_trouble.lock().ok().and_then(|last| last.clone()),
+            "in_use": match self.in_use.load(Ordering::Acquire) {
+                IN_USE_PROXY => "proxy",
+                IN_USE_TUN => "tun",
+                _ => "none",
+            },
+            "cores_ready": self.cores_ready(),
+            "tun_on": self.tun_on.load(Ordering::Acquire),
+            "generation_replaced": replaced,
+        })
     }
 
     fn prepared_generation(&self) -> Option<u64> {
@@ -332,6 +387,7 @@ impl<C: ServiceConnector> ServiceSession<C> {
             self.forget();
             *transport = Some(self.connector.connect()?);
         }
+        let started = Instant::now();
         let result = transport
             .as_ref()
             .expect("service transport exists")
@@ -341,6 +397,12 @@ impl<C: ServiceConnector> ServiceSession<C> {
             Err(error) => {
                 transport.take();
                 self.forget();
+                self.note_trouble(serde_json::json!({
+                    "cause": "channel",
+                    "command": command_label(command),
+                    "error": format!("{error:?}"),
+                    "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                }));
                 return Err(error);
             }
         };
@@ -542,8 +604,25 @@ impl<C: ServiceConnector> ServiceSession<C> {
                     && generation_id.is_some()
                     && *generation_id == session.prepared_generation();
                 session.healthy.store(healthy, Ordering::Release);
+                let tunnel_dropped =
+                    !*tun_on && session.in_use.load(Ordering::Acquire) == IN_USE_TUN;
+                if !healthy || tunnel_dropped {
+                    session.note_trouble(serde_json::json!({
+                        "cause": "status",
+                        "generation": generation_id,
+                        "prepared": session.prepared_generation(),
+                        "xray": format!("{xray:?}"),
+                        "mihomo": format!("{mihomo:?}"),
+                        "tun_on": tun_on,
+                        "failure": failure.map(|code| format!("{code:?}")),
+                    }));
+                }
             } else {
                 session.healthy.store(false, Ordering::Release);
+                session.note_trouble(serde_json::json!({
+                    "cause": "status",
+                    "error": "unexpected answer",
+                }));
             }
         });
         if result.is_err() {
@@ -785,6 +864,10 @@ impl<C: ServiceConnector> crate::CoresReadiness for ServiceSession<C> {
 
     fn connection_lost(&self) -> bool {
         ServiceSession::connection_lost(self)
+    }
+
+    fn loss_details(&self) -> serde_json::Value {
+        ServiceSession::loss_details(self)
     }
 
     fn release(&self) {

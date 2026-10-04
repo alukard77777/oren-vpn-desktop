@@ -59,6 +59,10 @@ struct FakeService {
     journal: Vec<String>,
     /// `CoreJournal` is answered like a service older than it.
     journal_unknown: bool,
+    /// The next exchange fails with this (a `Status` that timed out, a broken pipe).
+    fail_next: Option<ServiceError>,
+    /// `Status` reports Xray stopped.
+    xray_stopped: bool,
 }
 
 #[derive(Clone, Default)]
@@ -92,6 +96,9 @@ impl ServiceTransport for FakeTransport {
         if std::mem::take(&mut service.break_next) {
             return Err(ServiceError::Disconnected);
         }
+        if let Some(error) = service.fail_next.take() {
+            return Err(error);
+        }
         service.commands.push(command.clone());
         if service.busy {
             return Ok(ServiceResponse::Busy);
@@ -124,7 +131,11 @@ impl ServiceTransport for FakeTransport {
             }
             ServiceCommand::Status => ServiceResponse::Status {
                 generation_id: service.generation,
-                xray: ElevatedRuntimeState::Ready,
+                xray: if service.xray_stopped {
+                    ElevatedRuntimeState::Stopped
+                } else {
+                    ElevatedRuntimeState::Ready
+                },
                 mihomo: ElevatedRuntimeState::Ready,
                 tun_on: service.tun,
                 failure: service.status_failure,
@@ -663,6 +674,17 @@ fn read_only_commands_get_a_generous_timeout() {
     );
 }
 
+/// A `Status` waits behind whatever holds the service's lock, a crash restart included (both
+/// cores' readiness, then the tunnel back on). Timing out sooner drops the channel, and the
+/// service then stops the cores it has just restarted: a «cores lost» of its own making.
+#[test]
+fn a_status_outlasts_a_crash_restart_behind_the_service_lock() {
+    let restart = multicore_core::CORE_READINESS_TIMEOUT * 2
+        + multicore_core::service_protocol::SET_TUN_RESPONSE_TIMEOUT;
+    assert!(service_response_timeout(&ServiceCommand::Status) > restart);
+    assert!(service_response_timeout(&ServiceCommand::Diagnostics) > restart);
+}
+
 #[test]
 fn an_update_runs_on_its_own_channel_and_keeps_the_cores() {
     let (session, connector, _) = session();
@@ -762,6 +784,52 @@ async fn a_lost_tunnel_is_detected_while_connected() {
     session.poll();
     supervisor.disconnect().await.unwrap();
     assert!(!session.connection_lost());
+}
+
+/// The owner's 1.1.9 report: «cores lost» with nothing saying why. The loss event now carries
+/// what the service channel saw.
+#[tokio::test]
+async fn a_lost_connection_says_what_the_service_channel_saw() {
+    let (session, connector, _) = session();
+    let supervisor = Supervisor::new(Arc::new(ServiceTunController::new(session.clone(), 3)));
+    supervisor.connect().await.unwrap();
+    session.poll();
+    assert!(!session.connection_lost());
+    // A `Status` that did not come back within its budget drops the channel (and with it the
+    // service's cores).
+    connector.0.lock().unwrap().fail_next = Some(ServiceError::TimedOut);
+    session.poll();
+    assert!(session.connection_lost());
+    let details = session.loss_details();
+    assert_eq!(details["last"]["cause"], "channel", "{details}");
+    assert_eq!(details["last"]["command"], "Status");
+    assert_eq!(details["last"]["error"], "TimedOut");
+    assert!(details["last"]["elapsed_ms"].is_u64(), "{details}");
+    assert_eq!(details["in_use"], "tun");
+    assert_eq!(details["cores_ready"], false);
+    assert_eq!(details["tun_on"], false);
+}
+
+#[tokio::test]
+async fn a_status_naming_a_stopped_core_is_the_reason_given() {
+    let (session, connector, _) = session();
+    let supervisor = Supervisor::new(Arc::new(ServiceTunController::new(session.clone(), 3)));
+    supervisor.connect().await.unwrap();
+    connector.0.lock().unwrap().xray_stopped = true;
+    session.poll();
+    assert!(session.connection_lost());
+    assert_eq!(
+        session.loss_details()["last"],
+        serde_json::json!({
+            "cause": "status",
+            "generation": 3,
+            "prepared": 3,
+            "xray": "Stopped",
+            "mihomo": "Ready",
+            "tun_on": true,
+            "failure": null,
+        })
+    );
 }
 
 #[derive(Default)]

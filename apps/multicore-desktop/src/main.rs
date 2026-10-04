@@ -1050,6 +1050,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_manual_latency(&ui, model.clone());
     let _session_stats_timer = wire_session_stats(&ui, model.clone());
     let _cores_ready_timer = wire_cores_ready_watch(&ui, model.clone());
+    let _connection_watch_timer = wire_connection_watch(&ui, model.clone());
     wire_conflicting_apps_banner(&ui, model.clone());
     let _conflicting_apps_timer = wire_conflicting_apps_scan(&ui, model.clone());
     wire_windows_settings(&ui);
@@ -4723,6 +4724,46 @@ fn wire_cores_ready_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -
 
 /// Tick of [`wire_cores_ready_watch`].
 const CORES_READY_POLL: Duration = Duration::from_millis(500);
+
+/// Follows the daemon while connected (and while it reconnects by itself after the service
+/// lost the connection): the service can drop a connection without any request of the
+/// desktop's, and nothing else asks the daemon then. Runs whether or not the window is on
+/// screen, since the tray shows the connection too. A local `/v1/status` every two seconds.
+fn wire_connection_watch(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) -> Timer {
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    let in_flight = Arc::new(AtomicBool::new(false));
+    timer.start(TimerMode::Repeated, CONNECTION_WATCH_POLL, move || {
+        let client = {
+            let model = model.lock().expect("view model lock");
+            if !model.watches_connection(Instant::now()) {
+                return;
+            }
+            model.daemon_client()
+        };
+        if in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (weak, model, in_flight) = (weak.clone(), model.clone(), in_flight.clone());
+        thread::spawn(move || {
+            let result = client.status();
+            let changed = model
+                .lock()
+                .expect("view model lock")
+                .note_connection_status(result, Instant::now());
+            in_flight.store(false, Ordering::Release);
+            if changed {
+                let current = snapshot(&model.lock().expect("view model lock"));
+                // The cores changed under the catalog: reload it (latency checks need it).
+                apply_snapshot_from_worker(weak, current, model, true, false);
+            }
+        });
+    });
+    timer
+}
+
+/// Tick of [`wire_connection_watch`].
+const CONNECTION_WATCH_POLL: Duration = Duration::from_secs(2);
 
 fn apply_session_line(ui: &AppWindow, line: &SessionLine) {
     if ui.get_session_uptime() != line.uptime.as_str() {

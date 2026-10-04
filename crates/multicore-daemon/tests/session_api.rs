@@ -167,6 +167,10 @@ async fn connected_session_reports_start_time_and_mihomo_totals() {
     );
     assert_eq!(body["download_total"], 5_242_880);
     assert_eq!(body["upload_total"], 327_680);
+    // How long it has been up, on the daemon's monotonic clock: the client's uptime never
+    // depends on two wall clocks agreeing.
+    let for_ms = body["connected_for_ms"].as_u64().unwrap();
+    assert!(for_ms <= now_ms() - before, "{for_ms}");
 }
 
 #[tokio::test]

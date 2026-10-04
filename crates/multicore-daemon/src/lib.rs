@@ -85,6 +85,12 @@ const CONNECTING_MESSAGE: &str = "connect.starting_confirm_admin";
 const TUNNEL_ON_MESSAGE: &str = "connect.tunnel_on";
 const WARM_UP_FAILED_MESSAGE: &str = "cores.warm_up_failed";
 const CORES_LOST_MESSAGE: &str = "cores.lost";
+const CORES_LOST_RECONNECTING_MESSAGE: &str = "cores.lost_reconnecting";
+const CORES_RECONNECTED_MESSAGE: &str = "cores.reconnected";
+const CORES_RECONNECT_FAILED_MESSAGE: &str = "cores.reconnect_failed";
+/// A connection the service loses again this soon after an automatic reconnect is left to the
+/// user: a core that keeps failing must not be restarted forever.
+const AUTO_RECONNECT_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// A user-facing daemon message: the Russian text every client gets, and, for registered
 /// messages, the stable code the desktop shows in its own language
@@ -156,6 +162,12 @@ pub trait CoresReadiness: Send + Sync + 'static {
     }
     /// Lets the service stop the cores (Quit, or no subscription left). Blocking.
     fn release(&self) {}
+    /// What the service channel last saw that made `connection_lost` true (a dropped or
+    /// timed-out exchange, a `Status` naming a stopped core, a failure code, the tunnel off),
+    /// for the loss event's details.
+    fn loss_details(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,6 +305,10 @@ pub struct ConnectOptions {
     /// service, never from an on-demand elevation (no prompt without a Connect).
     #[serde(skip)]
     pub warm_up: bool,
+    /// Set by the automatic reconnect after the service lost a connection, never by a client:
+    /// like `warm_up`, the controller must come from the service (no prompt nobody asked for).
+    #[serde(skip)]
+    pub service_only: bool,
 }
 
 fn default_tun() -> bool {
@@ -304,6 +320,7 @@ impl Default for ConnectOptions {
         Self {
             tun: true,
             warm_up: false,
+            service_only: false,
         }
     }
 }
@@ -410,7 +427,13 @@ pub trait ServiceLogSource: Send + Sync + 'static {
 /// from which a client derives uptime and current speed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionDto {
+    /// Wall-clock start of the live connection; 0 while not connected (warm service cores).
     pub connected_since_unix_ms: u64,
+    /// How long the live connection has been up, on the daemon's monotonic clock; absent
+    /// while not connected. Clients show this rather than `now - connected_since_unix_ms`,
+    /// which depends on two wall clocks and jumps with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_for_ms: Option<u64>,
     /// Absent when the Mihomo controller could not be read this time.
     pub download_total: Option<u64>,
     pub upload_total: Option<u64>,
@@ -2733,6 +2756,14 @@ struct CoreRuntime<P: ProcessController> {
     /// Set on every transition into Connected (the only one is `connect`); only read while
     /// Connected, so a value left from an earlier session is never reported.
     connected_since_unix_ms: u64,
+    /// The same moment on the monotonic clock: uptime is measured from it, so a wall-clock
+    /// jump (a time sync after sleep, a manual change) never shows as hours of uptime.
+    connected_at: Option<std::time::Instant>,
+    /// The options of a connection the service lost, waiting for the watcher's one automatic
+    /// reconnect; cleared by a user Connect or Disconnect.
+    auto_reconnect: Option<ConnectOptions>,
+    /// When the last automatic reconnect was attempted (see [`AUTO_RECONNECT_COOLDOWN`]).
+    last_auto_reconnect: Option<std::time::Instant>,
     events: EventBuffer<Event>,
     /// Catalog revision whose cores the always-ready service already runs while Ready.
     warm_revision: Option<u64>,
@@ -2925,6 +2956,9 @@ impl<P: ProcessController> CoreRuntime<P> {
             message: None,
             degraded: false,
             connected_since_unix_ms: 0,
+            connected_at: None,
+            auto_reconnect: None,
+            last_auto_reconnect: None,
             events: EventBuffer::default(),
             warm_revision: None,
             readiness: None,
@@ -3752,12 +3786,24 @@ where
             };
             (state.state.current(), readiness)
         };
+        if !matches!(
+            current,
+            CoreConnectionState::Ready | CoreConnectionState::Connected
+        ) {
+            // An automatic reconnect only ever starts from Ready: one left pending while the
+            // last subscription was removed (or a cleanup is needed) must not fire later.
+            self.inner.write().await.auto_reconnect = None;
+        }
         match current {
             CoreConnectionState::Connected if readiness.connection_lost() => {
                 self.cores_lost().await;
                 false
             }
             CoreConnectionState::Ready => {
+                let pending = self.inner.write().await.auto_reconnect.take();
+                if let Some(options) = pending {
+                    return self.auto_reconnect(options, readiness.as_ref()).await;
+                }
                 readiness.service_available() && self.warm_up().await.is_ok()
             }
             CoreConnectionState::Empty if readiness.cores_ready() => {
@@ -3769,10 +3815,13 @@ where
     }
 
     /// The service lost the cores (or the tunnel) under an active connection: stop it the
-    /// usual way, so proxy mode restores the system proxy at once, and report the loss.
+    /// usual way, so proxy mode restores the system proxy at once, and report the loss with
+    /// what the service channel saw. Unless a connection was already reconnected
+    /// automatically within [`AUTO_RECONNECT_COOLDOWN`], the watcher's next tick reconnects
+    /// once (`auto_reconnect`).
     async fn cores_lost(&self) {
         let _operation = self.operation.lock().await;
-        let controller = {
+        let (controller, service, connected_ms) = {
             let state = self.inner.read().await;
             let lost = state.state.current() == CoreConnectionState::Connected
                 && state
@@ -3780,34 +3829,130 @@ where
                     .as_ref()
                     .is_some_and(|readiness| readiness.connection_lost());
             match (lost, state.controller.clone()) {
-                (true, Some(controller)) => controller,
+                (true, Some(controller)) => (
+                    controller,
+                    state
+                        .readiness
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |readiness| {
+                            readiness.loss_details()
+                        }),
+                    state
+                        .connected_at
+                        .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                ),
                 _ => return,
             }
         };
         let result = Supervisor::new(controller).disconnect().await;
         let mut state = self.inner.write().await;
         let stopped = result.is_ok();
+        let mut reconnect = false;
         if stopped {
             state.end_session("cores_lost");
             let _ = state.state.transition(CoreConnectionState::Ready);
             state.degraded = false;
             state.warm_revision = None;
+            reconnect = !self.shut_down.load(Ordering::SeqCst)
+                && state
+                    .last_auto_reconnect
+                    .is_none_or(|at| at.elapsed() >= AUTO_RECONNECT_COOLDOWN);
+            if reconnect {
+                state.auto_reconnect = Some(
+                    self.connect_options
+                        .lock()
+                        .map(|options| *options)
+                        .unwrap_or_default(),
+                );
+            }
             drop(state);
             // Like a disconnect: drop the controller and apply a snapshot left pending.
             self.reconcile_authoritative().await;
             state = self.inner.write().await;
-            state.message = Some(DaemonText::code(CORES_LOST_MESSAGE));
+            state.message = Some(DaemonText::code(if reconnect {
+                CORES_LOST_RECONNECTING_MESSAGE
+            } else {
+                CORES_LOST_MESSAGE
+            }));
         } else {
             state.mark_error(DaemonText::code("disconnect.incomplete"), true);
         }
-        state.push_event(
+        state.push_event_with_details(
             Severity::Error,
             Component::Core,
             "service_lost",
-            DaemonText::code(CORES_LOST_MESSAGE),
+            DaemonText::code(if reconnect {
+                CORES_LOST_RECONNECTING_MESSAGE
+            } else {
+                CORES_LOST_MESSAGE
+            }),
+            json!({
+                "service": service,
+                "connected_ms": connected_ms,
+                "stopped": stopped,
+                "auto_reconnect": reconnect,
+            }),
         );
         drop(state);
         self.request_warm();
+    }
+
+    /// The watcher's one automatic reconnect after `cores_lost`: like a user Connect, but
+    /// through the service only (never an elevation prompt nobody asked for), and given up at
+    /// once when the service is not usable. Returns whether it reconnected.
+    async fn auto_reconnect(
+        &self,
+        options: ConnectOptions,
+        readiness: &dyn CoresReadiness,
+    ) -> bool {
+        let reconnected = if readiness.service_available() && !self.shut_down.load(Ordering::SeqCst)
+        {
+            let _switch = self.generation_change.lock().await;
+            self.inner.write().await.last_auto_reconnect = Some(std::time::Instant::now());
+            self.connect_now(ConnectOptions {
+                warm_up: false,
+                service_only: true,
+                ..options
+            })
+            .await
+            .is_ok()
+        } else {
+            false
+        };
+        let mut state = self.inner.write().await;
+        if reconnected {
+            state.message = Some(DaemonText::code(CORES_RECONNECTED_MESSAGE));
+            state.push_event(
+                Severity::Info,
+                Component::Core,
+                "service_lost",
+                DaemonText::code(CORES_RECONNECTED_MESSAGE),
+            );
+        } else {
+            if state.state.current() == CoreConnectionState::Ready {
+                state.message = Some(DaemonText::code(CORES_RECONNECT_FAILED_MESSAGE));
+            }
+            state.push_event(
+                Severity::Error,
+                Component::Core,
+                "service_lost",
+                DaemonText::code(CORES_RECONNECT_FAILED_MESSAGE),
+            );
+            drop(state);
+            self.request_warm();
+        }
+        reconnected
+    }
+
+    /// A user Connect or Disconnect takes over from a pending automatic reconnect (and its
+    /// notice).
+    async fn cancel_auto_reconnect(&self) {
+        let mut state = self.inner.write().await;
+        if state.auto_reconnect.take().is_some()
+            && state.message.as_ref() == Some(&DaemonText::code(CORES_LOST_RECONNECTING_MESSAGE))
+        {
+            state.message = None;
+        }
     }
 
     /// Quit: disconnect, stop the service's cores and never warm them again.
@@ -3995,6 +4140,7 @@ where
                     .transition(CoreConnectionState::Connected)
                     .map_err(|_| BackendError::new())?;
                 state.connected_since_unix_ms = unix_timestamp_ms();
+                state.connected_at = Some(std::time::Instant::now());
                 state.message = None;
                 state.degraded = false;
                 // Where a slow Connect spends its time: the factory (staging or reusing the
@@ -5715,6 +5861,7 @@ where
     }
 
     async fn connect_with(&self, options: ConnectOptions) -> Result<StatusDto, BackendError> {
+        self.cancel_auto_reconnect().await;
         let _switch = if let Ok(switch) = self.generation_change.try_lock() {
             switch
         } else {
@@ -5735,6 +5882,7 @@ where
     }
 
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
+        self.cancel_auto_reconnect().await;
         // After a switch in progress, so its reconnect cannot undo this Disconnect.
         let _switch = self.generation_change.lock().await;
         let result = self.disconnect_now("user").await;
@@ -5915,7 +6063,7 @@ where
     }
 
     async fn session(&self) -> Result<SessionDto, SessionError> {
-        let (connected, connected_since_unix_ms, exit_start) = {
+        let (connected, connected_since_unix_ms, connected_for_ms, exit_start) = {
             let state = self.inner.read().await;
             if !state.cores_live() {
                 return Err(SessionError::NotConnected);
@@ -5925,6 +6073,9 @@ where
             (
                 state.state.current() == CoreConnectionState::Connected,
                 state.connected_since_unix_ms,
+                state
+                    .connected_at
+                    .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
                 exit_start,
             )
         };
@@ -5967,6 +6118,7 @@ where
             } else {
                 0
             },
+            connected_for_ms: connected_for_ms.filter(|_| connected),
             download_total: totals.map(|totals| totals.download),
             upload_total: totals.map(|totals| totals.upload),
             exit_now: exit_now.map(|raw| safe_catalog_label(&raw, "Узел", 0)),

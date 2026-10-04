@@ -246,6 +246,15 @@ msgstr "The cores couldn't start in advance. They'll start when you connect."
 msgid "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова."
 msgstr "The MULTICORE service lost its cores — disconnected. Connect again."
 
+msgid "Служба MULTICORE потеряла ядра — переподключаемся…"
+msgstr "The MULTICORE service lost its cores — reconnecting…"
+
+msgid "Подключение восстановлено автоматически."
+msgstr "Reconnected automatically."
+
+msgid "Не удалось переподключиться автоматически — подключитесь снова."
+msgstr "Couldn't reconnect automatically — connect again."
+
 msgid "Служба MULTICORE недоступна — права администратора будут запрошены при подключении."
 msgstr "MULTICORE service unavailable — admin rights will be requested on connect."
 

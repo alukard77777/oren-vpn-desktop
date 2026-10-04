@@ -29,6 +29,10 @@ pub const FAILING_SUBSCRIPTION: &str = "https://fail.invalid/sub";
 const WARM_UP_FAILED: &str = "Ядра не удалось запустить заранее. Они запустятся при подключении.";
 const CORES_LOST: &str =
     "Служба MULTICORE потеряла ядра — подключение разорвано. Подключитесь снова.";
+const CORES_LOST_RECONNECTING: &str = "Служба MULTICORE потеряла ядра — переподключаемся…";
+const CORES_RECONNECTED: &str = "Подключение восстановлено автоматически.";
+const CORES_RECONNECT_FAILED: &str =
+    "Не удалось переподключиться автоматически — подключитесь снова.";
 const PROMPT: Duration = Duration::from_secs(2);
 
 /// A subscription server: every URL serves `PROFILE_C`, except one containing `fail`,
@@ -74,6 +78,8 @@ pub struct Recording {
     /// The next `stop` waits here (a disconnect still tearing the tunnel down).
     pub stop_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     pub stop_entered: AtomicBool,
+    /// The options of every factory call, in order.
+    pub options: Mutex<Vec<ConnectOptions>>,
 }
 
 pub struct RecordingController(pub Arc<Recording>);
@@ -149,6 +155,10 @@ impl CoresReadiness for Readiness {
         self.released.fetch_add(1, Ordering::SeqCst);
         self.ready.store(false, Ordering::SeqCst);
     }
+
+    fn loss_details(&self) -> serde_json::Value {
+        serde_json::json!({ "cause": "channel", "error": "TimedOut", "status_ms": 15_002 })
+    }
 }
 
 #[derive(Default)]
@@ -212,7 +222,8 @@ pub fn harness(profiles: &[&str]) -> Harness {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let controller = Arc::new(RecordingController(recording.clone()));
     let factory_seen = seen.clone();
-    let factory: FactoryFn = Box::new(move |snapshot: &Snapshot, _options: ConnectOptions| {
+    let factory: FactoryFn = Box::new(move |snapshot: &Snapshot, options: ConnectOptions| {
+        controller.0.options.lock().unwrap().push(options);
         let gate = controller.0.factory_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             controller.0.factory_entered.store(true, Ordering::SeqCst);
@@ -470,6 +481,10 @@ async fn latency_session_and_selection_work_before_connecting_with_warm_cores() 
         "no uptime before connecting"
     );
     assert_eq!(
+        session.connected_for_ms, None,
+        "no uptime before connecting"
+    );
+    assert_eq!(
         session.download_total, None,
         "no counters before connecting"
     );
@@ -639,14 +654,167 @@ async fn a_connection_the_service_lost_is_torn_down_and_reported() {
     );
     let status = h.backend.status().await.unwrap();
     assert_eq!(status.state, ConnectionState::Ready);
-    assert_eq!(status.message.as_deref(), Some(CORES_LOST));
+    assert_eq!(status.message.as_deref(), Some(CORES_LOST_RECONNECTING));
+    let events = h.backend.events_after(0).await.unwrap();
+    let lost = events
+        .iter()
+        .find(|event| event.message == CORES_LOST_RECONNECTING)
+        .expect("the loss is reported");
+    assert_eq!(lost.level, "error");
+    // Why: what the service channel saw, how long the connection had been up, and that one
+    // automatic reconnect follows.
+    let details = lost.details.as_ref().expect("the loss says why");
+    assert_eq!(
+        details["service"],
+        serde_json::json!({ "cause": "channel", "error": "TimedOut", "status_ms": 15_002 })
+    );
+    assert!(details["connected_ms"].is_u64(), "{details}");
+    assert_eq!(details["auto_reconnect"], true);
+}
+
+/// The owner's 1.1.9 report: the service lost the cores, the daemon re-warmed them 4 s later,
+/// and the user was left disconnected with «Подключитесь снова». A loss the user did not ask
+/// for is followed by one automatic reconnect through the service.
+#[tokio::test]
+async fn a_lost_connection_is_reconnected_once_automatically() {
+    use multicore_core::core_sessions::read_sessions;
+    let h = harness(&[PROFILE_A]);
+    let directory = tempfile::tempdir().unwrap();
+    h.backend
+        .enable_session_log(directory.path().to_path_buf())
+        .await;
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    assert!(h.backend.session().await.is_err(), "no uptime while lost");
+    // The service is usable again (it answered the next probe).
+    readiness.lost.store(false, Ordering::SeqCst);
+    readiness.ready.store(true, Ordering::SeqCst);
+    assert!(h.backend.watch_service().await);
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Connected);
+    assert_eq!(status.message.as_deref(), Some(CORES_RECONNECTED));
+    let session = h.backend.session().await.unwrap();
+    assert!(
+        session.connected_for_ms.is_some_and(|ms| ms < 60_000),
+        "the uptime starts over: {session:?}"
+    );
+    // Through the service only: an automatic reconnect never asks for administrator rights.
+    let options = *h.recording.options.lock().unwrap().last().unwrap();
+    assert!(
+        options.service_only && options.tun && !options.warm_up,
+        "{options:?}"
+    );
     assert!(
         h.backend
             .events_after(0)
             .await
             .unwrap()
             .iter()
-            .any(|event| event.message == CORES_LOST)
+            .any(|event| event.message == CORES_RECONNECTED && event.level == "info")
+    );
+    let reasons = read_sessions(directory.path())
+        .iter()
+        .map(|session| session.reason.clone().unwrap_or_else(|| "open".into()))
+        .collect::<Vec<_>>();
+    assert_eq!(reasons, ["cores_lost", "open"]);
+
+    // Lost again soon after: a crash loop is left to the user.
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert_eq!(status.message.as_deref(), Some(CORES_LOST));
+    readiness.lost.store(false, Ordering::SeqCst);
+    readiness.ready.store(true, Ordering::SeqCst);
+    h.backend.watch_service().await;
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Ready,
+        "no second automatic reconnect"
+    );
+}
+
+#[tokio::test]
+async fn a_disconnect_while_the_reconnect_is_pending_cancels_it() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    readiness.lost.store(false, Ordering::SeqCst);
+    readiness.ready.store(true, Ordering::SeqCst);
+    h.backend.disconnect().await.unwrap();
+    h.backend.watch_service().await;
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert_eq!(
+        status.message, None,
+        "the user's disconnect clears the notice"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_automatic_reconnect_says_to_connect_again() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    h.recording.fail_xray.store(true, Ordering::SeqCst);
+    readiness.lost.store(false, Ordering::SeqCst);
+    h.backend.watch_service().await;
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert_eq!(status.message.as_deref(), Some(CORES_RECONNECT_FAILED));
+    let attempts = h.recording.options.lock().unwrap().len();
+    h.recording.fail_xray.store(false, Ordering::SeqCst);
+    h.backend.watch_service().await;
+    assert_eq!(
+        h.backend.status().await.unwrap().state,
+        ConnectionState::Ready,
+        "one attempt only"
+    );
+    assert!(
+        h.recording
+            .options
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(attempts)
+            .all(|options| !options.service_only || options.warm_up),
+        "no further automatic connect"
+    );
+}
+
+#[tokio::test]
+async fn without_the_service_the_automatic_reconnect_gives_up_at_once() {
+    let h = harness(&[PROFILE_A]);
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    readiness.lost.store(false, Ordering::SeqCst);
+    readiness.available.store(false, Ordering::SeqCst);
+    let factory_calls = h.recording.options.lock().unwrap().len();
+    h.backend.watch_service().await;
+    let status = h.backend.status().await.unwrap();
+    assert_eq!(status.state, ConnectionState::Ready);
+    assert_eq!(status.message.as_deref(), Some(CORES_RECONNECT_FAILED));
+    assert_eq!(
+        h.recording.options.lock().unwrap().len(),
+        factory_calls,
+        "never an on-demand (UAC) connect"
     );
 }
 

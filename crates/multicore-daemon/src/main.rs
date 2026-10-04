@@ -132,8 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Re-checked on every Connect and warm-up: a service that started after the app
             // is used at once; on-demand elevation only when it is absent or unreachable now.
             let use_service = factory_service.probe_mode() == ServiceMode::Service;
-            if options.warm_up && !use_service {
-                // Warming never falls back to an elevation prompt.
+            if (options.warm_up || options.service_only) && !use_service {
+                // Warming and the automatic reconnect after a service loss never fall back to
+                // an elevation prompt (or to per-user cores).
                 return Err(BackendError::new());
             }
             // TUN off without the service: cores run as this user (Windows only).
@@ -689,12 +690,15 @@ mod tests {
             .expect("proxy mode module");
         let tun_path_compact = compact(tun_path);
         // The service is re-probed by every Connect and warm-up (not once per start), and the
-        // warm-up never falls back to an elevation prompt.
+        // warm-up (or the automatic reconnect after a service loss) never falls back to an
+        // elevation prompt.
         let probe = tun_path_compact
             .find("factory_service.probe_mode()")
             .unwrap();
         assert!(probe < tun_path_compact.find("production_factory()").unwrap());
-        assert!(tun_path_compact.contains("ifoptions.warm_up&&!use_service{"));
+        assert!(
+            tun_path_compact.contains("if(options.warm_up||options.service_only)&&!use_service{")
+        );
         assert!(tun_path_compact.contains(".enable_always_ready("));
         assert!(tun_path_compact.contains("spawn_service_watch("));
         assert!(tun_path_compact.contains("SERVICE_UNAVAILABLE_NOTICE"));

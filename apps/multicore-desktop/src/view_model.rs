@@ -805,6 +805,14 @@ pub fn state_from_status(mut status: DaemonStatus) -> UiState {
     }
 }
 
+/// The daemon's status code while it reconnects by itself after the service lost the
+/// connection (`multicore_i18n::daemon_messages`).
+const AUTO_RECONNECT_CODE: &str = "cores.lost_reconnecting";
+/// How long the connection watch follows such a reconnect before leaving it to the user.
+const AUTO_RECONNECT_WATCH: Duration = Duration::from_secs(90);
+/// How long «Подключение восстановлено автоматически» stays under the switch.
+const RECONNECTED_NOTICE: Duration = Duration::from_secs(60);
+
 pub struct DesktopViewModel {
     client: Arc<dyn DaemonClient>,
     state: UiState,
@@ -815,6 +823,11 @@ pub struct DesktopViewModel {
     import_notice: Option<String>,
     import_previous_state: Option<UiState>,
     connection_notice: Option<String>,
+    /// The daemon announced an automatic reconnect after the service lost the connection:
+    /// the connection watch follows it until this moment.
+    awaiting_reconnect_until: Option<Instant>,
+    /// «Подключение восстановлено автоматически» under the switch, until this moment.
+    reconnected_notice: Option<(String, Instant)>,
     subscription: Option<DaemonSubscriptionInfo>,
     subscription_refresh_error: Option<String>,
     active_profile_id: Option<String>,
@@ -909,6 +922,8 @@ impl DesktopViewModel {
             import_notice: None,
             import_previous_state: None,
             connection_notice: None,
+            awaiting_reconnect_until: None,
+            reconnected_notice: None,
             subscription: None,
             subscription_refresh_error: None,
             active_profile_id: None,
@@ -976,6 +991,11 @@ impl DesktopViewModel {
 
     pub fn presentation(&self) -> StatePresentation {
         let mut presentation = self.state.presentation();
+        if let Some((notice, _)) = &self.reconnected_notice
+            && matches!(self.state, UiState::Connected { .. })
+        {
+            presentation.supporting = notice.clone();
+        }
         if let Some(notice) = &self.connection_notice {
             presentation.supporting = notice.clone();
             presentation.is_error = true;
@@ -1126,6 +1146,84 @@ impl DesktopViewModel {
 
     pub(crate) fn cores_ready(&self) -> bool {
         self.cores_ready
+    }
+
+    /// The connection watch polls `/v1/status` now: while connected, and while the daemon
+    /// reconnects by itself after the service lost the connection.
+    pub(crate) fn watches_connection(&self, now: Instant) -> bool {
+        matches!(self.state, UiState::Connected { .. })
+            || self
+                .awaiting_reconnect_until
+                .is_some_and(|until| now < until)
+    }
+
+    /// One poll of the connection watch. The desktop otherwise hears of a state change only
+    /// in answers to its own requests, so a connection the always-ready service lost stayed
+    /// «Подключено» (with a session timer fed by a daemon that was no longer connected) until
+    /// the app was restarted. Only changes of the connection itself are applied, and never
+    /// over the user's own action in progress. Returns true when what is shown changed.
+    pub(crate) fn note_connection_status(
+        &mut self,
+        result: Result<DaemonStatus, crate::daemon::DaemonError>,
+        now: Instant,
+    ) -> bool {
+        let Ok(status) = result else {
+            return false;
+        };
+        if self.primary_action_held() || self.queued_primary.is_some() {
+            return false;
+        }
+        let mut changed = false;
+        if self
+            .reconnected_notice
+            .as_ref()
+            .is_some_and(|(_, until)| now >= *until)
+        {
+            self.reconnected_notice = None;
+            changed = true;
+        }
+        let awaiting = self
+            .awaiting_reconnect_until
+            .is_some_and(|until| now < until);
+        if !awaiting {
+            self.awaiting_reconnect_until = None;
+        }
+        let connected_here = matches!(self.state, UiState::Connected { .. });
+        let connected_there = status.state == "connected";
+        if (connected_here && connected_there) || (!connected_here && !awaiting) {
+            return changed;
+        }
+        let code = status
+            .message_key
+            .as_ref()
+            .map(|key| key.code.clone())
+            .unwrap_or_default();
+        if !connected_here && !connected_there && code == AUTO_RECONNECT_CODE {
+            // Still reconnecting.
+            return changed;
+        }
+        let notice = status
+            .message_key
+            .as_ref()
+            .and_then(multicore_i18n::MessageKey::localize)
+            .or_else(|| status.message.clone());
+        self.state = self.apply_daemon_status(status);
+        // The cores (and the generation behind the catalog) changed: reload it.
+        self.catalog_revision = None;
+        if connected_there {
+            self.connection_notice = None;
+            self.awaiting_reconnect_until = None;
+            self.reconnected_notice = Some((
+                notice.unwrap_or_else(|| tr!("Подключение восстановлено автоматически.").into()),
+                now + RECONNECTED_NOTICE,
+            ));
+        } else {
+            self.connection_notice = notice;
+            self.reconnected_notice = None;
+            self.awaiting_reconnect_until =
+                (code == AUTO_RECONNECT_CODE).then(|| now + AUTO_RECONNECT_WATCH);
+        }
+        true
     }
 
     pub(crate) fn service_mode(&self) -> bool {
@@ -1914,6 +2012,7 @@ impl DesktopViewModel {
 
     pub(crate) fn begin_refresh(&mut self) -> MutationToken {
         self.connection_notice = None;
+        self.awaiting_reconnect_until = None;
         if self.profile_status_reconciliation_pending {
             self.profile_status_reload_needed = false;
         }
@@ -1964,6 +2063,8 @@ impl DesktopViewModel {
         };
         let token = self.next_mutation(kind);
         self.connection_notice = None;
+        self.awaiting_reconnect_until = None;
+        self.reconnected_notice = None;
         self.import_notice = None;
         if action == PrimaryAction::Connect {
             let current = self.state.presentation();
@@ -4396,7 +4497,9 @@ impl SessionTraffic {
         at: std::time::Instant,
         now_unix_ms: u64,
     ) -> SessionLine {
-        let uptime = format_uptime(now_unix_ms.saturating_sub(session.connected_since_unix_ms));
+        let uptime = session_uptime_ms(session, now_unix_ms)
+            .map(format_uptime)
+            .unwrap_or_default();
         let exit_now = session.exit_now.clone().unwrap_or_default();
         let (Some(download), Some(upload)) = (session.download_total, session.upload_total) else {
             // Keep the last good sample: the next readable one still yields a real rate.
@@ -4439,6 +4542,22 @@ impl SessionTraffic {
             exit_now,
         }
     }
+}
+
+/// How long the live connection has been up: the daemon's monotonic duration when it sends
+/// one, else the wall-clock difference (zero, never negative, when the clock went back past
+/// the start). `None` without a connection start: `0` means the daemon is not connected
+/// (warm service cores, or a connection the service just lost), and `now - 0` would read as
+/// the whole Unix epoch.
+fn session_uptime_ms(session: &DaemonSession, now_unix_ms: u64) -> Option<u64> {
+    if session.connected_since_unix_ms == 0 {
+        return None;
+    }
+    Some(
+        session
+            .connected_for_ms
+            .unwrap_or_else(|| now_unix_ms.saturating_sub(session.connected_since_unix_ms)),
+    )
 }
 
 /// "00:12:43"; hours keep growing past 99 instead of wrapping.
@@ -4487,6 +4606,7 @@ mod session_traffic_tests {
     fn session(since: u64, down: Option<u64>, up: Option<u64>) -> DaemonSession {
         DaemonSession {
             connected_since_unix_ms: since,
+            connected_for_ms: None,
             download_total: down,
             upload_total: up,
             exit_now: None,
@@ -4536,6 +4656,67 @@ mod session_traffic_tests {
         let line = traffic.sample(&sample, Instant::now(), 2_000);
         assert_eq!(line.exit_now, "🇸🇪 Sweden");
         assert_eq!(line.down, "");
+    }
+
+    /// The owner's 1.1.9 report: the service lost the cores, the daemon re-warmed them, and
+    /// `/v1/session` answered `connected_since_unix_ms: 0` (not connected, warm cores) while
+    /// the desktop still showed the connection: `now - 0` read as 497538 hours.
+    #[test]
+    fn a_session_without_a_connection_start_shows_no_uptime() {
+        let mut traffic = SessionTraffic::default();
+        let now = 1_791_138_096_000;
+        let line = traffic.sample(&session(0, None, None), Instant::now(), now);
+        assert_eq!(line.uptime, "");
+        let line = traffic.sample(
+            &DaemonSession {
+                connected_for_ms: Some(7_000),
+                ..session(0, Some(1), Some(1))
+            },
+            Instant::now(),
+            now,
+        );
+        assert_eq!(
+            line.uptime, "",
+            "no start, no uptime, whatever else is sent"
+        );
+    }
+
+    #[test]
+    fn uptime_comes_from_the_daemons_monotonic_duration() {
+        let mut traffic = SessionTraffic::default();
+        let since = 1_791_130_255_000;
+        // The wall clock jumped back an hour (time sync after sleep): the monotonic duration
+        // still says 2 h 10 min.
+        let line = traffic.sample(
+            &DaemonSession {
+                connected_for_ms: Some(7_834_000),
+                ..session(since, None, None)
+            },
+            Instant::now(),
+            since - 3_600_000,
+        );
+        assert_eq!(line.uptime, "02:10:34");
+        // ...and forward a day: still the same.
+        let line = traffic.sample(
+            &DaemonSession {
+                connected_for_ms: Some(7_835_000),
+                ..session(since, None, None)
+            },
+            Instant::now(),
+            since + 86_400_000,
+        );
+        assert_eq!(line.uptime, "02:10:35");
+    }
+
+    #[test]
+    fn an_older_daemon_falls_back_to_the_wall_clock_without_going_negative() {
+        let mut traffic = SessionTraffic::default();
+        let since = 1_791_130_255_000;
+        let line = traffic.sample(&session(since, None, None), Instant::now(), since + 61_000);
+        assert_eq!(line.uptime, "00:01:01");
+        // The clock went back past the start: zero, never a wrapped or negative value.
+        let line = traffic.sample(&session(since, None, None), Instant::now(), since - 5_000);
+        assert_eq!(line.uptime, "00:00:00");
     }
 
     #[test]
@@ -10124,6 +10305,106 @@ mod tests {
         assert!(
             reconciliation_worker.contains("finish_disconnect_reconciliation(mutation, result)")
         );
+    }
+
+    fn status(state: &str, code: Option<&str>) -> DaemonStatus {
+        DaemonStatus {
+            state: state.into(),
+            profile: Some("Тестовый".into()),
+            current_node: Some("Первый".into()),
+            message_key: code.map(multicore_i18n::MessageKey::new),
+            cores_ready: state == "connected",
+            service_mode: true,
+            ..DaemonStatus::default()
+        }
+    }
+
+    /// The owner's 1.1.9 report: the service lost the cores, the desktop never asked the
+    /// daemon again and kept showing «Подключено» (with a session timer fed by a daemon that
+    /// was no longer connected) until the app was restarted.
+    #[test]
+    fn a_connection_the_service_lost_leaves_connected_and_follows_the_automatic_reconnect() {
+        let mut view_model = connected_view_model_with_catalog();
+        let now = Instant::now();
+        assert!(view_model.watches_connection(now));
+        assert!(
+            !view_model.note_connection_status(Ok(status("connected", None)), now),
+            "still connected: nothing to change"
+        );
+
+        let lost = status("ready", Some("cores.lost_reconnecting"));
+        assert!(view_model.note_connection_status(Ok(lost.clone()), now));
+        let presentation = view_model.presentation();
+        assert!(!presentation.is_connected);
+        assert_eq!(
+            presentation.supporting,
+            "Служба MULTICORE потеряла ядра — переподключаемся…"
+        );
+        assert_eq!(view_model.catalog_revision, None, "the catalog is reloaded");
+        // The daemon reconnects by itself: the watch keeps following it meanwhile.
+        let later = now + Duration::from_secs(2);
+        assert!(view_model.watches_connection(later));
+        assert!(!view_model.note_connection_status(Ok(lost), later));
+
+        let back = now + Duration::from_secs(4);
+        assert!(
+            view_model
+                .note_connection_status(Ok(status("connected", Some("cores.reconnected"))), back)
+        );
+        let presentation = view_model.presentation();
+        assert!(presentation.is_connected);
+        assert!(!presentation.is_error);
+        assert_eq!(
+            presentation.supporting,
+            "Подключение восстановлено автоматически."
+        );
+
+        // The notice goes after a minute.
+        let minute = back + Duration::from_secs(61);
+        assert!(view_model.note_connection_status(Ok(status("connected", None)), minute));
+        assert_eq!(view_model.presentation().supporting, "Текущий маршрут");
+    }
+
+    #[test]
+    fn a_loss_without_an_automatic_reconnect_says_to_connect_again() {
+        for code in ["cores.lost", "cores.reconnect_failed"] {
+            let mut view_model = connected_view_model_with_catalog();
+            let now = Instant::now();
+            if code == "cores.reconnect_failed" {
+                assert!(view_model.note_connection_status(
+                    Ok(status("ready", Some("cores.lost_reconnecting"))),
+                    now
+                ));
+            }
+            assert!(view_model.note_connection_status(Ok(status("ready", Some(code))), now));
+            let presentation = view_model.presentation();
+            assert!(!presentation.is_connected);
+            assert_eq!(presentation.primary_action, PrimaryAction::Connect);
+            assert!(
+                presentation.supporting.contains("подключитесь снова")
+                    || presentation.supporting.contains("Подключитесь снова"),
+                "{}",
+                presentation.supporting
+            );
+            assert!(
+                !view_model.watches_connection(now + Duration::from_secs(1)),
+                "{code}: nothing left to follow"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connection_watch_never_overrides_the_users_own_action() {
+        let mut view_model = connected_view_model_with_catalog();
+        let now = Instant::now();
+        let (action, _) = view_model.begin_primary_action().expect("disconnect");
+        assert_eq!(action, PrimaryAction::Disconnect);
+        assert!(!view_model.note_connection_status(Ok(status("ready", Some("cores.lost"))), now));
+        assert!(matches!(view_model.state, UiState::Disconnecting { .. }));
+        // A failed poll changes nothing either.
+        let mut view_model = connected_view_model_with_catalog();
+        assert!(!view_model.note_connection_status(Err(DaemonError::new("unreachable")), now));
+        assert!(view_model.presentation().is_connected);
     }
 
     #[test]
