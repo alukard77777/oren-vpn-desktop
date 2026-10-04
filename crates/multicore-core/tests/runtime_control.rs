@@ -1419,3 +1419,61 @@ proxies: []
         );
     }
 }
+
+#[test]
+fn a_tun_without_ipv6_blackholes_native_ipv6_instead_of_leaking_it() {
+    // With `ipv6: false` Mihomo gives the TUN no inet6-address, so auto-route installs no IPv6
+    // routes and a dual-stack machine's native IPv6 would bypass the tunnel. sing-tun's
+    // strict-route then makes IPv6 unreachable for everything but Mihomo (Windows: a WFP
+    // block on ALE_AUTH_CONNECT_V6; Linux: an `unreachable` rule for AF_INET6).
+    for yaml in [
+        "ipv6: false\ntun: {enable: true, auto-route: true}\nproxies: []\n",
+        "ipv6: false\ntun: {enable: true}\nproxies: []\n",
+        "ipv6: false\nproxies: []\n",
+        "tun: {enable: true, inet6-address: []}\nproxies: []\n",
+    ] {
+        let mihomo = runtime_mihomo(yaml);
+        assert_eq!(mihomo["tun"]["strict-route"], Value::from(true), "{yaml}");
+    }
+}
+
+#[test]
+fn ipv6_through_the_tunnel_or_a_provider_routing_choice_keeps_its_strict_route() {
+    for (yaml, expected) in [
+        // IPv6 enabled (Mihomo's default): the TUN routes ::/0 itself, nothing leaks.
+        ("tun: {enable: true}\nproxies: []\n", None),
+        ("ipv6: true\ntun: {enable: true}\nproxies: []\n", None),
+        // The provider's own choice stands.
+        (
+            "ipv6: false\ntun: {enable: true, strict-route: false}\nproxies: []\n",
+            Some(false),
+        ),
+        // No auto-route: the provider owns the routing table.
+        (
+            "ipv6: false\ntun: {enable: true, auto-route: false}\nproxies: []\n",
+            None,
+        ),
+    ] {
+        let mihomo = runtime_mihomo(yaml);
+        assert_eq!(
+            mihomo["tun"].get("strict-route").and_then(Value::as_bool),
+            expected,
+            "{yaml}"
+        );
+    }
+    // The Remnawave template already asks for it.
+    let remnawave = Snapshot::parse(
+        include_bytes!("fixtures/remnawave-multicore-mihomo.yaml"),
+        multicore_core::IDLE_XRAY_CONFIG,
+    )
+    .unwrap();
+    let directory = TempDirectory::new();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&remnawave, directory.path(), &control).unwrap();
+    let mihomo: Value =
+        serde_yaml_ng::from_slice(&fs::read(&published.mihomo_config).unwrap()).unwrap();
+    assert_eq!(mihomo["tun"]["strict-route"], Value::from(true));
+    assert_eq!(mihomo["ipv6"], Value::from(false));
+}

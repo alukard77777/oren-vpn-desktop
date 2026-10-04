@@ -1455,6 +1455,10 @@ pub fn stage_runtime_with_mihomo_control(
             YamlValue::String(external_ui_directory.to_owned()),
         );
     }
+    let ipv6_off = mapping
+        .get(YamlValue::String("ipv6".to_owned()))
+        .and_then(YamlValue::as_bool)
+        == Some(false);
     let tun_key = YamlValue::String("tun".to_owned());
     let tun = mapping
         .entry(tun_key)
@@ -1474,6 +1478,25 @@ pub fn stage_runtime_with_mihomo_control(
     // unless the provider chose one explicitly.
     tun.entry(YamlValue::String("stack".to_owned()))
         .or_insert_with(|| YamlValue::String("gvisor".to_owned()));
+    // Without IPv6 (`ipv6: false`, or an explicitly empty `inet6-address`) Mihomo gives the TUN
+    // no IPv6 address, so auto-route installs no IPv6 routes and a dual-stack machine's native
+    // IPv6 bypasses the tunnel. sing-tun's strict-route then makes IPv6 unreachable for every
+    // process but Mihomo (Windows: a WFP block on ALE_AUTH_CONNECT_V6; Linux: an `unreachable`
+    // rule for AF_INET6), and IPv4 still goes through the tunnel. A provider's explicit
+    // strict-route, or auto-route turned off, stays their choice.
+    let tun_has_no_ipv6 = ipv6_off
+        || tun
+            .get(YamlValue::String("inet6-address".to_owned()))
+            .and_then(YamlValue::as_sequence)
+            .is_some_and(Vec::is_empty);
+    let auto_route = tun
+        .get(YamlValue::String("auto-route".to_owned()))
+        .and_then(YamlValue::as_bool)
+        != Some(false);
+    let strict_route_key = YamlValue::String("strict-route".to_owned());
+    if tun_has_no_ipv6 && auto_route && tun.get(&strict_route_key).is_none_or(YamlValue::is_null) {
+        tun.insert(strict_route_key, YamlValue::Bool(true));
+    }
     if let Some(port) = control.proxy_mixed_port {
         tun.insert(
             YamlValue::String("enable".to_owned()),
