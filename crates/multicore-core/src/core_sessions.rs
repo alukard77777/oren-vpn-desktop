@@ -587,7 +587,9 @@ impl SessionIndex {
     /// that identifies the session (what [`Self::end`] takes): `connect_ms`, or one millisecond
     /// after the previous session when that one began at the same time or later.
     pub fn start(&self, connect_ms: u64, start: &SessionStart) -> u64 {
-        let mut previous = self.last_connect_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let mut previous = self
+            .last_connect_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         let connect_ms = loop {
             let next = connect_ms.max(previous + 1);
             match self.last_connect_ms.compare_exchange_weak(
