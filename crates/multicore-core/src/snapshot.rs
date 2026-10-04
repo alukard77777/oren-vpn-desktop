@@ -1492,6 +1492,7 @@ pub fn stage_runtime_with_mihomo_control(
             YamlValue::Bool(false),
         );
     }
+    crate::mihomo_dns_guard::apply(mapping);
     let profile_key = YamlValue::String("profile".to_owned());
     let profile = mapping
         .entry(profile_key)
