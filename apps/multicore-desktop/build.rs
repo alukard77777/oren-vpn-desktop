@@ -2,6 +2,33 @@ include!("../../build-support/windows_version_info.rs");
 
 const APP_ICON_SVG: &[u8] = include_bytes!("assets/app-icon.svg");
 const TRAY_ICON_SIZES: [u32; 2] = [32, 64];
+/// The tray's connection states: a badge in the logo's empty lower-left corner, told apart by
+/// its shape (dot, ring, open arc, diamond) as well as its colour, so a monochrome or
+/// colour-blind look still reads it. «Disconnected» is the plain logo.
+const TRAY_STATE_BADGES: [(&str, &str); 4] = [
+    // Connected through the system proxy: a filled dot.
+    (
+        "proxy",
+        r##"<circle cx="13" cy="51" r="11" fill="#3CCB7F"/>"##,
+    ),
+    // Connected through TUN (all traffic): a ring.
+    (
+        "tun",
+        r##"<circle cx="13" cy="51" r="8.5" stroke="#3CCB7F" stroke-width="5"/>"##,
+    ),
+    // Connecting or disconnecting: an open arc, like a spinner.
+    (
+        "connecting",
+        r##"<path d="M13 42.5A8.5 8.5 0 1 0 20.36 55.25" stroke="#E7AA45" stroke-width="5" stroke-linecap="round"/>"##,
+    ),
+    // Error: a diamond.
+    (
+        "error",
+        r##"<path d="M13 39.5L24.5 51L13 62.5L1.5 51Z" fill="#F06A6A"/>"##,
+    ),
+];
+/// Sizes Windows draws a tray icon at (100–200 % scaling), for the offscreen previews.
+const TRAY_PREVIEW_SIZES: [u32; 4] = [16, 20, 24, 32];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MULTICORE_UPDATE_REPOSITORY");
@@ -16,6 +43,43 @@ fn main() {
         let tray_icon = rasterize_app_icon(&icon_tree, size);
         std::fs::write(output_dir.join(format!("app-icon-{size}.rgba")), tray_icon)
             .expect("failed to write the generated MultiCore tray icon");
+    }
+    // `MULTICORE_TRAY_PREVIEW_DIR`: also writes every state at the Windows tray sizes as raw
+    // RGBA (`<state>-<size>.rgba`), to review the badges offscreen.
+    println!("cargo:rerun-if-env-changed=MULTICORE_TRAY_PREVIEW_DIR");
+    let preview_dir = std::env::var_os("MULTICORE_TRAY_PREVIEW_DIR").map(std::path::PathBuf::from);
+    if let Some(preview_dir) = &preview_dir {
+        std::fs::create_dir_all(preview_dir).expect("failed to create the tray preview directory");
+        for size in TRAY_PREVIEW_SIZES {
+            std::fs::write(
+                preview_dir.join(format!("disconnected-{size}.rgba")),
+                rasterize_app_icon(&icon_tree, size),
+            )
+            .expect("failed to write a tray preview");
+        }
+    }
+    for (state, badge) in TRAY_STATE_BADGES {
+        let tree = resvg::usvg::Tree::from_data(
+            tray_state_svg(badge).as_bytes(),
+            &resvg::usvg::Options::default(),
+        )
+        .expect("failed to parse a MultiCore tray state icon");
+        for size in TRAY_ICON_SIZES {
+            std::fs::write(
+                output_dir.join(format!("app-icon-{state}-{size}.rgba")),
+                rasterize_app_icon(&tree, size),
+            )
+            .expect("failed to write a MultiCore tray state icon");
+        }
+        if let Some(preview_dir) = &preview_dir {
+            for size in TRAY_PREVIEW_SIZES {
+                std::fs::write(
+                    preview_dir.join(format!("{state}-{size}.rgba")),
+                    rasterize_app_icon(&tree, size),
+                )
+                .expect("failed to write a tray preview");
+            }
+        }
     }
 
     let components_path = manifest_dir
@@ -123,6 +187,24 @@ fn compile_windows_resources(
     embed_resource::compile(&resource_path, embed_resource::NONE)
         .manifest_required()
         .expect("failed to embed MultiCore Windows resources");
+}
+
+/// The canonical logo with `badge` drawn in its empty lower-left corner, the logo itself kept
+/// clear of the badge by a thin transparent gap so the badge reads on any taskbar colour.
+fn tray_state_svg(badge: &str) -> String {
+    let svg = std::str::from_utf8(APP_ICON_SVG).expect("the canonical SVG is UTF-8");
+    let body_start = svg.find('>').expect("the canonical SVG has a root element") + 1;
+    let body_end = svg.rfind("</svg>").expect("the canonical SVG is closed");
+    let logo = &svg[body_start..body_end];
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+<defs><mask id="badge-gap" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+<rect width="64" height="64" fill="#fff"/><circle cx="13" cy="51" r="14.5" fill="#000"/>
+</mask></defs>
+<g mask="url(#badge-gap)">{logo}</g>
+{badge}
+</svg>"##
+    )
 }
 
 fn rasterize_app_icon(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {

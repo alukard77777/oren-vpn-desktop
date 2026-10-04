@@ -971,6 +971,11 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     ui.set_tun_enabled(loaded_preferences.tun_enabled);
     // The TUN-off (system proxy) mode exists on Windows only.
     ui.set_tun_toggle_available(cfg!(windows));
+    // A connection that outlived the previous run was made in the saved mode.
+    model
+        .lock()
+        .expect("view model lock")
+        .set_connection_uses_tun(connect_uses_tun(&ui));
     if let Some(growth) = loaded_preferences.rail_growth {
         ui.set_rail_growth_delta(i32::try_from(growth.delta).unwrap_or(0));
         ui.set_rail_grown_width(i32::try_from(growth.grown_width).unwrap_or(0));
@@ -3427,6 +3432,7 @@ fn tray_menu_model(model: &DesktopViewModel) -> TrayMenuModel {
             .collect(),
         route_selection_enabled: catalog.selection_enabled,
         dumb_mode: catalog.dumb_mode,
+        icon_state: tray::tray_icon_state(&presentation, model.connection_uses_tun()),
     })
 }
 
@@ -4051,6 +4057,10 @@ fn dispatch_primary_action(
     match action {
         Some((PrimaryAction::Connect, mutation)) => {
             let tun = weak.upgrade().is_none_or(|ui| connect_uses_tun(&ui));
+            model
+                .lock()
+                .expect("view model lock")
+                .set_connection_uses_tun(tun);
             run_connect(weak.clone(), model.clone(), client, mutation, queued, tun);
         }
         Some((PrimaryAction::Disconnect | PrimaryAction::Cleanup, mutation)) => {

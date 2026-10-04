@@ -882,6 +882,9 @@ pub struct DesktopViewModel {
     /// The daemon reports running cores (connected, or warm through the service).
     cores_ready: bool,
     service_mode: bool,
+    /// The connection is (or the next one will be) made through TUN rather than the system
+    /// proxy; the mode is locked while connected.
+    connection_uses_tun: bool,
     latency_error: Option<String>,
     conflicting_apps: Vec<&'static str>,
     conflicting_apps_dismissed_key: Option<String>,
@@ -966,6 +969,7 @@ impl DesktopViewModel {
             latency_sweep_fresh: BTreeSet::new(),
             latency_sweep_priority: None,
             cores_ready: false,
+            connection_uses_tun: true,
             service_mode: false,
             latency_error: None,
             conflicting_apps: Vec::new(),
@@ -1130,6 +1134,14 @@ impl DesktopViewModel {
 
     pub(crate) fn service_mode(&self) -> bool {
         self.service_mode
+    }
+
+    pub(crate) fn connection_uses_tun(&self) -> bool {
+        self.connection_uses_tun
+    }
+
+    pub(crate) fn set_connection_uses_tun(&mut self, tun: bool) {
+        self.connection_uses_tun = tun;
     }
 
     pub(crate) fn active_profile_id(&self) -> Option<&str> {

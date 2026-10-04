@@ -1,3 +1,5 @@
+use crate::app_icon::TrayIconState;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TrayCommand {
     ShowWindow,
@@ -48,6 +50,8 @@ pub(crate) struct TrayInput {
     pub(crate) route_selection_enabled: bool,
     /// The provider's dumb-mode: one group, no group tabs.
     pub(crate) dumb_mode: bool,
+    /// What the tray icon itself shows (see `tray_icon_state`).
+    pub(crate) icon_state: TrayIconState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +81,7 @@ pub(crate) struct TrayMenuModel {
     pub(crate) groups: Vec<TrayMenuEntry>,
     pub(crate) nodes: Vec<TrayMenuEntry>,
     pub(crate) dumb_mode: bool,
+    pub(crate) icon_state: TrayIconState,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -141,6 +146,29 @@ pub(crate) fn build_menu_model(input: TrayInput) -> TrayMenuModel {
         groups,
         nodes,
         dumb_mode: input.dumb_mode,
+        icon_state: input.icon_state,
+    }
+}
+
+/// The tray icon for the connection state: a broken connection or service, a connect or
+/// disconnect in progress, connected through TUN or through the system proxy (`uses_tun` is
+/// the mode the connection was made in), or the plain logo.
+pub(crate) fn tray_icon_state(
+    presentation: &crate::view_model::StatePresentation,
+    uses_tun: bool,
+) -> TrayIconState {
+    if presentation.is_error || presentation.is_degraded {
+        TrayIconState::Error
+    } else if presentation.is_busy && presentation.has_profile {
+        TrayIconState::Connecting
+    } else if presentation.is_connected {
+        if uses_tun {
+            TrayIconState::Tun
+        } else {
+            TrayIconState::Proxy
+        }
+    } else {
+        TrayIconState::Disconnected
     }
 }
 
@@ -166,6 +194,15 @@ mod native {
         _timer: Timer,
     }
 
+    fn state_icon(state: crate::app_icon::TrayIconState) -> Result<Icon, String> {
+        Icon::from_rgba(
+            crate::app_icon::tray_state_rgba(state, crate::app_icon::TRAY_ICON_SIZE),
+            crate::app_icon::TRAY_ICON_SIZE,
+            crate::app_icon::TRAY_ICON_SIZE,
+        )
+        .map_err(|error| format!("invalid tray icon: {error}"))
+    }
+
     struct NativeTray {
         icon: TrayIcon,
         model: TrayMenuModel,
@@ -173,12 +210,7 @@ mod native {
 
     impl NativeTray {
         fn new(model: TrayMenuModel) -> Result<Self, String> {
-            let icon = Icon::from_rgba(
-                crate::app_icon::tray_rgba(),
-                crate::app_icon::TRAY_ICON_SIZE,
-                crate::app_icon::TRAY_ICON_SIZE,
-            )
-            .map_err(|error| format!("invalid tray icon: {error}"))?;
+            let icon = state_icon(model.icon_state)?;
             let tray = TrayIconBuilder::new()
                 .with_id("multicore-main")
                 .with_guid(TRAY_GUID)
@@ -195,6 +227,11 @@ mod native {
                 return;
             }
             let _ = self.icon.set_tooltip(Some(tooltip(&model)));
+            if self.model.icon_state != model.icon_state
+                && let Ok(icon) = state_icon(model.icon_state)
+            {
+                let _ = self.icon.set_icon(Some(icon));
+            }
             self.model = model;
         }
 
@@ -289,6 +326,7 @@ mod tests {
     use super::{
         TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayNode, TrayPointerButton,
         TrayPointerState, TrayPopupModelCache, build_menu_model, pointer_interaction,
+        tray_icon_state,
     };
 
     #[test]
@@ -343,6 +381,7 @@ mod tests {
             ],
             route_selection_enabled: true,
             dumb_mode: false,
+            icon_state: Default::default(),
         };
 
         let model = build_menu_model(input);
@@ -376,6 +415,53 @@ mod tests {
     }
 
     #[test]
+    fn the_icon_tells_disconnected_proxy_tun_connecting_and_error_apart() {
+        use crate::app_icon::TrayIconState;
+        use crate::view_model::UiState;
+
+        let state = |ui: UiState, tun: bool| tray_icon_state(&ui.presentation(), tun);
+        let ready = || UiState::Ready {
+            profile: "p".into(),
+            node: "n".into(),
+        };
+        let connected = || UiState::Connected {
+            profile: "p".into(),
+            node: "n".into(),
+        };
+        assert_eq!(state(UiState::Empty, true), TrayIconState::Disconnected);
+        assert_eq!(state(UiState::Importing, true), TrayIconState::Disconnected);
+        assert_eq!(state(ready(), true), TrayIconState::Disconnected);
+        assert_eq!(state(connected(), true), TrayIconState::Tun);
+        assert_eq!(state(connected(), false), TrayIconState::Proxy);
+        for transition in [
+            UiState::Connecting {
+                profile: "p".into(),
+                node: "n".into(),
+                step: String::new(),
+            },
+            UiState::Disconnecting {
+                profile: "p".into(),
+                node: "n".into(),
+            },
+        ] {
+            assert_eq!(state(transition, false), TrayIconState::Connecting);
+        }
+        for broken in [
+            UiState::Error {
+                message: String::new(),
+            },
+            UiState::ServiceUnreachable {
+                message: String::new(),
+            },
+            UiState::DaemonDegraded {
+                message: String::new(),
+            },
+        ] {
+            assert_eq!(state(broken, true), TrayIconState::Error);
+        }
+    }
+
+    #[test]
     fn empty_groups_never_leak_nodes() {
         let model = build_menu_model(TrayInput {
             status: "Готово".into(),
@@ -386,6 +472,7 @@ mod tests {
             groups: Vec::new(),
             route_selection_enabled: true,
             dumb_mode: false,
+            icon_state: Default::default(),
         });
 
         assert!(model.nodes.is_empty());
@@ -403,6 +490,7 @@ mod tests {
             groups: Vec::new(),
             route_selection_enabled: true,
             dumb_mode: false,
+            icon_state: Default::default(),
         });
         let mut cache = TrayPopupModelCache::default();
 
@@ -709,6 +797,7 @@ mod native_menu_tests {
             ],
             route_selection_enabled: routes_enabled,
             dumb_mode: false,
+            icon_state: Default::default(),
         }
     }
 
@@ -883,6 +972,13 @@ mod linux {
             }
         }
 
+        fn set_pixbuf(&self, pixbuf: &gtk::gdk_pixbuf::Pixbuf) {
+            use glib::translate::ToGlibPtr;
+            unsafe {
+                gtk::ffi::gtk_status_icon_set_from_pixbuf(self.raw(), pixbuf.to_glib_none().0)
+            };
+        }
+
         fn set_visible(&self, visible: bool) {
             unsafe { gtk::ffi::gtk_status_icon_set_visible(self.raw(), visible.into()) };
         }
@@ -928,17 +1024,46 @@ mod linux {
     }
 
     impl NativeTray {
-        fn sync(&self, model: &TrayMenuModel, shared: &Shared) {
+        fn sync(&self, model: &TrayMenuModel, previous: &TrayMenuModel, shared: &Shared) {
+            let icon_changed = model.icon_state != previous.icon_state;
             match self {
-                Self::StatusIcon(icon) => icon.set_tooltip(&tooltip(model)),
+                Self::StatusIcon(icon) => {
+                    icon.set_tooltip(&tooltip(model));
+                    if icon_changed {
+                        icon.set_pixbuf(&status_pixbuf(model.icon_state));
+                    }
+                }
                 Self::Indicator(tray) => {
                     if let Ok(menu) = build_menu(model, shared) {
                         tray.set_menu(Some(Box::new(menu)));
                     }
                     let _ = tray.set_tooltip(Some(tooltip(model)));
+                    if icon_changed && let Ok(icon) = indicator_icon(model.icon_state) {
+                        let _ = tray.set_icon(Some(icon));
+                    }
                 }
             }
         }
+    }
+
+    fn status_pixbuf(state: crate::app_icon::TrayIconState) -> gtk::gdk_pixbuf::Pixbuf {
+        gtk::gdk_pixbuf::Pixbuf::from_bytes(
+            &glib::Bytes::from_owned(crate::app_icon::tray_state_rgba(
+                state,
+                STATUS_ICON_SIZE as u32,
+            )),
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            STATUS_ICON_SIZE,
+            STATUS_ICON_SIZE,
+            STATUS_ICON_SIZE * 4,
+        )
+    }
+
+    fn indicator_icon(state: crate::app_icon::TrayIconState) -> Result<Icon, String> {
+        Icon::from_rgba(crate::app_icon::tray_state_rgba(state, 32), 32, 32)
+            .map_err(|error| format!("invalid tray icon: {error}"))
     }
 
     pub(crate) struct TrayRuntime {
@@ -1030,7 +1155,7 @@ mod linux {
             if let Some(model) = latest
                 && model != current
             {
-                tray.sync(&model, &shared);
+                tray.sync(&model, &current, &shared);
                 current = model;
             }
             glib::ControlFlow::Continue
@@ -1060,16 +1185,7 @@ mod linux {
     }
 
     fn create_status_icon(model: &TrayMenuModel, shared: &Arc<Shared>) -> StatusIcon {
-        let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
-            &glib::Bytes::from_owned(crate::app_icon::rgba(STATUS_ICON_SIZE as u32)),
-            gtk::gdk_pixbuf::Colorspace::Rgb,
-            true,
-            8,
-            STATUS_ICON_SIZE,
-            STATUS_ICON_SIZE,
-            STATUS_ICON_SIZE * 4,
-        );
-        let icon = StatusIcon::new(&pixbuf);
+        let icon = StatusIcon::new(&status_pixbuf(model.icon_state));
         icon.set_title("MULTICORE");
         icon.set_tooltip(&tooltip(model));
         icon.set_visible(true);
@@ -1104,8 +1220,7 @@ mod linux {
     }
 
     fn create_indicator(model: &TrayMenuModel, shared: &Shared) -> Result<TrayIcon, String> {
-        let icon = Icon::from_rgba(crate::app_icon::rgba(32), 32, 32)
-            .map_err(|error| format!("invalid tray icon: {error}"))?;
+        let icon = indicator_icon(model.icon_state)?;
         TrayIconBuilder::new()
             .with_id("multicore-main")
             .with_title("MULTICORE")
