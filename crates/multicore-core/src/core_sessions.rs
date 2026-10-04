@@ -614,10 +614,11 @@ impl SessionIndex {
     }
 
     /// The connection that began at `connect_ms` ended at `disconnect_ms` because of `reason`.
+    /// A session never ends before it began ([`Self::start`] may have moved its start ahead).
     pub fn end(&self, connect_ms: u64, disconnect_ms: u64, reason: &str) {
         self.append(&IndexRecord::End {
             connect_ms,
-            disconnect_ms: Some(disconnect_ms),
+            disconnect_ms: Some(disconnect_ms.max(connect_ms)),
             reason: reason.to_owned(),
         });
     }
@@ -864,6 +865,11 @@ mod tests {
             .map(|session| session.reason.clone().unwrap_or_default())
             .collect::<Vec<_>>();
         assert_eq!(reasons, ["user", "failed", ""]);
+        assert!(read_sessions(root).iter().all(|session| {
+            session
+                .disconnect_ms
+                .is_none_or(|end| end >= session.connect_ms)
+        }));
 
         // A restarted daemon continues after the newest recorded session.
         let reopened = SessionIndex::open(root, now);
