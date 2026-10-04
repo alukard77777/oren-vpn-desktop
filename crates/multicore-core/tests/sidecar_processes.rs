@@ -13,9 +13,9 @@ use std::{
 };
 
 use multicore_core::{
-    CommandSpec, CoreLogBuffer, DiagnosticStream, Engine, ManagedChild, ProcessController,
-    ProcessError, ProcessLauncher, RuntimeCheckState, RuntimePaths, SidecarProcessController,
-    StartFailureCause, TokioProcessLauncher,
+    CommandSpec, CoreLiveness, CoreLogBuffer, DiagnosticStream, Engine, ManagedChild,
+    ProcessController, ProcessError, ProcessLauncher, RuntimeCheckState, RuntimePaths,
+    SidecarProcessController, StartFailureCause, TokioProcessLauncher, describe_exit_code,
 };
 
 const SIDECAR_SOURCE: &str = include_str!("../src/sidecar.rs");
@@ -34,6 +34,8 @@ struct FakeLauncher {
     stops: Arc<AtomicUsize>,
     fail_stop_once: Arc<AtomicBool>,
     fail_readiness: Arc<AtomicBool>,
+    /// `current_ready` never answers: a readiness probe stuck on a wedged network stack.
+    hang_probes: Arc<AtomicBool>,
 }
 
 struct FakeChild {
@@ -45,6 +47,16 @@ struct FakeChild {
 impl ManagedChild for FakeChild {
     fn has_exited(&mut self) -> Result<bool, ProcessError> {
         Ok(self.exited.load(Ordering::SeqCst))
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(4242)
+    }
+
+    fn exit_description(&mut self) -> Option<String> {
+        self.exited
+            .load(Ordering::SeqCst)
+            .then(|| describe_exit_code(0xC000_0005))
     }
 
     fn stop<'a>(
@@ -97,6 +109,100 @@ impl ProcessLauncher for FakeLauncher {
             }
         })
     }
+
+    fn current_ready<'a>(
+        &'a self,
+        _engine: Engine,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            if self.hang_probes.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            true
+        })
+    }
+}
+
+/// The service's health check (every 2 s tick and every `Status`, under the service's lock)
+/// asks only whether the processes run: a readiness probe that hangs (a loopback connect or
+/// an interface query stuck on a wedged network stack) must never stall it, or every
+/// `Status` waits behind it, the daemon's budget runs out, and the dropped channel makes
+/// the service stop the cores of a perfectly healthy connection.
+#[tokio::test]
+async fn liveness_never_waits_for_a_readiness_probe() {
+    let launcher = FakeLauncher::default();
+    launcher.hang_probes.store(true, Ordering::SeqCst);
+    let controller = SidecarProcessController::with_launcher(paths(), launcher.clone());
+    assert_eq!(
+        controller.liveness(Engine::Xray).await,
+        CoreLiveness::NotStarted
+    );
+    controller.start(Engine::Xray).await.unwrap();
+    let liveness = tokio::time::timeout(Duration::from_secs(2), controller.liveness(Engine::Xray))
+        .await
+        .expect("liveness answers without probing");
+    assert_eq!(liveness, CoreLiveness::Running);
+}
+
+/// A core that died is reported with what the service log needs to say why: which one, its
+/// pid, how it ended and after how long.
+#[tokio::test]
+async fn liveness_reports_how_and_when_a_core_exited() {
+    let launcher = FakeLauncher::default();
+    let controller = SidecarProcessController::with_launcher(paths(), launcher.clone());
+    controller.start(Engine::Mihomo).await.unwrap();
+    launcher.exited.store(true, Ordering::SeqCst);
+    let CoreLiveness::Exited(exit) = controller.liveness(Engine::Mihomo).await else {
+        panic!("an exited core is reported as exited");
+    };
+    assert_eq!(exit.engine, Engine::Mihomo);
+    assert_eq!(exit.pid, Some(4242));
+    assert!(
+        exit.uptime
+            .is_some_and(|uptime| uptime < Duration::from_secs(60))
+    );
+    let line = exit.to_string();
+    assert!(
+        line.starts_with("mihomo (pid 4242) exited: 0xC0000005 (access violation) after "),
+        "{line}"
+    );
+    controller.stop(Engine::Mihomo).await.unwrap();
+    assert_eq!(
+        controller.liveness(Engine::Mihomo).await,
+        CoreLiveness::NotStarted,
+        "a stopped core is not a crash"
+    );
+}
+
+#[test]
+fn exit_codes_are_described_for_the_service_log() {
+    assert_eq!(describe_exit_code(0), "exit code 0");
+    assert_eq!(
+        describe_exit_code(1),
+        "exit code 1 (terminated, or a startup error)"
+    );
+    assert_eq!(
+        describe_exit_code(2),
+        "exit code 2 (Go runtime panic or fatal error)"
+    );
+    assert_eq!(
+        describe_exit_code(0xC000_0005),
+        "0xC0000005 (access violation)"
+    );
+    assert_eq!(
+        describe_exit_code(0xC000_00FD),
+        "0xC00000FD (stack overflow)"
+    );
+    assert_eq!(
+        describe_exit_code(0xC000_0409),
+        "0xC0000409 (fail fast / stack buffer overrun)"
+    );
+    assert_eq!(
+        describe_exit_code(0xC000_0017),
+        "0xC0000017 (out of memory)"
+    );
+    assert_eq!(describe_exit_code(0xDEAD_BEEF), "0xDEADBEEF");
+    assert_eq!(describe_exit_code(77), "exit code 77");
 }
 
 fn paths() -> RuntimePaths {

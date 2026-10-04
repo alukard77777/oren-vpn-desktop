@@ -25,9 +25,10 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-            INFINITE, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-            STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+            GetProcessId, INFINITE, InitializeProcThreadAttributeList,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+            WaitForSingleObject,
         },
     },
 };
@@ -195,6 +196,21 @@ impl ManagedChild for WindowsJobManagedChild {
             return Err(ProcessError::InspectFailed(self.engine));
         }
         Ok(code != STILL_ACTIVE as u32)
+    }
+    fn pid(&self) -> Option<u32> {
+        match unsafe { GetProcessId(self.process.as_raw_handle()) } {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+    fn exit_description(&mut self) -> Option<String> {
+        let mut code = 0;
+        if unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } == 0
+            || code == STILL_ACTIVE as u32
+        {
+            return None;
+        }
+        Some(crate::describe_exit_code(code))
     }
     fn stop<'a>(
         &'a mut self,

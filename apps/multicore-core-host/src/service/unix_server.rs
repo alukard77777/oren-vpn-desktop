@@ -24,7 +24,10 @@ use multicore_core::{
     },
 };
 
-use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop, execute_shared};
+use super::core_loop::{
+    ClientIdentity, ConnectionId, Cores, ServiceLoop, command_name, connection_closed,
+    execute_shared,
+};
 use super::cores::ProductionCores;
 use super::state_dir;
 use super::unix_identity::{IdentityError, production_identity};
@@ -84,6 +87,7 @@ fn handle_connection<C: Cores>(
         );
         return;
     };
+    let mut unanswered = None;
     while let Ok(frame) = read_stream_frame(&mut stream) {
         let Ok(command) = decode_service_command(&frame) else {
             let _ = write_service_frame(
@@ -95,15 +99,17 @@ fn handle_connection<C: Cores>(
             break;
         };
         let shutdown = command == ServiceCommand::Shutdown;
+        let name = command_name(&command);
         let response = execute_shared(&service, id, &identity, command);
-        if write_service_frame(&mut stream, &response).is_err() || shutdown {
+        if write_service_frame(&mut stream, &response).is_err() {
+            unanswered = Some(name);
+            break;
+        }
+        if shutdown {
             break;
         }
     }
-    service
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .client_gone(id);
+    connection_closed(&service, id, unanswered);
 }
 
 /// The normal stop, as for a `Shutdown` from the owner, for a service that is exiting: the
@@ -169,10 +175,9 @@ pub(crate) fn run_service() -> Result<(), ()> {
             .spawn(move || {
                 loop {
                     thread::sleep(TICK);
-                    service
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .tick();
+                    super::core_loop::with_service_lock(&service, "tick", |service| {
+                        service.tick();
+                    });
                 }
             })
             .map_err(drop)?;

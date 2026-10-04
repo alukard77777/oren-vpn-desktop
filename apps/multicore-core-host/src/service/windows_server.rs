@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     ptr,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -42,7 +42,10 @@ use windows_sys::Win32::{
     },
 };
 
-use super::core_loop::{ClientIdentity, ConnectionId, Cores, ServiceLoop, execute_shared};
+use super::core_loop::{
+    ClientIdentity, ConnectionId, Cores, ServiceLoop, command_name, connection_closed,
+    execute_shared,
+};
 use super::windows_identity::{
     IdentityError, client_facts, expected_daemon_image, user_data_root, verify_client,
 };
@@ -231,6 +234,7 @@ fn handle_connection<C: Cores>(
         return;
     };
     let mut pending = Some(first);
+    let mut unanswered = None;
     while let Some(frame) = pending
         .take()
         .or_else(|| read_message_or_signal(pipe, stop.as_raw_handle()).ok())
@@ -245,15 +249,17 @@ fn handle_connection<C: Cores>(
             break;
         };
         let shutdown = command == ServiceCommand::Shutdown;
+        let name = command_name(&command);
         let response = execute_shared(&service, id, &identity, command);
-        if !reply(pipe, &response) || shutdown {
+        if !reply(pipe, &response) {
+            unanswered = Some(name);
+            break;
+        }
+        if shutdown {
             break;
         }
     }
-    service
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .client_gone(id);
+    connection_closed(&service, id, unanswered);
     unsafe { DisconnectNamedPipe(pipe) };
 }
 

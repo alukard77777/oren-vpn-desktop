@@ -94,6 +94,13 @@ impl Cores for FakeCores {
             mihomo: self.running,
         }
     }
+    fn exits(&mut self) -> Vec<String> {
+        if self.running {
+            Vec::new()
+        } else {
+            vec!["xray (pid 4242) exited: 0xC0000005 (access violation) after 2h 10m 34s".into()]
+        }
+    }
     fn stop_all(&mut self) {
         self.calls.push("stop_all".into());
         self.running = false;
@@ -338,6 +345,119 @@ fn owner_channel_drop_stops_the_cores() {
         ["prepare:1", "tun:true", "tun:false", "stop_all"]
     );
     assert_eq!(service.owner_key(), None);
+}
+
+fn service_log(directory: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(directory.path().join("logs").join("service.log")).unwrap_or_default()
+}
+
+/// The owner's 1.1.9 report: the cores were gone and nothing in `service.log` said why. A
+/// dropped owner channel is one of the two ways the service stops a live connection.
+#[test]
+fn the_owners_dropped_channel_is_logged_as_why_the_cores_stopped() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service =
+        ServiceLoop::new(FakeCores::default()).with_log_directory(directory.path().to_owned());
+    let alice = user("alice");
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    service.execute(A, &alice, ServiceCommand::SetTun { on: true });
+    service.client_gone(B);
+    assert_eq!(
+        service_log(&directory),
+        "",
+        "another connection stops nothing"
+    );
+    service.client_gone(A);
+    let log = service_log(&directory);
+    assert!(
+        log.contains(
+            "owner connection 1 closed: stopping the cores of generation 1 and the tunnel"
+        ),
+        "{log}"
+    );
+}
+
+/// The other way: a core that exits. The log names the core, its pid, how it ended, how long
+/// it had run and what the service did about it.
+#[test]
+fn a_core_crash_is_logged_with_how_it_ended_and_what_the_service_did() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service =
+        ServiceLoop::new(FakeCores::default()).with_log_directory(directory.path().to_owned());
+    let alice = user("alice");
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    service.execute(A, &alice, ServiceCommand::SetTun { on: true });
+    service.tick();
+    assert_eq!(service_log(&directory), "", "a healthy tick logs nothing");
+    service.cores_mut().running = false;
+    service.tick();
+    let log = service_log(&directory);
+    assert!(
+        log.contains(
+            "core failure in generation 1: xray (pid 4242) exited: 0xC0000005 (access violation) after 2h 10m 34s; restarting both cores (tunnel was on)"
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains("crash restart of generation 1 ok in "),
+        "{log}"
+    );
+    service.cores_mut().running = false;
+    service.tick();
+    let log = service_log(&directory);
+    assert!(
+        log.contains(
+            "core failure in generation 1: xray (pid 4242) exited: 0xC0000005 (access violation) after 2h 10m 34s; second failure of this generation: cores stopped, tunnel off, Status reports NotReady until the next Prepare"
+        ),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_failed_crash_restart_is_logged() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = ServiceLoop::new(FakeCores {
+        fail_restart: true,
+        ..FakeCores::default()
+    })
+    .with_log_directory(directory.path().to_owned());
+    let alice = user("alice");
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    service.cores_mut().running = false;
+    service.tick();
+    let log = service_log(&directory);
+    assert!(
+        log.contains("crash restart of generation 1 failed (NotReady): cores stopped"),
+        "{log}"
+    );
+}
+
+/// A command stuck behind the service's lock (or holding it) for seconds is what turns a slow
+/// health check into a dropped channel: such waits are logged with the command's name.
+#[test]
+fn slow_service_lock_waits_and_holds_are_named() {
+    use service::core_loop::slow_lock_note;
+    use std::time::Duration;
+    assert_eq!(
+        slow_lock_note(
+            "Status",
+            Duration::from_millis(40),
+            Duration::from_millis(3)
+        ),
+        None
+    );
+    assert_eq!(
+        slow_lock_note(
+            "Status",
+            Duration::from_millis(17_320),
+            Duration::from_millis(3)
+        ),
+        Some("Status waited 17320 ms for the service lock, then ran 3 ms".to_owned())
+    );
+    assert_eq!(
+        slow_lock_note("tick", Duration::ZERO, Duration::from_millis(6_000)),
+        Some("tick waited 0 ms for the service lock, then ran 6000 ms".to_owned())
+    );
 }
 
 #[test]

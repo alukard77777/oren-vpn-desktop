@@ -275,6 +275,10 @@ impl ManagedChild for UnixGroupManagedChild {
         self.exited_without_reaping()
     }
 
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+
     fn stop<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProcessError>> + Send + 'a>> {

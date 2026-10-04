@@ -392,6 +392,17 @@ pub enum ProcessError {
 pub trait ManagedChild: Send {
     fn has_exited(&mut self) -> Result<bool, ProcessError>;
 
+    /// The process id, for the service log.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    /// How the process ended (see [`describe_exit_code`]), for the service log; `None` while
+    /// it runs or when the platform cannot tell.
+    fn exit_description(&mut self) -> Option<String> {
+        None
+    }
+
     fn stop<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), ProcessError>> + Send + 'a>>;
@@ -492,7 +503,7 @@ impl TokioProcessLauncher {
                     return xray_config_is_idle(&runtime.paths.xray_config);
                 }
                 for address in addresses {
-                    if TcpStream::connect(address).await.is_err() {
+                    if !loopback_accepts(address).await {
                         return false;
                     }
                 }
@@ -516,21 +527,30 @@ impl TokioProcessLauncher {
                 let Ok(targets) = mihomo_readiness_targets(&runtime.paths) else {
                     return false;
                 };
-                if TcpStream::connect(targets.controller).await.is_err() {
+                if !loopback_accepts(targets.controller).await {
                     return false;
                 }
                 match targets.traffic {
                     MihomoTrafficEntry::Tun { device } => tun_device_is_up(&device).await,
                     // System-proxy mode: the proxy port accepting a connection is what
                     // applications will actually use.
-                    MihomoTrafficEntry::MixedPort(address) => {
-                        TcpStream::connect(address).await.is_ok()
-                    }
+                    MihomoTrafficEntry::MixedPort(address) => loopback_accepts(address).await,
                     MihomoTrafficEntry::ControllerOnly => true,
                 }
             }
         }
     }
+}
+
+/// How long one readiness probe waits for a loopback listener. A listener answers in
+/// microseconds; an unbounded connect could hang for the OS's whole SYN retry window.
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn loopback_accepts(address: std::net::SocketAddr) -> bool {
+    matches!(
+        tokio::time::timeout(PROBE_CONNECT_TIMEOUT, TcpStream::connect(address)).await,
+        Ok(Ok(_))
+    )
 }
 
 pub struct TokioManagedChild {
@@ -544,6 +564,26 @@ impl ManagedChild for TokioManagedChild {
             .try_wait()
             .map(|status| status.is_some())
             .map_err(|_| ProcessError::InspectFailed(self.engine))
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    fn exit_description(&mut self) -> Option<String> {
+        let status = self.child.try_wait().ok()??;
+        if let Some(code) = status.code() {
+            // Windows reports the full 32-bit code (an NTSTATUS for a crash) as an `i32`.
+            return Some(describe_exit_code(code as u32));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return Some(format!("killed by signal {signal}"));
+            }
+        }
+        None
     }
 
     fn stop<'a>(
@@ -1216,6 +1256,86 @@ pub struct SidecarProcessController<L: ProcessLauncher = TokioProcessLauncher> {
     paths: RuntimePaths,
     launcher: L,
     children: Mutex<HashMap<Engine, L::Child>>,
+    /// When each running core was started, for the uptime a crash report gives.
+    started: StdMutex<HashMap<Engine, std::time::Instant>>,
+}
+
+/// Whether a core runs, from the process table alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoreLiveness {
+    /// Never started, or stopped on purpose.
+    NotStarted,
+    Running,
+    /// Started and gone without being stopped: a crash, a kill, an exit of its own.
+    Exited(CoreExit),
+}
+
+/// A core that ended without being stopped: what the service log says about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreExit {
+    pub engine: Engine,
+    pub pid: Option<u32>,
+    /// How it ended (see [`describe_exit_code`]), when the platform can tell.
+    pub status: Option<String>,
+    /// How long it had run.
+    pub uptime: Option<std::time::Duration>,
+}
+
+impl std::fmt::Display for CoreExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.engine {
+            Engine::Xray => "xray",
+            Engine::Mihomo => "mihomo",
+        })?;
+        if let Some(pid) = self.pid {
+            write!(formatter, " (pid {pid})")?;
+        }
+        write!(
+            formatter,
+            " exited: {}",
+            self.status.as_deref().unwrap_or("exit status unknown")
+        )?;
+        if let Some(uptime) = self.uptime {
+            let seconds = uptime.as_secs();
+            write!(
+                formatter,
+                " after {}h {:02}m {:02}s",
+                seconds / 3600,
+                seconds / 60 % 60,
+                seconds % 60
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A process exit code in words for the service log. Windows reports a crash as an NTSTATUS
+/// (`0xC0000005` and the like); Go cores exit with 2 on a runtime panic or fatal error, and
+/// `TerminateProcess` (a stop, Task Manager, an antivirus) leaves 1.
+#[must_use]
+pub fn describe_exit_code(code: u32) -> String {
+    let known = match code {
+        1 => Some("terminated, or a startup error"),
+        2 => Some("Go runtime panic or fatal error"),
+        0xC000_0005 => Some("access violation"),
+        0xC000_0017 => Some("out of memory"),
+        0xC000_001D => Some("illegal instruction"),
+        0xC000_00FD => Some("stack overflow"),
+        0xC000_013A => Some("Ctrl+C or console closed"),
+        0xC000_0142 => Some("DLL initialization failed"),
+        0xC000_0409 => Some("fail fast / stack buffer overrun"),
+        0x4001_0004 => Some("terminated by a debugger"),
+        _ => None,
+    };
+    let number = if code >= 0x4000_0000 {
+        format!("0x{code:08X}")
+    } else {
+        format!("exit code {code}")
+    };
+    match known {
+        Some(meaning) => format!("{number} ({meaning})"),
+        None => number,
+    }
 }
 
 impl SidecarProcessController<TokioProcessLauncher> {
@@ -1240,7 +1360,34 @@ impl<L: ProcessLauncher> SidecarProcessController<L> {
             paths,
             launcher,
             children: Mutex::new(HashMap::new()),
+            started: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether `engine` runs, from the process table alone: no file read, no connection and
+    /// no interface query, so it never blocks. The service's health check (its 2 s tick and
+    /// every `Status`) runs under the service's lock; a readiness probe stuck there (a
+    /// loopback connect, `GetIfTable2` on a busy network stack) stalled every `Status` until
+    /// the daemon's budget (15 s in 1.1.9) ran out and its dropped channel stopped healthy cores.
+    pub async fn liveness(&self, engine: Engine) -> CoreLiveness {
+        let mut children = self.children.lock().await;
+        let Some(child) = children.get_mut(&engine) else {
+            return CoreLiveness::NotStarted;
+        };
+        if child.has_exited().is_ok_and(|exited| !exited) {
+            return CoreLiveness::Running;
+        }
+        let uptime = self
+            .started
+            .lock()
+            .ok()
+            .and_then(|started| started.get(&engine).map(std::time::Instant::elapsed));
+        CoreLiveness::Exited(CoreExit {
+            engine,
+            pid: child.pid(),
+            status: child.exit_description(),
+            uptime,
+        })
     }
 }
 
@@ -1271,6 +1418,9 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
                 return Err(error);
             }
             children.insert(engine, child);
+            if let Ok(mut started) = self.started.lock() {
+                started.insert(engine, std::time::Instant::now());
+            }
             Ok(())
         })
     }
@@ -1298,6 +1448,9 @@ impl<L: ProcessLauncher> ProcessController for SidecarProcessController<L> {
             if let Err(error) = child.stop().await {
                 children.insert(engine, child);
                 return Err(error);
+            }
+            if let Ok(mut started) = self.started.lock() {
+                started.remove(&engine);
             }
             Ok(())
         })

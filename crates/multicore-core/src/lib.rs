@@ -48,10 +48,10 @@ pub use service_logo::{
     MAX_SERVICE_LOGO_OUTPUT_BYTES, normalize_group_icon, normalize_service_logo,
 };
 pub use sidecar::{
-    CORE_READINESS_TIMEOUT, CommandSpec, CoreLogBuffer, CoreLogRecord, DiagnosticStream,
-    MAX_PERSISTENT_LOG_BYTES, ManagedChild, ProcessDiagnostics, ProcessError, ProcessLauncher,
-    RuntimeCheckState, RuntimePaths, SidecarProcessController, TokioManagedChild,
-    TokioProcessLauncher, multicore_tun_is_up, rotated_log_path,
+    CORE_READINESS_TIMEOUT, CommandSpec, CoreExit, CoreLiveness, CoreLogBuffer, CoreLogRecord,
+    DiagnosticStream, MAX_PERSISTENT_LOG_BYTES, ManagedChild, ProcessDiagnostics, ProcessError,
+    ProcessLauncher, RuntimeCheckState, RuntimePaths, SidecarProcessController, TokioManagedChild,
+    TokioProcessLauncher, describe_exit_code, multicore_tun_is_up, rotated_log_path,
 };
 pub use snapshot::{
     AtomicSnapshot, MAX_GROUP_ICONS, MihomoRuntimeControl, PersistenceError,

@@ -160,10 +160,9 @@ fn run_body() -> io::Result<()> {
                 while unsafe { WaitForSingleObject(stop.as_raw_handle(), TICK_MILLISECONDS) }
                     == WAIT_TIMEOUT
                 {
-                    service
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .tick();
+                    super::core_loop::with_service_lock(&service, "tick", |service| {
+                        service.tick();
+                    });
                 }
             })?
     };

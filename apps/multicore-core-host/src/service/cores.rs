@@ -12,9 +12,9 @@ use std::{
 };
 
 use multicore_core::{
-    CORE_READINESS_TIMEOUT, CoreLogBuffer, DiagnosticStream, Engine, MAX_CONFIG_BYTES,
-    MihomoServicePolicy, ProcessController, ProcessError, RuntimeCheckState, RuntimePaths,
-    SidecarProcessController,
+    CORE_READINESS_TIMEOUT, CoreLiveness, CoreLogBuffer, DiagnosticStream, Engine,
+    MAX_CONFIG_BYTES, MihomoServicePolicy, ProcessController, ProcessError, RuntimeCheckState,
+    RuntimePaths, SidecarProcessController,
     elevation_protocol::{
         BrokerErrorCode, ElevatedDiagnosticStream, ElevatedEngine, ElevatedLogRecord,
         MAX_ELEVATION_FRAME_BYTES,
@@ -422,15 +422,35 @@ impl Cores for ProductionCores {
         Some(enabled || self.runtime.block_on(multicore_core::multicore_tun_is_up()))
     }
 
+    /// The processes only: `diagnostics()` also parses both configs, connects to every
+    /// loopback listener and reads the interface table, and only "exited" ever counted here.
+    /// Under the service's lock a stuck probe stalled every `Status` past the daemon's budget.
     fn health(&mut self) -> CoreHealth {
         let Some(active) = self.active.as_ref() else {
             return CoreHealth::default();
         };
-        let diagnostics = self.runtime.block_on(active.controller.diagnostics());
+        let running = |engine| {
+            self.runtime.block_on(active.controller.liveness(engine)) == CoreLiveness::Running
+        };
         CoreHealth {
-            xray: diagnostics.xray != RuntimeCheckState::Stopped,
-            mihomo: diagnostics.mihomo != RuntimeCheckState::Stopped,
+            xray: running(Engine::Xray),
+            mihomo: running(Engine::Mihomo),
         }
+    }
+
+    fn exits(&mut self) -> Vec<String> {
+        let Some(active) = self.active.as_ref() else {
+            return Vec::new();
+        };
+        [Engine::Xray, Engine::Mihomo]
+            .into_iter()
+            .filter_map(
+                |engine| match self.runtime.block_on(active.controller.liveness(engine)) {
+                    CoreLiveness::Exited(exit) => Some(exit.to_string()),
+                    CoreLiveness::NotStarted | CoreLiveness::Running => None,
+                },
+            )
+            .collect()
     }
 
     fn stop_all(&mut self) {

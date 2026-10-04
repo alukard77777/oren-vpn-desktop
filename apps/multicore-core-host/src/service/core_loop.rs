@@ -4,6 +4,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use multicore_core::elevation_protocol::{BrokerErrorCode, ElevatedRuntimeState};
@@ -56,7 +57,14 @@ pub(crate) trait Cores: Send {
     fn tun_is_on(&mut self) -> Option<bool> {
         None
     }
+    /// Whether both processes run. Must never block: it runs under the service's lock on
+    /// every tick and every `Status`.
     fn health(&mut self) -> CoreHealth;
+    /// For `logs/service.log`: one line per core that exited without being stopped (which
+    /// one, its pid, how it ended, after how long).
+    fn exits(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn stop_all(&mut self);
     fn diagnostics(&mut self) -> ServiceResponse;
 }
@@ -279,20 +287,49 @@ impl<C: Cores> ServiceLoop<C> {
             .as_ref()
             .is_some_and(|owner| owner.connection == connection)
         {
+            // The daemon left or dropped its channel (a timed-out exchange loses the framing):
+            // one of the two ways a live connection's cores stop, so it is always logged.
+            if let Some((generation, _)) = &self.prepared {
+                self.log(&format!(
+                    "owner connection {} closed: stopping the cores of generation {generation}{}",
+                    connection.0,
+                    if self.tun_on { " and the tunnel" } else { "" }
+                ));
+            }
             self.stop_everything();
         }
     }
 
     /// Periodic health check: a crashed core is restarted once per prepared generation (with
     /// the tunnel switched back on if it was on); a second crash stops both cores, leaves the
-    /// tunnel off and reports `NotReady` in `Status` until the next `Prepare`.
+    /// tunnel off and reports `NotReady` in `Status` until the next `Prepare`. Every failure is
+    /// logged with what ended the core and what the service did about it.
     pub(crate) fn tick(&mut self) {
-        if self.prepared.is_none() || self.failure.is_some() || self.cores.health().all() {
+        let Some(generation) = self.prepared.as_ref().map(|(generation, _)| *generation) else {
+            return;
+        };
+        if self.failure.is_some() {
             return;
         }
+        let health = self.cores.health();
+        if health.all() {
+            return;
+        }
+        let exits = self.cores.exits();
+        let what = if exits.is_empty() {
+            format!(
+                "xray running: {}, mihomo running: {}",
+                health.xray, health.mihomo
+            )
+        } else {
+            exits.join("; ")
+        };
         let tunnel = self.tun_on;
         self.tun_on = false;
         if self.crash_restarts >= MAX_CRASH_RESTARTS {
+            self.log(&format!(
+                "core failure in generation {generation}: {what}; second failure of this generation: cores stopped, tunnel off, Status reports NotReady until the next Prepare"
+            ));
             if tunnel {
                 let _ = self.cores.set_tun(false);
             }
@@ -300,20 +337,48 @@ impl<C: Cores> ServiceLoop<C> {
             self.failure = Some(BrokerErrorCode::NotReady);
             return;
         }
+        self.log(&format!(
+            "core failure in generation {generation}: {what}; restarting both cores{}",
+            if tunnel { " (tunnel was on)" } else { "" }
+        ));
         self.crash_restarts += 1;
+        let started = Instant::now();
         match self.cores.restart() {
             Ok(()) if tunnel => match self.cores.set_tun(true) {
-                Ok(()) => self.tun_on = true,
+                Ok(()) => {
+                    self.tun_on = true;
+                    self.log_restarted(generation, started);
+                }
                 Err(code) => {
                     let _ = self.cores.set_tun(false);
                     self.failure = Some(code);
+                    self.log(&format!(
+                        "crash restart of generation {generation}: the tunnel did not come back ({code:?}); Status reports the failure"
+                    ));
                 }
             },
-            Ok(()) => {}
+            Ok(()) => self.log_restarted(generation, started),
             Err(code) => {
                 self.cores.stop_all();
                 self.failure = Some(code);
+                self.log(&format!(
+                    "crash restart of generation {generation} failed ({code:?}): cores stopped"
+                ));
             }
+        }
+    }
+
+    fn log_restarted(&self, generation: u64, started: Instant) {
+        self.log(&format!(
+            "crash restart of generation {generation} ok in {} ms",
+            started.elapsed().as_millis()
+        ));
+    }
+
+    /// A line in `logs/service.log` (nothing without a log directory, as in most tests).
+    pub(crate) fn log(&self, line: &str) {
+        if let Some(directory) = &self.log_directory {
+            super::service_log::append(directory, line);
         }
     }
 
@@ -522,6 +587,78 @@ impl<C: Cores> ServiceLoop<C> {
     }
 }
 
+/// A wait for the service's lock this long is logged: every `Status` behind it waits too, and
+/// past the daemon's `Status` budget its dropped channel stops the cores.
+const SLOW_LOCK_WAIT: Duration = Duration::from_secs(2);
+/// Holding the lock this long is logged (a `Prepare` starting both cores takes a second or
+/// two; a tick or a `Status` takes microseconds).
+const SLOW_LOCK_HOLD: Duration = Duration::from_secs(5);
+
+/// What `logs/service.log` says about `what` (a command or the health tick) that waited
+/// `waited` for the service's lock and then held it for `held`; `None` when both were short.
+pub(crate) fn slow_lock_note(what: &str, waited: Duration, held: Duration) -> Option<String> {
+    (waited >= SLOW_LOCK_WAIT || held >= SLOW_LOCK_HOLD).then(|| {
+        format!(
+            "{what} waited {} ms for the service lock, then ran {} ms",
+            waited.as_millis(),
+            held.as_millis()
+        )
+    })
+}
+
+/// Runs `work` under the service's lock and logs a slow wait or hold (see [`slow_lock_note`]).
+pub(crate) fn with_service_lock<C: Cores, T>(
+    service: &Mutex<ServiceLoop<C>>,
+    what: &str,
+    work: impl FnOnce(&mut ServiceLoop<C>) -> T,
+) -> T {
+    let asked = Instant::now();
+    let mut guard = service.lock().unwrap_or_else(PoisonError::into_inner);
+    let waited = asked.elapsed();
+    let result = work(&mut guard);
+    if let Some(note) = slow_lock_note(what, waited, asked.elapsed().saturating_sub(waited)) {
+        guard.log(&note);
+    }
+    result
+}
+
+/// The command's name for the service log (never its arguments).
+pub(crate) fn command_name(command: &ServiceCommand) -> &'static str {
+    match command {
+        ServiceCommand::Prepare { .. } => "Prepare",
+        ServiceCommand::SetTun { on: true } => "SetTun(on)",
+        ServiceCommand::SetTun { on: false } => "SetTun(off)",
+        ServiceCommand::Status => "Status",
+        ServiceCommand::Stop { .. } => "Stop",
+        ServiceCommand::Diagnostics => "Diagnostics",
+        ServiceCommand::ServiceLog { .. } => "ServiceLog",
+        ServiceCommand::CoreJournal { .. } => "CoreJournal",
+        ServiceCommand::Shutdown => "Shutdown",
+        ServiceCommand::Update { .. } => "Update",
+        ServiceCommand::StageUpdate { .. } => "StageUpdate",
+        ServiceCommand::Troubleshoot { .. } => "Troubleshoot",
+    }
+}
+
+/// A server connection ended: logs an answer that could not be delivered (the client left
+/// while its command waited or ran: the trace of a timed-out exchange) and releases the cores
+/// if it was the owner's connection.
+pub(crate) fn connection_closed<C: Cores>(
+    service: &Mutex<ServiceLoop<C>>,
+    connection: ConnectionId,
+    unanswered: Option<&str>,
+) {
+    with_service_lock(service, "connection closed", |service| {
+        if let Some(command) = unanswered {
+            service.log(&format!(
+                "connection {}: the answer to {command} could not be sent (the client had left)",
+                connection.0
+            ));
+        }
+        service.client_gone(connection);
+    });
+}
+
 /// Runs one command for a server connection thread. `Update` and `StageUpdate` download and
 /// verify without holding the lock (and `Troubleshoot` runs its fixes without it), so the owner's `Status`/`SetTun`, crash restarts, a dropped
 /// owner and a service stop are all served meanwhile; every other command runs under the lock.
@@ -544,7 +681,11 @@ pub(crate) fn execute_shared<C: Cores>(
             let outcomes = troubleshooter.run(&fixes);
             return lock().finish_troubleshoot(&fixes, outcomes);
         }
-        command => return lock().execute(connection, client, command),
+        command => {
+            return with_service_lock(service, command_name(&command), |service| {
+                service.execute(connection, client, command)
+            });
+        }
     };
     let mut pending = match lock().start_update(client) {
         Ok(pending) => pending,
