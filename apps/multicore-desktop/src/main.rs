@@ -9,6 +9,7 @@ mod crash_log;
 mod crisp_image;
 mod daemon;
 mod data_reset;
+mod data_root;
 mod emoji_images;
 mod event_loop_guard;
 mod language;

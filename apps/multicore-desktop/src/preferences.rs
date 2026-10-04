@@ -131,7 +131,7 @@ pub struct PreferenceStore {
 
 impl PreferenceStore {
     pub fn from_user_data_root() -> io::Result<Self> {
-        multicore_platform::dirs::user_data_root().map(|root| Self::at(root.join(PREFERENCES_FILE)))
+        crate::data_root::user_data_root().map(|root| Self::at(root.join(PREFERENCES_FILE)))
     }
 
     pub fn at(path: PathBuf) -> Self {

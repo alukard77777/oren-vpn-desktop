@@ -157,7 +157,7 @@ fn hide_own_windows() {
 }
 
 fn marker_path() -> Option<PathBuf> {
-    multicore_platform::dirs::user_data_root()
+    crate::data_root::user_data_root()
         .ok()
         .map(|root| root.join(MARKER_FILE))
 }

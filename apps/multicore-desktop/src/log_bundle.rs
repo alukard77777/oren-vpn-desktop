@@ -91,7 +91,7 @@ impl BundleInputs {
             system,
             diagnostics,
             daemon_diagnostics: daemon,
-            data_root: multicore_platform::dirs::user_data_root().ok(),
+            data_root: crate::data_root::user_data_root().ok(),
             home: home_directory(),
             service_logs: Vec::new(),
             windows_errors: String::new(),

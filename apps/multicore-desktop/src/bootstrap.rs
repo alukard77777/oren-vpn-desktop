@@ -579,8 +579,7 @@ fn await_readiness_signal(
 
 fn start_packaged() -> Result<Bootstrap, BootstrapError> {
     let current_exe = std::env::current_exe().map_err(|_| BootstrapError::Package)?;
-    let data_dir =
-        multicore_platform::dirs::user_data_root().map_err(|_| BootstrapError::Package)?;
+    let data_dir = crate::data_root::user_data_root().map_err(|_| BootstrapError::Package)?;
     let paths = derive_and_validate_paths(&current_exe, data_dir)?;
     std::fs::create_dir_all(&paths.data_dir).map_err(|_| {
         eprintln!("bootstrap stage failed: data-directory");

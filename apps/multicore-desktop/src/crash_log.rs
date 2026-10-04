@@ -68,22 +68,12 @@ pub(crate) fn event_loop_exit_report(detail: &str, action: &str, version: &str) 
     )
 }
 
-#[cfg(not(test))]
+/// `logs/crash.log` in the data directory (a temp directory under `cfg(test)`, see
+/// `data_root`).
 pub(crate) fn crash_log_path() -> Option<PathBuf> {
-    multicore_platform::dirs::user_data_root()
+    crate::data_root::user_data_root()
         .ok()
         .map(|root| root.join("logs").join(CRASH_LOG_FILE_NAME))
-}
-
-/// Tests never write into the real user's data directory.
-#[cfg(test)]
-pub(crate) fn crash_log_path() -> Option<PathBuf> {
-    Some(
-        std::env::temp_dir()
-            .join(format!("multicore-desktop-test-{}", std::process::id()))
-            .join("logs")
-            .join(CRASH_LOG_FILE_NAME),
-    )
 }
 
 /// One report: when, which version and thread, where and why, then the backtrace.

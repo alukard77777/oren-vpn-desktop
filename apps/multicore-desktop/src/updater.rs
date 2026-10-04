@@ -793,7 +793,7 @@ pub(crate) fn download_release_to(
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn update_directory() -> Result<PathBuf, String> {
-    multicore_platform::dirs::user_data_root()
+    crate::data_root::user_data_root()
         .map(|root| root.join("updates"))
         .map_err(|_| tr!("Каталог данных MULTICORE недоступен").to_owned())
 }

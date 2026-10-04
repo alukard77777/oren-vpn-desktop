@@ -100,7 +100,7 @@ fn reset_while_holding<G>(guard: Option<G>, remove: impl FnOnce()) -> bool {
 }
 
 fn remove_data_directory() {
-    match multicore_platform::dirs::user_data_root() {
+    match crate::data_root::user_data_root() {
         Ok(root) if is_multicore_data_root(&root) => {
             if let Err(error) = remove_with_retry(&root, RESET_ATTEMPTS, RESET_DELAY, |path| {
                 std::fs::remove_dir_all(path)

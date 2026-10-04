@@ -31,18 +31,10 @@ fn low_level_log_path() -> Option<std::path::PathBuf> {
     low_level_data_root().map(|root| root.join("logs").join(LOW_LEVEL_LOG_FILE_NAME))
 }
 
-/// The data root the log lives under. Unit tests replay failing daemon exchanges (forbidden
-/// subscriptions, malformed bodies, private-node markers) through the very code that records
-/// them, so under `cfg(test)` the log goes to a per-process directory in the OS temp
-/// directory and never reaches the real user's diagnostics.
-#[cfg(not(test))]
+/// The data root the log lives under; a per-process temp directory under `cfg(test)` (see
+/// `data_root`), so replayed failures never reach the real user's diagnostics.
 fn low_level_data_root() -> Option<std::path::PathBuf> {
-    multicore_platform::dirs::user_data_root().ok()
-}
-
-#[cfg(test)]
-fn low_level_data_root() -> Option<std::path::PathBuf> {
-    Some(std::env::temp_dir().join(format!("multicore-desktop-test-{}", std::process::id())))
+    crate::data_root::user_data_root().ok()
 }
 
 pub(crate) fn record_low_level(context: &str, detail: impl fmt::Display) {
@@ -3130,12 +3122,7 @@ mod http_tests {
     #[test]
     fn tests_never_write_the_real_user_low_level_log() {
         let path = low_level_log_path().expect("test log path");
-        if let Ok(real_root) = multicore_platform::dirs::user_data_root() {
-            assert!(
-                !path.starts_with(&real_root),
-                "{path:?} is inside the real data directory {real_root:?}"
-            );
-        }
+        assert!(path.starts_with(crate::data_root::user_data_root().expect("test root")));
         assert!(path.starts_with(std::env::temp_dir()));
         // Unique, so neither the repeat filter nor another test's line can stand in for it.
         let probe = format!(
