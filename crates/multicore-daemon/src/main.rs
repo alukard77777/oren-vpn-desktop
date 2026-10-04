@@ -1,11 +1,12 @@
 use std::{
     env, io,
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use multicore_core::local_proxy_port::LocalProxyPort;
 use multicore_core::{
     DeviceIdentity, MihomoRuntimeControl, ProfileStore, ReqwestHttpClient, Snapshot,
     SubscriptionFetcher, TunnelProxy, default_ipv4_interface, stage_runtime_with_mihomo_control,
@@ -14,7 +15,7 @@ use multicore_daemon::connection_mode::{Backed, ModeController};
 use multicore_daemon::elevated_controller::{production_factory, runtime_generation_from_path};
 use multicore_daemon::service_client::{
     ControllerSlot, ProductionServiceConnector, ServiceMode, ServiceSession, ServiceTunController,
-    SlotSelector, WarmInputs, WarmStage, WarmStages,
+    SlotSelector, WarmInputs, WarmMiss, WarmStage, WarmStages,
 };
 use multicore_daemon::{
     Backend, BackendError, ConnectOptions, CoreBackend, PreparedController, bind_loopback,
@@ -97,6 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ReqwestHttpClient::new(device_identity)?.with_tunnel_proxy(tunnel_proxy.clone()),
     );
     let runtime_root = data_directory.join("runtime");
+    // Mihomo's loopback mixed port (system proxy, and the local proxy other apps may use):
+    // one saved port for every connection and restart. Chosen now so Settings can show it.
+    let local_proxy_port = LocalProxyPort::open(&data_directory);
+    let initial_local_proxy_port = local_proxy_port
+        .current()
+        .map_err(|error| eprintln!("local proxy port unavailable: {error}"))
+        .ok();
+    #[cfg(not(windows))]
+    let _ = initial_local_proxy_port;
     // Per-connection core logs and their index (see `multicore_core::core_sessions`).
     let core_sessions_directory = data_directory
         .join("logs")
@@ -144,7 +154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_xray_outbound_interface(interface)
                     .map_err(|_| BackendError::new())?;
                 on_demand_slot();
-                return proxy_mode.prepare(snapshot, &runtime_root, control);
+                return proxy_mode.prepare(
+                    snapshot,
+                    &runtime_root,
+                    control,
+                    local_proxy_port
+                        .verified()
+                        .map_err(|_| BackendError::new())?,
+                );
             }
             if use_service {
                 #[cfg(windows)]
@@ -165,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let key = inputs.key();
                 let _staging = staging.lock().map_err(|_| BackendError::new())?;
                 // A generation the service rejected (for example its mixed port was taken)
-                // is dropped here and staged again with a fresh port.
+                // is dropped here and staged again, its port checked first.
                 let miss = match warm_stages.reusable(&inputs, &factory_service) {
                     Ok(stage) => {
                         return Ok(PreparedController::reuse(controller(
@@ -175,7 +192,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(miss) => miss,
                 };
-                let mixed_port = free_loopback_port().ok_or_else(BackendError::new)?;
+                let mixed_port = match miss {
+                    WarmMiss::PrepareRejected => local_proxy_port.verified(),
+                    _ => local_proxy_port.current(),
+                }
+                .map_err(|_| BackendError::new())?;
                 let control = runtime_control
                     .clone()
                     .with_xray_outbound_interface(interface)
@@ -277,12 +298,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             package_root: env::current_exe()
                 .ok()
                 .and_then(|executable| dashboard_directory_for(&executable)),
-            // The on-demand Mihomo's controller (per-user TUN and proxy mode).
-            extra_ports: vec![multicore_core::troubleshoot::ListenPort {
-                port: mihomo_controller_address.port(),
-                udp: false,
-                mihomo: true,
-            }],
+            // The on-demand Mihomo's controller (per-user TUN and proxy mode) and the saved
+            // local proxy port every generation's mixed listener uses.
+            extra_ports: std::iter::once(mihomo_controller_address.port())
+                .chain(initial_local_proxy_port)
+                .map(|port| multicore_core::troubleshoot::ListenPort {
+                    port,
+                    udp: false,
+                    mihomo: true,
+                })
+                .collect(),
         },
     );
     #[cfg(not(windows))]
@@ -469,13 +494,6 @@ fn random_hex(bytes: usize) -> Result<String, getrandom::Error> {
     Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// A loopback port free right now; Mihomo binds it moments later. A port taken in between
-/// fails Mihomo's readiness check and the connect reports it.
-fn free_loopback_port() -> Option<u16> {
-    let listener = StdTcpListener::bind(("127.0.0.1", 0)).ok()?;
-    listener.local_addr().ok().map(|address| address.port())
-}
-
 /// The package root (parent of both `runtime/`, which this executable lives
 /// in, and `cores/`), where an optional vendored `dashboard/` directory is
 /// staged as a sibling of `cores/` - not as a sibling of this executable
@@ -550,8 +568,8 @@ mod proxy_mode {
             snapshot: &Snapshot,
             runtime_root: &std::path::Path,
             control: MihomoRuntimeControl,
+            port: u16,
         ) -> Result<PreparedController<Controller>, BackendError> {
-            let port = super::free_loopback_port().ok_or_else(BackendError::new)?;
             let control = control
                 .with_proxy_mode(port)
                 .map_err(|_| BackendError::new())?;
@@ -679,6 +697,24 @@ mod tests {
         ));
         assert!(production.contains("if!options.tun&&!use_service{"));
         assert!(production.contains("proxy_mode.service_controller("));
+    }
+
+    #[test]
+    fn every_mixed_port_is_the_saved_local_proxy_port() {
+        let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
+        let compact = compact(production);
+        // Chosen and saved at start, so Settings can show it before the first connection.
+        assert!(compact.contains("LocalProxyPort::open(&data_directory)"));
+        // The service path keeps the saved port (its previous generation may hold it) and
+        // checks it only after the service rejected a generation (it may be another app's).
+        assert!(compact.contains("WarmMiss::PrepareRejected=>local_proxy_port.verified()"));
+        assert!(compact.contains("_=>local_proxy_port.current()"));
+        // Proxy mode without the service runs no core of ours on it: checked at once.
+        assert!(compact.contains(
+            "proxy_mode.prepare(snapshot,&runtime_root,control,local_proxy_port.verified()"
+        ));
+        // No random per-connection port is left.
+        assert!(!production.contains("free_loopback_port"));
     }
 
     #[test]

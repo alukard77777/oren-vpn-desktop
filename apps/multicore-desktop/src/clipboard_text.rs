@@ -40,6 +40,20 @@ pub(crate) fn read_subscription_text(window: &slint::Window) -> Result<String, C
     })?)
 }
 
+/// Puts `text` on the clipboard, through the window's Wayland display first like
+/// `read_subscription_text`.
+pub(crate) fn write_text(window: &slint::Window, text: &str) -> Result<(), ClipboardTextError> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) =
+        wayland::with_clipboard(window, |clipboard| clipboard.set_contents(text.to_owned()))
+    {
+        return result.map_err(|_| ClipboardTextError::Unavailable);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = window;
+    with_native_clipboard(|clipboard| clipboard.set_contents(text.to_owned()))
+}
+
 thread_local! {
     // On X11 the copying process itself serves the selection for as long as
     // its context lives: a context dropped right after `set_contents` takes

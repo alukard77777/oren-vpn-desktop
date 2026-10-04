@@ -77,7 +77,8 @@ use view_model::{
     NodeLatencyRequest, NodeSelectionRequest, Panel, PrimaryAction, ProfileRequestToken,
     QueuedNodeSelection, SemanticTone, SessionLine, SessionTraffic, StatePresentation,
     SubscriptionPresentation, SubscriptionProfileOperation, SubscriptionProfilesPresentation,
-    derive_catalog_display, exit_now_display, search_routes, split_leading_symbol,
+    derive_catalog_display, exit_now_display, local_proxy_address, search_routes,
+    split_leading_symbol,
 };
 use windows_settings::LaunchAtSignInState;
 use windows_shell::{
@@ -1029,6 +1030,7 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     let _pending_import_timer =
         wire_pending_subscription_imports(&ui, model.clone(), pending_subscription_imports.clone());
     wire_clipboard_import(&ui, model.clone());
+    wire_local_proxy(&ui);
     wire_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
     let _subscription_refresh_timer =
         wire_automatic_subscription_refresh(&ui, model.clone(), profile_preferences.clone());
@@ -3555,6 +3557,38 @@ fn wire_import(
     });
 }
 
+/// The saved local proxy port, as Settings shows it ("" before the daemon chose one).
+fn saved_local_proxy_address() -> String {
+    local_proxy_address(
+        data_root::user_data_root()
+            .ok()
+            .and_then(|root| multicore_core::local_proxy_port::read_local_proxy_port(&root)),
+    )
+}
+
+/// «Локальный прокси: 127.0.0.1:PORT» in Settings and its copy action. The daemon saves the
+/// port at start and changes it only when another app took it, which a connect reveals.
+fn wire_local_proxy(ui: &AppWindow) {
+    ui.set_local_proxy_address(saved_local_proxy_address().into());
+    let weak = ui.as_weak();
+    ui.on_copy_local_proxy(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let address = ui.get_local_proxy_address().to_string();
+        if address.is_empty() || clipboard_text::write_text(ui.window(), &address).is_err() {
+            return;
+        }
+        ui.set_local_proxy_copied(true);
+        let reset = weak.clone();
+        Timer::single_shot(Duration::from_secs(2), move || {
+            if let Some(ui) = reset.upgrade() {
+                ui.set_local_proxy_copied(false);
+            }
+        });
+    });
+}
+
 fn wire_clipboard_import(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     let weak = ui.as_weak();
     let paste_model = model.clone();
@@ -5199,6 +5233,14 @@ fn run_connect(
             snapshot(&model)
         };
         apply_snapshot_from_worker(weak.clone(), current, model.clone(), refresh_catalog, false);
+        // A connect may have moved the local proxy to another port (the saved one was taken).
+        let proxy_address = saved_local_proxy_address();
+        let proxy_ui = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = proxy_ui.upgrade() {
+                ui.set_local_proxy_address(proxy_address.into());
+            }
+        });
         // Pull the bounded core log right away, success or failure, so the
         // first seconds of Xray/Mihomo startup are already cached in the
         // Events feed (see view_model::filtered_events) instead of only

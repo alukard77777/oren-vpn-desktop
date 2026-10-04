@@ -3635,6 +3635,12 @@ fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPres
     }
 }
 
+/// What Settings shows for the saved local proxy port (empty: no row).
+pub(crate) fn local_proxy_address(port: Option<u16>) -> String {
+    port.map(|port| format!("127.0.0.1:{port}"))
+        .unwrap_or_default()
+}
+
 fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
     match (status, latency_ms) {
         // Answered pings are graded: under 100 ms green, 100–249 ms amber,
@@ -9346,6 +9352,39 @@ mod tests {
         assert!(main.contains("tracker.set_tun_enabled(ui.get_tun_enabled());"));
         assert!(main.contains("client.connect_with_tun(tun)"));
         assert!(main.contains("!ui.get_tun_toggle_available() || ui.get_tun_enabled()"));
+    }
+
+    #[test]
+    fn settings_show_the_saved_local_proxy_address_with_a_copy_action() {
+        let app = include_str!("../ui/app.slint").replace(
+            "
+", "
+",
+        );
+        let main = include_str!("main.rs");
+        let card = app
+            .split("connection-rows := VerticalLayout {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.tun-toggle-available: HorizontalLayout {")
+                    .next()
+            })
+            .expect("connection card");
+        let row = card
+            .split("if root.local-proxy-address != \"\": HorizontalLayout {")
+            .nth(1)
+            .expect("local proxy row");
+        assert!(row.contains("@tr(\"Локальный прокси: {}\", root.local-proxy-address)"));
+        assert!(row.contains("label: @tr(\"Копировать\");"));
+        assert!(row.contains("swap-label: @tr(\"Скопировано ✓\");"));
+        assert!(row.contains("activated => { root.copy-local-proxy(); }"));
+        // The row above draws the separator only when this row is there.
+        assert!(card.contains("show-separator: root.local-proxy-address != \"\";"));
+        assert!(main.contains("ui.on_copy_local_proxy("));
+        assert!(main.contains("read_local_proxy_port("));
+        assert_eq!(local_proxy_address(Some(10780)), "127.0.0.1:10780");
+        assert_eq!(local_proxy_address(None), "");
     }
 
     #[test]

@@ -1488,6 +1488,15 @@ msgstr "Only apps that use the system proxy · no admin rights"
 msgid "Подключаться после входа в систему"
 msgstr "Connect after sign-in"
 
+msgid "Локальный прокси: {}"
+msgstr "Local proxy: {}"
+
+msgid "Копировать"
+msgstr "Copy"
+
+msgid "Скопировано ✓"
+msgstr "Copied ✓"
+
 msgid "Когда появится сеть и профиль будет готов"
 msgstr "Once the network and profile are ready"
 
