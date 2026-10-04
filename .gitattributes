@@ -1,2 +1,9 @@
 # Shipped dashboard scripts are hashed into SHA256SUMS: keep their bytes host-independent.
 packaging/dashboard/*.js text eol=lf
+# Patches applied to the pinned Mihomo source are SHA-256-pinned in their manifest: keep their bytes.
+packaging/mihomo-patches/*.patch -text
+# Run by Git Bash on Windows release hosts too: a CRLF checkout would break bash.
+scripts/build-mihomo.sh text eol=lf
+scripts/build-mihomo-in-docker.sh text eol=lf
+scripts/test-build-mihomo.sh text eol=lf
+scripts/reality-lab.py text eol=lf

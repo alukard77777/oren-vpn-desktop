@@ -1,0 +1,87 @@
+{
+  "$comment": "The Mihomo core MULTICORE ships: the pinned MetaCubeX source + the patch series in this directory, built reproducibly by scripts/build-mihomo.sh. Every value is a pin: the build refuses a patch, toolchain, source archive or binary whose SHA-256 differs. See docs/reality.md for the bump procedure.",
+  "schemaVersion": 1,
+  "series": "multicore.1",
+  "upstream": {
+    "project": "MetaCubeX/mihomo",
+    "version": "v1.19.32",
+    "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
+    "license": "GPL-3.0-only",
+    "source": {
+      "url": "https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip",
+      "sha256": "63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30",
+      "rootPrefix": "mihomo-88dcbf7f1614a67c3b36b848ee3592dfa92ada36/"
+    }
+  },
+  "patchesFrom": {
+    "project": "Nemu-x/SlothClash",
+    "pullRequest": "https://github.com/Nemu-x/SlothClash/pull/81",
+    "commit": "9a09ac799e9c63ed170cbbc039670be65311afff",
+    "path": "core/patches/mihomo",
+    "license": "GPL-3.0"
+  },
+  "patches": [
+    {
+      "file": "0001-reality-configurable-client-version.patch",
+      "sha256": "2f646761ebdbd243a6c32652fd63aba87d96bff6e989667fc5eef548286e9bde"
+    },
+    {
+      "file": "0002-reality-adaptive-mlkem.patch",
+      "sha256": "39dae2c2327581f8c2802f5fbe83fce784d9f8fdd2c842286d5ad196b756eda6"
+    },
+    {
+      "file": "0003-reality-config-keys.patch",
+      "sha256": "8524faf333caa15214b4b87ba3a7a8ca0d039defd54a26b8148260a57a6f1b07"
+    }
+  ],
+  "go": {
+    "version": "go1.26.8",
+    "note": "The Go release MetaCubeX built v1.19.32 with (their fork of it; this is the stock go.dev release). Only the build host's archive is used; every target is cross-compiled with CGO disabled, so the output does not depend on the host.",
+    "archives": {
+      "linux-amd64": {
+        "url": "https://go.dev/dl/go1.26.8.linux-amd64.tar.gz",
+        "sha256": "d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b"
+      },
+      "windows-amd64": {
+        "url": "https://go.dev/dl/go1.26.8.windows-amd64.zip",
+        "sha256": "b92c3b2adae85a11ba71fe7216daf0d84e82af4c8ab6c5625807f28622043a59"
+      }
+    }
+  },
+  "build": {
+    "tags": "with_gvisor",
+    "version": "v1.19.32",
+    "buildTime": "Wed Sep 30 14:35:49 UTC 2026",
+    "note": "MetaCubeX release flags (CGO_ENABLED=0, -tags with_gvisor, -trimpath, -ldflags \"-extldflags --static -X constant.Version -X constant.BuildTime -w -s -buildid=\"). BuildTime is the upstream commit time instead of the wall clock, so a rebuild is byte-identical."
+  },
+  "targets": {
+    "windows-amd64": {
+      "goos": "windows",
+      "goarch": "amd64",
+      "level": "v1",
+      "file": "mihomo-windows-amd64.exe",
+      "sha256": "445fa386b094ddf1dfae97f72f39525c1b45a956dd60583a24d0bf28f620fc5c"
+    },
+    "windows-386": {
+      "goos": "windows",
+      "goarch": "386",
+      "level": "sse2",
+      "file": "mihomo-windows-386.exe",
+      "sha256": "5ac12d37b1c1a43473a6d77894acc62a50edd87bdc760855d6531aa38c01dbc1"
+    },
+    "windows-arm64": {
+      "goos": "windows",
+      "goarch": "arm64",
+      "level": "v8.0",
+      "file": "mihomo-windows-arm64.exe",
+      "sha256": "8fe2dc9b2bb0a38b94e6fa2d972dece372b4aff6a71c2817914bbc201718c377"
+    },
+    "linux-amd64": {
+      "goos": "linux",
+      "goarch": "amd64",
+      "level": "v1",
+      "file": "mihomo-linux-amd64",
+      "sha256": "06bd7b3ed6bb5aa6df66a866cd5114e08de67e921e17e93b15f850af8a2b67a6"
+    }
+  }
+}

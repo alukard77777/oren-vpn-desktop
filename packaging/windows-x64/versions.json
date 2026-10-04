@@ -49,13 +49,13 @@
       "version": "v1.19.32",
       "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
       "license": "GPL-3.0-only",
-      "asset": {
-        "name": "mihomo-windows-amd64-compatible-v1.19.32.zip",
-        "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-amd64-compatible-v1.19.32.zip",
-        "sha256": "974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0",
-        "entry": "mihomo-windows-amd64-compatible.exe",
-        "executableSha256": "04f8d7fc2b314771e1ecbf15951d59f0e1cb7914503c88cfb6972ff6a824e314",
-        "maximumExpandedBytes": 268435456
+      "build": {
+        "series": "multicore.1",
+        "recipe": "packaging/mihomo-patches/manifest.json",
+        "target": "windows-amd64",
+        "file": "mihomo-windows-amd64.exe",
+        "executableSha256": "445fa386b094ddf1dfae97f72f39525c1b45a956dd60583a24d0bf28f620fc5c",
+        "note": "Built by scripts/build-mihomo.sh from the pinned upstream source plus packaging/mihomo-patches (REALITY client version + adaptive X25519MLKEM768, see docs/reality.md). Never the stock MetaCubeX download."
       },
       "licenseFile": {
         "name": "mihomo-GPL-3.0.txt",

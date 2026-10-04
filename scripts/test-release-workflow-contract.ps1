@@ -190,6 +190,17 @@ foreach ($token in @(
     Assert-True ($workflow.Contains($token)) "release workflow is missing: $token"
 }
 
+# Mihomo ships as the pinned patched build (packaging/mihomo-patches), and its GPL source archive is
+# the patched tree build-mihomo.sh compiled, not the stock upstream download.
+$mihomoBuildIndex = $workflow.IndexOf('scripts/build-mihomo.sh --output dist/mihomo', [StringComparison]::Ordinal)
+$x64PackageIndex = $workflow.IndexOf('-DestinationPath dist/release/multicore-windows-x64', [StringComparison]::Ordinal)
+Assert-True ($mihomoBuildIndex -ge 0 -and $mihomoBuildIndex -lt $x64PackageIndex) 'release must build the patched Mihomo before packaging'
+Assert-True ($workflow.Contains('MULTICORE_MIHOMO_BINARIES_DIR=')) 'release packaging must receive the patched Mihomo build'
+Assert-True ($workflow.Contains('Copy-Item -LiteralPath dist/mihomo/mihomo-source.zip -Destination dist/release/mihomo-source.zip')) 'mihomo-source.zip must be the patched source build-mihomo.sh compiled'
+Assert-True (-not $workflow.Contains('components.mihomo.source.url')) 'release must not attach the unpatched Mihomo source as the shipped source'
+$linuxReleaseScript = Get-Content -Raw -LiteralPath (Join-Path $root 'scripts\package-linux-release.sh')
+Assert-True ($linuxReleaseScript.Contains('scripts/build-mihomo.sh') -and -not $linuxReleaseScript.Contains('fetch_core mihomo')) 'Linux packages must ship the patched Mihomo build'
+
 Assert-True (-not $workflow.Contains('pull_request_target')) 'release workflow must not run in pull_request_target'
 Assert-True (-not $workflow.Contains('cargo test --workspace --all-targets --locked')) `
     'Windows release must not try to execute the requireAdministrator core-host binary as a test target'

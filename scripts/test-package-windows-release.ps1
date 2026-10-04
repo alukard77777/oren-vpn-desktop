@@ -148,10 +148,13 @@ function Write-TestManifest {
         [int64]$MaximumExpandedBytes = 1048576,
         [string]$XrayArchiveHash,
         [string]$MihomoArchiveHash,
-        [string]$Platform = 'windows-x64'
+        [string]$Platform = 'windows-x64',
+        # Pin Mihomo as a locally built binary (components.mihomo.build) instead of a ZIP asset.
+        [switch]$MihomoBuild,
+        [switch]$MihomoBuildAndAsset
     )
     if (-not $XrayArchiveHash) { $XrayArchiveHash = Get-Sha256 (Join-Path $InputDirectory 'xray-fixture.zip') }
-    if (-not $MihomoArchiveHash) { $MihomoArchiveHash = Get-Sha256 (Join-Path $InputDirectory 'mihomo-fixture.zip') }
+    if (-not $MihomoArchiveHash -and -not $MihomoBuild) { $MihomoArchiveHash = Get-Sha256 (Join-Path $InputDirectory 'mihomo-fixture.zip') }
     $manifest = [ordered]@{
         schemaVersion = 1
         fixtureContract = 'multicore-package-test-v1'
@@ -172,11 +175,25 @@ function Write-TestManifest {
             }
         }
     }
+    if ($MihomoBuild) {
+        $mihomo = $manifest.components.mihomo
+        $build = [ordered]@{ series = 'fixture'; recipe = 'packaging/mihomo-patches/manifest.json'; target = 'windows-amd64'; file = 'mihomo-fixture.exe'; executableSha256 = $MihomoExecutableHash }
+        $rebuilt = [ordered]@{}
+        foreach ($key in @($mihomo.Keys)) {
+            if ($key -ceq 'asset') {
+                $rebuilt['build'] = $build
+                if ($MihomoBuildAndAsset) { $rebuilt['asset'] = $mihomo['asset'] }
+            } else {
+                $rebuilt[$key] = $mihomo[$key]
+            }
+        }
+        $manifest.components.mihomo = $rebuilt
+    }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 
 function Invoke-Package {
-    param([string]$Destination, [string]$InputDirectory, [string]$Manifest, [string]$Desktop, [string]$Daemon, [string]$CoreHost, [string]$ReleaseAsset, [string]$Architecture, [string]$UpdaterPath)
+    param([string]$Destination, [string]$InputDirectory, [string]$Manifest, [string]$Desktop, [string]$Daemon, [string]$CoreHost, [string]$ReleaseAsset, [string]$Architecture, [string]$UpdaterPath, [string]$MihomoBinaries)
     $parameters = @{
         DestinationPath = $Destination
         OfflineSourceDirectory = $InputDirectory
@@ -190,6 +207,7 @@ function Invoke-Package {
     if ($UpdaterPath) { $parameters.UpdaterExecutablePath = $UpdaterPath }
     if ($ReleaseAsset) { $parameters.ReleaseAssetPath = $ReleaseAsset }
     if ($Architecture) { $parameters.Architecture = $Architecture }
+    if ($MihomoBinaries) { $parameters.MihomoBinariesDirectory = $MihomoBinaries }
     & $Packager @parameters
 }
 
@@ -229,6 +247,27 @@ foreach ($skiaArchitecture in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i6
     Assert-True ([string]$skiaPin.source.commit -cmatch '^[0-9a-f]{40}$') "windows-$($skiaArchitecture[0]) Skia source needs a full commit pin"
 }
 Assert-True ($PackagerSource.IndexOf('$PrivilegedBrokerReleaseReady = $true', [StringComparison]::Ordinal) -lt $PackagerSource.IndexOf('function Invoke-PinnedRustBuild', [StringComparison]::Ordinal)) 'release gate must be evaluated before Rust builds or downloads'
+# Mihomo is the patched build of packaging/mihomo-patches, pinned identically in the recipe, every
+# versions.json and the packager's immutable tuple; the stock download is gone from production.
+$MihomoRecipe = Get-Content -Raw -LiteralPath (Join-Path $RepositoryRoot 'packaging\mihomo-patches\manifest.json') | ConvertFrom-Json
+foreach ($patch in $MihomoRecipe.patches) {
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $RepositoryRoot "packaging\mihomo-patches\$($patch.file)") -Algorithm SHA256).Hash.ToLowerInvariant() -ceq [string]$patch.sha256) "Mihomo patch $($patch.file) must match its recipe pin"
+}
+foreach ($flavour in @(@('windows-x64', 'windows-amd64'), @('windows-x86', 'windows-386'), @('windows-arm64', 'windows-arm64'), @('linux', 'linux-amd64'))) {
+    $flavourMihomo = (Get-Content -Raw -LiteralPath (Join-Path $RepositoryRoot "packaging\$($flavour[0])\versions.json") | ConvertFrom-Json).components.mihomo
+    Assert-True (-not ($flavourMihomo.PSObject.Properties.Name -contains 'asset')) "$($flavour[0]) must not pin a stock Mihomo download"
+    $recipeTarget = $MihomoRecipe.targets.($flavour[1])
+    Assert-True ([string]$flavourMihomo.build.target -ceq $flavour[1]) "$($flavour[0]) must pin the $($flavour[1]) Mihomo build"
+    Assert-True ([string]$flavourMihomo.build.series -ceq [string]$MihomoRecipe.series) "$($flavour[0]) Mihomo series must match the recipe"
+    Assert-True ([string]$flavourMihomo.build.file -ceq [string]$recipeTarget.file) "$($flavour[0]) Mihomo file must match the recipe"
+    Assert-True ([string]$recipeTarget.sha256 -cmatch '^[0-9a-f]{64}$' -and [string]$flavourMihomo.build.executableSha256 -ceq [string]$recipeTarget.sha256) "$($flavour[0]) Mihomo SHA-256 must match the recipe"
+    Assert-True ([string]$flavourMihomo.commit -ceq [string]$MihomoRecipe.upstream.commit -and [string]$flavourMihomo.version -ceq [string]$MihomoRecipe.upstream.version) "$($flavour[0]) Mihomo upstream must match the recipe"
+    if ($flavour[0] -cne 'linux') {
+        Assert-True ([string]$flavourMihomo.source.sha256 -ceq [string]$MihomoRecipe.upstream.source.sha256) "$($flavour[0]) Mihomo source must match the recipe"
+        Assert-True ($PackagerSource.Contains("'$($recipeTarget.file)', '$($recipeTarget.sha256)'")) "packager must pin the $($flavour[1]) Mihomo build in its immutable tuple"
+    }
+}
+Assert-True (-not $PackagerSource.Contains('mihomo-windows-amd64-compatible')) 'packager must not keep the stock Mihomo download pin'
 foreach ($required in @('README.md', 'THIRD_PARTY_NOTICES.md', 'licenses\Xray-core-MPL-2.0.txt', 'licenses\mihomo-GPL-3.0.txt')) {
     Assert-True (Test-Path -LiteralPath (Join-Path $MetadataRoot $required)) "metadata file $required must exist"
 }
@@ -262,6 +301,48 @@ try {
         $productionOfflineProbeError = $_.Exception.Message
     }
     Assert-True ($productionOfflineProbeError -ceq 'Production packaging builds all Rust executables internally; executable overrides are fixture-only') 'offline inputs must not allow executable overrides with the production manifest'
+
+    # Production packaging refuses to start (before any Rust build or download) without the
+    # pinned patched Mihomo, and with a Mihomo whose bytes differ from the pin.
+    $savedMihomoDirectory = $env:MULTICORE_MIHOMO_BINARIES_DIR
+    Remove-Item Env:MULTICORE_MIHOMO_BINARIES_DIR -ErrorAction SilentlyContinue
+    try {
+        $mihomoProbeError = $null
+        try { & $Packager -DestinationPath (Join-Path $TestRoot 'production-no-mihomo') | Out-Null } catch { $mihomoProbeError = $_.Exception.Message }
+        Assert-True ([string]$mihomoProbeError).StartsWith('Packaging needs the patched Mihomo build') "production packaging must require the patched Mihomo build (got: $mihomoProbeError)"
+        $tamperedMihomo = Join-Path $TestRoot 'tampered-mihomo'; New-Item -ItemType Directory -Path $tamperedMihomo | Out-Null
+        Copy-Item -LiteralPath $mihomo -Destination (Join-Path $tamperedMihomo 'mihomo-windows-amd64.exe')
+        $mihomoProbeError = $null
+        try { & $Packager -DestinationPath (Join-Path $TestRoot 'production-tampered-mihomo') -MihomoBinariesDirectory $tamperedMihomo | Out-Null } catch { $mihomoProbeError = $_.Exception.Message }
+        Assert-True ([string]$mihomoProbeError).StartsWith('SHA-256 mismatch for patched mihomo executable') "production packaging must refuse a Mihomo that differs from its pin (got: $mihomoProbeError)"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $TestRoot 'production-tampered-mihomo'))) 'a refused Mihomo must not publish'
+        Assert-NoStageResidue $TestRoot 'production Mihomo refusal'
+    } finally {
+        if ($null -ne $savedMihomoDirectory) { $env:MULTICORE_MIHOMO_BINARIES_DIR = $savedMihomoDirectory }
+    }
+
+    # A fixture manifest that pins Mihomo as a local build stages exactly that binary.
+    $mihomoBuildDirectory = Join-Path $TestRoot 'mihomo-build'; New-Item -ItemType Directory -Path $mihomoBuildDirectory | Out-Null
+    Copy-Item -LiteralPath $mihomo -Destination (Join-Path $mihomoBuildDirectory 'mihomo-fixture.exe')
+    $buildManifest = Join-Path $TestRoot 'versions-mihomo-build.json'
+    Write-TestManifest $buildManifest $BaseInput $xrayHash $mihomoHash -MihomoBuild
+    $buildOut = Join-Path $TestRoot 'package-mihomo-build'
+    Invoke-Package $buildOut $BaseInput $buildManifest $Desktop $Daemon $CoreHost -MihomoBinaries $mihomoBuildDirectory | Out-Null
+    Assert-True ((Get-Sha256 (Join-Path $buildOut 'cores\mihomo.exe')) -ceq $mihomoHash) 'the built Mihomo must be staged unmodified'
+    foreach ($mihomoCase in @(
+            @{ Name = 'mihomo-build-wrong-hash'; Hash = ('0' * 64); Directory = $mihomoBuildDirectory; Both = $false },
+            @{ Name = 'mihomo-build-missing-directory'; Hash = $mihomoHash; Directory = $null; Both = $false },
+            @{ Name = 'mihomo-build-empty-directory'; Hash = $mihomoHash; Directory = (Join-Path $TestRoot 'tampered-mihomo'); Both = $false },
+            @{ Name = 'mihomo-build-and-asset'; Hash = $mihomoHash; Directory = $mihomoBuildDirectory; Both = $true })) {
+        $caseManifest = Join-Path $TestRoot "$($mihomoCase.Name).json"
+        Write-TestManifest $caseManifest $BaseInput $xrayHash $mihomoCase.Hash -MihomoBuild -MihomoBuildAndAsset:$mihomoCase.Both
+        $caseOut = Join-Path $TestRoot $mihomoCase.Name
+        $failed = $false
+        try { Invoke-Package $caseOut $BaseInput $caseManifest $Desktop $Daemon $CoreHost -MihomoBinaries $mihomoCase.Directory | Out-Null } catch { $failed = $true }
+        Assert-True $failed "$($mihomoCase.Name) must fail"
+        Assert-True (-not (Test-Path -LiteralPath $caseOut)) "$($mihomoCase.Name) must not publish"
+        Assert-NoStageResidue $TestRoot $mihomoCase.Name
+    }
 
     $out1 = Join-Path $TestRoot 'package-one'; $out2 = Join-Path $TestRoot 'package-two'
     $releaseAsset = Join-Path $TestRoot 'multicore-windows-x64.zip'
