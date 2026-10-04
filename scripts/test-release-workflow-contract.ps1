@@ -106,6 +106,62 @@ foreach ($token in @(
 $rpmName = 'multicore-$($env:APP_VERSION)-1.x86_64.rpm'
 Assert-True ([regex]::Matches($workflow, [regex]::Escape($rpmName)).Count -eq 4) `
     'RPM must appear in the required Linux set, checksums, release notes, and publication stage'
+# Version-less copies, so README buttons can link releases/latest/download/<name> directly.
+foreach ($stableName in @(
+    'multicore_amd64.deb',
+    'MultiCore-x86_64.AppImage',
+    'multicore-x86_64.pkg.tar.zst',
+    'multicore.x86_64.rpm'
+)) {
+    Assert-True ([regex]::Matches($workflow, [regex]::Escape($stableName)).Count -eq 4) `
+        "$stableName must appear in the required Linux set, checksums, release notes, and publication stage"
+}
+Assert-True ($workflow.Contains('run: ./scripts/add-stable-linux-asset-names.ps1 -Directory dist/release/linux -Version $env:APP_VERSION')) `
+    'release must add the version-less Linux asset names after collecting the packages'
+Assert-True ($workflow.IndexOf('add-stable-linux-asset-names.ps1') -lt $workflow.IndexOf('- name: Verify Linux package set')) `
+    'version-less Linux asset names must exist before the package set is verified'
+$stableFixture = Join-Path ([IO.Path]::GetTempPath()) ("multicore-stable-names-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stableFixture | Out-Null
+try {
+    $fixtureNames = @(
+        'multicore_9.8.7_amd64.deb',
+        'MultiCore-9.8.7-x86_64.AppImage',
+        'multicore-9.8.7-1-x86_64.pkg.tar.zst',
+        'multicore-9.8.7-1.x86_64.rpm'
+    )
+    foreach ($name in $fixtureNames) {
+        [IO.File]::WriteAllText((Join-Path $stableFixture $name), "fixture $name")
+    }
+    & (Join-Path $PSScriptRoot 'add-stable-linux-asset-names.ps1') -Directory $stableFixture -Version '9.8.7' | Out-Null
+    $pairs = @(
+        @('multicore_9.8.7_amd64.deb', 'multicore_amd64.deb'),
+        @('MultiCore-9.8.7-x86_64.AppImage', 'MultiCore-x86_64.AppImage'),
+        @('multicore-9.8.7-1-x86_64.pkg.tar.zst', 'multicore-x86_64.pkg.tar.zst'),
+        @('multicore-9.8.7-1.x86_64.rpm', 'multicore.x86_64.rpm')
+    )
+    foreach ($pair in $pairs) {
+        $versionedPath = Join-Path $stableFixture $pair[0]
+        $stablePath = Join-Path $stableFixture $pair[1]
+        Assert-True (Test-Path -LiteralPath $versionedPath -PathType Leaf) "$($pair[0]) must be kept"
+        Assert-True ([IO.File]::ReadAllText($stablePath) -ceq "fixture $($pair[0])") "$($pair[1]) must copy $($pair[0])"
+    }
+    Remove-Item -LiteralPath (Join-Path $stableFixture 'multicore-9.8.7-1.x86_64.rpm')
+    $refused = $false
+    try {
+        & (Join-Path $PSScriptRoot 'add-stable-linux-asset-names.ps1') -Directory $stableFixture -Version '9.8.7' | Out-Null
+    }
+    catch {
+        $refused = $true
+    }
+    Assert-True $refused 'a missing versioned Linux package must fail the version-less copies'
+}
+finally {
+    Remove-Item -LiteralPath $stableFixture -Recurse -Force -ErrorAction SilentlyContinue
+}
+# AppImageUpdate reads the delta file the AppImage's gh-releases-zsync update information names.
+$zsyncName = 'MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync'
+Assert-True ([regex]::Matches($workflow, [regex]::Escape($zsyncName)).Count -eq 3) `
+    'The AppImage .zsync must appear in the required Linux set, checksums, and publication stage'
 Assert-True ($workflow.Contains('needs: linux-packages')) 'release must wait for Fedora RPM smoke jobs'
 Assert-True ($linuxWorkflow -match '(?m)^          test "\$#" -eq 1\r?$') `
     'RPM smoke must reject multiple artifacts with a standalone fail-fast test'

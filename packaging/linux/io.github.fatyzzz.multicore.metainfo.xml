@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata (usr/share/metainfo) for software centres and AppImage catalogues.
+     scripts/package-linux-release.sh fills in @VERSION@ and @DATE@. -->
+<component type="desktop-application">
+  <id>io.github.fatyzzz.multicore</id>
+  <launchable type="desktop-id">multicore.desktop</launchable>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>(MIT OR Apache-2.0) AND MPL-2.0 AND GPL-3.0-only</project_license>
+  <name>MULTICORE</name>
+  <summary>Mihomo routing with Xray transports</summary>
+  <summary xml:lang="ru">Маршрутизация Mihomo с транспортами Xray</summary>
+  <developer id="io.github.fatyzzz">
+    <name>fatyzzz</name>
+  </developer>
+  <description>
+    <p>
+      MULTICORE connects through a provider subscription: it runs Mihomo for routing and
+      Xray for the transports, either for all traffic through a TUN adapter or through the
+      system proxy, and lets you pick a route and see its latency.
+    </p>
+    <p xml:lang="ru">
+      MULTICORE подключается по подписке провайдера: Mihomo отвечает за маршрутизацию,
+      Xray — за транспорты, весь трафик идёт через TUN-адаптер или через системный прокси,
+      а маршрут и его задержку можно выбрать и проверить.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/fatyzzz/multicore</url>
+  <url type="bugtracker">https://github.com/fatyzzz/multicore/issues</url>
+  <categories>
+    <category>Network</category>
+  </categories>
+  <keywords>
+    <keyword>VPN</keyword>
+    <keyword>Proxy</keyword>
+    <keyword>Mihomo</keyword>
+    <keyword>Xray</keyword>
+    <keyword>TUN</keyword>
+  </keywords>
+  <provides>
+    <binary>multicore</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

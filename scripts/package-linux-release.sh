@@ -88,7 +88,7 @@ STAGE_CORES="$PACKAGE_ROOT/cores"
 install -d -m 0755 "$PACKAGE_ROOT/runtime" "$STAGE_CORES" "$OUTPUT/usr/bin" \
     "$OUTPUT/usr/share/applications" "$OUTPUT/usr/share/icons/hicolor/scalable/apps" \
     "$OUTPUT/usr/share/polkit-1/actions" "$OUTPUT/usr/share/licenses/multicore" \
-    "$OUTPUT/usr/lib/systemd/system"
+    "$OUTPUT/usr/lib/systemd/system" "$OUTPUT/usr/share/metainfo"
 
 # The vendored dashboard is optional so manifests that predate it keep staging unchanged; a real
 # production manifest always carries it (see packaging/linux/versions.json). Its filenames are
@@ -171,6 +171,14 @@ install -m 0644 "$ROOT/apps/multicore-desktop/assets/app-icon.svg" \
     "$OUTPUT/usr/share/icons/hicolor/scalable/apps/multicore.svg"
 install -m 0644 "$ROOT/packaging/linux/io.github.fatyzzz.multicore.core-host.policy" \
     "$OUTPUT/usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy"
+# AppStream metadata for software centres and AppImage catalogues; SOURCE_DATE_EPOCH pins the
+# release date for a reproducible stage.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/apps/multicore-desktop/Cargo.toml" | head -1)"
+RELEASE_DATE="$(date -u -d "@${SOURCE_DATE_EPOCH:-$(date -u +%s)}" +%Y-%m-%d)"
+sed -e "s/@VERSION@/$VERSION/" -e "s/@DATE@/$RELEASE_DATE/" \
+    "$ROOT/packaging/linux/io.github.fatyzzz.multicore.metainfo.xml" \
+    > "$OUTPUT/usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml"
+chmod 0644 "$OUTPUT/usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml"
 # The always-ready service unit. deb/rpm/Arch enable it; the AppImage build removes it again
 # (the AppImage keeps the on-demand pkexec host).
 install -m 0644 "$ROOT/packaging/linux/multicore.service" "$OUTPUT/usr/lib/systemd/system/multicore.service"

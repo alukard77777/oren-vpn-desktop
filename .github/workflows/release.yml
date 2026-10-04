@@ -246,6 +246,10 @@ jobs:
           path: dist/release/linux
           merge-multiple: true
 
+      - name: Add version-less Linux asset names
+        shell: pwsh
+        run: ./scripts/add-stable-linux-asset-names.ps1 -Directory dist/release/linux -Version $env:APP_VERSION
+
       - name: Verify Linux package set
         shell: pwsh
         run: |
@@ -253,7 +257,12 @@ jobs:
             "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
             "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
             "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm"
+            "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm",
+            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync",
+            'dist/release/linux/multicore_amd64.deb',
+            'dist/release/linux/MultiCore-x86_64.AppImage',
+            'dist/release/linux/multicore-x86_64.pkg.tar.zst',
+            'dist/release/linux/multicore.x86_64.rpm'
           )) {
             if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing Linux package $asset" }
           }
@@ -272,6 +281,11 @@ jobs:
             "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
             "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
             "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm",
+            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync",
+            'dist/release/linux/multicore_amd64.deb',
+            'dist/release/linux/MultiCore-x86_64.AppImage',
+            'dist/release/linux/multicore-x86_64.pkg.tar.zst',
+            'dist/release/linux/multicore.x86_64.rpm',
             'dist/release/Xray-core-source.zip',
             'dist/release/mihomo-source.zip'
           )
@@ -296,7 +310,8 @@ jobs:
           - `multicore_$($env:APP_VERSION)_amd64.deb` - Debian and Ubuntu 22.04+ package.
           - `multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst` - Arch Linux package (`sudo pacman -U`).
           - `multicore-$($env:APP_VERSION)-1.x86_64.rpm` - Fedora 43/44 x86_64 package (`sudo dnf install ./multicore-<version>-1.x86_64.rpm`).
-          - `MultiCore-$($env:APP_VERSION)-x86_64.AppImage` - portable Linux build; needs GTK 3 and polkit on the host.
+          - `MultiCore-$($env:APP_VERSION)-x86_64.AppImage` - portable Linux build; needs GTK 3 and polkit on the host. AppImageUpdate can update it through the attached `.zsync` file.
+          - `multicore_amd64.deb`, `multicore-x86_64.pkg.tar.zst`, `multicore.x86_64.rpm` and `MultiCore-x86_64.AppImage` - the same Linux packages under version-less names, for stable `releases/latest/download/` links.
           - On Linux, Connect asks for the administrator password through polkit to start the core host.
           - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
           - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
@@ -320,6 +335,11 @@ jobs:
             "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
             "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
             "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm",
+            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync",
+            'dist/release/linux/multicore_amd64.deb',
+            'dist/release/linux/MultiCore-x86_64.AppImage',
+            'dist/release/linux/multicore-x86_64.pkg.tar.zst',
+            'dist/release/linux/multicore.x86_64.rpm',
             'dist/release/Xray-core-source.zip',
             'dist/release/mihomo-source.zip',
             'dist/release/RELEASE-SHA256SUMS.txt'

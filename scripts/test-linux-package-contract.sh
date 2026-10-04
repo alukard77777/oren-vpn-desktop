@@ -34,8 +34,10 @@ metadata=(
   usr/share/icons/hicolor/scalable/apps/multicore.svg
   usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy
   usr/lib/systemd/system/multicore.service
+  usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml
 )
 SERVICE_UNIT=usr/lib/systemd/system/multicore.service
+METAINFO=usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml
 
 for relative in "${executables[@]}"; do
   path="$STAGE/$relative"
@@ -120,6 +122,13 @@ for element in description message; do
     exit 1
   }
 done
+# AppStream: the component launches this desktop entry and names this release.
+grep -Fq '<launchable type="desktop-id">multicore.desktop</launchable>' "$STAGE/$METAINFO" &&
+  grep -Eq "<release version=\"$VERSION\" date=\"[0-9]{4}-[0-9]{2}-[0-9]{2}\"/>" "$STAGE/$METAINFO" &&
+  ! grep -q '@[A-Z]*@' "$STAGE/$METAINFO" || {
+  echo 'AppStream metadata must launch multicore.desktop and name this release' >&2
+  exit 1
+}
 grep -Fxq 'exec "$HERE/usr/lib/multicore/multicore" "$@"' "$ROOT/packaging/linux/appimage/AppRun" || {
   echo 'AppImage launcher must forward the protocol URL unchanged' >&2
   exit 1
@@ -447,6 +456,24 @@ for format in "${requested_formats[@]}"; do
         echo 'AppImage must not carry the systemd service unit' >&2
         exit 1
       }
+      [[ -f "$appimage_root/squashfs-root/$METAINFO" ]] || {
+        echo 'AppImage must carry the AppStream metadata' >&2
+        exit 1
+      }
+      # Built with an update channel: gh-releases-zsync update information and its .zsync
+      # file, which names this versioned image.
+      if [[ -e "$appimage.zsync" ]]; then
+        update_info="$("$appimage_path" --appimage-updateinformation)"
+        update_pattern='^gh-releases-zsync[|][A-Za-z0-9-]+[|][A-Za-z0-9._-]+[|]latest[|]MultiCore-[*]x86_64[.]AppImage[.]zsync$'
+        [[ "$update_info" =~ $update_pattern ]] || {
+          echo "Unexpected AppImage update information: $update_info" >&2
+          exit 1
+        }
+        grep -aqx "Filename: MultiCore-${VERSION}-x86_64.AppImage" "$appimage.zsync" || {
+          echo 'The .zsync file must describe the versioned AppImage' >&2
+          exit 1
+        }
+      fi
       rm -rf "$appimage_root"
       ;;
     arch)

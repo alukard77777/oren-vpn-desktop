@@ -81,6 +81,7 @@ chmod 0755 "%{buildroot}/usr/lib/multicore/multicore" \
 /usr/share/applications/multicore.desktop
 /usr/share/icons/hicolor/scalable/apps/multicore.svg
 /usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy
+/usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml
 /usr/lib/systemd/system/multicore.service
 # The vendored dashboard (packaging/linux/versions.json "dashboard" component) is a bare
 # directory path (no %dir, no per-file listing): rpmbuild packages it and everything beneath

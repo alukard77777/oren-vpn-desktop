@@ -130,7 +130,7 @@ timeout --kill-after=15s 300s dnf -y remove multicore >"$OUTPUT/remove.log" 2>&1
 if rpm -q multicore >/dev/null 2>&1; then fail 'RPM remains installed after removal'; fi
 for path in /usr/bin/multicore /usr/lib/multicore /usr/share/applications/multicore.desktop \
   /usr/share/icons/hicolor/scalable/apps/multicore.svg \
-  /usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy /usr/share/licenses/multicore; do
+  /usr/share/polkit-1/actions/io.github.fatyzzz.multicore.core-host.policy /usr/share/licenses/multicore   /usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml; do
   [[ ! -e "$path" && ! -L "$path" ]] || fail "Package-owned path remains after removal: $path"
 done
 [[ "$(sha256sum "$TEST_HOME/.local/share/multicore/rpm-smoke-sentinel" | cut -d ' ' -f 1)" == "$SENTINEL_BEFORE" ]] || fail 'Removal changed user data'
