@@ -3,9 +3,9 @@ use multicore_core::elevation_protocol::{
     decode_command, encode_frame,
 };
 use multicore_core::service_protocol::{
-    ControllerEndpoint, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceLogFile, ServiceResponse,
-    decode_service_command, decode_service_frame, encode_service_frame, redact_service_log,
-    service_response_matches,
+    ControllerEndpoint, CoreJournalCursor, SERVICE_PROTOCOL_VERSION, ServiceCommand,
+    ServiceLogFile, ServiceResponse, decode_service_command, decode_service_frame,
+    encode_service_frame, redact_service_log, service_response_matches,
 };
 
 fn raw(payload: &[u8]) -> Vec<u8> {
@@ -40,6 +40,17 @@ fn every_v2_command_round_trips() {
         ServiceCommand::ServiceLog {
             file: ServiceLogFile::Previous,
             before: Some(4096),
+        },
+        ServiceCommand::CoreJournal {
+            since_ms: 0,
+            cursor: None,
+        },
+        ServiceCommand::CoreJournal {
+            since_ms: 1_791_064_846_000,
+            cursor: Some(CoreJournalCursor {
+                segment: 1_791_064_000_000,
+                offset: 4096,
+            }),
         },
     ] {
         let frame = encode_service_frame(&command).unwrap();
@@ -303,6 +314,59 @@ fn the_service_log_is_an_additive_read_only_v2_command() {
     ));
     assert_eq!(ServiceLogFile::Current.file_name(), "service.log");
     assert_eq!(ServiceLogFile::Previous.file_name(), "service.log.1");
+}
+
+/// The core journal is additive too: no path on the wire (the service picks the caller's own
+/// directory), and a page must move forward or end, so a client's paging always terminates.
+#[test]
+fn the_core_journal_is_an_additive_read_only_v2_command() {
+    assert_eq!(
+        decode_service_command(&raw(
+            br#"{"version":2,"body":{"core_journal":{"since_ms":5,"cursor":{"segment":7,"offset":9}}}}"#
+        )),
+        Ok(ServiceCommand::CoreJournal {
+            since_ms: 5,
+            cursor: Some(CoreJournalCursor {
+                segment: 7,
+                offset: 9
+            })
+        })
+    );
+    for body in [
+        br#"{"version":2,"body":{"core_journal":{"since_ms":5,"cursor":null,"path":"C:\\x"}}}"#
+            .as_slice(),
+        br#"{"version":2,"body":{"core_journal":{"since_ms":5,"cursor":{"segment":1,"offset":2,"user":"x"}}}}"#,
+        br#"{"version":2,"body":{"core_journal":{"since_ms":-5,"cursor":null}}}"#,
+    ] {
+        assert_eq!(
+            decode_service_command(&raw(body)),
+            Err(ProtocolError::InvalidSchema)
+        );
+    }
+    let at = CoreJournalCursor {
+        segment: 7,
+        offset: 9,
+    };
+    let ask = |cursor| ServiceCommand::CoreJournal {
+        since_ms: 0,
+        cursor,
+    };
+    let page = |next| ServiceResponse::CoreJournal {
+        text: "1\tmihomo\tstdout\tok\n".into(),
+        next,
+    };
+    let frame = encode_service_frame(&page(Some(at))).unwrap();
+    assert_eq!(
+        decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+        page(Some(at))
+    );
+    assert!(service_response_matches(&ask(None), &page(Some(at))));
+    assert!(service_response_matches(&ask(Some(at)), &page(None)));
+    assert!(!service_response_matches(&ask(Some(at)), &page(Some(at))));
+    assert!(!service_response_matches(
+        &ServiceCommand::Status,
+        &page(None)
+    ));
 }
 
 #[test]

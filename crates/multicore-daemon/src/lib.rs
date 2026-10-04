@@ -381,10 +381,29 @@ pub struct ServiceLogFileDto {
     pub truncated: bool,
 }
 
+/// `/v1/core-journal?since_ms=`: this user's core journal as the always-ready service
+/// keeps it (see `multicore_core::core_sessions`), for «Сохранить лог…».
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreJournalDto {
+    pub status: ServiceLogStatus,
+    /// Whole journal lines, oldest first, redacted by the service.
+    #[serde(default)]
+    pub text: String,
+    /// Older lines exist that are not in `text` (the size cap was reached).
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// The always-ready service's own log (see `service_client::ServiceSession::service_log`).
 pub trait ServiceLogSource: Send + Sync + 'static {
     /// Blocking.
     fn service_log(&self) -> ServiceLogDto;
+
+    /// Blocking. This user's core journal in the service, from segments written at or after
+    /// `since_ms`.
+    fn core_journal(&self, _since_ms: u64) -> CoreJournalDto {
+        CoreJournalDto::default()
+    }
 }
 
 /// The live connection's session: when it started and Mihomo's cumulative byte counters,
@@ -1295,6 +1314,7 @@ fn build_router_shared(
         .route("/troubleshoot/check", post(troubleshoot_check))
         .route("/troubleshoot/fix", post(troubleshoot_fix))
         .route("/service-log", get(service_log_handler))
+        .route("/core-journal", get(core_journal_handler))
         .fallback(not_found)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn(normalize_errors))
@@ -2119,6 +2139,40 @@ async fn service_log_handler(
     Ok(Json(log))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreJournalQuery {
+    #[serde(default)]
+    since_ms: u64,
+}
+
+/// «Сохранить лог…»: this user's core journal from the always-ready service. Never an error:
+/// the status says why there is none (no service, a service too old to serve it, …).
+async fn core_journal_handler(
+    State(state): State<AppState>,
+    query: Result<Query<CoreJournalQuery>, axum::extract::rejection::QueryRejection>,
+    body: Bytes,
+) -> Result<Json<CoreJournalDto>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let Ok(Query(query)) = query else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Некорректный запрос.",
+        ));
+    };
+    let Some(source) = state.service_log.clone() else {
+        return Ok(Json(CoreJournalDto {
+            status: ServiceLogStatus::NoService,
+            ..CoreJournalDto::default()
+        }));
+    };
+    let journal = tokio::task::spawn_blocking(move || source.core_journal(query.since_ms))
+        .await
+        .unwrap_or_default();
+    Ok(Json(journal))
+}
+
 /// Troubleshooting checks and fixes only run while nothing is connected: the proxy check
 /// switches the system proxy off and the fixes reset networking.
 async fn troubleshoot_ready(
@@ -2689,6 +2743,10 @@ struct CoreRuntime<P: ProcessController> {
     service_logos: Arc<ServiceLogos>,
     /// Catalog revision whose background icon download has finished (successfully or not).
     icons_settled_revision: Option<u64>,
+    /// The per-connection log index (`multicore_core::core_sessions`); `None` until enabled.
+    sessions: Option<Arc<multicore_core::core_sessions::SessionIndex>>,
+    /// When the connection being recorded in `sessions` was attempted (unix ms).
+    open_session_ms: Option<u64>,
 }
 
 /// Downloaded Mihomo group icons by icon URL key, shared by every profile and persisted in
@@ -2873,6 +2931,45 @@ impl<P: ProcessController> CoreRuntime<P> {
             group_icons: Arc::default(),
             service_logos: Arc::default(),
             icons_settled_revision: None,
+            sessions: None,
+            open_session_ms: None,
+        }
+    }
+
+    /// A connection attempt begins: a new session in the index (ending one left open).
+    fn begin_session(&mut self, tun: bool) {
+        self.end_session("error");
+        let Some(sessions) = self.sessions.clone() else {
+            return;
+        };
+        let now = unix_timestamp_ms();
+        let start = multicore_core::core_sessions::SessionStart {
+            // Only Windows has system-proxy mode; elsewhere every connection is TUN.
+            mode: if cfg!(windows) && !tun {
+                "proxy"
+            } else {
+                "tun"
+            }
+            .to_owned(),
+            service: self.service_active(),
+            engines: vec!["xray".to_owned(), "mihomo".to_owned()],
+            profile: self
+                .active_profile_id
+                .as_ref()
+                .map(|id| multicore_core::core_sessions::profile_tag(id.as_str())),
+        };
+        sessions.start(now, &start);
+        self.open_session_ms = Some(now);
+    }
+
+    /// The recorded connection ended (`user`, `switch`, `quit`, `cores_lost`, `failed`,
+    /// `error`); nothing when none is open.
+    fn end_session(&mut self, reason: &str) {
+        let Some(connect_ms) = self.open_session_ms.take() else {
+            return;
+        };
+        if let Some(sessions) = &self.sessions {
+            sessions.end(connect_ms, unix_timestamp_ms(), reason);
         }
     }
 
@@ -3109,6 +3206,7 @@ impl<P: ProcessController> CoreRuntime<P> {
     }
 
     fn mark_error(&mut self, message: impl Into<DaemonText>, degraded: bool) {
+        self.end_session("error");
         match self.state.current() {
             CoreConnectionState::Ready => {
                 let _ = self.state.transition(CoreConnectionState::Empty);
@@ -3518,6 +3616,17 @@ where
         self.request_warm();
     }
 
+    /// Records every connection attempt in the per-connection log index in `directory`
+    /// (`multicore_core::core_sessions`), whose journal this daemon also prunes.
+    pub async fn enable_session_log(&self, directory: std::path::PathBuf) {
+        let index = tokio::task::spawn_blocking(move || {
+            multicore_core::core_sessions::SessionIndex::open(directory, unix_timestamp_ms())
+        })
+        .await
+        .ok();
+        self.inner.write().await.sessions = index.map(Arc::new);
+    }
+
     /// Signalled whenever the cores should be (re-)warmed: after a snapshot change, a
     /// disconnect or a failed connect. The service watcher waits on it; request handlers never
     /// run the warm-up themselves.
@@ -3680,6 +3789,7 @@ where
         let mut state = self.inner.write().await;
         let stopped = result.is_ok();
         if stopped {
+            state.end_session("cores_lost");
             let _ = state.state.transition(CoreConnectionState::Ready);
             state.degraded = false;
             state.warm_revision = None;
@@ -3704,7 +3814,7 @@ where
     /// Quit: disconnect, stop the service's cores and never warm them again.
     pub async fn shutdown_cores(&self) {
         self.shut_down.store(true, Ordering::SeqCst);
-        let _ = self.disconnect_now().await;
+        let _ = self.disconnect_now("quit").await;
         let readiness = self.inner.read().await.readiness.clone();
         if let Some(readiness) = readiness {
             let _ = tokio::task::spawn_blocking(move || readiness.release()).await;
@@ -3821,6 +3931,7 @@ where
                 .state
                 .transition(CoreConnectionState::Connecting)
                 .map_err(|_| BackendError::new())?;
+            state.begin_session(options.tun);
             state.message = Some(DaemonText::code(if state.service_active() {
                 TUNNEL_ON_MESSAGE
             } else {
@@ -3844,6 +3955,7 @@ where
                     let rollback = Supervisor::new(controller.clone()).disconnect().await;
                     let mut state = self.inner.write().await;
                     abandoned.disarm();
+                    state.end_session("failed");
                     if rollback.is_ok() {
                         state
                             .state
@@ -3911,6 +4023,7 @@ where
                 rollback_failed,
                 cause,
             }) => {
+                state.end_session("failed");
                 self.request_warm();
                 if rollback_failed {
                     state.mark_error(DaemonText::code("connect.rollback_incomplete"), true);
@@ -3943,6 +4056,7 @@ where
                 Err(BackendError::from_start_failure(engine, cause))
             }
             Err(multicore_core::SupervisorError::StopFailed) => {
+                state.end_session("failed");
                 state.mark_error(DaemonText::code("connect.processes_unknown"), true);
                 state.push_event_with_details(
                     Severity::Error,
@@ -3975,7 +4089,7 @@ where
                 return None;
             }
         }
-        self.disconnect_now().await.ok()?;
+        self.disconnect_now("switch").await.ok()?;
         Some(
             self.connect_options
                 .lock()
@@ -3984,7 +4098,8 @@ where
         )
     }
 
-    async fn disconnect_now(&self) -> Result<StatusDto, BackendError> {
+    /// Stops the connection; `reason` is recorded in the per-connection log index.
+    async fn disconnect_now(&self, reason: &str) -> Result<StatusDto, BackendError> {
         let _operation = self.operation.lock().await;
         let started = std::time::Instant::now();
         let controller = {
@@ -4002,6 +4117,7 @@ where
         let mut state = self.inner.write().await;
         match result {
             Ok(()) => {
+                state.end_session(reason);
                 state
                     .state
                     .transition(CoreConnectionState::Ready)
@@ -4484,6 +4600,7 @@ where
         let mut state = self.inner.write().await;
         match result {
             Ok(()) => {
+                state.end_session("switch");
                 state
                     .state
                     .transition(CoreConnectionState::Ready)
@@ -5621,7 +5738,7 @@ where
     async fn disconnect(&self) -> Result<StatusDto, BackendError> {
         // After a switch in progress, so its reconnect cannot undo this Disconnect.
         let _switch = self.generation_change.lock().await;
-        let result = self.disconnect_now().await;
+        let result = self.disconnect_now("user").await;
         // The cores stay (or become) warm in the background; the answer does not wait.
         let result = self.rewarm_after(result).await;
         match result {

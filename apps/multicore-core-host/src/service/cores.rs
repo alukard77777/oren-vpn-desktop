@@ -193,9 +193,16 @@ impl ProductionCores {
             dashboard_directory: None,
             mihomo_home_directory: Some(home),
         };
-        let logs = Arc::new(CoreLogBuffer::persistent_or_memory(
-            self.service_directory.join("logs").join("latest-core.log"),
-        ));
+        // Also into this user's own core journal, which `CoreJournal` serves only to them.
+        let logs = Arc::new(
+            CoreLogBuffer::persistent_or_memory(
+                self.service_directory.join("logs").join("latest-core.log"),
+            )
+            .with_journal(
+                client_journal_directory(&self.service_directory, client),
+                true,
+            ),
+        );
         let launcher = PlatformLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
             .map_err(|error| refuse(NotReady, "core launcher", &error))?;
         // The unit's CAP_SYS_PTRACE / CAP_DAC_READ_SEARCH / CAP_SETPCAP are for the service's
@@ -554,6 +561,16 @@ pub(crate) fn client_home(service_directory: &Path, client: &ClientIdentity) -> 
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     service_directory.join("users").join(name)
+}
+
+/// The core journal of `client` (see `multicore_core::core_sessions`), in their private
+/// directory of the service.
+pub(crate) fn client_journal_directory(
+    service_directory: &Path,
+    client: &ClientIdentity,
+) -> PathBuf {
+    client_home(service_directory, client)
+        .join(multicore_core::core_sessions::CORE_SESSIONS_DIRECTORY)
 }
 
 /// Windows `user_key` is `"<session>:<sid>"`: the SID part. Unix: the uid.

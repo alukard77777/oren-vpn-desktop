@@ -88,7 +88,15 @@ impl Factory for ProductionFactory {
         // silently falls back to memory-only, matching this being
         // diagnostic-only and never allowed to block a real Connect.
         let log_path = resolved.data_root.join("logs").join("latest-core.log");
-        let logs = Arc::new(CoreLogBuffer::persistent_or_memory(log_path));
+        // The per-connection journal next to it (see `multicore_core::core_sessions`). This
+        // elevated process only ever creates new segment files there; the user's daemon
+        // deletes the old ones.
+        let journal = resolved
+            .data_root
+            .join("logs")
+            .join(multicore_core::core_sessions::CORE_SESSIONS_DIRECTORY);
+        let logs =
+            Arc::new(CoreLogBuffer::persistent_or_memory(log_path).with_journal(journal, false));
         let launcher = PlatformLauncher::for_runtime(
             resolved.paths.clone(),
             logs,

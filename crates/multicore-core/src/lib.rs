@@ -1,4 +1,5 @@
 mod config_sanitize;
+pub mod core_sessions;
 mod device_identity;
 pub mod elevation_protocol;
 mod event;

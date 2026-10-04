@@ -65,6 +65,7 @@ async fn all_v1_routes_require_bearer_authentication() {
         ("GET", "/v1/diagnostics", Body::empty()),
         ("GET", "/v1/dashboard-url", Body::empty()),
         ("GET", "/v1/service-log", Body::empty()),
+        ("GET", "/v1/core-journal?since_ms=0", Body::empty()),
     ];
 
     for (method, uri, body) in routes {
@@ -113,6 +114,66 @@ impl multicore_daemon::ServiceLogSource for FakeServiceLog {
             }],
         }
     }
+
+    fn core_journal(&self, since_ms: u64) -> multicore_daemon::CoreJournalDto {
+        multicore_daemon::CoreJournalDto {
+            status: multicore_daemon::ServiceLogStatus::Included,
+            text: format!("{since_ms}\tmihomo\tstdout\tready\n"),
+            truncated: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn core_journal_route_passes_the_start_and_says_why_there_is_none() {
+    let response = app()
+        .oneshot(request("GET", "/v1/core-journal?since_ms=5", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "status": "no_service", "text": "", "truncated": false })
+    );
+
+    let backend: std::sync::Arc<dyn multicore_daemon::Backend> =
+        std::sync::Arc::new(MemoryBackend::default());
+    let app = multicore_daemon::try_router_with_service_log(
+        backend,
+        TOKEN,
+        None,
+        None,
+        None,
+        Some(std::sync::Arc::new(FakeServiceLog)),
+    )
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/v1/core-journal?since_ms=1791000000000",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({
+            "status": "included",
+            "text": "1791000000000\tmihomo\tstdout\tready\n",
+            "truncated": false
+        })
+    );
+    let response = app
+        .oneshot(request(
+            "GET",
+            "/v1/core-journal?since_ms=-1",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

@@ -55,6 +55,10 @@ struct FakeService {
     /// `service.log` is rotated (replaced by a short file) once this many chunks were served.
     rotate_after: Option<usize>,
     log_requests: usize,
+    /// The core journal's pages, served in order.
+    journal: Vec<String>,
+    /// `CoreJournal` is answered like a service older than it.
+    journal_unknown: bool,
 }
 
 #[derive(Clone, Default)]
@@ -137,6 +141,23 @@ impl ServiceTransport for FakeTransport {
             ServiceCommand::Troubleshoot { .. } if service.troubleshoot_unknown => {
                 ServiceResponse::Error {
                     code: BrokerErrorCode::InvalidRequest,
+                }
+            }
+            ServiceCommand::CoreJournal { .. } if service.journal_unknown => {
+                ServiceResponse::Error {
+                    code: BrokerErrorCode::InvalidRequest,
+                }
+            }
+            ServiceCommand::CoreJournal { cursor, .. } => {
+                let page = cursor.map_or(0, |cursor| cursor.offset as usize);
+                ServiceResponse::CoreJournal {
+                    text: service.journal.get(page).cloned().unwrap_or_default(),
+                    next: (page + 1 < service.journal.len()).then_some(
+                        multicore_core::service_protocol::CoreJournalCursor {
+                            segment: 1,
+                            offset: page as u64 + 1,
+                        },
+                    ),
                 }
             }
             ServiceCommand::ServiceLog { .. } if service.service_log_unknown => {
@@ -1021,6 +1042,64 @@ fn a_log_rotated_while_it_is_paged_stops_at_the_rotation() {
             .ends_with(&format!("current {:06} {}\n", 39, "x".repeat(10)))
     );
     assert!(!files[0].text.contains("rotated"));
+}
+
+#[test]
+fn the_core_journal_is_paged_on_its_own_channel_and_claims_nothing() {
+    use multicore_daemon::{ServiceLogSource, ServiceLogStatus};
+    let (session, connector, _slot) = session();
+    session.prepare(3).unwrap();
+    let pages = (0..5)
+        .map(|page| format!("{page}000\tmihomo\tstdout\tpage {page}\n"))
+        .collect::<Vec<_>>();
+    connector.0.lock().unwrap().journal = pages.clone();
+    let (text, truncated) = session.core_journal(1_791_000_000_000).unwrap();
+    assert_eq!(text, pages.concat());
+    assert!(!truncated);
+    {
+        let service = connector.0.lock().unwrap();
+        assert_eq!(service.connects, 2, "read on a channel of its own");
+        let asked = service
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                ServiceCommand::CoreJournal { since_ms, .. } => Some(*since_ms),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(asked, [1_791_000_000_000; 5]);
+    }
+    assert!(
+        session.cores_ready(),
+        "the connection channel was left alone"
+    );
+    let dto = ServiceLogSource::core_journal(session.as_ref(), 0);
+    assert_eq!(dto.status, ServiceLogStatus::Included);
+    assert_eq!(dto.text, pages.concat());
+
+    connector.0.lock().unwrap().journal_unknown = true;
+    assert_eq!(
+        ServiceLogSource::core_journal(session.as_ref(), 0).status,
+        ServiceLogStatus::TooOld
+    );
+    {
+        let mut service = connector.0.lock().unwrap();
+        service.journal_unknown = false;
+        service.busy = true;
+    }
+    assert_eq!(
+        ServiceLogSource::core_journal(session.as_ref(), 0).status,
+        ServiceLogStatus::Busy
+    );
+    {
+        let mut service = connector.0.lock().unwrap();
+        service.busy = false;
+        service.connect_errors = vec![ServiceError::NotInstalled];
+    }
+    assert_eq!(
+        ServiceLogSource::core_journal(session.as_ref(), 0).status,
+        ServiceLogStatus::NoService
+    );
 }
 
 #[test]

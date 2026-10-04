@@ -65,6 +65,24 @@ pub enum ServiceCommand {
         file: ServiceLogFile,
         before: Option<u64>,
     },
+    /// «Сохранить лог…»: the next piece of the requesting user's own core journal (see
+    /// `core_sessions`), in segments written at or after `since_ms`, from `cursor` on (the
+    /// oldest such segment when `None`). Read-only; the service picks the user's directory
+    /// from the connection's identity, never from the request. Additive like `StageUpdate`:
+    /// an older service answers `Error{InvalidRequest}`.
+    CoreJournal {
+        since_ms: u64,
+        cursor: Option<CoreJournalCursor>,
+    },
+}
+
+/// Where `CoreJournal` paging continues: a journal segment (its start in unix ms, which names
+/// it) and a byte offset in it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreJournalCursor {
+    pub segment: u64,
+    pub offset: u64,
 }
 
 /// The service's own log files under `<service directory>/logs`.
@@ -185,6 +203,13 @@ pub enum ServiceResponse {
         end: u64,
         text: String,
     },
+    /// `CoreJournal`: whole journal lines (`<unix ms>\t<engine>\t<stream>\t<message>`, the
+    /// message redacted like the service's own log) and where to continue; `next: None` when
+    /// everything was read.
+    CoreJournal {
+        text: String,
+        next: Option<CoreJournalCursor>,
+    },
     /// Another interactive user's session holds the cores.
     Busy,
     Error {
@@ -254,6 +279,9 @@ pub fn service_response_matches(command: &ServiceCommand, response: &ServiceResp
                 ..
             },
         ) => file == actual && start <= end && before.is_none_or(|before| *end <= before),
+        (ServiceCommand::CoreJournal { cursor, .. }, ServiceResponse::CoreJournal { next, .. }) => {
+            next.is_none() || next != cursor
+        }
         (ServiceCommand::Status, ServiceResponse::Status { .. })
         | (ServiceCommand::Diagnostics, ServiceResponse::ProcessDiagnostics { .. })
         | (ServiceCommand::Shutdown, ServiceResponse::ShuttingDown)

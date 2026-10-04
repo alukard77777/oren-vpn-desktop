@@ -212,7 +212,9 @@ pub fn service_response_timeout(command: &ServiceCommand) -> Duration {
         // Each fix waits at most a minute (a tool, a service stop); a batch has at most eight.
         ServiceCommand::Troubleshoot { .. } => Duration::from_secs(10 * 60),
         // One small file read, but it may wait behind a `Prepare` holding the service's lock.
-        ServiceCommand::ServiceLog { .. } => Duration::from_secs(30),
+        ServiceCommand::ServiceLog { .. } | ServiceCommand::CoreJournal { .. } => {
+            Duration::from_secs(30)
+        }
         _ => Duration::from_secs(5),
     }
 }
@@ -698,6 +700,46 @@ impl<C: ServiceConnector> ServiceSession<C> {
         Ok(files)
     }
 
+    /// «Сохранить лог…»: this user's core journal in the service (see
+    /// `multicore_core::core_sessions`), from segments written at or after `since_ms`, oldest
+    /// first. At most [`MAX_CORE_JOURNAL_BYTES`] of text: past that the oldest pages are
+    /// dropped (`truncated`). On a channel of its own like `service_log`: an older service
+    /// rejects the unknown command (`Rejected(InvalidRequest)`), and reading claims nothing.
+    pub fn core_journal(&self, since_ms: u64) -> Result<(String, bool), ServiceError> {
+        let transport = self.connector.connect()?;
+        let mut pages = std::collections::VecDeque::new();
+        let mut held = 0_usize;
+        let mut truncated = false;
+        let mut cursor = None;
+        for _ in 0..MAX_CORE_JOURNAL_PAGES {
+            let command = ServiceCommand::CoreJournal { since_ms, cursor };
+            let response = transport.request(&command)?;
+            let (text, next) = match response {
+                ServiceResponse::Busy => return Err(ServiceError::Busy),
+                ServiceResponse::Error { code } => return Err(ServiceError::Rejected(code)),
+                ref page if !service_response_matches(&command, page) => {
+                    return Err(ServiceError::Protocol);
+                }
+                ServiceResponse::CoreJournal { text, next } => (text, next),
+                _ => return Err(ServiceError::Protocol),
+            };
+            held += text.len();
+            pages.push_back(text);
+            while held > MAX_CORE_JOURNAL_BYTES {
+                let Some(oldest) = pages.pop_front() else {
+                    break;
+                };
+                held -= oldest.len();
+                truncated = true;
+            }
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return Ok((pages.into_iter().collect(), truncated)),
+            }
+        }
+        Ok((pages.into_iter().collect(), true))
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> ProcessDiagnostics {
         match self.request(&ServiceCommand::Diagnostics, false) {
@@ -762,6 +804,12 @@ impl<C: ServiceConnector> crate::ServiceUpdates for ServiceSession<C> {
 
 /// Requests per file before the daemon stops paging: a 512 KiB tail is about 35 chunks.
 const MAX_SERVICE_LOG_PAGES: usize = 128;
+/// The most core journal text the daemon collects for one archive: the service keeps at most
+/// this much per user anyway.
+pub const MAX_CORE_JOURNAL_BYTES: usize =
+    multicore_core::core_sessions::JOURNAL_TOTAL_BYTES as usize;
+/// Pages before the daemon stops paging the core journal (a page holds up to 32 KiB).
+const MAX_CORE_JOURNAL_PAGES: usize = 8_192;
 
 /// One file of the service's own log as `ServiceSession::service_log` collected it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -810,6 +858,30 @@ impl<C: ServiceConnector> crate::ServiceLogSource for ServiceSession<C> {
                         truncated: file.truncated,
                     })
                     .collect(),
+            },
+            Err(
+                ServiceError::NotInstalled
+                | ServiceError::Rejected(BrokerErrorCode::AuthenticationFailed),
+            ) => status(ServiceLogStatus::NoService),
+            Err(ServiceError::Rejected(BrokerErrorCode::InvalidRequest)) => {
+                status(ServiceLogStatus::TooOld)
+            }
+            Err(ServiceError::Busy) => status(ServiceLogStatus::Busy),
+            Err(_) => status(ServiceLogStatus::Unavailable),
+        }
+    }
+
+    fn core_journal(&self, since_ms: u64) -> crate::CoreJournalDto {
+        use crate::{CoreJournalDto, ServiceLogStatus};
+        let status = |status| CoreJournalDto {
+            status,
+            ..CoreJournalDto::default()
+        };
+        match ServiceSession::core_journal(self, since_ms) {
+            Ok((text, truncated)) => CoreJournalDto {
+                status: ServiceLogStatus::Included,
+                text,
+                truncated,
             },
             Err(
                 ServiceError::NotInstalled

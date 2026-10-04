@@ -650,6 +650,101 @@ async fn a_connection_the_service_lost_is_torn_down_and_reported() {
     );
 }
 
+/// Every connection attempt becomes a session of the per-connection log index: when it began
+/// and ended, why, the mode and a hash of the profile, never the profile id itself.
+#[tokio::test]
+async fn every_connection_is_recorded_in_the_session_index_with_why_it_ended() {
+    use multicore_core::core_sessions::{profile_tag, read_sessions};
+    let h = harness(&[PROFILE_A]);
+    let directory = tempfile::tempdir().unwrap();
+    let sessions_directory = directory.path().join("core-sessions");
+    h.backend
+        .enable_session_log(sessions_directory.clone())
+        .await;
+    let readiness = enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    assert!(
+        read_sessions(&sessions_directory).is_empty(),
+        "warming is no session"
+    );
+
+    h.backend.connect().await.unwrap();
+    let open = read_sessions(&sessions_directory);
+    assert_eq!(open.len(), 1);
+    assert!(open[0].is_open());
+    h.backend.disconnect().await.unwrap();
+
+    h.recording.fail_xray.store(true, Ordering::SeqCst);
+    assert!(h.backend.connect().await.is_err());
+    h.recording.fail_xray.store(false, Ordering::SeqCst);
+
+    h.backend.connect().await.unwrap();
+    readiness.lost.store(true, Ordering::SeqCst);
+    readiness.ready.store(false, Ordering::SeqCst);
+    assert!(!h.backend.watch_service().await);
+    readiness.lost.store(false, Ordering::SeqCst);
+    readiness.ready.store(true, Ordering::SeqCst);
+
+    h.backend.connect().await.unwrap();
+    h.backend.shutdown_cores().await;
+
+    let sessions = read_sessions(&sessions_directory);
+    let reasons = sessions
+        .iter()
+        .map(|session| session.reason.as_deref().unwrap_or("open"))
+        .collect::<Vec<_>>();
+    assert_eq!(reasons, ["user", "failed", "cores_lost", "quit"]);
+    let tag = profile_tag(h.profiles[0].as_str());
+    for session in &sessions {
+        assert!(
+            session
+                .disconnect_ms
+                .is_some_and(|end| end >= session.connect_ms)
+        );
+        assert_eq!(session.start.mode, "tun");
+        assert!(session.start.service);
+        assert_eq!(session.start.engines, ["xray", "mihomo"]);
+        assert_eq!(session.start.profile.as_deref(), Some(tag.as_str()));
+    }
+    assert!(
+        sessions
+            .windows(2)
+            .all(|pair| pair[0].connect_ms <= pair[1].connect_ms)
+    );
+    let index = std::fs::read_to_string(sessions_directory.join("sessions.jsonl")).unwrap();
+    assert!(!index.contains(h.profiles[0].as_str()), "{index}");
+}
+
+#[tokio::test]
+async fn a_subscription_switch_ends_the_session_and_the_reconnect_starts_a_new_one() {
+    use multicore_core::core_sessions::read_sessions;
+    let h = harness(&[PROFILE_A, PROFILE_B]);
+    let directory = tempfile::tempdir().unwrap();
+    h.backend
+        .enable_session_log(directory.path().to_path_buf())
+        .await;
+    enable(&h, true).await;
+    h.backend.warm_up().await.unwrap();
+    h.backend.connect().await.unwrap();
+    let active = h.backend.status().await.unwrap().active_profile_id;
+    let other = if active.as_deref() == Some(h.profiles[0].as_str()) {
+        h.profiles[1].clone()
+    } else {
+        h.profiles[0].clone()
+    };
+    Backend::activate_subscription(&*h.backend, other.clone())
+        .await
+        .unwrap();
+    let sessions = read_sessions(directory.path());
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert_eq!(sessions[0].reason.as_deref(), Some("switch"));
+    assert!(sessions[1].is_open());
+    assert_eq!(
+        sessions[1].start.profile,
+        Some(multicore_core::core_sessions::profile_tag(other.as_str()))
+    );
+}
+
 #[tokio::test]
 async fn switching_while_connected_moves_the_connection_to_the_new_generation() {
     let h = harness(&[PROFILE_A, PROFILE_B]);

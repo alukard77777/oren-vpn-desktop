@@ -12,10 +12,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use multicore_core::core_sessions::read_journal_chunk;
 use multicore_core::elevation_protocol::MAX_ELEVATION_FRAME_BYTES;
 use multicore_core::service_protocol::{
-    MAX_SERVICE_LOG_TAIL_BYTES, ServiceLogFile, ServiceResponse, encode_service_frame,
-    redact_service_log,
+    CoreJournalCursor, MAX_SERVICE_LOG_TAIL_BYTES, ServiceLogFile, ServiceResponse,
+    encode_service_frame, redact_service_log,
 };
 
 /// Past this size the log moves to `service.log.1` (replacing the one before), so a failure
@@ -118,6 +119,74 @@ pub(crate) fn read_chunk(
         }
         limit /= 2;
     }
+}
+
+/// The most raw journal bytes one `CoreJournal` page reads; smaller when the redacted page
+/// would not fit a frame.
+pub(crate) const CORE_JOURNAL_CHUNK_BYTES: usize = 32 * 1024;
+const MIN_CORE_JOURNAL_CHUNK_BYTES: usize = 1024;
+
+/// `CoreJournal{since_ms, cursor}`: the next page of the core journal in `directory` (the
+/// requesting user's own, see `cores::client_journal_directory`). Each line keeps its
+/// timestamp, engine and stream; its message is redacted like the service's own log, since
+/// the service ran the cores. A page that cannot fit a frame even at the smallest size is
+/// skipped (its cursor still moves on).
+pub(crate) fn read_core_journal(
+    directory: &Path,
+    since_ms: u64,
+    cursor: Option<CoreJournalCursor>,
+) -> ServiceResponse {
+    let mut limit = CORE_JOURNAL_CHUNK_BYTES;
+    loop {
+        let (raw, next) = read_journal_chunk(directory, since_ms, cursor, limit);
+        let response = ServiceResponse::CoreJournal {
+            text: redact_journal_lines(&raw),
+            next,
+        };
+        let fits = encode_service_frame(&response)
+            .is_ok_and(|frame| frame.len() <= MAX_ELEVATION_FRAME_BYTES);
+        if fits {
+            return response;
+        }
+        if limit <= MIN_CORE_JOURNAL_CHUNK_BYTES {
+            return ServiceResponse::CoreJournal {
+                text: String::new(),
+                next,
+            };
+        }
+        limit /= 2;
+    }
+}
+
+/// Redacts the message of every `<ms>\t<engine>\t<stream>\t<message>` line; anything else is
+/// redacted whole.
+fn redact_journal_lines(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        let mut fields = body.splitn(4, '\t');
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some(stamp), Some(engine), Some(stream), Some(message))
+                if stamp.bytes().all(|byte| byte.is_ascii_digit())
+                    && matches!(engine, "xray" | "mihomo")
+                    && matches!(stream, "stdout" | "stderr") =>
+            {
+                redacted.push_str(stamp);
+                redacted.push('\t');
+                redacted.push_str(engine);
+                redacted.push('\t');
+                redacted.push_str(stream);
+                redacted.push('\t');
+                redacted.push_str(&redact_service_log(message));
+            }
+            _ => redacted.push_str(&redact_service_log(body)),
+        }
+        redacted.push_str(newline);
+    }
+    redacted
 }
 
 #[cfg(test)]
@@ -272,6 +341,66 @@ mod tests {
         assert!(end < 1 << 20, "the end shows the file is shorter");
         assert!(text.ends_with("only line\n"));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn core_journal_pages_keep_line_fields_redact_messages_and_fit_a_frame() {
+        use multicore_core::core_sessions::{format_core_line, segment_name};
+        let root = temporary_directory("journal");
+        let mut journal = String::new();
+        let mut index = 0_u64;
+        while journal.len() < 200 * 1024 {
+            journal.push_str(&format_core_line(
+                1_791_000_000_000 + index,
+                if index.is_multiple_of(2) {
+                    "mihomo"
+                } else {
+                    "xray"
+                },
+                "stdout",
+                "dial C:\\Users\\alice\\x via https://panel.example.net/sub \"quoted\"",
+            ));
+            index += 1;
+        }
+        fs::write(root.join(segment_name(1_791_000_000_000)), &journal).unwrap();
+        let mut cursor = None;
+        let mut text = String::new();
+        for _ in 0..1000 {
+            let response = read_core_journal(&root, 0, cursor);
+            assert!(encode_service_frame(&response).unwrap().len() <= MAX_ELEVATION_FRAME_BYTES);
+            let ServiceResponse::CoreJournal { text: page, next } = response else {
+                panic!("not a core journal page");
+            };
+            text.push_str(&page);
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(text.lines().count(), index as usize);
+        for leak in ["alice", "panel.example.net"] {
+            assert!(!text.contains(leak), "leaks {leak}");
+        }
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.starts_with("1791000000000\tmihomo\tstdout\tdial "),
+            "{first}"
+        );
+        assert_eq!(
+            redact_journal_lines("not a journal line https://x.example/y\n"),
+            "not a journal line [redacted]\n"
+        );
+        // Nothing there: an empty last page.
+        let empty = temporary_directory("journal-empty");
+        assert_eq!(
+            read_core_journal(&empty.join("missing"), 0, None),
+            ServiceResponse::CoreJournal {
+                text: String::new(),
+                next: None
+            }
+        );
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&empty).unwrap();
     }
 
     #[test]

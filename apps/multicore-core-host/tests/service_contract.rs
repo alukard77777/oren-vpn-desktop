@@ -275,6 +275,57 @@ fn the_service_log_is_served_redacted_to_its_user_but_never_to_another_users_ses
 }
 
 #[test]
+fn each_user_reads_only_their_own_core_journal_and_never_while_another_holds_the_cores() {
+    use multicore_core::core_sessions::{format_core_line, segment_name};
+    let directory = tempfile::tempdir().unwrap();
+    let person = |key: &str, uid: u32| ClientIdentity { uid, ..user(key) };
+    let (alice, bob) = (
+        person("1:S-1-5-21-1-2-3-1001", 1001),
+        person("2:S-1-5-21-1-2-3-1002", 1002),
+    );
+    for (who, line) in [(&alice, "alice dial"), (&bob, "bob dial")] {
+        let journal = service::cores::client_journal_directory(directory.path(), who);
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::write(
+            journal.join(segment_name(1_791_000_000_000)),
+            format_core_line(1_791_000_000_000, "mihomo", "stdout", line),
+        )
+        .unwrap();
+    }
+    let mut service =
+        ServiceLoop::new(FakeCores::default()).with_log_directory(directory.path().to_path_buf());
+    let ask = ServiceCommand::CoreJournal {
+        since_ms: 0,
+        cursor: None,
+    };
+    let text_of = |response: ServiceResponse| match response {
+        ServiceResponse::CoreJournal { text, next: None } => text,
+        other => panic!("not a whole core journal page: {other:?}"),
+    };
+    let text = text_of(service.execute(B, &bob, ask.clone()));
+    assert!(
+        text.contains("\tbob dial") && !text.contains("alice"),
+        "{text}"
+    );
+    assert_eq!(service.owner_key(), None, "reading claims nothing");
+    service.execute(A, &alice, ServiceCommand::Prepare { generation_id: 1 });
+    assert_eq!(service.execute(B, &bob, ask.clone()), ServiceResponse::Busy);
+    let text = text_of(service.execute(A2, &alice, ask.clone()));
+    assert!(
+        text.contains("\talice dial") && !text.contains("bob"),
+        "{text}"
+    );
+    service.client_gone(A2);
+    assert!(service.cores_mut().running);
+    assert_eq!(
+        ServiceLoop::new(FakeCores::default()).execute(A, &alice, ask),
+        ServiceResponse::Error {
+            code: BrokerErrorCode::NotReady
+        }
+    );
+}
+
+#[test]
 fn owner_channel_drop_stops_the_cores() {
     let mut service = ServiceLoop::new(FakeCores::default());
     let alice = user("alice");

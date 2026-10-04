@@ -69,6 +69,8 @@ struct CoreLogState {
 pub struct CoreLogBuffer {
     state: StdMutex<CoreLogState>,
     persistent: Option<StdMutex<PersistentLogSink>>,
+    /// Every line also goes to the per-connection core journal (see `core_sessions`).
+    journal: Option<StdMutex<crate::core_sessions::CoreJournal>>,
     next_id: AtomicU64,
     max_records: usize,
     max_chars: usize,
@@ -135,23 +137,7 @@ impl PersistentLogSink {
         if self.disabled {
             return;
         }
-        let engine = match record.engine {
-            Engine::Xray => "xray",
-            Engine::Mihomo => "mihomo",
-        };
-        let stream = match record.stream {
-            DiagnosticStream::Stdout => "stdout",
-            DiagnosticStream::Stderr => "stderr",
-        };
-        let message: String = record
-            .message
-            .chars()
-            .map(|character| match character {
-                '\r' | '\n' | '\t' => ' ',
-                other => other,
-            })
-            .collect();
-        let line = format!("{}\t{engine}\t{stream}\t{message}\n", record.timestamp_ms);
+        let line = record_line(record);
         let bytes = line.as_bytes();
         let result = (|| -> std::io::Result<()> {
             if self.bytes_written.saturating_add(bytes.len() as u64) > MAX_PERSISTENT_LOG_BYTES {
@@ -168,6 +154,19 @@ impl PersistentLogSink {
     }
 }
 
+/// `record` as one line of `latest-core.log` and the core journal.
+fn record_line(record: &CoreLogRecord) -> String {
+    let engine = match record.engine {
+        Engine::Xray => "xray",
+        Engine::Mihomo => "mihomo",
+    };
+    let stream = match record.stream {
+        DiagnosticStream::Stdout => "stdout",
+        DiagnosticStream::Stderr => "stderr",
+    };
+    crate::core_sessions::format_core_line(record.timestamp_ms, engine, stream, &record.message)
+}
+
 impl Default for CoreLogBuffer {
     fn default() -> Self {
         Self::with_limits(256, 2_048)
@@ -181,6 +180,7 @@ impl CoreLogBuffer {
                 records: VecDeque::with_capacity(max_records),
             }),
             persistent: None,
+            journal: None,
             next_id: AtomicU64::new(1),
             max_records: max_records.max(1),
             max_chars: max_chars.max(1),
@@ -193,6 +193,7 @@ impl CoreLogBuffer {
                 records: VecDeque::with_capacity(256),
             }),
             persistent: Some(StdMutex::new(PersistentLogSink::create(path.as_ref())?)),
+            journal: None,
             next_id: AtomicU64::new(1),
             max_records: 256,
             max_chars: 2_048,
@@ -201,6 +202,16 @@ impl CoreLogBuffer {
 
     pub fn persistent_or_memory(path: impl AsRef<Path>) -> Self {
         Self::persistent(path).unwrap_or_default()
+    }
+
+    /// Also appends every line to the core journal in `directory` (see `core_sessions`);
+    /// `prune`: this process may delete the journal's old segments there.
+    #[must_use]
+    pub fn with_journal(mut self, directory: impl Into<PathBuf>, prune: bool) -> Self {
+        self.journal = Some(StdMutex::new(crate::core_sessions::CoreJournal::new(
+            directory, prune,
+        )));
+        self
     }
 
     pub fn push(&self, engine: Engine, stream: DiagnosticStream, message: &str) {
@@ -233,6 +244,12 @@ impl CoreLogBuffer {
                 .lock()
                 .expect("persistent core log lock poisoned")
                 .write(&record);
+        }
+        if let Some(journal) = &self.journal {
+            journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append(&record_line(&record));
         }
     }
 

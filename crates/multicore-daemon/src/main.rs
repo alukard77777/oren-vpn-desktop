@@ -97,6 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ReqwestHttpClient::new(device_identity)?.with_tunnel_proxy(tunnel_proxy.clone()),
     );
     let runtime_root = data_directory.join("runtime");
+    // Per-connection core logs and their index (see `multicore_core::core_sessions`).
+    let core_sessions_directory = data_directory
+        .join("logs")
+        .join(multicore_core::core_sessions::CORE_SESSIONS_DIRECTORY);
     #[cfg(windows)]
     let system_proxy_marker = data_directory.join("system-proxy.json");
     #[cfg(windows)]
@@ -113,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|executable| dashboard_directory_for(&executable)),
         dashboard_directory: None,
         log_path: data_directory.join("logs").join("latest-core.log"),
+        journal_directory: core_sessions_directory.clone(),
         marker_path: system_proxy_marker.clone(),
         tunnel_proxy: tunnel_proxy.clone(),
     };
@@ -226,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always-ready mode is armed from the start; it only acts while the watcher finds the
     // service available.
     backend.enable_always_ready(service.clone()).await;
+    backend.enable_session_log(core_sessions_directory).await;
     spawn_service_watch(backend.clone(), service.clone());
     spawn_group_icon_fetch(backend.clone()).await;
 
@@ -510,6 +516,8 @@ mod proxy_mode {
         pub(crate) package_root: Option<PathBuf>,
         pub(crate) dashboard_directory: Option<PathBuf>,
         pub(crate) log_path: PathBuf,
+        /// The user's core journal; this daemon owns the directory and prunes it.
+        pub(crate) journal_directory: PathBuf,
         pub(crate) marker_path: PathBuf,
         pub(crate) tunnel_proxy: multicore_core::TunnelProxy,
     }
@@ -565,7 +573,10 @@ mod proxy_mode {
                     .filter(|directory| directory.join("index.html").is_file()),
                 mihomo_home_directory: None,
             };
-            let logs = Arc::new(CoreLogBuffer::persistent_or_memory(&self.log_path));
+            let logs = Arc::new(
+                CoreLogBuffer::persistent_or_memory(&self.log_path)
+                    .with_journal(&self.journal_directory, true),
+            );
             let launcher =
                 WindowsJobLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
                     .map_err(|_| BackendError::new())?;

@@ -195,6 +195,17 @@ impl<C: Cores> ServiceLoop<C> {
                     code: BrokerErrorCode::NotReady,
                 },
             },
+            // Read-only: only the caller's own journal, chosen by its identity.
+            ServiceCommand::CoreJournal { since_ms, cursor } => match &self.log_directory {
+                Some(directory) => super::service_log::read_core_journal(
+                    &super::cores::client_journal_directory(directory, client),
+                    since_ms,
+                    cursor,
+                ),
+                None => ServiceResponse::Error {
+                    code: BrokerErrorCode::NotReady,
+                },
+            },
             ServiceCommand::Shutdown => {
                 self.stop_everything();
                 ServiceResponse::ShuttingDown
