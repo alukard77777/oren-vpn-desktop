@@ -137,7 +137,7 @@ fn write_low_level_entry(path: &std::path::Path, context: &str, detail: impl fmt
 }
 
 /// Everything `record_low_level` has captured since this log was last
-/// rotated, for the "Копировать лог" export to fold in alongside the
+/// rotated, for `diagnostics.txt` of «Сохранить лог…» to fold in alongside the
 /// daemon's own event log. `None` when nothing has been recorded yet or the
 /// file can't be read.
 pub(crate) fn read_low_level_log() -> Option<String> {

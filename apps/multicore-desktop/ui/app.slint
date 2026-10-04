@@ -542,7 +542,7 @@ component TextAction inherits Rectangle {
     // Why the action is unavailable, for assistive technology.
     in property <string> disabled-hint;
     in property <int> focus-epoch: 0;
-    // Momentary feedback ("Скопировано ✓") crossfades over the label.
+    // Momentary feedback («Сохранено ✓») crossfades over the label.
     in property <string> swap-label;
     in property <bool> swapped: false;
     // Tint of the feedback: "success" (green), "danger" (red) or "neutral" (progress).
@@ -1758,12 +1758,11 @@ export component AppWindow inherits Window {
     callback close-panel();
     callback escape-pressed();
     callback filter-events(string);
-    callback copy-diagnostics();
-    in-out property <bool> diagnostics-copied: false;
-    // «Сохранить лог…»: "" (idle), "saving", "saved", "saved-downloads" (no dialog: saved to
-    // Downloads) or "failed".
-    // With the range chosen in the «Сохранить лог» popup: "latest", "week" or "all".
+    // «Сохранить лог…» with the range chosen in the «Сохранить лог» popup: "latest", "week"
+    // or "all".
     callback save-diagnostics(string);
+    // Its progress: "" (idle), "saving", "saved", "saved-downloads" (no dialog: saved to
+    // Downloads) or "failed".
     in-out property <string> diagnostics-save-state;
     // The «Сохранить лог» popup: open, the chosen range, and one hint line per range.
     in-out property <bool> log-range-open: false;
@@ -3970,16 +3969,6 @@ export component AppWindow inherits Window {
                             enabled: root.dashboard-available && !root.profile-menu-open;
                             disabled-hint: @tr("Подключитесь, чтобы открыть панель Mihomo.");
                             activated => { root.open-dashboard(); }
-                        }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        TextAction {
-                            label: @tr("Копировать лог");
-                            swap-label: @tr("Скопировано ✓");
-                            swapped: root.diagnostics-copied;
-                            enabled: !root.profile-menu-open;
-                            activated => { root.copy-diagnostics(); }
                         }
                     }
                     VerticalLayout {

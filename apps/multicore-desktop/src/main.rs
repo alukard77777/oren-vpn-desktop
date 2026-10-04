@@ -1041,7 +1041,6 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
     wire_data_reset(&ui);
     wire_panels(&ui, model.clone());
     wire_event_filter(&ui, model.clone());
-    wire_copy_diagnostics(&ui, model.clone());
     wire_log_range(&ui);
     wire_save_diagnostics(&ui, model.clone());
     wire_catalog_group(&ui, model.clone());
@@ -1992,7 +1991,7 @@ fn process_writer_results(
                     .mark_persisted(preferences);
             }
             WriterResult::Failed(failure) => {
-                // The GUI process has no console: the low-level log ("Копировать лог") is
+                // The GUI process has no console: the low-level log (in «Сохранить лог…») is
                 // the only place this reason can be read from later.
                 let line = failure.log_line();
                 eprintln!("preferences save {line}");
@@ -4866,59 +4865,8 @@ fn wire_event_filter(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
     });
 }
 
-fn wire_copy_diagnostics(ui: &AppWindow, model: Arc<Mutex<DesktopViewModel>>) {
-    let weak = ui.as_weak();
-    ui.on_copy_diagnostics(move || {
-        // Events are otherwise only fetched when the Status panel opens, so
-        // a failure that happened while it was already open was missing
-        // from the export. Pull the newest events first, then copy.
-        let request = model
-            .lock()
-            .expect("view model lock")
-            .begin_events_request();
-        let Some(request) = request else {
-            copy_diagnostics_now(&weak, &model);
-            return;
-        };
-        let weak = weak.clone();
-        let model = model.clone();
-        thread::spawn(move || {
-            let result = request
-                .client
-                .events(request.after, request.known_epoch.as_deref());
-            let events = model
-                .lock()
-                .expect("view model lock")
-                .finish_events(request.token, result);
-            let _ = slint::invoke_from_event_loop(move || {
-                if let (Some(ui), Some(events)) = (weak.upgrade(), events) {
-                    apply_events(&ui, events);
-                }
-                copy_diagnostics_now(&weak, &model);
-            });
-        });
-    });
-}
-
-fn copy_diagnostics_now(weak: &slint::Weak<AppWindow>, model: &Arc<Mutex<DesktopViewModel>>) {
-    let text = diagnostics_export(model);
-    let Some(ui) = weak.upgrade() else {
-        return;
-    };
-    if clipboard_text::write_clipboard_text(ui.window(), text).is_err() {
-        return;
-    }
-    ui.set_diagnostics_copied(true);
-    let reset_weak = weak.clone();
-    Timer::single_shot(Duration::from_secs(2), move || {
-        if let Some(ui) = reset_weak.upgrade() {
-            ui.set_diagnostics_copied(false);
-        }
-    });
-}
-
-/// What «Копировать лог» copies (and `diagnostics.txt` in a saved archive): every known event,
-/// newest first, plus the low-level log of failed daemon calls.
+/// `diagnostics.txt` of a saved archive: every known event, newest first, plus the low-level
+/// log of failed daemon calls.
 fn diagnostics_export(model: &Arc<Mutex<DesktopViewModel>>) -> String {
     let mut text = model
         .lock()
@@ -5038,7 +4986,7 @@ fn save_diagnostics_archive(
             ui.set_diagnostics_save_state("saving".into());
         }
     });
-    // Like «Копировать лог»: pull the newest events first.
+    // Pull the newest events first.
     let request = model
         .lock()
         .expect("view model lock")
@@ -6640,29 +6588,6 @@ mod window_tests {
         assert!(!ambient_motion_allowed(true, true, true, false, true));
         assert!(!ambient_motion_allowed(true, true, false, true, true));
         assert!(!ambient_motion_allowed(true, true, false, false, false));
-    }
-
-    #[test]
-    fn copy_diagnostics_fetches_fresh_events_before_copying() {
-        // Regression coverage: events used to be fetched only when the
-        // Status panel opened, so "Копировать лог" could copy a stale or
-        // empty cache while the real failure was already in the daemon log.
-        let rust = include_str!("main.rs");
-        let body = rust
-            .split("fn wire_copy_diagnostics(")
-            .nth(1)
-            .and_then(|rest| rest.split("fn copy_diagnostics_now(").next())
-            .expect("wire_copy_diagnostics body");
-        let fetch = body
-            .find(".begin_events_request()")
-            .expect("fetches events");
-        let finish = body
-            .find(".finish_events(")
-            .expect("applies fetched events");
-        let copy = body
-            .rfind("copy_diagnostics_now(&weak, &model)")
-            .expect("copies after fetching");
-        assert!(fetch < finish && finish < copy);
     }
 
     #[test]

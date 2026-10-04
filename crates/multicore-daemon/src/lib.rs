@@ -2505,7 +2505,7 @@ mod event_persistence_tests {
     #[test]
     fn events_persisted_by_one_buffer_are_recovered_by_a_fresh_one_at_the_same_path() {
         // Regression coverage for a real bug report: a genuine subscription-add
-        // failure on a user's machine produced an empty "Копировать лог" export
+        // failure on a user's machine produced an empty log export
         // because the daemon's event buffer was purely in-memory and had been
         // wiped by a restart between the failure and the export.
         let directory = tempfile::tempdir().expect("temp dir");
@@ -4974,7 +4974,7 @@ where
         // `Event`'s own `phase` field never reaches `EventDto` (only
         // `message` and `details` do - see core_event_to_dto), so it's
         // repeated inside `details` too: that's what actually lets
-        // "Копировать лог" show which of several very different branches
+        // «Сохранить лог…» show which of several very different branches
         // failed instead of the same generic sentence every time.
         self.inner.write().await.push_event_with_details(
             Severity::Warning,

@@ -1,7 +1,7 @@
 //! «Сохранить лог…»: one ZIP with everything a support request needs.
 //!
 //! Contents: `system.txt` (app, OS, renderer, install and connection facts), `diagnostics.txt`
-//! (exactly what «Копировать лог» copies), `daemon-diagnostics.json` (the daemon's
+//! (the event feed and the low-level log), `daemon-diagnostics.json` (the daemon's
 //! `/v1/diagnostics`: core health, the bounded core log, proxy mappings), `preferences.json`
 //! (with profile ids pseudonymised and paths dropped) and `logs/*` from the data directory
 //! (`events.log`, `client-errors.log`, `crash.log` with the app's own panics, native crashes

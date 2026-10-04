@@ -3552,7 +3552,7 @@ impl DesktopViewModel {
     }
 
     /// A plain-text export of every currently-known event (ignoring the
-    /// active tab filter), newest first, for a "copy diagnostics" action: a
+    /// active tab filter), newest first, for `diagnostics.txt` of a saved archive: a
     /// user hitting an opaque failure can paste this into a support message
     /// instead of just describing "не удалось добавить подписку". Every
     /// message here has already gone through the same redaction as the live
@@ -9562,9 +9562,9 @@ mod tests {
         // Cards of a page fade in one after another (24ms apart) when the page appears.
         assert!(app.contains("animate opacity { duration: 280ms; delay: 24ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
         assert!(app.contains("animate opacity { duration: 280ms; delay: 72ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }"));
-        // "Скопировано ✓" crossfades over the label instead of swapping text.
-        assert!(app.contains("swap-label: @tr(\"Скопировано ✓\");"));
-        assert!(app.contains("swapped: root.diagnostics-copied;"));
+        // «Сохранено ✓» crossfades over the label instead of swapping text.
+        assert!(app.contains(": @tr(\"Сохранено ✓\");"));
+        assert!(app.contains("swapped: root.diagnostics-save-state != \"\";"));
         // URL fields forward focus to their input so `self.focus()` keeps working.
         assert!(app.contains("forward-focus: url-input;"));
     }

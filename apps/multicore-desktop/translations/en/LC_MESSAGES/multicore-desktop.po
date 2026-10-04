@@ -1407,12 +1407,6 @@ msgstr "Try another country or server name"
 msgid "Открыть дашборд"
 msgstr "Open dashboard"
 
-msgid "Копировать лог"
-msgstr "Copy log"
-
-msgid "Скопировано ✓"
-msgstr "Copied ✓"
-
 msgid "Сохранить лог…"
 msgstr "Save log…"
 

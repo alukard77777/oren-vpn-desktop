@@ -40,24 +40,6 @@ pub(crate) fn read_subscription_text(window: &slint::Window) -> Result<String, C
     })?)
 }
 
-/// Used by the "copy diagnostics" action: the caller is responsible for
-/// only ever passing already-redacted text (see
-/// `DesktopViewModel::diagnostics_export_text`).
-pub(crate) fn write_clipboard_text(
-    window: &slint::Window,
-    text: String,
-) -> Result<(), ClipboardTextError> {
-    #[cfg(target_os = "linux")]
-    let text =
-        match wayland::with_clipboard(window, |clipboard| clipboard.set_contents(text.clone())) {
-            Some(result) => return result.map_err(|_| ClipboardTextError::Unavailable),
-            None => text,
-        };
-    #[cfg(not(target_os = "linux"))]
-    let _ = window;
-    with_native_clipboard(|clipboard| clipboard.set_contents(text))
-}
-
 thread_local! {
     // On X11 the copying process itself serves the selection for as long as
     // its context lives: a context dropped right after `set_contents` takes
