@@ -111,7 +111,66 @@ pub const ALLOWED_MIHOMO_KEYS: &[&str] = &[
     "rules",
     "sub-rules",
     "mixed-port",
+    REALITY_MLKEM_KEY,
+    REALITY_CLIENT_VERSION_KEY,
 ];
+
+/// REALITY policy of the patched Mihomo MULTICORE ships (packaging/mihomo-patches, patch 0003):
+/// `auto` (the default when absent: the X25519MLKEM768 key share is learned per server), `on` or
+/// `off`. A stock Mihomo ignores the key.
+pub const REALITY_MLKEM_KEY: &str = "reality-mlkem";
+/// The `x.y.z` client version REALITY sends (each part 0..=255); absent means the core default.
+pub const REALITY_CLIENT_VERSION_KEY: &str = "reality-client-version";
+
+/// Keeps the two REALITY keys only with a value the patched core accepts, normalised to a plain
+/// string. The core refuses a whole config over an invalid value, so a malformed one from a
+/// provider is dropped instead: the core then uses its defaults (adaptive key share, its own
+/// client version), which is what a config without the keys gets.
+pub(crate) fn normalize_reality_policy(mapping: &mut Mapping) {
+    let mlkem = mapping
+        .get(key(REALITY_MLKEM_KEY))
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "auto" | "on" | "off"));
+    match mlkem {
+        Some(value) => {
+            mapping.insert(key(REALITY_MLKEM_KEY), Value::String(value));
+        }
+        None => {
+            mapping.remove(key(REALITY_MLKEM_KEY));
+        }
+    }
+    let version = mapping
+        .get(key(REALITY_CLIENT_VERSION_KEY))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_reality_client_version(value))
+        .map(ToOwned::to_owned);
+    match version {
+        Some(value) => {
+            mapping.insert(key(REALITY_CLIENT_VERSION_KEY), Value::String(value));
+        }
+        None => {
+            mapping.remove(key(REALITY_CLIENT_VERSION_KEY));
+        }
+    }
+}
+
+/// `x.y.z` or `vx.y.z` with each part a decimal 0..=255, as patch 0003 parses it.
+fn is_reality_client_version(value: &str) -> bool {
+    let parts: Vec<&str> = value
+        .strip_prefix('v')
+        .unwrap_or(value)
+        .split('.')
+        .collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u16>().is_ok_and(|number| number <= 255)
+        })
+}
 
 /// `profile` keys kept (no paths, no shared state beyond the client's own home).
 const ALLOWED_PROFILE_KEYS: &[&str] = &["store-selected", "store-fake-ip"];
@@ -153,6 +212,7 @@ pub fn sanitize_mihomo(
             None => *profile = Value::Mapping(Mapping::new()),
         }
     }
+    normalize_reality_policy(mapping);
     // Mihomo runs as SYSTEM/root: it must never set the machine clock.
     if let Some(ntp) = mapping.get_mut(key("ntp")) {
         match ntp.as_mapping_mut() {

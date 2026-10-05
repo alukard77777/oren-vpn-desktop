@@ -22,6 +22,10 @@ param(
     # scratch. The default is an isolated directory inside the stage that is deleted afterwards.
     # The build flags, toolchain check and pinned-Skia proof are identical in both modes.
     [string]$CargoTargetDirectory,
+    # Holds the patched Mihomo binaries built by scripts/build-mihomo.sh (or
+    # scripts/build-mihomo-in-docker.sh) and pinned in versions.json (components.mihomo.build).
+    # Defaults to MULTICORE_MIHOMO_BINARIES_DIR.
+    [string]$MihomoBinariesDirectory = $env:MULTICORE_MIHOMO_BINARIES_DIR,
     [Parameter(DontShow = $true)]
     [switch]$FixtureContractMode
 )
@@ -61,11 +65,17 @@ if ($FixtureContractMode -and $OfflineSourceDirectory -and [IO.File]::Exists($ma
             $manifestItem.Length -gt 0 -and $manifestItem.Length -le 1MB
         if ($manifestIsSafeTemporaryFile) {
             $fixtureManifest = Get-Content -Raw -LiteralPath $manifestCandidate | ConvertFrom-Json
+            $fixtureMihomo = $fixtureManifest.components.mihomo
+            $fixtureMihomoIsSynthetic = if ($fixtureMihomo.PSObject.Properties.Name -contains 'build') {
+                [string]$fixtureMihomo.build.series -ceq 'fixture'
+            } else {
+                ([string]$fixtureMihomo.asset.url).StartsWith('https://example.invalid/', [StringComparison]::Ordinal)
+            }
             $isFixtureInvocation = $fixtureManifest.fixtureContract -ceq 'multicore-package-test-v1' -and
                 $fixtureManifest.components.xray.version -ceq 'fixture' -and
-                $fixtureManifest.components.mihomo.version -ceq 'fixture' -and
+                $fixtureMihomo.version -ceq 'fixture' -and
                 ([string]$fixtureManifest.components.xray.asset.url).StartsWith('https://example.invalid/', [StringComparison]::Ordinal) -and
-                ([string]$fixtureManifest.components.mihomo.asset.url).StartsWith('https://example.invalid/', [StringComparison]::Ordinal)
+                $fixtureMihomoIsSynthetic
         }
     } catch {
         $isFixtureInvocation = $false
@@ -362,16 +372,6 @@ function Assert-ExactProductionPin {
             'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
             'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
         )
-        'x64/mihomo' = @(
-            'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
-            'mihomo-windows-amd64-compatible-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-amd64-compatible-v1.19.32.zip',
-            '974a4d7ad69aed27aa2e8f91d61113573c14dadb14562c63e58effabf59816f0', 'mihomo-windows-amd64-compatible.exe',
-            '04f8d7fc2b314771e1ecbf15951d59f0e1cb7914503c88cfb6972ff6a824e314', '268435456',
-            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
-            '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
-            'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
-            '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
-        )
         # x86: the same upstream releases and commits, 32-bit Windows assets.
         'x86/xray' = @(
             'XTLS/Xray-core', 'v26.9.30', 'b26a91de4f3294e26a0ad0a970b81a386a41f789', 'MPL-2.0',
@@ -383,16 +383,6 @@ function Assert-ExactProductionPin {
             'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
             'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
         )
-        'x86/mihomo' = @(
-            'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
-            'mihomo-windows-386-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-386-v1.19.32.zip',
-            '2fb4cfe1552e74eb1b2a0b98ec334041286a0de2ca01ca1ae16b4bf179c09b3f', 'mihomo-windows-386.exe',
-            '113d2a9118c26288df743cd753da519f2b2b8de17f1db7a3a892c1dd795eec2e', '268435456',
-            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
-            '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
-            'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
-            '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
-        )
         # arm64: the same upstream releases and commits, ARM64 Windows assets.
         'arm64/xray' = @(
             'XTLS/Xray-core', 'v26.9.30', 'b26a91de4f3294e26a0ad0a970b81a386a41f789', 'MPL-2.0',
@@ -403,16 +393,6 @@ function Assert-ExactProductionPin {
             '1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5',
             'https://github.com/XTLS/Xray-core/archive/b26a91de4f3294e26a0ad0a970b81a386a41f789.zip',
             'eb89ddcf9d2eb622efa6bb45c1f04ab8f2b52af81d891f05ba7e23ac57cd8a8b'
-        )
-        'arm64/mihomo' = @(
-            'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
-            'mihomo-windows-arm64-v1.19.32.zip', 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-arm64-v1.19.32.zip',
-            '7a4f6e58af9a120920935f2150cf642d945085fdb3e753314505b334234e1d1e', 'mihomo-windows-arm64.exe',
-            '7211487d8e4092cf6cf6fbbdbc10a10fbde462847e36fb8a43479b0e4cad4b33', '268435456',
-            'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
-            '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
-            'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
-            '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
         )
     }
     $actual = @(
@@ -427,6 +407,81 @@ function Assert-ExactProductionPin {
     for ($index = 0; $index -lt $expected.Count; $index++) {
         if ($actual[$index] -cne $expected[$index]) { throw "Production manifest does not match the built-in immutable $Name pin tuple" }
     }
+}
+
+# Mihomo is never the stock MetaCubeX download: it is the pinned upstream source plus the patch
+# series in packaging/mihomo-patches, built reproducibly by scripts/build-mihomo.sh. The tuple pins
+# the patched binary of each architecture.
+function Assert-ExactMihomoPin {
+    param([object]$Component)
+    $common = @(
+        'MetaCubeX/mihomo', 'v1.19.32', '88dcbf7f1614a67c3b36b848ee3592dfa92ada36', 'GPL-3.0-only',
+        'multicore.1', 'packaging/mihomo-patches/manifest.json'
+    )
+    $license = @(
+        'mihomo-GPL-3.0.txt', 'https://raw.githubusercontent.com/MetaCubeX/mihomo/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE',
+        '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
+        'https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip',
+        '63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30'
+    )
+    $binaries = @{
+        'x64' = @('windows-amd64', 'mihomo-windows-amd64.exe', '445fa386b094ddf1dfae97f72f39525c1b45a956dd60583a24d0bf28f620fc5c')
+        'x86' = @('windows-386', 'mihomo-windows-386.exe', '5ac12d37b1c1a43473a6d77894acc62a50edd87bdc760855d6531aa38c01dbc1')
+        'arm64' = @('windows-arm64', 'mihomo-windows-arm64.exe', '8fe2dc9b2bb0a38b94e6fa2d972dece372b4aff6a71c2817914bbc201718c377')
+    }
+    if (-not ($Component.PSObject.Properties.Name -contains 'build') -or ($Component.PSObject.Properties.Name -contains 'asset')) {
+        throw 'Production Mihomo must be the pinned patched build (components.mihomo.build), never a downloaded stock asset'
+    }
+    $expected = @($common + $binaries[$Architecture] + $license)
+    $actual = @(
+        [string]$Component.project, [string]$Component.version, [string]$Component.commit, [string]$Component.license,
+        [string]$Component.build.series, [string]$Component.build.recipe,
+        [string]$Component.build.target, [string]$Component.build.file, [string]$Component.build.executableSha256,
+        [string]$Component.licenseFile.name, [string]$Component.licenseFile.url, [string]$Component.licenseFile.sha256,
+        [string]$Component.source.url, [string]$Component.source.sha256
+    )
+    if ($actual.Count -ne $expected.Count) { throw 'Incomplete built-in pin tuple for mihomo' }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($actual[$index] -cne $expected[$index]) { throw 'Production manifest does not match the built-in immutable mihomo pin tuple' }
+    }
+}
+
+# The recipe (packaging/mihomo-patches/manifest.json) must describe exactly the binary this package
+# pins, and the patches in the tree must be the pinned series.
+function Assert-MihomoRecipe {
+    param([object]$Component)
+    $recipePath = Join-Path $RepositoryRoot ([string]$Component.build.recipe).Replace('/', '\')
+    Assert-File $recipePath 'Mihomo build recipe'
+    $recipe = Get-Content -Raw -LiteralPath $recipePath | ConvertFrom-Json
+    if ([string]$recipe.series -cne [string]$Component.build.series) { throw 'Mihomo recipe series does not match versions.json' }
+    if ([string]$recipe.upstream.version -cne [string]$Component.version -or [string]$recipe.upstream.commit -cne [string]$Component.commit -or
+        [string]$recipe.upstream.source.url -cne [string]$Component.source.url -or [string]$recipe.upstream.source.sha256 -cne [string]$Component.source.sha256) {
+        throw 'Mihomo recipe upstream source does not match versions.json'
+    }
+    $target = $recipe.targets.([string]$Component.build.target)
+    if ($null -eq $target -or [string]$target.file -cne [string]$Component.build.file -or [string]$target.sha256 -cne [string]$Component.build.executableSha256) {
+        throw "Mihomo recipe target $($Component.build.target) does not pin the binary versions.json pins"
+    }
+    $patchDirectory = Split-Path -Parent $recipePath
+    [string[]]$listed = @($recipe.patches | ForEach-Object { [string]$_.file })
+    [string[]]$onDisk = @(Get-ChildItem -LiteralPath $patchDirectory -Filter '*.patch' -File | ForEach-Object { $_.Name })
+    [Array]::Sort($onDisk, [StringComparer]::Ordinal)
+    if (($listed -join '|') -cne ($onDisk -join '|')) { throw 'packaging/mihomo-patches does not hold exactly the pinned patch series' }
+    foreach ($patch in $recipe.patches) { Assert-Hash (Join-Path $patchDirectory ([string]$patch.file)) ([string]$patch.sha256) "Mihomo patch $($patch.file)" }
+}
+
+# The patched Mihomo binary from -MihomoBinariesDirectory, checked against its pin before any
+# Rust build starts.
+function Resolve-PinnedMihomoBinary {
+    param([object]$Component)
+    if ([string]::IsNullOrWhiteSpace($MihomoBinariesDirectory)) {
+        throw 'Packaging needs the patched Mihomo build: run scripts/build-mihomo.sh --output <dir> (or scripts/build-mihomo-in-docker.sh) and pass -MihomoBinariesDirectory <dir> (or set MULTICORE_MIHOMO_BINARIES_DIR)'
+    }
+    Assert-SafeLeafName ([string]$Component.build.file) 'mihomo binary name'
+    $binary = Join-Path (Get-FullPath $MihomoBinariesDirectory) ([string]$Component.build.file)
+    Assert-File $binary 'Patched Mihomo binary'
+    Assert-Hash $binary ([string]$Component.build.executableSha256) 'patched mihomo executable'
+    $binary
 }
 
 function Assert-ExactDashboardPin {
@@ -751,15 +806,28 @@ try {
     foreach ($componentName in @('xray', 'mihomo')) {
         $component = $manifest.components.$componentName
         if ($component.commit -cnotmatch '^[0-9a-f]{40}$') { throw "$componentName must use a full lowercase commit pin" }
-        foreach ($hash in @($component.asset.sha256, $component.asset.executableSha256, $component.licenseFile.sha256, $component.source.sha256)) {
+        $names = $component.PSObject.Properties.Name
+        $isPatchedBuild = $names -contains 'build'
+        if ($isPatchedBuild -and ($componentName -cne 'mihomo' -or $names -contains 'asset')) { throw "$componentName must name exactly one of asset or build" }
+        $binaryHashes = if ($isPatchedBuild) { @($component.build.executableSha256) } else { @($component.asset.sha256, $component.asset.executableSha256) }
+        foreach ($hash in (@($binaryHashes) + @($component.licenseFile.sha256, $component.source.sha256))) {
             if ($hash -cnotmatch '^[0-9a-f]{64}$') { throw "$componentName contains an invalid SHA-256 pin" }
         }
-        Assert-SafeLeafName $component.asset.name "$componentName archive name"
+        if ($isPatchedBuild) {
+            Assert-SafeLeafName $component.build.file "$componentName binary name"
+        } else {
+            Assert-SafeLeafName $component.asset.name "$componentName archive name"
+            [void](Assert-SafeArchiveName $component.asset.entry)
+        }
         Assert-SafeLeafName $component.licenseFile.name "$componentName license name"
-        [void](Assert-SafeArchiveName $component.asset.entry)
+        if ($isProductionManifest -and $componentName -ceq 'mihomo') {
+            # Also with offline inputs: a production package never carries a stock Mihomo.
+            Assert-ExactMihomoPin $component
+            Assert-MihomoRecipe $component
+        }
         if (-not $OfflineSourceDirectory) {
-            Assert-ExactProductionPin $componentName $component
-            Assert-PinnedHttpsUrl $component.asset.url
+            if ($componentName -ceq 'xray') { Assert-ExactProductionPin $componentName $component }
+            if (-not $isPatchedBuild) { Assert-PinnedHttpsUrl $component.asset.url }
             Assert-PinnedHttpsUrl $component.licenseFile.url
             Assert-PinnedHttpsUrl $component.source.url
             if (-not $component.licenseFile.url.Contains($component.commit) -or -not $component.source.url.Contains($component.commit)) { throw "$componentName license/source URLs are not pinned to its full commit" }
@@ -791,10 +859,14 @@ try {
         }
     }
 
+    $mihomoIsPatchedBuild = $manifest.components.mihomo.PSObject.Properties.Name -contains 'build'
+    $patchedMihomoBinary = $null
     if ($isProductionManifest) {
         if ($DesktopExecutablePath -or $DaemonExecutablePath -or $UpdaterExecutablePath -or $CoreHostExecutablePath) {
             throw 'Production packaging builds all Rust executables internally; executable overrides are fixture-only'
         }
+        # Checked before the (long) Rust build, so a missing or wrong Mihomo build fails at once.
+        $patchedMihomoBinary = Resolve-PinnedMihomoBinary $manifest.components.mihomo
         $persistentRustTarget = [bool]$CargoTargetDirectory
         if ($persistentRustTarget) {
             $rustTarget = Get-FullPath $CargoTargetDirectory
@@ -845,12 +917,18 @@ try {
 
     foreach ($componentName in @('xray', 'mihomo')) {
         $component = $manifest.components.$componentName
-        $archive = Join-Path $stage ('.inputs\' + $component.asset.name)
-        Get-InputFile $component.asset.name $component.asset.url $archive
-        Assert-Hash $archive $component.asset.sha256 "$componentName archive"
         $coreTarget = Join-Path $stage ("cores\$componentName.exe")
-        Expand-ExactZipEntry $archive $component.asset.entry ([int64]$component.asset.maximumExpandedBytes) $coreTarget
-        Assert-Hash $coreTarget $component.asset.executableSha256 "$componentName executable"
+        if ($componentName -ceq 'mihomo' -and $mihomoIsPatchedBuild) {
+            if (-not $patchedMihomoBinary) { $patchedMihomoBinary = Resolve-PinnedMihomoBinary $component }
+            Copy-CreateNew $patchedMihomoBinary $coreTarget
+            Assert-Hash $coreTarget $component.build.executableSha256 "$componentName executable"
+        } else {
+            $archive = Join-Path $stage ('.inputs\' + $component.asset.name)
+            Get-InputFile $component.asset.name $component.asset.url $archive
+            Assert-Hash $archive $component.asset.sha256 "$componentName archive"
+            Expand-ExactZipEntry $archive $component.asset.entry ([int64]$component.asset.maximumExpandedBytes) $coreTarget
+            Assert-Hash $coreTarget $component.asset.executableSha256 "$componentName executable"
+        }
         Assert-NativePeExecutable $coreTarget "$componentName executable"
 
         $licenseTarget = Join-Path $stage ('licenses\' + $component.licenseFile.name)

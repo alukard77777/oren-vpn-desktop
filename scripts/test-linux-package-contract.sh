@@ -49,6 +49,13 @@ for relative in "${executables[@]}"; do
   }
 done
 
+# The staged Mihomo is the pinned patched build (packaging/mihomo-patches), never a stock core.
+mihomo_pin="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["components"]["mihomo"]["build"]["executableSha256"])' "$ROOT/packaging/linux/versions.json")"
+echo "$mihomo_pin  $STAGE/usr/lib/multicore/cores/mihomo" | sha256sum -c --quiet || {
+  echo "Staged Mihomo is not the pinned patched build" >&2
+  exit 1
+}
+
 for relative in "${metadata[@]}"; do
   [[ -f "$STAGE/$relative" && -r "$STAGE/$relative" ]] || { echo "Missing metadata: $relative" >&2; exit 1; }
 done

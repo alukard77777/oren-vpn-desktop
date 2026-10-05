@@ -1424,6 +1424,8 @@ pub fn stage_runtime_with_mihomo_control(
     ] {
         mapping.remove(YamlValue::String(key.to_owned()));
     }
+    // The REALITY policy keys of the patched core stay, with a value it accepts (or not at all).
+    crate::config_sanitize::normalize_reality_policy(mapping);
     let external_ui_keys: Vec<_> = mapping
         .keys()
         .filter(|key| {

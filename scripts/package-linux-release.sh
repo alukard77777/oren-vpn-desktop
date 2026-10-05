@@ -83,6 +83,38 @@ PY
     chmod 0755 "$target"
 }
 
+# Mihomo is never the stock MetaCubeX download: it is the pinned upstream source plus the patch
+# series in packaging/mihomo-patches (REALITY fixes, docs/reality.md), built by
+# scripts/build-mihomo.sh. MULTICORE_MIHOMO_BINARIES_DIR may hold an earlier output of that script;
+# either way the binary must match the SHA-256 pinned in versions.json.
+install_mihomo() {
+    local fields
+    fields="$(python3 - "$MANIFEST" <<'PY'
+import json, sys
+mihomo = json.load(open(sys.argv[1]))["components"]["mihomo"]
+if "asset" in mihomo or "build" not in mihomo:
+    sys.exit("versions.json must pin the patched Mihomo build (components.mihomo.build), not a stock asset")
+build = mihomo["build"]
+print(build["target"], build["file"], build["executableSha256"])
+PY
+)"
+    local target file exe_sha
+    read -r target file exe_sha <<<"$fields"
+    local directory="${MULTICORE_MIHOMO_BINARIES_DIR:-}" scratch=""
+    if [[ -z "$directory" ]]; then
+        scratch="$(mktemp -d "$CACHE/mihomo-build.XXXXXX")"
+        directory="$scratch/out"
+        "$ROOT/scripts/build-mihomo.sh" --cache "$CACHE/mihomo" --output "$directory" "$target"
+    fi
+    echo "$exe_sha  $directory/$file" | sha256sum -c --quiet || {
+        echo "the Mihomo binary in $directory does not match its pinned SHA-256" >&2
+        exit 1
+    }
+    install -m 0755 "$directory/$file" "$STAGE_CORES/mihomo"
+    echo "$exe_sha  $STAGE_CORES/mihomo" | sha256sum -c --quiet
+    if [[ -n "$scratch" ]]; then rm -rf "$scratch"; fi
+}
+
 PACKAGE_ROOT="$OUTPUT/usr/lib/multicore"
 STAGE_CORES="$PACKAGE_ROOT/cores"
 install -d -m 0755 "$PACKAGE_ROOT/runtime" "$STAGE_CORES" "$OUTPUT/usr/bin" \
@@ -162,7 +194,7 @@ install -m 0755 "$CARGO_TARGET_DIR/release/multicore-core-host" "$PACKAGE_ROOT/r
 strip --strip-all "$PACKAGE_ROOT/multicore" "$PACKAGE_ROOT/runtime/multicore-daemon" \
     "$PACKAGE_ROOT/runtime/multicore-core-host"
 fetch_core xray
-fetch_core mihomo
+install_mihomo
 fetch_dashboard
 
 ln -s ../lib/multicore/multicore "$OUTPUT/usr/bin/multicore"

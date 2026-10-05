@@ -26,6 +26,16 @@ projects. MULTICORE does not claim ownership of either project or its marks.
   `https://github.com/MetaCubeX/mihomo/archive/88dcbf7f1614a67c3b36b848ee3592dfa92ada36.zip`
 - Observed source snapshot SHA-256:
   `63ad2b98fb7a1067422af350a172e2c656c45a2564d0202b5181c6dc4cc7dd30`
+- Modified: the bundled Mihomo is built by MULTICORE from that snapshot plus three REALITY
+  patches (configurable client version, adaptive X25519MLKEM768 key share, `reality-mlkem` /
+  `reality-client-version` config keys), taken unmodified from SlothClash by Nemu-x
+  (`https://github.com/Nemu-x/SlothClash`, commit `9a09ac799e9c63ed170cbbc039670be65311afff`,
+  `core/patches/mihomo/`, GPL-3.0). The modified program is distributed under the same GNU GPL
+  version 3. The patches, their SHA-256 pins and the build script are in the MULTICORE source
+  (`packaging/mihomo-patches/`, `scripts/build-mihomo.sh`).
+- Corresponding source: every release attaches `mihomo-source.zip`, the complete patched source
+  tree that was compiled, with the patches, the pin manifest and the build script under
+  `MULTICORE-BUILD/`.
 
 ## Twemoji Mozilla font
 

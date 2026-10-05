@@ -49,14 +49,13 @@
       "version": "v1.19.32",
       "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
       "license": "GPL-3.0-only",
-      "asset": {
-        "name": "mihomo-windows-386-v1.19.32.zip",
-        "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-windows-386-v1.19.32.zip",
-        "sha256": "2fb4cfe1552e74eb1b2a0b98ec334041286a0de2ca01ca1ae16b4bf179c09b3f",
-        "entry": "mihomo-windows-386.exe",
-        "executableSha256": "113d2a9118c26288df743cd753da519f2b2b8de17f1db7a3a892c1dd795eec2e",
-        "maximumExpandedBytes": 268435456,
-        "note": "Mihomo embeds Wintun (sing-tun): this 386 build carries the x86 wintun.dll plus the amd64/arm64 driver helpers Wintun uses under WOW64, so no wintun.dll is shipped separately (same as x64)."
+      "build": {
+        "series": "multicore.1",
+        "recipe": "packaging/mihomo-patches/manifest.json",
+        "target": "windows-386",
+        "file": "mihomo-windows-386.exe",
+        "executableSha256": "5ac12d37b1c1a43473a6d77894acc62a50edd87bdc760855d6531aa38c01dbc1",
+        "note": "Built by scripts/build-mihomo.sh from the pinned upstream source plus packaging/mihomo-patches (REALITY client version + adaptive X25519MLKEM768, see docs/reality.md). Never the stock MetaCubeX download. Mihomo embeds Wintun (sing-tun): the 386 build carries the x86 wintun.dll plus the amd64/arm64 driver helpers Wintun uses under WOW64, so no wintun.dll is shipped separately (same as x64)."
       },
       "licenseFile": {
         "name": "mihomo-GPL-3.0.txt",

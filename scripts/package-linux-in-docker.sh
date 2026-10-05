@@ -46,6 +46,7 @@ docker run --rm \
     -e HOME=/tmp/home \
     -e CARGO_TARGET_DIR=/build/multicore/target/linux-release-ubuntu \
     -e MULTICORE_UPDATE_REPOSITORY="${MULTICORE_UPDATE_REPOSITORY:-}" \
+    -e GOMAXPROCS \
     -v "$ROOT:/build/multicore" \
     -v "$OUTPUT:/output" \
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \

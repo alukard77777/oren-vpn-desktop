@@ -222,9 +222,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-release-wor
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test-windows-elevation-manifest-contract.ps1
 ```
 
+The bundled Mihomo is the pinned MetaCubeX source plus the REALITY patches in
+`packaging/mihomo-patches`, built reproducibly (pinned Go, SHA-256-pinned output;
+see [docs/reality.md](docs/reality.md)). Build it first, in Git Bash or on Linux
+(`scripts/build-mihomo-in-docker.sh` runs the same build in the Linux build image):
+
+```bash
+./scripts/build-mihomo.sh --output dist/mihomo   # every target, plus mihomo-source.zip
+```
+
 Create the verified portable bundle and updater asset:
 
 ```powershell
+$env:MULTICORE_MIHOMO_BINARIES_DIR = (Resolve-Path dist\mihomo).Path
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -DestinationPath dist\multicore-windows-x64 `
   -UpdateRepository fatyzzz/multicore-releases `
@@ -253,7 +263,9 @@ inside the Ubuntu 22.04 image so they run on glibc 2.35 and newer:
 ```
 
 `packaging/linux/versions.json` pins the Linux core archives and executables by
-SHA-256. CI verifies Linux and Windows on every pull request and builds the Linux
+SHA-256; `package-linux-release.sh` builds the patched Mihomo with
+`scripts/build-mihomo.sh` (or takes `MULTICORE_MIHOMO_BINARIES_DIR`).
+CI verifies Linux and Windows on every pull request and builds the Linux
 packages as artifacts on pushes to `main` and `feature/**`. The same RPM is installed
 and smoke-tested in clean Fedora 43 and 44 containers before a tagged release can
 publish. See [Fedora RPM verification](docs/fedora-rpm-verification.md) for the build

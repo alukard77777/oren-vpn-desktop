@@ -112,6 +112,16 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Build patched Mihomo
+        shell: pwsh
+        run: |
+          # The pinned MetaCubeX source + packaging/mihomo-patches, built with the pinned Go release
+          # (Git Bash on this runner); every binary must match its SHA-256 pin or nothing ships.
+          if (-not (Test-Path -LiteralPath 'C:\Program Files\Git\bin\bash.exe' -PathType Leaf)) { throw 'Git Bash is required to build Mihomo' }
+          & 'C:\Program Files\Git\bin\bash.exe' scripts/build-mihomo.sh --output dist/mihomo --cache "$env:RUNNER_TEMP/mihomo-cache" windows-amd64 windows-386 windows-arm64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "MULTICORE_MIHOMO_BINARIES_DIR=$((Resolve-Path 'dist/mihomo').Path)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build verified portable bundle
         shell: pwsh
         run: |
@@ -226,18 +236,15 @@ jobs:
         shell: pwsh
         run: |
           $manifest = Get-Content -Raw packaging/windows-x64/versions.json | ConvertFrom-Json
-          $sources = @(
-            @{ Component = $manifest.components.xray; Name = 'Xray-core-source.zip' },
-            @{ Component = $manifest.components.mihomo; Name = 'mihomo-source.zip' }
-          )
-          foreach ($source in $sources) {
-            $destination = Join-Path 'dist/release' $source.Name
-            Invoke-WebRequest -UseBasicParsing -Uri $source.Component.source.url -OutFile $destination
-            $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -cne [string]$source.Component.source.sha256) {
-              throw "Pinned source checksum mismatch for $($source.Name)"
-            }
+          $destination = 'dist/release/Xray-core-source.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri $manifest.components.xray.source.url -OutFile $destination
+          $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne [string]$manifest.components.xray.source.sha256) {
+            throw 'Pinned source checksum mismatch for Xray-core-source.zip'
           }
+          # The GPL corresponding source of the shipped Mihomo: the patched tree it was compiled
+          # from, with the patches, the recipe and the build script (written by build-mihomo.sh).
+          Copy-Item -LiteralPath dist/mihomo/mihomo-source.zip -Destination dist/release/mihomo-source.zip
 
       - name: Collect Linux packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -314,7 +321,7 @@ jobs:
           - `multicore_amd64.deb`, `multicore-x86_64.pkg.tar.zst`, `multicore.x86_64.rpm` and `MultiCore-x86_64.AppImage` - the same Linux packages under version-less names, for stable `releases/latest/download/` links.
           - On Linux, Connect asks for the administrator password through polkit to start the core host.
           - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
-          - Upstream source archives are attached for the exact bundled Xray-core and Mihomo commits.
+          - Source archives are attached for the exact bundled Xray-core commit and for the bundled Mihomo (the pinned MetaCubeX commit with the REALITY patches in packaging/mihomo-patches, as compiled).
 
           PUBLIC UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn.
           "@ | Set-Content -LiteralPath dist/release/RELEASE_NOTES.md -Encoding utf8
