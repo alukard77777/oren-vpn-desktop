@@ -80,8 +80,25 @@ build_appimage() {
     cp "$STAGE/usr/share/applications/multicore.desktop" "$appdir/multicore.desktop"
     cp "$STAGE/usr/share/icons/hicolor/scalable/apps/multicore.svg" "$appdir/multicore.svg"
     ln -s multicore.svg "$appdir/.DirIcon"
-    ARCH=x86_64 "$tool" --appimage-extract-and-run --no-appstream "$appdir" \
-        "$OUTPUT/MultiCore-$VERSION-x86_64.AppImage"
+    # With an update channel compiled in, the AppImage also carries gh-releases-zsync update
+    # information and gets a .zsync file next to it, so AppImageUpdate can fetch the newest
+    # release as a delta. The in-app updater keeps using the versioned asset name.
+    local update_args=()
+    local image="MultiCore-$VERSION-x86_64.AppImage"
+    if [[ -n "${MULTICORE_UPDATE_REPOSITORY:-}" ]]; then
+        [[ "$MULTICORE_UPDATE_REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || {
+            echo "invalid MULTICORE_UPDATE_REPOSITORY: $MULTICORE_UPDATE_REPOSITORY" >&2
+            exit 1
+        }
+        local owner="${MULTICORE_UPDATE_REPOSITORY%%/*}" repository="${MULTICORE_UPDATE_REPOSITORY#*/}"
+        update_args=(-u "gh-releases-zsync|$owner|$repository|latest|MultiCore-*x86_64.AppImage.zsync")
+    fi
+    # appimagetool writes the .zsync into its working directory.
+    (cd "$OUTPUT" && ARCH=x86_64 VERSION="$VERSION" "$tool" --appimage-extract-and-run --no-appstream \
+        ${update_args[@]+"${update_args[@]}"} "$appdir" "$image")
+    if [[ -n "${MULTICORE_UPDATE_REPOSITORY:-}" ]]; then
+        [[ -s "$OUTPUT/$image.zsync" ]] || { echo "appimagetool did not write $image.zsync" >&2; exit 1; }
+    fi
 }
 
 IFS=',' read -r -a requested <<<"$FORMATS"

@@ -1617,6 +1617,10 @@ export component AppWindow inherits Window {
     // TUN (all traffic) vs the system proxy without an administrator prompt; next connect.
     in-out property <bool> tun-enabled: true;
     in property <bool> tun-toggle-available: false;
+    // «Локальный прокси: 127.0.0.1:PORT» in Settings: the saved mixed port other apps can use.
+    in property <string> local-proxy-address;
+    in-out property <bool> local-proxy-copied: false;
+    callback copy-local-proxy();
     // Windows per-user install without the MultiCore service: offer the service installer.
     in property <bool> service-card-visible: false;
     in property <bool> service-install-busy: false;
@@ -4268,7 +4272,30 @@ export component AppWindow inherits Window {
                                     description: root.launch-at-sign-in-enabled ? @tr("Когда появится сеть и профиль будет готов") : @tr("Сначала включите автозапуск");
                                     checked: root.auto-connect-on-startup;
                                     enabled: root.launch-at-sign-in-enabled && !root.profile-menu-open;
+                                    show-separator: root.local-proxy-address != "";
                                     toggled(value) => { root.auto-connect-on-startup = value; }
+                                }
+                                if root.local-proxy-address != "": HorizontalLayout {
+                                    height: 48px;
+                                    spacing: 12px;
+                                    Text {
+                                        text: @tr("Локальный прокси: {}", root.local-proxy-address);
+                                        color: Theme.text-primary;
+                                        font-size: Theme.type-label-size;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        TextAction {
+                                            label: @tr("Копировать");
+                                            swap-label: @tr("Скопировано ✓");
+                                            swapped: root.local-proxy-copied;
+                                            enabled: !root.profile-menu-open;
+                                            activated => { root.copy-local-proxy(); }
+                                        }
+                                    }
                                 }
                             }
                         }

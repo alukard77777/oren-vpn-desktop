@@ -5,6 +5,8 @@ pub mod elevation_protocol;
 mod event;
 mod fetch;
 mod input;
+pub mod local_proxy_port;
+mod mihomo_dns_guard;
 mod network;
 mod profile;
 mod service_logo;

@@ -83,7 +83,10 @@ pinned Xray and Mihomo binaries under `cores/`.
 - **Updates.** Arch, Debian, and Fedora packages are updated by the package manager; the
   client only announces new releases. The AppImage downloads
   `MultiCore-<v>-x86_64.AppImage` from the release channel, verifies size and
-  SHA-256, keeps the previous image as `<name>.old`, and relaunches.
+  SHA-256, keeps the previous image as `<name>.old`, and relaunches. It also
+  carries zsync update information for AppImageUpdate. Each release has
+  version-less copies of the Linux packages for stable download links; see
+  [download links, winget and the AUR](docs/distribution-manifests.md).
 
 ## Subscription profiles
 

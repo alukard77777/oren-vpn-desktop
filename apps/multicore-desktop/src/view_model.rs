@@ -895,6 +895,9 @@ pub struct DesktopViewModel {
     /// The daemon reports running cores (connected, or warm through the service).
     cores_ready: bool,
     service_mode: bool,
+    /// The connection is (or the next one will be) made through TUN rather than the system
+    /// proxy; the mode is locked while connected.
+    connection_uses_tun: bool,
     latency_error: Option<String>,
     conflicting_apps: Vec<&'static str>,
     conflicting_apps_dismissed_key: Option<String>,
@@ -981,6 +984,7 @@ impl DesktopViewModel {
             latency_sweep_fresh: BTreeSet::new(),
             latency_sweep_priority: None,
             cores_ready: false,
+            connection_uses_tun: true,
             service_mode: false,
             latency_error: None,
             conflicting_apps: Vec::new(),
@@ -1228,6 +1232,14 @@ impl DesktopViewModel {
 
     pub(crate) fn service_mode(&self) -> bool {
         self.service_mode
+    }
+
+    pub(crate) fn connection_uses_tun(&self) -> bool {
+        self.connection_uses_tun
+    }
+
+    pub(crate) fn set_connection_uses_tun(&mut self, tun: bool) {
+        self.connection_uses_tun = tun;
     }
 
     pub(crate) fn active_profile_id(&self) -> Option<&str> {
@@ -3722,6 +3734,12 @@ fn present_runtime_check(value: Option<&str>, loading: bool) -> RuntimeCheckPres
         value: value.into(),
         tone: tone.into(),
     }
+}
+
+/// What Settings shows for the saved local proxy port (empty: no row).
+pub(crate) fn local_proxy_address(port: Option<u16>) -> String {
+    port.map(|port| format!("127.0.0.1:{port}"))
+        .unwrap_or_default()
 }
 
 fn latency_display(status: &str, latency_ms: Option<u64>) -> (String, String) {
@@ -9515,6 +9533,39 @@ mod tests {
         assert!(main.contains("tracker.set_tun_enabled(ui.get_tun_enabled());"));
         assert!(main.contains("client.connect_with_tun(tun)"));
         assert!(main.contains("!ui.get_tun_toggle_available() || ui.get_tun_enabled()"));
+    }
+
+    #[test]
+    fn settings_show_the_saved_local_proxy_address_with_a_copy_action() {
+        let app = include_str!("../ui/app.slint").replace(
+            "
+", "
+",
+        );
+        let main = include_str!("main.rs");
+        let card = app
+            .split("connection-rows := VerticalLayout {")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("if root.tun-toggle-available: HorizontalLayout {")
+                    .next()
+            })
+            .expect("connection card");
+        let row = card
+            .split("if root.local-proxy-address != \"\": HorizontalLayout {")
+            .nth(1)
+            .expect("local proxy row");
+        assert!(row.contains("@tr(\"Локальный прокси: {}\", root.local-proxy-address)"));
+        assert!(row.contains("label: @tr(\"Копировать\");"));
+        assert!(row.contains("swap-label: @tr(\"Скопировано ✓\");"));
+        assert!(row.contains("activated => { root.copy-local-proxy(); }"));
+        // The row above draws the separator only when this row is there.
+        assert!(card.contains("show-separator: root.local-proxy-address != \"\";"));
+        assert!(main.contains("ui.on_copy_local_proxy("));
+        assert!(main.contains("read_local_proxy_port("));
+        assert_eq!(local_proxy_address(Some(10780)), "127.0.0.1:10780");
+        assert_eq!(local_proxy_address(None), "");
     }
 
     #[test]

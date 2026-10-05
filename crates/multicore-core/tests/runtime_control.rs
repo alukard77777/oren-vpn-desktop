@@ -1266,3 +1266,214 @@ proxies: []
         assert_eq!(mihomo["tun"]["stack"], Value::from(expected), "{yaml}");
     }
 }
+
+/// The Mihomo document the overlay publishes for `yaml` (TUN mode).
+fn runtime_mihomo(yaml: &str) -> Value {
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let snapshot = Snapshot::parse(yaml.as_bytes(), b"{}").unwrap();
+    let directory = TempDirectory::new();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    serde_yaml_ng::from_slice(&fs::read(&published.mihomo_config).unwrap()).unwrap()
+}
+
+fn fake_ip_filter(mihomo: &Value) -> Option<Vec<String>> {
+    mihomo["dns"]
+        .get("fake-ip-filter")?
+        .as_sequence()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.as_str().unwrap().to_owned())
+                .collect()
+        })
+}
+
+#[test]
+fn fake_ip_without_a_filter_gets_one_that_keeps_ncsi_ntp_and_the_lan_real() {
+    let mihomo = runtime_mihomo(
+        "dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [https://1.1.1.1/dns-query]
+proxies: []
+",
+    );
+    let filter = fake_ip_filter(&mihomo).expect("a default fake-ip-filter");
+    for needed in [
+        "+.msftconnecttest.com",
+        "+.msftncsi.com",
+        "time.*.com",
+        "ntp.*.com",
+        "+.time.windows.com",
+        "+.pool.ntp.org",
+        "*.lan",
+        "*.local",
+        "*.arpa",
+        "localhost.ptlogin2.qq.com",
+    ] {
+        assert!(filter.iter().any(|entry| entry == needed), "{needed}");
+    }
+    // The mode stays Mihomo's default (blacklist); nothing else in the section moves.
+    assert!(mihomo["dns"].get("fake-ip-filter-mode").is_none());
+    assert_eq!(mihomo["dns"]["enhanced-mode"], Value::from("fake-ip"));
+}
+
+#[test]
+fn a_provider_fake_ip_filter_or_other_dns_mode_is_never_touched() {
+    // The provider's own list, even an explicitly empty one, is theirs.
+    let remnawave = Snapshot::parse(
+        include_bytes!("fixtures/remnawave-multicore-mihomo.yaml"),
+        multicore_core::IDLE_XRAY_CONFIG,
+    )
+    .unwrap();
+    let directory = TempDirectory::new();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&remnawave, directory.path(), &control).unwrap();
+    let mihomo: Value =
+        serde_yaml_ng::from_slice(&fs::read(&published.mihomo_config).unwrap()).unwrap();
+    assert_eq!(
+        fake_ip_filter(&mihomo).unwrap(),
+        [
+            "*.lan",
+            "*.local",
+            "+.msftconnecttest.com",
+            "+.msftncsi.com",
+            "+.stun.*.*",
+            "+.stun.*.*.*",
+            "time.windows.com",
+            "pool.ntp.org"
+        ]
+    );
+
+    for yaml in [
+        "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-filter: []}\nproxies: []\n",
+        // In whitelist and rule modes the list means something else entirely.
+        "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-filter-mode: whitelist}\nproxies: []\n",
+        "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-filter-mode: rule}\nproxies: []\n",
+        "dns: {enable: true, enhanced-mode: redir-host}\nproxies: []\n",
+        "dns: {enable: true}\nproxies: []\n",
+    ] {
+        let mihomo = runtime_mihomo(yaml);
+        let filter = fake_ip_filter(&mihomo);
+        assert!(filter.is_none_or(|filter| filter.is_empty()), "{yaml}");
+    }
+    // No DNS section is not invented.
+    assert!(runtime_mihomo("proxies: []\n").get("dns").is_none());
+}
+
+#[test]
+fn a_v6_fake_ip_pool_the_tun_would_not_route_is_dropped() {
+    // The usual private-range exclusion list covers every ULA pool: Windows would send those
+    // connections out of the physical adapter, where nothing answers (a Happy-Eyeballs stall
+    // on every dual-stack site). Without a pool Mihomo answers AAAA with no records.
+    let excluded = runtime_mihomo(
+        "dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range6: fdfe:dcba:9876::1/64
+tun:
+  enable: true
+  route-exclude-address: [192.168.0.0/16, fc00::/7]
+proxies: []
+",
+    );
+    assert!(excluded["dns"].get("fake-ip-range6").is_none());
+    assert_eq!(excluded["dns"]["ipv6"], Value::from(true));
+
+    for (why, yaml) in [
+        (
+            "routed",
+            "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-range6: 'fdfe:dcba:9876::1/64'}
+tun: {enable: true, route-exclude-address: [192.168.0.0/16, '2001:db8::/32']}
+proxies: []
+",
+        ),
+        (
+            "on-link on the tunnel itself",
+            "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-range6: 'fdfe:dcba:9876::1/64'}
+tun:
+  enable: true
+  inet6-address: ['fdfe:dcba:9876::1/64']
+  route-exclude-address: ['fc00::/7']
+proxies: []
+",
+        ),
+        (
+            "no auto-route: the provider owns the routing table",
+            "dns: {enable: true, enhanced-mode: fake-ip, fake-ip-range6: 'fdfe:dcba:9876::1/64'}
+tun: {enable: true, auto-route: false, route-exclude-address: ['fc00::/7']}
+proxies: []
+",
+        ),
+    ] {
+        let mihomo = runtime_mihomo(yaml);
+        assert_eq!(
+            mihomo["dns"]["fake-ip-range6"],
+            Value::from("fdfe:dcba:9876::1/64"),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn a_tun_without_ipv6_blackholes_native_ipv6_instead_of_leaking_it() {
+    // With `ipv6: false` Mihomo gives the TUN no inet6-address, so auto-route installs no IPv6
+    // routes and a dual-stack machine's native IPv6 would bypass the tunnel. sing-tun's
+    // strict-route then makes IPv6 unreachable for everything but Mihomo (Windows: a WFP
+    // block on ALE_AUTH_CONNECT_V6; Linux: an `unreachable` rule for AF_INET6).
+    for yaml in [
+        "ipv6: false\ntun: {enable: true, auto-route: true}\nproxies: []\n",
+        "ipv6: false\ntun: {enable: true}\nproxies: []\n",
+        "ipv6: false\nproxies: []\n",
+        "tun: {enable: true, inet6-address: []}\nproxies: []\n",
+    ] {
+        let mihomo = runtime_mihomo(yaml);
+        assert_eq!(mihomo["tun"]["strict-route"], Value::from(true), "{yaml}");
+    }
+}
+
+#[test]
+fn ipv6_through_the_tunnel_or_a_provider_routing_choice_keeps_its_strict_route() {
+    for (yaml, expected) in [
+        // IPv6 enabled (Mihomo's default): the TUN routes ::/0 itself, nothing leaks.
+        ("tun: {enable: true}\nproxies: []\n", None),
+        ("ipv6: true\ntun: {enable: true}\nproxies: []\n", None),
+        // The provider's own choice stands.
+        (
+            "ipv6: false\ntun: {enable: true, strict-route: false}\nproxies: []\n",
+            Some(false),
+        ),
+        // No auto-route: the provider owns the routing table.
+        (
+            "ipv6: false\ntun: {enable: true, auto-route: false}\nproxies: []\n",
+            None,
+        ),
+    ] {
+        let mihomo = runtime_mihomo(yaml);
+        assert_eq!(
+            mihomo["tun"].get("strict-route").and_then(Value::as_bool),
+            expected,
+            "{yaml}"
+        );
+    }
+    // The Remnawave template already asks for it.
+    let remnawave = Snapshot::parse(
+        include_bytes!("fixtures/remnawave-multicore-mihomo.yaml"),
+        multicore_core::IDLE_XRAY_CONFIG,
+    )
+    .unwrap();
+    let directory = TempDirectory::new();
+    let control =
+        MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral").unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&remnawave, directory.path(), &control).unwrap();
+    let mihomo: Value =
+        serde_yaml_ng::from_slice(&fs::read(&published.mihomo_config).unwrap()).unwrap();
+    assert_eq!(mihomo["tun"]["strict-route"], Value::from(true));
+    assert_eq!(mihomo["ipv6"], Value::from(false));
+}
