@@ -243,7 +243,7 @@ def start_mihomo(binary, keys, rows, work, label, cleanup):
 
 
 def start_xray(binary, rows, work, cleanup):
-    home = os.path.join(work, "xray-client")
+    home = os.path.join(work, "xray-client-home")
     os.makedirs(home)
     inbounds, outbounds, rules, ports = [], [], [], []
     for index, row in enumerate(rows):
