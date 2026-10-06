@@ -84,6 +84,10 @@ pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
     metadata: SubscriptionMetadataHeaders,
+    /// Provider headers sent as leading `#key: value` lines of the body (see
+    /// [`split_body_headers`]); filled by [`HttpResponse::with_body_headers`], which also
+    /// removes those lines from `body`.
+    body_metadata: SubscriptionMetadataHeaders,
 }
 
 impl std::fmt::Debug for HttpResponse {
@@ -93,6 +97,7 @@ impl std::fmt::Debug for HttpResponse {
             .field("status", &self.status)
             .field("body_len", &self.body.len())
             .field("metadata_count", &self.metadata.fields.len())
+            .field("body_metadata_count", &self.body_metadata.fields.len())
             .finish()
     }
 }
@@ -141,6 +146,46 @@ impl SubscriptionMetadataHeaders {
         Self { fields }
     }
 
+    /// Pairs read from leading `#key: value` body lines: the same names, validation and
+    /// budget as response headers, except the ones only a real response can carry (a
+    /// download file name, Remnawave's device-limit signal).
+    fn from_body_pairs(pairs: Vec<(String, String)>) -> Self {
+        Self::from_pairs(pairs.into_iter().filter(|(name, _)| {
+            !matches!(name.as_str(), "content-disposition" | HWID_LIMIT_HEADER)
+        }))
+    }
+
+    /// The body-comment sources in priority order, each keeping only the keys that no real
+    /// header and no higher source sent: a comment only fills what the others left out.
+    fn comment_layers<const N: usize>(headers: &[&Self], comments: [&Self; N]) -> [Self; N] {
+        let mut sent: std::collections::HashSet<&str> = headers
+            .iter()
+            .flat_map(|headers| headers.fields.iter().map(|(name, _)| name.as_str()))
+            .collect();
+        comments.map(|source| {
+            let kept = Self {
+                fields: source
+                    .fields
+                    .iter()
+                    .filter(|(name, _)| !sent.contains(name.as_str()))
+                    .cloned()
+                    .collect(),
+            };
+            sent.extend(source.fields.iter().map(|(name, _)| name.as_str()));
+            kept
+        })
+    }
+
+    /// These headers followed by lower-priority fields, under the same validation and budget.
+    fn extended(&self, lower: &[Self]) -> Self {
+        Self::from_pairs(
+            self.fields
+                .iter()
+                .chain(lower.iter().flat_map(|source| source.fields.iter()))
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+    }
+
     fn from_header_map(headers: &HeaderMap) -> Self {
         Self::from_pairs(headers.iter().filter_map(|(name, value)| {
             std::str::from_utf8(value.as_bytes())
@@ -184,6 +229,74 @@ impl SubscriptionMetadataHeaders {
             })
             .map(|(_, value)| value.as_str())
     }
+}
+
+/// Leading `#key: value` body lines are looked for in at most this many lines ...
+const MAX_BODY_HEADER_LINES: usize = 64;
+/// ... and this many bytes from the start of the body (after a UTF-8 BOM).
+const MAX_BODY_HEADER_BYTES: usize = 16 * 1024;
+
+/// Providers that host a static file, or whose panel cannot set response headers, may write
+/// the same provider headers as comment lines at the very top of the body, as other clients
+/// accept them:
+///
+/// ```text
+/// #profile-title: base64:8J+agCBGam9yZA==
+/// #subscription-userinfo: upload=0; download=123; total=1073741824; expire=1798761600
+/// mixed-port: 7890
+/// ```
+///
+/// Only the leading block counts: blank lines and `#` lines (leading spaces allowed), up to
+/// the first other line, within [`MAX_BODY_HEADER_LINES`] lines and [`MAX_BODY_HEADER_BYTES`]
+/// bytes. A `#` line is a header when it reads `#[spaces]name:value`, `name` being letters,
+/// digits and `-` (any case); other `#` lines (free text, binary junk) are skipped. Returns
+/// the pairs found, and the body after the last `#` line of the block, or `None` when the
+/// body does not start with one (it is then used exactly as before).
+///
+/// Removing the block is safe for every body kind: in YAML these lines are comments, and
+/// neither JSON nor the combined bundle may begin with `#`.
+fn split_body_headers(body: &[u8]) -> (Vec<(String, String)>, Option<&[u8]>) {
+    let text = strip_utf8_bom(body);
+    let mut pairs = Vec::new();
+    let mut end_of_comments = None;
+    let mut position = 0;
+    for _ in 0..MAX_BODY_HEADER_LINES {
+        let remaining = &text[position..];
+        if remaining.is_empty() {
+            break;
+        }
+        let line_len = remaining
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(remaining.len(), |newline| newline + 1);
+        if position + line_len > MAX_BODY_HEADER_BYTES {
+            break;
+        }
+        let line = remaining[..line_len].trim_ascii();
+        position += line_len;
+        if line.is_empty() {
+            continue;
+        }
+        let Some(comment) = line.strip_prefix(b"#") else {
+            break;
+        };
+        end_of_comments = Some(position);
+        pairs.extend(body_header_pair(comment));
+    }
+    (pairs, end_of_comments.map(|end| &text[end..]))
+}
+
+fn body_header_pair(comment: &[u8]) -> Option<(String, String)> {
+    let (name, value) = std::str::from_utf8(comment).ok()?.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    Some((name.to_ascii_lowercase(), value.trim().to_owned()))
 }
 
 fn is_metadata_header(name: &str) -> bool {
@@ -689,6 +802,7 @@ async fn perform_get_detailed(
             status,
             body,
             metadata,
+            body_metadata: SubscriptionMetadataHeaders::default(),
         },
         retry_after,
     })
@@ -961,11 +1075,17 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
                 if looks_like_native_bundle(body) {
                     // A JSON array means the backend recognised the combined
                     // MultiCore request, so its answer is final.
-                    let outcome = parse_native(body).and_then(|snapshot| {
+                    let outcome = parse_native(body).and_then(|(snapshot, embedded)| {
+                        // Headers, then the bundle's own leading `#` lines, then those of
+                        // the Mihomo YAML inside it.
+                        let [bundle, embedded] = SubscriptionMetadataHeaders::comment_layers(
+                            &[&response.metadata],
+                            [&response.body_metadata, &embedded],
+                        );
                         snapshot
                             .with_subscription_metadata(
                                 url,
-                                &response.metadata,
+                                &response.metadata.extended(&[bundle, embedded]),
                                 current_unix_time(),
                             )
                             .map_err(|_| FetchError::InvalidBundle)
@@ -1036,7 +1156,7 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         &self,
         url: &str,
     ) -> (Option<Result<HttpResponse, FetchError>>, PerCoreState) {
-        let native = self.client.get(url, UA_NATIVE);
+        let native = self.subscription_get(url, UA_NATIVE);
         tokio::pin!(native);
         if let Ok(response) = tokio::time::timeout(NATIVE_HEAD_START, &mut native).await {
             return (Some(response), PerCoreState::NotStarted);
@@ -1063,13 +1183,26 @@ impl<C: HttpClient> SubscriptionFetcher<C> {
         }
     }
 
+    /// One subscription request; leading `#key: value` lines of its body become metadata
+    /// (see [`split_body_headers`]).
+    async fn subscription_get(
+        &self,
+        url: &str,
+        user_agent: &'static str,
+    ) -> Result<HttpResponse, FetchError> {
+        self.client
+            .get(url, user_agent)
+            .await
+            .map(HttpResponse::with_body_headers)
+    }
+
     /// The Mihomo and Xray requests together. A Mihomo configuration that routes nothing
     /// into Xray (see `standalone_mihomo`) waits only [`XRAY_GRACE`] for the Xray answer,
     /// which it does not need: a panel that serves only Mihomo may take its whole timeout to
     /// refuse the Xray request.
     async fn per_core(&self, url: &str) -> PerCore {
-        let mihomo = self.client.get(url, UA_MIHOMO);
-        let xray = self.client.get(url, UA_XRAY);
+        let mihomo = self.subscription_get(url, UA_MIHOMO);
+        let xray = self.subscription_get(url, UA_XRAY);
         tokio::pin!(mihomo, xray);
         tokio::select! {
             biased;
@@ -1193,7 +1326,20 @@ impl HttpResponse {
             status,
             body,
             metadata: SubscriptionMetadataHeaders::from_pairs(headers),
+            body_metadata: SubscriptionMetadataHeaders::default(),
         }
+    }
+
+    /// Moves the provider headers written as leading `#key: value` lines of the body into
+    /// `body_metadata` and removes those lines, so neither the configuration parsers nor the
+    /// generated core configurations ever see them. A body without such lines is untouched.
+    fn with_body_headers(mut self) -> Self {
+        let (pairs, rest) = split_body_headers(&self.body);
+        if let Some(rest) = rest {
+            self.body_metadata = SubscriptionMetadataHeaders::from_body_pairs(pairs);
+            self.body = rest.to_vec();
+        }
+        self
     }
 
     fn status_is_success(&self) -> bool {
@@ -1343,11 +1489,16 @@ fn parse_fallback(
             );
         }
     };
+    // Headers of either response, then the YAML's leading `#` lines, then the JSON's.
+    let [mihomo_comments, xray_comments] = SubscriptionMetadataHeaders::comment_layers(
+        &[&mihomo.metadata, &xray.metadata],
+        [&mihomo.body_metadata, &xray.body_metadata],
+    );
     snapshot
         .with_merged_subscription_metadata(
             url,
-            &mihomo.metadata,
-            &xray.metadata,
+            &mihomo.metadata.extended(&[mihomo_comments]),
+            &xray.metadata.extended(&[xray_comments]),
             current_unix_time(),
         )
         .map_err(|_| FetchError::InvalidConfig)
@@ -1368,10 +1519,13 @@ fn standalone_mihomo(url: &str, mihomo: &HttpResponse) -> Option<Result<Snapshot
     {
         return None;
     }
+    let [comments] =
+        SubscriptionMetadataHeaders::comment_layers(&[&mihomo.metadata], [&mihomo.body_metadata]);
+    let metadata = mihomo.metadata.extended(&[comments]);
     Some(
         Snapshot::parse(body, IDLE_XRAY_CONFIG)
             .and_then(|snapshot| {
-                snapshot.with_subscription_metadata(url, &mihomo.metadata, current_unix_time())
+                snapshot.with_subscription_metadata(url, &metadata, current_unix_time())
             })
             .map_err(|_| FetchError::InvalidConfig),
     )
@@ -1447,10 +1601,18 @@ fn current_unix_time() -> u64 {
         .as_secs()
 }
 
-fn parse_native(body: &[u8]) -> Result<Snapshot, FetchError> {
+/// The bundle's snapshot and the provider headers written as leading `#` lines of the Mihomo
+/// YAML inside it (removed from the YAML like those of a standalone one).
+fn parse_native(body: &[u8]) -> Result<(Snapshot, SubscriptionMetadataHeaders), FetchError> {
     let (mihomo, xray): (String, Box<RawValue>) =
         serde_json::from_slice(body).map_err(|_| FetchError::InvalidBundle)?;
-    Snapshot::parse(mihomo.as_bytes(), xray.get().as_bytes()).map_err(|_| FetchError::InvalidBundle)
+    let (pairs, rest) = split_body_headers(mihomo.as_bytes());
+    let snapshot = Snapshot::parse(rest.unwrap_or(mihomo.as_bytes()), xray.get().as_bytes())
+        .map_err(|_| FetchError::InvalidBundle)?;
+    Ok((
+        snapshot,
+        SubscriptionMetadataHeaders::from_body_pairs(pairs),
+    ))
 }
 
 fn is_image_user_agent(user_agent: &str) -> bool {
@@ -2142,5 +2304,103 @@ mod tunnel_proxy_tests {
         assert_eq!(tunnel.get(), None);
         tunnel.set(Some("127.0.0.1:7890".parse().unwrap()));
         assert_eq!(tunnel.get(), Some("127.0.0.1:7890".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod body_header_tests {
+    use super::*;
+
+    #[test]
+    fn bodies_without_a_leading_comment_are_left_alone() {
+        for body in [
+            &b""[..],
+            b"\n\n",
+            b"\xEF\xBB\xBF",
+            b"\xEF\xBB\xBF\n{\"outbounds\":[]}",
+            b"[\"proxies: []\", {}]",
+            b"mixed-port: 7890\n#profile-title: late\n",
+            b"  \t\nproxies: []\n# trailing\n",
+            b"\x00\x01#profile-title: junk\n",
+        ] {
+            let (pairs, rest) = split_body_headers(body);
+            assert!(pairs.is_empty(), "{body:?}");
+            assert_eq!(rest, None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn the_leading_block_is_split_off_after_its_last_comment_line() {
+        let (pairs, rest) = split_body_headers(
+            b"\xEF\xBB\xBF\r\n  # Profile-Title :  Name: with colon \r\n#\r\n# free text\n\n{}",
+        );
+        assert_eq!(
+            pairs,
+            [("profile-title".to_owned(), "Name: with colon".to_owned())]
+        );
+        assert_eq!(rest, Some(&b"\n{}"[..]));
+
+        let (pairs, rest) = split_body_headers(b"#dumb-mode: on");
+        assert_eq!(pairs, [("dumb-mode".to_owned(), "on".to_owned())]);
+        assert_eq!(rest, Some(&b""[..]));
+    }
+
+    #[test]
+    fn names_with_spaces_or_symbols_are_not_headers() {
+        let (pairs, rest) =
+            split_body_headers(b"# Generated at: 12:00\n#a_b: 1\n#: empty\n#no colon\n{}");
+        assert!(pairs.is_empty());
+        assert_eq!(rest, Some(&b"{}"[..]));
+    }
+
+    #[test]
+    fn the_scan_stops_at_its_line_and_byte_limits() {
+        let mut body = "#\n".repeat(MAX_BODY_HEADER_LINES).into_bytes();
+        body.extend_from_slice(b"#profile-title: late\n{}");
+        let (pairs, rest) = split_body_headers(&body);
+        assert!(pairs.is_empty());
+        assert_eq!(rest, Some(&b"#profile-title: late\n{}"[..]));
+
+        let mut body = format!("#{}\n", "x".repeat(MAX_BODY_HEADER_BYTES - 3)).into_bytes();
+        assert_eq!(body.len(), MAX_BODY_HEADER_BYTES - 1);
+        body.extend_from_slice(b"#a\n{}");
+        let (_, rest) = split_body_headers(&body);
+        assert_eq!(rest, Some(&b"#a\n{}"[..]));
+    }
+
+    #[test]
+    fn body_headers_cannot_carry_transport_only_fields() {
+        let metadata = SubscriptionMetadataHeaders::from_body_pairs(vec![
+            (
+                "content-disposition".into(),
+                "attachment; filename=x".into(),
+            ),
+            (HWID_LIMIT_HEADER.into(), "true".into()),
+            ("profile-title".into(), "Kept".into()),
+            ("x-unknown".into(), "dropped".into()),
+        ]);
+        assert_eq!(
+            metadata.fields,
+            [("profile-title".to_owned(), "Kept".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_comment_layer_keeps_only_keys_no_higher_source_sent() {
+        let headers = SubscriptionMetadataHeaders::from_pairs([("app-language", "en")]);
+        let yaml = SubscriptionMetadataHeaders::from_pairs([
+            ("app-language", "ru"),
+            ("profile-title", "YAML"),
+        ]);
+        let json = SubscriptionMetadataHeaders::from_pairs([
+            ("profile-title", "JSON"),
+            ("dumb-mode", "on"),
+        ]);
+        let [yaml, json] = SubscriptionMetadataHeaders::comment_layers(&[&headers], [&yaml, &json]);
+        assert_eq!(
+            yaml.fields,
+            [("profile-title".to_owned(), "YAML".to_owned())]
+        );
+        assert_eq!(json.fields, [("dumb-mode".to_owned(), "on".to_owned())]);
     }
 }
