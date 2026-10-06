@@ -1,6 +1,9 @@
 //! Verified release metadata and portable-bundle updates for MultiCore.
 
 pub mod brand;
+mod download;
+
+pub use download::{DownloadError, DownloadProgress, receive_exact};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
