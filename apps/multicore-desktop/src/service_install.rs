@@ -114,7 +114,7 @@ pub(crate) fn download_installer() -> Result<PathBuf, String> {
         std::fs::remove_file(&installer)
             .map_err(|_| tr!("Не удалось очистить прошлую загрузку").to_owned())?;
     }
-    crate::updater::download_release_to(&release, &installer)?;
+    crate::updater::download_release_to(&release, &installer, |_| {})?;
     verify_archive_file(
         &installer,
         release.asset().size(),

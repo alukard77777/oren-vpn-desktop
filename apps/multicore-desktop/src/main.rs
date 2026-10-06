@@ -56,7 +56,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use daemon::{DaemonClient, DaemonError, UnavailableDaemonClient};
+use daemon::{
+    DaemonClient, DaemonError, DaemonUpdateProgress, DaemonUpdateStage, UnavailableDaemonClient,
+};
 use multicore_release::GitHubRelease;
 use preferences::{
     AppPreferences, PreferenceStore, RailGrowthPreference, TrayPopupSizePreference, VisiblePage,
@@ -70,7 +72,7 @@ use tray::{
     TrayCommand, TrayGroup, TrayInput, TrayInteraction, TrayMenuModel, TrayNode,
     TrayPopupModelCache, build_menu_model,
 };
-use updater::{UpdateAction, UpdateState};
+use updater::{UpdateAction, UpdateStage, UpdateState};
 use view_model::{
     CatalogDisplayKind, CatalogPresentation, ConflictingAppsPresentation, DesktopViewModel,
     DiagnosticsPresentation, LatencyPresentation, LatencyRequest, MutationToken,
@@ -1011,6 +1013,11 @@ fn run_desktop(software_renderer: bool) -> Result<(), slint::PlatformError> {
         &update_state.lock().expect("update state lock"),
         runtime_allows_update(&model.lock().expect("view model lock").presentation()),
     );
+    // Once after an update: «Обновлено до …» where the update toast sits. Set even when
+    // starting hidden, so it shows when the window is next opened.
+    if let Some(version) = updater::take_update_confirmation() {
+        ui.set_update_done_version(version.into());
+    }
     apply_launch_at_sign_in(&ui, windows_settings::query_launch_at_sign_in());
     apply_saved_placement(&ui, &loaded_preferences);
     let pending_subscription_imports = Arc::new(Mutex::new(PendingSubscriptionImports::default()));
@@ -1697,6 +1704,12 @@ fn apply_update_state(ui: &AppWindow, state: &UpdateState, runtime_idle: bool) {
     ui.set_update_action_enabled(presentation.action_enabled);
     ui.set_update_available(presentation.available);
     ui.set_update_busy(presentation.busy);
+    ui.set_update_toast_title(presentation.toast_title.into());
+    ui.set_update_toast_copy(presentation.toast_copy.into());
+    ui.set_update_toast_key(presentation.toast_key.into());
+    ui.set_update_in_progress(presentation.in_progress);
+    ui.set_update_failed(presentation.failed);
+    ui.set_update_progress(presentation.progress_permille as f32 / 1000.0);
 }
 
 fn load_preferences() -> (Option<PreferenceStore>, AppPreferences) {
@@ -2182,12 +2195,8 @@ fn wire_updater(
         // Connected: only the download starts here. The tunnel stays up until the update is
         // downloaded and verified (see `continue_ready_update`).
         let started = match plan {
-            UpdateConfirmPlan::InstallNow => {
+            UpdateConfirmPlan::InstallNow | UpdateConfirmPlan::DisconnectFirst => {
                 start_update_install(weak.clone(), model.clone(), state.clone());
-                true
-            }
-            UpdateConfirmPlan::DisconnectFirst => {
-                start_update_download_first(weak.clone(), model.clone(), state.clone());
                 true
             }
             UpdateConfirmPlan::Wait => false,
@@ -2239,7 +2248,7 @@ fn wire_periodic_update_check(
     timer.start(TimerMode::Repeated, Duration::from_secs(60), move || {
         let busy = matches!(
             &*state.lock().expect("update state lock"),
-            UpdateState::Checking | UpdateState::Downloading(_)
+            UpdateState::Checking | UpdateState::Updating(..)
         );
         if update_check_due(check_started_at.get().elapsed(), jitter.get(), busy) {
             jitter.set(update_check_jitter());
@@ -2262,13 +2271,10 @@ fn update_through_service(service_mode: bool) -> bool {
     cfg!(windows) && service_mode
 }
 
-/// Marks the offered update as downloading, in one step under the lock: a second confirm (or
-/// a retry while one runs) finds no available release and never starts a second download.
+/// Starts an update run of the offered release, in one step under the lock: a second press
+/// (or a retry while one runs) finds no available release and never starts a second download.
 fn begin_update_download(state: &Mutex<UpdateState>) -> Option<GitHubRelease> {
-    let mut current = state.lock().expect("update state lock");
-    let release = current.available_release()?;
-    *current = UpdateState::Downloading(release.clone());
-    Some(release)
+    state.lock().expect("update state lock").begin_update()
 }
 
 fn show_update_state(weak: &slint::Weak<AppWindow>, state: &Mutex<UpdateState>, idle: bool) {
@@ -2277,36 +2283,91 @@ fn show_update_state(weak: &slint::Weak<AppWindow>, state: &Mutex<UpdateState>, 
     }
 }
 
-/// No tunnel to keep up: download, verify and apply in one go.
-fn start_update_install(
-    weak: slint::Weak<AppWindow>,
-    model: Arc<Mutex<DesktopViewModel>>,
-    state: Arc<Mutex<UpdateState>>,
-) {
-    let Some(release) = begin_update_download(&state) else {
-        return;
-    };
-    show_update_state(&weak, &state, true);
-    let (service_mode, client) = {
-        let model = model.lock().expect("view model lock");
-        (model.service_mode(), model.daemon_client())
-    };
-    thread::spawn(move || {
-        // Through the service, the daemon waits while the service downloads and verifies the
-        // release; on success the service's updater closes this client and relaunches it.
-        let result = if update_through_service(service_mode) {
-            client
-                .update_via_service(&release.version().to_string())
-                .map_err(|error| error.to_string())
-        } else {
-            updater::download_and_start_apply(&release)
-        };
-        finish_update_install(weak, state, release, result);
-    });
+/// On the event loop: moves the running update to `stage` (only forward) and redraws.
+fn advance_update(weak: &slint::Weak<AppWindow>, state: &Mutex<UpdateState>, stage: UpdateStage) {
+    let mut current = state.lock().expect("update state lock");
+    if current.advance(stage)
+        && let Some(ui) = weak.upgrade()
+    {
+        apply_update_state(&ui, &current, true);
+    }
 }
 
-/// From a worker: the updater took over (quit so it can replace this client), or the install
-/// failed and the release stays offered with the reason.
+/// From a worker: hands a stage the download reached to the event loop. Reports arrive in
+/// order, and before the worker's own result.
+fn report_update_stage(
+    weak: &slint::Weak<AppWindow>,
+    state: &Arc<Mutex<UpdateState>>,
+    stage: UpdateStage,
+) {
+    let (weak, state) = (weak.clone(), state.clone());
+    let _ = slint::invoke_from_event_loop(move || advance_update(&weak, &state, stage));
+}
+
+/// How often the service's download progress is asked for while it stages an update.
+const SERVICE_PROGRESS_POLL: Duration = Duration::from_millis(500);
+
+/// The stage a progress answer of the service means; `None` when it has nothing running
+/// (yet, or any more). A size the service does not know yet is the release's.
+fn service_update_stage(progress: DaemonUpdateProgress, release_size: u64) -> Option<UpdateStage> {
+    match progress.stage {
+        DaemonUpdateStage::Idle => None,
+        DaemonUpdateStage::Downloading => Some(UpdateStage::Downloading(
+            multicore_release::DownloadProgress {
+                received: progress.received,
+                total: if progress.total > 0 {
+                    progress.total
+                } else {
+                    release_size
+                },
+            },
+        )),
+        DaemonUpdateStage::Verifying => Some(UpdateStage::Verifying),
+    }
+}
+
+/// The service downloads and verifies `release` (`StageUpdate`) while a poller asks for its
+/// progress on a channel of its own; without an answer (an older service) the bar just has no
+/// figures. The poller ends with the staging.
+fn stage_through_service(
+    client: Arc<dyn DaemonClient>,
+    release: &GitHubRelease,
+    report: impl Fn(UpdateStage) + Send + 'static,
+) -> Result<ReadyPackage, String> {
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let (client, done, size) = (client.clone(), done.clone(), release.asset().size());
+        thread::spawn(move || {
+            loop {
+                thread::sleep(SERVICE_PROGRESS_POLL);
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(stage) = client
+                    .service_update_progress()
+                    .ok()
+                    .and_then(|progress| service_update_stage(progress, size))
+                {
+                    report(stage);
+                }
+            }
+        });
+    }
+    let result = client
+        .stage_update_via_service(&release.version().to_string())
+        .map(|()| ReadyPackage::Service)
+        .map_err(|error| error.to_string());
+    done.store(true, Ordering::Release);
+    result
+}
+
+/// How long «Перезапуск…» stays on screen before the app quits for the updater (which waits
+/// for this process to exit): long enough to be seen, short against the swap itself.
+const RESTART_NOTICE: Duration = Duration::from_millis(700);
+
+/// From a worker: the updater took over (show «Перезапуск…», note the version for the next
+/// start, then quit so it can replace this client), or the install failed and the release
+/// stays offered with the reason.
 fn finish_update_install(
     weak: slint::Weak<AppWindow>,
     state: Arc<Mutex<UpdateState>>,
@@ -2315,9 +2376,13 @@ fn finish_update_install(
 ) {
     let _ = slint::invoke_from_event_loop(move || match result {
         Ok(()) => {
-            let _keep_state_alive = state;
-            let _keep_window_alive = weak;
-            event_loop_guard::request_quit();
+            advance_update(&weak, &state, UpdateStage::Restarting);
+            updater::remember_restart_into(&release.version());
+            Timer::single_shot(RESTART_NOTICE, move || {
+                let _keep_state_alive = state;
+                let _keep_window_alive = weak;
+                event_loop_guard::request_quit();
+            });
         }
         Err(error) => update_install_failed(&weak, &state, release, error),
     });
@@ -2381,10 +2446,12 @@ fn ready_update_step(
     }
 }
 
-/// Connected: download and verify first while the tunnel stays up (a service install has the
-/// service stage the release; a per-user install downloads into its update directory). Only a
-/// ready update goes on to stop the tunnel; a failed download leaves the connection alone.
-fn start_update_download_first(
+/// Downloads and verifies first while everything keeps running (a service install has the
+/// service stage the release; a per-user install downloads into its update directory), with
+/// the real progress on screen. Only a ready update goes on (`continue_ready_update`): applied
+/// at once when idle, after stopping the tunnel when connected. A failed download leaves the
+/// connection alone and offers a retry.
+fn start_update_install(
     weak: slint::Weak<AppWindow>,
     model: Arc<Mutex<DesktopViewModel>>,
     state: Arc<Mutex<UpdateState>>,
@@ -2392,22 +2459,28 @@ fn start_update_download_first(
     let Some(release) = begin_update_download(&state) else {
         return;
     };
-    show_update_state(&weak, &state, false);
+    if let Some(ui) = weak.upgrade() {
+        // A run shows its toast even where an earlier one was hidden.
+        ui.set_update_banner_dismissed_for(SharedString::new());
+    }
+    show_update_state(&weak, &state, true);
     let (service_mode, client) = {
         let model = model.lock().expect("view model lock");
         (model.service_mode(), model.daemon_client())
     };
     thread::spawn(move || {
+        let report = {
+            let (weak, state) = (weak.clone(), state.clone());
+            move |stage| report_update_stage(&weak, &state, stage)
+        };
         let result = if update_through_service(service_mode) {
-            client
-                .stage_update_via_service(&release.version().to_string())
-                .map(|()| ReadyPackage::Service)
-                .map_err(|error| error.to_string())
+            stage_through_service(client, &release, report)
         } else {
-            updater::download_and_verify(&release).map(ReadyPackage::Local)
+            updater::download_and_verify(&release, report).map(ReadyPackage::Local)
         };
         let _ = slint::invoke_from_event_loop(move || match result {
             Ok(package) => {
+                advance_update(&weak, &state, UpdateStage::Installing);
                 let ready = ReadyUpdate { release, package };
                 continue_ready_update(weak, model, state, ready, false, 0);
             }
@@ -7545,8 +7618,8 @@ mod window_tests {
         for required in [
             "model.service_mode()",
             "update_through_service(service_mode)",
-            "client\n                .update_via_service(",
-            "updater::download_and_start_apply(&release)",
+            "stage_through_service(client, &release, report)",
+            "updater::download_and_verify(&release, report)",
             "begin_update_download(&state)",
         ] {
             assert!(
@@ -7554,6 +7627,84 @@ mod window_tests {
                 "missing: {required}"
             );
         }
+        // The service stages the release while its progress is polled on the side.
+        let stage = rust
+            .split("fn stage_through_service(")
+            .nth(1)
+            .and_then(|source| source.split("\nfn ").next())
+            .expect("service staging");
+        assert!(stage.contains(".stage_update_via_service("));
+        assert!(stage.contains(".service_update_progress()"));
+        assert!(stage.contains("done.store(true"));
+        assert!(!stage.contains(".update_via_service("));
+    }
+
+    #[test]
+    fn service_progress_answers_become_stages_and_an_idle_service_says_nothing() {
+        use super::{UpdateStage, service_update_stage};
+        use crate::daemon::{DaemonUpdateProgress, DaemonUpdateStage};
+        use multicore_release::DownloadProgress;
+        let answer = |stage, received, total| DaemonUpdateProgress {
+            stage,
+            received,
+            total,
+        };
+        assert_eq!(
+            service_update_stage(answer(DaemonUpdateStage::Idle, 0, 0), 52),
+            None
+        );
+        assert_eq!(
+            service_update_stage(answer(DaemonUpdateStage::Downloading, 18, 52), 99),
+            Some(UpdateStage::Downloading(DownloadProgress {
+                received: 18,
+                total: 52
+            }))
+        );
+        // Still fetching the release: its size is the one this client was offered.
+        assert_eq!(
+            service_update_stage(answer(DaemonUpdateStage::Downloading, 0, 0), 52),
+            Some(UpdateStage::Downloading(DownloadProgress {
+                received: 0,
+                total: 52
+            }))
+        );
+        assert_eq!(
+            service_update_stage(answer(DaemonUpdateStage::Verifying, 0, 0), 52),
+            Some(UpdateStage::Verifying)
+        );
+    }
+
+    #[test]
+    fn the_restart_is_shown_and_remembered_before_the_app_quits_for_the_updater() {
+        let rust = include_str!("main.rs").replace("\r\n", "\n");
+        let finish = rust
+            .split("fn finish_update_install(")
+            .nth(1)
+            .and_then(|source| source.split("\nfn ").next())
+            .expect("finish_update_install");
+        let restarting = finish
+            .find("advance_update(&weak, &state, UpdateStage::Restarting)")
+            .expect("«Перезапуск…» is shown");
+        let remembered = finish
+            .find("updater::remember_restart_into(&release.version())")
+            .expect("the next start can confirm the update");
+        let quit = finish
+            .find("event_loop_guard::request_quit()")
+            .expect("the app quits");
+        assert!(restarting < remembered && remembered < quit);
+        assert!(finish.contains("Timer::single_shot(RESTART_NOTICE"));
+        assert!(super::RESTART_NOTICE <= Duration::from_secs(1));
+        // A ready update moves on to «Устанавливаем…» before it is applied.
+        let install = rust
+            .split("fn start_update_install(")
+            .nth(1)
+            .and_then(|source| source.split("\nfn ").next())
+            .expect("update install");
+        assert!(
+            install.find("UpdateStage::Installing").unwrap()
+                < install.find("continue_ready_update(").unwrap()
+        );
+        assert!(rust.contains("updater::take_update_confirmation()"));
     }
 
     #[test]
@@ -7572,17 +7723,17 @@ mod window_tests {
             .nth(1)
             .and_then(|source| source.split("fn update_check_due").next())
             .expect("confirm handler");
-        assert!(confirm.contains("start_update_download_first("));
+        assert!(confirm.contains("start_update_install("));
         assert!(!confirm.contains("run_disconnect_for_update"));
         assert!(!confirm.contains("begin_primary_action"));
 
         // The download (service: stage only; per user: download and verify) runs first, with
         // the tunnel up; only a ready update ever reaches the disconnect.
-        let download = body("start_update_download_first");
+        let download = body("start_update_install");
         for required in [
             "begin_update_download(&state)",
-            ".stage_update_via_service(",
-            "updater::download_and_verify(&release)",
+            "stage_through_service(",
+            "updater::download_and_verify(&release, report)",
             "continue_ready_update(",
             "update_install_failed(",
         ] {
@@ -7681,10 +7832,7 @@ mod window_tests {
         .unwrap();
         let state = Mutex::new(UpdateState::Available(release.clone()));
         assert!(begin_update_download(&state).is_some());
-        assert!(matches!(
-            *state.lock().unwrap(),
-            UpdateState::Downloading(_)
-        ));
+        assert!(matches!(*state.lock().unwrap(), UpdateState::Updating(..)));
         assert!(
             begin_update_download(&state).is_none(),
             "already downloading"
@@ -8711,11 +8859,19 @@ mod window_tests {
 
     #[test]
     fn home_update_banner_only_shows_available_releases_and_has_actions() {
-        let ui = include_str!("../ui/app.slint");
+        let ui = include_str!("../ui/app.slint").replace("\r\n", "\n");
         assert!(ui.contains(
-            "root.update-available && root.update-status != root.update-banner-dismissed-for"
+            "root.update-available && root.update-toast-key != root.update-banner-dismissed-for"
         ));
-        assert!(ui.contains("root.update-banner-dismissed-for = root.update-status"));
+        assert!(ui.contains("root.update-banner-dismissed-for = root.update-toast-key"));
+        // A running update is only hidden (it goes on, and shows in Settings), never offered
+        // again; after an update the same place confirms the new version once.
+        assert!(ui.contains(
+            "if update-toast.running: BannerAction {\n                                label: @tr(\"Скрыть\");"
+        ));
+        assert!(ui.contains("if root.update-in-progress: VerticalLayout {"));
+        assert!(ui.contains("@tr(\"Обновлено до {}\", root.update-done-version)"));
+        assert!(ui.contains("activated => { root.update-done-dismissed = true; }"));
         assert!(ui.contains("root.update-action();"));
     }
 
@@ -8886,7 +9042,7 @@ mod window_tests {
             .split("update-toast := Rectangle {")
             .nth(1)
             .expect("update toast");
-        let toast = toast.chars().take(4500).collect::<String>();
+        let toast = toast.chars().take(9000).collect::<String>();
         for required in [
             "width: Math.min(356px, parent.width - 32px);",
             "x: parent.width - self.width - 16px;",
@@ -8897,7 +9053,8 @@ mod window_tests {
             "border-color: update-toast-hover.has-hover ? #3a414b : Theme.line;",
             "filled: true;",
             "label: root.update-action-label != \"\" ? root.update-action-label : @tr(\"Подробнее\");",
-            "root.update-banner-dismissed-for = root.update-status;",
+            "root.update-banner-dismissed-for = root.update-toast-key;",
+            "UpdateProgressBar {",
         ] {
             assert!(toast.contains(required), "update toast missing: {required}");
         }
@@ -8916,7 +9073,7 @@ mod window_tests {
             )
         );
         assert!(ui.contains("banner-enter := Timer {\n        interval: 16ms;"));
-        assert!(ui.contains("if (root.update-banner-visible && !root.reduced-motion) {"));
+        assert!(ui.contains("if (root.update-toast-shown && !root.reduced-motion) {"));
         assert!(ui.contains("if (root.conflicting-apps-banner-visible && !root.reduced-motion) {"));
         assert!(ui.contains("component TextAction inherits Rectangle {"));
         // The conflict card grows with its message instead of a fixed worst case.

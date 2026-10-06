@@ -579,11 +579,29 @@ msgstr "Install"
 msgid "Обновите пакет через менеджер пакетов"
 msgstr "Update via your package manager"
 
-msgid "Загружаем версию {}…"
-msgstr "Downloading {}…"
+msgid "Обновление до {}"
+msgstr "Updating to {}"
 
-msgid "Проверяем размер и SHA-256 перед установкой"
-msgstr "Checking size and SHA-256 before installing"
+msgid "Скачиваем… {} % · {} из {} МБ"
+msgstr "Downloading… {}% · {} of {} MB"
+
+msgid "Скачиваем…"
+msgstr "Downloading…"
+
+msgid "Устанавливаем…"
+msgstr "Installing…"
+
+msgid "Перезапуск…"
+msgstr "Restarting…"
+
+msgid "Не удалось обновить"
+msgstr "Update failed"
+
+msgid "Обновлено до {}"
+msgstr "Updated to {}"
+
+msgid "Новая версия уже работает"
+msgstr "The new version is running"
 
 msgid "Не удалось установить версию {}"
 msgstr "Couldn't install version {}"
@@ -687,14 +705,8 @@ msgstr "The update didn't download completely"
 msgid "Не удалось записать обновление"
 msgstr "Couldn't write the update"
 
-msgid "Ошибка завершения загрузки"
-msgstr "Couldn't finish the download"
-
 msgid "Обновление больше заявленного размера"
 msgstr "The update is larger than stated"
-
-msgid "Не удалось сохранить обновление"
-msgstr "Couldn't save the update"
 
 msgid "Каталог данных MULTICORE недоступен"
 msgstr "MULTICORE data folder unavailable"

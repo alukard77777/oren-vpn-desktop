@@ -1,12 +1,15 @@
 use multicore_i18n::tr;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use multicore_release::{GitHubRelease, ReleaseDecision, Repository, Version, verify_archive_file};
+use multicore_release::{
+    DownloadError, DownloadProgress, GitHubRelease, ReleaseDecision, Repository, Version,
+    receive_exact, verify_archive_file,
+};
 
 const RELEASE_BODY_LIMIT: usize = 512 * 1024;
 /// `release.txt` holds one version and a newline; anything longer is not that file.
@@ -26,8 +29,9 @@ fn replacement_detail() -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum UpdateAction {
+    #[default]
     None,
     Check,
     Install,
@@ -41,7 +45,8 @@ pub(crate) enum UpdateState {
     Available(GitHubRelease),
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Managed(GitHubRelease),
-    Downloading(GitHubRelease),
+    /// The user started installing `release`; `UpdateStage` says how far it got.
+    Updating(GitHubRelease, UpdateStage),
     /// Installing `release` failed; the release is kept so the banner stays
     /// visible with the reason and the install can be retried.
     InstallFailed(GitHubRelease, String),
@@ -51,7 +56,7 @@ pub(crate) enum UpdateState {
     Error(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct UpdatePresentation {
     pub status: String,
     pub detail: String,
@@ -60,6 +65,88 @@ pub(crate) struct UpdatePresentation {
     pub action_enabled: bool,
     pub available: bool,
     pub busy: bool,
+    /// The home toast (shown while `available`): its title and its one line under it.
+    pub toast_title: String,
+    pub toast_copy: String,
+    /// What «Позже»/«Скрыть» hides the toast for: the same offer, the same run or the same
+    /// failure stays hidden, the next one shows again.
+    pub toast_key: String,
+    /// An update runs: the progress bar is shown instead of an action.
+    pub in_progress: bool,
+    /// The bar's fill in thousandths; -1 while the size is not known (no fill is drawn).
+    pub progress_permille: i32,
+    pub failed: bool,
+}
+
+/// Where a running update is. Stages only move forward (see `UpdateStage::precedes`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpdateStage {
+    /// `received` of `total` bytes are in; `total` 0: the size is not known yet.
+    Downloading(DownloadProgress),
+    /// The download is complete; its size and SHA-256 are checked.
+    Verifying,
+    /// The verified update is handed to the updater or the service (after the tunnel is
+    /// stopped, when connected).
+    Installing,
+    /// The updater took over: the app quits and comes back as the new version.
+    Restarting,
+}
+
+impl UpdateStage {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Downloading(_) => 0,
+            Self::Verifying => 1,
+            Self::Installing => 2,
+            Self::Restarting => 3,
+        }
+    }
+
+    /// Whether `next` moves a run at `self` forward: a later stage, or more bytes of the same
+    /// download. A late report from a slower thread never moves the bar back.
+    pub(crate) fn precedes(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Downloading(now), Self::Downloading(then)) => {
+                then.received > now.received || (now.total == 0 && then.total > 0)
+            }
+            _ => next.rank() > self.rank(),
+        }
+    }
+
+    /// The bar's fill in thousandths, -1 while the download's size is unknown.
+    pub(crate) fn permille(self) -> i32 {
+        match self {
+            Self::Downloading(progress) if progress.total == 0 => -1,
+            Self::Downloading(progress) => {
+                let permille = u128::from(progress.received.min(progress.total)) * 1000
+                    / u128::from(progress.total);
+                i32::try_from(permille).unwrap_or(1000)
+            }
+            Self::Verifying | Self::Installing | Self::Restarting => 1000,
+        }
+    }
+
+    /// «Скачиваем… 34 % · 18 из 52 МБ», «Проверяем…», «Устанавливаем…», «Перезапуск…».
+    pub(crate) fn text(self) -> String {
+        match self {
+            Self::Downloading(progress) if progress.total > 0 => tr!(
+                "Скачиваем… {} % · {} из {} МБ",
+                progress.percent(),
+                megabytes(progress.received),
+                megabytes(progress.total)
+            ),
+            Self::Downloading(_) => tr!("Скачиваем…").into(),
+            Self::Verifying => tr!("Проверяем…").into(),
+            Self::Installing => tr!("Устанавливаем…").into(),
+            Self::Restarting => tr!("Перезапуск…").into(),
+        }
+    }
+}
+
+/// Whole MiB, rounded to the nearest so the received and total figures agree at the end.
+pub(crate) fn megabytes(bytes: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    bytes.saturating_add(MIB / 2) / MIB
 }
 
 impl UpdateState {
@@ -81,6 +168,33 @@ impl UpdateState {
         runtime_idle: bool,
         configured: bool,
     ) -> UpdatePresentation {
+        let mut shown = self.row_presentation(runtime_idle, configured);
+        match self {
+            Self::Available(release) | Self::Managed(release) => {
+                shown.toast_title = tr!("Доступно обновление").into();
+                shown.toast_copy = shown.status.clone();
+                shown.toast_key = format!("offer:{}", release.version());
+            }
+            Self::Updating(release, stage) => {
+                shown.toast_title = shown.status.clone();
+                shown.toast_copy = stage.text();
+                shown.toast_key = format!("update:{}", release.version());
+                shown.in_progress = true;
+                shown.progress_permille = stage.permille();
+            }
+            Self::InstallFailed(release, message) => {
+                shown.toast_title = tr!("Не удалось обновить").into();
+                shown.toast_copy = message.clone();
+                shown.toast_key = format!("failed:{}:{message}", release.version());
+                shown.failed = true;
+            }
+            _ => {}
+        }
+        shown
+    }
+
+    /// The Settings row (status, detail, action) of each state.
+    fn row_presentation(&self, runtime_idle: bool, configured: bool) -> UpdatePresentation {
         match self {
             Self::Unconfigured => UpdatePresentation {
                 status: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
@@ -90,6 +204,7 @@ impl UpdateState {
                 action_enabled: false,
                 available: false,
                 busy: false,
+                ..UpdatePresentation::default()
             },
             Self::Checking => UpdatePresentation {
                 status: tr!("Проверяем обновления…").into(),
@@ -99,6 +214,7 @@ impl UpdateState {
                 action_enabled: false,
                 available: false,
                 busy: true,
+                ..UpdatePresentation::default()
             },
             Self::Deferred => UpdatePresentation {
                 status: format!("MULTICORE {}", env!("CARGO_PKG_VERSION")),
@@ -108,6 +224,7 @@ impl UpdateState {
                 action_enabled: true,
                 available: false,
                 busy: false,
+                ..UpdatePresentation::default()
             },
             Self::Current => UpdatePresentation {
                 status: tr!("Установлена актуальная версия").into(),
@@ -117,6 +234,7 @@ impl UpdateState {
                 action_enabled: true,
                 available: false,
                 busy: false,
+                ..UpdatePresentation::default()
             },
             Self::Available(release) => UpdatePresentation {
                 status: tr!("Доступна версия {}", release.version()),
@@ -130,6 +248,7 @@ impl UpdateState {
                 action_enabled: true,
                 available: true,
                 busy: false,
+                ..UpdatePresentation::default()
             },
             Self::Managed(release) => UpdatePresentation {
                 status: tr!("Доступна версия {}", release.version()),
@@ -139,15 +258,17 @@ impl UpdateState {
                 action_enabled: false,
                 available: true,
                 busy: false,
+                ..UpdatePresentation::default()
             },
-            Self::Downloading(release) => UpdatePresentation {
-                status: tr!("Загружаем версию {}…", release.version()),
-                detail: tr!("Проверяем размер и SHA-256 перед установкой").into(),
-                action_label: tr!("Загружаем…").into(),
+            Self::Updating(release, stage) => UpdatePresentation {
+                status: tr!("Обновление до {}", release.version()),
+                detail: stage.text(),
+                action_label: String::new(),
                 action: UpdateAction::None,
                 action_enabled: false,
                 available: true,
                 busy: true,
+                ..UpdatePresentation::default()
             },
             Self::InstallFailed(release, message) => UpdatePresentation {
                 status: tr!("Не удалось установить версию {}", release.version()),
@@ -157,6 +278,7 @@ impl UpdateState {
                 action_enabled: true,
                 available: true,
                 busy: false,
+                ..UpdatePresentation::default()
             },
             Self::Error(message) => UpdatePresentation {
                 status: tr!("Не удалось проверить обновления").into(),
@@ -174,6 +296,7 @@ impl UpdateState {
                 action_enabled: configured,
                 available: false,
                 busy: false,
+                ..UpdatePresentation::default()
             },
         }
     }
@@ -182,6 +305,32 @@ impl UpdateState {
         match self {
             Self::Available(release) | Self::InstallFailed(release, _) => Some(release.clone()),
             _ => None,
+        }
+    }
+
+    /// Starts an update run of the offered release (also a retry after a failure) and
+    /// returns it; `None` when nothing is offered or a run is already going (a second press).
+    pub(crate) fn begin_update(&mut self) -> Option<GitHubRelease> {
+        let release = self.available_release()?;
+        let size = release.asset().size();
+        *self = Self::Updating(
+            release.clone(),
+            UpdateStage::Downloading(DownloadProgress {
+                received: 0,
+                total: size,
+            }),
+        );
+        Some(release)
+    }
+
+    /// Moves the running update to `stage` when that is forward; whether anything changed.
+    pub(crate) fn advance(&mut self, stage: UpdateStage) -> bool {
+        match self {
+            Self::Updating(_, current) if current.precedes(stage) => {
+                *current = stage;
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -465,13 +614,6 @@ impl StagedUpdate {
     }
 }
 
-/// Downloads and verifies `release`, then starts applying it: the path for a client with no
-/// tunnel to keep up.
-pub(crate) fn download_and_start_apply(release: &GitHubRelease) -> Result<(), String> {
-    let staged = download_and_verify(release)?;
-    start_apply(release, &staged)
-}
-
 /// The AppImage being replaced, the hidden download next to it, and the kept previous image.
 #[cfg(target_os = "linux")]
 fn appimage_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
@@ -491,15 +633,21 @@ fn appimage_paths() -> Result<(PathBuf, PathBuf, PathBuf), String> {
 }
 
 /// Downloads and verifies `release` without touching the installed AppImage, so the tunnel can
-/// stay up meanwhile.
+/// stay up meanwhile. `report` hears the download's progress, then `Verifying`.
 #[cfg(target_os = "linux")]
-pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdate, String> {
+pub(crate) fn download_and_verify(
+    release: &GitHubRelease,
+    mut report: impl FnMut(UpdateStage),
+) -> Result<StagedUpdate, String> {
     let (_, staged, _) = appimage_paths()?;
     if staged.exists() {
         fs::remove_file(&staged)
             .map_err(|_| tr!("Не удалось очистить прошлую загрузку").to_owned())?;
     }
-    download_release_to(release, &staged)?;
+    download_release_to(release, &staged, |progress| {
+        report(UpdateStage::Downloading(progress));
+    })?;
+    report(UpdateStage::Verifying);
     if verify_archive_file(
         &staged,
         release.asset().size(),
@@ -542,9 +690,13 @@ pub(crate) fn start_apply(release: &GitHubRelease, staged: &StagedUpdate) -> Res
 }
 
 /// Downloads and verifies `release` into the user's update directory without touching the
-/// install, so the tunnel can stay up meanwhile.
+/// install, so the tunnel can stay up meanwhile. `report` hears the download's progress, then
+/// `Verifying`.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdate, String> {
+pub(crate) fn download_and_verify(
+    release: &GitHubRelease,
+    mut report: impl FnMut(UpdateStage),
+) -> Result<StagedUpdate, String> {
     let update_dir = update_directory()?;
     fs::create_dir_all(&update_dir)
         .map_err(|_| tr!("Не удалось создать папку обновлений").to_owned())?;
@@ -557,7 +709,10 @@ pub(crate) fn download_and_verify(release: &GitHubRelease) -> Result<StagedUpdat
         }
     }
 
-    download_release_to(release, &partial)?;
+    download_release_to(release, &partial, |progress| {
+        report(UpdateStage::Downloading(progress));
+    })?;
+    report(UpdateStage::Verifying);
     verify_archive_file(
         &partial,
         release.asset().size(),
@@ -720,9 +875,12 @@ fn merge_install_failure(state: UpdateState, pending: &mut Option<InstallFailure
     }
 }
 
+/// Downloads the release's asset from GitHub to `destination`; `progress` hears every whole
+/// percent (see `receive_exact`).
 pub(crate) fn download_release_to(
     release: &GitHubRelease,
     destination: &Path,
+    progress: impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(8))
@@ -743,8 +901,26 @@ pub(crate) fn download_release_to(
         }))
         .build()
         .map_err(|_| tr!("Не удалось создать соединение для загрузки").to_owned())?;
+    download_to(
+        &client,
+        release.asset().download_url(),
+        release.asset().size(),
+        destination,
+        progress,
+    )
+}
+
+/// Fetches `url`, which must be exactly `size` bytes (from the verified release, never from
+/// the server), into `destination`.
+fn download_to(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    size: u64,
+    destination: &Path,
+    progress: impl FnMut(DownloadProgress),
+) -> Result<(), String> {
     let mut response = client
-        .get(release.asset().download_url())
+        .get(url)
         .header("User-Agent", UPDATE_USER_AGENT)
         .send()
         .map_err(|_| tr!("Не удалось загрузить обновление").to_owned())?;
@@ -756,39 +932,63 @@ pub(crate) fn download_release_to(
     }
     if response
         .content_length()
-        .is_some_and(|length| length != release.asset().size())
+        .is_some_and(|length| length != size)
     {
         return Err(tr!("Размер обновления не совпал с релизом").into());
     }
     let mut output = File::create(destination)
         .map_err(|_| tr!("Не удалось создать временный архив").to_owned())?;
-    let mut remaining = release.asset().size();
-    let mut buffer = [0_u8; 64 * 1024];
-    while remaining > 0 {
-        let limit = buffer.len().min(remaining as usize);
-        let read = response
-            .read(&mut buffer[..limit])
-            .map_err(|_| tr!("Загрузка обновления прервалась").to_owned())?;
-        if read == 0 {
-            return Err(tr!("Обновление загрузилось не полностью").into());
+    receive_exact(&mut response, &mut output, size, progress).map_err(|error| {
+        match error {
+            DownloadError::Read => tr!("Загрузка обновления прервалась"),
+            DownloadError::Write => tr!("Не удалось записать обновление"),
+            DownloadError::Short => tr!("Обновление загрузилось не полностью"),
+            DownloadError::Long => tr!("Обновление больше заявленного размера"),
         }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|_| tr!("Не удалось записать обновление").to_owned())?;
-        remaining -= read as u64;
+        .to_owned()
+    })
+}
+
+/// Left by the app right before it quits for an update: the version it is about to become.
+/// The next start reads it once (`take_update_confirmation`) to say «Обновлено до …».
+const UPDATED_MARKER: &str = "updated-to";
+
+fn updates_root() -> Option<PathBuf> {
+    crate::data_root::user_data_root()
+        .ok()
+        .map(|root| root.join("updates"))
+}
+
+/// Notes that this process quits so that `version` replaces it (see `UPDATED_MARKER`).
+pub(crate) fn remember_restart_into(version: &Version) {
+    if let Some(directory) = updates_root() {
+        let _ = remember_restart_into_in(&directory, version);
     }
-    let mut extra = [0_u8; 1];
-    if response
-        .read(&mut extra)
-        .map_err(|_| tr!("Ошибка завершения загрузки").to_owned())?
-        != 0
-    {
-        return Err(tr!("Обновление больше заявленного размера").into());
-    }
-    output
-        .flush()
-        .map_err(|_| tr!("Не удалось сохранить обновление").to_owned())?;
-    Ok(())
+}
+
+fn remember_restart_into_in(directory: &Path, version: &Version) -> std::io::Result<()> {
+    fs::create_dir_all(directory)?;
+    fs::write(directory.join(UPDATED_MARKER), version.to_string())
+}
+
+/// Once after an update: the version this build was updated to, when it is this build (an
+/// update that failed and relaunched the old version says nothing here; its helper's result
+/// explains it instead). The marker is removed either way.
+pub(crate) fn take_update_confirmation() -> Option<String> {
+    take_update_confirmation_in(&updates_root()?, env!("CARGO_PKG_VERSION"))
+}
+
+fn take_update_confirmation_in(directory: &Path, current: &str) -> Option<String> {
+    let marker = directory.join(UPDATED_MARKER);
+    let mut content = String::new();
+    File::open(&marker)
+        .ok()?
+        .take(RELEASE_HINT_LIMIT as u64)
+        .read_to_string(&mut content)
+        .ok();
+    let _ = fs::remove_file(&marker);
+    let version = content.trim();
+    (version == current).then(|| version.to_owned())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1133,15 +1333,9 @@ mod tests {
     }
 
     #[test]
-    fn download_and_apply_is_split_so_the_tunnel_can_stay_up_while_downloading() {
+    fn applying_is_separate_from_downloading_so_the_tunnel_can_stay_up_meanwhile() {
         let source = include_str!("updater.rs").replace("\r\n", "\n");
-        let combined = source
-            .split("pub(crate) fn download_and_start_apply(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("download_and_start_apply");
-        assert!(combined.contains("let staged = download_and_verify(release)?;"));
-        assert!(combined.contains("start_apply(release, &staged)"));
+        assert!(!source.contains(&format!("fn {}(", "download_and_start_apply")));
         let apply = source
             .split("pub(crate) fn start_apply(")
             .nth(1)
@@ -1288,6 +1482,189 @@ mod tests {
         assert!(unrelated.is_dir());
     }
 
+    fn mib(value: u64) -> u64 {
+        value * 1024 * 1024
+    }
+
+    fn downloading(received: u64, total: u64) -> super::UpdateStage {
+        super::UpdateStage::Downloading(multicore_release::DownloadProgress { received, total })
+    }
+
+    #[test]
+    fn an_update_run_moves_through_its_stages_in_order_and_never_back() {
+        use super::UpdateStage::{Installing, Restarting, Verifying};
+        let mut state = UpdateState::Available(release());
+        assert!(!state.advance(Verifying), "nothing runs before the press");
+        assert!(state.begin_update().is_some());
+        // The size is known from the release before the first byte arrives.
+        assert!(matches!(
+            state,
+            UpdateState::Updating(_, stage) if stage == downloading(0, 1234)
+        ));
+        assert!(state.advance(downloading(600, 1234)));
+        assert!(
+            !state.advance(downloading(500, 1234)),
+            "a late report never moves the bar back"
+        );
+        assert!(!state.advance(downloading(600, 1234)));
+        assert!(state.advance(Verifying));
+        assert!(!state.advance(downloading(1234, 1234)));
+        assert!(state.advance(Installing));
+        assert!(!state.advance(Verifying));
+        assert!(state.advance(Restarting));
+        assert!(!state.advance(Installing));
+        assert!(matches!(state, UpdateState::Updating(_, Restarting)));
+        // A service that did not know the size yet tells it later.
+        let mut unknown = UpdateState::Updating(release(), downloading(0, 0));
+        assert!(unknown.advance(downloading(0, 1234)));
+    }
+
+    #[test]
+    fn the_progress_line_shows_real_percent_and_megabytes() {
+        let shown =
+            UpdateState::Updating(release(), downloading(mib(18), mib(52))).presentation(true);
+        assert!(shown.in_progress);
+        assert_eq!(shown.toast_title, "Обновление до 0.2.0");
+        assert_eq!(shown.toast_copy, "Скачиваем… 34 % · 18 из 52 МБ");
+        assert_eq!(shown.status, "Обновление до 0.2.0");
+        assert_eq!(shown.detail, shown.toast_copy);
+        assert_eq!(shown.progress_permille, 346);
+        let done = downloading(mib(52) - 1, mib(52)).text();
+        assert_eq!(done, "Скачиваем… 99 % · 52 из 52 МБ");
+        // An unknown size draws no fill and claims no figures.
+        let unknown = UpdateState::Updating(release(), downloading(mib(3), 0)).presentation(true);
+        assert_eq!(unknown.toast_copy, "Скачиваем…");
+        assert_eq!(unknown.progress_permille, -1);
+        for (stage, text) in [
+            (super::UpdateStage::Verifying, "Проверяем…"),
+            (super::UpdateStage::Installing, "Устанавливаем…"),
+            (super::UpdateStage::Restarting, "Перезапуск…"),
+        ] {
+            let shown = UpdateState::Updating(release(), stage).presentation(true);
+            assert_eq!(shown.toast_copy, text);
+            assert_eq!(shown.progress_permille, 1000);
+        }
+    }
+
+    #[test]
+    fn a_second_press_starts_nothing_and_a_failure_offers_a_retry() {
+        let mut state = UpdateState::Available(release());
+        let offer = state.presentation(true);
+        assert!(!offer.in_progress && !offer.failed);
+        assert_eq!(offer.toast_title, "Доступно обновление");
+        assert!(state.begin_update().is_some());
+        let running = state.presentation(true);
+        assert!(state.begin_update().is_none(), "already updating");
+        assert_ne!(
+            offer.toast_key, running.toast_key,
+            "the offer's «Позже» does not hide the run"
+        );
+        state.advance(downloading(1000, 1234));
+        assert_eq!(
+            state.presentation(true).toast_key,
+            running.toast_key,
+            "a hidden run stays hidden as it moves"
+        );
+
+        state = UpdateState::InstallFailed(release(), "Файл занят".into());
+        let failed = state.presentation(true);
+        assert!(failed.failed && !failed.in_progress);
+        assert_eq!(failed.toast_title, "Не удалось обновить");
+        assert_eq!(failed.toast_copy, "Файл занят");
+        assert_eq!(failed.action, UpdateAction::Install);
+        assert_eq!(failed.action_label, "Повторить");
+        assert_ne!(failed.toast_key, running.toast_key);
+        assert!(state.begin_update().is_some(), "a retry starts a new run");
+    }
+
+    #[test]
+    fn the_download_reports_progress_from_a_mock_http_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let body: Vec<u8> = (0..300_000_u32).map(|index| (index % 253) as u8).collect();
+        let serve = |declared: usize| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                // In pieces, like a real download.
+                for piece in body.chunks(30_000) {
+                    if stream.write_all(piece).is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                }
+            });
+            (format!("http://{address}/asset.zip"), server)
+        };
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("asset.zip.partial");
+
+        let (url, server) = serve(body.len());
+        let mut seen = Vec::new();
+        super::download_to(&client, &url, body.len() as u64, &destination, |progress| {
+            seen.push(progress)
+        })
+        .expect("download");
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), body);
+        assert_eq!(seen.first().map(|first| first.received), Some(0));
+        assert_eq!(
+            seen.last().map(|last| (last.received, last.total)),
+            Some((body.len() as u64, body.len() as u64))
+        );
+        assert!(seen.len() > 2, "progress in between: {seen:?}");
+        assert!(
+            seen.windows(2)
+                .all(|pair| pair[0].received < pair[1].received)
+        );
+
+        // The server claims another size than the release: nothing is trusted.
+        let (url, server) = serve(body.len() + 1);
+        let error =
+            super::download_to(&client, &url, body.len() as u64, &destination, |_| {}).unwrap_err();
+        let _ = server.join();
+        assert_eq!(error, "Размер обновления не совпал с релизом");
+    }
+
+    #[test]
+    fn the_post_update_confirmation_is_shown_once_and_only_for_this_version() {
+        use super::{remember_restart_into_in, take_update_confirmation_in};
+        let directory = tempfile::tempdir().unwrap();
+        let updates = directory.path().join("updates");
+        assert_eq!(take_update_confirmation_in(&updates, "1.2.0"), None);
+        remember_restart_into_in(&updates, &version("1.2.0")).unwrap();
+        assert_eq!(
+            take_update_confirmation_in(&updates, "1.2.0"),
+            Some("1.2.0".into())
+        );
+        assert_eq!(take_update_confirmation_in(&updates, "1.2.0"), None, "once");
+        // The update failed and the previous version came back: no claim, and no leftover.
+        remember_restart_into_in(&updates, &version("1.2.0")).unwrap();
+        assert_eq!(take_update_confirmation_in(&updates, "1.1.10"), None);
+        assert_eq!(take_update_confirmation_in(&updates, "1.2.0"), None);
+    }
+
     #[test]
     fn unconfigured_channel_is_explicit_and_has_no_action() {
         let ui = UpdateState::Unconfigured.presentation(true);
@@ -1304,9 +1681,14 @@ mod tests {
         let current = UpdateState::Current.presentation(true);
         assert_eq!(current.action, UpdateAction::Check);
         assert!(current.action_enabled);
-        let downloading = UpdateState::Downloading(release()).presentation(true);
+        let downloading =
+            UpdateState::Updating(release(), super::UpdateStage::Verifying).presentation(true);
         assert_eq!(downloading.action, UpdateAction::None);
         assert!(downloading.busy);
+        assert!(
+            downloading.action_label.is_empty(),
+            "no button while it runs"
+        );
         for (configured, action, enabled) in [
             (false, UpdateAction::None, false),
             (true, UpdateAction::Check, true),
@@ -1428,7 +1810,20 @@ mod english_tests {
             UpdateState::Current,
             UpdateState::Available(release()),
             UpdateState::Managed(release()),
-            UpdateState::Downloading(release()),
+            UpdateState::Updating(
+                release(),
+                UpdateStage::Downloading(multicore_release::DownloadProgress {
+                    received: 18 << 20,
+                    total: 52 << 20,
+                }),
+            ),
+            UpdateState::Updating(
+                release(),
+                UpdateStage::Downloading(multicore_release::DownloadProgress::default()),
+            ),
+            UpdateState::Updating(release(), UpdateStage::Verifying),
+            UpdateState::Updating(release(), UpdateStage::Installing),
+            UpdateState::Updating(release(), UpdateStage::Restarting),
             UpdateState::InstallFailed(release(), "swap failed".into()),
             UpdateState::Error("GitHub is unavailable".into()),
         ];
@@ -1436,7 +1831,13 @@ mod english_tests {
             for idle in [true, false] {
                 for configured in [true, false] {
                     let shown = state.presentation_with_configuration(idle, configured);
-                    for text in [&shown.status, &shown.detail, &shown.action_label] {
+                    for text in [
+                        &shown.status,
+                        &shown.detail,
+                        &shown.action_label,
+                        &shown.toast_title,
+                        &shown.toast_copy,
+                    ] {
                         assert!(!cyrillic(text), "{state:?}: {text}");
                     }
                 }
@@ -1445,5 +1846,15 @@ mod english_tests {
         let available = UpdateState::Available(release()).presentation(true);
         assert_eq!(available.status, "Update 0.2.0 available");
         assert_eq!(available.action_label, "Install");
+        let running = UpdateState::Updating(
+            release(),
+            UpdateStage::Downloading(multicore_release::DownloadProgress {
+                received: 18 << 20,
+                total: 52 << 20,
+            }),
+        )
+        .presentation(true);
+        assert_eq!(running.toast_title, "Updating to 0.2.0");
+        assert_eq!(running.toast_copy, "Downloading… 34% · 18 of 52 MB");
     }
 }

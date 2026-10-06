@@ -160,6 +160,9 @@ const SUBSCRIPTIONS_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const API_ERROR_RESPONSE_LIMIT_BYTES: usize = 16 * 1024;
 const DASHBOARD_URL_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
 const SESSION_RESPONSE_LIMIT_BYTES: usize = 4 * 1024;
+const UPDATE_PROGRESS_RESPONSE_LIMIT_BYTES: usize = 1024;
+/// A progress poll is cheap; one that hangs is simply skipped by the next.
+const UPDATE_PROGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 // The daemon serves canonical group icons of at most 128 KiB.
 const GROUP_ICON_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
 const TROUBLESHOOT_RESPONSE_LIMIT_BYTES: usize = 256 * 1024;
@@ -379,6 +382,23 @@ pub struct DaemonServiceLogFile {
     pub text: String,
     #[serde(default)]
     pub truncated: bool,
+}
+
+/// Where the always-ready service's update download is (GET /v1/service/update/progress).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonUpdateStage {
+    Idle,
+    Downloading,
+    Verifying,
+}
+
+/// GET /v1/service/update/progress: `received` of `total` bytes (`total` 0 while unknown).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct DaemonUpdateProgress {
+    pub stage: DaemonUpdateStage,
+    pub received: u64,
+    pub total: u64,
 }
 
 /// GET /v1/session: when the live connection started and Mihomo's cumulative byte counters.
@@ -729,6 +749,12 @@ pub trait DaemonClient: Send + Sync {
     /// POST /v1/service/update/stage: the service only downloads and verifies `version`; the
     /// tunnel keeps running.
     fn stage_update_via_service(&self, _version: &str) -> Result<(), DaemonError> {
+        Err(DaemonError::new(tr!("Служба MULTICORE недоступна.")))
+    }
+
+    /// GET /v1/service/update/progress, polled while `stage_update_via_service` waits; a
+    /// failure only means the progress is not known right now (never logged: it is polled).
+    fn service_update_progress(&self) -> Result<DaemonUpdateProgress, DaemonError> {
         Err(DaemonError::new(tr!("Служба MULTICORE недоступна.")))
     }
 
@@ -1458,6 +1484,22 @@ impl DaemonClient for HttpDaemonClient {
         self.post_service_update("/v1/service/update/stage", version, 200)
     }
 
+    fn service_update_progress(&self) -> Result<DaemonUpdateProgress, DaemonError> {
+        let response = self
+            .http
+            .get(self.endpoint("/v1/service/update/progress"))
+            .bearer_auth(&self.token)
+            .timeout(UPDATE_PROGRESS_REQUEST_TIMEOUT)
+            .send()
+            .map_err(map_error)?;
+        if !response.status().is_success() {
+            return Err(DaemonError::definitive_http(tr!(
+                "Служба MULTICORE недоступна."
+            )));
+        }
+        decode_bounded_json(response, UPDATE_PROGRESS_RESPONSE_LIMIT_BYTES)
+    }
+
     fn service_log(&self) -> Result<DaemonServiceLog, DaemonError> {
         self.send_json(
             self.http
@@ -1888,6 +1930,78 @@ mod http_tests {
                 None => assert!(result.is_ok()),
                 Some(message) => assert_eq!(result.unwrap_err().to_string(), message),
             }
+        }
+    }
+
+    #[test]
+    fn the_service_update_progress_is_read_and_a_failure_is_only_unknown_progress() {
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"stage":"downloading","received":18,"total":52}"#,
+                Some(DaemonUpdateProgress {
+                    stage: DaemonUpdateStage::Downloading,
+                    received: 18,
+                    total: 52,
+                }),
+            ),
+            (
+                "200 OK",
+                r#"{"stage":"verifying","received":0,"total":0}"#,
+                Some(DaemonUpdateProgress {
+                    stage: DaemonUpdateStage::Verifying,
+                    received: 0,
+                    total: 0,
+                }),
+            ),
+            // A stage this build does not know, and an older daemon without the route.
+            (
+                "200 OK",
+                r#"{"stage":"later","received":0,"total":0}"#,
+                None,
+            ),
+            (
+                "404 Not Found",
+                r#"{"code":"not_found","message":"x"}"#,
+                None,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind progress server");
+            let address = listener.local_addr().expect("progress server address");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept progress request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                    let read = stream.read(&mut buffer).expect("read progress request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write progress response");
+                String::from_utf8_lossy(&request).into_owned()
+            });
+            let client = HttpDaemonClient::new(format!("http://{address}"), "token")
+                .expect("loopback client");
+            let result = client.service_update_progress();
+            let request = server.join().expect("progress server");
+            assert!(
+                request.starts_with("GET /v1/service/update/progress "),
+                "{request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer token"),
+                "{request}"
+            );
+            assert_eq!(result.ok(), expected, "{status} {body}");
         }
     }
 

@@ -657,6 +657,55 @@ fn log_range_open(ui: &AppWindow, range: &str) {
     ui.set_log_range_open(true);
 }
 
+/// A release of `version` whose package is 52 MiB, like a real Windows bundle.
+fn preview_release(version: &str) -> multicore_release::GitHubRelease {
+    let body = format!(
+        r#"{{
+            "tag_name":"v{version}",
+            "html_url":"https://github.com/Fatyzzz/multi-core/releases/tag/v{version}",
+            "assets":[{{
+                "name":"multicore-windows-x64.zip",
+                "browser_download_url":"https://github.com/Fatyzzz/multi-core/releases/download/v{version}/multicore-windows-x64.zip",
+                "size":{},
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }}]
+        }}"#,
+        52 * 1024 * 1024
+    );
+    multicore_release::GitHubRelease::parse_for_arch(
+        body.as_bytes(),
+        multicore_release::WindowsArch::X64,
+    )
+    .expect("preview release")
+}
+
+/// The update toast and Settings row exactly as the app presents `state`.
+fn show_update(ui: &AppWindow, state: crate::updater::UpdateState) {
+    crate::apply_update_state(ui, &state, true);
+}
+
+fn offer_update(ui: &AppWindow, version: &str) {
+    show_update(
+        ui,
+        crate::updater::UpdateState::Available(preview_release(version)),
+    );
+}
+
+/// A running update of 1.2.0 at `stage`.
+fn updating(ui: &AppWindow, stage: crate::updater::UpdateStage) {
+    show_update(
+        ui,
+        crate::updater::UpdateState::Updating(preview_release("1.2.0"), stage),
+    );
+}
+
+fn downloaded(received_mib: u64, total_mib: u64) -> crate::updater::UpdateStage {
+    crate::updater::UpdateStage::Downloading(multicore_release::DownloadProgress {
+        received: received_mib * 1024 * 1024 + 300 * 1024,
+        total: total_mib * 1024 * 1024,
+    })
+}
+
 fn ready(ui: &AppWindow) {
     ui.set_has_profile(true);
     ui.set_status_eyebrow(s("Готово"));
@@ -1256,10 +1305,7 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_toggle_on(true);
             ui.set_toggle_busy(true);
             ui.set_primary_enabled(false);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 0.3.4 · установится после отключения"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "0.3.4");
         }),
         ("home-local-profile", 840, 720, |ui| {
             ready(ui);
@@ -1275,34 +1321,23 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-update-banner-menu", 840, 720, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 0.4.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "0.4.0");
             ui.set_active_panel(s("subscription"));
         }),
         ("home-update-banner", 840, 720, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 0.4.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "0.4.0");
         }),
         ("home-update-banner-min", 700, 620, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 0.4.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "0.4.0");
         }),
         ("home-update-banner-longstatus-min", 700, 620, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s(
+            offer_update(ui, "0.4.0");
+            ui.set_update_toast_copy(s(
                 "Доступна версия 0.4.0 с исправлениями безопасности и стабильности",
             ));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
         }),
         ("home-conflicting-banner-min", 700, 620, |ui| {
             ready(ui);
@@ -1337,10 +1372,7 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-both-banners-min", 700, 620, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 0.4.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "0.4.0");
             ui.set_conflicting_apps_banner_visible(true);
             ui.set_conflicting_apps_message(s(
                 "Обнаружено другое VPN-приложение (FlClash): оно может конфликтовать с MULTICORE. Закройте его перед подключением.",
@@ -1352,18 +1384,12 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-handoff-and-update-toasts", 840, 720, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 1.2.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "1.2.0");
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
         }),
         ("home-handoff-and-update-toasts-min", 700, 620, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 1.2.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "1.2.0");
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
         }),
         ("home-service-toast", 840, 720, |ui| {
@@ -1372,19 +1398,13 @@ fn scenarios() -> Vec<Scenario> {
         }),
         ("home-three-toasts", 840, 720, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 1.2.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "1.2.0");
             ui.set_service_card_visible(true);
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
         }),
         ("home-three-toasts-min", 700, 620, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 1.2.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "1.2.0");
             ui.set_service_card_visible(true);
             ui.set_handoff_notice_for(s("/home/me/Apps/MultiCore-1.1.1-x86_64.AppImage"));
         }),
@@ -1394,10 +1414,7 @@ fn scenarios() -> Vec<Scenario> {
         ("home-ready-wide", 1600, 900, ready),
         ("home-update-banner-wide", 1600, 900, |ui| {
             ready(ui);
-            ui.set_update_available(true);
-            ui.set_update_status(s("MULTICORE 0.4.0"));
-            ui.set_update_action_label(s("Обновить"));
-            ui.set_update_action_enabled(true);
+            offer_update(ui, "0.4.0");
         }),
         ("subscriptions-wide", 1600, 900, |ui| {
             ready(ui);
@@ -1558,6 +1575,76 @@ fn scenarios() -> Vec<Scenario> {
             ui.set_tun_toggle_available(true);
             ui.set_service_card_visible(true);
             ui.set_service_install_busy(true);
+        }),
+        // An update run, stage by stage, as `apply_update_state` shows it.
+        ("update-offer", 840, 720, |ui| {
+            ready(ui);
+            offer_update(ui, "1.2.0");
+        }),
+        ("update-downloading", 840, 720, |ui| {
+            ready(ui);
+            updating(ui, downloaded(18, 52));
+        }),
+        ("update-downloading-min", 700, 620, |ui| {
+            ready(ui);
+            updating(ui, downloaded(18, 52));
+        }),
+        // A service that does not report its progress: no figures, no fill.
+        ("update-downloading-unknown", 840, 720, |ui| {
+            ready(ui);
+            updating(ui, downloaded(0, 0));
+        }),
+        ("update-verifying", 840, 720, |ui| {
+            ready(ui);
+            updating(ui, crate::updater::UpdateStage::Verifying);
+        }),
+        ("update-installing", 840, 720, |ui| {
+            ready(ui);
+            updating(ui, crate::updater::UpdateStage::Installing);
+        }),
+        ("update-restarting", 840, 720, |ui| {
+            ready(ui);
+            updating(ui, crate::updater::UpdateStage::Restarting);
+        }),
+        ("update-failed", 840, 720, |ui| {
+            ready(ui);
+            show_update(
+                ui,
+                crate::updater::UpdateState::InstallFailed(
+                    preview_release("1.2.0"),
+                    multicore_i18n::tr!("Служба не смогла загрузить или проверить обновление.")
+                        .into(),
+                ),
+            );
+        }),
+        ("update-failed-min", 700, 620, |ui| {
+            ready(ui);
+            show_update(
+                ui,
+                crate::updater::UpdateState::InstallFailed(
+                    preview_release("1.2.0"),
+                    multicore_i18n::tr!("Загрузка обновления прервалась").into(),
+                ),
+            );
+        }),
+        ("update-done", 840, 720, |ui| {
+            ready(ui);
+            show_update(ui, crate::updater::UpdateState::Current);
+            ui.set_update_done_version(s("1.2.0"));
+        }),
+        // The toast was hidden: the run goes on and Settings shows the same progress.
+        ("update-settings-progress", 840, 720, |ui| {
+            ready(ui);
+            updating(ui, downloaded(34, 52));
+            ui.set_update_banner_dismissed_for(s("update:1.2.0"));
+            ui.set_local_page(s("settings"));
+            ui.set_settings_section(s("updates"));
+        }),
+        ("update-settings-progress-min", 700, 620, |ui| {
+            ready(ui);
+            updating(ui, crate::updater::UpdateStage::Verifying);
+            ui.set_local_page(s("settings"));
+            ui.set_settings_section(s("updates"));
         }),
         ("settings-updates", 840, 720, |ui| {
             ready(ui);

@@ -539,6 +539,31 @@ global Motion {
     in-out property <bool> reduced: false;
 }
 
+// Thin determinate bar of a running update: its fill is the real share of bytes received
+// (full once the download is complete); below 0 the size is unknown and only the track shows.
+component UpdateProgressBar inherits Rectangle {
+    in property <float> progress;
+    in property <bool> reduced-motion;
+    in property <string> label;
+    height: 4px;
+    border-radius: 2px;
+    background: #ffffff14;
+    accessible-role: progress-indicator;
+    accessible-label: root.label;
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    accessible-value: root.progress < 0 ? "" : Math.round(Math.clamp(root.progress, 0, 1) * 100);
+    Rectangle {
+        x: 0;
+        y: 0;
+        height: parent.height;
+        width: root.progress < 0 ? 0px : parent.width * Math.clamp(root.progress, 0, 1);
+        border-radius: 2px;
+        background: Theme.accent-blue;
+        animate width { duration: root.reduced-motion ? 0ms : 240ms; easing: ease-out; }
+    }
+}
+
 component SectionCaption inherits Text {
     color: Theme.text-muted;
     font-family: Theme.font-family;
@@ -1662,6 +1687,17 @@ export component AppWindow inherits Window {
     // A connect/disconnect/import is in flight: installing now cannot start.
     in property <bool> update-runtime-busy: false;
     in-out property <string> update-banner-dismissed-for;
+    // The update toast: an offer, a running update (with its real stage) or a failure.
+    in property <string> update-toast-title;
+    in property <string> update-toast-copy;
+    // What «Позже»/«Скрыть» hides the toast for (the offer, the run, the failure).
+    in property <string> update-toast-key;
+    in property <bool> update-in-progress: false;
+    in property <bool> update-failed: false;
+    // Fill of the progress bar, 0..1; below 0 while the size is not known (no fill).
+    in property <float> update-progress: 0;
+    // Set once after an update for «Обновлено до …» (until «Понятно»).
+    in property <string> update-done-version;
     // Provider notice popover, opened from the title-bar bell.
     in-out property <bool> announcement-open: false;
     // Fingerprint of the notice last shown (persisted); see announcement_fingerprint.
@@ -1767,7 +1803,11 @@ export component AppWindow inherits Window {
     private property <int> profile-shelf-focus-serial: 0;
     in-out property <string> profile-delete-confirm-id;
     private property <bool> catalog-group-navigation-enabled: !root.catalog-loading && root.catalog-groups.length > 0;
-    private property <bool> update-banner-visible: root.update-available && root.update-status != root.update-banner-dismissed-for;
+    private property <bool> update-banner-visible: root.update-available && root.update-toast-key != root.update-banner-dismissed-for;
+    // «Понятно» on «Обновлено до …»; the version stays so the toast keeps its text while it fades.
+    private property <bool> update-done-dismissed: false;
+    private property <bool> update-done-visible: root.update-done-version != "" && !root.update-done-dismissed && !root.update-banner-visible;
+    private property <bool> update-toast-shown: root.update-banner-visible || root.update-done-visible;
     // Border + header + hints + body + footer of the subscription dropdown.
     private property <length> profile-menu-content-height: 2px + 32px
         + (root.profile-switch-locked ? 28px : 0px)
@@ -1950,8 +1990,8 @@ export component AppWindow inherits Window {
         }
     }
 
-    changed update-banner-visible => {
-        if (root.update-banner-visible && !root.reduced-motion) {
+    changed update-toast-shown => {
+        if (root.update-toast-shown && !root.reduced-motion) {
             root.update-banner-entering = true;
         }
     }
@@ -4474,6 +4514,15 @@ export component AppWindow inherits Window {
                                     spacing: 2px;
                                     Text { text: root.update-status; color: Theme.text-primary; font-size: Theme.type-label-size; font-weight: Theme.weight-medium; overflow: elide; }
                                     Text { text: root.update-detail; color: Theme.text-muted; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                                    // The same real progress as the toast, also after the toast was hidden.
+                                    if root.update-in-progress: VerticalLayout {
+                                        padding-top: 6px;
+                                        UpdateProgressBar {
+                                            progress: root.update-progress;
+                                            reduced-motion: root.reduced-motion;
+                                            label: root.update-detail;
+                                        }
+                                    }
                                 }
                                 if root.update-action-label != "": VerticalLayout {
                                     alignment: center;
@@ -4856,14 +4905,21 @@ export component AppWindow inherits Window {
             }
 
             // Update notice as a Sonner-style toast: bottom-right of the pane, it never
-            // pushes content. Always mounted so it can fade out after "Позже".
+            // pushes content. Always mounted so it can fade out after "Позже". It offers the
+            // update, then follows the real run (download bytes, check, install, restart), says
+            // why one failed, and once after an update confirms the new version.
             update-toast := Rectangle {
-                property <bool> shown: root.update-banner-visible;
+                property <bool> shown: root.update-toast-shown;
+                // What it says; independent of being shown, so it keeps its content while fading.
+                property <bool> done: root.update-done-version != "" && !root.update-banner-visible;
+                property <bool> running: !self.done && root.update-in-progress;
+                property <bool> failed: !self.done && root.update-failed;
                 property <length> motion: root.reduced-motion ? 0px
                     : root.update-banner-entering ? 16px
                     : self.shown ? 0px : 8px;
                 width: Math.min(356px, parent.width - 32px);
-                height: Math.max(60px, update-toast-title.preferred-height + update-toast-copy.preferred-height + 30px);
+                height: Math.max(60px, update-toast-title.preferred-height + update-toast-copy.preferred-height + 30px
+                    + (self.running ? 12px : 0px));
                 x: parent.width - self.width - 16px;
                 y: parent.height - self.height - 16px + self.motion;
                 opacity: self.shown && !root.update-banner-entering ? 1 : 0;
@@ -4891,21 +4947,52 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         alignment: start;
                         padding-top: 1px;
-                        Image { width: 18px; height: 18px; source: @image-url("../assets/download.svg"); colorize: Theme.accent-blue; image-fit: contain; accessible-role: none; }
+                        Image {
+                            width: 18px;
+                            height: 18px;
+                            source: update-toast.done ? @image-url("../assets/circle-check.svg")
+                                : update-toast.failed ? @image-url("../assets/circle-alert.svg")
+                                : @image-url("../assets/download.svg");
+                            colorize: update-toast.done ? Theme.accent-green
+                                : update-toast.failed ? Theme.error
+                                : Theme.accent-blue;
+                            image-fit: contain;
+                            accessible-role: none;
+                        }
                     }
                     VerticalLayout {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         alignment: center;
                         spacing: 2px;
-                        update-toast-title := Text { text: @tr("Доступно обновление"); color: Theme.text-primary; font-size: 13px; font-weight: Theme.weight-semibold; overflow: elide; }
-                        update-toast-copy := Text { text: root.update-status; color: Theme.text-secondary; font-size: Theme.type-metadata-size; wrap: word-wrap; }
+                        update-toast-title := Text {
+                            text: update-toast.done ? @tr("Обновлено до {}", root.update-done-version) : root.update-toast-title;
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            font-weight: Theme.weight-semibold;
+                            overflow: elide;
+                        }
+                        update-toast-copy := Text {
+                            text: update-toast.done ? @tr("Новая версия уже работает") : root.update-toast-copy;
+                            color: Theme.text-secondary;
+                            font-size: Theme.type-metadata-size;
+                            wrap: word-wrap;
+                        }
+                        if update-toast.running: VerticalLayout {
+                            padding-top: 8px;
+                            UpdateProgressBar {
+                                progress: root.update-progress;
+                                reduced-motion: root.reduced-motion;
+                                label: root.update-toast-copy;
+                            }
+                        }
                     }
                     VerticalLayout {
-                        alignment: center;
+                        alignment: update-toast.running ? start : center;
                         HorizontalLayout {
                             spacing: 4px;
-                            BannerAction {
+                            // Offer or failure: install (or retry) and «Позже».
+                            if !update-toast.done && !update-toast.running: BannerAction {
                                 filled: true;
                                 label: root.update-action-label != "" ? root.update-action-label : @tr("Подробнее");
                                 enabled: update-toast.shown && !root.update-busy && !root.profile-menu-open && !root.update-confirm-open
@@ -4915,10 +5002,22 @@ export component AppWindow inherits Window {
                                     else { root.local-page = "settings"; root.settings-section = "updates"; }
                                 }
                             }
-                            BannerAction {
+                            if !update-toast.done && !update-toast.running: BannerAction {
                                 label: @tr("Позже");
                                 enabled: update-toast.shown && !root.profile-menu-open;
-                                activated => { root.update-banner-dismissed-for = root.update-status; }
+                                activated => { root.update-banner-dismissed-for = root.update-toast-key; }
+                            }
+                            // Running: only hide it; the update goes on (and shows in Settings).
+                            if update-toast.running: BannerAction {
+                                label: @tr("Скрыть");
+                                enabled: update-toast.shown && !root.profile-menu-open;
+                                activated => { root.update-banner-dismissed-for = root.update-toast-key; }
+                            }
+                            if update-toast.done: BannerAction {
+                                filled: true;
+                                label: @tr("Понятно");
+                                enabled: update-toast.shown && !root.profile-menu-open;
+                                activated => { root.update-done-dismissed = true; }
                             }
                         }
                     }
