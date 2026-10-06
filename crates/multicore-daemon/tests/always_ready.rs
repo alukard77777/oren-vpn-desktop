@@ -1017,6 +1017,76 @@ impl multicore_daemon::ServiceUpdates for RecordingUpdates {
         self.0.lock().unwrap().push(format!("stage {version}"));
         self.1.map_or(Ok(()), Err)
     }
+
+    fn progress(
+        &self,
+    ) -> Result<
+        multicore_daemon::service_client::ServiceUpdateProgress,
+        multicore_daemon::service_client::ServiceError,
+    > {
+        self.0.lock().unwrap().push("progress".into());
+        match self.1 {
+            Some(error) => Err(error),
+            None => Ok(multicore_daemon::service_client::ServiceUpdateProgress {
+                stage: multicore_core::service_protocol::ServiceUpdateStage::Downloading,
+                received: 18,
+                total: 52,
+            }),
+        }
+    }
+}
+
+async fn get_update_progress(updates: Option<Arc<RecordingUpdates>>) -> (u16, String) {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let h = harness(&[PROFILE_A]);
+    let backend: Arc<dyn Backend> = h.backend.clone();
+    let updates = updates.map(|updates| updates as Arc<dyn multicore_daemon::ServiceUpdates>);
+    let app = multicore_daemon::try_router_shared(backend, "t", None, updates).unwrap();
+    let response = app
+        .oneshot(
+            Request::get("/v1/service/update/progress")
+                .header("authorization", "Bearer t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn the_service_update_progress_is_read_through_the_daemon() {
+    use multicore_daemon::service_client::ServiceError;
+    let updates = Arc::new(RecordingUpdates(Mutex::default(), None));
+    let (status, body) = get_update_progress(Some(updates.clone())).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"stage": "downloading", "received": 18, "total": 52})
+    );
+    assert_eq!(*updates.0.lock().unwrap(), ["progress"]);
+    assert_eq!(get_update_progress(None).await.0, 404);
+    for (error, status) in [
+        (ServiceError::Unavailable, 404),
+        (
+            ServiceError::Rejected(
+                multicore_core::elevation_protocol::BrokerErrorCode::InvalidRequest,
+            ),
+            502,
+        ),
+        (ServiceError::TimedOut, 502),
+    ] {
+        let updates = Arc::new(RecordingUpdates(Mutex::default(), Some(error)));
+        assert_eq!(
+            get_update_progress(Some(updates)).await.0,
+            status,
+            "{error:?}"
+        );
+    }
 }
 
 async fn post_update(

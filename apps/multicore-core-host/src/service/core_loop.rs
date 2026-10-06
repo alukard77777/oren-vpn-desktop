@@ -8,8 +8,12 @@ use std::{
 };
 
 use multicore_core::elevation_protocol::{BrokerErrorCode, ElevatedRuntimeState};
-use multicore_core::service_protocol::{ControllerEndpoint, ServiceCommand, ServiceResponse};
+use multicore_core::service_protocol::{
+    ControllerEndpoint, ServiceCommand, ServiceResponse, ServiceUpdateStage,
+};
 use multicore_core::troubleshoot::{FixOutcome, PrivilegedFix};
+
+use super::update::UpdateProgress;
 
 /// Who is on the other end of one connection, as established by the platform server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +84,11 @@ pub(crate) trait ServiceUpdater: Send {
     /// Starts the updater for the prepared `version` (the cores are already stopped) and
     /// arranges for the service to exit so the updater can replace `current`.
     fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode>;
+    /// Where `prepare` reports its progress (`UpdateProgress`); read while the updater itself
+    /// is taken out of the loop for the download.
+    fn progress(&self) -> Option<Arc<UpdateProgress>> {
+        None
+    }
 }
 
 /// Service-side «Устранить неполадки»: runs a validated batch of fixed fixes and reports one
@@ -106,6 +115,8 @@ pub(crate) struct ServiceLoop<C: Cores> {
     updater: Option<Box<dyn ServiceUpdater>>,
     /// An `Update` is downloading outside the lock; its updater is taken out meanwhile.
     updating: bool,
+    /// The updater's progress, answered for `UpdateProgress` while it downloads.
+    update_progress: Option<Arc<UpdateProgress>>,
     troubleshooter: Option<Arc<dyn Troubleshooter>>,
     /// A `Troubleshoot` batch is running outside the lock.
     troubleshooting: bool,
@@ -130,6 +141,7 @@ impl<C: Cores> ServiceLoop<C> {
             failure: None,
             updater: None,
             updating: false,
+            update_progress: None,
             troubleshooter: None,
             troubleshooting: false,
             log_directory: None,
@@ -152,6 +164,7 @@ impl<C: Cores> ServiceLoop<C> {
     /// Windows only: Linux packages are updated by the package manager.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn with_updater(mut self, updater: Box<dyn ServiceUpdater>) -> Self {
+        self.update_progress = updater.progress();
         self.updater = Some(updater);
         self
     }
@@ -218,6 +231,7 @@ impl<C: Cores> ServiceLoop<C> {
                 self.stop_everything();
                 ServiceResponse::ShuttingDown
             }
+            ServiceCommand::UpdateProgress => self.update_progress(),
             ServiceCommand::Update { version } => self.update(client, &version, false),
             ServiceCommand::StageUpdate { version } => self.update(client, &version, true),
             ServiceCommand::Troubleshoot { fixes } => match self.start_troubleshoot(client, &fixes)
@@ -458,6 +472,21 @@ impl<C: Cores> ServiceLoop<C> {
         }
     }
 
+    /// `UpdateProgress`: the running download's progress; without an update, or once it is
+    /// over, `Idle`. An updater that reports none is downloading with an unknown size.
+    fn update_progress(&self) -> ServiceResponse {
+        let idle = |stage| ServiceResponse::UpdateProgress {
+            stage,
+            received: 0,
+            total: 0,
+        };
+        match (&self.update_progress, self.updating) {
+            (Some(progress), true) => progress.response(),
+            (None, true) => idle(ServiceUpdateStage::Downloading),
+            (_, false) => idle(ServiceUpdateStage::Idle),
+        }
+    }
+
     fn update(
         &mut self,
         client: &ClientIdentity,
@@ -636,6 +665,7 @@ pub(crate) fn command_name(command: &ServiceCommand) -> &'static str {
         ServiceCommand::Shutdown => "Shutdown",
         ServiceCommand::Update { .. } => "Update",
         ServiceCommand::StageUpdate { .. } => "StageUpdate",
+        ServiceCommand::UpdateProgress => "UpdateProgress",
         ServiceCommand::Troubleshoot { .. } => "Troubleshoot",
     }
 }

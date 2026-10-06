@@ -23,7 +23,7 @@ use multicore_core::{
     },
     service_protocol::{
         MAX_SERVICE_LOG_TAIL_BYTES, ServiceCommand, ServiceLogFile, ServiceResponse,
-        service_response_matches,
+        ServiceUpdateStage, service_response_matches,
     },
 };
 use sha2::{Digest, Sha256};
@@ -293,8 +293,17 @@ fn command_label(command: &ServiceCommand) -> &'static str {
         ServiceCommand::Shutdown => "Shutdown",
         ServiceCommand::Update { .. } => "Update",
         ServiceCommand::StageUpdate { .. } => "StageUpdate",
+        ServiceCommand::UpdateProgress => "UpdateProgress",
         ServiceCommand::Troubleshoot { .. } => "Troubleshoot",
     }
+}
+
+/// How far the service's running update got (`ServiceSession::update_progress`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceUpdateProgress {
+    pub stage: ServiceUpdateStage,
+    pub received: u64,
+    pub total: u64,
 }
 
 impl<C: ServiceConnector> ServiceSession<C> {
@@ -720,6 +729,32 @@ impl<C: ServiceConnector> ServiceSession<C> {
         }
     }
 
+    /// How far the service's running `stage_update`/`update` got, for the desktop's progress
+    /// bar. On a channel of its own, like `troubleshoot`, while the update's channel waits: an
+    /// older service rejects the unknown command (`Rejected(InvalidRequest)`) and closes only
+    /// this channel.
+    pub fn update_progress(&self) -> Result<ServiceUpdateProgress, ServiceError> {
+        let transport = self.connector.connect()?;
+        let command = ServiceCommand::UpdateProgress;
+        match transport.request(&command)? {
+            ServiceResponse::Busy => Err(ServiceError::Busy),
+            ServiceResponse::Error { code } => Err(ServiceError::Rejected(code)),
+            ref response if !service_response_matches(&command, response) => {
+                Err(ServiceError::Protocol)
+            }
+            ServiceResponse::UpdateProgress {
+                stage,
+                received,
+                total,
+            } => Ok(ServiceUpdateProgress {
+                stage,
+                received,
+                total,
+            }),
+            _ => Err(ServiceError::Protocol),
+        }
+    }
+
     /// «Сохранить лог…»: the newest redacted lines of the service's own log, `service.log`
     /// then its predecessor, at most [`MAX_SERVICE_LOG_TAIL_BYTES`] of text in all. On a
     /// channel of its own, like `troubleshoot`: an older service rejects the unknown command
@@ -882,6 +917,10 @@ impl<C: ServiceConnector> crate::ServiceUpdates for ServiceSession<C> {
 
     fn stage(&self, version: &str) -> Result<(), ServiceError> {
         ServiceSession::stage_update(self, version)
+    }
+
+    fn progress(&self) -> Result<ServiceUpdateProgress, ServiceError> {
+        ServiceSession::update_progress(self)
     }
 }
 

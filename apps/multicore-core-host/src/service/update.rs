@@ -13,11 +13,57 @@
 //! client that only sends `Update` (1.1.1) gets the one-step download-then-install as before.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 
 use multicore_core::elevation_protocol::BrokerErrorCode;
+use multicore_core::service_protocol::{ServiceResponse, ServiceUpdateStage};
 use multicore_release::{Version, verify_archive_file};
 
 use super::core_loop::ClientIdentity;
+
+/// How far the running update got: written by the updater, which downloads outside the
+/// service's lock, and read for `UpdateProgress` on another client channel.
+pub(crate) struct UpdateProgress {
+    state: Mutex<(ServiceUpdateStage, u64, u64)>,
+}
+
+impl Default for UpdateProgress {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new((ServiceUpdateStage::Idle, 0, 0)),
+        }
+    }
+}
+
+impl UpdateProgress {
+    fn set(&self, stage: ServiceUpdateStage, received: u64, total: u64) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = (stage, received, total);
+    }
+
+    /// `received` of `total` bytes are in (`total` 0 while the release is still fetched).
+    pub(crate) fn downloading(&self, received: u64, total: u64) {
+        self.set(ServiceUpdateStage::Downloading, received, total);
+    }
+
+    /// The download is complete; its size and digests are being checked.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn verifying(&self) {
+        self.set(ServiceUpdateStage::Verifying, 0, 0);
+    }
+
+    pub(crate) fn idle(&self) {
+        self.set(ServiceUpdateStage::Idle, 0, 0);
+    }
+
+    pub(crate) fn response(&self) -> ServiceResponse {
+        let (stage, received, total) = *self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        ServiceResponse::UpdateProgress {
+            stage,
+            received,
+            total,
+        }
+    }
+}
 
 /// A release the service downloaded and verified (GitHub digest and the in-zip
 /// `SHA256SUMS.txt`), waiting for `Update` to hand it to the updater. `StageUpdate` leaves one
@@ -85,7 +131,7 @@ mod production {
         System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS, SetEvent, WaitForSingleObject},
     };
 
-    use super::{ClientIdentity, StagedRelease, plan_update, session_of};
+    use super::{ClientIdentity, StagedRelease, UpdateProgress, plan_update, session_of};
     use crate::service::core_loop::ServiceUpdater;
 
     const RELEASE_BODY_LIMIT: usize = 512 * 1024;
@@ -102,6 +148,7 @@ mod production {
         runtime: Option<tokio::runtime::Runtime>,
         staged: Option<StagedRelease>,
         launched: bool,
+        progress: Arc<UpdateProgress>,
     }
 
     impl ProductionUpdater {
@@ -121,6 +168,7 @@ mod production {
                     .ok(),
                 staged: None,
                 launched: false,
+                progress: Arc::default(),
             }
         }
 
@@ -218,6 +266,7 @@ mod production {
                     output
                         .write_all(&chunk)
                         .map_err(|_| BrokerErrorCode::NotReady)?;
+                    self.progress.downloading(written, release.asset().size());
                 }
                 output.flush().map_err(|_| BrokerErrorCode::NotReady)?;
                 Ok(())
@@ -233,6 +282,7 @@ mod production {
                 .and_then(|value| Repository::parse(value).ok())
                 .ok_or(BrokerErrorCode::Unsupported)?;
             multicore_core::ensure_crypto_provider_installed();
+            self.progress.downloading(0, 0);
             let release = self.fetch(&repository)?;
             if release.version().to_string() != version {
                 return Err(BrokerErrorCode::InvalidRequest);
@@ -241,7 +291,9 @@ mod production {
             let _ = fs::remove_dir_all(&update_dir);
             fs::create_dir_all(&update_dir).map_err(|_| BrokerErrorCode::NotReady)?;
             let archive = update_dir.join(format!("multicore-{version}.zip"));
+            self.progress.downloading(0, release.asset().size());
             self.download(&release, &archive)?;
+            self.progress.verifying();
             verify_archive_file(
                 &archive,
                 release.asset().size(),
@@ -277,16 +329,25 @@ mod production {
                 .ok_or(BrokerErrorCode::InvalidRequest)?;
             // `Update` after a `StageUpdate`: the tunnel is already down, so hand over the
             // release that was verified while it was still up instead of downloading again.
-            if self
+            self.progress.verifying();
+            let reusable = self
                 .staged
                 .as_ref()
-                .is_some_and(|staged| staged.reusable_for(version))
-            {
-                return Ok(());
-            }
-            self.staged = None;
-            self.staged = Some(self.stage(version)?);
-            Ok(())
+                .is_some_and(|staged| staged.reusable_for(version));
+            let prepared = if reusable {
+                Ok(())
+            } else {
+                self.staged = None;
+                self.stage(version).map(|staged| {
+                    self.staged = Some(staged);
+                })
+            };
+            self.progress.idle();
+            prepared
+        }
+
+        fn progress(&self) -> Option<Arc<UpdateProgress>> {
+            Some(self.progress.clone())
         }
 
         fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {

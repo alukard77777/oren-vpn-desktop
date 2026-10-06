@@ -74,6 +74,22 @@ pub enum ServiceCommand {
         since_ms: u64,
         cursor: Option<CoreJournalCursor>,
     },
+    /// How far the running `StageUpdate`/`Update` got, for the desktop's progress bar.
+    /// Read-only, and on a channel of its own while the update's channel waits. Additive like
+    /// `StageUpdate`: an older service answers `Error{InvalidRequest}`.
+    UpdateProgress,
+}
+
+/// Where the service's update download is (`ServiceResponse::UpdateProgress`).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceUpdateStage {
+    /// No update is being downloaded or checked.
+    Idle,
+    /// The release is being fetched: `received` of `total` bytes (`total` 0 until known).
+    Downloading,
+    /// The download is complete and its size, digest and in-zip checksums are checked.
+    Verifying,
 }
 
 /// Where `CoreJournal` paging continues: a journal segment (its start in unix ms, which names
@@ -189,6 +205,12 @@ pub enum ServiceResponse {
         version: String,
     },
     UpdateStarted,
+    /// `UpdateProgress`: the stage of the running update and the bytes of its download.
+    UpdateProgress {
+        stage: ServiceUpdateStage,
+        received: u64,
+        total: u64,
+    },
     /// `Troubleshoot` ran: one outcome per requested fix, in order.
     Troubleshot {
         outcomes: Vec<FixOutcome>,
@@ -282,6 +304,12 @@ pub fn service_response_matches(command: &ServiceCommand, response: &ServiceResp
         (ServiceCommand::CoreJournal { cursor, .. }, ServiceResponse::CoreJournal { next, .. }) => {
             next.is_none() || next != cursor
         }
+        (
+            ServiceCommand::UpdateProgress,
+            ServiceResponse::UpdateProgress {
+                received, total, ..
+            },
+        ) => *total == 0 || received <= total,
         (ServiceCommand::Status, ServiceResponse::Status { .. })
         | (ServiceCommand::Diagnostics, ServiceResponse::ProcessDiagnostics { .. })
         | (ServiceCommand::Shutdown, ServiceResponse::ShuttingDown)

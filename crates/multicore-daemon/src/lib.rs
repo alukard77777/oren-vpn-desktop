@@ -1218,6 +1218,14 @@ pub trait ServiceUpdates: Send + Sync + 'static {
     fn update(&self, version: &str) -> Result<(), service_client::ServiceError>;
     /// Downloads and verifies `version` only; the cores and the tunnel keep running.
     fn stage(&self, version: &str) -> Result<(), service_client::ServiceError>;
+    /// How far a running `update`/`stage` got (asked while it waits on another channel).
+    fn progress(
+        &self,
+    ) -> Result<service_client::ServiceUpdateProgress, service_client::ServiceError> {
+        Err(service_client::ServiceError::Rejected(
+            multicore_core::elevation_protocol::BrokerErrorCode::InvalidRequest,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -1334,6 +1342,7 @@ fn build_router_shared(
         .route("/session", get(session))
         .route("/service/update", post(service_update))
         .route("/service/update/stage", post(service_update_stage))
+        .route("/service/update/progress", get(service_update_progress))
         .route("/troubleshoot/check", post(troubleshoot_check))
         .route("/troubleshoot/fix", post(troubleshoot_fix))
         .route("/service-log", get(service_log_handler))
@@ -2100,6 +2109,35 @@ async fn service_update_stage(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     run_service_update(state, body, true).await
+}
+
+/// How far the service's running update got, polled by the desktop for its progress bar
+/// while `service_update`/`service_update_stage` waits. Read-only.
+async fn service_update_progress(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<service_client::ServiceUpdateProgress>, ApiError> {
+    reject_nonempty_body(&body)?;
+    let Some(updates) = state.service_updates.clone() else {
+        return Err(service_unavailable());
+    };
+    let result = tokio::task::spawn_blocking(move || updates.progress())
+        .await
+        .map_err(|_| ApiError::backend("Служба не ответила."))?;
+    match result {
+        Ok(progress) => Ok(Json(progress)),
+        Err(
+            service_client::ServiceError::NotInstalled
+            | service_client::ServiceError::Unavailable
+            | service_client::ServiceError::Impostor,
+        ) => Err(service_unavailable()),
+        // An older service without the command, a timeout, another user's session.
+        Err(_) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "service_progress_unavailable",
+            "Служба не сообщила ход обновления.",
+        )),
+    }
 }
 
 async fn run_service_update(

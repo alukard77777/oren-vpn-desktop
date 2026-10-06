@@ -4,8 +4,8 @@ use multicore_core::elevation_protocol::{
 };
 use multicore_core::service_protocol::{
     ControllerEndpoint, CoreJournalCursor, SERVICE_PROTOCOL_VERSION, ServiceCommand,
-    ServiceLogFile, ServiceResponse, decode_service_command, decode_service_frame,
-    encode_service_frame, redact_service_log, service_response_matches,
+    ServiceLogFile, ServiceResponse, ServiceUpdateStage, decode_service_command,
+    decode_service_frame, encode_service_frame, redact_service_log, service_response_matches,
 };
 
 fn raw(payload: &[u8]) -> Vec<u8> {
@@ -45,6 +45,7 @@ fn every_v2_command_round_trips() {
             since_ms: 0,
             cursor: None,
         },
+        ServiceCommand::UpdateProgress,
         ServiceCommand::CoreJournal {
             since_ms: 1_791_064_846_000,
             cursor: Some(CoreJournalCursor {
@@ -154,6 +155,71 @@ fn staging_is_an_additive_v2_command() {
         &staged
     ));
     assert!(service_response_matches(&stage, &ServiceResponse::Busy));
+}
+
+/// The download progress of a running `StageUpdate`/`Update` is additive and read-only: no
+/// arguments on the wire, and a v2 service that does not know it rejects it (never misreads).
+#[test]
+fn update_progress_is_an_additive_read_only_v2_command() {
+    assert_eq!(
+        decode_service_command(&raw(br#"{"version":2,"body":"update_progress"}"#)),
+        Ok(ServiceCommand::UpdateProgress)
+    );
+    assert_eq!(
+        decode_service_command(&raw(
+            br#"{"version":2,"body":{"update_progress":{"path":"x"}}}"#
+        )),
+        Err(ProtocolError::InvalidSchema)
+    );
+    let downloading = ServiceResponse::UpdateProgress {
+        stage: ServiceUpdateStage::Downloading,
+        received: 18,
+        total: 52,
+    };
+    let frame = encode_service_frame(&downloading).unwrap();
+    assert_eq!(
+        decode_service_frame::<ServiceResponse>(&frame).unwrap(),
+        downloading
+    );
+    let ask = ServiceCommand::UpdateProgress;
+    assert!(service_response_matches(&ask, &downloading));
+    for stage in [
+        ServiceUpdateStage::Idle,
+        ServiceUpdateStage::Downloading,
+        ServiceUpdateStage::Verifying,
+    ] {
+        // An unknown size (`total` 0) is allowed; more received than the size is not.
+        assert!(service_response_matches(
+            &ask,
+            &ServiceResponse::UpdateProgress {
+                stage,
+                received: 0,
+                total: 0,
+            }
+        ));
+        assert!(!service_response_matches(
+            &ask,
+            &ServiceResponse::UpdateProgress {
+                stage,
+                received: 53,
+                total: 52,
+            }
+        ));
+    }
+    assert!(!service_response_matches(
+        &ask,
+        &ServiceResponse::UpdateStarted
+    ));
+    assert!(!service_response_matches(
+        &ServiceCommand::Status,
+        &downloading
+    ));
+    assert!(service_response_matches(
+        &ask,
+        &ServiceResponse::Error {
+            code: BrokerErrorCode::InvalidRequest
+        }
+    ));
 }
 
 #[test]

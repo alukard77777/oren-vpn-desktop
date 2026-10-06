@@ -10,21 +10,25 @@ use multicore_core::{
     elevation_protocol::{BrokerErrorCode, ElevatedRuntimeState},
     service_protocol::{
         ControllerEndpoint, MAX_SERVICE_LOG_TAIL_BYTES, ServiceCommand, ServiceLogFile,
-        ServiceResponse,
+        ServiceResponse, ServiceUpdateStage,
     },
 };
 use multicore_daemon::MihomoSelector;
 use multicore_daemon::connection_mode::{ProxySwitch, SystemProxyController};
 use multicore_daemon::service_client::{
     ControllerSlot, ServiceConnector, ServiceCoresController, ServiceError, ServiceMode,
-    ServiceSession, ServiceTransport, ServiceTunController, SlotSelector, WarmInputs, WarmMiss,
-    WarmStage, WarmStages, service_response_timeout, warm_key,
+    ServiceSession, ServiceTransport, ServiceTunController, ServiceUpdateProgress, SlotSelector,
+    WarmInputs, WarmMiss, WarmStage, WarmStages, service_response_timeout, warm_key,
 };
 
 #[derive(Default)]
 struct FakeService {
     commands: Vec<ServiceCommand>,
     connects: usize,
+    /// An older service: `UpdateProgress` is an unknown command.
+    progress_unknown: bool,
+    /// `UpdateProgress` claims more received than the size.
+    progress_overrun: bool,
     busy: bool,
     status_failure: Option<BrokerErrorCode>,
     break_next: bool,
@@ -204,6 +208,14 @@ impl ServiceTransport for FakeTransport {
             }
             ServiceCommand::Troubleshoot { fixes } => ServiceResponse::Troubleshot {
                 outcomes: vec![multicore_core::troubleshoot::FixOutcome::Done; fixes.len()],
+            },
+            ServiceCommand::UpdateProgress if service.progress_unknown => ServiceResponse::Error {
+                code: BrokerErrorCode::InvalidRequest,
+            },
+            ServiceCommand::UpdateProgress => ServiceResponse::UpdateProgress {
+                stage: ServiceUpdateStage::Downloading,
+                received: if service.progress_overrun { 53 } else { 18 },
+                total: 52,
             },
             ServiceCommand::StageUpdate { version } => ServiceResponse::UpdateStaged {
                 version: if service.stage_wrong_version {
@@ -739,6 +751,41 @@ fn staging_runs_on_its_own_channel_and_leaves_the_connection_alone() {
     assert!(
         service.tun,
         "the tunnel stays up while the release downloads"
+    );
+}
+
+#[test]
+fn update_progress_is_read_on_its_own_channel_and_an_older_service_is_told_apart() {
+    let (session, connector, _) = session();
+    session.prepare(3).unwrap();
+    session.set_tun(true).unwrap();
+    assert_eq!(
+        session.update_progress(),
+        Ok(ServiceUpdateProgress {
+            stage: ServiceUpdateStage::Downloading,
+            received: 18,
+            total: 52,
+        })
+    );
+    assert_eq!(
+        connector.0.lock().unwrap().connects,
+        2,
+        "progress opened its own channel"
+    );
+    connector.0.lock().unwrap().progress_overrun = true;
+    assert_eq!(session.update_progress(), Err(ServiceError::Protocol));
+    connector.0.lock().unwrap().progress_unknown = true;
+    assert_eq!(
+        session.update_progress(),
+        Err(ServiceError::Rejected(BrokerErrorCode::InvalidRequest))
+    );
+    session.poll();
+    assert!(session.cores_ready(), "the connection was left alone");
+    assert!(connector.0.lock().unwrap().tun);
+    assert!(
+        service_response_timeout(&ServiceCommand::UpdateProgress)
+            <= std::time::Duration::from_secs(5),
+        "a progress poll never waits long"
     );
 }
 

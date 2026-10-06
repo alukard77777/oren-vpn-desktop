@@ -2607,8 +2607,9 @@ mod update_outside_the_lock {
     use crate::service::core_loop::{
         ClientIdentity, ConnectionId, ServiceLoop, ServiceUpdater, execute_shared,
     };
+    use crate::service::update::UpdateProgress;
     use multicore_core::elevation_protocol::BrokerErrorCode;
-    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse};
+    use multicore_core::service_protocol::{ServiceCommand, ServiceResponse, ServiceUpdateStage};
     use std::sync::{
         Arc, Mutex,
         mpsc::{Receiver, Sender, channel},
@@ -2616,11 +2617,13 @@ mod update_outside_the_lock {
     use std::thread;
     use std::time::Duration;
 
-    /// `prepare` reports that the download started, then blocks until released.
+    /// `prepare` reports that the download started (18 of 52 bytes in), then blocks until
+    /// released.
     struct BlockingDownload {
         started: Sender<()>,
         release: Mutex<Receiver<Result<(), BrokerErrorCode>>>,
         begun: Arc<Mutex<Vec<String>>>,
+        progress: Arc<UpdateProgress>,
     }
 
     impl ServiceUpdater for BlockingDownload {
@@ -2629,8 +2632,14 @@ mod update_outside_the_lock {
             _client: &ClientIdentity,
             _version: &str,
         ) -> Result<(), BrokerErrorCode> {
+            self.progress.downloading(18, 52);
             self.started.send(()).unwrap();
-            self.release.lock().unwrap().recv().unwrap()
+            let result = self.release.lock().unwrap().recv().unwrap();
+            self.progress.idle();
+            result
+        }
+        fn progress(&self) -> Option<Arc<UpdateProgress>> {
+            Some(self.progress.clone())
         }
         fn begin(&mut self, client: &ClientIdentity, version: &str) -> Result<(), BrokerErrorCode> {
             self.begun
@@ -2663,6 +2672,7 @@ mod update_outside_the_lock {
                 started: started_tx,
                 release: Mutex::new(release_rx),
                 begun: begun.clone(),
+                progress: Arc::default(),
             })),
         ));
         Harness {
@@ -2733,6 +2743,52 @@ mod update_outside_the_lock {
         assert_eq!(updating.join().unwrap(), ServiceResponse::UpdateStarted);
         assert!(!h.service.lock().unwrap().cores_mut().running);
         assert_eq!(*h.begun.lock().unwrap(), ["1:alice@1.2.0"]);
+    }
+
+    #[test]
+    fn the_download_progress_is_answered_while_it_runs_and_idle_otherwise() {
+        let h = harness();
+        let idle = ServiceResponse::UpdateProgress {
+            stage: ServiceUpdateStage::Idle,
+            received: 0,
+            total: 0,
+        };
+        assert_eq!(
+            run(&h.service, 1, "1:alice", ServiceCommand::UpdateProgress),
+            idle
+        );
+        let staging = {
+            let service = h.service.clone();
+            thread::spawn(move || {
+                run(
+                    &service,
+                    9,
+                    "1:alice",
+                    ServiceCommand::StageUpdate {
+                        version: "1.2.0".into(),
+                    },
+                )
+            })
+        };
+        h.started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // On a channel of its own, while the staging channel waits for the download.
+        assert_eq!(
+            run(&h.service, 2, "1:alice", ServiceCommand::UpdateProgress),
+            ServiceResponse::UpdateProgress {
+                stage: ServiceUpdateStage::Downloading,
+                received: 18,
+                total: 52,
+            }
+        );
+        h.release.send(Ok(())).unwrap();
+        assert!(matches!(
+            staging.join().unwrap(),
+            ServiceResponse::UpdateStaged { .. }
+        ));
+        assert_eq!(
+            run(&h.service, 2, "1:alice", ServiceCommand::UpdateProgress),
+            idle
+        );
     }
 
     #[test]
