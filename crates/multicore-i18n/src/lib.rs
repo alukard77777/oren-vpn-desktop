@@ -445,6 +445,8 @@ mod tests {
         "Удалить подписку?",
         // A label of the saved log's system.txt, not shown in the window.
         "Язык",
+        // The update toast's download line without figures: "Loading…" would not say what.
+        "Скачиваем…",
     ];
 
     fn chars(text: &str) -> usize {

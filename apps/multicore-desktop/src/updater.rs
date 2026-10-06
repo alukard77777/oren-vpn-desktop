@@ -185,7 +185,7 @@ impl UpdateState {
             Self::InstallFailed(release, message) => {
                 shown.toast_title = tr!("Не удалось обновить").into();
                 shown.toast_copy = message.clone();
-                shown.toast_key = format!("failed:{}:{message}", release.version());
+                shown.toast_key = format!("failed:{}", release.version());
                 shown.failed = true;
             }
             _ => {}
