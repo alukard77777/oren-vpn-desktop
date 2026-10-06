@@ -112,9 +112,34 @@ non-empty vendor prefix followed by `-servicelogo`. Remote styling/behavior
 headers such as `flclashx-background`, `ajsdjddj-background`, widgets, settings,
 or routing overrides are intentionally not supported.
 
+### Metadata as leading `#` lines of the body
+
+A provider that hosts a static file (a gist, object storage, a plain web server) or runs a panel that cannot set response headers may write the same metadata as comment lines at the very top of the body, the convention other clients (Happ, Hiddify, Clash family) accept:
+
+```yaml
+#profile-title: base64:8J+agCBGam9yZA==
+#profile-update-interval: 12
+#subscription-userinfo: upload=0; download=123; total=1073741824; expire=1798761600
+#support-url: https://t.me/support
+#profile-web-page-url: https://example.com
+#announce: base64:0J/RgNC40LLQtdGC
+#dumb-mode: on
+#app-language: en
+mixed-port: 7890
+proxies:
+  ...
+```
+
+- Every header in the table above is accepted, with the same names (case-insensitive, vendor prefixes included), formats, sanitizers and limits; values go through exactly the same code as response headers. Two are only taken from a real response: `Content-Disposition` and `x-hwid-max-devices-reached`. Unknown names are ignored.
+- Line format: `#name: value`, optionally with spaces after `#` and around `:`; `name` is letters, digits and `-`. Other `#` lines (free text such as `# generated 12:00`) and blank lines are skipped. A UTF-8 BOM and CRLF line ends are fine.
+- Only the leading block counts: scanning stops at the first line that is neither blank nor a `#` line, and after 64 lines or 16 KiB. A `#` line further down is an ordinary YAML comment and is not read.
+- All three bodies may carry the block: the Mihomo YAML (`multicore-mihomo`), the Xray JSON (`multicore-xray`), the combined bundle (`multicore-json-massive`, before its `[`), and the Mihomo YAML string inside the bundle. The block is removed before the body is parsed, so it never reaches the core configurations. JSON cannot contain comments, so a JSON body or bundle that does not start with `#` is parsed byte for byte as before; a `#` anywhere past the leading block is still invalid JSON.
+- Priority, per key, highest first: (1) real HTTP response headers (of any response used for the refresh), (2) the combined bundle's leading lines, (3) the Mihomo YAML's leading lines (inside the bundle, or the `multicore-mihomo` answer), (4) the Xray JSON's leading lines. A lower source only fills keys no higher source sent; a header that was sent keeps its key even when its value is invalid. A bundle answer is final, so sources (2)-(3) apply to a bundle, and (3)-(4) to the separate Mihomo and Xray answers. Between different keys the usual rules apply, for example a `#profile-title` line beats a file name from a `Content-Disposition` header.
+- Body lines are as untrusted as headers and get no extra trust: URLs, titles and announcements pass the same sanitizers, and neither values nor the body are logged.
+
 ## Metadata limits and safety
 
-- Maximum accepted raw metadata total: 16 KiB.
+- Maximum accepted raw metadata total: 16 KiB, shared by response headers and leading `#` body lines (headers first).
 - Maximum accepted raw value per metadata field: 4 KiB.
 - Header values containing CR or LF are discarded.
 - URLs and subscription credentials never enter normal status responses, diagnostics, or logs.
