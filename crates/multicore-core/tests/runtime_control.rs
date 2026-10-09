@@ -134,6 +134,138 @@ dns:
     );
 }
 
+/// The `fake-ip-filter` entries of the runtime Mihomo config for `mihomo`, with an Xray
+/// overlay whose two endpoints are `se.acmevpn.net` and `srv4.eunodes.net`.
+fn fake_ip_filter_with_live_endpoints(mihomo: &[u8]) -> Option<Vec<String>> {
+    let xray = br#"{"outbounds": [
+        {"tag":"se","protocol":"shadowsocks","settings":{"address":"se.acmevpn.net","port":443}},
+        {"tag":"lv-mux","protocol":"shadowsocks",
+         "settings":{"address":"srv4.eunodes.net","port":443}}]}"#;
+    let snapshot = Snapshot::parse(mihomo, xray).unwrap();
+    let directory = TempDirectory::new();
+    let control = MihomoRuntimeControl::new("127.0.0.1:19090".parse().unwrap(), "ephemeral")
+        .unwrap()
+        .with_xray_outbound_interface("Ethernet")
+        .unwrap();
+    let published =
+        publish_runtime_with_mihomo_control(&snapshot, directory.path(), &control).unwrap();
+    let runtime: Value =
+        serde_yaml_ng::from_slice(&fs::read(published.mihomo_config).unwrap()).unwrap();
+    let filter = runtime
+        .get("dns")
+        .and_then(|dns| dns.get("fake-ip-filter"))?
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap().to_owned())
+        .collect();
+    Some(filter)
+}
+
+#[test]
+fn endpoint_domains_get_real_addresses_from_a_fake_ip_mihomo() {
+    // Xray's endpoint lookup is hijacked into Mihomo's DNS, and in fake-ip mode Mihomo hands
+    // out a fake 198.18.x.x address before `nameserver-policy` is ever consulted. Xray then
+    // dials that fake address out of the physical adapter, so every node whose server is not
+    // in the provider's own filter (here `srv4.eunodes.net`) failed its pings and traffic
+    // whenever its real address was not cached. Captured on the owner's PC with 1.1.12.
+    let filter = fake_ip_filter_with_live_endpoints(
+        br#"
+proxies: []
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - +.acmevpn.net
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        filter[0], "+.acmevpn.net",
+        "the provider's own entries stay first"
+    );
+    assert!(
+        filter.contains(&"srv4.eunodes.net".to_owned()),
+        "{filter:?}"
+    );
+    assert!(filter.contains(&"se.acmevpn.net".to_owned()), "{filter:?}");
+
+    // No filter of its own: the defaults are kept and the endpoints added to them.
+    let filter = fake_ip_filter_with_live_endpoints(
+        b"proxies: []
+dns:
+  enhanced-mode: fake-ip
+",
+    )
+    .unwrap();
+    assert!(
+        filter.contains(&"+.msftconnecttest.com".to_owned()),
+        "{filter:?}"
+    );
+    assert!(
+        filter.contains(&"srv4.eunodes.net".to_owned()),
+        "{filter:?}"
+    );
+
+    // Rule mode: the endpoints are real-ip rules ahead of the provider's own.
+    let filter = fake_ip_filter_with_live_endpoints(
+        br#"
+proxies: []
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: rule
+  fake-ip-filter:
+    - MATCH,fake-ip
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        filter,
+        [
+            "DOMAIN,se.acmevpn.net,real-ip",
+            "DOMAIN,srv4.eunodes.net,real-ip",
+            "MATCH,fake-ip"
+        ]
+    );
+
+    // Whitelist mode lists what gets a fake address: an endpoint listed there is taken out.
+    let filter = fake_ip_filter_with_live_endpoints(
+        br#"
+proxies: []
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter:
+    - srv4.eunodes.net
+    - +.example.com
+"#,
+    )
+    .unwrap();
+    assert_eq!(filter, ["+.example.com"]);
+
+    // Already filtered: nothing is duplicated.
+    let filter = fake_ip_filter_with_live_endpoints(
+        br#"
+proxies: []
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-filter: [se.acmevpn.net, srv4.eunodes.net]
+"#,
+    )
+    .unwrap();
+    assert_eq!(filter, ["se.acmevpn.net", "srv4.eunodes.net"]);
+
+    // redir-host gives real addresses anyway: no filter is invented.
+    assert_eq!(
+        fake_ip_filter_with_live_endpoints(
+            b"proxies: []
+dns:
+  enhanced-mode: redir-host
+"
+        ),
+        None
+    );
+}
+
 #[test]
 fn mihomo_nameserver_policy_is_untouched_without_a_live_endpoint_domain() {
     let mihomo = br#"

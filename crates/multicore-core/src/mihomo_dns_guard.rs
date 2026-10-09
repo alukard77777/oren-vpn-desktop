@@ -3,7 +3,7 @@
 //! It only fills in what a provider left out or repairs a pool its own TUN would black-hole;
 //! anything the provider set explicitly stays as written.
 
-use std::net::IpAddr;
+use std::{collections::BTreeSet, net::IpAddr};
 
 use serde_yaml_ng::{Mapping, Value};
 
@@ -57,6 +57,67 @@ pub(crate) fn apply(mapping: &mut Mapping) {
     // With `ipv6: false` Mihomo discards the v6 pool itself.
     if !ipv6_off {
         drop_unroutable_v6_pool(dns, tun.as_ref());
+    }
+}
+
+/// Makes Mihomo answer `domains` (exact names) with real addresses in fake-ip mode: they are
+/// added to a blacklist filter, prepended as `real-ip` rules in rule mode, and taken out of a
+/// whitelist. A whitelist wildcard that also covers one of them is left alone: removing it would
+/// take real addresses from every other name it covers.
+pub(crate) fn exempt_from_fake_ip(dns: &mut Mapping, domains: &BTreeSet<String>) {
+    let fake_ip = dns
+        .get(key("enhanced-mode"))
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("fake-ip"));
+    if !fake_ip || domains.is_empty() {
+        return;
+    }
+    let mode = match dns.get(key("fake-ip-filter-mode")) {
+        None | Some(Value::Null) => "blacklist".to_owned(),
+        Some(mode) => match mode.as_str() {
+            Some(mode) => mode.trim().to_ascii_lowercase(),
+            None => return,
+        },
+    };
+    let filter = dns.entry(key("fake-ip-filter")).or_insert(Value::Null);
+    if filter.is_null() {
+        *filter = Value::Sequence(Vec::new());
+    }
+    let Some(filter) = filter.as_sequence_mut() else {
+        return;
+    };
+    let listed = |filter: &Vec<Value>, wanted: &str| {
+        filter.iter().any(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|entry| entry.trim().eq_ignore_ascii_case(wanted))
+        })
+    };
+    match mode.as_str() {
+        "blacklist" => {
+            for domain in domains {
+                if !listed(filter, domain) {
+                    filter.push(key(domain));
+                }
+            }
+        }
+        "rule" => {
+            let rules: Vec<Value> = domains
+                .iter()
+                .map(|domain| format!("DOMAIN,{domain},real-ip"))
+                .filter(|rule| !listed(filter, rule))
+                .map(Value::String)
+                .collect();
+            filter.splice(0..0, rules);
+        }
+        "whitelist" => filter.retain(|entry| {
+            !entry.as_str().is_some_and(|entry| {
+                domains
+                    .iter()
+                    .any(|domain| entry.trim().eq_ignore_ascii_case(domain))
+            })
+        }),
+        _ => {}
     }
 }
 

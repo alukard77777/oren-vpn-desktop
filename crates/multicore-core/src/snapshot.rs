@@ -1573,6 +1573,10 @@ pub fn stage_runtime_with_mihomo_control(
                     YamlValue::String(ENDPOINT_DNS_RESOLVER.to_owned()),
                 );
             }
+            // In fake-ip mode Mihomo answers before `nameserver-policy` is consulted, so the
+            // hijacked query would get a fake address that only means something inside the
+            // tunnel Xray deliberately dials around.
+            crate::mihomo_dns_guard::exempt_from_fake_ip(dns, &domains);
         }
     }
     let mihomo = serde_yaml_ng::to_string(&document)
