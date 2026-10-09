@@ -880,6 +880,10 @@ impl DaemonClient for UnavailableDaemonClient {
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// The daemon answers a latency check by its batch deadline (12 s: two waves of Mihomo's own
+// 5 s delay timeout), leaving out what it could not measure by then. Waiting less would turn
+// a slow but complete answer into an error for every row.
+const LATENCY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 // A refresh can perform a native request, a legacy fallback pair, an optional logo fetch,
 // and a managed core shutdown before the daemon can answer. It must not inherit the short
 // timeout used by local status and selector calls.
@@ -1066,6 +1070,7 @@ impl HttpDaemonClient {
             .http
             .post(self.endpoint("/v1/latencies"))
             .bearer_auth(&self.token)
+            .timeout(LATENCY_REQUEST_TIMEOUT)
             .json(&request)
             .send()
             .map_err(map_error)?;
@@ -3268,6 +3273,46 @@ mod http_tests {
         assert!(CONNECT_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
         assert!(CONNECT_REQUEST_TIMEOUT >= Duration::from_secs(300 + 2 * 20 + 30));
         assert!(DISCONNECT_REQUEST_TIMEOUT >= Duration::from_secs(2 * 5 + 10));
+    }
+
+    #[test]
+    fn latency_requests_outwait_the_daemons_batch_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed latency server");
+        let address = listener.local_addr().expect("delayed server address");
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept delayed request");
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                thread::sleep(Duration::from_millis(600));
+                let body =
+                    r#"{"entries":[{"group_id":"g","node_id":"n","latency_ms":42,"status":"ok"}]}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let client = HttpDaemonClient::with_timeouts(
+            format!("http://{address}"),
+            "token",
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        // A sweep answers by the daemon's deadline, not within the short status timeout.
+        assert!(client.latencies(Some(1), &["g".to_owned()]).is_ok());
+        assert!(client.node_latencies(Some(1), &["n".to_owned()]).is_ok());
+        server.join().unwrap();
+        // The daemon's latency batch deadline (12 s) plus room for the answer itself.
+        assert!(LATENCY_REQUEST_TIMEOUT >= Duration::from_secs(12 + 3));
+        assert!(LATENCY_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
     }
 
     #[test]

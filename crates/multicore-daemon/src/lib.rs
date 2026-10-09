@@ -61,10 +61,19 @@ pub const MAX_CONCURRENT_LATENCY_PROBES: usize = 8;
 /// or re-measured row) and each swept group's selected node. They have their own budget so
 /// they never queue behind a sweep.
 pub const MAX_PRIORITY_LATENCY_PROBES: usize = 4;
-const LATENCY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long a finished probe stays available to requests that were already waiting for it.
+/// Mihomo's own delay timeout (also its dashboard's default). A cold node behind Xray spends
+/// it on the endpoint DNS, the REALITY/TLS handshake and the TLS GET (twice with
+/// `unified-delay`); Mihomo answers 504 once it runs out.
+const MIHOMO_DELAY_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// Our own bound on one probe (the HTTP request and the timer around it): longer than
+/// Mihomo's, so Mihomo's answer, not a race with our timers, decides the outcome.
+const LATENCY_PROBE_TIMEOUT: Duration = Duration::from_millis(6_000);
+/// How long a finished probe stays available to requests that were already waiting for it,
+/// and how long a probe that finished for nobody can be handed to the next sweep.
 const LATENCY_RESULT_RETENTION: Duration = Duration::from_secs(60);
-const LATENCY_BATCH_TIMEOUT: Duration = Duration::from_secs(8);
+/// One latency request answers within this: room for two sweep waves of Mihomo's 5 s answer.
+/// Targets not measured by then are left out of the answer. The desktop waits longer.
+const LATENCY_BATCH_TIMEOUT: Duration = Duration::from_secs(12);
 /// Maximum number of Mihomo-to-Xray loopback bridge mappings exposed in diagnostics.
 pub const MAX_DIAGNOSTIC_MAPPINGS: usize = 256;
 static NEXT_CORRELATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -868,11 +877,12 @@ impl MihomoSelector for MihomoHttpSelector {
             .map_err(|_| LatencyProbeError::Unavailable)?
             .extend(["proxies", raw_name, "delay"]);
         url.query_pairs_mut()
-            .append_pair("timeout", &LATENCY_PROBE_TIMEOUT.as_millis().to_string())
+            .append_pair("timeout", &MIHOMO_DELAY_TIMEOUT.as_millis().to_string())
             .append_pair("url", "https://www.gstatic.com/generate_204");
         let mut response = self
             .client
             .get(url)
+            .timeout(LATENCY_PROBE_TIMEOUT)
             .header(header::AUTHORIZATION, self.authorization.clone())
             .send()
             .await
@@ -990,20 +1000,38 @@ type ProbeOutcome = Result<u64, LatencyProbeError>;
 #[derive(Default)]
 struct LatencyFlights {
     in_flight: HashMap<String, tokio::sync::watch::Receiver<Option<ProbeOutcome>>>,
-    finished: HashMap<String, (tokio::time::Instant, ProbeOutcome)>,
+    finished: HashMap<String, FinishedProbe>,
+}
+
+struct FinishedProbe {
+    at: tokio::time::Instant,
+    outcome: ProbeOutcome,
+    /// Nobody was waiting when it finished (its request had passed its deadline): the result
+    /// has reached no one yet.
+    unclaimed: bool,
 }
 
 impl LatencyFlights {
-    /// A finished result no older than `since`, or the receiver of a probe in flight.
+    /// A finished result no older than `since` (or, when `take_unclaimed`, a recent one that
+    /// reached no one), or the receiver of a probe in flight.
     fn join(
         &mut self,
         raw_node: &str,
         since: tokio::time::Instant,
+        take_unclaimed: bool,
     ) -> Option<Result<ProbeOutcome, tokio::sync::watch::Receiver<Option<ProbeOutcome>>>> {
-        if let Some((finished_at, outcome)) = self.finished.get(raw_node)
-            && *finished_at >= since
-        {
-            return Some(Ok(*outcome));
+        if let Some(finished) = self.finished.get_mut(raw_node) {
+            if finished.at >= since {
+                return Some(Ok(finished.outcome));
+            }
+            if take_unclaimed
+                && finished.unclaimed
+                && finished.at.elapsed() < LATENCY_RESULT_RETENTION
+            {
+                // Handed over once; the sweep after this one measures the node afresh.
+                finished.unclaimed = false;
+                return Some(Ok(finished.outcome));
+            }
         }
         let receiver = self.in_flight.get(raw_node)?;
         // A probe whose task is gone (runtime shutting down) is no probe to wait for.
@@ -1021,6 +1049,9 @@ struct LatencyLane {
     selector: Arc<dyn MihomoSelector>,
     permits: Arc<tokio::sync::Semaphore>,
     flights: Arc<std::sync::Mutex<LatencyFlights>>,
+    /// A sweep takes a result an earlier request's deadline left unclaimed instead of spending
+    /// a permit on that node again; an explicitly requested node is always measured afresh.
+    take_unclaimed: bool,
 }
 
 async fn wait_for_probe(
@@ -1033,19 +1064,20 @@ async fn wait_for_probe(
 }
 
 /// Measures `raw_node` once for everybody asking: joins a probe in flight, reuses one finished
-/// since `since`, or takes a permit of `lane` and starts it. The probe itself runs detached and
-/// bounded by `LATENCY_PROBE_TIMEOUT`, so a request that gives up (its batch deadline) never
-/// cancels a measurement another request is waiting for.
+/// since `since` (or one left unclaimed, on a sweep lane), or takes a permit of `lane` and
+/// starts it. The probe itself runs detached and bounded by `LATENCY_PROBE_TIMEOUT`, so a
+/// request that gives up (its batch deadline) never cancels a measurement another request is
+/// waiting for.
 async fn measure_latency(
     lane: LatencyLane,
     raw_node: String,
     since: tokio::time::Instant,
 ) -> ProbeOutcome {
-    let joined = lane
-        .flights
-        .lock()
-        .expect("latency flights lock")
-        .join(&raw_node, since);
+    let joined = lane.flights.lock().expect("latency flights lock").join(
+        &raw_node,
+        since,
+        lane.take_unclaimed,
+    );
     match joined {
         Some(Ok(outcome)) => return outcome,
         Some(Err(receiver)) => return wait_for_probe(receiver).await,
@@ -1060,7 +1092,7 @@ async fn measure_latency(
     let receiver = {
         let mut flights = lane.flights.lock().expect("latency flights lock");
         // Somebody may have started or finished it while this request queued for a permit.
-        match flights.join(&raw_node, since) {
+        match flights.join(&raw_node, since, lane.take_unclaimed) {
             Some(Ok(outcome)) => return outcome,
             Some(Err(receiver)) => Err(receiver),
             None => {
@@ -1088,10 +1120,19 @@ async fn measure_latency(
             let mut flights = flights.lock().expect("latency flights lock");
             let now = tokio::time::Instant::now();
             flights.in_flight.remove(&raw_node);
-            flights.finished.retain(|_, (finished_at, _)| {
-                now.saturating_duration_since(*finished_at) < LATENCY_RESULT_RETENTION
+            flights.finished.retain(|_, finished| {
+                now.saturating_duration_since(finished.at) < LATENCY_RESULT_RETENTION
             });
-            flights.finished.insert(raw_node, (now, outcome));
+            // Every waiter holds a receiver; the one kept in `in_flight` is gone now.
+            let unclaimed = sender.receiver_count() == 0;
+            flights.finished.insert(
+                raw_node,
+                FinishedProbe {
+                    at: now,
+                    outcome,
+                    unclaimed,
+                },
+            );
         }
         let _ = sender.send(Some(outcome));
     });
@@ -6271,6 +6312,7 @@ where
                     self.latency_permits.clone()
                 },
                 flights: self.latency_flights.clone(),
+                take_unclaimed: !*priority,
             };
             probes.spawn(probe_latency_target(
                 lane,
@@ -6282,11 +6324,7 @@ where
             ));
         }
 
-        let all_targets: Vec<_> = targets
-            .into_iter()
-            .map(|(group_id, node_id, _, _)| (group_id, node_id, ()))
-            .collect();
-        let mut completed = vec![None; all_targets.len()];
+        let mut completed = vec![None; targets.len()];
         while !probes.is_empty() {
             match tokio::time::timeout_at(batch_deadline, probes.join_next()).await {
                 Ok(Some(Ok((index, entry)))) => completed[index] = Some(entry),
@@ -6294,24 +6332,17 @@ where
                 Ok(None) => break,
                 Err(_) => {
                     // Waiting requests stop here; probes already running finish on their own
-                    // (bounded by the probe timeout) for anybody else waiting on them.
+                    // (bounded by the probe timeout) for anybody else waiting on them, and one
+                    // that finishes for nobody is left for the next sweep.
                     probes.abort_all();
                     break;
                 }
             }
         }
-        let entries = all_targets
-            .into_iter()
-            .enumerate()
-            .map(|(index, (group_id, node_id, _))| {
-                completed[index].take().unwrap_or(LatencyResultDto {
-                    group_id,
-                    node_id,
-                    latency_ms: None,
-                    status: LatencyStatus::Timeout,
-                })
-            })
-            .collect();
+        // A target still waiting for a permit was never sent to Mihomo, and one still running
+        // has not timed out by Mihomo's measure: neither is a timeout. Both are left out, so
+        // the caller keeps what it last knew about them.
+        let entries = completed.into_iter().flatten().collect();
         Ok(LatencyResponseDto { entries })
     }
 

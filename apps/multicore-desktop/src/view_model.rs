@@ -8418,6 +8418,39 @@ mod tests {
     }
 
     #[test]
+    fn routes_left_out_of_a_latency_answer_keep_their_value_and_stop_measuring() {
+        // The daemon leaves out routes it could not measure before its deadline (never sent
+        // to Mihomo, or still running): neither a timeout nor a reason to keep waiting.
+        let mut view_model = connected_view_model_with_catalog();
+        let before_b = presented_node(&view_model, "opaque:node-b").latency_text;
+        let before_c = presented_node(&view_model, "opaque:node-c").latency_text;
+        assert_eq!(before_c, "51 ms");
+        let mut sweep = view_model.begin_latency_request().expect("sweep");
+        let priority = sweep.priority.take().expect("selected route request");
+
+        view_model
+            .finish_latencies(sweep.token, Ok(DaemonLatencies::default()))
+            .expect("sweep completion");
+        let node_c = presented_node(&view_model, "opaque:node-c");
+        assert!(!node_c.measuring);
+        assert_eq!(node_c.latency_text, before_c);
+        assert!(!view_model.latency_sweep_running());
+
+        view_model
+            .finish_node_latency(
+                91,
+                &priority.node_ids,
+                priority.token,
+                Ok(DaemonLatencies::default()),
+            )
+            .expect("priority completion");
+        let node_b = presented_node(&view_model, "opaque:node-b");
+        assert!(!node_b.measuring);
+        assert_eq!(node_b.latency_text, before_b);
+        assert!(!view_model.latency_presentation().loading);
+    }
+
+    #[test]
     fn priority_measurement_is_wired_into_the_sweep_the_pick_and_the_rows() {
         let main = include_str!("main.rs");
         let app = include_str!("../ui/app.slint");

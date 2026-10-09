@@ -316,7 +316,9 @@ async fn http_latency_probe_percent_encodes_raw_name_and_uses_bounded_authentica
         request.starts_with("GET /proxies/node%20%2F%20%3F%20%23%20%25/delay?"),
         "{request}"
     );
-    assert!(request.contains("timeout=3000"), "{request}");
+    // Mihomo's own (and its dashboard's) default: a cold node behind Xray needs the endpoint
+    // DNS, the REALITY/TLS handshake and the TLS GET within it.
+    assert!(request.contains("timeout=5000"), "{request}");
     assert!(
         request.contains("url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"),
         "{request}"
@@ -327,6 +329,30 @@ async fn http_latency_probe_percent_encodes_raw_name_and_uses_bounded_authentica
             .contains("authorization: bearer private-secret\r\n"),
         "{request}"
     );
+}
+
+#[tokio::test]
+async fn http_latency_probe_waits_for_mihomos_own_answer_past_the_old_three_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        // A cold node: Mihomo answers well inside its own 5 s, but after 3 s.
+        thread::sleep(Duration::from_millis(3_500));
+        let body = r#"{"delay":3400}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+
+    let controller = MihomoHttpSelector::new(address, "private-secret").unwrap();
+    assert_eq!(controller.probe_latency("cold").await, Ok(3400));
+    server.join().unwrap();
 }
 
 #[tokio::test]
@@ -360,27 +386,42 @@ async fn probe_all_caps_controller_concurrency() {
     );
 }
 
+/// Answers every probe like Mihomo does for a dead node: a 504 once its own 5 s delay timeout
+/// runs out. Records which node was probed, in order.
+#[derive(Default)]
+struct DeadNodesController {
+    probes: Mutex<Vec<String>>,
+}
+
+impl DeadNodesController {
+    fn probes(&self) -> Vec<String> {
+        self.probes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MihomoSelector for DeadNodesController {
+    async fn select(&self, _: &str, _: &str) -> Result<(), SelectorError> {
+        Ok(())
+    }
+
+    async fn probe_latency(&self, raw_name: &str) -> Result<u64, LatencyProbeError> {
+        self.probes.lock().unwrap().push(raw_name.to_owned());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Err(LatencyProbeError::Timeout)
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn slow_multiwave_probe_finishes_within_the_whole_batch_deadline() {
-    let nodes = (0..17)
-        .map(|index| format!("slow-{index}"))
-        .collect::<Vec<_>>();
-    let proxies = nodes
-        .iter()
-        .map(|node| format!("  - {{name: {node}, type: socks5}}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mihomo = format!(
-        "proxies:\n{proxies}\nproxy-groups:\n  - name: Main\n    type: select\n    proxies: [{}]\n",
-        nodes.join(", ")
-    );
-    let backend = backend_with_mihomo(Arc::new(SlowController), &mihomo);
+    let backend = backend_with_mihomo(Arc::new(DeadNodesController::default()), &slow_group(17));
     backend.connect().await.unwrap();
     let started = tokio::time::Instant::now();
 
     let response = backend.latencies(LatencyRequest::default()).await.unwrap();
 
-    assert!(started.elapsed() <= Duration::from_secs(8));
+    // The selected node on the priority lane plus two full sweep waves of Mihomo's 5 s answer.
+    assert!(started.elapsed() <= Duration::from_secs(12));
     assert_eq!(response.entries.len(), 17);
     assert!(
         response
@@ -388,6 +429,130 @@ async fn slow_multiwave_probe_finishes_within_the_whole_batch_deadline() {
             .iter()
             .all(|entry| { entry.status == LatencyStatus::Timeout && entry.latency_ms.is_none() })
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_mihomo_never_answers_times_out_on_our_own_timer() {
+    let backend = backend_with_mihomo(Arc::new(SlowController), &slow_group(3));
+    backend.connect().await.unwrap();
+    let started = tokio::time::Instant::now();
+
+    let response = backend.latencies(LatencyRequest::default()).await.unwrap();
+
+    assert!(started.elapsed() <= Duration::from_secs(12));
+    assert_eq!(response.entries.len(), 3);
+    assert!(
+        response
+            .entries
+            .iter()
+            .all(|entry| { entry.status == LatencyStatus::Timeout && entry.latency_ms.is_none() })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn targets_not_measured_by_the_batch_deadline_are_left_out_not_reported_as_timeouts() {
+    let controller = Arc::new(DeadNodesController::default());
+    let backend = backend_with_mihomo(controller.clone(), &slow_group(40));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let started = tokio::time::Instant::now();
+
+    let response = backend.latencies(LatencyRequest::default()).await.unwrap();
+
+    assert!(started.elapsed() <= Duration::from_secs(12));
+    // Measured: the selected node plus two sweep waves. The third wave was still running at
+    // the deadline and the rest never got a permit: neither is a measured timeout.
+    let measured = 1 + 2 * multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES;
+    assert_eq!(response.entries.len(), measured, "{:?}", response.entries);
+    assert!(
+        response
+            .entries
+            .iter()
+            .all(|entry| { entry.status == LatencyStatus::Timeout && entry.latency_ms.is_none() })
+    );
+    let answered: Vec<&str> = response
+        .entries
+        .iter()
+        .map(|entry| entry.node_id.as_str())
+        .collect();
+    let expected: Vec<&str> = catalog.groups[0].nodes[..measured]
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect();
+    assert_eq!(answered, expected, "entries keep the catalog order");
+    assert_eq!(
+        controller.probes().len(),
+        measured + multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_next_sweep_takes_results_that_finished_after_the_previous_deadline() {
+    let controller = Arc::new(DeadNodesController::default());
+    let backend = backend_with_mihomo(controller.clone(), &slow_group(40));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let measured = 1 + 2 * multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES;
+    let late = &catalog.groups[0].nodes
+        [measured..measured + multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES];
+
+    let first = backend.latencies(LatencyRequest::default()).await.unwrap();
+    assert_eq!(first.entries.len(), measured);
+    // The third wave finishes for nobody.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(controller.probes().len(), measured + late.len());
+
+    let second = backend.latencies(LatencyRequest::default()).await.unwrap();
+    for node in late {
+        let entry = second
+            .entries
+            .iter()
+            .find(|entry| entry.node_id == node.id)
+            .unwrap_or_else(|| panic!("{} missing from {:?}", node.id, second.entries));
+        assert_eq!(entry.status, LatencyStatus::Timeout);
+    }
+    // Taken, not measured again: their permits went to nodes further down the list.
+    let probes = controller.probes();
+    for index in measured..measured + late.len() {
+        let raw = format!("slow-{index:02}");
+        assert_eq!(probes.iter().filter(|probe| **probe == raw).count(), 1);
+    }
+    assert!(probes.contains(&format!("slow-{:02}", measured + late.len())));
+
+    // A result is handed over once: a third sweep measures those nodes afresh.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let before = controller.probes().len();
+    backend.latencies(LatencyRequest::default()).await.unwrap();
+    let probes = controller.probes()[before..].to_vec();
+    assert!(
+        probes.contains(&format!("slow-{measured:02}")),
+        "{probes:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_explicitly_requested_node_is_measured_afresh_not_taken_from_a_finished_sweep() {
+    let controller = Arc::new(DeadNodesController::default());
+    let backend = backend_with_mihomo(controller.clone(), &slow_group(40));
+    backend.connect().await.unwrap();
+    let catalog = backend.catalog().await.unwrap();
+    let measured = 1 + 2 * multicore_daemon::MAX_CONCURRENT_LATENCY_PROBES;
+    let late = catalog.groups[0].nodes[measured].id.clone();
+
+    backend.latencies(LatencyRequest::default()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let before = controller.probes().len();
+
+    let response = backend
+        .latencies(LatencyRequest {
+            revision: Some(catalog.revision),
+            group_ids: Vec::new(),
+            node_ids: vec![late],
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.entries.len(), 1);
+    assert_eq!(controller.probes().len(), before + 1);
 }
 
 #[tokio::test]
