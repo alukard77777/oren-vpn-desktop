@@ -203,8 +203,9 @@ impl ProductionCores {
                 true,
             ),
         );
-        let launcher = PlatformLauncher::for_runtime(paths.clone(), logs, CORE_READINESS_TIMEOUT)
-            .map_err(|error| refuse(NotReady, "core launcher", &error))?;
+        let launcher =
+            PlatformLauncher::for_runtime(paths.clone(), logs.clone(), CORE_READINESS_TIMEOUT)
+                .map_err(|error| refuse(NotReady, "core launcher", &error))?;
         // The unit's CAP_SYS_PTRACE / CAP_DAC_READ_SEARCH / CAP_SETPCAP are for the service's
         // own peer checks and staged-generation reads; Mihomo and Xray keep only CAP_NET_*.
         #[cfg(unix)]
@@ -216,6 +217,10 @@ impl ProductionCores {
                 self.stop_processes(&controller);
                 return Err(refuse(start_error(&error), "start core", &error));
             }
+        }
+        // What starting the cores noticed but did not fail on (every node unreachable at start).
+        for note in logs.take_notes() {
+            service_log::append(&log, &format!("prepare generation {generation}: {note}"));
         }
         let token = match random_secret() {
             Ok(token) => token,

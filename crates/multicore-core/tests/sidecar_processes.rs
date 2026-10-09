@@ -554,11 +554,11 @@ fn readiness_poll_interval_is_tight_but_not_a_busy_loop() {
         "a readiness loop reverted to the old, wasteful 100ms poll tick"
     );
     let occurrences = SIDECAR_SOURCE.matches("READINESS_POLL_INTERVAL").count();
-    // One definition plus both readiness loops (`wait_until_ready` and
-    // `wait_for_runtime_readiness`) actually using it.
+    // One definition plus the one readiness loop every launcher shares
+    // (`wait_for_runtime_readiness`) actually using it.
     assert!(
-        occurrences >= 3,
-        "expected both readiness poll loops to share one tight interval constant"
+        occurrences >= 2,
+        "expected the readiness poll loop to use the one tight interval constant"
     );
 }
 
