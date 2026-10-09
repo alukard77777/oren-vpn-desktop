@@ -54,8 +54,7 @@ pub use sidecar::{
     CORE_READINESS_TIMEOUT, CommandSpec, CoreExit, CoreLiveness, CoreLogBuffer, CoreLogRecord,
     DiagnosticStream, MAX_PERSISTENT_LOG_BYTES, ManagedChild, ProcessDiagnostics, ProcessError,
     ProcessLauncher, RuntimeCheckState, RuntimePaths, SidecarProcessController, TokioManagedChild,
-    TokioProcessLauncher, XRAY_STARTUP_SETTLE_BUDGET, describe_exit_code, multicore_tun_is_up,
-    rotated_log_path,
+    TokioProcessLauncher, describe_exit_code, multicore_tun_is_up, rotated_log_path,
 };
 pub use snapshot::{
     AtomicSnapshot, MAX_GROUP_ICONS, MihomoRuntimeControl, PersistenceError,

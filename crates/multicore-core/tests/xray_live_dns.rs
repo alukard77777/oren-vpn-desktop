@@ -21,7 +21,7 @@ const TTL: u32 = 3;
 /// A syntactically valid (correct length, base64) but meaningless
 /// 2022-blake3-aes-128-gcm key: only the TCP-level dial-after-resolve is
 /// exercised, never a real shadowsocks handshake.
-const WARMUP_PLACEHOLDER_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZg==";
+const PLACEHOLDER_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZg==";
 
 struct Fixture {
     stop: Arc<AtomicBool>,
@@ -362,20 +362,13 @@ fn live_dns_refreshes_after_ttl_without_core_restart_or_blocked_fallback() {
     assert_eq!(fallback_queries.load(Ordering::SeqCst), 1);
 }
 
-/// Regression coverage for a real failure found on real hardware: right after Xray starts
-/// (and, in production, right as MultiCore's own brand-new TUN adapter attaches), a
-/// domain-scoped endpoint DNS lookup can fail ("record not found") for a moment even though
-/// the resolver itself is healthy. The SOCKS listener accepting a TCP connection proves
-/// nothing about whether Xray's DNS client and interface-bound outbound sockets have settled,
-/// so starting Xray also checks a real SOCKS5 CONNECT through its own loopback inbounds -
-/// which forces a real domain resolve-then-dial.
-///
-/// That check goes through a remote node, and a node can be unreachable from the user's
-/// network (a dead server; a "whitelist" mobile network that blocks every direct node). So it
-/// is best effort since 1.1.12: the first node that answers proves the path, and when none
-/// answers within `XRAY_STARTUP_SETTLE_BUDGET` Xray is ready anyway with a note in its log.
-/// In 1.1.11 the one node it picked (always the first) being dead failed every Connect with
-/// «Xray не успел запуститься вовремя».
+/// Starting the real Xray is ready as soon as its loopback listeners accept connections; it
+/// never dials a node. Through 1.1.11 starting Xray first proved its endpoint DNS + dial path
+/// with a SOCKS5 CONNECT through one node: that node being dead failed every Connect with
+/// «Xray не успел запуститься вовремя», and on the pinned Xray 26.9.30 the probe
+/// never caught a silent resolver anyway (Xray retries a failed lookup itself instead of closing
+/// the tunnel - see `real_xray_with_blocked_endpoint_dns_is_ready_promptly`), while it cost
+/// every healthy Connect over a second. A dead node now shows as its own failed ping.
 ///
 /// Uses "ordinary.example.com" (already recognized by `Fixture::dns`'s wire-format stub
 /// above), never "edge.example": Xray silently treats a bare `.example` suffix as a local-only
@@ -386,6 +379,8 @@ struct LiveXray {
     _directory: tempfile::TempDir,
     paths: multicore_core::RuntimePaths,
     command: multicore_core::CommandSpec,
+    /// The loopback SOCKS inbound of each node, in `node_ports` order.
+    inbounds: Vec<SocketAddr>,
 }
 
 /// A real Xray whose inbounds each lead (1:1 tags) to a shadowsocks node at
@@ -413,26 +408,28 @@ fn live_xray(dns: SocketAddr, node_ports: &[u16]) -> LiveXray {
     // outbound, the outbound needs the query) that production
     // (crates/multicore-core/src/snapshot.rs) avoids with a dedicated freedom outbound.
     // Mirrored here for the same reason.
-    const DNS_OUTBOUND_TAG: &str = "warm-dns-direct";
+    const DNS_OUTBOUND_TAG: &str = "endpoint-dns-direct";
     let mut inbounds = Vec::new();
+    let mut inbound_addresses = Vec::new();
     let mut outbounds = Vec::new();
-    let mut rules = vec![json!({"type": "field", "inboundTag": ["warm-dns"],
+    let mut rules = vec![json!({"type": "field", "inboundTag": ["endpoint-dns"],
         "outboundTag": DNS_OUTBOUND_TAG})];
     for (index, port) in node_ports.iter().enumerate() {
         let tag = format!("node-{index}");
         let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-        let inbound_port = reserved.local_addr().unwrap().port();
+        let inbound = reserved.local_addr().unwrap();
         drop(reserved);
         inbounds.push(
-            json!({"tag": tag, "listen": "127.0.0.1", "port": inbound_port,
+            json!({"tag": tag, "listen": "127.0.0.1", "port": inbound.port(),
             "protocol": "socks", "settings": {"auth": "noauth", "udp": false}}),
         );
+        inbound_addresses.push(inbound);
         // shadowsocks, like every real production outbound this app generates, is a raw relay
         // protocol: Xray must resolve `settings.address` itself before dialing. A bogus key
         // still completes the TCP-level dial and the client-facing SOCKS5 CONNECT reply.
         outbounds.push(json!({"tag": tag, "protocol": "shadowsocks",
             "settings": {"address": domain, "port": port,
-                "method": "2022-blake3-aes-128-gcm", "password": WARMUP_PLACEHOLDER_KEY},
+                "method": "2022-blake3-aes-128-gcm", "password": PLACEHOLDER_KEY},
             "streamSettings": {"sockopt": {"domainStrategy": "ForceIP"}}}));
         rules.push(json!({"type": "field", "inboundTag": [tag], "outboundTag": tag}));
     }
@@ -442,7 +439,7 @@ fn live_xray(dns: SocketAddr, node_ports: &[u16]) -> LiveXray {
         "log": {"loglevel": "debug"},
         "dns": {"servers": [
             {"address": "127.0.0.1", "port": dns.port(), "domains": [format!("full:{domain}")],
-             "skipFallback": true, "finalQuery": true, "tag": "warm-dns", "timeoutMs": 1200}
+             "skipFallback": true, "finalQuery": true, "tag": "endpoint-dns", "timeoutMs": 1200}
         ]},
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -470,17 +467,16 @@ fn live_xray(dns: SocketAddr, node_ports: &[u16]) -> LiveXray {
         _directory: directory,
         paths,
         command,
+        inbounds: inbound_addresses,
     }
 }
 
-/// Starts `xray` and waits for readiness: the result, how long it took, and the notes logged.
+/// Starts `xray`, waits for readiness, then runs `after_ready` against the still-running core:
+/// the readiness result and how long it took.
 async fn start_live(
     xray: &LiveXray,
-) -> (
-    Result<(), multicore_core::ProcessError>,
-    Duration,
-    Vec<String>,
-) {
+    after_ready: impl FnOnce(),
+) -> (Result<(), multicore_core::ProcessError>, Duration) {
     use multicore_core::{
         CORE_READINESS_TIMEOUT, ManagedChild, ProcessLauncher, TokioProcessLauncher,
     };
@@ -490,14 +486,21 @@ async fn start_live(
     let started = Instant::now();
     let result = launcher.wait_until_ready(&xray.command, &mut child).await;
     let elapsed = started.elapsed();
+    if result.is_ok() {
+        after_ready();
+    }
     child.stop().await.unwrap();
     if std::env::var_os("MULTICORE_TEST_XRAY_LOG").is_some() {
         for record in launcher.logs().snapshot() {
             eprintln!("{} {}", record.timestamp_ms, record.message);
         }
     }
-    (result, elapsed, launcher.logs().take_notes())
+    (result, elapsed)
 }
+
+/// How long the real Xray may take to be ready: its own start (~0.5 s before its listeners
+/// answer) with room for a slow machine, far below the old probe's DNS window on top of it.
+const PROMPTLY: Duration = Duration::from_millis(1_500);
 
 /// A node that accepts the dial: the real Xray keeps the proxied tunnel open.
 fn live_node(threads: &mut Vec<thread::JoinHandle<()>>) -> u16 {
@@ -518,84 +521,77 @@ fn dead_node() -> u16 {
     port
 }
 
-/// Healthy endpoint DNS and a live node: readiness still waits out Xray's own DNS timeout
-/// window (it does not trust the optimistic first SOCKS5 reply), and notes nothing.
+/// A SOCKS5 CONNECT through `inbound` to a synthetic target: whether Xray acknowledged it.
+fn socks_connect(inbound: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&inbound, Duration::from_secs(2)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut greeting = [0; 2];
+    let mut reply = [0; 4];
+    stream.write_all(&[5, 1, 0]).is_ok()
+        && stream.read_exact(&mut greeting).is_ok()
+        && stream
+            .write_all(&[5, 1, 0, 1, 192, 0, 2, 1, 1, 187])
+            .is_ok()
+        && stream.read_exact(&mut reply).is_ok()
+        && reply[1] == 0
+}
+
+/// Healthy endpoint DNS and a live node: ready promptly, without resolving any node's endpoint
+/// at start, and the node is usable right after (Xray resolves it on that first dial).
 #[tokio::test]
 #[ignore = "requires explicit MULTICORE_TEST_XRAY_BIN; loopback-only native core smoke"]
-async fn readiness_gate_waits_for_a_real_dns_resolve_then_dial_before_reporting_ready() {
+async fn real_xray_is_ready_once_its_listeners_are_up() {
     let mut fixture = Fixture::new();
     let queries = Arc::new(AtomicUsize::new(0));
     let dns = fixture.dns(Arc::new(AtomicU8::new(0)), queries.clone());
     let mut threads = Vec::new();
     let xray = live_xray(dns, &[live_node(&mut threads)]);
-    let (result, elapsed, notes) = start_live(&xray).await;
+    let mut queries_at_ready = None;
+    let (result, elapsed) = start_live(&xray, || {
+        queries_at_ready = Some(queries.load(Ordering::SeqCst));
+        assert!(socks_connect(xray.inbounds[0]), "the live node refused");
+    })
+    .await;
     eprintln!("healthy DNS, live node: ready after {elapsed:?}");
     assert_eq!(result, Ok(()));
-    assert!(
-        elapsed >= Duration::from_millis(1_200),
-        "ready after only {elapsed:?}: the gate trusted the first SOCKS5 reply"
-    );
-    // Proven, not given up on: nothing to note.
-    assert_eq!(notes, Vec::<String>::new());
-    assert!(
-        queries.load(Ordering::SeqCst) > 0,
-        "no endpoint DNS query was ever observed"
+    assert!(elapsed < PROMPTLY, "took {elapsed:?}");
+    assert_eq!(
+        queries_at_ready,
+        Some(0),
+        "starting Xray resolved a node's endpoint: it probed a node"
     );
 }
 
-/// The 1.1.11 failure with the real Xray: the first node is dead, the second is alive.
+/// Every node dead (a whitelist network blocks every direct node): Xray itself is up, so it is
+/// ready promptly; each dead node fails only its own ping.
 #[tokio::test]
 #[ignore = "requires explicit MULTICORE_TEST_XRAY_BIN; loopback-only native core smoke"]
-async fn real_xray_with_a_dead_first_node_is_ready_through_the_live_one() {
-    let mut fixture = Fixture::new();
-    let dns = fixture.dns(Arc::new(AtomicU8::new(0)), Arc::new(AtomicUsize::new(0)));
-    let mut threads = Vec::new();
-    let xray = live_xray(dns, &[dead_node(), live_node(&mut threads)]);
-    let (result, elapsed, notes) = start_live(&xray).await;
-    eprintln!("dead first node: ready after {elapsed:?}");
-    assert_eq!(result, Ok(()));
-    // Proven through the live node (Xray's own start takes ~0.5 s before the probe begins).
-    assert_eq!(notes, Vec::<String>::new());
-    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
-}
-
-/// Every node dead: the real Xray is ready within the budget anyway, with a note saying why
-/// nothing could be proven.
-#[tokio::test]
-#[ignore = "requires explicit MULTICORE_TEST_XRAY_BIN; loopback-only native core smoke"]
-async fn real_xray_with_every_node_dead_is_ready_within_the_budget() {
+async fn real_xray_with_every_node_dead_is_ready_promptly() {
     let mut fixture = Fixture::new();
     let dns = fixture.dns(Arc::new(AtomicU8::new(0)), Arc::new(AtomicUsize::new(0)));
     let xray = live_xray(dns, &[dead_node(), dead_node()]);
-    let (result, elapsed, notes) = start_live(&xray).await;
-    eprintln!("every node dead: ready after {elapsed:?}, notes {notes:?}");
+    let (result, elapsed) = start_live(&xray, || {}).await;
+    eprintln!("every node dead: ready after {elapsed:?}");
     assert_eq!(result, Ok(()));
-    // Xray's own start (~0.5 s before its listeners answer) plus the budget.
-    assert!(
-        elapsed < multicore_core::XRAY_STARTUP_SETTLE_BUDGET + Duration::from_secs(1),
-        "took {elapsed:?}"
-    );
-    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(elapsed < PROMPTLY, "took {elapsed:?}");
 }
 
 /// Endpoint DNS that never answers. Recorded on the pinned Xray 26.9.30: after a failed
 /// lookup ("failed to resolve ip > record not found" after `timeoutMs`) Xray retries the
-/// dial, lookup included, instead of closing the client's tunnel - so for several seconds
-/// the probe cannot tell a blocked resolver from a node that answered. Whatever the probe
-/// concludes, starting Xray never waits past the budget.
+/// dial, lookup included, instead of closing the client's tunnel, so a startup probe could
+/// never tell a blocked resolver from a node that answered. Starting Xray does not wait on it.
 #[tokio::test]
 #[ignore = "requires explicit MULTICORE_TEST_XRAY_BIN; loopback-only native core smoke"]
-async fn real_xray_with_blocked_endpoint_dns_is_ready_within_the_budget() {
+async fn real_xray_with_blocked_endpoint_dns_is_ready_promptly() {
     let mut fixture = Fixture::new();
     // Phase 2 drops every query: a resolver that never answers.
     let blocked_dns = fixture.dns(Arc::new(AtomicU8::new(2)), Arc::new(AtomicUsize::new(0)));
     let mut threads = Vec::new();
     let xray = live_xray(blocked_dns, &[live_node(&mut threads)]);
-    let (result, elapsed, notes) = start_live(&xray).await;
-    eprintln!("endpoint DNS blocked: ready after {elapsed:?}, notes {notes:?}");
+    let (result, elapsed) = start_live(&xray, || {}).await;
+    eprintln!("endpoint DNS blocked: ready after {elapsed:?}");
     assert_eq!(result, Ok(()));
-    assert!(
-        elapsed < multicore_core::XRAY_STARTUP_SETTLE_BUDGET + Duration::from_secs(1),
-        "took {elapsed:?}"
-    );
+    assert!(elapsed < PROMPTLY, "took {elapsed:?}");
 }

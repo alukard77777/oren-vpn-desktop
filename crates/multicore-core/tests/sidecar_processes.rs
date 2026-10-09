@@ -780,12 +780,12 @@ async fn service_mihomo_without_ports_is_ready_once_its_controller_listens() {
     assert!(!service.current_ready(Engine::Mihomo).await);
 }
 
-/// Health checks run under the service's lock every 2 s and on every `Status`. They must not
-/// pay Xray's DNS-and-dial settle window (over a second for a domain endpoint): it stalled
-/// every `Status`, `Prepare` and `SetTun` of a real PC for seconds. Only starting Xray proves
-/// that path.
+/// Health checks run under the service's lock every 2 s and on every `Status`. They check
+/// Xray's listeners only and never dial a node through it: a SOCKS CONNECT to a domain
+/// endpoint (over a second each) once stalled every `Status`, `Prepare` and `SetTun` of a
+/// real PC for seconds.
 #[tokio::test]
-async fn health_check_of_xray_with_a_domain_endpoint_does_not_wait_for_the_settle_window() {
+async fn health_check_of_xray_with_a_domain_endpoint_only_checks_its_listeners() {
     use std::io::{Read, Write};
     let socks = TcpListener::bind("127.0.0.1:0").unwrap();
     let socks_port = socks.local_addr().unwrap().port();
@@ -837,7 +837,7 @@ async fn health_check_of_xray_with_a_domain_endpoint_does_not_wait_for_the_settl
     assert!(launcher.current_ready(Engine::Xray).await);
     assert!(
         started.elapsed() < Duration::from_millis(800),
-        "a health check took {:?}: it waited for the startup settle window",
+        "a health check took {:?}: it dialled a node through Xray",
         started.elapsed()
     );
 }

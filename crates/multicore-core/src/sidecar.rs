@@ -20,7 +20,7 @@ use tokio::{
     net::TcpStream,
     process::Child,
     sync::Mutex,
-    time::{Duration, sleep},
+    time::Duration,
 };
 
 use crate::{Engine, ProcessController};
@@ -74,12 +74,7 @@ pub struct CoreLogBuffer {
     next_id: AtomicU64,
     max_records: usize,
     max_chars: usize,
-    /// MultiCore's own notes about a core (see [`CoreLogBuffer::note`]), until taken.
-    notes: StdMutex<Vec<String>>,
 }
-
-/// At most this many untaken notes are kept (see [`CoreLogBuffer::note`]); older ones drop.
-const MAX_KEPT_NOTES: usize = 16;
 
 /// Size at which the persistent core log rotates. At most two files exist: the log itself and
 /// one rotated predecessor (`<name>.1`), so the log never uses more than twice this on disk.
@@ -189,7 +184,6 @@ impl CoreLogBuffer {
             next_id: AtomicU64::new(1),
             max_records: max_records.max(1),
             max_chars: max_chars.max(1),
-            notes: StdMutex::default(),
         }
     }
 
@@ -203,7 +197,6 @@ impl CoreLogBuffer {
             next_id: AtomicU64::new(1),
             max_records: 256,
             max_chars: 2_048,
-            notes: StdMutex::default(),
         })
     }
 
@@ -258,33 +251,6 @@ impl CoreLogBuffer {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .append(&record_line(&record));
         }
-    }
-
-    /// A note from MultiCore itself about `engine` (not a line the core printed): logged like
-    /// any core line and also kept until [`CoreLogBuffer::take_notes`], so the process that
-    /// started the core can repeat it in its own log (the service's `service.log`).
-    pub fn note(&self, engine: Engine, message: &str) {
-        let message = format!("multicore: {message}");
-        self.push(engine, DiagnosticStream::Stderr, &message);
-        let mut notes = self
-            .notes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Only the service takes them; elsewhere they must not pile up over a long session.
-        if notes.len() >= MAX_KEPT_NOTES {
-            notes.remove(0);
-        }
-        notes.push(message);
-    }
-
-    /// The notes logged since the last call, oldest first.
-    pub fn take_notes(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .notes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
     }
 
     pub fn snapshot(&self) -> Vec<CoreLogRecord> {
@@ -403,11 +369,6 @@ pub struct CommandSpec {
 /// least this long plus launch overhead.
 pub const CORE_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Longest time starting Xray spends proving its endpoint DNS + dial path once its listeners
-/// are up (see `xray_endpoint_settle`). The proof needs a remote node to answer, so it is a
-/// best effort: past this budget Xray is ready anyway and the core log says why.
-pub const XRAY_STARTUP_SETTLE_BUDGET: Duration = Duration::from_secs(2);
-
 /// How often a readiness-wait loop re-checks a launched core.
 ///
 /// Small enough that a core becoming ready between checks is reported with only brief latency,
@@ -515,17 +476,6 @@ impl TokioProcessLauncher {
 
     pub fn logs(&self) -> Arc<CoreLogBuffer> {
         self.logs.clone()
-    }
-
-    /// Best-effort proof that Xray's endpoint DNS + dial path works, once its listeners are up
-    /// (see [`xray_endpoint_settle`]); `budget` bounds it. Starting a core only: health checks
-    /// (the service's 2 s tick, every `Status`, diagnostics) run under the service's lock,
-    /// where a settle window stalled every `Status`, `Prepare` and `SetTun` for seconds.
-    async fn xray_startup_settle(&self, budget: Duration) -> XraySettle {
-        let Some(runtime) = &self.runtime else {
-            return XraySettle::NotNeeded;
-        };
-        xray_endpoint_settle(&runtime.paths.xray_config, budget).await
     }
 
     /// Whether `engine` is ready: its listeners (and Mihomo's TUN device) are up.
@@ -823,32 +773,13 @@ pub(crate) async fn wait_for_runtime_readiness<C: ManagedChild>(
             return Err(ProcessError::ReadinessFailed(command.engine));
         }
         if readiness.runtime_ready(command.engine).await {
-            break;
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(ProcessError::ReadinessTimedOut(command.engine));
         }
         tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
-    if command.engine == Engine::Xray {
-        let budget = XRAY_STARTUP_SETTLE_BUDGET
-            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        if let XraySettle::Unproven { probed } = readiness.xray_startup_settle(budget).await {
-            readiness.logs.note(
-                Engine::Xray,
-                &format!(
-                    "Xray is up, but none of the {probed} node(s) checked at start answered \
-                     within {} ms (unreachable from this network, or endpoint DNS still \
-                     settling); continuing - each node's own ping shows whether it works",
-                    budget.as_millis()
-                ),
-            );
-        }
-        if child.has_exited()? {
-            return Err(ProcessError::ReadinessFailed(command.engine));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) struct BoundedLogDecoder {
@@ -949,315 +880,6 @@ fn xray_config_is_idle(path: &std::path::Path) -> bool {
                     == Some(crate::IDLE_XRAY_OUTBOUND_TAG)
         });
     no_inbounds && idle_outbound
-}
-
-/// What starting Xray learned about its endpoint DNS + dial path (see [`xray_endpoint_settle`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum XraySettle {
-    /// No inbound leads to a domain endpoint: nothing to resolve.
-    NotNeeded,
-    /// A node answered through Xray: its DNS + dial path works.
-    Proven,
-    /// None of the `probed` nodes answered within the budget.
-    Unproven { probed: usize },
-}
-
-/// At most this many nodes are checked when Xray starts: enough that a few dead nodes cannot
-/// hide a working one, without dialling every node of a large subscription at each start.
-const XRAY_SETTLE_MAX_PROBES: usize = 8;
-
-/// Pause between two checks of the same node, so a node that refuses at once is not hammered.
-const XRAY_SETTLE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
-/// One node to check through Xray: a loopback SOCKS inbound and its 1:1-tagged outbound's own
-/// endpoint domain:port.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct XrayProbeTarget {
-    inbound: std::net::SocketAddr,
-    domain: String,
-    port: u16,
-    /// The outbound reaches its server through another outbound (`dialerProxy` or
-    /// `proxySettings.tag`): a chain such as «Sweden via RU».
-    chained: bool,
-}
-
-/// Every loopback SOCKS inbound whose 1:1-tagged outbound requires DNS resolution (its
-/// `address` is a domain, not a literal IP) - i.e. this app's own endpoint-DNS-scoped
-/// outbounds, never anything provider/user supplied outside that overlay. Empty means nothing
-/// in this config needs a DNS warm-up (every outbound dials a literal IP), not an error.
-fn xray_domain_warmup_targets(path: &std::path::Path) -> Vec<XrayProbeTarget> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
-    };
-    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Vec::new();
-    };
-    let (Some(inbounds), Some(outbounds)) = (
-        document
-            .get("inbounds")
-            .and_then(serde_json::Value::as_array),
-        document
-            .get("outbounds")
-            .and_then(serde_json::Value::as_array),
-    ) else {
-        return Vec::new();
-    };
-    inbounds
-        .iter()
-        .filter_map(|inbound| xray_probe_target(inbound, outbounds))
-        .collect()
-}
-
-fn xray_probe_target(
-    inbound: &serde_json::Value,
-    outbounds: &[serde_json::Value],
-) -> Option<XrayProbeTarget> {
-    if inbound.get("protocol").and_then(serde_json::Value::as_str) != Some("socks") {
-        return None;
-    }
-    let tag = inbound.get("tag").and_then(serde_json::Value::as_str)?;
-    let port = inbound
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())?;
-    let listen = inbound
-        .get("listen")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("127.0.0.1");
-    let ip = listen.parse::<std::net::IpAddr>().ok()?;
-    if !ip.is_loopback() {
-        return None;
-    }
-    let outbound = outbounds
-        .iter()
-        .find(|outbound| outbound.get("tag").and_then(serde_json::Value::as_str) == Some(tag))?;
-    // Most single-server protocols (shadowsocks, vmess, vless, trojan - everything this app's
-    // own overlay generates) put `address`/`port` directly under `settings`. A few (socks,
-    // http) nest the same pair one level deeper under `settings.servers[0]`. Accept either
-    // shape rather than assuming one, since this only has to find *a* domain to warm up, not
-    // fully understand every outbound protocol.
-    let settings = outbound.get("settings");
-    let nested_server = settings
-        .and_then(|settings| settings.get("servers"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|servers| servers.first());
-    let target = settings
-        .into_iter()
-        .chain(nested_server)
-        .find(|candidate| {
-            candidate
-                .get("address")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|address| address.parse::<std::net::IpAddr>().is_err())
-        })?;
-    let domain = target.get("address").and_then(serde_json::Value::as_str)?;
-    let destination_port = target
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())?;
-    let non_empty = |value: Option<&serde_json::Value>| {
-        value
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|tag| !tag.trim().is_empty())
-    };
-    let chained = non_empty(outbound.pointer("/streamSettings/sockopt/dialerProxy"))
-        || non_empty(outbound.pointer("/proxySettings/tag"));
-    Some(XrayProbeTarget {
-        inbound: std::net::SocketAddr::new(ip, port),
-        domain: domain.to_owned(),
-        port: destination_port,
-        chained,
-    })
-}
-
-/// The nodes worth checking, at most [`XRAY_SETTLE_MAX_PROBES`]: chains first (on a
-/// "whitelist" network every direct node is unreachable by design and only chains through a
-/// whitelisted relay work), and each endpoint domain once before any repeats, so the check
-/// spreads over different servers.
-fn xray_settle_probe_targets(mut targets: Vec<XrayProbeTarget>) -> Vec<XrayProbeTarget> {
-    // Stable: config order is kept within each group.
-    targets.sort_by_key(|target| !target.chained);
-    let mut seen = std::collections::HashSet::new();
-    let (first, repeats): (Vec<_>, Vec<_>) = targets
-        .into_iter()
-        .partition(|target| seen.insert(target.domain.clone()));
-    first
-        .into_iter()
-        .chain(repeats)
-        .take(XRAY_SETTLE_MAX_PROBES)
-        .collect()
-}
-
-/// Right after a fresh Xray process (and MultiCore's own brand-new TUN adapter) starts, its
-/// DNS client and interface-bound outbound sockets settle on their own timeline: a live,
-/// real-hardware Connect showed a domain-scoped endpoint lookup fail with "record not found"
-/// for a moment while traffic was already flowing into Xray. Its SOCKS ports accepting a TCP
-/// connection prove nothing about that, so starting Xray also checks one real proxied dial.
-///
-/// That dial necessarily goes through a remote node, and a node can be unreachable from the
-/// user's network for reasons that have nothing to do with Xray (a dead server, or a mobile
-/// "whitelist" network where every direct node is blocked by design). The check therefore
-/// never depends on one node: it tries up to [`XRAY_SETTLE_MAX_PROBES`] nodes at once, each
-/// repeatedly, and the first one that answers proves the path. If none answers within
-/// `budget`, Xray is ready anyway - its listeners are up - and the caller notes why: a dead
-/// node then shows as that node failing its own ping, never as Xray failing to start.
-async fn xray_endpoint_settle(config_path: &std::path::Path, budget: Duration) -> XraySettle {
-    let targets = xray_settle_probe_targets(xray_domain_warmup_targets(config_path));
-    if targets.is_empty() {
-        return XraySettle::NotNeeded;
-    }
-    let probed = targets.len();
-    let checks = targets
-        .into_iter()
-        .map(|target| {
-            Box::pin(async move {
-                while !xray_endpoint_probe(&target).await {
-                    sleep(XRAY_SETTLE_RETRY_INTERVAL).await;
-                }
-            }) as Pin<Box<dyn Future<Output = ()> + Send>>
-        })
-        .collect::<Vec<_>>();
-    match tokio::time::timeout(budget, first_to_finish(checks)).await {
-        Ok(()) => XraySettle::Proven,
-        Err(_) => XraySettle::Unproven { probed },
-    }
-}
-
-/// Completes when any of `futures` does; the others are dropped (cancelled) with it.
-async fn first_to_finish(mut futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>>) {
-    std::future::poll_fn(|context| {
-        if futures
-            .iter_mut()
-            .any(|future| future.as_mut().poll(context).is_ready())
-        {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-}
-
-/// Proves Xray's real DNS-resolve-then-dial path works, not just that its
-/// SOCKS listener accepts a connection: a real SOCKS5 CONNECT through one
-/// loopback inbound to its own outbound's real domain:port, so an actual
-/// endpoint-DNS lookup happens.
-///
-/// A live-hardware capture (real pinned Xray, real endpoint domain) proved
-/// the client-facing SOCKS5 CONNECT reply is sent the instant Xray accepts
-/// the request into its dispatcher, entirely independent of whether the
-/// real DNS lookup or outbound dial ever succeeds: the "success" header
-/// arrived in well under a second while a deliberately-blocked scoped
-/// resolver still hadn't answered. Only once Xray's own configured DNS
-/// timeoutMs genuinely elapsed did it close the client-facing connection to
-/// report the resolve-then-dial had failed. So the reply header alone is
-/// not proof of readiness. This instead treats that reply as a mere
-/// acknowledgement and watches the connection for that failure-close signal
-/// over a window bounded by Xray's own DNS timeout (`ENDPOINT_DNS_TIMEOUT_MS`,
-/// shared with the config generator so the two can never drift apart): if
-/// the connection is still alive once that window elapses, the resolve-
-/// then-dial genuinely succeeded.
-///
-/// The CONNECT necessarily goes through a remote node, so a `false` here means "this node
-/// did not answer" as much as "DNS is not settled": [`xray_endpoint_settle`] never waits on
-/// one node, and gives up within its budget. The pinned Xray 26.9.30 also retries a dial
-/// whose lookup failed (lookup included) instead of closing at once, so a resolver that
-/// never answers keeps the tunnel open past this window (see
-/// `real_xray_with_blocked_endpoint_dns_is_ready_within_the_budget`): the probe reliably
-/// sees a node that refuses or closes, not a resolver that stays silent.
-async fn xray_endpoint_probe(target: &XrayProbeTarget) -> bool {
-    use tokio::io::AsyncWriteExt;
-
-    let XrayProbeTarget {
-        inbound,
-        domain,
-        port: destination_port,
-        ..
-    } = target;
-    let (inbound, destination_port) = (*inbound, *destination_port);
-    let Ok(Ok(mut stream)) =
-        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(inbound)).await
-    else {
-        return false;
-    };
-    if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
-        return false;
-    }
-    let mut greeting = [0_u8; 2];
-    if tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut greeting))
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    if greeting != [0x05, 0x00] {
-        return false;
-    }
-    let domain_bytes = domain.as_bytes();
-    if domain_bytes.len() > u8::MAX as usize {
-        return false;
-    }
-    let mut request = vec![0x05, 0x01, 0x00, 0x03, domain_bytes.len() as u8];
-    request.extend_from_slice(domain_bytes);
-    request.extend_from_slice(&destination_port.to_be_bytes());
-    if stream.write_all(&request).await.is_err() {
-        return false;
-    }
-
-    let mut reply_head = [0_u8; 4];
-    if tokio::time::timeout(
-        Duration::from_millis(2_000),
-        stream.read_exact(&mut reply_head),
-    )
-    .await
-    .is_err()
-    {
-        return false;
-    }
-    if reply_head[1] != 0x00 {
-        return false;
-    }
-    // Drain BND.ADDR + BND.PORT per ATYP so nothing is left unread to be
-    // mistaken for the later close/data signal being watched for below.
-    let addr_len: usize = match reply_head[3] {
-        0x01 => 4,
-        0x03 => {
-            let mut len = [0_u8; 1];
-            if tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut len))
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            len[0] as usize
-        }
-        0x04 => 16,
-        _ => return false,
-    };
-    let mut rest = vec![0_u8; addr_len + 2];
-    if tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut rest))
-        .await
-        .is_err()
-    {
-        return false;
-    }
-
-    let confirm_window = Duration::from_millis(crate::snapshot::ENDPOINT_DNS_TIMEOUT_MS)
-        + Duration::from_millis(300);
-    let deadline = tokio::time::Instant::now() + confirm_window;
-    let mut probe_buf = [0_u8; 64];
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return true;
-        }
-        match tokio::time::timeout(remaining, stream.read(&mut probe_buf)).await {
-            Ok(Ok(0)) => return false,
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) => return false,
-            Err(_) => return true,
-        }
-    }
 }
 
 /// Where application traffic enters Mihomo: its TUN device, or (system-proxy mode, TUN
