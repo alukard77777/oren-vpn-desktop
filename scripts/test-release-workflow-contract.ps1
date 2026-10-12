@@ -168,7 +168,7 @@ Assert-True ($linuxWorkflow -match '(?m)^          test "\$#" -eq 1\r?$') `
 $linuxCiJob = [regex]::Match($ci, '(?ms)^  linux-packages:\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)').Groups['body'].Value
 Assert-True ($linuxCiJob -match "(?m)^    if: github\.event_name == 'push'\r?`$") `
     'Linux packaging must run on every configured push branch, without a main-only restriction'
-Assert-True ($linuxCiJob -match '(?m)^      update-repository: fatyzzz/multicore-releases\r?$') `
+Assert-True ($linuxCiJob -match '(?m)^      update-repository: fatyzzz/multicore\r?$') `
     'Linux CI artifacts must use the public update channel before publication'
 
 if ($ExpectedVersion) {
@@ -193,7 +193,7 @@ foreach ($token in @(
     'cargo clippy --workspace --all-targets --locked -- -D warnings',
     '-AssertReleaseReady',
     'GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}',
-    '-UpdateRepository fatyzzz/multicore-releases',
+    '-UpdateRepository fatyzzz/multicore `',
     'multicore-windows-x64.zip',
     'MultiCore-Setup-x64.exe',
     # 32-bit Windows flavour.
@@ -235,7 +235,9 @@ foreach ($token in @(
     'Xray-core-source.zip',
     'mihomo-source.zip',
     'publish-github-release.ps1',
-    '-Repository fatyzzz/multicore-releases',
+    '-Repository fatyzzz/multicore `',
+    '-Repository fatyzzz/multicore-releases `',
+    'Point release.txt at this version',
     'Upload verified release publication',
     'Download verified release publication',
     'name: release-publication',

@@ -128,4 +128,4 @@ jobs:
     needs: linux
     uses: ./.github/workflows/linux-packages.yml
     with:
-      update-repository: fatyzzz/multicore-releases
+      update-repository: fatyzzz/multicore

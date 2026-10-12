@@ -163,8 +163,7 @@ unsupported massive response triggers the atomic Mihomo + Xray fallback pair.
 The Xray JSON is retained byte-for-byte in the saved snapshot. At Connect time,
 an ephemeral runtime copy receives only the client-local DNS/interface overlay
 needed to bootstrap before TUN. See the complete
-[subscription HTTP contract](docs/subscription-http-contract.md) and the
-[provider implementation contract](docs/contracts/multicore-subscription-backend-prompt.md).
+[subscription HTTP contract](docs/subscription-http-contract.md).
 
 While the active profile is disconnected and ready, MULTICORE refreshes it
 automatically using `profile-update-interval`; when the provider omits that
@@ -193,8 +192,7 @@ Core diagnostics are bounded and redacted before they are exposed through the
 authenticated local API and UI. The current elevated-host path retains them in
 memory; it does not promise a persistent `latest-core.log`.
 
-Updater builds are pinned to the public release-only repository
-`fatyzzz/multicore-releases`. The
+Updater builds are pinned to this repository, `fatyzzz/multicore`. The
 client reads the latest non-draft `vX.Y.Z` GitHub Release anonymously and expects
 `multicore-windows-x64.zip` with GitHub's SHA-256 asset digest. It then verifies
 the archive's internal `SHA256SUMS.txt`, stages a sibling directory, swaps the
@@ -237,7 +235,7 @@ Create the verified portable bundle and updater asset:
 $env:MULTICORE_MIHOMO_BINARIES_DIR = (Resolve-Path dist\mihomo).Path
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -DestinationPath dist\multicore-windows-x64 `
-  -UpdateRepository fatyzzz/multicore-releases `
+  -UpdateRepository fatyzzz/multicore `
   -ReleaseAssetPath dist\release\multicore-windows-x64.zip
 ```
 
@@ -273,8 +271,8 @@ commands and the boundaries of the container checks. The verified RPM is also
 added to the existing v0.3.0 release; its other binary assets are not replaced.
 
 Pushing a matching `vX.Y.Z` tag builds and verifies the artifacts, then publishes
-them to `fatyzzz/multicore-releases`; installed clients read that public channel
-anonymously. Current releases are explicitly unsigned previews. A hardened
+them here and mirrors them to `fatyzzz/multicore-releases`, which clients built before
+1.1.14 still read; installed clients read the channel anonymously. Current releases are explicitly unsigned previews. A hardened
 production release still requires Authenticode signing, protected release
 credentials, immutable corresponding source for the bundled cores, and a
 complete Rust dependency/license inventory. The current third-party notice is

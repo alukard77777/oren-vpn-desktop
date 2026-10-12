@@ -17,7 +17,7 @@ jobs:
   linux-packages:
     uses: ./.github/workflows/linux-packages.yml
     with:
-      update-repository: fatyzzz/multicore-releases
+      update-repository: fatyzzz/multicore
 
   release:
     needs: linux-packages
@@ -127,7 +127,7 @@ jobs:
         run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
             -DestinationPath dist/release/multicore-windows-x64 `
-            -UpdateRepository fatyzzz/multicore-releases `
+            -UpdateRepository fatyzzz/multicore `
             -ReleaseAssetPath dist/release/multicore-windows-x64.zip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
@@ -149,7 +149,7 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
             -Architecture x86 `
             -DestinationPath dist/release/multicore-windows-x86 `
-            -UpdateRepository fatyzzz/multicore-releases `
+            -UpdateRepository fatyzzz/multicore `
             -ReleaseAssetPath dist/release/multicore-windows-x86.zip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
@@ -173,7 +173,7 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
             -Architecture arm64 `
             -DestinationPath dist/release/multicore-windows-arm64 `
-            -UpdateRepository fatyzzz/multicore-releases `
+            -UpdateRepository fatyzzz/multicore `
             -ReleaseAssetPath dist/release/multicore-windows-arm64.zip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
@@ -378,6 +378,8 @@ jobs:
     # lightweight and uses the already verified artifact, so reuse the trusted Windows runner.
     runs-on: [self-hosted, Windows, X64, windowsbuild]
     timeout-minutes: 90
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
 
@@ -386,7 +388,7 @@ jobs:
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-            throw 'RELEASES_TOKEN is required to publish into fatyzzz/multicore-releases'
+            throw 'RELEASES_TOKEN is required to mirror the release into fatyzzz/multicore-releases'
           }
 
       - name: Download verified release publication
@@ -395,7 +397,24 @@ jobs:
           name: release-publication
           path: release-publication
 
+      # Clients from this release on update from this repository.
       - name: Publish release to update channel
+        shell: pwsh
+        working-directory: release-publication
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          ./publish-github-release.ps1 `
+            -Repository fatyzzz/multicore `
+            -Tag $env:GITHUB_REF_NAME `
+            -Target main `
+            -Title "MultiCore $version" `
+            -NotesPath RELEASE_NOTES.md `
+            -AssetManifest RELEASE-ASSETS.txt `
+            -Token '${{ github.token }}'
+
+      # Clients built before the move still read fatyzzz/multicore-releases, and the download
+      # links point there, so every release is mirrored into it as well.
+      - name: Mirror release to legacy update channel
         shell: pwsh
         working-directory: release-publication
         run: |
@@ -407,3 +426,27 @@ jobs:
             -Title "MultiCore $version" `
             -NotesPath RELEASE_NOTES.md `
             -AssetManifest RELEASE-ASSETS.txt
+
+      # release.txt is the updater's cheap hint; it moves only after both releases carry every asset.
+      - name: Point release.txt at this version
+        shell: pwsh
+        env:
+          CHANNEL_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$version`n"))
+          foreach ($channel in @(
+              @{ Repository = 'fatyzzz/multicore'; Token = $env:CHANNEL_TOKEN },
+              @{ Repository = 'fatyzzz/multicore-releases'; Token = $env:GH_TOKEN }
+          )) {
+            $uri = "https://api.github.com/repos/$($channel.Repository)/contents/release.txt"
+            $headers = @{ Authorization = "Bearer $($channel.Token)"; Accept = 'application/vnd.github+json' }
+            $body = @{ message = "release: $version"; content = $content; branch = 'main' }
+            try {
+              $body.sha = (Invoke-RestMethod -Uri "$uri`?ref=main" -Headers $headers).sha
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+            }
+            Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+          }
