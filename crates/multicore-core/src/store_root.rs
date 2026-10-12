@@ -1274,8 +1274,10 @@ mod windows_rename_tests {
         let released_at_writer = released_at.clone();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            drop(blocking_handle);
+            // Stamp the release before it happens: the rename may finish the
+            // moment the handle closes, before this thread runs again.
             *released_at_writer.lock().unwrap() = Some(Instant::now());
+            drop(blocking_handle);
         });
 
         let started = Instant::now();
