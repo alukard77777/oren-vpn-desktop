@@ -442,7 +442,8 @@ jobs:
           )) {
             $uri = "https://api.github.com/repos/$($channel.Repository)/contents/release.txt"
             $headers = @{ Authorization = "Bearer $($channel.Token)"; Accept = 'application/vnd.github+json' }
-            $body = @{ message = "release: $version"; content = $content; branch = 'main' }
+            $signature = @{ name = 'fatyzzz'; email = '82300276+fatyzzz@users.noreply.github.com' }
+            $body = @{ message = "release: $version"; content = $content; branch = 'main'; author = $signature; committer = $signature }
             try {
               $body.sha = (Invoke-RestMethod -Uri "$uri`?ref=main" -Headers $headers).sha
             } catch {
