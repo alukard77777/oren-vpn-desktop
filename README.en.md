@@ -218,7 +218,9 @@ MULTICORE is written in Rust and Slint. How to build, verify and package it for 
 
 ## License
 
-MULTICORE is licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+MULTICORE is licensed under the [GNU GPL v3](LICENSE). You may study, change and redistribute it, but any modified version you distribute must be released under the same licence with its source code.
+
+The MULTICORE name and logo are not covered by the licence: a fork must use its own name and logo.
 
 ## Core licences and sources
 

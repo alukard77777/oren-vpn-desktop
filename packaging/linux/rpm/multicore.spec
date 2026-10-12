@@ -15,7 +15,7 @@ Version:        @VERSION@
 Release:        1
 Summary:        Native network client combining Mihomo routing with Xray transports
 Summary(ru):    Сетевой клиент: маршрутизация Mihomo и транспорты Xray
-License:        (MIT OR Apache-2.0) AND MPL-2.0 AND GPL-3.0-only
+License:        GPL-3.0-only AND MPL-2.0
 URL:            https://github.com/fatyzzz/multicore
 Source0:        %{name}-%{version}-stage.tar.gz
 BuildArch:      x86_64
@@ -89,8 +89,7 @@ chmod 0755 "%{buildroot}/usr/lib/multicore/multicore" \
 # re-vendor, so unlike the entries above they cannot be listed individually here.
 /usr/lib/multicore/dashboard
 %dir /usr/share/licenses/multicore
-%license /usr/share/licenses/multicore/LICENSE-MIT
-%license /usr/share/licenses/multicore/LICENSE-APACHE
+%license /usr/share/licenses/multicore/LICENSE
 %license /usr/share/licenses/multicore/THIRD_PARTY_NOTICES.md
 %license /usr/share/licenses/multicore/Xray-core-MPL-2.0.txt
 %license /usr/share/licenses/multicore/mihomo-GPL-3.0.txt

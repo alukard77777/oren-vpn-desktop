@@ -5,7 +5,7 @@
   <id>io.github.fatyzzz.multicore</id>
   <launchable type="desktop-id">multicore.desktop</launchable>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>(MIT OR Apache-2.0) AND MPL-2.0 AND GPL-3.0-only</project_license>
+  <project_license>GPL-3.0-only AND MPL-2.0</project_license>
   <name>MULTICORE</name>
   <summary>Mihomo routing with Xray transports</summary>
   <summary xml:lang="ru">Маршрутизация Mihomo с транспортами Xray</summary>

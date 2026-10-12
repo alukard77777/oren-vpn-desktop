@@ -29,4 +29,4 @@ PURPOSE. See the GNU General Public License for more details.
 
 Every MULTICORE release attaches `mihomo-source.zip`: the complete patched source tree that was
 compiled, with these patches, `manifest.json` and `build-mihomo.sh` under `MULTICORE-BUILD/`.
-MULTICORE's own code stays under its MIT/Apache-2.0 licences; Mihomo runs as a separate program.
+MULTICORE's own code is licensed under GPL-3.0-only as well; Mihomo runs as a separate program.

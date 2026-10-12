@@ -287,8 +287,7 @@ check_rpm() (
   }
 
   local licenses=(
-    usr/share/licenses/multicore/LICENSE-MIT
-    usr/share/licenses/multicore/LICENSE-APACHE
+    usr/share/licenses/multicore/LICENSE
     usr/share/licenses/multicore/THIRD_PARTY_NOTICES.md
     usr/share/licenses/multicore/Xray-core-MPL-2.0.txt
     usr/share/licenses/multicore/mihomo-GPL-3.0.txt

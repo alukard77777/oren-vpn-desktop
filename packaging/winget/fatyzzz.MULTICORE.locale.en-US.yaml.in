@@ -8,8 +8,8 @@ PublisherUrl: https://github.com/fatyzzz
 PublisherSupportUrl: https://github.com/fatyzzz/multicore/issues
 PackageName: MULTICORE
 PackageUrl: https://github.com/fatyzzz/multicore
-License: MIT OR Apache-2.0 (bundled cores MPL-2.0 and GPL-3.0)
-LicenseUrl: https://github.com/fatyzzz/multicore/blob/main/LICENSE-MIT
+License: GPL-3.0-only (bundled cores MPL-2.0 and GPL-3.0)
+LicenseUrl: https://github.com/fatyzzz/multicore/blob/main/LICENSE
 ShortDescription: Native network client combining Mihomo routing with Xray transports
 Description: |-
   MULTICORE connects through a provider subscription: Mihomo routes, Xray carries the

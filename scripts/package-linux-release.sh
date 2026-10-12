@@ -214,7 +214,7 @@ chmod 0644 "$OUTPUT/usr/share/metainfo/io.github.fatyzzz.multicore.metainfo.xml"
 # The always-ready service unit. deb/rpm/Arch enable it; the AppImage build removes it again
 # (the AppImage keeps the on-demand pkexec host).
 install -m 0644 "$ROOT/packaging/linux/multicore.service" "$OUTPUT/usr/lib/systemd/system/multicore.service"
-install -m 0644 "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ROOT/packaging/linux/THIRD_PARTY_NOTICES.md" \
+install -m 0644 "$ROOT/LICENSE" "$ROOT/packaging/linux/THIRD_PARTY_NOTICES.md" \
     "$ROOT/packaging/windows-x64/licenses/Xray-core-MPL-2.0.txt" \
     "$ROOT/packaging/windows-x64/licenses/mihomo-GPL-3.0.txt" \
     "$OUTPUT/usr/share/licenses/multicore/"
