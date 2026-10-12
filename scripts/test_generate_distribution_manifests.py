@@ -43,7 +43,7 @@ class GenerateTest(unittest.TestCase):
         winget, _ = self.generate()
         self.assertEqual(winget.parts[-4:], ("f", "fatyzzz", "MULTICORE", VERSION))
         installer = (winget / "fatyzzz.MULTICORE.installer.yaml").read_text(encoding="utf-8")
-        base = f"https://github.com/fatyzzz/multicore-releases/releases/download/v{VERSION}"
+        base = f"https://github.com/fatyzzz/multicore/releases/download/v{VERSION}"
         for arch, digest in [("x64", "A"), ("x86", "B"), ("arm64", "C")]:
             self.assertIn(
                 f"- Architecture: {arch}\n  InstallerUrl: {base}/MultiCore-Setup-{arch}.exe\n"
@@ -71,7 +71,7 @@ class GenerateTest(unittest.TestCase):
         self.assertIn(f"pkgver={VERSION}\n", pkgbuild)
         self.assertIn(f"sha256sums=('{'d' * 64}')\n", pkgbuild)
         self.assertIn(
-            'source=("${_package}::https://github.com/fatyzzz/multicore-releases/releases/'
+            'source=("${_package}::https://github.com/fatyzzz/multicore/releases/'
             'download/v${pkgver}/${_package}")',
             pkgbuild,
         )
@@ -79,7 +79,7 @@ class GenerateTest(unittest.TestCase):
         self.assertTrue(srcinfo.startswith("pkgbase = multicore-bin\n"))
         self.assertIn(
             f"\tsource = multicore-{VERSION}-1-x86_64.pkg.tar.zst::https://github.com/fatyzzz/"
-            f"multicore-releases/releases/download/v{VERSION}/"
+            f"multicore/releases/download/v{VERSION}/"
             f"multicore-{VERSION}-1-x86_64.pkg.tar.zst\n",
             srcinfo,
         )

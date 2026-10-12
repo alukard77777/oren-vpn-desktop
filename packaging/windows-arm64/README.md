@@ -41,7 +41,7 @@ Build the updater asset for the official anonymous channel with:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows-release.ps1 `
   -Architecture arm64 `
   -DestinationPath dist\multicore-windows-arm64 `
-  -UpdateRepository fatyzzz/multicore-releases `
+  -UpdateRepository fatyzzz/multicore `
   -ReleaseAssetPath dist\release\multicore-windows-arm64.zip
 ```
 

@@ -47,7 +47,7 @@ not project-operated network services.
 
 If an update repository is compiled into the client, update checks request the
 latest stable release metadata and selected asset from GitHub. Official updater
-builds use the public `fatyzzz/multicore-releases` release-only repository and require anonymous access;
+builds use the public `fatyzzz/multicore` repository and require anonymous access;
 no GitHub access token is embedded in the client. GitHub's privacy terms apply.
 
 ## Elevation and preview security

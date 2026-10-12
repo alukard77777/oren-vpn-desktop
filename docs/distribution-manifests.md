@@ -13,7 +13,7 @@ needs updating.
 | `multicore-<v>-1-x86_64.pkg.tar.zst` | `multicore-x86_64.pkg.tar.zst` |
 | `multicore-<v>-1.x86_64.rpm` | `multicore.x86_64.rpm` |
 
-For example `https://github.com/fatyzzz/multicore-releases/releases/latest/download/multicore_amd64.deb`.
+For example `https://github.com/fatyzzz/multicore/releases/latest/download/multicore_amd64.deb`.
 
 The versioned files must stay: the in-app AppImage updater of every installed release looks
 for `MultiCore-<v>-x86_64.AppImage`. `scripts/add-stable-linux-asset-names.ps1 -Directory
@@ -42,7 +42,7 @@ python3 scripts/generate_distribution_manifests.py --version 1.2.0 \
     --checksums dist/release/RELEASE-SHA256SUMS.txt --output dist/distribution
 ```
 
-`--repository` (default `fatyzzz/multicore-releases`) and `--release-date` (default today)
+`--repository` (default `fatyzzz/multicore`) and `--release-date` (default today)
 can be overridden. The templates live in `packaging/winget/` and `packaging/aur/`; the AUR
 package takes its install hooks from `packaging/linux/arch/multicore.install`, and a test
 keeps its dependencies equal to the release's own Arch package.

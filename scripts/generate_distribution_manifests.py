@@ -21,7 +21,7 @@ WINGET_TEMPLATES = ROOT / "packaging" / "winget"
 AUR_TEMPLATES = ROOT / "packaging" / "aur"
 ARCH_INSTALL = ROOT / "packaging" / "linux" / "arch" / "multicore.install"
 PACKAGE_IDENTIFIER = "fatyzzz.MULTICORE"
-DEFAULT_REPOSITORY = "fatyzzz/multicore-releases"
+DEFAULT_REPOSITORY = "fatyzzz/multicore"
 
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
