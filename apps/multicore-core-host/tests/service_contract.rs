@@ -1751,8 +1751,9 @@ mod windows_pipe_server {
         );
         assert_eq!(facts.session_id, session, "token session of the client");
         assert!(facts.user_sid.starts_with("S-1-5-"));
+        // Session 0 (a CI runner installed as a service) never carries INTERACTIVE.
         assert!(
-            facts.interactive || std::env::var_os("SSH_CONNECTION").is_some(),
+            facts.interactive || session == 0 || std::env::var_os("SSH_CONNECTION").is_some(),
             "a desktop test run carries the INTERACTIVE group"
         );
         let data_root = user_data_root(token.as_raw_handle()).unwrap();
