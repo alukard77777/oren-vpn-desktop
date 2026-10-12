@@ -9,6 +9,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# This smoke installs per user ("No service"). Over a service-mode install Setup must remove that
+# install first, which needs elevation, so it ends with exit code 7. A runner that also carries a
+# service-mode MULTICORE cannot run it; it needs a machine without one.
+$serviceInstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{D95AB954-248C-44C9-9E3A-952398802A2D}_is1'
+if (Test-Path -LiteralPath $serviceInstallKey) {
+    $installed = (Get-ItemProperty -LiteralPath $serviceInstallKey).DisplayName
+    Write-Warning "SKIPPED: this machine has a service-mode install ($installed); the installed-update smoke needs a machine without one"
+    if ($env:GITHUB_STEP_SUMMARY) {
+        "> [!WARNING]`n> Installed-update smoke skipped: the runner has a service-mode MULTICORE install ($installed)." |
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+    }
+    exit 0
+}
+
 function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw "FAIL: $Message" }
