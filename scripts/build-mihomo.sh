@@ -40,6 +40,9 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$OUTPUT" ]] || usage
 [[ ! -e "$OUTPUT" ]] || fail "refusing to overwrite existing $OUTPUT"
+# Anchor a relative --output to the caller's directory: the build cds into the source tree.
+mkdir -p "$(dirname "$OUTPUT")"
+OUTPUT="$(cd "$(dirname "$OUTPUT")" && pwd)/$(basename "$OUTPUT")"
 
 PY=""
 for candidate in python3 python; do
