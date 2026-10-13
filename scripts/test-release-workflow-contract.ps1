@@ -55,8 +55,7 @@ foreach ($hostJob in @(
     }
 }
 foreach ($fedoraJob in @(
-    @{ Name = 'rpm'; Tools = 'Install RPM build and verification tools' },
-    @{ Name = 'rpm-smoke'; Tools = 'Install isolated Fedora smoke tools' }
+    @{ Name = 'rpm'; Tools = 'Install RPM build and verification tools' }
 )) {
     $pattern = '(?ms)^  ' + [regex]::Escape($fedoraJob.Name) + ':\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)'
     $body = [regex]::Match($linuxWorkflow, $pattern).Groups['body'].Value
@@ -70,22 +69,7 @@ foreach ($fedoraJob in @(
 Assert-True ($ci.Contains('python3 -B scripts/fixtures/test_runner_workspace_recovery.py')) `
     'Linux CI must exercise the actual workspace recovery guards'
 
-foreach ($token in @(
-    '  workflow_dispatch:',
-    '      rpm-run-id:',
-    '      rpm-sha256:',
-    "if: github.event_name != 'workflow_dispatch'",
-    'if: ${{ !cancelled() && (needs.rpm.result == ''success'' || github.event_name == ''workflow_dispatch'') }}',
-    '    timeout-minutes: 45',
-    'name: Verify selected RPM digest',
-    'SOURCE_RUN_ID: ${{ inputs.rpm-run-id }}',
-    'EXPECTED_SHA256: ${{ inputs.rpm-sha256 }}',
-    'run-id: ${{ inputs.rpm-run-id }}',
-    'github-token: ${{ github.token }}',
-    'sha256sum --check --strict -'
-)) {
-    Assert-True ($linuxWorkflow.Contains($token)) "Immutable RPM smoke rerun is missing: $token"
-}
+Assert-True (-not $linuxWorkflow.Contains('rpm-smoke')) 'The Fedora RPM smoke was removed from CI'
 foreach ($content in @($ci, $workflow, $linuxWorkflow)) {
     Assert-True ($content.Contains('  actions: read')) 'RPM artifact reuse requires read-only Actions permissions in each caller'
 }
@@ -94,12 +78,7 @@ foreach ($token in @(
     '  rpm:',
     'container: fedora:43',
     '--formats rpm',
-    'name: linux-packages-rpm',
-    '  rpm-smoke:',
-    "fedora: ['43', '44']",
-    'container: fedora:${{ matrix.fedora }}',
-    'MULTICORE_DISPOSABLE_RPM_TEST: 1',
-    'test-fedora-rpm.sh'
+    'name: linux-packages-rpm'
 )) {
     Assert-True ($linuxWorkflow.Contains($token)) "Fedora RPM workflow is missing: $token"
 }
@@ -162,9 +141,7 @@ finally {
 $zsyncName = 'MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync'
 Assert-True ([regex]::Matches($workflow, [regex]::Escape($zsyncName)).Count -eq 3) `
     'The AppImage .zsync must appear in the required Linux set, checksums, and publication stage'
-Assert-True ($workflow.Contains('needs: linux-packages')) 'release must wait for Fedora RPM smoke jobs'
-Assert-True ($linuxWorkflow -match '(?m)^          test "\$#" -eq 1\r?$') `
-    'RPM smoke must reject multiple artifacts with a standalone fail-fast test'
+Assert-True ($workflow.Contains('needs: linux-packages')) 'release must wait for the Linux packages'
 $linuxCiJob = [regex]::Match($ci, '(?ms)^  linux-packages:\r?\n(?<body>.*?)(?=^  [\w-]+:\r?$|\z)').Groups['body'].Value
 Assert-True ($linuxCiJob -match "(?m)^    if: github\.event_name == 'push'\r?`$") `
     'Linux packaging must run on every configured push branch, without a main-only restriction'
