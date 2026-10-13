@@ -2273,7 +2273,22 @@ export component AppWindow inherits Window {
                     }
 
                     drag-touch := TouchArea {
-                        moved => { root.window-drag(); }
+                        // One compositor move per press. On Wayland the compositor owns the move
+                        // and the release that ends it never reaches us, so without this latch
+                        // the next hover motion re-sent the move with the stale press serial and
+                        // KWin glued the window to the cursor until the next click.
+                        property <bool> drag-issued;
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down) {
+                                self.drag-issued = false;
+                            }
+                        }
+                        moved => {
+                            if (self.pressed && !self.drag-issued) {
+                                self.drag-issued = true;
+                                root.window-drag();
+                            }
+                        }
                         double-clicked => { root.window-toggle-maximize(); }
                     }
                 }

@@ -2627,11 +2627,32 @@ fn run_update_check(
     });
 }
 
+/// After a compositor-driven move or resize the window manager owns the pointer, and on Linux
+/// (Wayland, and X11's _NET_WM_MOVERESIZE) the button release that ends it never reaches us:
+/// Slint keeps the title bar's TouchArea grabbed, so the first click afterwards is swallowed.
+/// A pointer exit clears that grab. It is dispatched once the current input event has been
+/// handled, because Slint restores its mouse state after dispatch and would drop a nested event.
+#[cfg(target_os = "linux")]
+fn release_pointer_grab_after_compositor_move(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    Timer::single_shot(Duration::ZERO, move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerExited);
+        }
+    });
+}
+
+/// Windows runs the move in a modal loop and hands the release back, so nothing is stuck there.
+#[cfg(not(target_os = "linux"))]
+fn release_pointer_grab_after_compositor_move(_ui: &AppWindow) {}
+
 fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
     let weak = ui.as_weak();
     ui.on_window_drag(move || {
         if let Some(ui) = weak.upgrade() {
             let _ = ui.window().with_winit_window(|window| window.drag_window());
+            release_pointer_grab_after_compositor_move(&ui);
         }
     });
 
@@ -2661,6 +2682,7 @@ fn wire_window_controls(ui: &AppWindow, tray_available: bool) {
                 let _ = set_current_monitor_max_size(window);
                 let _ = window.drag_resize_window(edge.into());
             });
+            release_pointer_grab_after_compositor_move(&ui);
         }
     });
 
@@ -8387,6 +8409,18 @@ mod window_tests {
         assert!(rust.contains("ui.on_window_resize"));
         assert!(rust.contains("parse_resize_edge"));
         assert!(rust.contains("drag_resize_window"));
+        // Wayland: one compositor move per press, then Slint's stuck grab is released.
+        assert!(slint.contains("if (self.pressed && !self.drag-issued)"));
+        assert!(rust.contains("WindowEvent::PointerExited"));
+        assert!(
+            rust.split("fn native_resize_and_persistence_source_contract")
+                .next()
+                .unwrap()
+                .matches("release_pointer_grab_after_compositor_move(&ui);")
+                .count()
+                == 2,
+            "both the move and the resize release the grab"
+        );
         assert!(rust.contains("PreferenceStore::from_user_data_root()"));
         assert!(rust.contains("TimerMode::Repeated, Duration::from_millis(500)"));
         assert!(rust.contains("stop_and_flush"));
