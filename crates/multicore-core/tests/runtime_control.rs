@@ -266,6 +266,98 @@ dns:
     );
 }
 
+fn group<'a>(runtime: &'a Value, name: &str) -> Option<&'a Value> {
+    runtime
+        .get("proxy-groups")?
+        .as_sequence()?
+        .iter()
+        .find(|group| group.get("name").and_then(Value::as_str) == Some(name))
+}
+
+fn members(group: &Value) -> Vec<&str> {
+    group
+        .get("proxies")
+        .and_then(Value::as_sequence)
+        .unwrap()
+        .iter()
+        .map(|member| member.as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_global_mode_subscription_routes_through_its_first_group_not_direct() {
+    // In `mode: global` Mihomo sends everything through its GLOBAL selector, whose default is
+    // DIRECT when the config defines no GLOBAL group: connected, yet nothing was proxied, and
+    // picking a location (in the subscription's own group) changed nothing. Seen on Linux with
+    // a Remnawave subscription: every connection logged "using GLOBAL", dialled directly.
+    let runtime = runtime_mihomo(
+        r#"
+mode: global
+proxies:
+  - {name: de, type: socks5, server: 192.0.2.1, port: 1080}
+  - {name: nl, type: socks5, server: 192.0.2.2, port: 1080}
+proxy-groups:
+  - {name: "→ Remnawave", type: select, proxies: [de, nl]}
+  - {name: Auto, type: url-test, proxies: [de, nl], url: "https://www.gstatic.com/generate_204"}
+"#,
+    );
+    let global = group(&runtime, "GLOBAL").expect("a GLOBAL group is added");
+    assert_eq!(global.get("type").and_then(Value::as_str), Some("select"));
+    assert_eq!(members(global), ["→ Remnawave", "Auto", "DIRECT"]);
+    assert_eq!(runtime.get("mode").and_then(Value::as_str), Some("global"));
+}
+
+#[test]
+fn global_mode_handling_leaves_other_configs_alone() {
+    // Rule mode: no GLOBAL group is invented.
+    let runtime = runtime_mihomo(
+        "mode: rule
+proxies: []
+proxy-groups:
+  - {name: Main, type: select, proxies: [DIRECT]}
+",
+    );
+    assert!(group(&runtime, "GLOBAL").is_none());
+
+    // The provider's own GLOBAL group wins.
+    let runtime = runtime_mihomo(
+        r#"
+mode: Global
+proxies: []
+proxy-groups:
+  - {name: Main, type: select, proxies: [DIRECT]}
+  - {name: GLOBAL, type: select, proxies: [DIRECT, Main]}
+"#,
+    );
+    assert_eq!(
+        members(group(&runtime, "GLOBAL").unwrap()),
+        ["DIRECT", "Main"]
+    );
+
+    // A group that itself lists GLOBAL cannot be a member of it (Mihomo rejects the loop).
+    let runtime = runtime_mihomo(
+        r#"
+mode: global
+proxies: []
+proxy-groups:
+  - {name: Outer, type: select, proxies: [GLOBAL, DIRECT]}
+  - {name: Main, type: select, proxies: [DIRECT]}
+"#,
+    );
+    assert_eq!(
+        members(group(&runtime, "GLOBAL").unwrap()),
+        ["Main", "DIRECT"]
+    );
+
+    // No groups at all: nothing to route through, nothing added.
+    let runtime = runtime_mihomo(
+        "mode: global
+proxies: []
+",
+    );
+    assert!(group(&runtime, "GLOBAL").is_none());
+}
+
 #[test]
 fn mihomo_nameserver_policy_is_untouched_without_a_live_endpoint_domain() {
     let mihomo = br#"

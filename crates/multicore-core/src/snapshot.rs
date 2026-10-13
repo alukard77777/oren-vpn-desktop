@@ -1518,6 +1518,7 @@ pub fn stage_runtime_with_mihomo_control(
         );
     }
     crate::mihomo_dns_guard::apply(mapping);
+    route_global_mode_through_first_group(mapping);
     let profile_key = YamlValue::String("profile".to_owned());
     let profile = mapping
         .entry(profile_key)
@@ -1583,6 +1584,74 @@ pub fn stage_runtime_with_mihomo_control(
         .map_err(|error| PersistenceError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
     let xray = xray_runtime_bytes(snapshot, control.xray_outbound_interface.as_deref())?;
     stage_runtime_payloads(mihomo.as_bytes(), &xray, runtime_root)
+}
+
+/// In `mode: global` Mihomo sends every connection through its GLOBAL selector. Without a GLOBAL
+/// group of the provider's own, Mihomo builds one whose default member is DIRECT, so a connected
+/// client proxied nothing, and a location picked in the subscription's groups (the only ones the
+/// app shows) changed nothing. A GLOBAL group listing those groups, first one first, makes global
+/// mode use the location picked in the app. A group that itself lists GLOBAL is left out (Mihomo
+/// rejects the loop); a provider's own GLOBAL group is kept as written.
+fn route_global_mode_through_first_group(mapping: &mut serde_yaml_ng::Mapping) {
+    let global_mode = mapping
+        .get(YamlValue::String("mode".to_owned()))
+        .and_then(YamlValue::as_str)
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("global"));
+    if !global_mode {
+        return;
+    }
+    let Some(groups) = mapping
+        .get_mut(YamlValue::String("proxy-groups".to_owned()))
+        .and_then(YamlValue::as_sequence_mut)
+    else {
+        return;
+    };
+    let name = |group: &YamlValue| {
+        group
+            .get("name")
+            .and_then(YamlValue::as_str)
+            .map(str::to_owned)
+    };
+    if groups
+        .iter()
+        .any(|group| name(group).as_deref() == Some("GLOBAL"))
+    {
+        return;
+    }
+    let lists_global = |group: &YamlValue| {
+        group
+            .get("proxies")
+            .and_then(YamlValue::as_sequence)
+            .is_some_and(|members| {
+                members
+                    .iter()
+                    .any(|member| member.as_str() == Some("GLOBAL"))
+            })
+    };
+    let mut members: Vec<YamlValue> = groups
+        .iter()
+        .filter(|group| !lists_global(group))
+        .filter_map(name)
+        .map(YamlValue::String)
+        .collect();
+    if members.is_empty() {
+        return;
+    }
+    members.push(YamlValue::String("DIRECT".to_owned()));
+    let mut global = serde_yaml_ng::Mapping::new();
+    global.insert(
+        YamlValue::String("name".to_owned()),
+        YamlValue::String("GLOBAL".to_owned()),
+    );
+    global.insert(
+        YamlValue::String("type".to_owned()),
+        YamlValue::String("select".to_owned()),
+    );
+    global.insert(
+        YamlValue::String("proxies".to_owned()),
+        YamlValue::Sequence(members),
+    );
+    groups.push(YamlValue::Mapping(global));
 }
 
 fn xray_runtime_bytes(
