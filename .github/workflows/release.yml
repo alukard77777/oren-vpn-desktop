@@ -1,4 +1,4 @@
-name: Windows and Linux release
+name: Build OREN VPN Desktop (Windows x64)
 
 on:
   workflow_dispatch:
@@ -8,447 +8,119 @@ on:
 
 permissions:
   contents: write
-  actions: read
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
-  linux-packages:
-    uses: ./.github/workflows/linux-packages.yml
-    with:
-      update-repository: alukard77777/oren-vpn-desktop
-
-  release:
-    needs: linux-packages
+  build-windows:
+    name: Build OREN VPN Setup (x64)
     runs-on: windows-latest
-    timeout-minutes: 90
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTUP_TOOLCHAIN: 1.98.1-x86_64-pc-windows-msvc
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      CARGO_INCREMENTAL: 0
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout tagged source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          fetch-depth: 1
 
-      - name: Enforce privileged broker release gate
+      - name: Install Rust toolchain (1.98.1)
         shell: pwsh
         run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 -AssertReleaseReady
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Install pinned Rust toolchain
-        shell: pwsh
-        run: |
-          rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal
           rustup default 1.98.1-x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup target add i686-pc-windows-msvc --toolchain 1.98.1-x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup target add aarch64-pc-windows-msvc --toolchain 1.98.1-x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc -Vv
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo -V
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify tag and package version
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          $manifest = Get-Content -Raw apps/multicore-desktop/Cargo.toml
-          $match = [regex]::Match($manifest, '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$')
-          if (-not $match.Success) { throw 'Desktop package version was not found' }
-          $expectedTag = "v$($match.Groups[1].Value)"
-          if ($env:GITHUB_REF_NAME -cne $expectedTag) {
-            throw "Release tag $env:GITHUB_REF_NAME does not match $expectedTag"
-          }
-          "APP_VERSION=$($match.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          choco install innosetup -y --no-progress
 
-      - name: Verify source
-        shell: pwsh
-        run: |
-          cargo fmt --all -- --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --workspace --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # rust-skia has no 32-bit Windows download: link the pinned static-CRT Skia build
-          # (MULTICORE_SKIA_BINARIES_DIR on the runner, see docs/renderer.md).
-          $env:SKIA_BINARIES_URL = powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pinned-skia-binaries-url.ps1 -Architecture x86
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
-          cargo test --workspace --locked --target i686-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo clippy --workspace --all-targets --locked --target i686-pc-windows-msvc -- -D warnings
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Remove-Item Env:SKIA_BINARIES_URL, Env:CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS
-          # ARM64 is cross-compiled: this x64 runner cannot run it, so its tests are built, not run.
-          # The runner needs the MSVC ARM64 build tools and LLVM clang on PATH (ring builds its ARM64
-          # code only with clang), and the pinned ARM64 Skia build (docs/renderer.md).
-          if (-not (Get-Command clang.exe -CommandType Application -ErrorAction SilentlyContinue)) { throw 'The ARM64 build needs LLVM clang.exe on PATH' }
-          $env:SKIA_BINARIES_URL = powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/pinned-skia-binaries-url.ps1 -Architecture arm64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
-          cargo test --workspace --locked --target aarch64-pc-windows-msvc --no-run
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo clippy --workspace --all-targets --locked --target aarch64-pc-windows-msvc -- -D warnings
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Remove-Item Env:SKIA_BINARIES_URL, Env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-windows-release.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-smoke-test-one-click-contract.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-packaged-daemon-smoke-contract.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer-contract.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-workflow-contract.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Build patched Mihomo
-        shell: pwsh
-        run: |
-          # The pinned MetaCubeX source + packaging/mihomo-patches, built with the pinned Go release
-          # (Git Bash on this runner); every binary must match its SHA-256 pin or nothing ships.
-          if (-not (Test-Path -LiteralPath 'C:\Program Files\Git\bin\bash.exe' -PathType Leaf)) { throw 'Git Bash is required to build Mihomo' }
-          & 'C:\Program Files\Git\bin\bash.exe' scripts/build-mihomo.sh --output dist/mihomo --cache "$env:RUNNER_TEMP/mihomo-cache" windows-amd64 windows-386 windows-arm64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "MULTICORE_MIHOMO_BINARIES_DIR=$((Resolve-Path 'dist/mihomo').Path)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Build verified portable bundle
-        shell: pwsh
-        run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
-            -DestinationPath dist/release/multicore-windows-x64 `
-            -UpdateRepository fatyzzz/multicore `
-            -ReleaseAssetPath dist/release/multicore-windows-x64.zip
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
-            -DesktopExecutablePath dist/release/multicore-windows-x64/MultiCore.exe `
-            -DaemonExecutablePath dist/release/multicore-windows-x64/runtime/multicore-daemon.exe `
-            -UpdaterExecutablePath dist/release/multicore-windows-x64/runtime/multicore-updater.exe `
-            -CoreHostExecutablePath dist/release/multicore-windows-x64/runtime/multicore-core-host.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x64.zip').Path
-          cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-packaged-daemon.ps1 `
-            -PackagePath dist/release/multicore-windows-x64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Build verified x86 portable bundle
-        shell: pwsh
-        run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
-            -Architecture x86 `
-            -DestinationPath dist/release/multicore-windows-x86 `
-            -UpdateRepository fatyzzz/multicore `
-            -ReleaseAssetPath dist/release/multicore-windows-x86.zip
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
-            -Architecture x86 `
-            -DesktopExecutablePath dist/release/multicore-windows-x86/MultiCore.exe `
-            -DaemonExecutablePath dist/release/multicore-windows-x86/runtime/multicore-daemon.exe `
-            -UpdaterExecutablePath dist/release/multicore-windows-x86/runtime/multicore-updater.exe `
-            -CoreHostExecutablePath dist/release/multicore-windows-x86/runtime/multicore-core-host.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-x86.zip').Path
-          $env:MULTICORE_RELEASE_BUNDLE_ARCH = 'x86'
-          cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-packaged-daemon.ps1 `
-            -PackagePath dist/release/multicore-windows-x86
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Build verified arm64 portable bundle
-        shell: pwsh
-        run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-release.ps1 `
-            -Architecture arm64 `
-            -DestinationPath dist/release/multicore-windows-arm64 `
-            -UpdateRepository fatyzzz/multicore `
-            -ReleaseAssetPath dist/release/multicore-windows-arm64.zip
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-elevation-manifest.ps1 `
-            -Architecture arm64 `
-            -DesktopExecutablePath dist/release/multicore-windows-arm64/MultiCore.exe `
-            -DaemonExecutablePath dist/release/multicore-windows-arm64/runtime/multicore-daemon.exe `
-            -UpdaterExecutablePath dist/release/multicore-windows-arm64/runtime/multicore-updater.exe `
-            -CoreHostExecutablePath dist/release/multicore-windows-arm64/runtime/multicore-core-host.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:MULTICORE_RELEASE_BUNDLE = (Resolve-Path 'dist/release/multicore-windows-arm64.zip').Path
-          $env:MULTICORE_RELEASE_BUNDLE_ARCH = 'arm64'
-          cargo test -p multicore-release --test archive_contract built_release_bundle_matches_updater_contract --locked -- --ignored --exact
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # No packaged-daemon smoke test: ARM64 executables do not run on this x64 runner.
-
-      - name: Install pinned Inno Setup
-        shell: pwsh
-        run: |
-          $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
-          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
-          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $installer
-          $actual = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expected = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
-          if ($actual -cne $expected) { throw 'Inno Setup installer checksum mismatch' }
-          $process = Start-Process -FilePath $installer `
-            -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER') `
-            -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Inno Setup install failed: $($process.ExitCode)" }
-
-      - name: Build Windows installer
-        shell: pwsh
-        run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1 `
-            -PackagePath dist/release/multicore-windows-x64 `
-            -OutputDirectory dist/release `
-            -AppVersion $env:APP_VERSION
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1 `
-            -Architecture x86 `
-            -PackagePath dist/release/multicore-windows-x86 `
-            -OutputDirectory dist/release `
-            -AppVersion $env:APP_VERSION
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1 `
-            -Architecture arm64 `
-            -PackagePath dist/release/multicore-windows-arm64 `
-            -OutputDirectory dist/release `
-            -AppVersion $env:APP_VERSION
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Smoke-test installed update boundary
-        shell: pwsh
-        run: |
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test-windows-installed-update.ps1 `
-            -InstallerPath dist/release/MultiCore-Setup-x64.exe `
-            -PackagePath dist/release/multicore-windows-x64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Preserve pinned upstream source
-        shell: pwsh
-        run: |
-          $manifest = Get-Content -Raw packaging/windows-x64/versions.json | ConvertFrom-Json
-          $destination = 'dist/release/Xray-core-source.zip'
-          Invoke-WebRequest -UseBasicParsing -Uri $manifest.components.xray.source.url -OutFile $destination
-          $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -cne [string]$manifest.components.xray.source.sha256) {
-            throw 'Pinned source checksum mismatch for Xray-core-source.zip'
-          }
-          # The GPL corresponding source of the shipped Mihomo: the patched tree it was compiled
-          # from, with the patches, the recipe and the build script (written by build-mihomo.sh).
-          Copy-Item -LiteralPath dist/mihomo/mihomo-source.zip -Destination dist/release/mihomo-source.zip
-
-      - name: Collect Linux packages
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: linux-packages-*
-          path: dist/release/linux
-          merge-multiple: true
-
-      - name: Add version-less Linux asset names
-        shell: pwsh
-        run: ./scripts/add-stable-linux-asset-names.ps1 -Directory dist/release/linux -Version $env:APP_VERSION
-
-      - name: Verify Linux package set
-        shell: pwsh
-        run: |
-          foreach ($asset in @(
-            "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
-            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm",
-            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync",
-            'dist/release/linux/multicore_amd64.deb',
-            'dist/release/linux/MultiCore-x86_64.AppImage',
-            'dist/release/linux/multicore-x86_64.pkg.tar.zst',
-            'dist/release/linux/multicore.x86_64.rpm'
-          )) {
-            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "Missing Linux package $asset" }
-          }
-
-      - name: Create release checksums and notes
-        shell: pwsh
-        run: |
-          $assets = @(
-            'dist/release/multicore-windows-x64.zip',
-            'dist/release/MultiCore-Setup-x64.exe',
-            'dist/release/multicore-windows-x86.zip',
-            'dist/release/MultiCore-Setup-x86.exe',
-            'dist/release/multicore-windows-arm64.zip',
-            'dist/release/MultiCore-Setup-arm64.exe',
-            "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
-            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm",
-            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync",
-            'dist/release/linux/multicore_amd64.deb',
-            'dist/release/linux/MultiCore-x86_64.AppImage',
-            'dist/release/linux/multicore-x86_64.pkg.tar.zst',
-            'dist/release/linux/multicore.x86_64.rpm',
-            'dist/release/Xray-core-source.zip',
-            'dist/release/mihomo-source.zip'
-          )
-          $lines = foreach ($asset in $assets) {
-            $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $([IO.Path]::GetFileName($asset))"
-          }
-          [IO.File]::WriteAllLines(
-            (Join-Path $PWD 'dist/release/RELEASE-SHA256SUMS.txt'),
-            $lines,
-            [Text.UTF8Encoding]::new($false)
-          )
-          @"
-          MultiCore $env:APP_VERSION for Windows x64, Windows x86 (32-bit), Windows on ARM (arm64) and Linux x86_64.
-
-          Source commit: https://github.com/fatyzzz/multicore/commit/$env:GITHUB_SHA
-
-          - `MultiCore-Setup-x64.exe` - per-user installer.
-          - `multicore-windows-x64.zip` - verified portable bundle and updater asset.
-          - `MultiCore-Setup-x86.exe` and `multicore-windows-x86.zip` - the same for 32-bit Windows; on 64-bit Windows use the x64 files.
-          - `MultiCore-Setup-arm64.exe` and `multicore-windows-arm64.zip` - the same for Windows on ARM (ARM64 PCs only); it replaces an x64 install there in place.
-          - `multicore_$($env:APP_VERSION)_amd64.deb` - Debian and Ubuntu 22.04+ package.
-          - `multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst` - Arch Linux package (`sudo pacman -U`).
-          - `multicore-$($env:APP_VERSION)-1.x86_64.rpm` - Fedora 43/44 x86_64 package (`sudo dnf install ./multicore-<version>-1.x86_64.rpm`).
-          - `MultiCore-$($env:APP_VERSION)-x86_64.AppImage` - portable Linux build; needs GTK 3 and polkit on the host. AppImageUpdate can update it through the attached `.zsync` file.
-          - `multicore_amd64.deb`, `multicore-x86_64.pkg.tar.zst`, `multicore.x86_64.rpm` and `MultiCore-x86_64.AppImage` - the same Linux packages under version-less names, for stable `releases/latest/download/` links.
-          - On Linux, Connect asks for the administrator password through polkit to start the core host.
-          - The desktop and daemon run as the current user; Connect requests UAC for the dedicated core host.
-          - Source archives are attached for the exact bundled Xray-core commit and for the bundled Mihomo (the pinned MetaCubeX commit with the REALITY patches in packaging/mihomo-patches, as compiled).
-
-          PUBLIC UNSIGNED PREVIEW: the binaries are not Authenticode-signed, and the elevated core host and cores are stored in a user-writable per-user installation. Windows SmartScreen may warn.
-          "@ | Set-Content -LiteralPath dist/release/RELEASE_NOTES.md -Encoding utf8
-
-      - name: Stage release publication
-        shell: pwsh
-        run: |
-          $stage = 'dist/release-publication'
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          $assets = @(
-            'dist/release/multicore-windows-x64.zip',
-            'dist/release/MultiCore-Setup-x64.exe',
-            'dist/release/multicore-windows-x86.zip',
-            'dist/release/MultiCore-Setup-x86.exe',
-            'dist/release/multicore-windows-arm64.zip',
-            'dist/release/MultiCore-Setup-arm64.exe',
-            "dist/release/linux/multicore_$($env:APP_VERSION)_amd64.deb",
-            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1-x86_64.pkg.tar.zst",
-            "dist/release/linux/multicore-$($env:APP_VERSION)-1.x86_64.rpm",
-            "dist/release/linux/MultiCore-$($env:APP_VERSION)-x86_64.AppImage.zsync",
-            'dist/release/linux/multicore_amd64.deb',
-            'dist/release/linux/MultiCore-x86_64.AppImage',
-            'dist/release/linux/multicore-x86_64.pkg.tar.zst',
-            'dist/release/linux/multicore.x86_64.rpm',
-            'dist/release/Xray-core-source.zip',
-            'dist/release/mihomo-source.zip',
-            'dist/release/RELEASE-SHA256SUMS.txt'
-          )
-          foreach ($asset in $assets) {
-            Copy-Item -LiteralPath $asset -Destination $stage
-          }
-          Copy-Item -LiteralPath dist/release/RELEASE_NOTES.md -Destination $stage
-          Copy-Item -LiteralPath scripts/publish-github-release.ps1 -Destination $stage
-          $assetNames = $assets | ForEach-Object { [IO.Path]::GetFileName($_) }
-          [IO.File]::WriteAllLines(
-            (Join-Path $stage 'RELEASE-ASSETS.txt'),
-            $assetNames,
-            [Text.UTF8Encoding]::new($false)
-          )
-
-      - name: Upload verified release publication
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-publication
-          path: dist/release-publication/*
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    name: publish
-    needs: release
-    # GitHub-hosted jobs are unavailable when account Actions billing is paused. Publication is
-    # lightweight and uses the already verified artifact, so reuse the trusted Windows runner.
-    runs-on: [self-hosted, Windows, X64, windowsbuild]
-    timeout-minutes: 90
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
-
-    steps:
-      - name: Require dedicated release credential
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
-            throw 'RELEASES_TOKEN is required to mirror the release into fatyzzz/multicore-releases'
-          }
-
-      - name: Download verified release publication
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-publication
-          path: release-publication
-
-      # Clients from this release on update from this repository.
-      - name: Publish release to update channel
-        shell: pwsh
-        working-directory: release-publication
-        run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          ./publish-github-release.ps1 `
-            -Repository fatyzzz/multicore `
-            -Tag $env:GITHUB_REF_NAME `
-            -Target main `
-            -Title "MultiCore $version" `
-            -NotesPath RELEASE_NOTES.md `
-            -AssetManifest RELEASE-ASSETS.txt `
-            -Token '${{ github.token }}'
-
-      # Clients built before the move still read fatyzzz/multicore-releases, and the download
-      # links point there, so every release is mirrored into it as well.
-      - name: Mirror release to legacy update channel
-        shell: pwsh
-        working-directory: release-publication
-        run: |
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          ./publish-github-release.ps1 `
-            -Repository fatyzzz/multicore-releases `
-            -Tag $env:GITHUB_REF_NAME `
-            -Target main `
-            -Title "MultiCore $version" `
-            -NotesPath RELEASE_NOTES.md `
-            -AssetManifest RELEASE-ASSETS.txt
-
-      # release.txt is the updater's cheap hint; it moves only after both releases carry every asset.
-      - name: Point release.txt at this version
+      - name: Build OREN VPN Desktop Client
         shell: pwsh
         env:
-          CHANNEL_TOKEN: ${{ github.token }}
+          MULTICORE_UPDATE_REPOSITORY: alukard77777/oren-vpn-desktop
         run: |
-          $ErrorActionPreference = 'Stop'
-          $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          $content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$version`n"))
-          foreach ($channel in @(
-              @{ Repository = 'fatyzzz/multicore'; Token = $env:CHANNEL_TOKEN },
-              @{ Repository = 'fatyzzz/multicore-releases'; Token = $env:GH_TOKEN }
-          )) {
-            $uri = "https://api.github.com/repos/$($channel.Repository)/contents/release.txt"
-            $headers = @{ Authorization = "Bearer $($channel.Token)"; Accept = 'application/vnd.github+json' }
-            $signature = @{ name = 'fatyzzz'; email = '82300276+fatyzzz@users.noreply.github.com' }
-            $body = @{ message = "release: $version"; content = $content; branch = 'main'; author = $signature; committer = $signature }
-            try {
-              $body.sha = (Invoke-RestMethod -Uri "$uri`?ref=main" -Headers $headers).sha
-            } catch {
-              if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
-            }
-            Invoke-RestMethod -Method Put -Uri $uri -Headers $headers -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+          cargo build --release -p multicore-desktop
+          if (-not (Test-Path "target/release/multicore-desktop.exe")) {
+            throw "multicore-desktop.exe was not built"
           }
+          Write-Host "OREN VPN desktop executable built successfully."
+
+      - name: Download Upstream Runtime & Stage Package
+        shell: pwsh
+        run: |
+          $stage = "dist/staging"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          
+          $zipUrl = "https://github.com/fatyzzz/multicore/releases/download/v1.1.15/multicore-windows-x64.zip"
+          $zipFile = "$env:RUNNER_TEMP/multicore-windows-x64.zip"
+          Write-Host "Downloading runtime components from $zipUrl..."
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zipFile
+          
+          Write-Host "Unpacking runtime bundle..."
+          Expand-Archive -Path $zipFile -DestinationPath $stage -Force
+
+          Write-Host "Injecting custom OREN VPN desktop client..."
+          Copy-Item -Path "target/release/multicore-desktop.exe" -Destination "$stage/MultiCore.exe" -Force
+
+          Write-Host "Updating SHA256 checksums..."
+          $newHash = (Get-FileHash -Path "$stage/MultiCore.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sumFile = Join-Path $stage 'SHA256SUMS.txt'
+          $lines = (Get-Content -Path $sumFile) | ForEach-Object {
+            if ($_ -match '\*MultiCore\.exe$') {
+              "$newHash *MultiCore.exe"
+            } else {
+              $_
+            }
+          }
+          [IO.File]::WriteAllLines($sumFile, $lines, [Text.UTF8Encoding]::new($false))
+          Write-Host "Staging ready with updated checksums."
+
+      - name: Build Windows Installer
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1 `
+            -PackagePath dist/staging `
+            -OutputDirectory dist/release `
+            -AppVersion "1.1.15"
+
+          if (-not (Test-Path "dist/release/MultiCore-Setup-x64.exe")) {
+            throw "MultiCore-Setup-x64.exe was not created"
+          }
+
+          Copy-Item "dist/release/MultiCore-Setup-x64.exe" "dist/release/OREN-VPN-Setup-x64.exe" -Force
+          Compress-Archive -Path "dist/staging/*" -DestinationPath "dist/release/OREN-VPN-Portable-x64.zip" -Force
+          Write-Host "Release artifacts successfully created in dist/release:"
+          Get-ChildItem "dist/release"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OREN-VPN-Windows-x64
+          path: |
+            dist/release/OREN-VPN-Setup-x64.exe
+            dist/release/OREN-VPN-Portable-x64.zip
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: v1.1.15
+          name: "OREN VPN Desktop v1.1.15"
+          draft: false
+          prerelease: false
+          body: |
+            ## OREN VPN Desktop (Windows x64)
+
+            - **`OREN-VPN-Setup-x64.exe`** — Официальный инсталлятор (установка в `Program Files` или per-user).
+            - **`OREN-VPN-Portable-x64.zip`** — Портативная версия (распакуй и запусти `MultiCore.exe`).
+
+            ### Детали сборки:
+            - **Фирменный стиль**: Тема *Cyber Crimson & Obsidian Dark* (акцент `#ff2a4d`, фон `#0b0b0f`, тёмные панели `#12121a`).
+            - **Ядра**: Xray Core v26.9.30 + Mihomo v1.19.32 с поддержкой REALITY + MLKEM768.
+            - **Поддерживаемые протоколы**: VLESS Reality (TCP/gRPC/XHTTP), Hysteria 2, Trojan, ShadowTLS, TUIC.
+          files: |
+            dist/release/OREN-VPN-Setup-x64.exe
+            dist/release/OREN-VPN-Portable-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
