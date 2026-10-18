@@ -2262,7 +2262,7 @@ export component AppWindow inherits Window {
                         y: -root.title-lift;
                         width: 112px;
                         height: parent.height;
-                        text: "MULTICORE";
+                        text: "OREN VPN";
                         color: Theme.text-primary;
                         font-family: Theme.font-family;
                         // The tray popup's wordmark: tighter, bolder, tracked caps.
@@ -2628,7 +2628,7 @@ export component AppWindow inherits Window {
 
                 TitleBarButton { x: parent.width - 132px; y: -root.resize-border; height: 44px + root.resize-border; kind: "minimize"; state-label: @tr("Свернуть окно"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-minimize(); } }
                 TitleBarButton { x: parent.width - 88px; y: -root.resize-border; height: 44px + root.resize-border; kind: root.maximized ? "restore" : "maximize"; state-label: @tr("Развернуть или восстановить окно"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-toggle-maximize(); } }
-                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: @tr("Закрыть MULTICORE"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
+                TitleBarButton { x: parent.width - 44px; y: -root.resize-border; height: 44px + root.resize-border; kind: "close"; state-label: @tr("Закрыть OREN VPN"); activated => { if (root.profile-menu-open) { root.close-profile-menu(); } root.window-close(); } }
             }
 
             HorizontalLayout {

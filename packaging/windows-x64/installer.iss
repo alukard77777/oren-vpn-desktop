@@ -16,8 +16,8 @@
   #error Arch must be x64, x86 or arm64
 #endif
 
-#define AppName "MULTICORE"
-#define AppPublisher "MULTICORE"
+#define AppName "OREN VPN"
+#define AppPublisher "OREN VPN"
 #define AppExeName "MultiCore.exe"
 
 [Setup]
@@ -26,8 +26,8 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 ; Service mode (default): Program Files + the MULTICORE service. "Без службы": per-user.
-DefaultDirName={autopf}\MultiCore
-DefaultGroupName=MultiCore
+DefaultDirName={autopf}\OREN VPN
+DefaultGroupName=OREN VPN
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=commandline dialog

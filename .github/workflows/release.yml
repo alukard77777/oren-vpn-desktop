@@ -1,12 +1,13 @@
 name: Windows and Linux release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 concurrency:
@@ -17,11 +18,11 @@ jobs:
   linux-packages:
     uses: ./.github/workflows/linux-packages.yml
     with:
-      update-repository: fatyzzz/multicore
+      update-repository: alukard77777/oren-vpn-desktop
 
   release:
     needs: linux-packages
-    runs-on: [self-hosted, Windows, X64, windowsbuild]
+    runs-on: windows-latest
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
